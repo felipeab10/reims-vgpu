@@ -2409,19 +2409,23 @@ pub(crate) fn note_access_modes(state: &DeviceState, built: &reims_vgpu_core::se
 /// into the model and this takes work out of it, and neither is a function of
 /// where a ring's head happens to be.
 fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mut H) {
-    // **Until nothing more runs, not once.** Running a position publishes its
-    // channel's completion words, and a published word discharges the stamp
-    // waits other positions were admitted with — so one pass over what was
-    // ready when the pass began leaves the work it just released for whenever
-    // this device is next entered. A guest that ordered a packet behind a fence
-    // this very drain published would wait on a doorbell instead.
+    let t_sw_start = std::time::Instant::now();
+    let mut iter_count = 0;
+    let mut t_stamps_ns = 0u64;
+    let mut t_pump_ns = 0u64;
+    let mut t_run_ns = 0u64;
+    let mut ran_count = 0;
     loop {
+        iter_count += 1;
+        let ts0 = std::time::Instant::now();
         observe_awaited_stamps(state, host);
+        t_stamps_ns += ts0.elapsed().as_nanos() as u64;
+
+        let tp0 = std::time::Instant::now();
         pump_translations(state, host);
+        t_pump_ns += tp0.elapsed().as_nanos() as u64;
+
         for ingress in state.take_ready() {
-            // `false` is a position the model released and this device holds no
-            // bytes for. `mark_ready` has already named it; there is nothing
-            // here to run.
             let _ = state.parked.mark_ready(ingress);
         }
         let mut ran = false;
@@ -2435,23 +2439,37 @@ fn settle_model_work<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             else {
                 continue;
             };
+            let tr0 = std::time::Instant::now();
             run_parked(state, host, ingress, &work);
+            t_run_ns += tr0.elapsed().as_nanos() as u64;
             ran = true;
+            ran_count += 1;
         }
         if !ran {
             break;
         }
     }
-    // A position still parked is work this device owes, and the ring it came
-    // from is empty — so nothing but a re-entry will run it. Asking the store
-    // rather than a mask is what keeps "which timelines are owed" one fact:
-    // the store is what holds the work.
+    let tw0 = std::time::Instant::now();
     for ingress in state.parked.waiting_in_order() {
         match state.parked.domain_of(ingress) {
             Some(0) => state.pending.main_drain = true,
             Some(domain) => state.pending.child_mask |= 1u32.checked_shl(domain).unwrap_or(0),
             None => {}
         }
+    }
+    let t_waiting = tw0.elapsed();
+    let total_ms = t_sw_start.elapsed().as_millis();
+    if total_ms > 20 {
+        crate::observe::off(format!(
+            "DIAG_SETTLE total_ms={} iters={} ran={} stamps_ms={} pump_ms={} run_ms={} waiting_ms={}",
+            total_ms,
+            iter_count,
+            ran_count,
+            t_stamps_ns / 1_000_000,
+            t_pump_ns / 1_000_000,
+            t_run_ns / 1_000_000,
+            t_waiting.as_millis()
+        ));
     }
 }
 
@@ -6814,14 +6832,6 @@ pub fn drain_child_fifo<H: HostMemory + HostOps>(
                 }
 
                 admit_and_park(state, host, fifo, stamp_index, packet);
-                settle_model_work(state, host);
-
-                if state.pending.host_action_yield {
-                    if head != tail {
-                        state.pending.child_mask |= bit;
-                    }
-                    break;
-                }
             }
         }
     }
@@ -7947,6 +7957,7 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
     // nothing to re-arm it, and froze a boot for 29 s. Every bit that arrives
     // here arrives with its own `schedule_bh` already rung by the vCPU, so the
     // worker is guaranteed another wakeup for whatever this pass leaves.
+    let t_p_start = std::time::Instant::now();
     for _ in 0..CHILD_DOORBELL_REFILLS {
         let mut remaining = mask;
         for ch in 1..MAX_CHANNELS as u32 {
@@ -7967,35 +7978,34 @@ pub fn drain_pending<H: HostMemory + HostOps>(state: &mut DeviceState, host: &mu
             }
         }
         fold_rung_child_doorbells(state);
-        // Only channels this pass has not already run: a channel rung again
-        // while its own drain was in flight has had that work seen, and
-        // re-running it here would spin on one busy channel while the others
-        // wait.
         mask = std::mem::take(&mut state.pending.child_mask) & !served;
         if mask == 0 {
             break;
         }
         note_store_route("child_doorbell_refill");
     }
-    // Whatever the refill cap left, handed back to the next wakeup.
+    let t_children = t_p_start.elapsed();
     state.pending.child_mask |= mask;
-    // The successor of `retry_stamp_held_timelines`, which walked channels in
-    // id order and re-offered the ones held on a slot a higher-numbered channel
-    // publishes. There is no walk to get out of order any more: a released
-    // position is run by whoever is settling, whatever channel it belongs to,
-    // and the stamp that released it was observed in the same pass.
+    let t_settle_start = std::time::Instant::now();
     settle_model_work(state, host);
+    let t_settle = t_settle_start.elapsed();
+    let t_tail_start = std::time::Instant::now();
     if state.pending.iosfc {
         drain_iosfc(state, host);
     }
     try_display_online(state, host);
-    // Unmap contiguous views retired by MAP/UNMAP/page-table changes (their
-    // Metal objects were dropped at retire time; execution is sync-per-packet
-    // so nothing aliases them anymore).
     crate::runtime::mapper::flush_retired_views(state, host);
-    // Unpin engine residents of linear cache entries dropped by task/object
-    // deletes this drain, so they become LRU-evictable instead of leaking.
     crate::runtime::render_writeback::retire_linear_residents(state);
+    let t_tail = t_tail_start.elapsed();
+    if t_p_start.elapsed().as_millis() > 50 {
+        crate::observe::off(format!(
+            "DIAG_DRAIN_PENDING total_ms={} children_ms={} end_settle_ms={} tail_ms={}",
+            t_p_start.elapsed().as_millis(),
+            t_children.as_millis(),
+            t_settle.as_millis(),
+            t_tail.as_millis()
+        ));
+    }
 }
 
 #[cfg(test)]

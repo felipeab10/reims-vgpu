@@ -1104,9 +1104,13 @@ impl WindowPresenter {
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
         let frame_in_flight = self.frames[frame_ix].in_flight;
+        let acquire_timeout = match std::env::var("REIMS_VGPU_ACQUIRE_TIMEOUT_MS") {
+            Ok(v) => v.parse::<u64>().unwrap_or(100).saturating_mul(1_000_000),
+            Err(_) => 100_000_000,
+        };
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
-            0,
+            acquire_timeout,
             frame_image_available,
             vk::Fence::null(),
         ) {
