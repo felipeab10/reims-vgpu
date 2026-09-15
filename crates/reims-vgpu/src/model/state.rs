@@ -4525,6 +4525,7 @@ impl DeviceState {
         packet: &reims_vgpu_core::session::Packet,
     ) -> Result<Admission, reims_vgpu_core::session::Refusal> {
         let mut session = self.session.lock().expect("session");
+        let _ = session.maybe_compact(Some(4096));
         let admitted = session.admit(packet)?;
         Ok(Admission {
             epoch: session.epoch(),

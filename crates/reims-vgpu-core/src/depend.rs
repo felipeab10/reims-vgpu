@@ -75,6 +75,7 @@ pub struct Census {
 #[derive(Debug, Default)]
 pub struct DependencyGraph {
     entries: Vec<Entry>,
+    dead_entries: usize,
     by_backing: HashMap<BackingId, Vec<usize>>,
     /// Keyed by the heap, not by `HeapId`: the membership generation says
     /// which set a record was written against and never which memory exists, so
@@ -116,6 +117,16 @@ impl DependencyGraph {
         self.entries.iter().filter(|e| e.live).count()
     }
 
+    #[must_use]
+    pub const fn dead_entries(&self) -> usize {
+        self.dead_entries
+    }
+
+    #[must_use]
+    pub fn entries(&self) -> usize {
+        self.entries.len()
+    }
+
     /// Admit one transaction's accesses and return the ordinals it must wait
     /// for.
     ///
@@ -153,7 +164,10 @@ impl DependencyGraph {
             self.gather(intent, &mut scratch);
             for &candidate in &scratch {
                 let entry = self.entries[candidate];
-                if !entry.live || entry.ordinal == ordinal {
+                if !entry.live {
+                    continue;
+                }
+                if entry.ordinal == ordinal {
                     continue;
                 }
                 if !requires_edge(&entry.intent, intent) {
@@ -260,9 +274,14 @@ impl DependencyGraph {
     /// creating edges when the work that declared it has finished, and a caller
     /// that retires early publishes a hazard it still owes.
     pub fn retire(&mut self, ordinal: IngressOrdinal) {
+        let mut newly_dead = 0;
         for &idx in self.by_ordinal.get(&ordinal).into_iter().flatten() {
-            self.entries[idx].live = false;
+            if self.entries[idx].live {
+                self.entries[idx].live = false;
+                newly_dead += 1;
+            }
         }
+        self.dead_entries += newly_dead;
         self.by_ordinal.remove(&ordinal);
     }
 
@@ -286,6 +305,7 @@ impl DependencyGraph {
             self.insert(e.ordinal, e.intent);
         }
         self.census = saved;
+        self.dead_entries = 0;
     }
 }
 
@@ -503,8 +523,10 @@ mod tests {
         g.retire(ord(1));
         assert!(g.admit(ord(2), &[intent(k, AccessMode::Read)]).is_empty());
         assert_eq!(g.live_accesses(), 1);
+        assert_eq!(g.dead_entries(), 1);
         g.compact();
         assert_eq!(g.live_accesses(), 1, "only the live access survives");
+        assert_eq!(g.dead_entries(), 0);
     }
 
     /// Compaction is bookkeeping. It must not change an answer, and it must not
@@ -517,9 +539,11 @@ mod tests {
         g.admit(ord(1), &[intent(k, AccessMode::Write)]);
         g.admit(ord(2), &[intent(k, AccessMode::Read)]);
         g.retire(ord(1));
+        assert_eq!(g.dead_entries(), 1);
         let before = g.census();
         g.compact();
         assert_eq!(g.census(), before);
+        assert_eq!(g.dead_entries(), 0);
         assert_eq!(
             g.admit(ord(3), &[intent(k, AccessMode::Write)]),
             vec![ord(2)]

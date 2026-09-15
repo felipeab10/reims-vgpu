@@ -1082,6 +1082,23 @@ impl SessionModel {
         self.graph.compact();
     }
 
+    /// Compact retired graph entries before a growing admission, never from
+    /// completion or withdrawal. Returns (compact_us, dead_before, live_before)
+    /// when the configured threshold caused a rebuild.
+    #[must_use]
+    pub fn maybe_compact(&mut self, dead_threshold: Option<usize>) -> Option<(u64, usize, usize)> {
+        let threshold = dead_threshold?;
+        if self.graph.dead_entries() < threshold {
+            return None;
+        }
+        let dead = self.graph.dead_entries();
+        let live = self.graph.live_accesses();
+        let started = std::time::Instant::now();
+        self.graph.compact();
+        Some((started.elapsed().as_micros() as u64, dead, live))
+    }
+
+
     /// Whether a payload class reaches an executor, for a caller deciding what
     /// to hand where.
     #[must_use]
