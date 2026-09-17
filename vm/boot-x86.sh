@@ -125,6 +125,9 @@ OVMF_CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT}"
 OVMF_VARS_MASTER="${OVMF_VARS_MASTER:-$OVMF_DIR/OVMF_VARS-1920x1080.fd}"
 OPENCORE_MASTER="${OPENCORE_MASTER:-$DISKS_DIR/OpenCore.qcow2}"
 DISK_MASTER="${DISK_MASTER:-$DISKS_DIR/macos.img}"
+# Optional read-only Apple recovery/installer media. When set, it is attached
+# from the first boot, including bootstrap installs; unset preserves existing boots.
+INSTALL_MEDIA="${INSTALL_MEDIA:-}"
 
 RAM="${RAM:-16G}"
 CPU_SOCKETS="${CPU_SOCKETS:-1}"
@@ -199,7 +202,7 @@ Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
 Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
-     OPENCORE_MASTER DISK_MASTER RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
+     OPENCORE_MASTER DISK_MASTER INSTALL_MEDIA RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
      CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
      NET=user (SLIRP, default) | NET=none (no NIC)
@@ -532,6 +535,10 @@ QEMU_ARGS=(
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
   -drive "id=MacHDD,if=none,format=qcow2,file=$DISK"
   -device ide-hd,bus=sata.4,drive=MacHDD
+  ${INSTALL_MEDIA:+-drive}
+  ${INSTALL_MEDIA:+id=InstallMedia,if=none,format=raw,file=$INSTALL_MEDIA}
+  ${INSTALL_MEDIA:+-device}
+  ${INSTALL_MEDIA:+ide-hd,bus=sata.3,drive=InstallMedia}
   -qmp "unix:$QMP_SOCK,server=on,wait=off"
 )
 

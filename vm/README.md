@@ -105,3 +105,32 @@ Pathway-specific trees hold provisioned disks, rails, and per-boot clones. The r
 
 Stop a wedged guest with the pathway's shutdown helper when available
 (`scripts/vmapple-shutdown` on arm); otherwise use QMP quit plus a process kill.
+
+## macOS Tahoe installer with Reims from first boot
+
+The OSX-KVM tooling is integrated as the attributed submodule `third_party/OSX-KVM`
+(source: https://github.com/kholia/OSX-KVM, pinned to its recorded commit).
+Downloaded Apple recovery media and guest disks remain local and are ignored.
+
+Prepare the Tahoe recovery image outside Git:
+
+```bash
+OSX_KVM=$PWD/third_party/OSX-KVM
+TAHOE=/home/felipeab10/Documentos/macos/tahoe-installer
+python3 "$OSX_KVM/fetch-macOS-v2.py" --action download --shortname tahoe --os-type latest \
+  --outdir "$TAHOE" --basename Tahoe
+dmg2img -i "$TAHOE/Tahoe.dmg" "$TAHOE/Tahoe.img"
+qemu-img create -f qcow2 "$TAHOE/macos.img" 256G
+```
+
+Start the installer with the Reims PCI device already attached:
+
+```bash
+DISKS_DIR="$TAHOE" \
+DISK_MASTER="$TAHOE/macos.img" \
+OPENCORE_MASTER="$OSX_KVM/OpenCore/OpenCore.qcow2" \
+OVMF_VARS_MASTER="$OSX_KVM/OVMF_VARS-1920x1080.fd" \
+INSTALL_MEDIA="$TAHOE/Tahoe.img" \
+REIMS_VGPU_BACKEND=vulkan \
+./vm/boot-x86.sh --interactive --device reims-vgpu-pci --rail macos-26
+```
