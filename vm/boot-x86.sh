@@ -160,7 +160,8 @@ AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
 # notices.
 AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
 
-BOOT_CLASS="testing"          # testing | interactive | capture
+BOOT_CLASS="testing"          # testing | interactive | capture | persistent
+IS_PERSISTENT=0
 RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
 SNAPSHOT_LABEL=""             # empty = follow the rail's snapshots/current
 LIST_RAILS=0
@@ -176,7 +177,7 @@ GFX_DEVICE="reims-vgpu-pci"  # reims-vgpu-pci | vmware-svga
 
 usage() {
   cat <<EOF
-usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--capture]
+usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interactive|--capture|--persistent]
                       [--rail NAME] [--snapshot LABEL]
 
   --device NAME          primary VGA (default: reims-vgpu-pci)
@@ -186,6 +187,7 @@ usage: vm/boot-x86.sh [--device reims-vgpu-pci|vmware-svga] [--testing|--interac
                                             no GPU output once the guest uses Reims vGPU)
   --testing              agent boot (default): GUI, ${TESTING_TIMEOUT}s hard kill, reverts
   --interactive          human/GUI boot, no time limit, reverts
+  --persistent           boot dedicated writable storage directly; no clone, discard, or snapshot promotion
   --capture              boot writable; a clean guest shutdown CAPTURES a new snapshot
                          into the selected rail (also bootstraps an empty rail)
   --rail NAME            guest OS line to boot, e.g. --rail macos-11.
@@ -201,7 +203,7 @@ Both selections are per-boot and repoint no \`current\`. Layout:
 Change the default rail with:  ln -sfn <rail> $RAILS_DIR/current
 Always builds reims-vgpu-efi and reims-vgpu before boot. In-tree QEMU is rebuilt
 unless QEMU_BIN is set to something other than the default path.
-Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
+Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR PERSISTENT_DIR QEMU_BIN OVMF_CODE OVMF_VARS_MASTER
      OPENCORE_MASTER DISK_MASTER INSTALL_MEDIA RAM CPU_SOCKETS CPU_CORES CPU_THREADS CPU_MODEL
      CPU_OPTIONS SSH_PORT TESTING_TIMEOUT QMP_DUMP_TIMEOUT GUEST_MAC REIMS_VGPU_BACKEND
      (metal|vulkan for qemu-build)
@@ -241,6 +243,7 @@ while [ "$#" -gt 0 ]; do
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
     --capture) BOOT_CLASS="capture"; shift ;;
+    --persistent) BOOT_CLASS="persistent"; IS_PERSISTENT=1; shift ;;
     --rail) shift; RAIL_LABEL="${1:-}"; [ -n "$RAIL_LABEL" ] || { echo "boot-x86.sh: --rail needs a name" >&2; exit 64; }; shift ;;
     --rail=*) RAIL_LABEL="${1#--rail=}"; shift ;;
     # `--snapshot` carries two meanings, kept apart by whether a label follows.
@@ -314,7 +317,16 @@ available: $(list_rail_labels | tr '\n' ' ')
 (start a new guest line by creating the directory first:  mkdir -p $RAIL_DIR
  then bootstrap it with:  vm/boot-x86.sh --rail $RAIL_NAME --capture)"
 
-# --- Resolve the snapshot within that rail ---------------------------------------
+# --- Resolve persistent storage or the snapshot within that rail ------------------
+PERSISTENT_DIR="${PERSISTENT_DIR:-$RAIL_DIR/persistent}"
+if [ "$IS_PERSISTENT" -eq 1 ]; then
+  [ -d "$PERSISTENT_DIR" ] || die "persistent storage directory not found: $PERSISTENT_DIR (set PERSISTENT_DIR to a dedicated writable VM area)"
+  [ -f "$PERSISTENT_DIR/macos.qcow2" ] || die "persistent disk not found: $PERSISTENT_DIR/macos.qcow2"
+  [ -f "$PERSISTENT_DIR/OpenCore.qcow2" ] || die "persistent OpenCore not found: $PERSISTENT_DIR/OpenCore.qcow2"
+  [ -f "$PERSISTENT_DIR/OVMF_VARS.fd" ] || die "persistent OVMF_VARS not found: $PERSISTENT_DIR/OVMF_VARS.fd"
+  HAVE_SNAPSHOT=0
+  SNAPSHOT_NAME="(persistent)"
+else
 CURRENT="$SNAPSHOTS_DIR/current"
 if [ "$LIST_SNAPSHOTS" -eq 1 ]; then
   echo "rail '$RAIL_NAME' snapshots under $SNAPSHOTS_DIR (current -> $(readlink "$CURRENT" 2>/dev/null || echo '(unset)')):"
@@ -362,6 +374,7 @@ else
   if [ "$OVMF_CODE" = "$OVMF_CODE_DEFAULT" ] && [ -f "$SNAPSHOT_SRC/OVMF_CODE.fd" ]; then
     OVMF_CODE="$SNAPSHOT_SRC/OVMF_CODE.fd"
   fi
+fi
 fi
 [ -f "$OVMF_CODE" ] || die "OVMF_CODE not found: $OVMF_CODE"
 
@@ -451,7 +464,13 @@ if [ "$TRACE" = "1" ]; then
   fi
 fi
 
-if [ "$HAVE_SNAPSHOT" -eq 0 ]; then
+if [ "$IS_PERSISTENT" -eq 1 ]; then
+  DISK="$PERSISTENT_DIR/macos.qcow2"
+  OPENCORE="$PERSISTENT_DIR/OpenCore.qcow2"
+  OVMF_VARS="$PERSISTENT_DIR/OVMF_VARS.fd"
+  IS_CLONE=0
+  echo "boot-x86.sh: rail '$RAIL_NAME' — persistent storage $PERSISTENT_DIR (direct read/write) ..."
+elif [ "$HAVE_SNAPSHOT" -eq 0 ]; then
   DISK="$DISK_MASTER"
   OPENCORE="$OPENCORE_MASTER"
   OVMF_VARS="$OVMF_VARS_MASTER"
@@ -736,9 +755,14 @@ else
   REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
 fi
 
-if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
-  # gtk display + serial multiplexed with the monitor on stdio (Apple EB logs on console).
-  QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY" -serial mon:stdio)
+if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ] || [ "$BOOT_CLASS" = "persistent" ]; then
+  # Persistent keeps serial in the run log; existing modes retain mon:stdio.
+  QEMU_ARGS+=(-display "$REIMS_VGPU_DISPLAY")
+  if [ "$BOOT_CLASS" = "persistent" ]; then
+    QEMU_ARGS+=(-serial "file:$SERIAL_LOG")
+  else
+    QEMU_ARGS+=(-serial mon:stdio)
+  fi
   rc=0
   "$QEMU_BIN" "${QEMU_ARGS[@]}" || rc=$?
   if [ "$BOOT_CLASS" = "capture" ] && [ "$rc" -eq 0 ]; then
@@ -746,7 +770,14 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ]; then
     promote_to_snapshot
   else
     [ "$BOOT_CLASS" = "capture" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
-    discard_clone
+    if [ "$IS_PERSISTENT" -eq 0 ]; then
+      discard_clone
+    else
+      rm -f "$QMP_SOCK"
+      if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
+        rm -f "$RUN_DIR/qmp.sock"
+      fi
+    fi
   fi
   exit "$rc"
 fi
