@@ -121,6 +121,8 @@ REIMS_VGPU_EFI_ROM_SCRIPT="$REPO_ROOT/crates/reims-vgpu-efi/scripts/reims-vgpu-e
 # QEMU_BIN above, because `${VAR:-fallback}` cannot tell "set to the default"
 # from "not set" once it has run.
 OVMF_CODE_DEFAULT="$OVMF_DIR/OVMF_CODE_4M.fd"
+OVMF_CODE_EXPLICIT=0
+[ -n "${OVMF_CODE+x}" ] && OVMF_CODE_EXPLICIT=1
 OVMF_CODE="${OVMF_CODE:-$OVMF_CODE_DEFAULT}"
 OVMF_VARS_MASTER="${OVMF_VARS_MASTER:-$OVMF_DIR/OVMF_VARS-1920x1080.fd}"
 OPENCORE_MASTER="${OPENCORE_MASTER:-$DISKS_DIR/OpenCore.qcow2}"
@@ -161,7 +163,6 @@ AUDIO_BUFFER_US="${AUDIO_BUFFER_US:-46440}"
 AUDIO_USB_BUFFER="${AUDIO_USB_BUFFER:-65536}"
 
 BOOT_CLASS="testing"          # testing | interactive | capture | persistent
-IS_PERSISTENT=0
 RAIL_LABEL="${RAIL:-}"        # empty = follow rails/current; else a rail name
 SNAPSHOT_LABEL=""             # empty = follow the rail's snapshots/current
 LIST_RAILS=0
@@ -243,7 +244,7 @@ while [ "$#" -gt 0 ]; do
     --testing) BOOT_CLASS="testing"; shift ;;
     --interactive) BOOT_CLASS="interactive"; shift ;;
     --capture) BOOT_CLASS="capture"; shift ;;
-    --persistent) BOOT_CLASS="persistent"; IS_PERSISTENT=1; shift ;;
+    --persistent) BOOT_CLASS="persistent"; shift ;;
     --rail) shift; RAIL_LABEL="${1:-}"; [ -n "$RAIL_LABEL" ] || { echo "boot-x86.sh: --rail needs a name" >&2; exit 64; }; shift ;;
     --rail=*) RAIL_LABEL="${1#--rail=}"; shift ;;
     # `--snapshot` carries two meanings, kept apart by whether a label follows.
@@ -319,14 +320,6 @@ available: $(list_rail_labels | tr '\n' ' ')
 
 # --- Resolve persistent storage or the snapshot within that rail ------------------
 PERSISTENT_DIR="${PERSISTENT_DIR:-$RAIL_DIR/persistent}"
-if [ "$IS_PERSISTENT" -eq 1 ]; then
-  [ -d "$PERSISTENT_DIR" ] || die "persistent storage directory not found: $PERSISTENT_DIR (set PERSISTENT_DIR to a dedicated writable VM area)"
-  [ -f "$PERSISTENT_DIR/macos.qcow2" ] || die "persistent disk not found: $PERSISTENT_DIR/macos.qcow2"
-  [ -f "$PERSISTENT_DIR/OpenCore.qcow2" ] || die "persistent OpenCore not found: $PERSISTENT_DIR/OpenCore.qcow2"
-  [ -f "$PERSISTENT_DIR/OVMF_VARS.fd" ] || die "persistent OVMF_VARS not found: $PERSISTENT_DIR/OVMF_VARS.fd"
-  HAVE_SNAPSHOT=0
-  SNAPSHOT_NAME="(persistent)"
-else
 CURRENT="$SNAPSHOTS_DIR/current"
 if [ "$LIST_SNAPSHOTS" -eq 1 ]; then
   echo "rail '$RAIL_NAME' snapshots under $SNAPSHOTS_DIR (current -> $(readlink "$CURRENT" 2>/dev/null || echo '(unset)')):"
@@ -334,6 +327,22 @@ if [ "$LIST_SNAPSHOTS" -eq 1 ]; then
   exit 0
 fi
 
+if [ "$BOOT_CLASS" = "persistent" ]; then
+  [ -z "$SNAPSHOT_LABEL" ] || die "--snapshot cannot be used with --persistent"
+  [ -d "$PERSISTENT_DIR" ] || die "persistent storage directory not found: $PERSISTENT_DIR (set PERSISTENT_DIR to a dedicated writable VM area)"
+  [ -f "$PERSISTENT_DIR/macos.qcow2" ] || die "persistent disk not found: $PERSISTENT_DIR/macos.qcow2"
+  [ -f "$PERSISTENT_DIR/OpenCore.qcow2" ] || die "persistent OpenCore not found: $PERSISTENT_DIR/OpenCore.qcow2"
+  [ -f "$PERSISTENT_DIR/OVMF_VARS.fd" ] || die "persistent OVMF_VARS not found: $PERSISTENT_DIR/OVMF_VARS.fd"
+  [ -w "$PERSISTENT_DIR" ] || die "persistent storage directory is not writable: $PERSISTENT_DIR"
+  [ -w "$PERSISTENT_DIR/macos.qcow2" ] || die "persistent disk is not writable: $PERSISTENT_DIR/macos.qcow2"
+  [ -w "$PERSISTENT_DIR/OpenCore.qcow2" ] || die "persistent OpenCore is not writable: $PERSISTENT_DIR/OpenCore.qcow2"
+  [ -w "$PERSISTENT_DIR/OVMF_VARS.fd" ] || die "persistent OVMF_VARS is not writable: $PERSISTENT_DIR/OVMF_VARS.fd"
+  if [ "$OVMF_CODE_EXPLICIT" -eq 0 ] && [ -f "$PERSISTENT_DIR/OVMF_CODE.fd" ]; then
+    OVMF_CODE="$PERSISTENT_DIR/OVMF_CODE.fd"
+  fi
+  HAVE_SNAPSHOT=0
+  SNAPSHOT_NAME="(persistent)"
+else
 if [ -n "$SNAPSHOT_LABEL" ]; then
   require_plain_label --snapshot "$SNAPSHOT_LABEL"
   SNAPSHOT_SRC="$SNAPSHOTS_DIR/$SNAPSHOT_LABEL"
@@ -464,7 +473,7 @@ if [ "$TRACE" = "1" ]; then
   fi
 fi
 
-if [ "$IS_PERSISTENT" -eq 1 ]; then
+if [ "$BOOT_CLASS" = "persistent" ]; then
   DISK="$PERSISTENT_DIR/macos.qcow2"
   OPENCORE="$PERSISTENT_DIR/OpenCore.qcow2"
   OVMF_VARS="$PERSISTENT_DIR/OVMF_VARS.fd"
@@ -770,7 +779,7 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ] || [ "$BOO
     promote_to_snapshot
   else
     [ "$BOOT_CLASS" = "capture" ] && echo "boot-x86.sh: qemu exited rc=$rc (not clean) — snapshot NOT updated"
-    if [ "$IS_PERSISTENT" -eq 0 ]; then
+    if [ "$BOOT_CLASS" != "persistent" ]; then
       discard_clone
     else
       rm -f "$QMP_SOCK"
