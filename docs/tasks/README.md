@@ -18,22 +18,23 @@ Uma task só deve mudar para `[x]` após existir evidência de implementação e
 3. Após a implementação, revisar o diff e executar os critérios de aceitação da task.
 4. Somente depois atualizar este arquivo e o arquivo da task para `[x]`.
 5. Mudanças arquiteturais devem atualizar `docs/arquitetura.md` e/ou `docs/requisitos.md`.
+6. O implementador não deve marcar a própria task como concluída; a conclusão é feita na etapa de validação.
 
 ## Backlog 0.1.0
 
 ### Fundação
 
-- [ ] T001 — Implementar modo persistente no launcher
-- [ ] T002 — Simplificar o VM Manager para fluxo de appliance
-- [ ] T003 — Implementar fullscreen nativo obrigatório
-- [ ] T004 — Criar modelo de estado persistente do appliance
+- [ ] [T001 — Implementar modo persistente no launcher](T001-persistent-mode.md)
+- [ ] [T002 — Simplificar o VM Manager para fluxo de appliance](T002-vm-manager-appliance.md)
+- [ ] [T003 — Implementar fullscreen nativo obrigatório](T003-fullscreen.md)
+- [ ] [T004 — Criar modelo de estado persistente do appliance](T004-state-model.md)
 
 ### Lifecycle
 
-- [ ] T005 — Criar supervisor QMP/serial/QEMU
-- [ ] T006 — Shutdown do macOS desliga o host
-- [ ] T007 — Restart do macOS reinicia o host
-- [ ] T008 — Diferenciar shutdown/reboot normal de crash/kernel panic
+- [ ] [T005 — Criar supervisor QMP/serial/QEMU](T005-supervisor.md)
+- [ ] [T006 — Shutdown do macOS desliga o host](T006-host-poweroff.md)
+- [ ] [T007 — Restart do macOS reinicia o host](T007-host-reboot.md)
+- [ ] [T008 — Diferenciar shutdown/reboot normal de crash/kernel panic](T008-lifecycle-classification.md)
 
 ### Inicialização automática
 
@@ -98,3 +99,26 @@ T001 → T002 → T003 → T004
 ```
 
 Não iniciar a construção final da ISO antes de o modo persistente, o VM Manager simplificado, fullscreen e lifecycle estarem funcionais em um host de desenvolvimento conhecido.
+
+## Protocolo de handoff para implementação
+
+Antes de implementar qualquer task, o implementador deve ler:
+
+```text
+docs/arquitetura.md
+docs/requisitos.md
+docs/tasks/README.md
+docs/tasks/TXXX-....md
+```
+
+Ao terminar, deve entregar sem marcar `[x]`:
+
+- ID da task;
+- commit/PR;
+- arquivos alterados;
+- decisões de implementação;
+- comandos de teste;
+- resultados;
+- pendências ou desvios de arquitetura.
+
+A validação da task revisa o diff e os critérios de aceitação antes de atualizar o status.
