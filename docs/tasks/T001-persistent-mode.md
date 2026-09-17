@@ -1,6 +1,6 @@
 # T001 — Implementar modo persistente no launcher
 
-Status: `[ ]` não iniciada
+Status: `[-]` em andamento — implementação publicada, revisão solicitou ajustes
 
 ## Objetivo
 
@@ -85,6 +85,84 @@ Registrar nesta task:
 - paths dos discos usados no teste;
 - confirmação de persistência após shutdown e reboot.
 
+## Implementação em revisão
+
+Branch:
+
+```text
+feat/t001-persistent-mode
+```
+
+Commit inicial:
+
+```text
+311435ce873666f01284cd36b94ad182b58b819a
+```
+
+Arquivo alterado:
+
+```text
+vm/boot-x86.sh
+```
+
+A implementação adicionou `--persistent`, `PERSISTENT_DIR`, resolução direta de `macos.qcow2`, `OpenCore.qcow2` e `OVMF_VARS.fd`, serial em arquivo e preservação do QMP.
+
+### Revisão 1 — CHANGES_REQUESTED
+
+O commit ainda não pode ser validado como concluído.
+
+#### Bloqueador: estado duplicado `BOOT_CLASS` x `IS_PERSISTENT`
+
+`--persistent` define simultaneamente:
+
+```text
+BOOT_CLASS=persistent
+IS_PERSISTENT=1
+```
+
+mas `--testing`, `--interactive`, `--capture` e o `--snapshot` sem label alteram `BOOT_CLASS` sem necessariamente limpar `IS_PERSISTENT`.
+
+Isso quebra a semântica de “última classe informada vence” e pode misturar modos. Exemplos:
+
+```text
+--persistent --interactive
+```
+
+pode terminar com `BOOT_CLASS=interactive` usando storage persistente write-through.
+
+```text
+--persistent --capture
+```
+
+pode usar storage persistente e depois entrar no caminho de promoção de snapshot; `CURRENT` nem é resolvido no ramo persistente.
+
+A correção preferida é ter uma única fonte de verdade para a classe de boot, derivando o comportamento persistente de `BOOT_CLASS=persistent` em vez de manter `IS_PERSISTENT` independente.
+
+#### Ajuste recomendado: combinações inválidas
+
+`--persistent` com `--snapshot LABEL` não deve ignorar silenciosamente o snapshot. Rejeitar a combinação ou definir semântica explícita.
+
+`--list-snapshots` deve continuar sendo uma ação de listagem e nunca iniciar uma VM apenas porque `--persistent` também foi informado.
+
+#### Ajuste recomendado: writability
+
+Além de verificar existência, o preflight do persistent deve verificar que a área e os arquivos que precisam ser graváveis realmente são graváveis pelo usuário que executará QEMU.
+
+#### Ajuste recomendado: par OVMF
+
+O fluxo de snapshots já preserva a relação entre `OVMF_VARS.fd` e um `OVMF_CODE.fd` específico. O modo persistente deve preservar essa propriedade, preferencialmente aceitando `PERSISTENT_DIR/OVMF_CODE.fd` quando presente, sem sobrepor um `OVMF_CODE` explicitamente fornecido pelo ambiente.
+
+### Validação funcional pendente
+
+Ainda não houve boot runtime em guest descartável para provar:
+
+- persistência após shutdown;
+- persistência após reboot;
+- reutilização dos mesmos discos persistentes.
+
+Até essa validação existir, T001 não pode mudar para `[x]`.
+
 ## Histórico
 
-Nenhuma implementação validada ainda.
+- 2026-09-17 — implementação inicial publicada em `311435ce873666f01284cd36b94ad182b58b819a`.
+- 2026-09-17 — revisão estática: `CHANGES_REQUESTED`; task permanece `[-]`.
