@@ -32,7 +32,10 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 - iniciar Reims automaticamente após o provisionamento;
 - integrar com o modo persistente criado em T001;
 - durante a instalação, iniciar o launcher com política de reboot que mantenha o mesmo processo QEMU/janela vivo entre os reboots normais do instalador (equivalente a `QEMU_REBOOT_ACTION=reset`);
-- impedir sobrescrita acidental de uma instalação existente.
+- impedir sobrescrita acidental de uma instalação existente;
+- gerar um `OpenCore.qcow2` realmente personalizado para a VM, contendo o `EFI/OC/config.plist` gerado para aquela identidade;
+- configurar OpenCore para permitir seleção padrão persistente e boot automático do sistema instalado;
+- preservar a flexibilidade necessária aos estágios intermediários `Recovery`, `macOS Installer` e Preboot durante a instalação.
 
 ## Fora de escopo
 
@@ -62,6 +65,12 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 14. Não remover capacidades de desenvolvimento necessárias aos testes do repositório sem justificar e documentar.
 15. Enquanto a instalação estiver em andamento, reboots normais do guest não podem fechar a janela/QEMU nem exigir relançamento manual; o fluxo deve continuar automaticamente no mesmo storage persistente.
 16. A política de reboot da fase de instalação não deve ser confundida com a política pós-instalação de T007.
+17. O `config.plist` gerado deve ser gravado dentro da partição EFI do `OpenCore.qcow2` dedicado; um plist externo/orfão não satisfaz o requisito.
+18. A imagem OpenCore final deve ser validada por inspeção read-only, comprovando pelo menos `EFI/BOOT/BOOTX64.EFI`, `EFI/OC/OpenCore.efi` e `EFI/OC/config.plist`.
+19. O config final deve habilitar `Misc.Security.AllowSetDefault=true` e preservar `UEFI.Quirks.RequestBootVarRouting=true` quando disponível na base.
+20. Durante `installing`, a configuração não pode forçar permanentemente o volume final e impedir os boots temporários do instalador.
+21. Depois que a instalação for marcada `installed`, o próximo boot deve selecionar automaticamente o volume macOS principal sem exigir interação do usuário.
+22. O picker/recovery deve continuar acessível por mecanismo de recuperação documentado, mesmo com autoboot normal.
 
 ## Critérios de aceitação
 
@@ -83,7 +92,10 @@ Executar com diretórios temporários/dedicados sempre que possível e provar qu
 5. versão selecionada corresponde ao artefato baixado/preparado;
 6. ao final o launcher é chamado automaticamente com `reims-vgpu-pci` e modo persistente;
 7. uma segunda execução não sobrescreve silenciosamente a primeira instalação;
-8. um reboot do instalador mantém o mesmo QEMU/sessão ativo e continua usando os mesmos discos persistentes, sem intervenção manual do usuário.
+8. um reboot do instalador mantém o mesmo QEMU/sessão ativo e continua usando os mesmos discos persistentes, sem intervenção manual do usuário;
+9. a inspeção read-only do `OpenCore.qcow2` comprova que o `config.plist` personalizado está realmente dentro da imagem;
+10. após instalação concluída, rebootar a VM sem interação no picker inicia o volume macOS instalado automaticamente;
+11. Recovery/picker continua acessível pelo mecanismo de recuperação escolhido.
 
 ### Segurança
 
