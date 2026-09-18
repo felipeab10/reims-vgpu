@@ -1,6 +1,6 @@
 # T001 — Implementar modo persistente no launcher
 
-Status: `[!]` bloqueada — implementação aprovada; validação runtime bloqueada no UEFI Interactive Shell
+Status: `[-]` em andamento — implementação aprovada; instalação Sequoia em progresso para validação runtime
 
 ## Objetivo
 
@@ -256,23 +256,24 @@ Somente após essa evidência T001 pode mudar para `[x]`.
 
 
 
-### Tentativa runtime 2 — BLOCKED NO UEFI INTERACTIVE SHELL
+### Tentativa runtime 2 — CORREÇÃO DE CLASSIFICAÇÃO
 
 A mesma fixture foi reutilizada sem recriar ou regenerar artefatos.
 
-Boot observado:
+O estado visual inicialmente classificado como `UEFI Interactive Shell` foi corrigido após revisão. Tratava-se do boot verbose do macOS Recovery.
+
+Evidência confirmada:
 
 ```text
-BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00017"
+#[EB|LOG:EXITBS:END]
+#[EB.BST.FBS|-]
+#[EB|B:BOOT]
+#[EB|LOG:HANDOFF TO XNU]
 ```
 
-Estado visual final:
+Isso comprova que a cadeia firmware/OpenCore chegou ao handoff para o kernel XNU do ambiente de Recovery. Portanto, não há evidência de falha no UEFI/OpenCore nessa rodada.
 
-```text
-UEFI Interactive Shell
-```
-
-Resultado:
+Resultado corrigido:
 
 ```text
 INSTALL_RESULT=PARTIAL
@@ -283,17 +284,27 @@ STORAGE_REUSED=yes
 QMP=PASS
 SERIAL=PASS
 SNAPSHOT_SAFETY=PASS
+MANUAL_OPENCORE_BOOT=PASS
+INSTALL_MEDIA_AB=PASS
 ```
 
-O bloqueio atual é de boot da fixture persistente, não uma evidência de falha de persistência. Antes de alterar código ou regenerar OpenCore/OVMF, deve-se determinar:
+Interpretação do A/B de `INSTALL_MEDIA`:
 
-1. para qual dispositivo/caminho EFI `Boot0002` aponta;
-2. se o `OpenCore.qcow2` persistente ainda contém e expõe o bootloader EFI esperado;
-3. se o boot retomado anexou a mesma mídia de instalação usada nos boots anteriores;
-4. se iniciar manualmente o OpenCore a partir do UEFI Shell permite continuar a instalação;
-5. se o `OVMF_VARS.fd` persistente alterou `BootOrder` durante a instalação.
+- com a mídia anexada, o OpenCore exibiu/permitiu o caminho de Recovery/installer;
+- isso prova que esse caminho de instalação permanece utilizável;
+- não prova que a ausência da mídia tenha causado o estado anteriormente observado, porque o screenshot havia sido classificado incorretamente.
 
-Não regenerar a fixture até concluir esse diagnóstico.
+A classificação operacional correta para T001 volta a ser: instalação Sequoia ainda incompleta; continuar a mesma fixture até Setup Assistant/desktop.
+
+Evidências adicionais:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/uefi-recovery-diagnosis.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/install-media-ab-after-select.png
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/serial-20260918-124748.log
+```
+
+Nenhum código, disco persistente, OpenCore, OVMF ou snapshot foi alterado durante o diagnóstico.
 
 ## Histórico
 
@@ -303,4 +314,4 @@ Não regenerar a fixture até concluir esse diagnóstico.
 - 2026-09-18 — revisão 2: `APPROVED_PENDING_RUNTIME_VALIDATION`.
 - 2026-09-18 — QEMU customizado reconstruído e sanity checks concluídos; ambiente pronto para fixture Sequoia.
 - 2026-09-18 — tentativa runtime 1: instalação Sequoia parcial, storage reutilizado, QMP/serial/snapshot safety PASS; validação de shutdown/reboot bloqueada antes do Setup Assistant.
-- 2026-09-18 — tentativa runtime 2: mesma fixture caiu no UEFI Interactive Shell após `Boot0002`; T001 marcada como bloqueada até diagnóstico da cadeia de boot.
+- 2026-09-18 — tentativa runtime 2 inicialmente classificada como UEFI Shell foi corrigida: era macOS Recovery em verbose com handoff para XNU. T001 voltou a `[-]`; instalação deve continuar na mesma fixture.
