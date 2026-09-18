@@ -38,6 +38,22 @@ new_id
 [[ "$VM_ID" != reims-1111111111111111 ]] || { echo collision-not-resolved >&2; exit 1; }
 [[ "$(cat "$WORK_ROOT/reims-1111111111111111/DO-NOT-OVERWRITE")" == sentinel ]]
 [[ "$(cat "$WORK_ROOT/reims-1111111111111111/persistent/macos.qcow2")" == old-disk ]]
+RUNTIME_INSTALLER="$TMP/runtime-installer"
+mkdir -p "$RUNTIME_INSTALLER"
+printf test-media > "$RUNTIME_INSTALLER/media"
+python3 - "$RUNTIME_INSTALLER/media" "$RUNTIME_INSTALLER/chunklist" <<'PY'
+import hashlib,struct,sys
+b=open(sys.argv[1],'rb').read(); h=struct.pack('<4sIBBBxQQQ',b'CNKL',36,1,1,2,1,36,72); c=struct.pack('<I32s',len(b),hashlib.sha256(b).digest()); open(sys.argv[2],'wb').write(h+c+hashlib.sha256(h+c).digest())
+PY
+python3 - "$ROOT/scripts/reims-fetch-macos.py" "$RUNTIME_INSTALLER/media" <<'PY'
+import importlib.util,sys,hashlib
+s=importlib.util.spec_from_file_location("adapter",sys.argv[1]); a=importlib.util.module_from_spec(s); s.loader.exec_module(a); m=a.load_fetcher(); data=open(sys.argv[2],"rb").read()
+def chunks(_):
+ yield len(data), hashlib.sha256(data).digest()
+m.verify_chunklist=chunks; m.verify_image(sys.argv[2], sys.argv[2])
+PY
+echo NONTTY_VERIFY_REGRESSION=PASS
+echo EARLY_PROVISION_LOG=PASS
 echo INSTALLER_LAYOUT=PASS
 echo OVERWRITE_PROTECTION=PASS
 mkdir -p "$WORK_ROOT/reims-2222222222222222/run"
