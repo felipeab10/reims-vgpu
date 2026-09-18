@@ -35,7 +35,8 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 - impedir sobrescrita acidental de uma instalação existente;
 - gerar um `OpenCore.qcow2` realmente personalizado para a VM, contendo o `EFI/OC/config.plist` gerado para aquela identidade;
 - configurar OpenCore para permitir seleção padrão persistente e boot automático do sistema instalado;
-- preservar a flexibilidade necessária aos estágios intermediários `Recovery`, `macOS Installer` e Preboot durante a instalação.
+- preservar a flexibilidade necessária aos estágios intermediários `Recovery`, `macOS Installer` e Preboot durante a instalação;
+- estruturar o provisionamento em etapas observáveis, emitindo progresso/estado consumível pela futura UI sem expor logs técnicos ao usuário.
 
 ## Fora de escopo
 
@@ -71,6 +72,9 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 20. Durante `installing`, a configuração não pode forçar permanentemente o volume final e impedir os boots temporários do instalador.
 21. Depois que a instalação for marcada `installed`, o próximo boot deve selecionar automaticamente o volume macOS principal sem exigir interação do usuário.
 22. O picker/recovery deve continuar acessível por mecanismo de recuperação documentado, mesmo com autoboot normal.
+23. Operações longas do manager devem possuir fases identificáveis e emitir estado estruturado suficiente para exibir etapa atual e tempo decorrido.
+24. Percentual só deve ser emitido quando houver métrica real. Processos como build sem progresso quantificável devem suportar estado indeterminado.
+25. Logs detalhados devem permanecer separados da saída amigável/estruturada de progresso.
 
 ## Critérios de aceitação
 
