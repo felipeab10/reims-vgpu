@@ -66,7 +66,39 @@ Deve:
 - criar OpenCore próprio;
 - criar OVMF_VARS persistente;
 - iniciar automaticamente com `reims-vgpu-pci`;
-- entrar em fullscreen automaticamente.
+- entrar em fullscreen automaticamente;
+- durante a instalação, permitir que OpenCore encontre as entradas temporárias do instalador e continue os reboots sem intervenção;
+- após a instalação estar utilizável, iniciar automaticamente o volume macOS instalado como entrada padrão do OpenCore, sem exigir seleção manual a cada boot;
+- manter uma forma de acessar o picker/Recovery para recuperação, mesmo quando o boot normal for automático.
+
+### 4.1 Contrato OpenCore
+
+Cada VM deve possuir seu próprio `OpenCore.qcow2` e seu próprio `config.plist` efetivamente instalado dentro da partição EFI dessa imagem.
+
+Não basta gerar um `config.plist` fora do qcow2: a validação deve montar/inspecionar a imagem final e comprovar que `EFI/OC/config.plist` contém a identidade e as opções esperadas.
+
+O contrato mínimo para a 0.1.0 inclui:
+
+- enumeração das partições APFS/macOS pelo OpenCore;
+- `Misc -> Security -> AllowSetDefault = true`;
+- `UEFI -> Quirks -> RequestBootVarRouting = true` quando suportado pela configuração base utilizada;
+- política de scan que permita localizar os volumes macOS necessários;
+- timeout de boot automático;
+- durante `installing`, não fixar prematuramente o volume final de modo a impedir os estágios `macOS Installer`/Preboot;
+- após `installed`, o volume principal macOS deve ser a seleção padrão persistente.
+
+O objetivo de produto é:
+
+```text
+instalação
+→ OpenCore pode alternar entre Recovery / macOS Installer / Preboot
+
+instalação concluída
+→ OpenCore reconhece o macOS instalado
+→ seleção padrão persistida
+→ timeout
+→ macOS inicia automaticamente
+```
 
 ## 5. Persistência
 
