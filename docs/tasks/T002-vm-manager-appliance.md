@@ -31,6 +31,7 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 - reaproveitar download do OSX-KVM, chunklist, `dmg2img`, `qemu-img` e geração de identidade/OpenCore existentes;
 - iniciar Reims automaticamente após o provisionamento;
 - integrar com o modo persistente criado em T001;
+- durante a instalação, iniciar o launcher com política de reboot que mantenha o mesmo processo QEMU/janela vivo entre os reboots normais do instalador (equivalente a `QEMU_REBOOT_ACTION=reset`);
 - impedir sobrescrita acidental de uma instalação existente.
 
 ## Fora de escopo
@@ -59,6 +60,8 @@ Ao terminar a preparação, o macOS deve iniciar automaticamente com `reims-vgpu
 12. O provisionamento não pode modificar a imagem OpenCore compartilhada do projeto.
 13. Um erro deve encerrar com mensagem clara e sem deixar uma instalação marcada como pronta.
 14. Não remover capacidades de desenvolvimento necessárias aos testes do repositório sem justificar e documentar.
+15. Enquanto a instalação estiver em andamento, reboots normais do guest não podem fechar a janela/QEMU nem exigir relançamento manual; o fluxo deve continuar automaticamente no mesmo storage persistente.
+16. A política de reboot da fase de instalação não deve ser confundida com a política pós-instalação de T007.
 
 ## Critérios de aceitação
 
@@ -79,7 +82,8 @@ Executar com diretórios temporários/dedicados sempre que possível e provar qu
 4. disco recebeu o tamanho solicitado;
 5. versão selecionada corresponde ao artefato baixado/preparado;
 6. ao final o launcher é chamado automaticamente com `reims-vgpu-pci` e modo persistente;
-7. uma segunda execução não sobrescreve silenciosamente a primeira instalação.
+7. uma segunda execução não sobrescreve silenciosamente a primeira instalação;
+8. um reboot do instalador mantém o mesmo QEMU/sessão ativo e continua usando os mesmos discos persistentes, sem intervenção manual do usuário.
 
 ### Segurança
 
