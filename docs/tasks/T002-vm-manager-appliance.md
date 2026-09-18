@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[ ]` não iniciada
+Status: `[-]` em andamento — implementação parcial; validação da imagem OpenCore pendente
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -116,6 +116,54 @@ Registrar nesta task:
 - saída resumida dos testes;
 - prova de que o launcher final usa `reims-vgpu-pci` e persistência;
 - confirmação de que uma instalação existente não foi sobrescrita.
+
+## Implementação parcial em validação
+
+Branch local:
+
+```text
+feat/t002-vm-manager-appliance
+```
+
+HEAD reportado:
+
+```text
+81183c22f35b958045d7eb8fc69a861888d12cc4
+```
+
+Commits reportados:
+
+```text
+df4a3397 feat(appliance): simplify VM manager flow [T002]
+c4bcd075 fix(appliance): stage OpenCore builder per VM
+ff2cb676 fix(appliance): stage OpenCore sources outside builder workdir
+81183c22 fix(appliance): copy staged OpenCore EFI into image
+```
+
+Arquivos alterados:
+
+```text
+scripts/reims-vm-manager.sh
+tests/t002-vm-manager.sh
+```
+
+Resultados já reportados:
+
+```text
+STATIC_TESTS=PASS
+CONTROLLED_TESTS=PASS
+LAUNCHER_TEST=PASS
+OPENCORE_IMAGE_TEST=PENDING
+RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_AUTOBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_RECOVERY=PENDING_RUNTIME_VALIDATION
+```
+
+O fluxo reportado já contém wizard reduzido, ID automático, storage persistente, launch com `--persistent --device reims-vgpu-pci` e `QEMU_REBOOT_ACTION=reset`.
+
+A T002 não pode ser aprovada ainda. Antes da validação runtime é obrigatório gerar uma imagem OpenCore descartável e comprovar, por inspeção read-only, que a imagem final contém `EFI/BOOT/BOOTX64.EFI`, `EFI/OC/OpenCore.efi` e o `EFI/OC/config.plist` personalizado com os campos exigidos.
+
+Também deve ser reconciliado o path efetivo da mídia de instalação: o layout reportado lista `<vm>/<version>.img`, enquanto a chamada de launch reportada usa `<vm>/installer/<version>.img`. O código e os testes devem usar um contrato único.
 
 ## Histórico
 
