@@ -307,6 +307,27 @@ A criação de um disco virtual de 70 GiB em qcow2 não exige necessariamente 70
 
 Antes de repetir o runtime, fazer auditoria read-only de uso de disco, liberar espaço suficiente ou disponibilizar mídia/caching seguro fora da fixture T001. Não apagar nem reutilizar destrutivamente evidências T001/T002.
 
+## Storage preflight runtime
+
+A auditoria read-only do host encontrou:
+
+```text
+filesystem=/home (btrfs)
+free=22.5 GiB
+T001 fixture≈37 GiB
+T002 OpenCore fixture≈175 MiB
+Sequoia.img≈3.0 GiB
+T001 macos.qcow2: 80 GiB virtual / ≈32.3 GiB atual
+recommended_free≈48 GiB
+deficit≈25.5 GiB
+```
+
+A maior oportunidade aparente está em `/home/felipeab10/Documentos/macos/reims-vgpu/vm/disks/run/*.img`, com quatro imagens reportadas em ≈39.8 GiB cada. Essas imagens são classificadas como evidência/dados de projeto e não devem ser removidas sem provar que são clones de execução descartáveis e que nenhum processo/rail/snapshot depende delas.
+
+Como `/home` é Btrfs, decisões de limpeza não devem usar apenas `du`: antes de remover uma imagem grande é necessário medir extents compartilhados/exclusivos com `btrfs filesystem du`. O teste de reflink reportado em `/tmp` não comprova suporte ou ausência de reflink no filesystem `/home`; qualquer teste deve ser feito em um diretório temporário descartável dentro de `/home`.
+
+A próxima ação é uma validação segura dos arquivos em `vm/disks/run`, sem remover nada automaticamente. Uma única imagem realmente exclusiva e descartável pode ser suficiente para eliminar o déficit de runtime.
+
 ## Histórico
 
 Nenhuma implementação validada ainda.
