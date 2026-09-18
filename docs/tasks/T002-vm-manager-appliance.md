@@ -165,6 +165,16 @@ A T002 não pode ser aprovada ainda. Antes da validação runtime é obrigatóri
 
 Também deve ser reconciliado o path efetivo da mídia de instalação: o layout reportado lista `<vm>/<version>.img`, enquanto a chamada de launch reportada usa `<vm>/installer/<version>.img`. O código e os testes devem usar um contrato único.
 
+### Builder OpenCore — diagnóstico complementar
+
+A validação controlada chegou a `guestfish 1.60.1` e `libguestfs-test-tool=PASS`, portanto o bloqueio não deve ser atribuído genericamente ao libguestfs.
+
+Foi identificado no upstream `osx-serial-generator` que o fluxo nativo de criação de bootdisk usado por `generate-unique-machine-values.sh` chama `opencore-image-ng.sh` quando `--create-bootdisks`/`--output-bootdisk` é usado. Esse builder usa um diretório temporário próprio e espera, ao lado do script, a árvore `EFI` e `resources/OcBinaryData/Resources`, além de `startup.nsh` no diretório de execução.
+
+A variante `opencore-image-ng-linux.sh` usa contrato `.fish` diferente e está introduzindo complexidade adicional no staging atual. Antes de adicionar novos workarounds, T002 deve validar o uso do builder padrão `opencore-image-ng.sh` (ou o fluxo nativo `--output-bootdisk`) em staging privado por VM, mantendo a imagem compartilhada intacta.
+
+O objetivo continua sendo gerar uma imagem dedicada e então executar `qemu-img check` + inspeção read-only de `EFI/BOOT/BOOTX64.EFI`, `EFI/OC/OpenCore.efi` e `EFI/OC/config.plist`.
+
 ## Histórico
 
 Nenhuma implementação validada ainda.
