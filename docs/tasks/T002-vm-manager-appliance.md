@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[-]` em andamento — validação estática/controlada concluída; pronta para runtime
+Status: `[!]` bloqueada em runtime por espaço/fixture — validação estática/controlada concluída
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -275,6 +275,37 @@ RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
 RUNTIME_AUTOBOOT=PENDING_RUNTIME_VALIDATION
 RUNTIME_RECOVERY=PENDING_RUNTIME_VALIDATION
 ```
+
+## Runtime T002 — bloqueio de ambiente
+
+A primeira tentativa de validação runtime não iniciou o provisionamento.
+
+Estado reportado:
+
+```text
+branch: feat/t002-vm-manager-appliance
+HEAD: d9791ee4fb56f15139a02d003c3f5f16474de0de
+RUNTIME_INSTALL_REBOOT=NOT_RUN
+RUNTIME_AUTOBOOT=NOT_RUN
+RUNTIME_RECOVERY=NOT_RUN
+SNAPSHOT_SAFETY=PASS
+FAILURE_CLASSIFICATION=ENVIRONMENT
+```
+
+Pré-condições do host:
+
+```text
+DISPLAY=:1
+WAYLAND_DISPLAY=wayland-1
+/dev/kvm=available
+filesystem: 23G livres, 94% utilizado
+```
+
+Nenhuma nova fixture/runtime foi criada e as fixtures T001/T002 existentes permaneceram intactas.
+
+A criação de um disco virtual de 70 GiB em qcow2 não exige necessariamente 70 GiB físicos livres no momento da criação, pois a imagem pode ser sparse. Porém o fluxo completo mantém artefatos de installer e produz gravações significativas no qcow2 durante a instalação; com apenas ~23 GiB livres a validação completa foi considerada insegura.
+
+Antes de repetir o runtime, fazer auditoria read-only de uso de disco, liberar espaço suficiente ou disponibilizar mídia/caching seguro fora da fixture T001. Não apagar nem reutilizar destrutivamente evidências T001/T002.
 
 ## Histórico
 
