@@ -328,6 +328,29 @@ Como `/home` é Btrfs, decisões de limpeza não devem usar apenas `du`: antes d
 
 A próxima ação é uma validação segura dos arquivos em `vm/disks/run`, sem remover nada automaticamente. Uma única imagem realmente exclusiva e descartável pode ser suficiente para eliminar o déficit de runtime.
 
+## Runtime T002 — falha de chunklist em stdout sem TTY
+
+A retomada runtime chegou ao fluxo real de download do Sequoia e falhou na verificação chunklist antes de conversão/criação de discos.
+
+Resultado reportado:
+
+```text
+VM_ID=reims-564a0707b2fc464d
+STORAGE_PREFLIGHT=PASS
+WIZARD_UI=PASS
+VM_ID_GENERATION=PASS
+QEMU_BIN=PASS
+FAILURE_CLASSIFICATION=CODE_BUG
+
+Image verification failed. ([Errno 25] Inappropriate ioctl for device)
+```
+
+A inspeção do `fetch-macOS-v2.py` upstream mostra assimetria relevante: o caminho de download protege `os.get_terminal_size()` com fallback para 80 colunas quando stdout não é TTY, enquanto `verify_image()` chama `os.get_terminal_size()` diretamente, sem `try/except`. Em execução headless/redirecionada isso pode gerar `ENOTTY` (`Errno 25`) antes da validação dos chunks.
+
+Antes de alterar o produto, a versão pinada local deve ser inspecionada e a hipótese reproduzida contra os `.dmg/.chunklist` já baixados na fixture runtime. A correção do Reims OS não deve depender de stdout ser um terminal interativo e não deve modificar silenciosamente o submodule upstream.
+
+A fixture parcial deve ser preservada para reuso da mídia no diagnóstico, evitando novo download enquanto a integridade não tiver sido determinada.
+
 ## Histórico
 
 Nenhuma implementação validada ainda.
