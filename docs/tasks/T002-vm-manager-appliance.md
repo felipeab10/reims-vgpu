@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[-]` em andamento — implementação parcial; validação da imagem OpenCore pendente
+Status: `[-]` em andamento — validação estática/controlada concluída; pronta para runtime
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -234,6 +234,41 @@ A inspeção final foi read-only via `guestfish --ro`, com descoberta de partiç
 A pendência estática remanescente é pequena: a fase `build_opencore` já emite `running` e `completed`, porém `failed` ainda não é garantido em todos os caminhos de erro do builder. Antes do runtime completo, fechar esse contrato e garantir que stdout/stderr técnico do builder possa ser capturado em log separado da saída amigável.
 
 Pendências runtime continuam:
+
+```text
+RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_AUTOBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_RECOVERY=PENDING_RUNTIME_VALIDATION
+```
+
+## Contrato de progresso — READY_FOR_RUNTIME
+
+Implementação reportada em:
+
+```text
+branch: feat/t002-vm-manager-appliance
+HEAD: d9791ee4
+commit: d9791ee4 feat(appliance): complete provisioning progress contract [T002]
+```
+
+Resultados:
+
+```text
+PROGRESS_OPENCORE_RUNNING=PASS
+PROGRESS_OPENCORE_COMPLETED=PASS
+PROGRESS_OPENCORE_FAILED=PASS
+PROGRESS_OPENCORE_SUCCESS=PASS
+PROGRESS_OPENCORE_FAILURE=PASS
+TECHNICAL_LOG_CAPTURE=PASS
+FRIENDLY_ERROR=PASS
+STATIC_TESTS=PASS
+CONTROLLED_TESTS=PASS
+OPENCORE_NON_REGRESSION=PASS
+```
+
+A fase `build_opencore` permanece corretamente indeterminada, sem percentual artificial. O output técnico do builder é capturado em `<vm>/run/provision.log`, enquanto a saída amigável é separada.
+
+Com isso, as pendências estáticas/controladas da T002 estão fechadas. Restam apenas os critérios runtime:
 
 ```text
 RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
