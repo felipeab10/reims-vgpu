@@ -205,7 +205,36 @@ Não faz parte do primeiro release remover completamente Wayland/compositor e ap
 
 Um supervisor do appliance será responsável por observar QMP, serial e o processo QEMU.
 
-### 8.1 Shutdown normal do macOS
+### 8.1 Política de reboot por fase
+
+O appliance possui fases distintas e o mesmo evento de reboot do guest não pode produzir a mesma ação em todas elas.
+
+Durante `installing`, reinicializações do macOS são parte normal do instalador. O QEMU deve permanecer ativo e resetar o guest no mesmo processo/janela, preservando os mesmos discos persistentes. O caminho esperado é usar a política equivalente a:
+
+```text
+QEMU_REBOOT_ACTION=reset
+```
+
+Nessa fase, um reboot do guest **não** deve reiniciar o host Linux e não deve exigir relançamento manual da VM.
+
+Depois que o estado for `installed`, um Restart solicitado pelo macOS passa a ser um evento de lifecycle do appliance. O supervisor deve distinguir reboot normal de kernel panic/crash e somente então T007 poderá reiniciar o host Linux.
+
+Portanto:
+
+```text
+state=installing + guest reboot
+→ QEMU permanece vivo
+→ guest reseta
+→ instalação continua
+
+state=installed + GUEST_REBOOT confirmado
+→ supervisor persiste logs
+→ host Linux reinicia
+```
+
+O fechamento da janela/QEMU durante cada reboot do instalador não faz parte da experiência final esperada.
+
+### 8.2 Shutdown normal do macOS
 
 ```text
 macOS solicita shutdown
@@ -217,7 +246,7 @@ QEMU termina limpo
 systemctl poweroff
 ```
 
-### 8.2 Restart normal do macOS
+### 8.3 Restart normal do macOS
 
 ```text
 macOS solicita restart
@@ -229,7 +258,7 @@ supervisor finaliza a sessão
 systemctl reboot
 ```
 
-### 8.3 Falha não deve desligar/reiniciar o host automaticamente
+### 8.4 Falha não deve desligar/reiniciar o host automaticamente
 
 Os seguintes eventos não podem ser tratados como reboot/shutdown normal:
 
