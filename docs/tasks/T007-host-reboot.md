@@ -6,11 +6,11 @@ Dependência: **T005** concluída e validada.
 
 ## Objetivo
 
-Quando o supervisor comprovar que o macOS solicitou um reboot normal, o host Linux deve reiniciar de forma limpa e automática, preservando a experiência de máquina dedicada.
+Quando o supervisor comprovar que o macOS já instalado solicitou um reboot normal, o host Linux deve reiniciar de forma limpa e automática, preservando a experiência de máquina dedicada. Reboots ocorridos durante `state=installing` são internos ao instalador e não acionam reboot do host.
 
 ## Escopo
 
-- consumir a classificação `GUEST_REBOOT` do supervisor;
+- consumir a classificação `GUEST_REBOOT` do supervisor somente quando o estado persistente da VM for `installed`;
 - reiniciar o host somente após reset/reboot normal confirmado;
 - persistir logs/estado antes da reinicialização;
 - permitir dry-run/desativação em ambiente de desenvolvimento;
@@ -37,6 +37,7 @@ Quando o supervisor comprovar que o macOS solicitou um reboot normal, o host Lin
 6. Não usar apenas o fechamento da janela ou término do QEMU como sinal de reboot.
 7. A ação deve ser idempotente e executada uma única vez por sessão.
 8. Não executar QEMU/Reims como root apenas para permitir reboot do host.
+9. `state=installing` + RESET/reboot do guest nunca pode executar `systemctl reboot`; o QEMU deve continuar/resetar o guest para que a instalação prossiga sem intervenção manual.
 
 ## Critérios de aceitação
 
