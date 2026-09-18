@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[-]` em andamento — instalação, reboot interno, QMP, desktop e autoboot validados; Recovery pendente
+Status: `[-]` em andamento — Recovery validado; falta sanity final de autoboot/SSH pós-Recovery
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -458,6 +458,40 @@ length=35
 Após shutdown limpo, a mesma VM foi relançada sem `INSTALL_MEDIA`. Sem qualquer input no picker, o OpenCore iniciou automaticamente o macOS instalado e o SSH voltou a responder. Isso satisfaz o critério de autoboot pós-instalação.
 
 A única pendência funcional restante da T002 é comprovar que Recovery continua acessível pelo picker/caminho de recuperação. A task não deve ser marcada `[x]` antes dessa evidência.
+
+## Recovery final — PASS; sanity pós-Recovery pendente
+
+A validação de Recovery foi concluída com sucesso na VM instalada:
+
+```text
+VM_ID=reims-57f0fd6b61a74542
+PICKER_VISIBLE=PASS
+RECOVERY_DISCOVERABLE=PASS
+RECOVERY_ENTRY=Recovery 15.8 (dmg)
+RUNTIME_RECOVERY=PASS
+QMP=PASS
+SERIAL=PASS
+SNAPSHOT_SAFETY=PASS
+```
+
+Entradas observadas no picker:
+
+```text
+1. OSX
+2. Recovery 15.8 (dmg)
+3. UEFI Shell
+```
+
+O Recovery foi acessado diretamente, sem auxiliary action, e a evidência visual mostrou o ambiente macOS Recovery com Restore from Time Machine, Reinstall macOS Sequoia, Safari e Disk Utility.
+
+Pendência única antes da revisão final:
+
+```text
+AUTOBOOT_AFTER_RECOVERY=PENDING
+SSH_AFTER_RECOVERY=PENDING
+```
+
+O próximo passo é somente aguardar/concluir o boot normal após sair do Recovery e confirmar que o macOS instalado continua sendo selecionado automaticamente, sem input no picker, e que o SSH volta a responder.
 
 ## Histórico
 
