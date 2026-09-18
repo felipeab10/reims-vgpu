@@ -1,6 +1,6 @@
 # T001 — Implementar modo persistente no launcher
 
-Status: `[-]` em andamento — revisão de código aprovada; primeira validação runtime bloqueada antes do Setup Assistant
+Status: `[!]` bloqueada — implementação aprovada; validação runtime bloqueada no UEFI Interactive Shell
 
 ## Objetivo
 
@@ -254,6 +254,47 @@ Não usar `system_powerdown` como substituto do shutdown funcional do macOS para
 
 Somente após essa evidência T001 pode mudar para `[x]`.
 
+
+
+### Tentativa runtime 2 — BLOCKED NO UEFI INTERACTIVE SHELL
+
+A mesma fixture foi reutilizada sem recriar ou regenerar artefatos.
+
+Boot observado:
+
+```text
+BdsDxe: starting Boot0002 "UEFI QEMU HARDDISK QM00017"
+```
+
+Estado visual final:
+
+```text
+UEFI Interactive Shell
+```
+
+Resultado:
+
+```text
+INSTALL_RESULT=PARTIAL
+DESKTOP_REACHED=no
+SHUTDOWN_PERSISTENCE=NOT_TESTED
+REBOOT_PERSISTENCE=NOT_TESTED
+STORAGE_REUSED=yes
+QMP=PASS
+SERIAL=PASS
+SNAPSHOT_SAFETY=PASS
+```
+
+O bloqueio atual é de boot da fixture persistente, não uma evidência de falha de persistência. Antes de alterar código ou regenerar OpenCore/OVMF, deve-se determinar:
+
+1. para qual dispositivo/caminho EFI `Boot0002` aponta;
+2. se o `OpenCore.qcow2` persistente ainda contém e expõe o bootloader EFI esperado;
+3. se o boot retomado anexou a mesma mídia de instalação usada nos boots anteriores;
+4. se iniciar manualmente o OpenCore a partir do UEFI Shell permite continuar a instalação;
+5. se o `OVMF_VARS.fd` persistente alterou `BootOrder` durante a instalação.
+
+Não regenerar a fixture até concluir esse diagnóstico.
+
 ## Histórico
 
 - 2026-09-17 — implementação inicial publicada em `311435ce873666f01284cd36b94ad182b58b819a`.
@@ -262,3 +303,4 @@ Somente após essa evidência T001 pode mudar para `[x]`.
 - 2026-09-18 — revisão 2: `APPROVED_PENDING_RUNTIME_VALIDATION`.
 - 2026-09-18 — QEMU customizado reconstruído e sanity checks concluídos; ambiente pronto para fixture Sequoia.
 - 2026-09-18 — tentativa runtime 1: instalação Sequoia parcial, storage reutilizado, QMP/serial/snapshot safety PASS; validação de shutdown/reboot bloqueada antes do Setup Assistant.
+- 2026-09-18 — tentativa runtime 2: mesma fixture caiu no UEFI Interactive Shell após `Boot0002`; T001 marcada como bloqueada até diagnóstico da cadeia de boot.
