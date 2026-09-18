@@ -129,10 +129,10 @@ Branch local:
 feat/t002-vm-manager-appliance
 ```
 
-HEAD reportado:
+HEAD reportado mais recente:
 
 ```text
-81183c22f35b958045d7eb8fc69a861888d12cc4
+4efae714
 ```
 
 Commits reportados:
@@ -142,6 +142,7 @@ df4a3397 feat(appliance): simplify VM manager flow [T002]
 c4bcd075 fix(appliance): stage OpenCore builder per VM
 ff2cb676 fix(appliance): stage OpenCore sources outside builder workdir
 81183c22 fix(appliance): copy staged OpenCore EFI into image
+4efae714 fix(appliance): complete T002 controlled validation
 ```
 
 Arquivos alterados:
@@ -156,6 +157,8 @@ Resultados já reportados:
 ```text
 STATIC_TESTS=PASS
 CONTROLLED_TESTS=PASS
+INSTALLER_LAYOUT=PASS
+OVERWRITE_PROTECTION=PASS
 LAUNCHER_TEST=PASS
 OPENCORE_IMAGE_TEST=PENDING
 RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
