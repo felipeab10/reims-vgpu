@@ -76,6 +76,7 @@ Uma task só deve mudar para `[x]` após existir evidência de implementação e
 - [ ] T029 — Testar update quebrado + rollback
 - [ ] T030 — Teste prolongado/soak
 - [ ] T031 — Congelar versões da plataforma 0.1.0
+- [ ] [T033 — Polimento de boot nativo OpenCore](T033-opencore-native-boot-polish.md)
 - [ ] T032 — Preparar release 0.1.0
 
 ## Ordem recomendada
@@ -95,7 +96,11 @@ T001 → T002 → T003 → T004
           ↓
        T021-T024
           ↓
-       T025-T032
+       T025-T031
+          ↓
+          T033
+          ↓
+          T032
 ```
 
 Não iniciar a construção final da ISO antes de o modo persistente, o VM Manager simplificado, fullscreen e lifecycle estarem funcionais em um host de desenvolvimento conhecido.
