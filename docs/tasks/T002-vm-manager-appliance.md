@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[!]` bloqueada em runtime — QMP socket excede limite de pathname Unix
+Status: `[-]` em andamento — instalação, reboot interno, QMP, desktop e autoboot validados; Recovery pendente
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -418,6 +418,46 @@ O launcher atual deriva `QMP_SOCK` diretamente de `RUN_DIR`. A correção deve d
 A solução deve preservar compatibilidade com paths curtos existentes, limpar somente o próprio socket/runtime dir e fornecer um caminho explícito/descobrível para consumidores QMP. Não reduzir artificialmente o VM ID nem depender do tamanho do workspace como workaround.
 
 A fixture completa de `runtime-sequoia-retry-2` deve ser preservada para reteste após a correção, evitando novo download/provisionamento se os artefatos permanecerem íntegros.
+
+## Runtime T002 — instalação e autoboot PASS; Recovery pendente
+
+A correção de QMP curto foi implementada e a mesma VM provisionada foi utilizada para concluir a instalação.
+
+Estado reportado:
+
+```text
+branch: feat/t002-vm-manager-appliance
+HEAD: 521a2390
+commit: 521a2390 fix(vm): use short runtime path for QMP socket [T002]
+VM_ID=reims-57f0fd6b61a74542
+QMP_FIX=PASS
+QMP_DISCOVERY=PASS
+QMP=PASS
+SERIAL=PASS
+RUNTIME_INSTALL_REBOOT=PASS
+PID_CONTINUITY=PASS
+DESKTOP_REACHED=yes
+MACOS_VERSION=15.8
+SSH=PASS
+RUNTIME_AUTOBOOT=PASS
+AUTOBOOT_MANUAL_INPUT=no
+POST_INSTALL_INSTALL_MEDIA_ATTACHED=no
+SNAPSHOT_SAFETY=PASS
+RUNTIME_RECOVERY=PENDING
+```
+
+O socket QMP real passou a usar pathname curto e foi descoberto por `run/qmp.path`:
+
+```text
+/run/user/1000/r-q-vP4Rys/qmp.sock
+length=35
+```
+
+`query-status` confirmou QEMU em execução. Os reboots do instalador ocorreram mantendo o mesmo processo QEMU, sem relançamento manual. A instalação chegou ao desktop do macOS 15.8 e o acesso SSH foi validado.
+
+Após shutdown limpo, a mesma VM foi relançada sem `INSTALL_MEDIA`. Sem qualquer input no picker, o OpenCore iniciou automaticamente o macOS instalado e o SSH voltou a responder. Isso satisfaz o critério de autoboot pós-instalação.
+
+A única pendência funcional restante da T002 é comprovar que Recovery continua acessível pelo picker/caminho de recuperação. A task não deve ser marcada `[x]` antes dessa evidência.
 
 ## Histórico
 
