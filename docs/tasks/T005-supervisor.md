@@ -31,6 +31,7 @@ Nesta task o supervisor **classifica e registra**. As ações de desligar/reinic
 - registrar timestamps e eventos em log persistente;
 - preservar exit code do QEMU;
 - produzir um resultado final estruturado da sessão;
+- consumir a fase atual do appliance (`installing`, `installed`, `recovery`) para que a ação posterior possa distinguir reboot interno do instalador de reboot normal de uso diário;
 - nunca depender de `pgrep`/`pkill` amplo para controlar a VM.
 
 ## Fora de escopo
@@ -60,6 +61,8 @@ Nesta task o supervisor **classifica e registra**. As ações de desligar/reinic
 10. Logs devem ficar fora da checkout, sob `/var/log/reims/` no appliance; testes podem usar diretório temporário.
 11. Nunca usar broad `pkill`.
 12. Encerramento do supervisor não deve apagar evidência da sessão.
+13. Durante `state=installing`, um RESET/reboot normal do guest deve ser registrado como evento de instalação e não deve implicar encerramento da sessão nem reboot do host.
+14. A classificação que habilita T007 só pode ser emitida no contexto `state=installed`, após excluir kernel panic/crash conforme as regras de precedência.
 
 ## Classificações mínimas
 
