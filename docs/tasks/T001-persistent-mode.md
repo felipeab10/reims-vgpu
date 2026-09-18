@@ -1,6 +1,6 @@
 # T001 — Implementar modo persistente no launcher
 
-Status: `[-]` em andamento — implementação aprovada; instalação Sequoia em progresso para validação runtime
+Status: `[x]` concluída e validada
 
 ## Objetivo
 
@@ -306,6 +306,181 @@ Evidências adicionais:
 
 Nenhum código, disco persistente, OpenCore, OVMF ou snapshot foi alterado durante o diagnóstico.
 
+
+## Validação runtime final — PASS
+
+Fixture Sequoia:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia
+```
+
+macOS validado:
+
+```text
+macOS 15.8
+```
+
+Instalação completada até desktop funcional, com acesso SSH ao guest.
+
+Mídia usada durante a instalação:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/work/installer/Sequoia.img
+```
+
+Número de boots observados durante a instalação:
+
+```text
+5
+```
+
+### Storage persistente validado
+
+Os mesmos arquivos foram reutilizados durante todos os boots:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/persistent/macos.qcow2
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/persistent/OpenCore.qcow2
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/persistent/OVMF_VARS.fd
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/persistent/OVMF_CODE.fd
+```
+
+Nenhum artefato persistente foi recriado entre os testes.
+
+### Marcador de persistência
+
+Criado no guest:
+
+```text
+/Users/felipeab10/Desktop/T001-PERSISTENCE-TEST.txt
+```
+
+Conteúdo:
+
+```text
+T001
+uuid=0E9D1169-EF09-4C79-B89A-CB741AB48DAC
+created=2026-09-18T18:02:30Z
+after_shutdown=2026-09-18T18:07:12Z
+```
+
+O mesmo UUID e conteúdo foram confirmados após shutdown e reboot.
+
+### Shutdown persistence
+
+Resultado:
+
+```text
+SHUTDOWN_PERSISTENCE=PASS
+```
+
+Fluxo validado:
+
+1. marcador criado dentro do macOS;
+2. shutdown solicitado pelo próprio macOS;
+3. QEMU encerrou;
+4. VM foi relançada com os mesmos arquivos persistentes;
+5. marcador permaneceu presente com o mesmo UUID.
+
+### Reboot persistence
+
+Resultado:
+
+```text
+REBOOT_PERSISTENCE=PASS
+```
+
+Fluxo validado:
+
+1. marcador recebeu `after_shutdown`;
+2. Restart foi solicitado pelo próprio macOS;
+3. VM foi relançada usando a mesma fixture;
+4. marcador permaneceu presente com conteúdo idêntico.
+
+### Observabilidade
+
+```text
+QMP=PASS
+SERIAL=PASS
+```
+
+Sockets QMP observados incluem:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/qmp-20260918-140547.sock
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/qmp-20260918-140645.sock
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/qmp-20260918-140743.sock
+```
+
+Serial registrou repetidamente:
+
+```text
+#[EB|LOG:EXITBS:END]
+#[EB|B:BOOT]
+#[EB|LOG:HANDOFF TO XNU]
+```
+
+### Segurança de snapshots
+
+Resultado:
+
+```text
+SNAPSHOT_SAFETY=PASS
+```
+
+Foi confirmado que:
+
+- nenhum snapshot foi criado ou promovido;
+- `work/rails/t001-sequoia/snapshots` permaneceu vazio;
+- nenhum `qemu-img commit` foi executado;
+- nenhum artefato persistente foi recriado;
+- nenhum código foi alterado durante a validação runtime.
+
+O `OVMF_VARS.fd` manteve SHA-256:
+
+```text
+6ed987af3a3c155be71665f510eae3e007eda9b8b94afd59d45e91c4a11565cc
+```
+
+### Evidências
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/marker-original.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/final-persistence-result.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/desktop-reached-ssh.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/shutdown-test-boot-1.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/shutdown-test-boot-2.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/reboot-test-boot-2.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/serial-20260918-140547.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/serial-20260918-140645.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/run/serial-20260918-140743.log
+```
+
+### Resultado de aceitação
+
+Todos os critérios obrigatórios da T001 foram satisfeitos:
+
+```text
+STATIC_REVIEW=PASS
+RUNTIME_BOOT=PASS
+SHUTDOWN_PERSISTENCE=PASS
+REBOOT_PERSISTENCE=PASS
+STORAGE_REUSED=yes
+QMP=PASS
+SERIAL=PASS
+SNAPSHOT_SAFETY=PASS
+```
+
+Implementação validada:
+
+```text
+branch: feat/t001-persistent-mode
+commit: bb171c33dbee75ab01453173afae9422552a2343
+```
+
+A T001 está concluída e liberada como dependência para T002.
+
 ## Histórico
 
 - 2026-09-17 — implementação inicial publicada em `311435ce873666f01284cd36b94ad182b58b819a`.
@@ -315,3 +490,4 @@ Nenhum código, disco persistente, OpenCore, OVMF ou snapshot foi alterado duran
 - 2026-09-18 — QEMU customizado reconstruído e sanity checks concluídos; ambiente pronto para fixture Sequoia.
 - 2026-09-18 — tentativa runtime 1: instalação Sequoia parcial, storage reutilizado, QMP/serial/snapshot safety PASS; validação de shutdown/reboot bloqueada antes do Setup Assistant.
 - 2026-09-18 — tentativa runtime 2 inicialmente classificada como UEFI Shell foi corrigida: era macOS Recovery em verbose com handoff para XNU. T001 voltou a `[-]`; instalação deve continuar na mesma fixture.
+- 2026-09-18 — instalação Sequoia concluída até desktop; persistência após shutdown e reboot comprovada; QMP/serial/snapshot safety PASS; T001 marcada `[x]`.
