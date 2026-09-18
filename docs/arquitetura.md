@@ -169,6 +169,14 @@ A configuração deve permitir persistência da seleção padrão (incluindo `Al
 
 Na experiência normal pós-instalação, o usuário não deve precisar selecionar manualmente `Macintosh HD`/volume equivalente a cada boot.
 
+### 4.4 Polimento de boot nativo — somente após validação funcional
+
+Depois que persistência, instalação, autoboot, fullscreen, lifecycle, atualização e matriz Ventura/Sonoma/Sequoia estiverem validados, será feita uma etapa separada de polimento para aproximar a experiência visual/sonora de um Mac nativo.
+
+Essa etapa pode incluir ocultar o picker do OpenCore no boot normal, reduzir/remover elementos visuais intermediários, usar o chime de inicialização suportado pela configuração OpenCore e manter um mecanismo de recuperação para tornar o picker visível quando necessário.
+
+Esse polimento não deve ser usado para mascarar problemas durante o desenvolvimento. Enquanto a plataforma ainda estiver sendo validada, o picker e logs permanecem visíveis quando forem úteis ao diagnóstico.
+
 ## 5. Boot normal
 
 Depois que a instalação está configurada:
