@@ -25,7 +25,7 @@ Uma task só deve mudar para `[x]` após existir evidência de implementação e
 ### Fundação
 
 - [x] [T001 — Implementar modo persistente no launcher](T001-persistent-mode.md) — concluída e validada em Sequoia 15.8; shutdown/reboot persistence PASS
-- [-] [T002 — Simplificar o VM Manager para fluxo de appliance](T002-vm-manager-appliance.md) — Recovery PASS; sanity final de autoboot/SSH pós-Recovery pendente
+- [x] [T002 — Simplificar o VM Manager para fluxo de appliance](T002-vm-manager-appliance.md) — concluída e validada em Sequoia 15.8; reboots, QMP, autoboot e Recovery PASS
 - [ ] [T003 — Implementar fullscreen nativo obrigatório](T003-fullscreen.md)
 - [ ] [T004 — Criar modelo de estado persistente do appliance](T004-state-model.md)
 
