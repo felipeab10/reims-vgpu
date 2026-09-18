@@ -145,6 +145,30 @@ O sistema gera automaticamente:
 
 O fluxo atual de `scripts/reims-vm-manager.sh` deve ser simplificado, reaproveitando o download via OSX-KVM, validação de chunklist, criação das imagens e geração da identidade.
 
+### 4.3 OpenCore e seleção automática do sistema
+
+O OpenCore da VM é parte do estado persistente da máquina e deve ser personalizado por instalação. A imagem compartilhada do projeto é apenas uma fonte/base; o appliance nunca deve depender de um `config.plist` gerado que não tenha sido efetivamente instalado dentro do `OpenCore.qcow2` da VM.
+
+Durante `state=installing`, o OpenCore precisa continuar descobrindo e permitindo os estágios transitórios criados pelo instalador do macOS, como Recovery, `macOS Installer` e Preboot. A seleção padrão não deve ser fixada cedo demais.
+
+Depois que a VM alcançar um macOS instalado e utilizável, a seleção padrão deve persistir para o volume principal do macOS. O boot normal desejado é:
+
+```text
+OpenCore
+  ↓
+descobre volumes APFS
+  ↓
+volume macOS instalado = padrão persistente
+  ↓
+timeout
+  ↓
+boot automático
+```
+
+A configuração deve permitir persistência da seleção padrão (incluindo `AllowSetDefault` e roteamento de variáveis de boot do OpenCore quando aplicável), sem remover a possibilidade de acessar picker/Recovery em recuperação.
+
+Na experiência normal pós-instalação, o usuário não deve precisar selecionar manualmente `Macintosh HD`/volume equivalente a cada boot.
+
 ## 5. Boot normal
 
 Depois que a instalação está configurada:
