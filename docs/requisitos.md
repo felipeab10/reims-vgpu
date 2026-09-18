@@ -71,7 +71,37 @@ Deve:
 - após a instalação estar utilizável, iniciar automaticamente o volume macOS instalado como entrada padrão do OpenCore, sem exigir seleção manual a cada boot;
 - manter uma forma de acessar o picker/Recovery para recuperação, mesmo quando o boot normal for automático.
 
-### 4.1 Contrato OpenCore
+### 4.1 Progresso de instalação
+
+O provisionamento não deve expor logs técnicos, output de build, `guestfish`, `dmg2img`, `qemu-img`, Cargo ou detalhes internos ao usuário final.
+
+Durante operações demoradas, a interface deve exibir progresso claro, no mínimo:
+
+- etapa atual em linguagem amigável;
+- barra de progresso quando houver métrica real;
+- tempo decorrido desde o início da instalação;
+- indicação de atividade quando a etapa não tiver percentual confiável;
+- erro resumido e acionável em caso de falha.
+
+Exemplo:
+
+```text
+Preparando o macOS
+
+Baixando o instalador              100%
+Validando arquivos                 100%
+Preparando mídia                    72%
+Configurando máquina virtual        40%
+
+Progresso geral                     58%
+Tempo decorrido                  12:47
+```
+
+Percentuais não devem ser inventados. Etapas sem progresso mensurável devem usar estado indeterminado e continuar mostrando o tempo decorrido.
+
+O backend do provisionamento deve emitir estado/progresso estruturado para que a UI possa renderizar essa experiência sem depender de parsing frágil de stdout.
+
+### 4.2 Contrato OpenCore
 
 Cada VM deve possuir seu próprio `OpenCore.qcow2` e seu próprio `config.plist` efetivamente instalado dentro da partição EFI dessa imagem.
 
