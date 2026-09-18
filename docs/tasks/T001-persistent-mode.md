@@ -1,6 +1,6 @@
 # T001 — Implementar modo persistente no launcher
 
-Status: `[-]` em andamento — revisão de código aprovada; validação runtime pendente
+Status: `[-]` em andamento — revisão de código aprovada; primeira validação runtime bloqueada antes do Setup Assistant
 
 ## Objetivo
 
@@ -181,19 +181,76 @@ Sanity checks:
 
 Os submodules em `vendor/qemu/roms/*` ficaram dirty apenas por artefatos do build local; nenhuma alteração de código do superproject foi feita.
 
+### Tentativa runtime 1 — BLOCKED
+
+Fixture dedicada:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia
+```
+
+Persistent storage:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/persistent
+```
+
+Resultado observado:
+
+- download e conversão do instalador Sequoia concluídos;
+- disco qcow2 de 80 GiB criado;
+- OpenCore e OVMF dedicados criados;
+- boot com `--persistent --device reims-vgpu-pci` iniciado;
+- instalador e telas de progresso foram observados;
+- aproximadamente 11,7 GiB foram gravados no disco persistente;
+- os mesmos paths `macos.qcow2`, `OpenCore.qcow2` e `OVMF_VARS.fd` foram reutilizados entre boots;
+- QMP funcionou;
+- serial funcionou e registrou handoff para XNU;
+- snapshots históricos permaneceram intocados;
+- Setup Assistant/desktop ainda não foi alcançado.
+
+A solicitação `system_powerdown` via QMP durante o estado de instalação não encerrou o guest no intervalo observado. O QEMU foi posteriormente parado para não deixar a VM ativa. Por isso não existe evidência suficiente para validar persistência após shutdown ou reboot.
+
+Resultado desta rodada:
+
+```text
+INSTALL_RESULT=PARTIAL
+SHUTDOWN_PERSISTENCE=NOT_TESTED
+REBOOT_PERSISTENCE=NOT_TESTED
+STORAGE_REUSED=yes
+QMP=PASS
+SERIAL=PASS
+SNAPSHOT_SAFETY=PASS
+```
+
+Evidências principais:
+
+```text
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/validation-summary.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/baseline.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/final-state.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/final-sha256.txt
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/boot-1-launch.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/boot-2-launch.log
+/home/felipeab10/Documentos/reims-t001-fixtures/sequoia/evidence/boot-3-launch.log
+```
+
 ### Próxima validação obrigatória
 
-Criar uma fixture Sequoia descartável e executar:
+Retomar a MESMA fixture, sem recriar discos/OpenCore/OVMF, até alcançar Setup Assistant e desktop funcional.
 
-1. boot persistent;
-2. criar marcador no guest;
-3. shutdown limpo;
-4. boot persistent novamente;
-5. confirmar marcador;
-6. reboot do guest;
-7. confirmar marcador novamente;
-8. confirmar que os mesmos paths persistentes foram reutilizados;
-9. confirmar que snapshots históricos permaneceram inalterados.
+Depois:
+
+1. criar marcador no guest;
+2. shutdown limpo pelo próprio macOS;
+3. boot persistent novamente;
+4. confirmar marcador;
+5. reboot pelo próprio macOS;
+6. confirmar marcador novamente;
+7. confirmar reutilização dos mesmos paths persistentes;
+8. confirmar que snapshots históricos permaneceram inalterados.
+
+Não usar `system_powerdown` como substituto do shutdown funcional do macOS para o critério de aceitação da T001.
 
 Somente após essa evidência T001 pode mudar para `[x]`.
 
@@ -204,3 +261,4 @@ Somente após essa evidência T001 pode mudar para `[x]`.
 - 2026-09-17 — correções publicadas em `bb171c33dbee75ab01453173afae9422552a2343`.
 - 2026-09-18 — revisão 2: `APPROVED_PENDING_RUNTIME_VALIDATION`.
 - 2026-09-18 — QEMU customizado reconstruído e sanity checks concluídos; ambiente pronto para fixture Sequoia.
+- 2026-09-18 — tentativa runtime 1: instalação Sequoia parcial, storage reutilizado, QMP/serial/snapshot safety PASS; validação de shutdown/reboot bloqueada antes do Setup Assistant.
