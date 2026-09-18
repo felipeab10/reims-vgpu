@@ -26,6 +26,7 @@ Arquivos da VM devem ficar em:
 - persistir `vm_id`, versão do macOS, estado da instalação, CPU, RAM e disco;
 - apontar para paths persistentes da VM sem depender da checkout Git;
 - representar pelo menos os estados `unconfigured`, `installing`, `installed` e `recovery`;
+- tornar a fase de instalação disponível para a política de lifecycle, pois `installing` e `installed` tratam reboot do guest de forma diferente;
 - fornecer leitura/escrita atômica do estado;
 - impedir que update de código apague estado do usuário;
 - permitir evolução futura via campo de versão do schema.
@@ -59,6 +60,8 @@ Arquivos da VM devem ficar em:
 9. Falha durante instalação deve manter estado suficiente para diagnóstico/recovery.
 10. Deve existir uma ferramenta/helper simples para imprimir/validar o estado sem iniciar a VM.
 11. Não armazenar segredos desnecessários no JSON.
+12. O estado `installing` deve permitir que o launcher/supervisor reconheça que reboots do guest são internos ao instalador e não devem reiniciar o host.
+13. O estado `installed` é pré-condição para aplicar a política de T007 que transforma um reboot normal confirmado do macOS em reboot do host.
 
 ## Schema inicial esperado
 
