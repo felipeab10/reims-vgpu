@@ -42,6 +42,7 @@ Uma task só deve mudar para `[x]` após existir evidência de implementação e
 - [ ] T010 — Criar serviços systemd do appliance
 - [ ] T011 — Implementar first-boot automático
 - [ ] T012 — Ocultar desktop/console Linux no fluxo normal
+- [ ] [T034 — UI de progresso da instalação](T034-install-progress-ui.md)
 
 ### Atualização
 
@@ -88,7 +89,7 @@ T001 → T002 → T003 → T004
           ↓
        T005-T008
           ↓
-       T009-T012
+       T009-T012/T034
           ↓
        T013-T017
           ↓
