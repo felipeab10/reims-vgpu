@@ -450,8 +450,16 @@ fi
 mkdir -p "$RUN_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SERIAL_LOG="$RUN_DIR/serial-$STAMP.log"
-QMP_SOCK="$RUN_DIR/qmp-$STAMP.sock"
-ln -sfn "qmp-$STAMP.sock" "$RUN_DIR/qmp.sock"
+QMP_RUNTIME_BASE="${REIMS_QMP_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
+mkdir -p "$QMP_RUNTIME_BASE"
+chmod 700 "$QMP_RUNTIME_BASE" 2>/dev/null || true
+QMP_RUNTIME_DIR="$(mktemp -d "${QMP_RUNTIME_BASE%/}/r-q-XXXXXX")" || die "cannot create private QMP runtime directory"
+chmod 700 "$QMP_RUNTIME_DIR"
+QMP_SOCK="$QMP_RUNTIME_DIR/qmp.sock"
+QMP_SOCKET_LENGTH=${#QMP_SOCK}
+[ "$QMP_SOCKET_LENGTH" -lt 108 ] || die "QMP socket path too long ($QMP_SOCKET_LENGTH bytes): $QMP_SOCK"
+printf "%s\n" "$QMP_SOCK" > "$RUN_DIR/qmp.path"
+ln -sfn "$QMP_SOCK" "$RUN_DIR/qmp.sock"
 
 # --- Control-plane trace rail ---------------------------------------------------
 TRACE="${TRACE:-0}"
@@ -646,15 +654,10 @@ discard_clone() {
     rm -f "$DISK" "$OPENCORE" "$OVMF_VARS"
   fi
   rm -f "$QMP_SOCK"
-  # `qmp.sock` is the shared name every driver script resolves, and it is
-  # re-pointed by whichever boot started last. A boot shutting down must only
-  # remove it while it still names ITS socket: killing one VM and starting the
-  # next immediately otherwise has the dying instance delete the live
-  # instance's symlink, and the driver then fails with a bare ENOENT partway
-  # through a run — which reads as a guest defect, not as a missing socket.
-  if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
-    rm -f "$RUN_DIR/qmp.sock"
+  if [ -f "$RUN_DIR/qmp.path" ] && [ "$(cat "$RUN_DIR/qmp.path")" = "$QMP_SOCK" ]; then
+    rm -f "$RUN_DIR/qmp.path" "$RUN_DIR/qmp.sock"
   fi
+  rmdir "$QMP_RUNTIME_DIR" 2>/dev/null || true
 }
 
 # Captures land in the SELECTED rail, next to the snapshot they descend from,
@@ -782,10 +785,7 @@ if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ] || [ "$BOO
     if [ "$BOOT_CLASS" != "persistent" ]; then
       discard_clone
     else
-      rm -f "$QMP_SOCK"
-      if [ "$(readlink "$RUN_DIR/qmp.sock" 2>/dev/null)" = "qmp-$STAMP.sock" ]; then
-        rm -f "$RUN_DIR/qmp.sock"
-      fi
+      discard_clone
     fi
   fi
   exit "$rc"

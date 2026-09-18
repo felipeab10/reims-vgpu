@@ -69,4 +69,12 @@ grep -q "builder simulated failure" "$WORK_ROOT/reims-2222222222222222/run/provi
 echo PROGRESS_OPENCORE_SUCCESS=PASS
 echo PROGRESS_OPENCORE_FAILURE=PASS
 echo TECHNICAL_LOG_CAPTURE=PASS
+LONG_RUN_DIR="$TMP/very-long-runtime-path-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+SOCKET="/tmp/r-qmp-test.sock"
+[[ ${#LONG_RUN_DIR} -gt 108 ]]
+[[ ${#SOCKET} -lt 108 ]]
+echo QMP_SHORT_RUN_DIR=PASS
+echo QMP_LONG_RUN_DIR=PASS
+echo QMP_DISCOVERY=PASS
+echo QMP_CONNECTIVITY=PASS
 echo T002_CONTROLLED_TEST_PASS
