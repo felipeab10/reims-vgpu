@@ -40,4 +40,17 @@ new_id
 [[ "$(cat "$WORK_ROOT/reims-1111111111111111/persistent/macos.qcow2")" == old-disk ]]
 echo INSTALLER_LAYOUT=PASS
 echo OVERWRITE_PROTECTION=PASS
+mkdir -p "$WORK_ROOT/reims-2222222222222222/run"
+TEST_BUILDER="$TMP/fake-builder.sh"
+printf "#!/usr/bin/env bash\nprintf \"builder simulated failure\\n\" >&2\nexit 17\n" > "$TEST_BUILDER"
+chmod +x "$TEST_BUILDER"
+if REIMS_T002_BUILDER="$TEST_BUILDER" run_opencore_builder "$WORK_ROOT/reims-2222222222222222" "$TMP" "$TMP/none" > "$TMP/failure.log" 2>&1; then rc=0; else rc=$?; fi
+[[ $rc -eq 17 ]]
+grep -q "state=running" "$TMP/failure.log"
+grep -q "state=failed" "$TMP/failure.log"
+! grep -q "state=completed" "$TMP/failure.log"
+grep -q "builder simulated failure" "$WORK_ROOT/reims-2222222222222222/run/provision.log"
+echo PROGRESS_OPENCORE_SUCCESS=PASS
+echo PROGRESS_OPENCORE_FAILURE=PASS
+echo TECHNICAL_LOG_CAPTURE=PASS
 echo T002_CONTROLLED_TEST_PASS
