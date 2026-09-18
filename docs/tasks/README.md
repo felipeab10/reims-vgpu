@@ -24,7 +24,7 @@ Uma task só deve mudar para `[x]` após existir evidência de implementação e
 
 ### Fundação
 
-- [!] [T001 — Implementar modo persistente no launcher](T001-persistent-mode.md) — código aprovado; runtime bloqueado no UEFI Interactive Shell; diagnosticar cadeia de boot da fixture
+- [-] [T001 — Implementar modo persistente no launcher](T001-persistent-mode.md) — código aprovado; fixture Sequoia funcional em Recovery/installer; continuar instalação até desktop e validar shutdown/reboot
 - [ ] [T002 — Simplificar o VM Manager para fluxo de appliance](T002-vm-manager-appliance.md)
 - [ ] [T003 — Implementar fullscreen nativo obrigatório](T003-fullscreen.md)
 - [ ] [T004 — Criar modelo de estado persistente do appliance](T004-state-model.md)
