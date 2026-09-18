@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[!]` bloqueada em runtime por espaço/fixture — validação estática/controlada concluída
+Status: `[-]` em andamento — bloqueios de storage e chunklist non-TTY resolvidos; pronta para novo runtime
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -350,6 +350,44 @@ A inspeção do `fetch-macOS-v2.py` upstream mostra assimetria relevante: o cami
 Antes de alterar o produto, a versão pinada local deve ser inspecionada e a hipótese reproduzida contra os `.dmg/.chunklist` já baixados na fixture runtime. A correção do Reims OS não deve depender de stdout ser um terminal interativo e não deve modificar silenciosamente o submodule upstream.
 
 A fixture parcial deve ser preservada para reuso da mídia no diagnóstico, evitando novo download enquanto a integridade não tiver sido determinada.
+
+## Chunklist non-TTY — corrigido
+
+Correção reportada em:
+
+```text
+branch: feat/t002-vm-manager-appliance
+HEAD: bf360327
+commit: bf360327 fix(appliance): support macOS verification without TTY [T002]
+```
+
+Root cause confirmado na versão pinada de `fetch-macOS-v2.py`: `verify_image()` chamava `os.get_terminal_size()` sem fallback em stdout não-TTY, produzindo `OSError: [Errno 25] Inappropriate ioctl for device`.
+
+A solução mantém o submodule upstream intacto e adiciona o adapter Reims-owned:
+
+```text
+scripts/reims-fetch-macos.py
+```
+
+Resultados:
+
+```text
+LOCAL_NONTTY_BUG_CONFIRMED=yes
+UPSTREAM_SUBMODULE_UNCHANGED=PASS
+NONTTY_REPRODUCTION=PASS
+CHUNKLIST_VERIFY_NONTTY=PASS
+CHUNKLIST_VERIFY_TTY=PASS
+NONTTY_VERIFY_REGRESSION=PASS
+EARLY_PROVISION_LOG=PASS
+FETCH_MEDIA_PROGRESS=PASS
+STATIC_TESTS=PASS
+CONTROLLED_TESTS=PASS
+OPENCORE_NON_REGRESSION=PASS
+```
+
+A mídia Sequoia já baixada na fixture parcial foi verificada integralmente com sucesso após a correção, sem redownload.
+
+A fixture parcial `reims-564a0707b2fc464d` permanece como evidência do bug original e não deve ser continuada como instalação válida. A próxima validação runtime deve criar um novo VM ID e um novo diretório de VM.
 
 ## Histórico
 
