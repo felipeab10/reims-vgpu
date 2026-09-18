@@ -389,6 +389,36 @@ A mídia Sequoia já baixada na fixture parcial foi verificada integralmente com
 
 A fixture parcial `reims-564a0707b2fc464d` permanece como evidência do bug original e não deve ser continuada como instalação válida. A próxima validação runtime deve criar um novo VM ID e um novo diretório de VM.
 
+## Runtime T002 — QMP socket path longo
+
+A segunda tentativa runtime limpa chegou até o launcher e falhou antes do QEMU iniciar por comprimento excessivo do pathname Unix usado pelo QMP.
+
+Estado reportado:
+
+```text
+VM_ID=reims-57f0fd6b61a74542
+FETCH_MEDIA_RUNTIME=PASS
+CHUNKLIST_RUNTIME=PASS
+RUNTIME_OPENCORE_SANITY=PASS
+QEMU_BIN=PASS
+QMP=FAIL
+FAILURE_CLASSIFICATION=REIMS_RUNTIME
+```
+
+Path rejeitado pelo QEMU:
+
+```text
+/home/felipeab10/Documentos/reims-t002-fixtures/runtime-sequoia-retry-2/vms/reims-57f0fd6b61a74542/run/qmp-20260918-182038.sock
+```
+
+Esse pathname possui 127 caracteres, excedendo o limite aceito pelo socket Unix do QEMU (`< 108` bytes no pathname).
+
+O launcher atual deriva `QMP_SOCK` diretamente de `RUN_DIR`. A correção deve desacoplar o socket QMP efêmero dos logs persistentes: serial/provision/logs continuam em `RUN_DIR`, enquanto o socket deve morar em um runtime dir curto e seguro, preferencialmente `$XDG_RUNTIME_DIR` com fallback controlado para `/tmp`.
+
+A solução deve preservar compatibilidade com paths curtos existentes, limpar somente o próprio socket/runtime dir e fornecer um caminho explícito/descobrível para consumidores QMP. Não reduzir artificialmente o VM ID nem depender do tamanho do workspace como workaround.
+
+A fixture completa de `runtime-sequoia-retry-2` deve ser preservada para reteste após a correção, evitando novo download/provisionamento se os artefatos permanecerem íntegros.
+
 ## Histórico
 
 Nenhuma implementação validada ainda.
