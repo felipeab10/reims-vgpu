@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[-]` em andamento — Recovery validado; falta sanity final de autoboot/SSH pós-Recovery
+Status: `[x]` concluída e validada — runtime Sequoia 15.8, reboots internos, QMP, autoboot e Recovery PASS
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
@@ -492,6 +492,59 @@ SSH_AFTER_RECOVERY=PENDING
 ```
 
 O próximo passo é somente aguardar/concluir o boot normal após sair do Recovery e confirmar que o macOS instalado continua sendo selecionado automaticamente, sem input no picker, e que o SSH volta a responder.
+
+## Validação final T002 — PASS
+
+A validação runtime final foi concluída na VM:
+
+```text
+VM_ID=reims-57f0fd6b61a74542
+branch=feat/t002-vm-manager-appliance
+HEAD=521a2390ebd7e2b4d54da07286b07c7a060f2d3a
+macOS=15.8 (24H23)
+```
+
+Critérios finais:
+
+```text
+WIZARD_UI=PASS
+VM_ID_GENERATION=PASS
+FETCH_MEDIA_RUNTIME=PASS
+CHUNKLIST_RUNTIME=PASS
+EARLY_PROVISION_LOG=PASS
+RUNTIME_OPENCORE_SANITY=PASS
+QMP_FIX=PASS
+QMP_DISCOVERY=PASS
+QMP=PASS
+SERIAL=PASS
+RUNTIME_INSTALL_REBOOT=PASS
+PID_CONTINUITY=PASS
+DESKTOP_REACHED=yes
+SSH=PASS
+RUNTIME_AUTOBOOT=PASS
+AUTOBOOT_MANUAL_INPUT=no
+POST_INSTALL_INSTALL_MEDIA_ATTACHED=no
+PICKER_VISIBLE=PASS
+RECOVERY_DISCOVERABLE=PASS
+RUNTIME_RECOVERY=PASS
+AUTOBOOT_AFTER_RECOVERY=PASS
+SSH_AFTER_RECOVERY=PASS
+SNAPSHOT_SAFETY=PASS
+```
+
+Entradas observadas no picker:
+
+```text
+1. OSX
+2. Recovery 15.8 (dmg)
+3. UEFI Shell
+```
+
+O Recovery foi acessado diretamente pela entrada `Recovery 15.8 (dmg)`, sem auxiliary action e sem alterar a seleção padrão. Após sair do Recovery, o boot normal voltou ao macOS instalado automaticamente e o SSH respondeu novamente.
+
+A correção do socket QMP curto permaneceu funcional no runtime real, usando `run/qmp.path` para descobrir o socket efetivo sob `/run/user/<uid>/...`.
+
+Com os critérios estáticos, controlados e runtime concluídos, a T002 está aceita.
 
 ## Histórico
 
