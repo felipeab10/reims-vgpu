@@ -145,7 +145,43 @@ O sistema gera automaticamente:
 
 O fluxo atual de `scripts/reims-vm-manager.sh` deve ser simplificado, reaproveitando o download via OSX-KVM, validação de chunklist, criação das imagens e geração da identidade.
 
-### 4.3 OpenCore e seleção automática do sistema
+### 4.3 Contrato de progresso do provisionamento
+
+O provisionador deve separar saída técnica de estado apresentado ao usuário.
+
+Cada operação longa deve poder publicar eventos estruturados equivalentes a:
+
+```text
+phase
+label
+state
+current
+total
+percent
+started_at
+elapsed_seconds
+message
+```
+
+`current/total/percent` são opcionais e só devem existir quando a operação possui progresso real mensurável. Builds ou operações sem unidade confiável usam estado indeterminado.
+
+As fases mínimas previstas incluem:
+
+```text
+preflight
+download
+verify
+convert
+create_disk
+generate_identity
+build_opencore
+prepare_firmware
+launch_installer
+```
+
+A UI do first boot consome esses eventos e apresenta uma única experiência contínua de instalação. Logs técnicos completos continuam sendo gravados separadamente para diagnóstico.
+
+### 4.4 OpenCore e seleção automática do sistema
 
 O OpenCore da VM é parte do estado persistente da máquina e deve ser personalizado por instalação. A imagem compartilhada do projeto é apenas uma fonte/base; o appliance nunca deve depender de um `config.plist` gerado que não tenha sido efetivamente instalado dentro do `OpenCore.qcow2` da VM.
 
@@ -169,7 +205,7 @@ A configuração deve permitir persistência da seleção padrão (incluindo `Al
 
 Na experiência normal pós-instalação, o usuário não deve precisar selecionar manualmente `Macintosh HD`/volume equivalente a cada boot.
 
-### 4.4 Polimento de boot nativo — somente após validação funcional
+### 4.5 Polimento de boot nativo — somente após validação funcional
 
 Depois que persistência, instalação, autoboot, fullscreen, lifecycle, atualização e matriz Ventura/Sonoma/Sequoia estiverem validados, será feita uma etapa separada de polimento para aproximar a experiência visual/sonora de um Mac nativo.
 
