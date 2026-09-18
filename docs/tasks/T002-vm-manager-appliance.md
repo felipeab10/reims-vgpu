@@ -1,6 +1,6 @@
 # T002 — Simplificar o VM Manager para fluxo de appliance
 
-Status: `[-]` em andamento — bloqueios de storage e chunklist non-TTY resolvidos; pronta para novo runtime
+Status: `[!]` bloqueada em runtime — QMP socket excede limite de pathname Unix
 
 Dependência: **T001** deve estar implementada ou disponível para integração.
 
