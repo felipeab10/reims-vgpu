@@ -182,6 +182,65 @@ A variante `opencore-image-ng-linux.sh` usa contrato `.fish` diferente e está i
 
 O objetivo continua sendo gerar uma imagem dedicada e então executar `qemu-img check` + inspeção read-only de `EFI/BOOT/BOOTX64.EFI`, `EFI/OC/OpenCore.efi` e `EFI/OC/config.plist`.
 
+## OpenCore dedicado — validação controlada PASS
+
+Implementação reportada em:
+
+```text
+branch: feat/t002-vm-manager-appliance
+HEAD: 04d34e53
+commit: 04d34e53 fix(appliance): finalize per-VM OpenCore image build
+```
+
+Builder selecionado:
+
+```text
+third_party/osx-serial-generator/generate-specific-bootdisk.sh
+→ third_party/osx-serial-generator/opencore-image-ng.sh
+```
+
+Fixture exclusiva:
+
+```text
+/home/felipeab10/Documentos/reims-t002-fixtures/opencore
+```
+
+Resultados reportados:
+
+```text
+OPENCORE_BUILD=PASS
+QEMU_IMG_INFO=PASS
+QEMU_IMG_CHECK=PASS
+OPENCORE_BOOTX64=PASS
+OPENCORE_EFI=PASS
+OPENCORE_CONFIG=PASS
+CONFIG_IMAGE_MATCH=PASS
+SHOW_PICKER=PASS
+PICKER_MODE=PASS
+TIMEOUT=PASS
+ALLOW_SET_DEFAULT=PASS
+REQUEST_BOOT_VAR_ROUTING=PASS
+IDENTITY_IN_IMAGE=PASS
+SHARED_OPENCORE_UNCHANGED=PASS
+INSTALLER_LAYOUT=PASS
+OVERWRITE_PROTECTION=PASS
+LAUNCHER_TEST=PASS
+STATIC_TESTS=PASS
+CONTROLLED_TESTS=PASS
+```
+
+A inspeção final foi read-only via `guestfish --ro`, com descoberta de partições/filesystems e extração do `EFI/OC/config.plist`. O plist extraído foi semanticamente equivalente ao plist gerado e, nessa execução, também byte-identical.
+
+A pendência estática remanescente é pequena: a fase `build_opencore` já emite `running` e `completed`, porém `failed` ainda não é garantido em todos os caminhos de erro do builder. Antes do runtime completo, fechar esse contrato e garantir que stdout/stderr técnico do builder possa ser capturado em log separado da saída amigável.
+
+Pendências runtime continuam:
+
+```text
+RUNTIME_INSTALL_REBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_AUTOBOOT=PENDING_RUNTIME_VALIDATION
+RUNTIME_RECOVERY=PENDING_RUNTIME_VALIDATION
+```
+
 ## Histórico
 
 Nenhuma implementação validada ainda.
