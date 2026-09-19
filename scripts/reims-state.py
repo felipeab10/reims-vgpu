@@ -64,10 +64,10 @@ def write_state(value, base=None, fail_before_replace=False):
     return value
 
 def paths(value=None, base=None):
-    value = value or read_state(base); vm = root() / "vms" / value["vm_id"] if value["vm_id"] else None
+    value = value or read_state(base); base_root = Path(base) if base is not None else root(); vm = base_root / "vms" / value["vm_id"] if value["vm_id"] else None
     if vm is None: return {"VM_ROOT": None}
     persistent = vm / "persistent"
-    return {"VM_ROOT": str(vm), "PERSISTENT_DIR": str(persistent), "INSTALLER_DIR": str(vm/"installer"), "RUN_DIR": str(vm/"run"), "SERIAL_DIR": str(vm/"serial"), "MACOS_DISK": str(persistent/"macos.qcow2"), "OPENCORE": str(persistent/"OpenCore.qcow2"), "OVMF_CODE": str(persistent/"OVMF_CODE.fd"), "OVMF_VARS": str(persistent/"OVMF_VARS.fd"), "RAILS_DIR": str(root()/"rails")}
+    return {"VM_ROOT": str(vm), "PERSISTENT_DIR": str(persistent), "INSTALLER_DIR": str(vm/"installer"), "RUN_DIR": str(vm/"run"), "SERIAL_DIR": str(vm/"serial"), "MACOS_DISK": str(persistent/"macos.qcow2"), "OPENCORE": str(persistent/"OpenCore.qcow2"), "OVMF_CODE": str(persistent/"OVMF_CODE.fd"), "OVMF_VARS": str(persistent/"OVMF_VARS.fd"), "RAILS_DIR": str(base_root/"rails")}
 
 def main(argv=None):
     p=argparse.ArgumentParser(); sub=p.add_subparsers(dest="cmd", required=True)
@@ -76,7 +76,16 @@ def main(argv=None):
     t=sub.add_parser("transition"); t.add_argument("state", choices=sorted(STATES))
     args=p.parse_args(argv)
     try:
-        if args.cmd == "init": write_state({"schema":1,"configured":False,"vm_id":None,"macos":None,"state":"unconfigured","cpu":None,"ram_gb":None,"disk_gb":None}); print("state=unconfigured")
+        if args.cmd == "init":
+            path = state_path()
+            if path.exists():
+                current = read_state()
+                if current["configured"]:
+                    raise ValueError("state already contains a configured primary VM")
+                print("state=unconfigured")
+            else:
+                write_state({"schema":1,"configured":False,"vm_id":None,"macos":None,"state":"unconfigured","cpu":None,"ram_gb":None,"disk_gb":None})
+                print("state=unconfigured")
         elif args.cmd == "configure":
             path = state_path()
             if path.exists() and read_state()["configured"]:

@@ -3,12 +3,14 @@ set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OSX_KVM="${OSX_KVM:-$ROOT/third_party/OSX-KVM}"
 REIMS_STATE_ROOT="${REIMS_STATE_ROOT:-/var/lib/reims}"
-WORK_ROOT="${REIMS_VM_WORK_ROOT:-$REIMS_STATE_ROOT/vms}"
-RAILS_DIR="${RAILS_DIR:-$REIMS_STATE_ROOT/rails}"
+WORK_ROOT="$REIMS_STATE_ROOT/vms"
+RAILS_DIR="$REIMS_STATE_ROOT/rails"
 PERSIST_MODE="${REIMS_PERSIST_MODE:-persistent}"
 SMBIOS_MODEL="${REIMS_SMBIOS_MODEL:-iMacPro1,1}"
 RESERVE_CORES="${REIMS_RESERVE_CORES:-2}"; RESERVE_RAM="${REIMS_RESERVE_RAM_GB:-4}"
 die(){ echo "ERRO: $*" >&2; exit 1; }
+if [[ -n "${REIMS_VM_WORK_ROOT:-}" && "$REIMS_VM_WORK_ROOT" != "$WORK_ROOT" ]]; then die "REIMS_VM_WORK_ROOT must match REIMS_STATE_ROOT/vms"; fi
+if [[ -n "${RAILS_DIR_OVERRIDE:-}" && "$RAILS_DIR_OVERRIDE" != "$RAILS_DIR" ]]; then die "RAILS_DIR override must match REIMS_STATE_ROOT/rails"; fi
 fetch_media(){ local base=$1 installer="$base/installer"; mkdir -p "$base/run"; : > "$base/run/provision.log"; emit_progress fetch_media running; if [[ ! -f "$installer/$VERSION.dmg" || ! -f "$installer/$VERSION.chunklist" ]]; then if ! python3 "$ROOT/scripts/reims-fetch-macos.py" --action download --shortname "$VERSION" --os-type "$OS_TYPE" --outdir "$installer" --basename "$VERSION" >>"$base/run/provision.log" 2>&1; then emit_progress fetch_media failed "Falha ao baixar ou validar o instalador do macOS"; printf "ERRO: Falha ao baixar ou validar o instalador do macOS (consulte %s)\n" "$base/run/provision.log" >&2; return 1; fi; else if ! python3 "$ROOT/scripts/reims-fetch-macos.py" --verify-only "$installer/$VERSION.dmg" "$installer/$VERSION.chunklist" >>"$base/run/provision.log" 2>&1; then emit_progress fetch_media failed "Falha ao baixar ou validar o instalador do macOS"; printf "ERRO: Falha ao baixar ou validar o instalador do macOS (consulte %s)\n" "$base/run/provision.log" >&2; return 1; fi; fi; emit_progress fetch_media completed; }
 need(){ command -v "$1" >/dev/null 2>&1 || missing+=("$1"); }
 emit_progress(){ local phase=$1 state=$2 message=${3:-}; printf "phase=%s state=%s" "$phase" "$state"; [[ -n "$message" ]] && printf " message=%s" "$message"; printf "\n"; }

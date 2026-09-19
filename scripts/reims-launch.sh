@@ -6,7 +6,7 @@ export REIMS_STATE_ROOT="$STATE_ROOT"
 DRY=0
 [ "${1:-}" = --dry-run ] && { DRY=1; shift; }
 [ "$#" -eq 0 ] || { echo "usage: scripts/reims-launch.sh [--dry-run]" >&2; exit 64; }
-readarray -t KV < <(python3 - "$ROOT/scripts/reims-state.py" <<"PY"
+if ! STATE_KV="$(python3 - "$ROOT/scripts/reims-state.py" <<"PY"
 import importlib.util, sys
 s=importlib.util.spec_from_file_location("reims_state",sys.argv[1]); m=importlib.util.module_from_spec(s); s.loader.exec_module(m)
 v=m.read_state()
@@ -15,7 +15,11 @@ if v["state"] == "recovery": raise ValueError("state is recovery; recovery launc
 p=m.paths(v)
 for k,val in {**p,"VM_ID":v["vm_id"],"MACOS":v["macos"],"CPU_CORES":v["cpu"],"RAM":v["ram_gb"],"DISK_GB":v["disk_gb"],"APPLIANCE_STATE":v["state"]}.items(): print(f"{k}={val}")
 PY
-) || { echo "ERROR: invalid Reims state" >&2; exit 1; }
+)"; then
+  echo "ERROR: invalid Reims state" >&2
+  exit 1
+fi
+mapfile -t KV <<< "$STATE_KV"
 for item in "${KV[@]}"; do key=${item%%=*}; val=${item#*=}; printf -v "$key" "%s" "$val"; done
 INSTALL_MEDIA="$INSTALLER_DIR/$MACOS.img"
 if [ "$APPLIANCE_STATE" = installed ]; then INSTALL_MEDIA=""; QEMU_REBOOT_ACTION=exit; else [ -f "$INSTALL_MEDIA" ] || { echo "ERROR: installer media missing: $INSTALL_MEDIA" >&2; exit 1; }; QEMU_REBOOT_ACTION=reset; fi
