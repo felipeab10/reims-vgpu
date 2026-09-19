@@ -1,6 +1,6 @@
 # T004 — Criar modelo de estado persistente do appliance
 
-Status: `[ ]` não iniciada
+Status: `[-]` em validação
 
 Dependências: **T001**, **T002** e decisões consolidadas em `docs/arquitetura.md`.
 
@@ -111,6 +111,16 @@ Registrar nesta task:
 - exemplos de transição de estado;
 - prova de que paths de VM não ficam dentro da release Git.
 
+## Implementação em validação
+
+- Schema 1 validado em `scripts/reims-state.py`.
+- Estado padrão: `REIMS_STATE_ROOT=/var/lib/reims`, com override controlado para testes.
+- Estado: `REIMS_STATE_ROOT/state.json`; dados: `REIMS_STATE_ROOT/vms/<vm-id>/`.
+- Estados: `unconfigured`, `installing`, `installed`, `recovery`.
+- Escrita atômica: arquivo temporário no mesmo diretório, `fsync` do arquivo, `os.replace` e `fsync` do diretório quando suportado.
+- Launcher state-driven: `scripts/reims-launch.sh --dry-run`.
+- O VM Manager cria `installing` antes do provisionamento; `installed` não é automático.
+
 ## Histórico
 
-Nenhuma implementação validada ainda.
+Implementação T004 em validação; ainda não concluída.

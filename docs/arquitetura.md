@@ -76,13 +76,15 @@ Nesse modo, QEMU abre os discos persistentes diretamente em leitura/escrita:
 
 ```text
 /var/lib/reims/vms/<vm-id>/
-├── macos.qcow2
-├── OpenCore.qcow2
-├── OVMF_VARS.fd
-├── config.toml
-├── machine-id
-├── logs/
-└── serial/
+├── installer/
+├── persistent/
+│   ├── macos.qcow2
+│   ├── OpenCore.qcow2
+│   ├── OVMF_CODE.fd
+│   └── OVMF_VARS.fd
+├── run/
+├── serial/
+└── serial-work/
 ```
 
 Alterações feitas dentro do macOS são persistidas continuamente no disco virtual. Não é necessário criar um novo snapshot a cada desligamento.

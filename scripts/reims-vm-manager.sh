@@ -2,8 +2,9 @@
 set -Eeuo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 OSX_KVM="${OSX_KVM:-$ROOT/third_party/OSX-KVM}"
-WORK_ROOT="${REIMS_VM_WORK_ROOT:-$HOME/.local/share/reims-vgpu/vms}"
-RAILS_DIR="${RAILS_DIR:-$ROOT/vm/disks/rails}"
+REIMS_STATE_ROOT="${REIMS_STATE_ROOT:-/var/lib/reims}"
+WORK_ROOT="${REIMS_VM_WORK_ROOT:-$REIMS_STATE_ROOT/vms}"
+RAILS_DIR="${RAILS_DIR:-$REIMS_STATE_ROOT/rails}"
 PERSIST_MODE="${REIMS_PERSIST_MODE:-persistent}"
 SMBIOS_MODEL="${REIMS_SMBIOS_MODEL:-iMacPro1,1}"
 RESERVE_CORES="${REIMS_RESERVE_CORES:-2}"; RESERVE_RAM="${REIMS_RESERVE_RAM_GB:-4}"
@@ -15,6 +16,7 @@ preflight(){ missing=(); for x in bash python3 cargo qemu-img dmg2img pkg-config
 choose(){ local o=(ventura sonoma sequoia); select VERSION in "${o[@]}"; do [[ -n "$VERSION" ]]&&break; done; case "$VERSION" in ventura) OS_TYPE=latest;; sonoma|sequoia) OS_TYPE=default;; esac; }
 resources(){ read -r -p "CPUs [$HOST_CORES]: " CORES; CORES=${CORES:-4}; read -r -p "RAM GiB [$HOST_RAM]: " RAM; RAM=${RAM:-8}; read -r -p 'Disco GiB [mínimo 70]: ' DISK; DISK=${DISK:-70}; [[ "$CORES" =~ ^[0-9]+$ && "$RAM" =~ ^[0-9]+$ && "$DISK" =~ ^[0-9]+$ ]]||die resources; ((CORES>0&&CORES<=HOST_CORES&&RAM>=2&&RAM<=HOST_RAM&&DISK>=70))||die resources; }
 new_id(){ local id; while :; do id="reims-$(uuidgen | tr -d "-" | cut -c1-16)"; [[ ! -e "$WORK_ROOT/$id" && ! -e "$RAILS_DIR/$id" ]] && { VM_ID=$id; return; }; done; }
+create_installing_state(){ python3 "$ROOT/scripts/reims-state.py" configure --vm-id "$VM_ID" --macos "$VERSION" --cpu "$CORES" --ram-gb "$RAM" --disk-gb "$DISK" >/dev/null; }
 run_opencore_builder(){ local base=$1 sw=$2 env_file=$3 rc log; log="$base/run/provision.log"; mkdir -p "$base/run"; printf "\n=== build_opencore ===\n" >>"$log"; emit_progress build_opencore running; if [[ -n "${REIMS_T002_BUILDER:-}" ]]; then if bash "$REIMS_T002_BUILDER" >>"$log" 2>&1; then :; else rc=$?; emit_progress build_opencore failed "Falha ao configurar o OpenCore"; printf "ERRO: Falha ao configurar o OpenCore (consulte %s)\n" "$log" >&2; return "$rc"; fi; elif (cd "$sw" && source "$env_file" && bash ./generate-specific-bootdisk.sh --model "$DEVICE_MODEL" --serial "$SERIAL" --board-serial "$BOARD_SERIAL" --uuid "$UUID" --mac-address "$MAC_ADDRESS" --master-plist "$base/serial/config-auto.plist" --output-bootdisk "$base/persistent/OpenCore.qcow2") >>"$log" 2>&1; then :; else rc=$?; emit_progress build_opencore failed "Falha ao configurar o OpenCore"; printf "ERRO: Falha ao configurar o OpenCore (consulte %s)\n" "$log" >&2; return "$rc"; fi; emit_progress build_opencore completed; }
 verify(){ python3 - "$1" "$2" <<'PY'
 import hashlib,struct,sys
@@ -38,5 +40,6 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   choose
   resources
   new_id
+  create_installing_state
   prepare
 fi
