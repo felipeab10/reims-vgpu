@@ -57,6 +57,18 @@ echo EARLY_PROVISION_LOG=PASS
 echo INSTALLER_LAYOUT=PASS
 echo OVERWRITE_PROTECTION=PASS
 mkdir -p "$WORK_ROOT/reims-2222222222222222/run"
+printf fetch-marker > "$WORK_ROOT/reims-2222222222222222/run/provision.log"
+SUCCESS_BUILDER="$TMP/success-builder.sh"
+printf "#!/usr/bin/env bash\nprintf \"builder simulated success\\n\"\nexit 0\n" > "$SUCCESS_BUILDER"
+chmod +x "$SUCCESS_BUILDER"
+if REIMS_T002_BUILDER="$SUCCESS_BUILDER" run_opencore_builder "$WORK_ROOT/reims-2222222222222222" "$TMP" "$TMP/none" > "$TMP/success.log" 2>&1; then :; else exit 1; fi
+grep -q "state=running" "$TMP/success.log"
+grep -q "state=completed" "$TMP/success.log"
+! grep -q "state=failed" "$TMP/success.log"
+grep -q fetch-marker "$WORK_ROOT/reims-2222222222222222/run/provision.log"
+grep -q "builder simulated success" "$WORK_ROOT/reims-2222222222222222/run/provision.log"
+echo PROGRESS_OPENCORE_SUCCESS=PASS
+echo PROVISION_LOG_PRESERVES_FETCH=PASS
 TEST_BUILDER="$TMP/fake-builder.sh"
 printf "#!/usr/bin/env bash\nprintf \"builder simulated failure\\n\" >&2\nexit 17\n" > "$TEST_BUILDER"
 chmod +x "$TEST_BUILDER"
@@ -70,9 +82,32 @@ echo PROGRESS_OPENCORE_SUCCESS=PASS
 echo PROGRESS_OPENCORE_FAILURE=PASS
 echo TECHNICAL_LOG_CAPTURE=PASS
 LONG_RUN_DIR="$TMP/very-long-runtime-path-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-SOCKET="/tmp/r-qmp-test.sock"
+mkdir -p "$LONG_RUN_DIR"
+QMP_RUNTIME_DIR=$(mktemp -d /tmp/r-qmp-test-XXXXXX)
+chmod 700 "$QMP_RUNTIME_DIR"
+QMP_SOCK="$QMP_RUNTIME_DIR/qmp.sock"
+printf "%s\n" "$QMP_SOCK" > "$LONG_RUN_DIR/qmp.path"
 [[ ${#LONG_RUN_DIR} -gt 108 ]]
-[[ ${#SOCKET} -lt 108 ]]
+[[ ${#QMP_SOCK} -lt 108 ]]
+QEMU_TEST_BIN="${QEMU_BIN:-/home/felipeab10/Documentos/reims-macos-appliance-runtime/vendor/qemu/build/qemu-system-x86_64}"
+"$QEMU_TEST_BIN" -display none -nodefaults -machine none -qmp "unix:$QMP_SOCK,server=on,wait=off" -S >"$TMP/qmp.log" 2>&1 &
+QMP_PID=$!
+for _ in $(seq 1 50); do [[ -S "$QMP_SOCK" ]] && break; sleep .1; done
+test -S "$QMP_SOCK"
+QMP_REAL=$(cat "$LONG_RUN_DIR/qmp.path")
+test -S "$QMP_REAL"
+python3 - "$QMP_REAL" <<"PY"
+import json,socket,sys
+s=socket.socket(socket.AF_UNIX); s.connect(sys.argv[1]); f=s.makefile("rwb",buffering=0)
+json.loads(f.readline())
+def call(name):
+ f.write((json.dumps({"execute":name})+"\n").encode()); return json.loads(f.readline())
+assert "return" in call("qmp_capabilities")
+assert call("query-status")["return"]["status"] == "prelaunch"
+PY
+kill "$QMP_PID" 2>/dev/null || true
+wait "$QMP_PID" 2>/dev/null || true
+rm -rf "$QMP_RUNTIME_DIR" "$LONG_RUN_DIR"
 echo QMP_SHORT_RUN_DIR=PASS
 echo QMP_LONG_RUN_DIR=PASS
 echo QMP_DISCOVERY=PASS
