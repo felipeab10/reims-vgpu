@@ -451,9 +451,8 @@ mkdir -p "$RUN_DIR"
 STAMP="$(date +%Y%m%d-%H%M%S)"
 SERIAL_LOG="$RUN_DIR/serial-$STAMP.log"
 QMP_RUNTIME_BASE="${REIMS_QMP_RUNTIME_DIR:-${XDG_RUNTIME_DIR:-/tmp}}"
-mkdir -p "$QMP_RUNTIME_BASE"
-chmod 700 "$QMP_RUNTIME_BASE" 2>/dev/null || true
-QMP_RUNTIME_DIR="$(mktemp -d "${QMP_RUNTIME_BASE%/}/r-q-XXXXXX")" || die "cannot create private QMP runtime directory"
+( umask 077; mkdir -p "$QMP_RUNTIME_BASE" ) || die "cannot create QMP runtime base"
+QMP_RUNTIME_DIR="$(umask 077; mktemp -d "${QMP_RUNTIME_BASE%/}/r-q-XXXXXX")" || die "cannot create private QMP runtime directory"
 chmod 700 "$QMP_RUNTIME_DIR"
 QMP_SOCK="$QMP_RUNTIME_DIR/qmp.sock"
 QMP_SOCKET_LENGTH=${#QMP_SOCK}

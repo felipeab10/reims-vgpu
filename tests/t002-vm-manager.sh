@@ -81,6 +81,23 @@ grep -q "builder simulated failure" "$WORK_ROOT/reims-2222222222222222/run/provi
 echo PROGRESS_OPENCORE_SUCCESS=PASS
 echo PROGRESS_OPENCORE_FAILURE=PASS
 echo TECHNICAL_LOG_CAPTURE=PASS
+QMP_PARENT="$TMP/qmp-parent"
+mkdir "$QMP_PARENT"
+chmod 755 "$QMP_PARENT"
+QMP_PARENT_BEFORE=$(stat -c %a "$QMP_PARENT")
+QMP_SESSION=$(umask 077; mktemp -d "$QMP_PARENT/r-q-XXXXXX")
+QMP_PARENT_AFTER=$(stat -c %a "$QMP_PARENT")
+[[ "$QMP_PARENT_BEFORE" == "$QMP_PARENT_AFTER" ]]
+[[ "$(stat -c %a "$QMP_SESSION")" == 700 ]]
+echo QMP_PARENT_PERMISSIONS_PRESERVED=PASS
+echo QMP_SESSION_PERMISSIONS=PASS
+TMP_MODE_BEFORE=$(stat -c %a /tmp)
+FALLBACK_PARENT="${REIMS_QMP_RUNTIME_DIR_UNSET_TEST:-/tmp}"
+FALLBACK_SESSION=$(umask 077; mktemp -d "${FALLBACK_PARENT%/}/r-q-test-XXXXXX")
+TMP_MODE_AFTER=$(stat -c %a /tmp)
+[[ "$TMP_MODE_BEFORE" == "$TMP_MODE_AFTER" ]]
+rm -rf "$FALLBACK_SESSION" "$QMP_SESSION"
+echo QMP_TMP_PERMISSIONS_PRESERVED=PASS
 LONG_RUN_DIR="$TMP/very-long-runtime-path-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
 mkdir -p "$LONG_RUN_DIR"
 QMP_RUNTIME_DIR=$(mktemp -d /tmp/r-qmp-test-XXXXXX)
