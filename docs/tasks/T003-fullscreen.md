@@ -1,6 +1,6 @@
 # T003 — Implementar fullscreen nativo obrigatório
 
-Status: `[ ]` não iniciada
+Status: `[-]` em validação
 
 Dependência: **T001** e integração básica de **T002**.
 
@@ -78,6 +78,13 @@ Registrar nesta task:
 - evidência de boot fullscreen automático em pelo menos duas execuções;
 - resultado do teste com fullscreen desabilitado.
 
+## API e integração atual
+
+- `REIMS_VGPU_FULLSCREEN=1`: a janela host existente solicita `winit::window::Fullscreen::Borderless(None)` antes de `create_window()`.
+- `REIMS_VGPU_FULLSCREEN=0`: mantém o modo `WindowMode::Sized` para desenvolvimento.
+- `--persistent`: o launcher exporta `REIMS_VGPU_FULLSCREEN=1` somente quando a variável não estava presente; `0`, `1` e até valor vazio explicitamente fornecidos pelo operador são preservados.
+- `--testing`, `--interactive` e `--capture`: não recebem fullscreen automático.
+
 ## Histórico
 
-Nenhuma implementação validada ainda.
+Integração do default de appliance em validação; T003 ainda não está concluída.
