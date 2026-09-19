@@ -108,17 +108,22 @@ Stop a wedged guest with the pathway's shutdown helper when available
 
 ## macOS Tahoe installer with Reims from first boot
 
-The OSX-KVM tooling is integrated as the attributed submodule `third_party/OSX-KVM`
-(source: https://github.com/kholia/OSX-KVM, pinned to its recorded commit).
-Downloaded Apple recovery media and guest disks remain local and are ignored.
+The Reims OS appliance owns the canonical OSX-KVM checkout:
 
-Prepare the Tahoe recovery image outside Git:
+https://github.com/felipeab10/reims-os
+
+This component repository does not vendor OSX-KVM. Provisioning and appliance
+lifecycle belong to reims-os. For isolated low-level development, provide an
+external OSX-KVM checkout explicitly; downloaded Apple recovery media and guest
+disks remain local and are ignored.
+
+Prepare a Tahoe recovery image outside Git using an external checkout:
 
 ```bash
-OSX_KVM=$PWD/third_party/OSX-KVM
-TAHOE=/home/felipeab10/Documentos/macos/tahoe-installer
-python3 "$OSX_KVM/fetch-macOS-v2.py" --action download --shortname tahoe --os-type latest \
-  --outdir "$TAHOE" --basename Tahoe
+: "${OSX_KVM:?set OSX_KVM to an external OSX-KVM checkout}"
+TAHOE="${TAHOE:-$PWD/.local/tahoe-installer}"
+mkdir -p "$TAHOE"
+python3 "$OSX_KVM/fetch-macOS-v2.py" --action download --shortname tahoe --os-type latest   --outdir "$TAHOE" --basename Tahoe
 dmg2img -i "$TAHOE/Tahoe.dmg" "$TAHOE/Tahoe.img"
 qemu-img create -f qcow2 "$TAHOE/macos.img" 256G
 ```

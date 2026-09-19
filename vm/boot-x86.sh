@@ -212,6 +212,8 @@ Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR PERSISTENT_DIR QEMU_BIN OVMF_CODE
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
      QEMU_REBOOT_ACTION=exit|pause|reset
+     REIMS_VGPU_FULLSCREEN=1 native borderless fullscreen; =0 sized/windowed
+     (set explicitly by the caller; no product default is applied here)
        (default exit — guest reboot/KP-reset → QEMU quits; serial already on disk)
      TRACE=1 — QEMU trace events → \$RUN_DIR/trace-<stamp>.log
      TRACE_PATTERN=glob — override the default trace glob
@@ -266,10 +268,6 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
-# Persistent appliance boots request native borderless fullscreen by default.
-# An explicitly present REIMS_VGPU_FULLSCREEN (including 0 or empty) wins.
-source "$REPO_ROOT/scripts/reims-fullscreen-env.sh"
-reims_resolve_fullscreen "$BOOT_CLASS"
 
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-x86.sh: $*" >&2; exit 1; }
