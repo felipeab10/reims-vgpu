@@ -1,6 +1,6 @@
 # T003 — Implementar fullscreen nativo obrigatório
 
-Status: `[-]` em validação
+Status: `[x]` concluída e validada
 
 Dependência: **T001** e integração básica de **T002**.
 
@@ -85,6 +85,23 @@ Registrar nesta task:
 - `--persistent`: o launcher exporta `REIMS_VGPU_FULLSCREEN=1` somente quando a variável não estava presente; `0`, `1` e até valor vazio explicitamente fornecidos pelo operador são preservados.
 - `--testing`, `--interactive` e `--capture`: não recebem fullscreen automático.
 
+## Validação final
+
+- implementação: `dd6ba80e9c2588b9e79dfffddced6a47b1a349ca`;
+- PR: #3;
+- merge em `master`: `6b517cdb62fc6fd62c4459a7dd67401b62ace5d1`;
+- host de validação: Wayland + niri;
+- `cargo check --package reims-vgpu --no-default-features --features backend-vulkan,host-window`: PASS;
+- testes host-window: 50 passed, 0 failed;
+- regressão T002: PASS;
+- boot persistente 1: fullscreen automático, `REIMS_VGPU_FULLSCREEN=1`, QEMU `-display none`: PASS;
+- boot persistente 2: fullscreen automático repetível: PASS;
+- override `REIMS_VGPU_FULLSCREEN=0`: modo windowed/sized: PASS;
+- apresentação: primeiro frame e primeiro guest frame via rail resident: PASS;
+- nenhum workaround externo de fullscreen foi usado.
+
+A indisponibilidade de SSH observada durante essa rodada foi classificada separadamente como problema não pertencente à T003. O caminho de input não foi alterado por esta task e os testes existentes de host-window permaneceram passando.
+
 ## Histórico
 
-Integração do default de appliance em validação; T003 ainda não está concluída.
+T003 concluída após revisão remota da PR #3 e validação runtime do fullscreen automático e do override windowed.
