@@ -266,6 +266,11 @@ while [ "$#" -gt 0 ]; do
   esac
 done
 
+# Persistent appliance boots request native borderless fullscreen by default.
+# An explicitly present REIMS_VGPU_FULLSCREEN (including 0 or empty) wins.
+source "$REPO_ROOT/scripts/reims-fullscreen-env.sh"
+reims_resolve_fullscreen "$BOOT_CLASS"
+
 # --- Preflight ------------------------------------------------------------------
 die() { echo "boot-x86.sh: $*" >&2; exit 1; }
 
