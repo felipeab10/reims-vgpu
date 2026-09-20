@@ -24,6 +24,22 @@ vm/boot-x86.sh --device reims-vgpu-pci --testing --rail macos-11   # a specific 
 
 Both scripts use a snapshot-revert lifecycle (testing vs interactive classes; testing hard kill).
 
+### Host window system
+
+`REIMS_VGPU_WINDOW_SYSTEM` decides which window system the host-owned window
+opens on (`vm/window-system-env.sh`, applied by `vm/boot-x86.sh`):
+
+- `auto` (default) — leave the environment as the caller set it, with the
+  historical development fallbacks that invent `WAYLAND_DISPLAY`/`DISPLAY`
+  when neither is present. Works on a Wayland desktop and on an X11 session.
+- `x11` — require a non-empty `DISPLAY` and remove `WAYLAND_DISPLAY` and
+  `WAYLAND_SOCKET` before QEMU/reims-vgpu start. winit 0.30 has no
+  `WINIT_UNIX_BACKEND` and prefers Wayland whenever both are set, so the
+  variables are what selects X11. A missing `DISPLAY` is a refusal.
+- `wayland` — require `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`.
+
+Contract test: `vm/tests/window-system-env-test.sh` (no VM, no display needed).
+
 ## Driving a guest, and sweeping every rail
 
 A boot that sits at an idle Finder produces no rates, and almost every reading
