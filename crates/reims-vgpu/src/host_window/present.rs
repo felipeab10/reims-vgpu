@@ -245,35 +245,159 @@ impl FullscreenStrategy {
     }
 }
 
+/// Where a WM-less window's rectangle came from.
+///
+/// Carried with the geometry rather than inferred later: a boot that only got
+/// its rectangle because RandR had nothing usable must say so, or a reader
+/// cannot tell a measured monitor from a fallback that happened to be the right
+/// size. It is also the answer to "did the fallback run at all".
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WmLessGeometrySource {
+    /// A RandR monitor `winit` identified, by a non-zero native id.
+    Monitor,
+    /// The X11 root window, used when no usable RandR monitor exists.
+    X11Root,
+}
+
+impl WmLessGeometrySource {
+    /// The name this source takes in the `host_window_mode` line.
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::Monitor => "monitor",
+            Self::X11Root => "x11_root",
+        }
+    }
+}
+
+/// A monitor as the geometry policy sees it: `winit`'s own identity plus the
+/// rectangle it reports.
+///
+/// The policy only needs the identity to reject the dummy and the rectangle to
+/// build the window, so that is all this carries — which is what keeps the
+/// policy a pure function of values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MonitorRect {
+    pub native_id: u32,
+    pub position: winit::dpi::PhysicalPosition<i32>,
+    pub size: winit::dpi::PhysicalSize<u32>,
+}
+
+impl MonitorRect {
+    /// Whether this is a monitor rather than the placeholder `winit` substitutes
+    /// when RandR yields no CRTC.
+    ///
+    /// Zero is `winit`'s own marker: its X11 backend builds the placeholder with
+    /// `id: 0` and `is_dummy()` is literally `self.id == 0`. That method is
+    /// `pub(crate)`, but `native_id()` is public and returns the same `id`, so
+    /// zero is the identification available outside the crate. Size is
+    /// deliberately not the test: a real monitor may legitimately be any size,
+    /// and the placeholder's `1x1` is a symptom of its identity, not the identity.
+    pub fn is_usable(self) -> bool {
+        self.native_id != 0
+    }
+}
+
+/// The X11 root window's rectangle.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RootRect {
+    pub size: winit::dpi::PhysicalSize<u32>,
+}
+
+/// Why the root window's rectangle was not available.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RootRectError {
+    /// The event loop's raw display handle was not Xlib, or carried no display
+    /// pointer. The WM-less path says X11, so anything else is a contradiction
+    /// rather than a reason to guess.
+    NoXlibHandle,
+    /// The Xlib call itself failed; the string is the greppable reason.
+    QueryFailed(&'static str),
+}
+
 /// The rectangle and attribute set the WM-less X11 path pins, as data.
 ///
-/// Split from the code that reads a monitor so the four properties the
-/// appliance depends on — override-redirect, undecorated, fixed, monitor-sized
-/// — are testable without an X server. The window code turns this into
-/// [`winit::window::WindowAttributes`]; this type is where the values are
-/// decided.
+/// Split from the code that reads a monitor or the root so the properties the
+/// appliance depends on — override-redirect, undecorated, fixed, screen-sized,
+/// and where the rectangle came from — are testable without an X server. The
+/// window code turns this into [`winit::window::WindowAttributes`]; this type is
+/// where the values are decided.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WmLessX11Geometry {
     pub position: winit::dpi::PhysicalPosition<i32>,
     pub size: winit::dpi::PhysicalSize<u32>,
+    pub source: WmLessGeometrySource,
     pub decorations: bool,
     pub resizable: bool,
     pub override_redirect: bool,
 }
 
 impl WmLessX11Geometry {
-    /// The appliance window's rectangle for a monitor at `position` with `size`.
+    /// The appliance window's rectangle from the frames the window system offers.
     ///
-    /// The four attributes are not parameters: a window that took the monitor
-    /// rectangle and was still decorated, or still resizable, could be moved off
-    /// it or resized away from it.
-    pub fn for_monitor_rect(
-        position: winit::dpi::PhysicalPosition<i32>,
-        size: winit::dpi::PhysicalSize<u32>,
-    ) -> Self {
+    /// The policy, in order, with no other branch anywhere:
+    ///
+    /// 1. the primary monitor, when `winit` identified one;
+    /// 2. otherwise the first available monitor it identified;
+    /// 3. otherwise the X11 root window's rectangle;
+    /// 4. otherwise a refusal.
+    ///
+    /// Step 3 exists because `winit`'s X11 backend answers a RandR-less or
+    /// CRTC-less server with a placeholder monitor of `1x1` at the root origin
+    /// rather than with `None` — `active_event_loop.primary_monitor()` is
+    /// `Some(placeholder)` — so a policy that only checks for absence silently
+    /// builds a one-pixel window. Xephyr is such a server, and a physical Xorg
+    /// is not, which is exactly why the placeholder has to be recognised by
+    /// identity and the fallback has to be a real answer instead of a size.
+    ///
+    /// The root is the right fallback here and nowhere else: the appliance
+    /// session is one application with no window manager, so the whole root
+    /// rectangle is the area that application may occupy. The degenerate
+    /// rectangles are refused rather than accepted, because a `1x1` root would
+    /// otherwise be reported as a successful full-screen window.
+    pub fn resolve(
+        primary: Option<MonitorRect>,
+        available: &[MonitorRect],
+        root: Result<RootRect, RootRectError>,
+    ) -> Result<Self, WindowError> {
+        if let Some(monitor) = primary.filter(|monitor| monitor.is_usable()) {
+            return Ok(Self::from_monitor_rect(monitor));
+        }
+        if let Some(monitor) = available
+            .iter()
+            .copied()
+            .find(|monitor| monitor.is_usable())
+        {
+            return Ok(Self::from_monitor_rect(monitor));
+        }
+        let root = match root {
+            Ok(root) => root,
+            Err(RootRectError::NoXlibHandle) => return Err(WindowError::X11RootHandle),
+            Err(RootRectError::QueryFailed(reason)) => {
+                return Err(WindowError::X11RootGeometry(reason.to_string()))
+            }
+        };
+        if root.size.width <= 1 || root.size.height <= 1 {
+            return Err(WindowError::X11RootGeometryInvalid {
+                width: root.size.width,
+                height: root.size.height,
+            });
+        }
+        Ok(Self {
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: root.size,
+            source: WmLessGeometrySource::X11Root,
+            decorations: false,
+            resizable: false,
+            override_redirect: true,
+        })
+    }
+
+    /// The appliance window's rectangle for a monitor's own rectangle.
+    fn from_monitor_rect(monitor: MonitorRect) -> Self {
         Self {
-            position,
-            size,
+            position: monitor.position,
+            size: monitor.size,
+            source: WmLessGeometrySource::Monitor,
             decorations: false,
             resizable: false,
             override_redirect: true,
@@ -313,20 +437,88 @@ fn apply_wm_less_geometry(
         .with_inner_size(geometry.size)
 }
 
-/// The monitor a WM-less appliance window takes.
+/// The WM-less window's rectangle, read from the window system this boot is on.
 ///
-/// Primary first, then the first the loop lists. No monitor at all is a refusal
-/// rather than a fallback size: a window that opened at [`WindowConfig`]'s
-/// extent because no monitor could be found would look like a working
-/// full-screen window that is quietly 1280x800, which is the failure the
-/// WM-less path exists to prevent.
-fn appliance_monitor(
+/// The only place `winit` and the X connection are touched; everything after this
+/// is [`WmLessX11Geometry::resolve`], which is pure. Note that "no monitor" is
+/// not a condition `winit`'s X11 backend can report as absence — see the
+/// placeholder discussion on [`MonitorRect::is_usable`] — so the monitor list is
+/// filtered by identity here and the root is consulted rather than trusted to be
+/// unnecessary.
+#[cfg(target_os = "linux")]
+fn resolve_wm_less_geometry(
     event_loop: &winit::event_loop::ActiveEventLoop,
-) -> Result<winit::monitor::MonitorHandle, WindowError> {
-    event_loop
-        .primary_monitor()
-        .or_else(|| event_loop.available_monitors().next())
-        .ok_or(WindowError::NoMonitor)
+) -> Result<WmLessX11Geometry, WindowError> {
+    let primary = event_loop.primary_monitor().map(monitor_rect);
+    let available: Vec<MonitorRect> = event_loop.available_monitors().map(monitor_rect).collect();
+    WmLessX11Geometry::resolve(primary, &available, x11_root_rect(event_loop))
+}
+
+/// The WM-less path is selected only on Linux/X11 — `config::window_system()`
+/// answers `None` in every other build — so this arm keeps the call site one
+/// shape rather than being reached.
+#[cfg(not(target_os = "linux"))]
+fn resolve_wm_less_geometry(
+    _event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<WmLessX11Geometry, WindowError> {
+    Err(WindowError::X11RootHandle)
+}
+
+/// A monitor as the policy sees it, identity included.
+///
+/// `native_id()` is the X11 extension trait's accessor for `winit`'s own monitor
+/// id. It is zero exactly for the placeholder `winit` substitutes when RandR
+/// yields no usable CRTC, which is the condition this policy has to recognise.
+#[cfg(target_os = "linux")]
+fn monitor_rect(monitor: winit::monitor::MonitorHandle) -> MonitorRect {
+    use winit::platform::x11::MonitorHandleExtX11 as _;
+    MonitorRect {
+        native_id: monitor.native_id(),
+        position: monitor.position(),
+        size: monitor.size(),
+    }
+}
+
+/// The X11 root window's rectangle, read through the display `winit` already owns.
+///
+/// `XRootWindow`/`XGetWindowAttributes` on the event loop's own connection: no
+/// `XOpenDisplay`, so no second authentication, no second connection that could
+/// disagree with the backend about which display is running, and no external
+/// `xrandr`/`xwininfo`/`xdpyinfo` — those are runtime and test instruments, not
+/// product dependencies.
+#[cfg(target_os = "linux")]
+fn x11_root_rect(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<RootRect, RootRectError> {
+    let handle = event_loop
+        .display_handle()
+        .map_err(|_| RootRectError::NoXlibHandle)?;
+    let raw_window_handle::RawDisplayHandle::Xlib(xlib_handle) = handle.as_raw() else {
+        return Err(RootRectError::NoXlibHandle);
+    };
+    let display = xlib_handle.display.ok_or(RootRectError::NoXlibHandle)?;
+    let screen = xlib_handle.screen;
+
+    let xlib =
+        x11_dl::xlib::Xlib::open().map_err(|_| RootRectError::QueryFailed("libx11_unavailable"))?;
+    // SAFETY: `display` is the pointer this event loop's own X11 backend handed
+    // out and keeps alive for as long as the loop is; both calls are the
+    // read-only root query, and `attrs` is fully written before it is read.
+    unsafe {
+        let display = display.as_ptr().cast::<x11_dl::xlib::Display>();
+        let root = (xlib.XRootWindow)(display, screen);
+        let mut attrs = std::mem::MaybeUninit::<x11_dl::xlib::XWindowAttributes>::uninit();
+        if (xlib.XGetWindowAttributes)(display, root, attrs.as_mut_ptr()) == 0 {
+            return Err(RootRectError::QueryFailed("xgetwindowattributes_failed"));
+        }
+        let attrs = attrs.assume_init();
+        Ok(RootRect {
+            size: winit::dpi::PhysicalSize::new(
+                attrs.width.max(0) as u32,
+                attrs.height.max(0) as u32,
+            ),
+        })
+    }
 }
 
 /// Which full-screen path this boot took, for the always-on census line.
@@ -340,17 +532,25 @@ pub struct HostWindowMode {
     window_system: &'static str,
     wm: &'static str,
     fullscreen: &'static str,
+    geometry_source: &'static str,
     geometry: Option<(i32, i32, u32, u32)>,
 }
 
 impl HostWindowMode {
     /// The appliance's path: X11, no window manager, geometry from the monitor
-    /// rectangle.
+    /// rectangle or — when no monitor was usable — the X11 root rectangle.
+    ///
+    /// The source travels on the line because the two are indistinguishable by
+    /// their numbers alone on a single-monitor host: a fallback that happened to
+    /// read `1600x900` and a monitor that measured `1600x900` would otherwise
+    /// look the same, and the point of the line is that a reader can tell what
+    /// actually happened.
     pub fn wm_less_x11(geometry: WmLessX11Geometry) -> Self {
         Self {
             window_system: "x11",
             wm: "none",
             fullscreen: "override_redirect",
+            geometry_source: geometry.source.name(),
             geometry: Some((
                 geometry.position.x,
                 geometry.position.y,
@@ -373,6 +573,11 @@ impl HostWindowMode {
             } else {
                 "sized"
             },
+            // No rectangle is pinned on this path, so there is no rectangle to
+            // attribute. `none` rather than an omitted field keeps every
+            // `host_window_mode` line the same shape, which is what makes it
+            // greppable.
+            geometry_source: "none",
             geometry: None,
         }
     }
@@ -388,6 +593,7 @@ impl crate::observe::Decline for HostWindowMode {
             ("window_system", self.window_system.to_string()),
             ("wm", self.wm.to_string()),
             ("fullscreen", self.fullscreen.to_string()),
+            ("geometry_source", self.geometry_source.to_string()),
         ];
         if let Some((x, y, width, height)) = self.geometry {
             fields.push(("position", format!("{x:+},{y:+}")));
@@ -740,9 +946,29 @@ pub enum WindowError {
     /// nor an off spelling. The window takes the ordinary path and the value is
     /// quoted; like [`Self::FullscreenValue`], it ends nothing.
     X11WmLessValue(String),
+    /// The WM-less path needed the X11 root window's rectangle and the event
+    /// loop's raw display handle was not Xlib, or carried no display pointer.
+    /// The strategy said X11, so anything else contradicts the backend rather
+    /// than merely being unavailable, and guessing past it is what puts a
+    /// one-pixel window on the screen.
+    X11RootHandle,
+    /// The Xlib root query itself failed. The string is the greppable reason
+    /// (`libx11_unavailable`, `xgetwindowattributes_failed`).
+    X11RootGeometry(String),
+    /// The root window answered with a rectangle an appliance window cannot be:
+    /// a dimension of `1` or less. A full-screen `1x1` window is the failure this
+    /// path exists to prevent, so the rectangle is refused rather than applied.
+    X11RootGeometryInvalid { width: u32, height: u32 },
     /// The WM-less path asked for a monitor and the window system offered none.
-    /// The one refusal that ends the window *before* it exists: a fallback size
-    /// here is a full-screen window that quietly is not full-screen.
+    ///
+    /// Retained for a caller that resolves geometry without a root fallback.
+    /// The appliance path no longer ends here, because `winit`'s X11 backend
+    /// does not report "no monitor" as absence: when RandR yields no usable
+    /// CRTC it returns a placeholder `MonitorHandle` with `id: 0` and a `1x1`
+    /// rectangle, so `primary_monitor()` is `Some(placeholder)` and an
+    /// absence-only check never fires. [`Self::X11RootHandle`],
+    /// [`Self::X11RootGeometry`] and [`Self::X11RootGeometryInvalid`] are the
+    /// refusals the root fallback raises in its place.
     NoMonitor,
 }
 
@@ -760,10 +986,13 @@ impl WindowError {
             | Self::AttachWindowHandle(d)
             | Self::AttachPresenter(d)
             | Self::FullscreenValue(d)
-            | Self::X11WmLessValue(d) => Some(d),
+            | Self::X11WmLessValue(d)
+            | Self::X11RootGeometry(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
             | Self::WrongOwner { .. }
+            | Self::X11RootHandle
+            | Self::X11RootGeometryInvalid { .. }
             | Self::NoMonitor => None,
         }
     }
@@ -790,6 +1019,9 @@ impl crate::observe::Decline for WindowError {
             Self::AttachPresenter(_) => "window_attach_presenter",
             Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
             Self::X11WmLessValue(_) => "window_x11_wmless_unrecognized",
+            Self::X11RootHandle => "window_x11_root_handle",
+            Self::X11RootGeometry(_) => "window_x11_root_geometry",
+            Self::X11RootGeometryInvalid { .. } => "window_x11_root_geometry_invalid",
             Self::NoMonitor => "window_no_monitor",
         }
     }
@@ -802,6 +1034,9 @@ impl crate::observe::Decline for WindowError {
                 ("owner", owner.to_string()),
                 ("requested", requested.to_string()),
             ],
+            Self::X11RootGeometryInvalid { width, height } => {
+                vec![("width", width.to_string()), ("height", height.to_string())]
+            }
             other => match other.detail() {
                 Some(d) => vec![("detail", detail_field(d))],
                 None => Vec::new(),
@@ -1137,15 +1372,16 @@ impl ApplicationHandler<FramePublished> for App {
                 .off();
             }
             FullscreenStrategy::X11WmLess => {
-                // The monitor's own rectangle, applied at creation. The
-                // `Fullscreen::Borderless` request above stays: with no window
-                // manager it moves nothing, and it is what makes winit call
-                // `XSetInputFocus` when the window becomes visible — the
-                // WM-independent keyboard focus this session depends on. What
-                // it must not do is be the *only* thing sizing the window, and
-                // it no longer is.
-                let monitor = match appliance_monitor(event_loop) {
-                    Ok(monitor) => monitor,
+                // The screen's own rectangle, applied at creation: a RandR
+                // monitor when winit identified one, and the X11 root window
+                // when it did not. The `Fullscreen::Borderless` request above
+                // stays: with no window manager it moves nothing, and it is what
+                // makes winit call `XSetInputFocus` when the window becomes
+                // visible — the WM-independent keyboard focus this session
+                // depends on. What it must not do is be the *only* thing sizing
+                // the window, and it no longer is.
+                let geometry = match resolve_wm_less_geometry(event_loop) {
+                    Ok(geometry) => geometry,
                     Err(error) => {
                         crate::observe::Emit::decline("host_window_init", &error).fail();
                         eprintln!("reims-vgpu-window: {error}; shutting down");
@@ -1154,8 +1390,6 @@ impl ApplicationHandler<FramePublished> for App {
                         return;
                     }
                 };
-                let geometry =
-                    WmLessX11Geometry::for_monitor_rect(monitor.position(), monitor.size());
                 attrs = apply_wm_less_geometry(attrs, &geometry);
                 crate::observe::Emit::decline(
                     "host_window_mode",
@@ -2048,6 +2282,12 @@ mod tests {
             WindowError::AttachPresenter("swapchain unavailable".into()),
             WindowError::FullscreenValue("borderless please".into()),
             WindowError::X11WmLessValue("wmless please".into()),
+            WindowError::X11RootHandle,
+            WindowError::X11RootGeometry("xgetwindowattributes_failed".into()),
+            WindowError::X11RootGeometryInvalid {
+                width: 1,
+                height: 1,
+            },
             WindowError::NoMonitor,
         ]
     }
@@ -2068,6 +2308,9 @@ mod tests {
             WindowError::AttachPresenter(_) => "AttachPresenter",
             WindowError::FullscreenValue(_) => "FullscreenValue",
             WindowError::X11WmLessValue(_) => "X11WmLessValue",
+            WindowError::X11RootHandle => "X11RootHandle",
+            WindowError::X11RootGeometry(_) => "X11RootGeometry",
+            WindowError::X11RootGeometryInvalid { .. } => "X11RootGeometryInvalid",
             WindowError::NoMonitor => "NoMonitor",
         }
     }
@@ -2132,12 +2375,14 @@ mod tests {
     /// point), the three ways the single process window can be claimed by the
     /// wrong device, creating the native window, the three steps of the
     /// presenter attach, the geometry the operator asked for being unreadable,
-    /// and the two the WM-less X11 path adds — an unreadable
-    /// [`crate::config::X11_WMLESS`] value, and a WM-less boot with no monitor to
-    /// take its rectangle from. Of those, the unreadable-value one ends nothing
-    /// and the no-monitor one ends the window before it exists; both belong here
-    /// for the same reason as the rest: they are statements about bringing the
-    /// window up, made once, before there is a window.
+    /// and the five the WM-less X11 path adds — an unreadable
+    /// [`crate::config::X11_WMLESS`] value, a display handle that is not Xlib,
+    /// a root query that failed, a root rectangle too degenerate to be a
+    /// window, and a WM-less boot with no monitor to take its rectangle from.
+    /// Of those, the unreadable-value one ends nothing and the rest end the
+    /// window before it exists; they belong here for the same reason as the
+    /// rest: they are statements about bringing the window up, made once,
+    /// before there is a window.
     #[test]
     fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
@@ -2150,7 +2395,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            13,
+            16,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
@@ -2412,10 +2657,17 @@ mod tests {
     /// that must be passed through rather than clamped.
     #[test]
     fn wm_less_geometry_pins_the_monitor_rectangle_and_its_attributes() {
-        let geometry = WmLessX11Geometry::for_monitor_rect(
-            winit::dpi::PhysicalPosition::new(-1920, 0),
-            winit::dpi::PhysicalSize::new(1920, 1080),
-        );
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 7,
+                position: winit::dpi::PhysicalPosition::new(-1920, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
         assert_eq!(
             geometry.position,
             winit::dpi::PhysicalPosition::new(-1920, 0)
@@ -2435,13 +2687,171 @@ mod tests {
         );
         // A primary monitor at the origin is the common case and must not be
         // special-cased into anything else.
-        let origin = WmLessX11Geometry::for_monitor_rect(
-            winit::dpi::PhysicalPosition::new(0, 0),
-            winit::dpi::PhysicalSize::new(2560, 1440),
-        );
+        let origin = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 3,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
         assert_eq!(origin.position, winit::dpi::PhysicalPosition::new(0, 0));
         assert_eq!(origin.size, winit::dpi::PhysicalSize::new(2560, 1440));
         println!("T009_VGPU_WMLESS_GEOMETRY=PASS");
+    }
+
+    /// A usable primary monitor wins, and the root is never consulted for it.
+    ///
+    /// The root here is a *different* size on purpose: if the policy ever asked
+    /// for it first, this case would answer `2560x1440` and fail rather than
+    /// quietly agreeing.
+    #[test]
+    fn wm_less_geometry_prefers_a_usable_primary_monitor() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 10,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+        )
+        .expect("a usable primary monitor is the first answer");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
+        assert_eq!(geometry.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        println!("T009_VGPU_WMLESS_PRIMARY_MONITOR=PASS");
+    }
+
+    /// The placeholder `winit` substitutes must not hide a real monitor.
+    ///
+    /// This is the runtime's own shape: a `1x1` primary with `id: 0`. The
+    /// appliance must walk past it to the real monitor, and the negative origin
+    /// has to survive intact — a window manager places windows against a root
+    /// origin and monitors to the left of it really are negative.
+    #[test]
+    fn wm_less_geometry_skips_a_placeholder_primary_for_a_real_monitor() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[MonitorRect {
+                native_id: 42,
+                position: winit::dpi::PhysicalPosition::new(-1920, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(2560, 1440),
+            }),
+        )
+        .expect("a placeholder primary must not hide a real monitor");
+        assert_eq!(geometry.source, WmLessGeometrySource::Monitor);
+        assert_eq!(
+            geometry.position,
+            winit::dpi::PhysicalPosition::new(-1920, 0)
+        );
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        println!("T009_VGPU_WMLESS_MONITOR_FALLBACK=PASS");
+    }
+
+    /// Nothing usable in RandR: the root window is the rectangle.
+    ///
+    /// This is exactly the server the first runtime ran on — Xephyr with no
+    /// RandR CRTC behind its output — where the placeholder is all `winit`
+    /// offers and the root is the only true answer. The WM-less attributes stay
+    /// the same whichever source answered.
+    #[test]
+    fn wm_less_geometry_falls_back_to_the_x11_root() {
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(1600, 900),
+            }),
+        )
+        .expect("a server with no usable CRTC still has a root rectangle");
+        assert_eq!(geometry.source, WmLessGeometrySource::X11Root);
+        assert_eq!(geometry.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1600, 900));
+        assert!(!geometry.decorations);
+        assert!(!geometry.resizable);
+        assert!(geometry.override_redirect);
+        println!("T009_VGPU_WMLESS_ROOT_FALLBACK=PASS");
+    }
+
+    /// A degenerate root is refused, not adopted.
+    ///
+    /// `1x1` is the size the runtime actually produced, and `0x0` and an
+    /// out-of-shape root are the same statement: there is no usable rectangle
+    /// here, so say so instead of opening a window that cannot be seen.
+    #[test]
+    fn wm_less_geometry_refuses_a_degenerate_root() {
+        use crate::observe::Decline as _;
+        let placeholder = Some(MonitorRect {
+            native_id: 0,
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: winit::dpi::PhysicalSize::new(1, 1),
+        });
+        for (width, height) in [(1u32, 1u32), (1, 900), (1600, 1), (0, 0)] {
+            let error = WmLessX11Geometry::resolve(
+                placeholder,
+                &[],
+                Ok(RootRect {
+                    size: winit::dpi::PhysicalSize::new(width, height),
+                }),
+            )
+            .expect_err("a degenerate root is never a full-screen window");
+            assert_eq!(error.slug(), "window_x11_root_geometry_invalid");
+            assert_eq!(
+                error.fields(),
+                vec![("width", width.to_string()), ("height", height.to_string())],
+                "{width}x{height}"
+            );
+        }
+        println!("T009_VGPU_WMLESS_INVALID_ROOT_REFUSED=PASS");
+    }
+
+    /// An unreadable root is refused with the reason it could not be read.
+    ///
+    /// The two failures are different answers and get different refusals: a
+    /// display handle that is not Xlib contradicts the strategy that selected
+    /// this path, while a failed Xlib call is an error from a display that is
+    /// real. Neither may become a size.
+    #[test]
+    fn wm_less_geometry_refuses_an_unreadable_root() {
+        use crate::observe::Decline as _;
+        let placeholder = Some(MonitorRect {
+            native_id: 0,
+            position: winit::dpi::PhysicalPosition::new(0, 0),
+            size: winit::dpi::PhysicalSize::new(1, 1),
+        });
+        let no_handle =
+            WmLessX11Geometry::resolve(placeholder, &[], Err(RootRectError::NoXlibHandle))
+                .expect_err("a display that is not Xlib must not be guessed past");
+        assert_eq!(no_handle.slug(), "window_x11_root_handle");
+
+        let query_failed = WmLessX11Geometry::resolve(
+            placeholder,
+            &[],
+            Err(RootRectError::QueryFailed("xgetwindowattributes_failed")),
+        )
+        .expect_err("a failed root query must not become a size");
+        assert_eq!(query_failed.slug(), "window_x11_root_geometry");
+        assert_eq!(
+            query_failed.fields(),
+            vec![("detail", "xgetwindowattributes_failed".to_string())]
+        );
+        println!("T009_VGPU_WMLESS_ROOT_ERROR_REFUSED=PASS");
     }
 
     /// The census line tells the two full-screen paths apart.
@@ -2451,10 +2861,16 @@ mod tests {
     /// full-screen from the appliance's own rectangle.
     #[test]
     fn the_window_mode_line_distinguishes_the_wm_less_path_from_the_ordinary_one() {
-        let geometry = WmLessX11Geometry::for_monitor_rect(
-            winit::dpi::PhysicalPosition::new(0, 0),
-            winit::dpi::PhysicalSize::new(1920, 1080),
-        );
+        let geometry = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 5,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
         let appliance = crate::observe::Emit::decline(
             "host_window_mode",
             &HostWindowMode::wm_less_x11(geometry),
@@ -2492,5 +2908,78 @@ mod tests {
         assert!(sized.contains("window_system=native"), "{sized}");
         assert!(sized.contains("fullscreen=sized"), "{sized}");
         println!("T009_VGPU_WMLESS_X11_FULLSCREEN=PASS");
+    }
+
+    /// The census line says which source answered, not just what it answered.
+    ///
+    /// A fallback that happens to measure the same as a monitor would otherwise
+    /// be invisible, and a reader has to be able to tell "this host has a real
+    /// monitor" from "this host fell back to the root". The ordinary paths
+    /// pin no rectangle and say `none`.
+    #[test]
+    fn the_window_mode_line_names_where_the_geometry_came_from() {
+        let from_monitor = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 5,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1920, 1080),
+            }),
+            &[],
+            Err(RootRectError::NoXlibHandle),
+        )
+        .expect("a usable primary monitor is the first answer");
+        let monitor_line = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(from_monitor),
+        )
+        .render();
+        assert!(
+            monitor_line.contains("geometry_source=monitor"),
+            "{monitor_line}"
+        );
+        assert!(
+            !monitor_line.contains("geometry_source=x11_root"),
+            "{monitor_line}"
+        );
+
+        let from_root = WmLessX11Geometry::resolve(
+            Some(MonitorRect {
+                native_id: 0,
+                position: winit::dpi::PhysicalPosition::new(0, 0),
+                size: winit::dpi::PhysicalSize::new(1, 1),
+            }),
+            &[],
+            Ok(RootRect {
+                size: winit::dpi::PhysicalSize::new(1600, 900),
+            }),
+        )
+        .expect("the root is the answer when nothing else is usable");
+        let root_line = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(from_root),
+        )
+        .render();
+        assert!(
+            root_line.contains("geometry_source=x11_root"),
+            "{root_line}"
+        );
+        assert!(root_line.contains("wm=none"), "{root_line}");
+        assert!(root_line.contains("size=1600x900"), "{root_line}");
+        assert!(root_line.contains("position=+0,+0"), "{root_line}");
+        assert!(
+            !root_line.contains("geometry_source=monitor"),
+            "{root_line}"
+        );
+
+        let ordinary = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(
+                Some(crate::config::WindowSystem::X11),
+                WindowMode::Borderless,
+            ),
+        )
+        .render();
+        assert!(ordinary.contains("geometry_source=none"), "{ordinary}");
+        println!("T009_VGPU_WMLESS_GEOMETRY_SOURCE=PASS");
     }
 }
