@@ -177,6 +177,226 @@ impl WindowMode {
     }
 }
 
+/// How a full-screen window is made full-screen, and therefore what it depends
+/// on.
+///
+/// A type rather than a `bool` because the two answers differ in *what has to
+/// exist*: the ordinary path asks the window system and needs a window manager
+/// to answer, and the appliance's path asks nothing and needs no one. That is
+/// the reason the variant exists at all.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FullscreenStrategy {
+    /// The window system's own answer — winit's `Fullscreen::Borderless`, which
+    /// on X11 is `_NET_WM_STATE_FULLSCREEN` and is therefore a request to a
+    /// window manager. Every host that has one, on every platform, takes this
+    /// path.
+    Normal,
+    /// The Reims appliance's dedicated Xorg session, which has no window
+    /// manager to ask. The window is created override-redirect at the monitor's
+    /// own rectangle, so its geometry is fixed before a window manager could
+    /// have had an opinion, and nothing else has to resize it afterwards.
+    X11WmLess,
+}
+
+impl FullscreenStrategy {
+    /// The strategy for the three independent answers.
+    ///
+    /// Pure, which is the point: the rule is testable without a server. WM-less
+    /// geometry is selected only when the operator asked for fullscreen *and*
+    /// asked for WM-less *and* the window will open on X11. Every other
+    /// combination — all of Wayland, all of macOS, and every existing X11 host
+    /// with a window manager — is [`Self::Normal`].
+    pub fn resolve(
+        window_system: Option<crate::config::WindowSystem>,
+        fullscreen: bool,
+        x11_wmless: bool,
+    ) -> Self {
+        if fullscreen && x11_wmless && window_system == Some(crate::config::WindowSystem::X11) {
+            Self::X11WmLess
+        } else {
+            Self::Normal
+        }
+    }
+
+    /// [`Self::resolve`] against the environment, read once where the window is
+    /// configured rather than once per frame.
+    pub fn requested(mode: WindowMode) -> Self {
+        let wmless = match crate::config::read(crate::config::X11_WMLESS) {
+            (crate::config::Switch::On, _) => true,
+            (crate::config::Switch::Unrecognized, value) => {
+                // The one refusal here that ends nothing: the parse could not
+                // read the ask, and the ordinary path is what the boot gets.
+                // Saying so is what keeps a typo from reading as a switch that
+                // does nothing.
+                crate::observe::Emit::decline(
+                    "host_window_init",
+                    &WindowError::X11WmLessValue(value.unwrap_or_default()),
+                )
+                .fail();
+                false
+            }
+            _ => false,
+        };
+        Self::resolve(
+            crate::config::window_system(),
+            mode == WindowMode::Borderless,
+            wmless,
+        )
+    }
+}
+
+/// The rectangle and attribute set the WM-less X11 path pins, as data.
+///
+/// Split from the code that reads a monitor so the four properties the
+/// appliance depends on — override-redirect, undecorated, fixed, monitor-sized
+/// — are testable without an X server. The window code turns this into
+/// [`winit::window::WindowAttributes`]; this type is where the values are
+/// decided.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct WmLessX11Geometry {
+    pub position: winit::dpi::PhysicalPosition<i32>,
+    pub size: winit::dpi::PhysicalSize<u32>,
+    pub decorations: bool,
+    pub resizable: bool,
+    pub override_redirect: bool,
+}
+
+impl WmLessX11Geometry {
+    /// The appliance window's rectangle for a monitor at `position` with `size`.
+    ///
+    /// The four attributes are not parameters: a window that took the monitor
+    /// rectangle and was still decorated, or still resizable, could be moved off
+    /// it or resized away from it.
+    pub fn for_monitor_rect(
+        position: winit::dpi::PhysicalPosition<i32>,
+        size: winit::dpi::PhysicalSize<u32>,
+    ) -> Self {
+        Self {
+            position,
+            size,
+            decorations: false,
+            resizable: false,
+            override_redirect: true,
+        }
+    }
+}
+
+/// Apply the WM-less rectangle and attributes to `attrs`.
+///
+/// `with_override_redirect` exists only on the X11 platform, so it is applied
+/// behind the same gate as `winit::platform::x11` itself. The cross-platform
+/// attributes stay outside the gate, which is what keeps the pure geometry test
+/// meaningful on any host.
+#[cfg(target_os = "linux")]
+fn apply_wm_less_geometry(
+    attrs: winit::window::WindowAttributes,
+    geometry: &WmLessX11Geometry,
+) -> winit::window::WindowAttributes {
+    use winit::platform::x11::WindowAttributesExtX11 as _;
+    attrs
+        .with_decorations(geometry.decorations)
+        .with_resizable(geometry.resizable)
+        .with_position(geometry.position)
+        .with_inner_size(geometry.size)
+        .with_override_redirect(geometry.override_redirect)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn apply_wm_less_geometry(
+    attrs: winit::window::WindowAttributes,
+    geometry: &WmLessX11Geometry,
+) -> winit::window::WindowAttributes {
+    attrs
+        .with_decorations(geometry.decorations)
+        .with_resizable(geometry.resizable)
+        .with_position(geometry.position)
+        .with_inner_size(geometry.size)
+}
+
+/// The monitor a WM-less appliance window takes.
+///
+/// Primary first, then the first the loop lists. No monitor at all is a refusal
+/// rather than a fallback size: a window that opened at [`WindowConfig`]'s
+/// extent because no monitor could be found would look like a working
+/// full-screen window that is quietly 1280x800, which is the failure the
+/// WM-less path exists to prevent.
+fn appliance_monitor(
+    event_loop: &winit::event_loop::ActiveEventLoop,
+) -> Result<winit::monitor::MonitorHandle, WindowError> {
+    event_loop
+        .primary_monitor()
+        .or_else(|| event_loop.available_monitors().next())
+        .ok_or(WindowError::NoMonitor)
+}
+
+/// Which full-screen path this boot took, for the always-on census line.
+///
+/// `REIMS_VGPU_FULLSCREEN=1` alone cannot distinguish a window the window
+/// manager made full-screen from one this process created at the monitor's own
+/// rectangle. On the appliance's window-manager-less Xorg session only the
+/// second one fills the screen, so a reader has to be able to tell them apart
+/// from the log — and the WM-less arm carries the rectangle it asked for.
+pub struct HostWindowMode {
+    window_system: &'static str,
+    wm: &'static str,
+    fullscreen: &'static str,
+    geometry: Option<(i32, i32, u32, u32)>,
+}
+
+impl HostWindowMode {
+    /// The appliance's path: X11, no window manager, geometry from the monitor
+    /// rectangle.
+    pub fn wm_less_x11(geometry: WmLessX11Geometry) -> Self {
+        Self {
+            window_system: "x11",
+            wm: "none",
+            fullscreen: "override_redirect",
+            geometry: Some((
+                geometry.position.x,
+                geometry.position.y,
+                geometry.size.width,
+                geometry.size.height,
+            )),
+        }
+    }
+
+    /// Every other path: whatever window system `winit` chose, a window manager
+    /// if the host has one, and the window system's own sizing.
+    pub fn ordinary(window_system: Option<crate::config::WindowSystem>, mode: WindowMode) -> Self {
+        Self {
+            window_system: window_system
+                .map(|system| system.name())
+                .unwrap_or("native"),
+            wm: "external",
+            fullscreen: if mode == WindowMode::Borderless {
+                "ewmh"
+            } else {
+                "sized"
+            },
+            geometry: None,
+        }
+    }
+}
+
+impl crate::observe::Decline for HostWindowMode {
+    fn slug(&self) -> &'static str {
+        "host_window_mode"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        let mut fields = vec![
+            ("window_system", self.window_system.to_string()),
+            ("wm", self.wm.to_string()),
+            ("fullscreen", self.fullscreen.to_string()),
+        ];
+        if let Some((x, y, width, height)) = self.geometry {
+            fields.push(("position", format!("{x:+},{y:+}")));
+            fields.push(("size", format!("{width}x{height}")));
+        }
+        fields
+    }
+}
+
 /// Window creation parameters.
 ///
 /// `mode` is resolved from the environment by whoever builds the config rather
@@ -188,15 +408,21 @@ pub struct WindowConfig {
     pub width: u32,
     pub height: u32,
     pub mode: WindowMode,
+    /// Which full-screen path, resolved beside `mode` and for the same reason:
+    /// it is an operator's answer about this boot, decided once on the thread
+    /// that starts the window rather than per frame.
+    pub strategy: FullscreenStrategy,
 }
 
 impl Default for WindowConfig {
     fn default() -> Self {
+        let mode = WindowMode::requested();
         Self {
             title: "Reims vGPU".to_string(),
             width: 1280,
             height: 800,
-            mode: WindowMode::requested(),
+            mode,
+            strategy: FullscreenStrategy::requested(mode),
         }
     }
 }
@@ -510,6 +736,14 @@ pub enum WindowError {
     /// operator can see what the parse rejected. The one variant here that does
     /// not end anything.
     FullscreenValue(String),
+    /// [`crate::config::X11_WMLESS`] was set to something that is neither an on
+    /// nor an off spelling. The window takes the ordinary path and the value is
+    /// quoted; like [`Self::FullscreenValue`], it ends nothing.
+    X11WmLessValue(String),
+    /// The WM-less path asked for a monitor and the window system offered none.
+    /// The one refusal that ends the window *before* it exists: a fallback size
+    /// here is a full-screen window that quietly is not full-screen.
+    NoMonitor,
 }
 
 impl WindowError {
@@ -525,10 +759,12 @@ impl WindowError {
             | Self::AttachDisplayHandle(d)
             | Self::AttachWindowHandle(d)
             | Self::AttachPresenter(d)
-            | Self::FullscreenValue(d) => Some(d),
+            | Self::FullscreenValue(d)
+            | Self::X11WmLessValue(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
-            | Self::WrongOwner { .. } => None,
+            | Self::WrongOwner { .. }
+            | Self::NoMonitor => None,
         }
     }
 }
@@ -553,6 +789,8 @@ impl crate::observe::Decline for WindowError {
             Self::AttachWindowHandle(_) => "window_attach_window_handle",
             Self::AttachPresenter(_) => "window_attach_presenter",
             Self::FullscreenValue(_) => "window_fullscreen_unrecognized",
+            Self::X11WmLessValue(_) => "window_x11_wmless_unrecognized",
+            Self::NoMonitor => "window_no_monitor",
         }
     }
 
@@ -889,6 +1127,42 @@ impl ApplicationHandler<FramePublished> for App {
             // the window system declines the full-screen request, and it is the
             // size a later `set_fullscreen(None)` would restore.
             attrs = attrs.with_fullscreen(Some(winit::window::Fullscreen::Borderless(None)));
+        }
+        match self.config.strategy {
+            FullscreenStrategy::Normal => {
+                crate::observe::Emit::decline(
+                    "host_window_mode",
+                    &HostWindowMode::ordinary(crate::config::window_system(), self.config.mode),
+                )
+                .off();
+            }
+            FullscreenStrategy::X11WmLess => {
+                // The monitor's own rectangle, applied at creation. The
+                // `Fullscreen::Borderless` request above stays: with no window
+                // manager it moves nothing, and it is what makes winit call
+                // `XSetInputFocus` when the window becomes visible — the
+                // WM-independent keyboard focus this session depends on. What
+                // it must not do is be the *only* thing sizing the window, and
+                // it no longer is.
+                let monitor = match appliance_monitor(event_loop) {
+                    Ok(monitor) => monitor,
+                    Err(error) => {
+                        crate::observe::Emit::decline("host_window_init", &error).fail();
+                        eprintln!("reims-vgpu-window: {error}; shutting down");
+                        self.request_shutdown();
+                        event_loop.exit();
+                        return;
+                    }
+                };
+                let geometry =
+                    WmLessX11Geometry::for_monitor_rect(monitor.position(), monitor.size());
+                attrs = apply_wm_less_geometry(attrs, &geometry);
+                crate::observe::Emit::decline(
+                    "host_window_mode",
+                    &HostWindowMode::wm_less_x11(geometry),
+                )
+                .off();
+            }
         }
         let window = match event_loop.create_window(attrs) {
             Ok(w) => Arc::new(w),
@@ -1773,6 +2047,8 @@ mod tests {
             WindowError::AttachWindowHandle("no window handle".into()),
             WindowError::AttachPresenter("swapchain unavailable".into()),
             WindowError::FullscreenValue("borderless please".into()),
+            WindowError::X11WmLessValue("wmless please".into()),
+            WindowError::NoMonitor,
         ]
     }
 
@@ -1791,6 +2067,8 @@ mod tests {
             WindowError::AttachWindowHandle(_) => "AttachWindowHandle",
             WindowError::AttachPresenter(_) => "AttachPresenter",
             WindowError::FullscreenValue(_) => "FullscreenValue",
+            WindowError::X11WmLessValue(_) => "X11WmLessValue",
+            WindowError::NoMonitor => "NoMonitor",
         }
     }
 
@@ -1850,14 +2128,16 @@ mod tests {
     /// drawn. Re-adding a presenter here means re-adding that family, and this
     /// count is what makes that a deliberate act.
     ///
-    /// The eleven: building the event loop, running it (one variant per entry
+    /// The thirteen: building the event loop, running it (one variant per entry
     /// point), the three ways the single process window can be claimed by the
     /// wrong device, creating the native window, the three steps of the
-    /// presenter attach, and the geometry the operator asked for being
-    /// unreadable. That
-    /// last one is the only variant that ends nothing, and it belongs here for
-    /// the same reason as the rest: it is a statement about bringing the window
-    /// up, made once, before there is a window.
+    /// presenter attach, the geometry the operator asked for being unreadable,
+    /// and the two the WM-less X11 path adds — an unreadable
+    /// [`crate::config::X11_WMLESS`] value, and a WM-less boot with no monitor to
+    /// take its rectangle from. Of those, the unreadable-value one ends nothing
+    /// and the no-monitor one ends the window before it exists; both belong here
+    /// for the same reason as the rest: they are statements about bringing the
+    /// window up, made once, before there is a window.
     #[test]
     fn the_window_types_only_its_own_lifecycle_refusals() {
         use crate::observe::Decline as _;
@@ -1870,7 +2150,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            11,
+            13,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
@@ -2086,5 +2366,131 @@ mod tests {
     #[test]
     fn a_resize_with_nothing_pending_is_not_an_answer() {
         assert_eq!(guest_resize_settled(None, (1920, 1080)), None);
+    }
+
+    /// WM-less geometry is selected only when all three answers agree.
+    ///
+    /// The three are independent on purpose: `fullscreen` is the operator's
+    /// ask, `x11_wmless` is the appliance's ask, and the window system is the
+    /// environment's. Dropping any one of them has to fall back to the ordinary
+    /// path, because on Wayland or on a host with a window manager the
+    /// override-redirect window would be the wrong answer even though both asks
+    /// were made.
+    #[test]
+    fn wm_less_geometry_is_selected_only_when_all_three_answers_agree() {
+        use crate::config::WindowSystem::{Wayland, X11};
+        let cases = [
+            // x11 + fullscreen + wmless — the appliance's session.
+            (Some(X11), true, true, FullscreenStrategy::X11WmLess),
+            // ...and every one of the three answers removed in turn.
+            (Some(X11), true, false, FullscreenStrategy::Normal),
+            (Some(Wayland), true, true, FullscreenStrategy::Normal),
+            (Some(X11), false, true, FullscreenStrategy::Normal),
+            // The window system unknown — a build without either backend, and
+            // the one answer that must never select the X11 attribute.
+            (None, true, true, FullscreenStrategy::Normal),
+            // The ordinary development host, unchanged.
+            (Some(Wayland), true, false, FullscreenStrategy::Normal),
+            (Some(Wayland), false, false, FullscreenStrategy::Normal),
+            (Some(X11), false, false, FullscreenStrategy::Normal),
+        ];
+        for (window_system, fullscreen, wmless, expected) in cases {
+            assert_eq!(
+                FullscreenStrategy::resolve(window_system, fullscreen, wmless),
+                expected,
+                "window_system={window_system:?} fullscreen={fullscreen} wmless={wmless}"
+            );
+        }
+        println!("T009_VGPU_WMLESS_STRATEGY=PASS");
+    }
+
+    /// The geometry the WM-less path pins, as values.
+    ///
+    /// All four properties are load-bearing, and the negative monitor position
+    /// is the one worth keeping in the table: a window manager places windows on
+    /// a root origin, and monitors to the left of it have negative coordinates
+    /// that must be passed through rather than clamped.
+    #[test]
+    fn wm_less_geometry_pins_the_monitor_rectangle_and_its_attributes() {
+        let geometry = WmLessX11Geometry::for_monitor_rect(
+            winit::dpi::PhysicalPosition::new(-1920, 0),
+            winit::dpi::PhysicalSize::new(1920, 1080),
+        );
+        assert_eq!(
+            geometry.position,
+            winit::dpi::PhysicalPosition::new(-1920, 0)
+        );
+        assert_eq!(geometry.size, winit::dpi::PhysicalSize::new(1920, 1080));
+        assert!(
+            !geometry.decorations,
+            "a decorated window is not the monitor"
+        );
+        assert!(
+            !geometry.resizable,
+            "a resizable window can leave the monitor"
+        );
+        assert!(
+            geometry.override_redirect,
+            "without override-redirect the window is a request, not a rectangle"
+        );
+        // A primary monitor at the origin is the common case and must not be
+        // special-cased into anything else.
+        let origin = WmLessX11Geometry::for_monitor_rect(
+            winit::dpi::PhysicalPosition::new(0, 0),
+            winit::dpi::PhysicalSize::new(2560, 1440),
+        );
+        assert_eq!(origin.position, winit::dpi::PhysicalPosition::new(0, 0));
+        assert_eq!(origin.size, winit::dpi::PhysicalSize::new(2560, 1440));
+        println!("T009_VGPU_WMLESS_GEOMETRY=PASS");
+    }
+
+    /// The census line tells the two full-screen paths apart.
+    ///
+    /// `REIMS_VGPU_FULLSCREEN=1` is on the boot line either way, so a reader who
+    /// cannot see from the log which path ran cannot tell a window manager's
+    /// full-screen from the appliance's own rectangle.
+    #[test]
+    fn the_window_mode_line_distinguishes_the_wm_less_path_from_the_ordinary_one() {
+        let geometry = WmLessX11Geometry::for_monitor_rect(
+            winit::dpi::PhysicalPosition::new(0, 0),
+            winit::dpi::PhysicalSize::new(1920, 1080),
+        );
+        let appliance = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::wm_less_x11(geometry),
+        )
+        .render();
+        assert!(appliance.contains("window_system=x11"), "{appliance}");
+        assert!(appliance.contains("wm=none"), "{appliance}");
+        assert!(
+            appliance.contains("fullscreen=override_redirect"),
+            "{appliance}"
+        );
+        assert!(appliance.contains("size=1920x1080"), "{appliance}");
+        assert!(appliance.contains("position=+0,+0"), "{appliance}");
+
+        let ordinary = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(
+                Some(crate::config::WindowSystem::X11),
+                WindowMode::Borderless,
+            ),
+        )
+        .render();
+        assert!(ordinary.contains("fullscreen=ewmh"), "{ordinary}");
+        assert!(ordinary.contains("wm=external"), "{ordinary}");
+        assert!(
+            !ordinary.contains("override_redirect"),
+            "the ordinary path must not claim the WM-less geometry: {ordinary}"
+        );
+
+        let sized = crate::observe::Emit::decline(
+            "host_window_mode",
+            &HostWindowMode::ordinary(None, WindowMode::Sized),
+        )
+        .render();
+        assert!(sized.contains("window_system=native"), "{sized}");
+        assert!(sized.contains("fullscreen=sized"), "{sized}");
+        println!("T009_VGPU_WMLESS_X11_FULLSCREEN=PASS");
     }
 }

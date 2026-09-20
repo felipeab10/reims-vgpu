@@ -38,6 +38,16 @@ opens on (`vm/window-system-env.sh`, applied by `vm/boot-x86.sh`):
   variables are what selects X11. A missing `DISPLAY` is a refusal.
 - `wayland` — require `WAYLAND_DISPLAY` or `WAYLAND_SOCKET`.
 
+Within an X11 session, `REIMS_VGPU_X11_WMLESS` decides *how* the window becomes
+full-screen (Rust side, `host_window::present`):
+
+- `0` (default) — winit's `Fullscreen::Borderless`, which on X11 is an EWMH
+  request (`_NET_WM_STATE_FULLSCREEN`) and needs a window manager to honour it.
+- `1` — require `REIMS_VGPU_FULLSCREEN` as well, and create the window
+  override-redirect at the monitor's own rectangle, so no window manager is
+  involved. This is the Reims OS appliance's session; a host with a window
+  manager is unaffected because the switch is off there.
+
 Contract test: `vm/tests/window-system-env-test.sh` (no VM, no display needed).
 
 ## Driving a guest, and sweeping every rail

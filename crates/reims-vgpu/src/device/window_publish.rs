@@ -120,7 +120,7 @@ pub(crate) struct EarlyFb {
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     use crate::backend::Backend as _;
     use crate::host_window::present::{
-        FrameSlot, InputSink, WindowConfig, WindowMode, WindowWaker,
+        FrameSlot, FullscreenStrategy, InputSink, WindowConfig, WindowMode, WindowWaker,
     };
     // Two questions, two owners. The `cfg` above answers "did this build
     // compile a window"; the running rail answers "is there a swapchain to fill
@@ -172,6 +172,10 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
             }
         }
     });
+    // Resolved here, once, on the thread that starts the window: the mode and
+    // the full-screen path are an operator's answers about this boot, not
+    // per-frame questions.
+    let mode = WindowMode::requested();
     let cfg = WindowConfig {
         title: "Reims vGPU".to_string(),
         width: if width == 0 {
@@ -184,9 +188,8 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
         } else {
             height
         },
-        // Resolved here, once, on the thread that starts the window: the mode is
-        // an operator's answer about this boot, not a per-frame question.
-        mode: WindowMode::requested(),
+        mode,
+        strategy: FullscreenStrategy::requested(mode),
     };
     let stop: crate::host_window::present::StopFlag =
         Arc::new(std::sync::atomic::AtomicBool::new(false));
