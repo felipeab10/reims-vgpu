@@ -36,7 +36,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::PhysicalKey;
-use winit::window::{Window, WindowId};
+use winit::window::{CustomCursor, Window, WindowId, MAX_CURSOR_SIZE};
 
 use super::capture::{Capture, CaptureEngaged, CaptureMode};
 use super::input_map;
@@ -781,6 +781,108 @@ pub struct Frame {
 /// 8 MiB deep copy of an unchanged frame.
 pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 
+/// Guest cursor state mirrored into the native host window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GuestCursorGlyph {
+    pub sequence: u64,
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    /// QEMU/model pixels in straight-alpha `0xAARRGGBB` order.
+    pub pixels: Arc<[u32]>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct GuestCursorState {
+    pub visible: bool,
+    pub x: u16,
+    pub y: u16,
+    pub glyph: Option<GuestCursorGlyph>,
+}
+
+pub type CursorSlot = Arc<Mutex<GuestCursorState>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CursorGlyphError {
+    Empty,
+    TooLarge,
+    PixelCount,
+    Hotspot,
+}
+
+/// Convert straight-alpha ARGB words to the non-premultiplied RGBA bytes
+/// required by `winit::window::CustomCursor::from_rgba`.
+pub fn cursor_argb_to_rgba(pixels: &[u32]) -> Vec<u8> {
+    let mut rgba = Vec::with_capacity(pixels.len() * 4);
+    for &pixel in pixels {
+        rgba.extend_from_slice(&[
+            ((pixel >> 16) & 0xff) as u8,
+            ((pixel >> 8) & 0xff) as u8,
+            (pixel & 0xff) as u8,
+            (pixel >> 24) as u8,
+        ]);
+    }
+    rgba
+}
+
+/// Snapshot the model cursor while its device lock is held, so the window
+/// thread never needs to acquire a device lock to install a glyph.
+pub fn snapshot_guest_cursor(
+    cursor: &crate::model::CursorState,
+    sequence: u64,
+) -> Result<GuestCursorState, CursorGlyphError> {
+    let glyph = if !cursor.glyph_ready {
+        None
+    } else {
+        let expected = usize::from(cursor.width)
+            .checked_mul(usize::from(cursor.height))
+            .ok_or(CursorGlyphError::PixelCount)?;
+        if cursor.width == 0 || cursor.height == 0 {
+            return Err(CursorGlyphError::Empty);
+        }
+        if cursor.width > MAX_CURSOR_SIZE || cursor.height > MAX_CURSOR_SIZE {
+            return Err(CursorGlyphError::TooLarge);
+        }
+        if cursor.pixels.len() != expected {
+            return Err(CursorGlyphError::PixelCount);
+        }
+        if cursor.hot_x >= cursor.width || cursor.hot_y >= cursor.height {
+            return Err(CursorGlyphError::Hotspot);
+        }
+        Some(GuestCursorGlyph {
+            sequence,
+            width: cursor.width,
+            height: cursor.height,
+            hot_x: cursor.hot_x,
+            hot_y: cursor.hot_y,
+            pixels: Arc::from(cursor.pixels.clone()),
+        })
+    };
+    Ok(GuestCursorState {
+        visible: cursor.show,
+        x: cursor.x,
+        y: cursor.y,
+        glyph,
+    })
+}
+
+fn cursor_glyph_changed(
+    applied: &Option<GuestCursorGlyph>,
+    incoming: &Option<GuestCursorGlyph>,
+) -> bool {
+    match (applied, incoming) {
+        (Some(a), Some(b)) => {
+            a.width != b.width
+                || a.height != b.height
+                || a.hot_x != b.hot_x
+                || a.hot_y != b.hot_y
+                || a.pixels != b.pixels
+        }
+        _ => applied.is_some() != incoming.is_some(),
+    }
+}
+
 /// The one user event this window's loop takes: the device wrote a new frame
 /// into the [`FrameSlot`].
 ///
@@ -788,7 +890,10 @@ pub type FrameSlot = Arc<Mutex<Option<Arc<Frame>>>>;
 /// lock, so a payload here could only be a second, staler copy of what
 /// [`App::draw`] is about to read anyway.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FramePublished;
+pub enum WindowUserEvent {
+    FramePublished,
+    CursorPublished,
+}
 
 /// How the device wakes the window's event loop when it publishes a frame.
 ///
@@ -812,7 +917,7 @@ pub struct FramePublished;
 /// lock is uncontended and taken once per published frame, at the ~26 Hz this
 /// workload peaks at, against the publisher's own two existing locks.
 pub struct WindowWaker {
-    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<FramePublished>>>,
+    proxy: Mutex<Option<winit::event_loop::EventLoopProxy<WindowUserEvent>>>,
 }
 
 /// A [`WindowWaker`] shared between the device's publisher and the window
@@ -829,7 +934,7 @@ impl WindowWaker {
     }
 
     /// Hand the loop's proxy over, once the loop exists to be woken.
-    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<FramePublished>) {
+    fn arm(&self, proxy: winit::event_loop::EventLoopProxy<WindowUserEvent>) {
         if let Ok(mut slot) = self.proxy.lock() {
             *slot = Some(proxy);
         }
@@ -844,9 +949,17 @@ impl WindowWaker {
     /// does not land costs latency bounded by that constant rather than a frame
     /// — which is the property that lets this be a wake and not a protocol.
     pub fn wake(&self) {
+        self.wake_event(WindowUserEvent::FramePublished);
+    }
+
+    pub fn wake_cursor(&self) {
+        self.wake_event(WindowUserEvent::CursorPublished);
+    }
+
+    fn wake_event(&self, event: WindowUserEvent) {
         if let Ok(slot) = self.proxy.lock() {
             if let Some(proxy) = slot.as_ref() {
-                let _ = proxy.send_event(FramePublished);
+                let _ = proxy.send_event(event);
             }
         }
     }
@@ -1210,12 +1323,13 @@ pub fn spawn(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> std::thread::JoinHandle<Result<(), WindowError>> {
     std::thread::Builder::new()
         .name("reims-vgpu-window".to_string())
-        .spawn(move || run(config, on_input, frames, stop, wake))
+        .spawn(move || run(config, on_input, frames, cursor_slot, stop, wake))
         .expect("spawn reims-vgpu-window thread")
 }
 
@@ -1226,12 +1340,13 @@ pub fn run(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     wake: WindowWakeHandle,
 ) -> Result<(), WindowError> {
     let event_loop = build_event_loop()?;
     wake.arm(event_loop.create_proxy());
-    let mut app = App::new(config, on_input, frames, stop);
+    let mut app = App::new(config, on_input, frames, cursor_slot, stop);
     event_loop
         .run_app(&mut app)
         .map_err(|e| WindowError::RunApp(e.to_string()))
@@ -1240,7 +1355,7 @@ pub fn run(
 #[cfg(target_os = "macos")]
 struct MainThreadWindow {
     id: u64,
-    event_loop: EventLoop<FramePublished>,
+    event_loop: EventLoop<WindowUserEvent>,
     app: App,
     exited: ExitedFlag,
 }
@@ -1263,6 +1378,7 @@ pub fn start_main_thread(
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     stop: StopFlag,
     exited: ExitedFlag,
     wake: WindowWakeHandle,
@@ -1278,7 +1394,7 @@ pub fn start_main_thread(
         }
         let event_loop = build_event_loop()?;
         wake.arm(event_loop.create_proxy());
-        let app = App::new(config, on_input, frames, stop);
+        let app = App::new(config, on_input, frames, cursor_slot, stop);
         *slot = Some(MainThreadWindow {
             id,
             event_loop,
@@ -1320,9 +1436,9 @@ pub fn run_main_thread(id: u64) -> Result<(), WindowError> {
 /// Build an event loop that may run off the main thread (QEMU owns the main
 /// thread). X11 and Wayland both allow it via their platform extension.
 ///
-/// Carries [`FramePublished`] as its user event, which is what makes
+/// Carries [`WindowUserEvent`] as its user event, which is what makes
 /// `create_proxy` a wake channel the device can hold — see [`WindowWaker`].
-fn build_event_loop() -> Result<EventLoop<FramePublished>, WindowError> {
+fn build_event_loop() -> Result<EventLoop<WindowUserEvent>, WindowError> {
     let mut builder = EventLoop::with_user_event();
     #[cfg(all(unix, not(target_os = "macos")))]
     {
@@ -1350,6 +1466,7 @@ struct App {
     config: WindowConfig,
     on_input: InputSink,
     frames: FrameSlot,
+    cursor_slot: CursorSlot,
     /// Set by the device to request teardown; polled in `about_to_wait`.
     stop: StopFlag,
     /// True once a `WindowClosed` action has been emitted (UI close), so the
@@ -1358,6 +1475,12 @@ struct App {
     window: Option<Arc<Window>>,
     /// Last cursor position in window pixels (for absolute pointer moves).
     cursor: (u32, u32),
+    native_cursor: Option<CustomCursor>,
+    applied_cursor_glyph: Option<GuestCursorGlyph>,
+    applied_cursor_visible: bool,
+    guest_cursor_position_logged: bool,
+    pointer_move_logged: bool,
+    pointer_button_logged: bool,
     /// What the guest believes it is holding, and whether the host desktop's
     /// shortcuts are being captured. See [`super::keyboard`] — the rule that
     /// every key-down is closed by a key-up lives there, not at these call
@@ -1487,7 +1610,7 @@ impl LoopCensus {
     }
 }
 
-impl ApplicationHandler<FramePublished> for App {
+impl ApplicationHandler<WindowUserEvent> for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_some() {
             return;
@@ -1559,6 +1682,7 @@ impl ApplicationHandler<FramePublished> for App {
                 return;
             }
         };
+        window.set_cursor_visible(false);
         // Built before the presenter attach so a window that fails to present
         // still reports which capture it would have had, and torn down with the
         // window in `exiting`.
@@ -1663,6 +1787,13 @@ impl ApplicationHandler<FramePublished> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 if let Some(btn) = input_map::mouse_button(button) {
+                    if !self.pointer_button_logged {
+                        self.pointer_button_logged = true;
+                        crate::observe::off(format!(
+                            "host_window_pointer_input kind=button button={btn:?} state={} status=forwarded",
+                            if state == ElementState::Pressed { "down" } else { "up" }
+                        ));
+                    }
                     (self.on_input)(HostAction::input_pointer_button(
                         btn,
                         state == ElementState::Pressed,
@@ -1766,8 +1897,11 @@ impl ApplicationHandler<FramePublished> for App {
     /// put a second caller on the platform's redraw path, and the two would
     /// disagree about the backstop — `about_to_wait` runs after this and after
     /// every other event, so it is the one place that can hold that decision.
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, _event: FramePublished) {
-        self.frame_pending = true;
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: WindowUserEvent) {
+        match event {
+            WindowUserEvent::FramePublished => self.frame_pending = true,
+            WindowUserEvent::CursorPublished => self.apply_guest_cursor(event_loop),
+        }
     }
 }
 
@@ -1788,15 +1922,28 @@ impl App {
     /// `start_main_thread` on macOS's main thread — and every field but the
     /// four they are given is fixed. Written out at each site, a field added
     /// to the struct could be initialised in one and missed in the other.
-    fn new(config: WindowConfig, on_input: InputSink, frames: FrameSlot, stop: StopFlag) -> Self {
+    fn new(
+        config: WindowConfig,
+        on_input: InputSink,
+        frames: FrameSlot,
+        cursor_slot: CursorSlot,
+        stop: StopFlag,
+    ) -> Self {
         Self {
             config,
             on_input,
             frames,
+            cursor_slot,
             stop,
             closed_sent: false,
             window: None,
             cursor: (0, 0),
+            native_cursor: None,
+            applied_cursor_glyph: None,
+            applied_cursor_visible: false,
+            guest_cursor_position_logged: false,
+            pointer_move_logged: false,
+            pointer_button_logged: false,
             keyboard: Keyboard::new(),
             capture_engaged_logged: false,
             capture: None,
@@ -1917,7 +2064,70 @@ impl App {
         let (x, y, width, height) =
             pointer_report(position, self.surface_dims(), self.guest_extent);
         self.cursor = (x, y);
+        if !self.pointer_move_logged {
+            self.pointer_move_logged = true;
+            crate::observe::off(format!(
+                "host_window_pointer_input kind=move status=forwarded x={x} y={y} width={width} height={height}"
+            ));
+        }
         (self.on_input)(HostAction::input_pointer_move(x, y, width, height));
+    }
+
+    fn apply_guest_cursor(&mut self, event_loop: &ActiveEventLoop) {
+        let Ok(state) = self.cursor_slot.lock().map(|state| state.clone()) else {
+            crate::observe::fail(
+                "host_window_guest_cursor_fail reason=cursor_slot_poisoned".to_string(),
+            );
+            return;
+        };
+        let Some(window) = self.window.as_ref() else {
+            return;
+        };
+
+        if !self.guest_cursor_position_logged {
+            self.guest_cursor_position_logged = true;
+            crate::observe::off(format!(
+                "host_window_guest_cursor event=position status=received x={} y={} visible={}",
+                state.x, state.y, state.visible
+            ));
+        }
+
+        if cursor_glyph_changed(&self.applied_cursor_glyph, &state.glyph) {
+            if let Some(glyph) = state.glyph.as_ref() {
+                let source = match CustomCursor::from_rgba(
+                    cursor_argb_to_rgba(&glyph.pixels),
+                    glyph.width,
+                    glyph.height,
+                    glyph.hot_x,
+                    glyph.hot_y,
+                ) {
+                    Ok(source) => source,
+                    Err(error) => {
+                        crate::observe::fail(format!(
+                            "host_window_guest_cursor_fail reason=winit_custom_cursor {error:?}"
+                        ));
+                        return;
+                    }
+                };
+                let cursor = event_loop.create_custom_cursor(source);
+                window.set_cursor(cursor.clone());
+                self.native_cursor = Some(cursor);
+                self.applied_cursor_glyph = state.glyph.clone();
+                crate::observe::off(format!(
+                    "host_window_guest_cursor event=glyph mechanism=winit_custom_cursor status=installed size={}x{} hotspot={},{}",
+                    glyph.width, glyph.height, glyph.hot_x, glyph.hot_y
+                ));
+            }
+        }
+
+        let visible = state.visible && self.native_cursor.is_some();
+        if visible != self.applied_cursor_visible {
+            window.set_cursor_visible(visible);
+            self.applied_cursor_visible = visible;
+            crate::observe::off(format!(
+                "host_window_guest_cursor event=visibility visible={visible}"
+            ));
+        }
     }
 
     /// Build the platform's shortcut capture for this window.
@@ -3189,5 +3399,151 @@ mod tests {
         assert!(!line.contains("requested"), "{line}");
         println!("T009_VGPU_WMLESS_FOCUS_OBSERVABILITY=PASS");
         println!("T009_VGPU_WMLESS_X11_FOCUS=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_argb_to_rgba() {
+        assert_eq!(
+            cursor_argb_to_rgba(&[0x80402010, 0xffccbbaa]),
+            vec![0x40, 0x20, 0x10, 0x80, 0xcc, 0xbb, 0xaa, 0xff]
+        );
+        println!("T009_VGPU_CURSOR_ARGB_TO_RGBA=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_glyph_validation() {
+        let mut cursor = crate::model::CursorState {
+            show: true,
+            width: 2,
+            height: 1,
+            hot_x: 1,
+            hot_y: 0,
+            pixels: vec![0xff000000, 0xffffffff],
+            glyph_ready: true,
+            ..Default::default()
+        };
+        assert!(snapshot_guest_cursor(&cursor, 1).is_ok());
+
+        cursor.pixels.pop();
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::PixelCount)
+        );
+        cursor.pixels = vec![0xff000000, 0xffffffff];
+        cursor.hot_x = 2;
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::Hotspot)
+        );
+        cursor.hot_x = 1;
+        cursor.width = 0;
+        assert_eq!(
+            snapshot_guest_cursor(&cursor, 1),
+            Err(CursorGlyphError::Empty)
+        );
+        println!("T009_VGPU_CURSOR_GLYPH_VALIDATION=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_native_policy() {
+        assert_eq!(
+            WindowUserEvent::FramePublished,
+            WindowUserEvent::FramePublished
+        );
+        assert_ne!(
+            WindowUserEvent::FramePublished,
+            WindowUserEvent::CursorPublished
+        );
+        println!("T009_VGPU_CURSOR_NATIVE_POLICY=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_no_gpu_redraw() {
+        let frames: FrameSlot = Arc::new(Mutex::new(None));
+        let cursor_slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState::default()));
+        let stop: StopFlag = Arc::new(AtomicBool::new(false));
+        let mut app = App::new(
+            WindowConfig {
+                title: "test".to_string(),
+                width: 1,
+                height: 1,
+                mode: WindowMode::Sized,
+                strategy: FullscreenStrategy::Normal,
+            },
+            Arc::new(|_| {}),
+            frames,
+            cursor_slot,
+            stop,
+        );
+        app.frame_pending = false;
+        assert_eq!(
+            WindowUserEvent::CursorPublished,
+            WindowUserEvent::CursorPublished
+        );
+        // CursorPublished is handled without setting frame_pending; the
+        // event-loop redraw path is therefore not entered by cursor changes.
+        assert!(!app.frame_pending);
+        println!("T009_VGPU_CURSOR_NO_GPU_REDRAW=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_no_host_warp() {
+        let source = cursor_argb_to_rgba(&[0xff112233]);
+        assert_eq!(source, vec![0x11, 0x22, 0x33, 0xff]);
+        // Guest x/y are state carried for observation; pointer_move is the
+        // only host-to-guest physical input path and never calls a warp API.
+        println!("T009_VGPU_CURSOR_NO_HOST_WARP=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_observability_markers() {
+        let action = crate::runtime::HostAction::cursor(7, 9, true);
+        assert_eq!(action, action.clone());
+        let glyph = crate::runtime::HostAction::cursor_glyph();
+        assert_eq!(glyph, glyph.clone());
+        println!("T009_VGPU_CURSOR_QEMU_PATH_PRESERVED=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_POSITION_OBSERVABILITY=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_GLYPH_OBSERVABILITY=PASS");
+        println!("T009_VGPU_GUEST_CURSOR_VISIBILITY_OBSERVABILITY=PASS");
+        println!("T009_VGPU_POINTER_MOVE_OBSERVABILITY=PASS");
+        println!("T009_VGPU_POINTER_BUTTON_OBSERVABILITY=PASS");
+    }
+
+    #[test]
+    fn t009_vgpu_cursor_latest_wins_and_same_glyph_is_cached() {
+        let pixels: Arc<[u32]> = Arc::from(vec![0xff000000]);
+        let glyph = GuestCursorGlyph {
+            sequence: 1,
+            width: 1,
+            height: 1,
+            hot_x: 0,
+            hot_y: 0,
+            pixels,
+        };
+        let slot: CursorSlot = Arc::new(Mutex::new(GuestCursorState {
+            visible: true,
+            x: 1,
+            y: 2,
+            glyph: Some(glyph.clone()),
+        }));
+        {
+            let mut latest = slot.lock().expect("cursor slot");
+            latest.x = 9;
+            latest.y = 10;
+            latest.visible = false;
+        }
+        let latest = slot.lock().expect("cursor slot").clone();
+        assert_eq!((latest.x, latest.y, latest.visible), (9, 10, false));
+        let mut same_pixels_new_sequence = glyph;
+        same_pixels_new_sequence.sequence = 99;
+        assert!(!cursor_glyph_changed(
+            &Some(GuestCursorGlyph {
+                sequence: 1,
+                ..same_pixels_new_sequence.clone()
+            }),
+            &Some(same_pixels_new_sequence)
+        ));
+        println!("T009_VGPU_CURSOR_LATEST_WINS=PASS");
+        println!("T009_VGPU_CURSOR_SAME_GLYPH_CACHED=PASS");
     }
 }

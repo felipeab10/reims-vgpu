@@ -43,6 +43,8 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use crate::qemu::host_ops::{NullHost, QemuHost, ReimsVgpuHostOps};
+#[cfg(feature = "host-window")]
+use crate::runtime::host::HostActionKind;
 // The four names the two chapter modules below reach through `use super::*`,
 // and this module uses itself. They were the crate root's "convenience
 // re-exports used by qemu ABI and tests" and came with the registry.
@@ -793,11 +795,37 @@ pub fn device_pop_action(id: u64) -> Option<HostAction> {
             if q.is_empty() {
                 crate::runtime::drain::note_irq_delivered();
             }
+            #[cfg(feature = "host-window")]
+            if a.kind == HostActionKind::CursorUpdate {
+                drop(q);
+                window_publish::mirror_guest_cursor_update(&slot, a);
+                return Some(a);
+            }
             return Some(a);
         }
     }
     let mut d = slot.inner.try_lock()?;
-    d.actions.pop_front()
+    let action = d.actions.pop_front();
+    #[cfg(feature = "host-window")]
+    let cursor_snapshot = if action.is_some_and(|a| a.kind == HostActionKind::CursorGlyph) {
+        Some(crate::host_window::present::snapshot_guest_cursor(
+            &d.device.state.cursor,
+            0,
+        ))
+    } else {
+        None
+    };
+    drop(d);
+    #[cfg(feature = "host-window")]
+    if let Some(snapshot) = cursor_snapshot {
+        match snapshot {
+            Ok(snapshot) => window_publish::mirror_guest_cursor_glyph(&slot, snapshot),
+            Err(error) => {
+                crate::observe::fail(format!("host_window_guest_cursor_fail reason={error:?}"))
+            }
+        }
+    }
+    action
 }
 
 /// What the process's backend calls itself, for QEMU's realize trace.
