@@ -603,6 +603,119 @@ impl crate::observe::Decline for HostWindowMode {
     }
 }
 
+/// The focus confirmation emitted only after the WM-less X11 window is the
+/// server's current input focus. Geometry and focus are separate contracts:
+/// the first does not imply the second when there is no window manager.
+struct HostWindowFocus;
+
+impl crate::observe::Decline for HostWindowFocus {
+    fn slug(&self) -> &'static str {
+        "host_window_focus"
+    }
+
+    fn fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            ("mechanism", "x11_set_input_focus".to_string()),
+            ("status", "verified".to_string()),
+        ]
+    }
+}
+
+/// Request and verify focus for the appliance's WM-less X11 window.
+///
+/// This deliberately consumes the raw handles from the already-created winit
+/// window. `x11_dl::Xlib::open` loads libX11; it does not call `XOpenDisplay`,
+/// so the `Display*` remains the connection owned by winit and used by the
+/// presenter and keyboard capture.
+#[cfg(target_os = "linux")]
+fn focus_wm_less_x11_window(window: &Arc<Window>) -> Result<(), WindowError> {
+    use raw_window_handle::{HasDisplayHandle as _, HasWindowHandle as _};
+    use std::mem::MaybeUninit;
+    use std::os::raw::{c_int, c_ulong};
+
+    let display_handle = window
+        .display_handle()
+        .map_err(|_| WindowError::X11FocusHandle)?
+        .as_raw();
+    let raw_window = window
+        .window_handle()
+        .map_err(|_| WindowError::X11FocusHandle)?
+        .as_raw();
+    let raw_window_handle::RawDisplayHandle::Xlib(display_handle) = display_handle else {
+        return Err(WindowError::X11FocusHandle);
+    };
+    let raw_window_handle::RawWindowHandle::Xlib(window_handle) = raw_window else {
+        return Err(WindowError::X11FocusHandle);
+    };
+    let display = display_handle
+        .display
+        .ok_or(WindowError::X11FocusHandle)?
+        .as_ptr()
+        .cast::<x11_dl::xlib::Display>();
+    let xlib = x11_dl::xlib::Xlib::open()
+        .map_err(|error| WindowError::X11FocusRequest(detail_field(&error.to_string())))?;
+
+    // A focus request against an unmapped window is an X11 refusal. Check once
+    // at the deterministic lifecycle point after presenter attach; do not turn
+    // this into a polling loop.
+    let mut attrs = MaybeUninit::<x11_dl::xlib::XWindowAttributes>::uninit();
+    // SAFETY: `display` and `window_handle.window` came from the live winit
+    // window, and the output is fully written when XGetWindowAttributes says
+    // it succeeded.
+    let attributes_ok =
+        unsafe { (xlib.XGetWindowAttributes)(display, window_handle.window, attrs.as_mut_ptr()) };
+    if attributes_ok == 0 {
+        return Err(WindowError::X11FocusQuery);
+    }
+    let attrs = unsafe { attrs.assume_init() };
+    if attrs.map_state != x11_dl::xlib::IsViewable {
+        return Err(WindowError::X11FocusNotViewable);
+    }
+
+    // SAFETY: this is the same live Xlib connection and window handle. The
+    // request is synchronous at the Xlib API boundary; verification below
+    // rejects servers that did not make this window the focus target.
+    let set_ok = unsafe {
+        (xlib.XSetInputFocus)(
+            display,
+            window_handle.window,
+            x11_dl::xlib::RevertToParent,
+            0,
+        )
+    };
+    if set_ok == 0 {
+        return Err(WindowError::X11FocusRequest("xsetinputfocus_failed".into()));
+    }
+    unsafe {
+        (xlib.XFlush)(display);
+    }
+
+    let mut focused: c_ulong = 0;
+    let mut revert_to: c_int = 0;
+    // SAFETY: both output pointers are valid for the duration of the call.
+    let focus_query_ok = unsafe { (xlib.XGetInputFocus)(display, &mut focused, &mut revert_to) };
+    if focus_query_ok == 0 {
+        return Err(WindowError::X11FocusQuery);
+    }
+    verify_x11_focus_target(window_handle.window, focused)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn focus_wm_less_x11_window(_window: &Arc<Window>) -> Result<(), WindowError> {
+    Err(WindowError::X11FocusHandle)
+}
+
+/// Keep the server-result validation independent from the live X11 call so
+/// `None`, `PointerRoot`, the root window and another client are all covered
+/// without needing an X server in the regression suite.
+fn verify_x11_focus_target(target: u64, focused: u64) -> Result<(), WindowError> {
+    if focused == target {
+        Ok(())
+    } else {
+        Err(WindowError::X11FocusVerify { focused })
+    }
+}
+
 /// Window creation parameters.
 ///
 /// `mode` is resolved from the environment by whoever builds the config rather
@@ -922,11 +1035,18 @@ pub enum WindowError {
     /// `run_app` returned an error on the macOS main-thread loop.
     MainLoopRun(String),
     /// A second device tried to claim the single process window.
-    AlreadyOwned { owner: u64 },
+    AlreadyOwned {
+        owner: u64,
+    },
     /// `run_main_thread` found no registered window for the device.
-    NoRegisteredWindow { id: u64 },
+    NoRegisteredWindow {
+        id: u64,
+    },
     /// `run_main_thread` was asked to run a window owned by another device.
-    WrongOwner { owner: u64, requested: u64 },
+    WrongOwner {
+        owner: u64,
+        requested: u64,
+    },
     /// `resumed`: winit could not create the native window (shared step, both
     /// platforms) — the bring-up cannot proceed past this.
     CreateNativeWindow(String),
@@ -958,7 +1078,23 @@ pub enum WindowError {
     /// The root window answered with a rectangle an appliance window cannot be:
     /// a dimension of `1` or less. A full-screen `1x1` window is the failure this
     /// path exists to prevent, so the rectangle is refused rather than applied.
-    X11RootGeometryInvalid { width: u32, height: u32 },
+    X11RootGeometryInvalid {
+        width: u32,
+        height: u32,
+    },
+    /// The WM-less path could not obtain the existing Xlib display/window
+    /// handles needed for the explicit focus request.
+    X11FocusHandle,
+    /// The WM-less window was not viewable at its one focus lifecycle point.
+    X11FocusNotViewable,
+    /// The Xlib focus request or a focus query failed.
+    X11FocusRequest(String),
+    X11FocusQuery,
+    /// XGetInputFocus returned a different target, including None, PointerRoot
+    /// or the root window, so the window is not usable as appliance input.
+    X11FocusVerify {
+        focused: u64,
+    },
     /// The WM-less path asked for a monitor and the window system offered none.
     ///
     /// Retained for a caller that resolves geometry without a root fallback.
@@ -987,12 +1123,17 @@ impl WindowError {
             | Self::AttachPresenter(d)
             | Self::FullscreenValue(d)
             | Self::X11WmLessValue(d)
-            | Self::X11RootGeometry(d) => Some(d),
+            | Self::X11RootGeometry(d)
+            | Self::X11FocusRequest(d) => Some(d),
             Self::AlreadyOwned { .. }
             | Self::NoRegisteredWindow { .. }
             | Self::WrongOwner { .. }
             | Self::X11RootHandle
             | Self::X11RootGeometryInvalid { .. }
+            | Self::X11FocusHandle
+            | Self::X11FocusNotViewable
+            | Self::X11FocusQuery
+            | Self::X11FocusVerify { .. }
             | Self::NoMonitor => None,
         }
     }
@@ -1022,6 +1163,11 @@ impl crate::observe::Decline for WindowError {
             Self::X11RootHandle => "window_x11_root_handle",
             Self::X11RootGeometry(_) => "window_x11_root_geometry",
             Self::X11RootGeometryInvalid { .. } => "window_x11_root_geometry_invalid",
+            Self::X11FocusHandle => "window_x11_focus_handle",
+            Self::X11FocusNotViewable => "window_x11_focus_not_viewable",
+            Self::X11FocusRequest(_) => "window_x11_focus_request",
+            Self::X11FocusQuery => "window_x11_focus_query",
+            Self::X11FocusVerify { .. } => "window_x11_focus_verify",
             Self::NoMonitor => "window_no_monitor",
         }
     }
@@ -1037,6 +1183,7 @@ impl crate::observe::Decline for WindowError {
             Self::X11RootGeometryInvalid { width, height } => {
                 vec![("width", width.to_string()), ("height", height.to_string())]
             }
+            Self::X11FocusVerify { focused } => vec![("focused", focused.to_string())],
             other => match other.detail() {
                 Some(d) => vec![("detail", detail_field(d))],
                 None => Vec::new(),
@@ -1375,11 +1522,11 @@ impl ApplicationHandler<FramePublished> for App {
                 // The screen's own rectangle, applied at creation: a RandR
                 // monitor when winit identified one, and the X11 root window
                 // when it did not. The `Fullscreen::Borderless` request above
-                // stays: with no window manager it moves nothing, and it is what
-                // makes winit call `XSetInputFocus` when the window becomes
-                // visible — the WM-independent keyboard focus this session
-                // depends on. What it must not do is be the *only* thing sizing
-                // the window, and it no longer is.
+                // stays for the ordinary winit fullscreen contract, but it is
+                // not the source of focus in this path: winit returns before
+                // its focus hint when the X11 monitor is the dummy id=0. The
+                // explicit WM-less focus request happens after the presenter
+                // attaches below.
                 let geometry = match resolve_wm_less_geometry(event_loop) {
                     Ok(geometry) => geometry,
                     Err(error) => {
@@ -1419,10 +1566,20 @@ impl ApplicationHandler<FramePublished> for App {
         match Self::attach_presenter(&window) {
             Ok(()) => {
                 self.presenter_attached = true;
+                self.window = Some(window.clone());
+                if self.config.strategy == FullscreenStrategy::X11WmLess {
+                    if let Err(error) = focus_wm_less_x11_window(&window) {
+                        crate::observe::Emit::decline("host_window_focus", &error).fail();
+                        eprintln!("reims-vgpu-window: {error}; shutting down");
+                        self.request_shutdown();
+                        event_loop.exit();
+                        return;
+                    }
+                    crate::observe::Emit::decline("host_window_focus", &HostWindowFocus).off();
+                }
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
                 window.request_redraw();
-                self.window = Some(window);
             }
             Err(error) => {
                 // One rule on every platform and every rail: a rail that
@@ -2288,6 +2445,11 @@ mod tests {
                 width: 1,
                 height: 1,
             },
+            WindowError::X11FocusHandle,
+            WindowError::X11FocusNotViewable,
+            WindowError::X11FocusRequest("xsetinputfocus_failed".into()),
+            WindowError::X11FocusQuery,
+            WindowError::X11FocusVerify { focused: 1 },
             WindowError::NoMonitor,
         ]
     }
@@ -2311,6 +2473,11 @@ mod tests {
             WindowError::X11RootHandle => "X11RootHandle",
             WindowError::X11RootGeometry(_) => "X11RootGeometry",
             WindowError::X11RootGeometryInvalid { .. } => "X11RootGeometryInvalid",
+            WindowError::X11FocusHandle => "X11FocusHandle",
+            WindowError::X11FocusNotViewable => "X11FocusNotViewable",
+            WindowError::X11FocusRequest(_) => "X11FocusRequest",
+            WindowError::X11FocusQuery => "X11FocusQuery",
+            WindowError::X11FocusVerify { .. } => "X11FocusVerify",
             WindowError::NoMonitor => "NoMonitor",
         }
     }
@@ -2378,7 +2545,8 @@ mod tests {
     /// and the five the WM-less X11 path adds — an unreadable
     /// [`crate::config::X11_WMLESS`] value, a display handle that is not Xlib,
     /// a root query that failed, a root rectangle too degenerate to be a
-    /// window, and a WM-less boot with no monitor to take its rectangle from.
+    /// window, and a WM-less boot with no monitor to take its rectangle from;
+    /// plus the five explicit X11 focus refusals.
     /// Of those, the unreadable-value one ends nothing and the rest end the
     /// window before it exists; they belong here for the same reason as the
     /// rest: they are statements about bringing the window up, made once,
@@ -2395,7 +2563,7 @@ mod tests {
         );
         assert_eq!(
             names.len(),
-            16,
+            21,
             "WindowError carries {} variants; a presenter-shaped family here is \
              a second rail that no fail line distinguishes",
             names.len()
@@ -2981,5 +3149,45 @@ mod tests {
         .render();
         assert!(ordinary.contains("geometry_source=none"), "{ordinary}");
         println!("T009_VGPU_WMLESS_GEOMETRY_SOURCE=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_policy_is_explicit_and_normal_path_is_unchanged() {
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::X11), true, true),
+            FullscreenStrategy::X11WmLess
+        );
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::X11), true, false),
+            FullscreenStrategy::Normal
+        );
+        assert_eq!(
+            FullscreenStrategy::resolve(Some(crate::config::WindowSystem::Wayland), true, true),
+            FullscreenStrategy::Normal
+        );
+        println!("T009_VGPU_WMLESS_FOCUS_POLICY=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_verification_accepts_only_the_target_window() {
+        use crate::observe::Decline as _;
+        let target = 0x44;
+        assert!(verify_x11_focus_target(target, target).is_ok());
+        for focused in [0, 1, 0x480, target + 1] {
+            let error = verify_x11_focus_target(target, focused)
+                .expect_err("None, PointerRoot, root and another window must refuse");
+            assert_eq!(error.slug(), "window_x11_focus_verify");
+        }
+        println!("T009_VGPU_WMLESS_FOCUS_VERIFY=PASS");
+    }
+
+    #[test]
+    fn wm_less_focus_observability_requires_verified_status() {
+        let line = crate::observe::Emit::decline("host_window_focus", &HostWindowFocus).render();
+        assert!(line.contains("mechanism=x11_set_input_focus"), "{line}");
+        assert!(line.contains("status=verified"), "{line}");
+        assert!(!line.contains("requested"), "{line}");
+        println!("T009_VGPU_WMLESS_FOCUS_OBSERVABILITY=PASS");
+        println!("T009_VGPU_WMLESS_X11_FOCUS=PASS");
     }
 }
