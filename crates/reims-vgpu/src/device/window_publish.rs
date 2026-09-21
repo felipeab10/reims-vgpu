@@ -53,7 +53,6 @@ pub(super) fn window_frame_key(present: &crate::model::PresentState) -> WindowFr
 pub(crate) struct WindowLink {
     /// Shared latest-frame slot the window thread reads each redraw.
     frames: crate::host_window::present::FrameSlot,
-    pub(crate) cursor: crate::host_window::present::CursorSlot,
     /// Wakes the window's event loop once a frame has landed in `frames`.
     ///
     /// The window used to find frames by polling the slot every 2 ms, which on a
@@ -121,7 +120,7 @@ pub(crate) struct EarlyFb {
 pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     use crate::backend::Backend as _;
     use crate::host_window::present::{
-        CursorSlot, FrameSlot, FullscreenStrategy, InputSink, WindowConfig, WindowMode, WindowWaker,
+        FrameSlot, FullscreenStrategy, InputSink, WindowConfig, WindowMode,
     };
     // Two questions, two owners. The `cfg` above answers "did this build
     // compile a window"; the running rail answers "is there a swapchain to fill
@@ -150,12 +149,12 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     // FrameSlot is a std::sync::Mutex (owned by the window module); lib.rs's
     // bare `Mutex` is parking_lot, so qualify it here.
     let frames: FrameSlot = Arc::new(std::sync::Mutex::new(None));
-    let cursor: CursorSlot = Arc::new(std::sync::Mutex::new(Default::default()));
-    // Created here rather than on the window thread so the link holds it before
-    // the loop exists: an unarmed waker is a no-op and the window's backstop
-    // covers the gap, so a publish that beats the loop's creation costs latency
-    // rather than a frame.
-    let wake = WindowWaker::new();
+    // Created with the device rather than on the window thread so cursor
+    // publication never needs the frame/Vulkan `window` lock. An unarmed waker
+    // is a no-op and the window's backstop covers the gap, so a publish that
+    // beats the loop's creation costs latency rather than a frame.
+    let cursor = Arc::clone(&slot.window_cursor);
+    let wake = Arc::clone(&slot.window_wake);
     // Weak so a live window does not pin a destroyed device; post-destroy input
     // upgrades to None and is dropped (the guest is gone anyway).
     let weak = Arc::downgrade(&slot);
@@ -227,7 +226,6 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
     ));
     *link = Some(WindowLink {
         frames,
-        cursor,
         wake,
         last: (u32::MAX, u32::MAX, u32::MAX, u64::MAX),
         seq: 0,
@@ -255,11 +253,7 @@ pub fn device_window_start(id: u64, width: u32, height: u32) -> bool {
 
 #[cfg(feature = "host-window")]
 pub(crate) fn mirror_guest_cursor_update(slot: &BoundDevice, action: crate::runtime::HostAction) {
-    let mut guard = slot.window.lock();
-    let Some(link) = guard.as_mut() else {
-        return;
-    };
-    let Ok(mut cursor) = link.cursor.lock() else {
+    let Ok(mut cursor) = slot.window_cursor.lock() else {
         crate::observe::fail(
             "host_window_guest_cursor_fail reason=cursor_slot_poisoned".to_string(),
         );
@@ -269,7 +263,7 @@ pub(crate) fn mirror_guest_cursor_update(slot: &BoundDevice, action: crate::runt
     cursor.y = action.a1 as u16;
     cursor.visible = action.a2 != 0;
     drop(cursor);
-    link.wake.wake_cursor();
+    slot.window_wake.wake_cursor();
 }
 
 #[cfg(feature = "host-window")]
@@ -277,11 +271,7 @@ pub(crate) fn mirror_guest_cursor_glyph(
     slot: &BoundDevice,
     mut snapshot: crate::host_window::present::GuestCursorState,
 ) {
-    let mut guard = slot.window.lock();
-    let Some(link) = guard.as_mut() else {
-        return;
-    };
-    let Ok(mut cursor) = link.cursor.lock() else {
+    let Ok(mut cursor) = slot.window_cursor.lock() else {
         crate::observe::fail(
             "host_window_guest_cursor_fail reason=cursor_slot_poisoned".to_string(),
         );
@@ -296,7 +286,7 @@ pub(crate) fn mirror_guest_cursor_glyph(
     }
     *cursor = snapshot;
     drop(cursor);
-    link.wake.wake_cursor();
+    slot.window_wake.wake_cursor();
 }
 
 /// No-op stub when the `host-window` feature is off: the FFI symbol still links

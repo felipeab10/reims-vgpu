@@ -132,6 +132,14 @@ struct BoundDevice {
     /// boot (the window is opt-in behind `REIMS_VGPU_WINDOW`).
     #[cfg(feature = "host-window")]
     window: Mutex<Option<window_publish::WindowLink>>,
+    /// Cursor publication is deliberately independent from `window`: the
+    /// QEMU BH pops cursor actions on its main loop, while frame publication
+    /// can hold `window` across a Vulkan resident lookup/copy. Coupling the two
+    /// lets a cosmetic cursor update stall every guest-facing BH action.
+    #[cfg(feature = "host-window")]
+    window_cursor: crate::host_window::present::CursorSlot,
+    #[cfg(feature = "host-window")]
+    window_wake: crate::host_window::present::WindowWakeHandle,
     /// Early-boot framebuffer (BAR1 GOP) registered by the C shim, shown in the
     /// window until the product present path latches.
     #[cfg(feature = "host-window")]
@@ -260,6 +268,10 @@ pub fn device_create(ops: Option<ReimsVgpuHostOps>, page_shift: u32) -> Option<u
             ops,
             #[cfg(feature = "host-window")]
             window: Mutex::new(None),
+            #[cfg(feature = "host-window")]
+            window_cursor: Arc::new(std::sync::Mutex::new(Default::default())),
+            #[cfg(feature = "host-window")]
+            window_wake: crate::host_window::present::WindowWaker::new(),
             #[cfg(feature = "host-window")]
             early_fb: Mutex::new(None),
             #[cfg(feature = "host-window")]
