@@ -3898,8 +3898,9 @@ pub(crate) fn slot_span_fits(size: u64, slot_size: u64) -> bool {
 /// Staging slots are mapped for their lifetime at allocation, so this is a field
 /// read. The fallback map exists for a slot that predates the persistent
 /// mapping or was built by a path that does not map — it is the same
-/// map-per-write the pools used to do everywhere, and it leaks nothing because
-/// `vkFreeMemory` unmaps implicitly.
+/// map-per-write the pools used to do everywhere. The boolean in the return
+/// value tells the caller to unmap after its copy; keeping that lifetime at the
+/// call site prevents a second map of the same dedicated allocation.
 ///
 /// # Why the length is checked here and not left to the caller
 ///
@@ -3920,7 +3921,7 @@ unsafe fn staging_write_ptr(
     ctx: &DeviceContext,
     slot: &BufferSlot,
     size: u64,
-) -> Result<*mut u8, DrawError> {
+) -> Result<(*mut u8, bool), DrawError> {
     if !slot_span_fits(size, slot.size) {
         return Err(DrawError::DrawExecution(
             super::draw_execution::DrawExecutionDecline::StagingWriteBeyondSlot {
@@ -3930,12 +3931,15 @@ unsafe fn staging_write_ptr(
         ));
     }
     if slot.mapped != 0 {
-        return Ok(slot.mapped as *mut u8);
+        return Ok((slot.mapped as *mut u8, false));
     }
-    Ok(ctx
-        .device
-        .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
-        .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))? as *mut u8)
+    Ok((
+        ctx.device
+            .map_memory(slot.memory, 0, size, vk::MemoryMapFlags::empty())
+            .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsMapStaging, e)))?
+            as *mut u8,
+        true,
+    ))
 }
 
 /// Copy the first `len` bytes out of a readback slot, invalidating first when the
@@ -4149,6 +4153,8 @@ mod staging_mapping_tests {
             again.mapped, 0,
             "recycling must not restore a stale pointer"
         );
+        unsafe { pools.write_staging(&ctx, &again, &payload) }
+            .expect("a recycled CPU snapshot must map, write, and unmap again");
 
         pools.recycle_staging();
         unsafe { pools.destroy_all(&ctx.device) };

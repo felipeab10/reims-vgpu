@@ -3459,7 +3459,7 @@ impl ResourcePools {
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("bytes", bytes.len() as u64, 0);
         let size = bytes.len().max(4) as u64;
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         unsafe {
             if bytes.is_empty() {
                 // Nothing to copy — the mapped span is the 4-byte minimum; zero it
@@ -3471,6 +3471,9 @@ impl ResourcePools {
                 // full-span zeroing would just be overwritten. Copy only.
                 std::ptr::copy_nonoverlapping(bytes.as_ptr(), ptr, bytes.len());
             }
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }
@@ -3530,32 +3533,35 @@ impl ResourcePools {
         rgba: &[u8],
     ) -> Result<(), DrawError> {
         let size = rgba.len().max(4) as u64;
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         unsafe {
             if rgba.is_empty() {
                 std::ptr::write_bytes(ptr, 0, size as usize);
-                return Ok(());
+            } else {
+                // The mapped span is at least `rgba.len()` and is exclusively ours
+                // for the duration of this call, so a slice over it is sound. It
+                // exists so the transformation can be a plain function with a test
+                // rather than pointer arithmetic no test can reach.
+                //
+                // Timed on its own, because `draw_phase`'s `stage_us` also carries
+                // vertex, index and storage staging: dividing that by
+                // `seed_upload_bytes` gives a rate contaminated by whatever else the
+                // draw staged, which is enough to see the seed path is slow and not
+                // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
+                // this write and nothing else, so it can be read against the memcpy
+                // rate `write_staging_from_runs` gets into the same memory class and
+                // convict either the loop or the memory.
+                let started = std::time::Instant::now();
+                exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
+                crate::runtime::drain::note_store_route_us(
+                    "swap_rb_us",
+                    started.elapsed().as_micros() as u64,
+                );
+                crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
             }
-            // The mapped span is at least `rgba.len()` and is exclusively ours
-            // for the duration of this call, so a slice over it is sound. It
-            // exists so the transformation can be a plain function with a test
-            // rather than pointer arithmetic no test can reach.
-            //
-            // Timed on its own, because `draw_phase`'s `stage_us` also carries
-            // vertex, index and storage staging: dividing that by
-            // `seed_upload_bytes` gives a rate contaminated by whatever else the
-            // draw staged, which is enough to see the seed path is slow and not
-            // enough to say what limits it. `swap_rb_us` against `swap_rb_kb` is
-            // this write and nothing else, so it can be read against the memcpy
-            // rate `write_staging_from_runs` gets into the same memory class and
-            // convict either the loop or the memory.
-            let started = std::time::Instant::now();
-            exchange_rb_into(rgba, std::slice::from_raw_parts_mut(ptr, rgba.len()));
-            crate::runtime::drain::note_store_route_us(
-                "swap_rb_us",
-                started.elapsed().as_micros() as u64,
-            );
-            crate::runtime::drain::note_store_route_n("swap_rb_kb", (rgba.len() / 1024) as u64);
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }
@@ -3580,7 +3586,7 @@ impl ResourcePools {
     ) -> Result<(), DrawError> {
         let _slow = SlowStagingWrite::watch("guest_runs", total_len, runs.len());
         let size = total_len.max(4);
-        let ptr = staging_write_ptr(ctx, slot, size)?;
+        let (ptr, transient) = staging_write_ptr(ctx, slot, size)?;
         let total = total_len as usize;
         let mut off = 0usize;
         let mut skip = source_offset;
@@ -3613,6 +3619,9 @@ impl ResourcePools {
             if off < size as usize {
                 std::ptr::write_bytes(ptr.add(off), 0, size as usize - off);
             }
+        }
+        if transient {
+            ctx.device.unmap_memory(slot.memory);
         }
         Ok(())
     }
