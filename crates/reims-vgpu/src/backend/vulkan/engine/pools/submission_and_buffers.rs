@@ -3245,13 +3245,43 @@ impl ResourcePools {
         size: u64,
         counters: &EngineCounters,
     ) -> Result<BufferSlot, DrawError> {
+        self.acquire_staging_with_mapping(ctx, size, counters, true)
+    }
+
+    /// Acquire a CPU snapshot slot without retaining a persistent host pointer.
+    /// The guest-run fallback uses this conservative path after runtime #3
+    /// reproduced a SIGSEGV in the persistent staging destination.
+    pub(crate) unsafe fn acquire_staging_cpu_snapshot(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+    ) -> Result<BufferSlot, DrawError> {
+        self.acquire_staging_with_mapping(ctx, size, counters, false)
+    }
+
+    unsafe fn acquire_staging_with_mapping(
+        &mut self,
+        ctx: &DeviceContext,
+        size: u64,
+        counters: &EngineCounters,
+        persistent_mapping: bool,
+    ) -> Result<BufferSlot, DrawError> {
         let need = size.max(4);
         let bucket = Self::bucket(need);
         // Free slots in this bucket, whatever the caller is about to bind them
         // as: every slot carries [`POOL_SLOT_USAGE`], so there is no usage for
         // this list to be keyed by.
         if let Some(list) = self.staging_free.get_mut(&bucket) {
-            if let Some(slot) = list.pop() {
+            let slot_index = if persistent_mapping {
+                list.len().checked_sub(1)
+            } else {
+                list.iter().rposition(|slot| {
+                    slot.mapped == 0 && matches!(slot.backing, BufferBacking::Dedicated)
+                })
+            };
+            if let Some(index) = slot_index {
+                let slot = list.swap_remove(index);
                 self.note_staging_hit();
                 self.staging_live.push(slot);
                 return Ok(slot);
@@ -3278,38 +3308,47 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
-        // Carve out of a shared HOST_VISIBLE block rather than allocating one
-        // memory object per buffer. The block is allocated and mapped once; a
-        // miss here is a create + carve + bind, which is what turns the ~0.4 ms
-        // floor every miss used to pay into a handful of block allocations for
-        // the whole boot. The slab picks the same `MemoryClass::Upload` type
-        // `mt` resolves to and records it on the block, so a carve only ever
-        // lands in a block this bind can legally use; `mt` stays here because
-        // the slot still has to report that type's caching.
-        let token = self
-            .slabs
-            .upload()
-            .acquire(ctx, &req, counters)
-            .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
-        ctx.device
-            .bind_buffer_memory(buffer, token.memory, token.offset())
+        let (memory, mapped, backing) = if persistent_mapping {
+            let token = self
+                .slabs
+                .upload()
+                .acquire(ctx, &req, counters)
+                .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+            (token.memory, token.mapped, BufferBacking::Slab(token))
+        } else {
+            let memory = allocate_memory_timed(
+                ctx,
+                &vk::MemoryAllocateInfo::default()
+                    .allocation_size(req.size)
+                    .memory_type_index(mt),
+                AllocSite::StagingBuffer,
+            )
             .map_err(|e| {
-                self.slabs.release(&ctx.device, token);
+                ctx.device.destroy_buffer(buffer, None);
+                DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e))
+            })?;
+            counters.note_alloc();
+            (memory, 0, BufferBacking::Dedicated)
+        };
+        ctx.device
+            .bind_buffer_memory(buffer, memory, 0)
+            .map_err(|e| {
+                match backing {
+                    BufferBacking::Dedicated => ctx.device.free_memory(memory, None),
+                    BufferBacking::Slab(token) => self.slabs.release(&ctx.device, token),
+                }
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
         let slot = BufferSlot {
             buffer,
-            memory: token.memory,
+            memory,
             size: bucket,
-            // The block's mapping covers every carve in it, so a slot's host
-            // address is a pointer into it. Nothing maps or unmaps per slot;
-            // the pool's whole point is that the allocation outlives the bind,
-            // and now so does the mapping of the block behind it.
-            mapped: token.mapped,
-            backing: BufferBacking::Slab(token),
+            mapped,
+            backing,
             // `MemoryClass::Upload` requires HOST_COHERENT, so a staging write
-            // needs no flush and the persistent mapping above is sound.
+            // needs no flush, whether the slot uses a persistent or transient
+            // mapping.
             coherent: true,
             // Read rather than asserted: `MemoryClass::Upload` says nothing
             // about caching, and nothing on the staging path reads this field —

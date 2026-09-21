@@ -733,7 +733,7 @@ unsafe fn stage_buffer_content(
                 // deferred-submit hot path, ~4.8 binds/draw under compositing).
                 let slot = {
                     let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                    pools.acquire_staging(ctx, src.total_len, counters)?
+                    pools.acquire_staging_cpu_snapshot(ctx, src.total_len, counters)?
                 };
                 let _s = stage_phase::Span::moving(stage_phase::Part::Runs, src.total_len);
                 pools.write_staging_from_runs(
@@ -3837,7 +3837,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 None => {
                     let slot = {
                         let _s = stage_phase::Span::open(stage_phase::Part::Acquire);
-                        pools.acquire_staging(ctx, seed.source.total_len, counters)?
+                        pools.acquire_staging_cpu_snapshot(ctx, seed.source.total_len, counters)?
                     };
                     {
                         let _s = stage_phase::Span::moving(
@@ -4202,7 +4202,8 @@ pub(crate) unsafe fn execute_draw_inner(
                         imported
                     }
                     None => {
-                        let scratch = pools.acquire_staging(ctx, src.total_len, counters)?;
+                        let scratch =
+                            pools.acquire_staging_cpu_snapshot(ctx, src.total_len, counters)?;
                         pools.write_staging_from_runs(
                             ctx,
                             &scratch,

@@ -3405,6 +3405,10 @@ pub(crate) enum AllocSite {
     /// comparing a new `staging_block` figure against an old `staging` one
     /// would be comparing block allocations against buffer allocations.
     StagingBlock,
+    /// A dedicated HOST_VISIBLE staging allocation. This is the conservative
+    /// path for CPU-written staging slots: its mapping is created only for the
+    /// write and cannot outlive the slot's own allocation.
+    StagingBuffer,
     Readback,
     ReadbackMulti,
     SlabBlock,
@@ -3422,7 +3426,7 @@ pub(crate) enum AllocSite {
     GuestGatherBlock,
 }
 
-const ALLOC_SITE_N: usize = 9;
+const ALLOC_SITE_N: usize = 10;
 
 impl AllocSite {
     const fn idx(self) -> usize {
@@ -3432,10 +3436,11 @@ impl AllocSite {
             AllocSite::TransientDepth => 2,
             AllocSite::DepthResident => 3,
             AllocSite::StagingBlock => 4,
-            AllocSite::Readback => 5,
-            AllocSite::ReadbackMulti => 6,
-            AllocSite::SlabBlock => 7,
-            AllocSite::GuestGatherBlock => 8,
+            AllocSite::StagingBuffer => 5,
+            AllocSite::Readback => 6,
+            AllocSite::ReadbackMulti => 7,
+            AllocSite::SlabBlock => 8,
+            AllocSite::GuestGatherBlock => 9,
         }
     }
 }
@@ -3446,6 +3451,7 @@ const ALLOC_SITE_NAMES: [&str; ALLOC_SITE_N] = [
     "transient_depth",
     "depth_resident",
     "staging_block",
+    "staging_buffer",
     "readback",
     "readback_multi",
     "slab_block",
@@ -4047,7 +4053,10 @@ pub(super) unsafe fn invalidate_slot_for_read(
 
 #[cfg(test)]
 mod staging_mapping_tests {
-    use super::{readback_leases_outstanding, return_readback_lease, DeviceContext, ResourcePools};
+    use super::{
+        readback_leases_outstanding, return_readback_lease, BufferBacking, DeviceContext,
+        ResourcePools,
+    };
     use crate::backend::vulkan::engine::counters::EngineCounters;
 
     /// A staging slot carries its own host mapping, and keeps it across recycle.
@@ -4090,6 +4099,55 @@ mod staging_mapping_tests {
         assert_eq!(
             again.mapped, first.mapped,
             "a recycled slot lost its mapping and would map per write again"
+        );
+
+        pools.recycle_staging();
+        unsafe { pools.destroy_all(&ctx.device) };
+        unsafe { ctx.destroy() };
+    }
+
+    /// CPU guest-run snapshots must not retain the persistent slab mapping.
+    #[test]
+    fn a_cpu_snapshot_slot_maps_only_for_the_write() {
+        crate::observe::redirect_logs_for_tests();
+        let mut ctx = match unsafe { DeviceContext::create() } {
+            Ok(c) => c,
+            Err(e) => {
+                eprintln!("SKIP CPU snapshot mapping: no device ({e})");
+                return;
+            }
+        };
+        let counters = EngineCounters::default();
+        let mut pools = ResourcePools::new();
+
+        let persistent = unsafe { pools.acquire_staging(&ctx, 4096, &counters) }
+            .expect("a persistent staging slot must be available");
+        pools.recycle_staging();
+
+        let first = unsafe { pools.acquire_staging_cpu_snapshot(&ctx, 4096, &counters) }
+            .expect("a CPU snapshot slot must be available");
+        assert_ne!(
+            first.buffer, persistent.buffer,
+            "CPU snapshots must not reuse a persistent staging slot"
+        );
+        assert_eq!(
+            first.mapped, 0,
+            "CPU snapshots must not retain a host pointer"
+        );
+        assert!(
+            matches!(first.backing, BufferBacking::Dedicated),
+            "CPU snapshots must own their allocation"
+        );
+        let payload = vec![0x5a; 4096];
+        unsafe { pools.write_staging(&ctx, &first, &payload) }.expect("snapshot write must land");
+
+        pools.recycle_staging();
+        let again = unsafe { pools.acquire_staging_cpu_snapshot(&ctx, 4096, &counters) }
+            .expect("the CPU snapshot slot must recycle");
+        assert_eq!(again.buffer, first.buffer, "expected the recycled slot");
+        assert_eq!(
+            again.mapped, 0,
+            "recycling must not restore a stale pointer"
         );
 
         pools.recycle_staging();
