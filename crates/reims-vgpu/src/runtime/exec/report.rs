@@ -109,8 +109,13 @@ pub(super) fn note_unimplemented_render_opcode(
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("");
+    let class = if crate::model::is_opengl_compat_render_opcode(opcode) {
+        "opengl_compat"
+    } else {
+        "unknown"
+    };
     crate::observe::fail(format!(
-        "render_unimplemented reason=accepted_without_executor task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
+        "render_unimplemented reason=accepted_without_executor class={class} task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
         opcode,
         cmd_bytes.len(),
         acc.color_targets,

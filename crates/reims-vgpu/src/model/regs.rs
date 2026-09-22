@@ -1265,6 +1265,24 @@ pub const DEVICE_INFO_KEY_SERIALIZER_VERSION: u32 = 10;
 /// pathway that this checkout cannot take.
 pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 
+/// Render records unlocked by the serializer's OpenGL compatibility rung.
+///
+/// These are deliberately kept separate from the executable render vocabulary:
+/// the PCI guest personality currently answers `supportsOpenGL` negatively, so
+/// a normal x86 guest must never emit them. Keeping the inventory explicit lets
+/// the compatibility work observe the first real request without pretending
+/// that advertising the serializer rung implements the records.
+pub const OPENGL_COMPAT_RENDER_OPCODES: &[u32] = &[
+    0x8a, 0x8b, 0x8c, 0x8d, 0x8e, 0x8f, 0x90, 0x91, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98,
+];
+
+/// Whether a render record belongs to the serializer's OpenGL compatibility
+/// surface rather than the Vulkan/Metal path currently executed here.
+#[inline]
+pub fn is_opengl_compat_render_opcode(opcode: u32) -> bool {
+    OPENGL_COMPAT_RENDER_OPCODES.contains(&opcode)
+}
+
 /// Wire key 11 — bitmask of the `MTLPrimitiveType` values the guest may draw.
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
@@ -2267,5 +2285,14 @@ mod tests {
             assert!(u32::from(height) <= MAX_SCANOUT_DIM);
         }
         assert_eq!(DISPLAY_PRODUCT_NAME.last(), Some(&0));
+    }
+
+    #[test]
+    fn opengl_compatibility_inventory_is_explicit_and_closed() {
+        assert_eq!(OPENGL_COMPAT_RENDER_OPCODES.len(), 15);
+        assert!(is_opengl_compat_render_opcode(0x8a));
+        assert!(is_opengl_compat_render_opcode(0x98));
+        assert!(!is_opengl_compat_render_opcode(0x89));
+        assert!(!is_opengl_compat_render_opcode(0x99));
     }
 }
