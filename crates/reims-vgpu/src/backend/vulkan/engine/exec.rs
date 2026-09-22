@@ -282,6 +282,16 @@ fn geometry_probe_enabled() -> bool {
     })
 }
 
+fn first_materialization_clear_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_CLEAR_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn geometry_probe_budget(req: &DrawRequest) -> bool {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let partial = req.scissors.iter().any(|scissor| {
@@ -3082,7 +3092,23 @@ pub(crate) unsafe fn execute_draw_inner(
     // The second question used to have no representation here, so both answers
     // resolved to `CLEAR` and an unseeded preserving pass was cleared to a
     // colour the guest never supplied. See [`Color0Load`].
-    let color0_load = if load_uses_gpu_content
+    let first_materialization_clear_probe = first_materialization_clear_probe_enabled()
+        && req.target_rgba8.is_some()
+        && req.target_identity.as_ref().is_some_and(|identity| {
+            !pools.registry_content_ready(identity)
+        })
+        && req.scissors.iter().any(|scissor| {
+            !(scissor.x == 0
+                && scissor.y == 0
+                && scissor.width >= req.width
+                && scissor.height >= req.height)
+        })
+        && req
+            .color0_declared
+            .is_some_and(|declared| declared.preserves_prior_contents());
+    let color0_load = if first_materialization_clear_probe {
+        Color0Load::Clear
+    } else if load_uses_gpu_content
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some()
@@ -3587,7 +3613,9 @@ pub(crate) unsafe fn execute_draw_inner(
         }
         Some((rgba8, layout))
     });
-    let seed_slot = if let Some((rgba8, layout)) = seed_wide {
+    let seed_slot = if first_materialization_clear_probe {
+        None
+    } else if let Some((rgba8, layout)) = seed_wide {
         // The seed's own order first, because `expand_rgba8_to_texel` reads
         // semantic RGBA8 — the same normalization the four-byte arm folds into
         // its copy, done here as a step because a widening pass cannot also
