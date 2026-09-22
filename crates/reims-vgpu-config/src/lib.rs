@@ -966,6 +966,8 @@ pub const FIRST_MATERIALIZATION_CLEAR_PROBE: &str =
     "REIMS_VGPU_FIRST_MATERIALIZATION_CLEAR_PROBE";
 pub const FIRST_MATERIALIZATION_ZERO_SEED_PROBE: &str =
     "REIMS_VGPU_FIRST_MATERIALIZATION_ZERO_SEED_PROBE";
+pub const FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE: &str =
+    "REIMS_VGPU_FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE";
 
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an

@@ -302,6 +302,16 @@ fn first_materialization_zero_seed_probe_enabled() -> bool {
     })
 }
 
+fn first_materialization_explicit_barrier_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_EXPLICIT_BARRIER_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn geometry_probe_budget(req: &DrawRequest) -> bool {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let partial = req.scissors.iter().any(|scissor| {
@@ -4733,9 +4743,25 @@ pub(crate) unsafe fn execute_draw_inner(
             vk::ImageLayout::TRANSFER_DST_OPTIMAL,
             &copy,
         );
+        let explicit_first_barrier = first_materialization_explicit_barrier_probe_enabled()
+            && !target_registry_ready_before
+            && req.target_rgba8.is_some()
+            && req.scissors.iter().any(|scissor| {
+                !(scissor.x == 0
+                    && scissor.y == 0
+                    && scissor.width >= req.width
+                    && scissor.height >= req.height)
+            })
+            && req
+                .color0_declared
+                .is_some_and(|declared| declared.preserves_prior_contents());
         let barrier = [vk::ImageMemoryBarrier::default()
             .src_access_mask(vk::AccessFlags::TRANSFER_WRITE)
-            .dst_access_mask(target_dst_access)
+            .dst_access_mask(if explicit_first_barrier {
+                vk::AccessFlags::COLOR_ATTACHMENT_READ | vk::AccessFlags::COLOR_ATTACHMENT_WRITE
+            } else {
+                target_dst_access
+            })
             .old_layout(vk::ImageLayout::TRANSFER_DST_OPTIMAL)
             .new_layout(target_pass_layout)
             .image(target_image)
@@ -4743,8 +4769,16 @@ pub(crate) unsafe fn execute_draw_inner(
         ctx.device.cmd_pipeline_barrier(
             cb,
             vk::PipelineStageFlags::TRANSFER,
-            target_dst_stage,
-            target_dependency,
+            if explicit_first_barrier {
+                vk::PipelineStageFlags::COLOR_ATTACHMENT_OUTPUT
+            } else {
+                target_dst_stage
+            },
+            if explicit_first_barrier {
+                vk::DependencyFlags::empty()
+            } else {
+                target_dependency
+            },
             &[],
             &[],
             &barrier,
