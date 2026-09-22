@@ -621,6 +621,15 @@ pub fn encode_draw_chain<M: HostMemory + HostOps>(
                     false
                 }
             } else if c0.target_gva != 0 {
+                // `execute_draw_request` reports the physical order of the
+                // resident readback separately from its byte vector.  GVA
+                // writeback and the GVA host caches consume semantic RGBA8,
+                // so normalize a BGRA resident before either consumer sees
+                // it.  Without this, a BGRA GVA Store is published as though
+                // it were RGBA8; the next partial LOAD then seeds the target
+                // with exchanged R/B channels and the corruption appears
+                // outside the draw's scissor.
+                reorder_rb_in_place(&mut rgba, draw_bgra, false);
                 // What this Store would cost if it were served the way the
                 // mapper-ref-texture surface Store is served.
                 //
