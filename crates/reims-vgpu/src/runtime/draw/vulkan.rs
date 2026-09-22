@@ -9848,18 +9848,36 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     scissor.width,
                     scissor.height,
                 );
+                let mut swapped_after = after_pixels.clone();
+                for pixel in swapped_after.chunks_exact_mut(4) {
+                    pixel.swap(0, 2);
+                }
+                let (changed_outside_swapped, changed_inside_swapped) =
+                    target_content_diff_outside(
+                        before,
+                        &swapped_after,
+                        w,
+                        h,
+                        scissor.x,
+                        scissor.y,
+                        scissor.width,
+                        scissor.height,
+                    );
                 let first = after_pixels
                     .get(..4)
                     .map(|px| format!("[{},{},{},{}]", px[0], px[1], px[2], px[3]))
                     .unwrap_or_else(|| "none".to_string());
                 format!(
                     "source=draw_readback sig={:016x} first={} readback_bgra={} \
-                     changed_outside={} changed_inside={}",
+                     changed_outside={} changed_inside={} \
+                     swapped_outside={} swapped_inside={}",
                     target_content_signature(&after_pixels),
                     first,
                     out.pixels_bgra as u8,
                     changed_outside,
                     changed_inside,
+                    changed_outside_swapped,
+                    changed_inside_swapped,
                 )
             } else {
                 format!(
