@@ -116,7 +116,8 @@ pub(super) fn note_unimplemented_render_opcode(
         "unknown"
     };
     let selector = gl_record.map_or("-", |record| record.selector);
-    let expected_body_len = gl_record.map_or(0, |record| record.body_len);
+    let expected_body_len =
+        gl_record.map_or_else(|| "-".to_owned(), |record| record.body_len.to_string());
     let actual_body_len = cmd_bytes.len().saturating_sub(8);
     crate::observe::fail(format!(
         "render_unimplemented reason=accepted_without_executor class={class} selector={selector} expected_body_len={expected_body_len} actual_body_len={actual_body_len} task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",

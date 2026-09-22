@@ -1358,13 +1358,6 @@ pub const OPENGL_COMPAT_RENDER_OPCODES: &[OpenGlCompatRenderOpcode] = &[
     },
 ];
 
-/// Whether a render record belongs to the serializer's OpenGL compatibility
-/// surface rather than the Vulkan/Metal path currently executed here.
-#[inline]
-pub fn is_opengl_compat_render_opcode(opcode: u32) -> bool {
-    opengl_compat_render_opcode(opcode).is_some()
-}
-
 /// Metadata for an OpenGL compatibility record, when `opcode` belongs to that
 /// surface. No wire fields are interpreted here.
 #[inline]
@@ -2381,11 +2374,11 @@ mod tests {
     #[test]
     fn opengl_compatibility_inventory_is_explicit_and_closed() {
         assert_eq!(OPENGL_COMPAT_RENDER_OPCODES.len(), 15);
-        assert!(is_opengl_compat_render_opcode(0x8a));
-        assert!(is_opengl_compat_render_opcode(0x98));
+        assert!(opengl_compat_render_opcode(0x8a).is_some());
+        assert!(opengl_compat_render_opcode(0x98).is_some());
         assert_eq!(opengl_compat_render_opcode(0x94).unwrap().body_len, 0);
         assert_eq!(opengl_compat_render_opcode(0x8d).unwrap().body_len, 20);
-        assert!(!is_opengl_compat_render_opcode(0x89));
-        assert!(!is_opengl_compat_render_opcode(0x99));
+        assert!(opengl_compat_render_opcode(0x89).is_none());
+        assert!(opengl_compat_render_opcode(0x99).is_none());
     }
 }
