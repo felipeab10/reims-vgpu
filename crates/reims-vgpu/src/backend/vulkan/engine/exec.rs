@@ -3023,8 +3023,20 @@ pub(crate) unsafe fn execute_draw_inner(
             super::reason::DrawReason::UsedBindingAbsentFromLayout { binding, fragment },
         ));
     }
-    // Resolve load action: resident > guest/host seed > Clear black.
-    let mut load_uses_gpu_content = req.load_from_target;
+    // Resolve load action: resident > guest/host seed > Clear black. A
+    // preserving guest pass may arrive without an explicit seed: on a later
+    // compositor damage draw, the existing resident is itself the seed.
+    // Leaving that pass as DONT_CARE permits Vulkan to discard untouched
+    // regions, which appears as stale/duplicated UI in the host window.
+    let preserving_existing_target = req.color0_declared.is_some_and(|declared| {
+        declared.preserves_prior_contents()
+            && req.target_identity.as_ref().is_some_and(|identity| {
+                pools
+                    .registry_get(identity)
+                    .is_some_and(|slot| slot.content_ready)
+            })
+    });
+    let mut load_uses_gpu_content = req.load_from_target || preserving_existing_target;
     // output_bgra (computed with the batch decision above): BGRA output only
     // on the resident path (pooled targets stay RGBA); the whole
     // pass/pipeline/image chain then agrees on B8G8R8A8 so a raw image→buffer
@@ -3057,6 +3069,7 @@ pub(crate) unsafe fn execute_draw_inner(
         // damage-only draw can enter with DONT_CARE/CLEAR and destroy the
         // pixels its scissor does not repaint.
         || (req.load_guest_target_backing && req.guest_target_memory.is_some())
+        || preserving_existing_target
     {
         Color0Load::Preserve
     } else if req
