@@ -279,6 +279,7 @@ impl ResourcePools {
             staging_miss_bins: [0; STAGING_BUCKET_BINS],
             staging_miss_us_bins: [0; STAGING_BUCKET_BINS],
             settled_staging_mark: 0,
+            last_staging_activity_ms: None,
             targets: HashMap::new(),
             target_order: Vec::new(),
             multisample_target: None,
@@ -563,7 +564,9 @@ impl ResourcePools {
     ///
     /// A pass is settled only if no staging buffer was acquired since the
     /// previous pass. The trim then needs
-    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes.
+    /// `SETTLED_PASSES_FOR_BUFFER_TRIM` consecutive settled passes and
+    /// `STAGING_BUFFER_TRIM_IDLE_MS` since the last observed acquire. The grace
+    /// interval preserves staging allocations across periodic guest updates.
     ///
     /// Upload traffic is the direct signal for the failure this gate prevents:
     /// "a single quiet pass mid-playback
@@ -589,8 +592,12 @@ impl ResourcePools {
             self.settled_maintenance_passes = self.settled_maintenance_passes.saturating_add(1);
         } else {
             self.settled_maintenance_passes = 0;
+            self.last_staging_activity_ms = Some(self.idle_clock_ms);
         }
         self.settled_maintenance_passes >= SETTLED_PASSES_FOR_BUFFER_TRIM
+            && self.last_staging_activity_ms.is_none_or(|last| {
+                self.idle_clock_ms.saturating_sub(last) >= STAGING_BUFFER_TRIM_IDLE_MS
+            })
     }
 
     /// Run periodic maintenance for objects that are already outside live
@@ -3304,7 +3311,9 @@ impl ResourcePools {
             }
         }
         let miss_started = Instant::now();
-        let _slow = SlowStagingWrite::watch("acquire", need, 0);
+        let mut slow = SlowStagingWrite::watch("acquire", need, 0);
+        let detail_enabled = super::slow_staging_detail_enabled();
+        let create_started = detail_enabled.then(Instant::now);
         let buffer = ctx
             .device
             .create_buffer(
@@ -3315,8 +3324,13 @@ impl ResourcePools {
                 None,
             )
             .map_err(|e| DrawError::VkCall(VkCall::new(VkOp::PoolsCreateStaging, e)))?;
+        let create_us = create_started.map_or(0, |started| started.elapsed().as_micros() as u64);
         counters.note_create(CreateSite::StagingBuffer);
+        let requirements_started = detail_enabled.then(Instant::now);
         let req = ctx.device.get_buffer_memory_requirements(buffer);
+        let requirements_us =
+            requirements_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        let memory_type_started = detail_enabled.then(Instant::now);
         let mt = ctx
             .memory_type_for(req.memory_type_bits, req.size, MemoryClass::Upload)
             .ok_or({
@@ -3324,12 +3338,20 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
+        let memory_type_us =
+            memory_type_started.map_or(0, |started| started.elapsed().as_micros() as u64);
+        let mut slab_acquire_us = 0;
+        let mut allocation_us = 0;
+        let mut slab_trace = detail_enabled.then(Default::default);
         let (memory, mapped, bind_offset, backing) = if persistent_mapping {
+            let slab_started = detail_enabled.then(Instant::now);
             let token = self
                 .slabs
                 .upload()
-                .acquire(ctx, &req, counters)
+                .acquire_traced(ctx, &req, counters, slab_trace.as_mut())
                 .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
+            slab_acquire_us =
+                slab_started.map_or(0, |started| started.elapsed().as_micros() as u64);
             let bind_offset = token.offset();
             (
                 token.memory,
@@ -3338,6 +3360,7 @@ impl ResourcePools {
                 BufferBacking::Slab(token),
             )
         } else {
+            let allocation_started = detail_enabled.then(Instant::now);
             let memory = allocate_memory_timed(
                 ctx,
                 &vk::MemoryAllocateInfo::default()
@@ -3349,9 +3372,12 @@ impl ResourcePools {
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e))
             })?;
+            allocation_us =
+                allocation_started.map_or(0, |started| started.elapsed().as_micros() as u64);
             counters.note_alloc();
             (memory, 0, 0, BufferBacking::Dedicated)
         };
+        let bind_started = detail_enabled.then(Instant::now);
         ctx.device
             .bind_buffer_memory(buffer, memory, bind_offset)
             .map_err(|e| {
@@ -3362,6 +3388,7 @@ impl ResourcePools {
                 ctx.device.destroy_buffer(buffer, None);
                 DrawError::VkCall(VkCall::new(VkOp::PoolsBindStaging, e))
             })?;
+        let bind_us = bind_started.map_or(0, |started| started.elapsed().as_micros() as u64);
         let slot = BufferSlot {
             buffer,
             memory,
@@ -3378,7 +3405,28 @@ impl ResourcePools {
             cached: ctx.mapped_memory_kind(mt).cached,
         };
         self.staging_live.push(slot);
-        self.note_staging_miss(bucket, miss_started.elapsed().as_micros() as u64);
+        let miss_us = miss_started.elapsed().as_micros() as u64;
+        if detail_enabled {
+            let slab = slab_trace.unwrap_or_default();
+            slow.detail_when_slow(|| {
+                format!(
+                    "bucket={bucket} persistent={} create_us={create_us} requirements_us={requirements_us} \
+                     memory_type_us={memory_type_us} slab_acquire_us={slab_acquire_us} \
+                     slab_blocks_scanned={} slab_ranges_scanned={} slab_carve_us={} \
+                     slab_check_us={} slab_memory_type_us={} slab_alloc_us={} slab_map_us={} \
+                     allocation_us={allocation_us} bind_us={bind_us}",
+                    u8::from(persistent_mapping),
+                    slab.blocks_scanned,
+                    slab.ranges_scanned,
+                    slab.carve_us,
+                    slab.check_us,
+                    slab.memory_type_us,
+                    slab.alloc_us,
+                    slab.map_us,
+                )
+            });
+        }
+        self.note_staging_miss(bucket, miss_us);
         Ok(slot)
     }
 

@@ -306,6 +306,11 @@ pub(crate) struct ResourcePools {
     /// `staging_hits + staging_misses` at the previous maintenance pass; see
     /// `note_maintenance_settled`.
     settled_staging_mark: u64,
+    /// Last maintenance clock at which a staging acquire was observed. A short
+    /// quiet gap is not sufficient evidence that the upload workload is done:
+    /// periodic guest updates can otherwise cause a staging buffer to be
+    /// destroyed and synchronously reallocated on the next update.
+    last_staging_activity_ms: Option<u64>,
     /// Target images + framebuffers keyed by geometry + render_pass identity.
     targets: HashMap<(TargetKey, u64), TargetSlot>, // u64 = render_pass as u64
     target_order: Vec<(TargetKey, u64)>,
@@ -2935,6 +2940,13 @@ const IDLE_RECYCLE_TRIM_PER_PASS: usize = 8;
 /// climbs and the buffers drain to zero within a few hundred ms of settling.
 const SETTLED_PASSES_FOR_BUFFER_TRIM: u32 = 3;
 
+/// Minimum quiet interval before trimming host-visible buffers. The pass count
+/// above rejects continuous traffic; this grace period also protects periodic
+/// workloads whose updates are farther apart than a few maintenance ticks.
+/// Keeping an idle buffer briefly is preferable to paying a synchronous Vulkan
+/// allocation on the next guest update.
+const STAGING_BUFFER_TRIM_IDLE_MS: u64 = 90_000;
+
 /// Empty image-slab blocks retained once idle has **settled**.
 /// `slab::SLAB_KEEP_EMPTY` (2) is the churn buffer the hot release path keeps
 /// mid-burst; at settled idle the drain trims all the way to zero so no empty
@@ -3536,6 +3548,7 @@ pub(crate) struct SlowStagingWrite {
     bytes: u64,
     runs: usize,
     started: std::time::Instant,
+    detail: Option<String>,
 }
 
 /// Below this a staging step is ordinary work. A frame at 60 Hz is 16.7 ms; the
@@ -3546,6 +3559,14 @@ const SLOW_STAGING_WRITE_US: u64 = 20_000;
 const SLOW_STAGING_LINE_CAP: u64 = 256;
 static SLOW_STAGING_LINES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
+/// Enable per-stage timestamps only in a diagnostic runtime. Pool misses are
+/// frequent enough that even a few extra clock reads should not tax normal
+/// rendering.
+pub(crate) fn slow_staging_detail_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("REIMS_VGPU_STAGING_DETAIL").is_some())
+}
+
 impl SlowStagingWrite {
     pub(crate) fn watch(kind: &'static str, bytes: u64, runs: usize) -> Self {
         Self {
@@ -3553,6 +3574,14 @@ impl SlowStagingWrite {
             bytes,
             runs,
             started: std::time::Instant::now(),
+            detail: None,
+        }
+    }
+
+    /// Attach expensive-path context without formatting it on ordinary calls.
+    pub(crate) fn detail_when_slow(&mut self, detail: impl FnOnce() -> String) {
+        if self.started.elapsed().as_micros() as u64 >= SLOW_STAGING_WRITE_US {
+            self.detail = Some(detail());
         }
     }
 }
@@ -3567,11 +3596,16 @@ impl Drop for SlowStagingWrite {
         if n >= SLOW_STAGING_LINE_CAP {
             return;
         }
+        let detail = self
+            .detail
+            .as_deref()
+            .map_or_else(String::new, |detail| format!(" detail={detail}"));
         crate::observe::off(format!(
-            "staging_write_slow kind={} us={us} bytes={} runs={}{}",
+            "staging_write_slow kind={} us={us} bytes={} runs={}{}{}",
             self.kind,
             self.bytes,
             self.runs,
+            detail,
             if n + 1 == SLOW_STAGING_LINE_CAP {
                 " (last: report cap reached)"
             } else {
