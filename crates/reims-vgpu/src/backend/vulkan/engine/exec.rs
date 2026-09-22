@@ -3051,6 +3051,12 @@ pub(crate) unsafe fn execute_draw_inner(
         || seed_bytes.is_some()
         || req.target_guest_seed.is_some()
         || req.seed_from_target.is_some()
+        // The mapper-ref-texture path supplies the guest allocation as the
+        // attachment's backing after the request is assembled. Keep the pass
+        // on LOAD from the outset when that backing was admitted; otherwise a
+        // damage-only draw can enter with DONT_CARE/CLEAR and destroy the
+        // pixels its scissor does not repaint.
+        || (req.load_guest_target_backing && req.guest_target_memory.is_some())
     {
         Color0Load::Preserve
     } else if req
