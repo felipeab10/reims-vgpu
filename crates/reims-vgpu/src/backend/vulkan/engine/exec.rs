@@ -4715,21 +4715,27 @@ pub(crate) unsafe fn execute_draw_inner(
         // skip keyed on the layout alone is what `ResidentAccess` exists to
         // stop, since a layout can be reached by a write that shares its name.
         //
-        // The second skip is the layout one, and it is sound only because both
-        // halves are asked. `layout() == layout()` says there is nothing to
-        // *place*, which is true for every resident once a colour target rests
-        // in one layout; `covered_by_pass_entry` says the pass's own incoming
-        // external dependency already makes the prior access *visible* to this
-        // draw's sampled read, which is a separate question and the one that
-        // carries the hazard. Asking only the first is exactly the mistake
-        // `ResidentAccess` exists to stop — a layout can be reached by a write
-        // that shares its name.
+        // A same-layout skip is sound only for a read-after-read. A
+        // `ColorWrite`/`ColorFeedback` resident can share the resting layout
+        // with `ShaderRead`, but it still needs an explicit visibility
+        // dependency when it is not an attachment of this pass. The render
+        // pass's external dependency is scoped to the pass's attachment
+        // accesses; relying on it for these secondary resident images is what
+        // lets a small glyph or button sample stale pixels. Keep the layout
+        // skip for read-only predecessors, but retain the barrier for writes.
         //
         // This is what retires `passmerge_outside_resident_layout`: the barrier
         // it charged is not moved earlier or made cheaper, it stops being owed.
+        let prior_is_write = matches!(
+            access,
+            super::pools::ResidentAccess::ColorWrite(_)
+                | super::pools::ResidentAccess::ColorFeedback(_)
+        );
         if !transitioned_resident.insert(identity.clone())
             || access == next_access
-            || (access.layout() == next_access.layout() && access.covered_by_pass_entry())
+            || (access.layout() == next_access.layout()
+                && access.covered_by_pass_entry()
+                && !prior_is_write)
         {
             continue;
         }
