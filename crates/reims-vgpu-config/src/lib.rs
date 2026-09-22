@@ -947,6 +947,12 @@ pub const LAYOUT_CHURN: &str = "REIMS_VGPU_LAYOUT_CHURN";
 /// us/draw — excluded as slow, and a single such boot says nothing either.
 pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 
+/// Diagnostic-only probe for partial render-target content. When enabled, the
+/// Vulkan draw rail samples the resident before and after a partial preserving
+/// draw and records compact content signatures. It is off by default and does
+/// not change the normal execution path unless explicitly requested.
+pub const TARGET_CONTENT_PROBE: &str = "REIMS_VGPU_TARGET_CONTENT_PROBE";
+
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an
 /// ordinary optimally-tiled device-local resident and its Store copies out.

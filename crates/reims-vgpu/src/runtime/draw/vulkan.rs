@@ -21,6 +21,70 @@ use crate::runtime::mapper::{mapping_guest_write_verdict, GuestWriteVerdict};
 use crate::runtime::surface_currency::{surface_currency, CurrencyStandard, SurfaceCurrency};
 use reims_vgpu_protocol::pass_action::MTL_LOAD_ACTION_DONT_CARE;
 
+fn target_content_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::TARGET_CONTENT_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+/// A cheap, stable fingerprint for diagnostic frame comparisons. Sampling one
+/// byte per 4 KiB keeps the probe bounded even for a full 4K target while still
+/// distinguishing the repeated corruption patterns seen in the VM.
+fn target_content_signature(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64 ^ bytes.len() as u64;
+    for &byte in bytes.iter().step_by(4096) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    for &byte in bytes.iter().rev().take(64) {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
+}
+
+fn target_content_diff_outside(
+    before: &[u8],
+    after: &[u8],
+    width: u32,
+    height: u32,
+    scissor_x: u32,
+    scissor_y: u32,
+    scissor_width: u32,
+    scissor_height: u32,
+) -> (u64, u64) {
+    let pixels = (width as usize).saturating_mul(height as usize);
+    let available = before.len().min(after.len()) / 4;
+    let mut changed_outside = 0;
+    let mut changed_inside = 0;
+    let x_end = scissor_x.saturating_add(scissor_width).min(width);
+    let y_end = scissor_y.saturating_add(scissor_height).min(height);
+    for index in 0..pixels.min(available) {
+        let x = (index as u32) % width.max(1);
+        let y = (index as u32) / width.max(1);
+        let offset = index * 4;
+        if before[offset..offset + 4] == after[offset..offset + 4] {
+            continue;
+        }
+        if x >= scissor_x && x < x_end && y >= scissor_y && y < y_end {
+            changed_inside += 1;
+        } else {
+            changed_outside += 1;
+        }
+    }
+    (changed_outside, changed_inside)
+}
+
+fn target_content_probe_budget() -> Option<u64> {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    (n < 128).then_some(n)
+}
+
 /// Vulkan image shape for a reflected Metal sampled-image dimensionality.
 ///
 /// The engine caps array layers at 1 (a single-layer array is still a distinct
@@ -9613,12 +9677,115 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 )
             })?;
         }
+        let target_content_probe = target_content_probe_enabled()
+            && req.scissors.first().is_some_and(|scissor| {
+                !(scissor.x == 0 && scissor.y == 0 && scissor.width >= w && scissor.height >= h)
+            })
+            && req.colors.first().is_some_and(|color| {
+                reims_vgpu_protocol::pass_action::LoadAction::from_declared(color.load_action)
+                    .preserves_prior_contents()
+            });
+        // The probe needs the same resident bytes that the partial pass is
+        // supposed to preserve. A diagnostic readback is deliberately forced
+        // for this draw only; the normal resident/no-readback path remains
+        // unchanged when the switch is off.
+        let probe_id = target_content_probe
+            .then(target_content_probe_budget)
+            .flatten();
+        let mut probe_before_pixels = None;
+        if let Some(probe_id) = probe_id {
+            let before_pixels = if let Some(seed) = resources.target_rgba8.as_deref() {
+                let mut pixels = seed.to_vec();
+                if resources.target_seed_order == crate::backend::vulkan::engine::SeedOrder::Rgba8 {
+                    for pixel in pixels.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                }
+                Some(pixels)
+            } else if let Some(identity) = resources.target_identity.as_ref() {
+                crate::backend::vulkan::engine::read_target(identity)
+                    .ok()
+                    .and_then(|readback| readback.into_bgra8())
+            } else {
+                None
+            };
+            let before = before_pixels.as_ref().map(|pixels| {
+                let source = if resources.target_rgba8.is_some() {
+                    "cpu_seed"
+                } else {
+                    "resident"
+                };
+                (source, target_content_signature(pixels))
+            });
+            probe_before_pixels = before_pixels;
+            let before_text = before
+                .map(|(source, signature)| format!("source={source} sig={signature:016x}"))
+                .unwrap_or_else(|| "source=unavailable sig=none".to_string());
+            let scissor = req.scissors.first().expect("probe requires a scissor");
+            crate::observe::off(format!(
+                "target_content_probe phase=before id={probe_id} pipe={} target={:?} mapping={} gva={:#x} size={}x{} scissor={},{},{},{} load={:#x} {before_text}",
+                req.pipeline_ref,
+                resources.target_identity,
+                req.colors.first().map(|color| color.mapping_id).unwrap_or(0),
+                req.colors.first().map(|color| color.target_gva).unwrap_or(0),
+                w,
+                h,
+                scissor.x,
+                scissor.y,
+                scissor.width,
+                scissor.height,
+                req.colors.first().map(|color| color.load_action).unwrap_or(0),
+            ));
+            resources.skip_readback = false;
+        }
         // The engine's own typed `DrawError` (a `vk_*` VkCall slug, a
         // `DrawReason` refusal, an interim `_untyped`) propagates unchanged so
         // the boundary below names the engine's specific check as the primary
         // `reason=` rather than flattening it into a `vk_engine: {e}` blob.
         crate::runtime::chain_phase::enter(crate::runtime::chain_phase::Phase::Engine);
         let out = crate::backend::vulkan::engine::execute_draw_request(state, &resources)?;
+        if let Some(probe_id) = probe_id {
+            let after = if out.pixels.is_empty() {
+                "source=unavailable sig=none".to_string()
+            } else if let (Some(before), Some(scissor)) =
+                (probe_before_pixels.as_deref(), req.scissors.first())
+            {
+                let mut after_pixels = out.pixels.clone();
+                if !out.pixels_bgra {
+                    for pixel in after_pixels.chunks_exact_mut(4) {
+                        pixel.swap(0, 2);
+                    }
+                }
+                let (changed_outside, changed_inside) = target_content_diff_outside(
+                    before,
+                    &after_pixels,
+                    w,
+                    h,
+                    scissor.x,
+                    scissor.y,
+                    scissor.width,
+                    scissor.height,
+                );
+                format!(
+                    "source=draw_readback sig={:016x} changed_outside={} changed_inside={}",
+                    target_content_signature(&after_pixels),
+                    changed_outside,
+                    changed_inside,
+                )
+            } else {
+                format!(
+                    "source=draw_readback sig={:016x}",
+                    target_content_signature(&out.pixels)
+                )
+            };
+            crate::observe::off(format!(
+                "target_content_probe phase=after id={probe_id} pipe={} target={:?} size={}x{} {after}",
+                req.pipeline_ref,
+                resources.target_identity,
+                w,
+                h,
+            ));
+        }
         // Carried back on the request so `runtime::exec` can sum the chain's
         // draws into the guest's buffer. The engine reports per draw because a
         // Metal pass whose counter spans several draws is several Vulkan
