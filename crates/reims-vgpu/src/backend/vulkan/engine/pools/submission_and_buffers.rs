@@ -3324,13 +3324,19 @@ impl ResourcePools {
                     memory_type_bits: req.memory_type_bits,
                 })
             })?;
-        let (memory, mapped, backing) = if persistent_mapping {
+        let (memory, mapped, bind_offset, backing) = if persistent_mapping {
             let token = self
                 .slabs
                 .upload()
                 .acquire(ctx, &req, counters)
                 .inspect_err(|_| ctx.device.destroy_buffer(buffer, None))?;
-            (token.memory, token.mapped, BufferBacking::Slab(token))
+            let bind_offset = token.offset();
+            (
+                token.memory,
+                token.mapped,
+                bind_offset,
+                BufferBacking::Slab(token),
+            )
         } else {
             let memory = allocate_memory_timed(
                 ctx,
@@ -3344,10 +3350,10 @@ impl ResourcePools {
                 DrawError::VkCall(VkCall::new(VkOp::PoolsAllocStaging, e))
             })?;
             counters.note_alloc();
-            (memory, 0, BufferBacking::Dedicated)
+            (memory, 0, 0, BufferBacking::Dedicated)
         };
         ctx.device
-            .bind_buffer_memory(buffer, memory, 0)
+            .bind_buffer_memory(buffer, memory, bind_offset)
             .map_err(|e| {
                 match backing {
                     BufferBacking::Dedicated => ctx.device.free_memory(memory, None),
