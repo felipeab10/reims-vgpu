@@ -9744,6 +9744,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             .then(target_content_probe_budget)
             .flatten();
         let mut probe_before_pixels = None;
+        let mut probe_resident_text = None;
         if let Some(probe_id) = probe_id {
             let before_pixels = if let Some(seed) = resources.target_rgba8.as_deref() {
                 let mut pixels = seed.to_vec();
@@ -9751,6 +9752,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     for pixel in pixels.chunks_exact_mut(4) {
                         pixel.swap(0, 2);
                     }
+                }
+                if let Some(identity) = resources.target_identity.as_ref() {
+                    probe_resident_text = crate::backend::vulkan::engine::read_target(identity)
+                        .ok()
+                        .and_then(|readback| readback.into_bgra8())
+                        .map(|resident| {
+                            format!(
+                                " resident_sig={:016x}",
+                                target_content_signature(&resident)
+                            )
+                        });
                 }
                 Some(pixels)
             } else if let Some(identity) = resources.target_identity.as_ref() {
@@ -9772,6 +9784,10 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
             let before_text = before
                 .map(|(source, signature)| format!("source={source} sig={signature:016x}"))
                 .unwrap_or_else(|| "source=unavailable sig=none".to_string());
+            let before_text = format!(
+                "{before_text}{}",
+                probe_resident_text.as_deref().unwrap_or("")
+            );
             let scissor = req.scissors.first().expect("probe requires a scissor");
             crate::observe::off(format!(
                 "target_content_probe phase=before id={probe_id} pipe={} target={:?} mapping={} gva={:#x} size={}x{} scissor={},{},{},{} load={:#x} {before_text}",
