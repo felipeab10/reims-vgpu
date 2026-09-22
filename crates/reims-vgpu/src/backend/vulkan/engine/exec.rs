@@ -4507,6 +4507,35 @@ pub(crate) unsafe fn execute_draw_inner(
         } else {
             vk::AccessFlags::empty()
         };
+    if partial_preserving_draw
+        && !target_registry_ready_before
+        && req.target_rgba8.is_some()
+        && crate::observe::first_sight(
+            "gva_first_materialization",
+            req.target_identity
+                .as_ref()
+                .map(|identity| identity.generation())
+                .unwrap_or_default(),
+        )
+    {
+        crate::observe::off(format!(
+            "gva_first_materialization target={:?} ready_before={} ready_after={} \
+             color0_load={:?} load_gpu={} seed_cpu={} seed_slot={} guest_backed={} \
+             target_access={:?} pass_layout={:?} dst_stage={:?} dst_access={:?}",
+            req.target_identity,
+            u8::from(target_registry_ready_before),
+            u8::from(target_content_ready),
+            pass_key.color0_load,
+            u8::from(load_uses_gpu_content),
+            u8::from(req.target_rgba8.is_some()),
+            u8::from(seed_slot.is_some()),
+            u8::from(target_guest_backed),
+            target_access.layout(),
+            target_pass_layout,
+            target_dst_stage,
+            target_dst_access,
+        ));
+    }
     let target_dependency = if target_feedback {
         vk::DependencyFlags::FEEDBACK_LOOP_EXT
     } else {
