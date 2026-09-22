@@ -4590,7 +4590,8 @@ pub(crate) unsafe fn execute_draw_inner(
         crate::observe::off(format!(
             "gva_first_materialization target={:?} ready_before={} ready_after={} \
              color0_load={:?} load_gpu={} seed_cpu={} seed_slot={} guest_backed={} \
-             target_access={:?} pass_layout={:?} dst_stage={:?} dst_access={:?}",
+             color_input={} feedback={} adhoc={} target_access={:?} \
+             pass_layout={:?} dst_stage={:?} dst_access={:?}",
             req.target_identity,
             u8::from(target_registry_ready_before),
             u8::from(target_content_ready),
@@ -4599,6 +4600,9 @@ pub(crate) unsafe fn execute_draw_inner(
             u8::from(req.target_rgba8.is_some()),
             u8::from(seed_slot.is_some()),
             u8::from(target_guest_backed),
+            u8::from(req.color_input),
+            u8::from(pass_key.color_feedback(0)),
+            u8::from(ordinary_ad_hoc_framebuffer),
             target_access.layout(),
             target_pass_layout,
             target_dst_stage,
