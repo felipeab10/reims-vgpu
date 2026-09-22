@@ -1700,6 +1700,14 @@ impl ApplicationHandler<WindowUserEvent> for App {
                         return;
                     }
                     crate::observe::Emit::decline("host_window_focus", &HostWindowFocus).off();
+                    // X11 may deliver Focused(true) before the presenter is
+                    // attached.  The explicit focus request above is the
+                    // authoritative hand-off for the WM-less appliance
+                    // window, so make the keyboard/capture state agree with
+                    // it instead of waiting for an event that has already
+                    // been consumed by winit.
+                    let effect = self.keyboard.focus(true);
+                    self.apply_key_effect(effect);
                 }
                 // Kick the first frame; RedrawRequested re-arms each subsequent
                 // one, so without this the window would never draw.
