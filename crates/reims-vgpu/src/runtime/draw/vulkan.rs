@@ -31,6 +31,16 @@ fn target_content_probe_enabled() -> bool {
     })
 }
 
+fn blend_replace_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::BLEND_REPLACE_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 /// A cheap, stable fingerprint for diagnostic frame comparisons. Sampling one
 /// byte per 4 KiB keeps the probe bounded even for a full 4K target while still
 /// distinguishing the repeated corruption patterns seen in the VM.
@@ -9155,6 +9165,15 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 dst_alpha: pd.color0.dst_alpha,
                 op_alpha: pd.color0.op_alpha,
             });
+        }
+        if blend_replace_probe_enabled() {
+            resources.blend = None;
+            if crate::observe::first_sight("blend_replace_probe", req.pipeline_ref as u64) {
+                crate::observe::off(format!(
+                    "blend_replace_probe pipe={} {}x{} declared_blend={}",
+                    req.pipeline_ref, w, h, pd.color0.blending_enabled as u8,
+                ));
+            }
         }
 
         // The engine ignores this when the draw is indexed (the index count

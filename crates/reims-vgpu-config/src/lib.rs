@@ -953,6 +953,11 @@ pub const PASS_CHURN: &str = "REIMS_VGPU_PASS_CHURN";
 /// not change the normal execution path unless explicitly requested.
 pub const TARGET_CONTENT_PROBE: &str = "REIMS_VGPU_TARGET_CONTENT_PROBE";
 
+/// Diagnostic-only blend control. When enabled, Vulkan ignores declared color
+/// blending and uses opaque replace for the draw, allowing UI corruption to be
+/// classified without changing the default renderer.
+pub const BLEND_REPLACE_PROBE: &str = "REIMS_VGPU_BLEND_REPLACE_PROBE";
+
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an
 /// ordinary optimally-tiled device-local resident and its Store copies out.
