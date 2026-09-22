@@ -9787,11 +9787,17 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     "resident"
                 };
-                (source, target_content_signature(pixels))
+                let first = pixels
+                    .get(..4)
+                    .map(|px| format!("[{},{},{},{}]", px[0], px[1], px[2], px[3]))
+                    .unwrap_or_else(|| "none".to_string());
+                (source, target_content_signature(pixels), first)
             });
             probe_before_pixels = before_pixels;
             let before_text = before
-                .map(|(source, signature)| format!("source={source} sig={signature:016x}"))
+                .map(|(source, signature, first)| {
+                    format!("source={source} sig={signature:016x} first={first}")
+                })
                 .unwrap_or_else(|| "source=unavailable sig=none".to_string());
             let before_text = format!(
                 "{before_text}{}",
@@ -9842,9 +9848,16 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     scissor.width,
                     scissor.height,
                 );
+                let first = after_pixels
+                    .get(..4)
+                    .map(|px| format!("[{},{},{},{}]", px[0], px[1], px[2], px[3]))
+                    .unwrap_or_else(|| "none".to_string());
                 format!(
-                    "source=draw_readback sig={:016x} changed_outside={} changed_inside={}",
+                    "source=draw_readback sig={:016x} first={} readback_bgra={} \
+                     changed_outside={} changed_inside={}",
                     target_content_signature(&after_pixels),
+                    first,
+                    out.pixels_bgra as u8,
                     changed_outside,
                     changed_inside,
                 )
