@@ -3677,6 +3677,7 @@ pub(crate) unsafe fn execute_draw_inner(
     }
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
+    let mut target_content_ready = false;
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
     let (target_image, mut target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
@@ -3704,6 +3705,7 @@ pub(crate) unsafe fn execute_draw_inner(
                 counters,
             )?;
             target_guest_backed = t.memory.is_guest_imported();
+            target_content_ready = t.content_ready;
             target_guest_footprint = t.memory.guest_footprint();
             target_loads_guest_backing = target_guest_backed && req.load_guest_target_backing;
             if target_loads_guest_backing {
@@ -3796,6 +3798,41 @@ pub(crate) unsafe fn execute_draw_inner(
                 )
             }
         };
+    // The runtime-side coverage census runs before target admission and can
+    // therefore only see an explicit seed or a render-chain load. Record the
+    // engine's actual answer as well, at the point where the resident and its
+    // content state are known. This separates a conservative telemetry
+    // classification from a real partial preserving pass that entered without
+    // a readable source.
+    let partial_preserving_draw = req.scissors.iter().any(|scissor| {
+        !(scissor.x == 0
+            && scissor.y == 0
+            && scissor.width >= req.width
+            && scissor.height >= req.height)
+    }) && req
+        .color0_declared
+        .is_some_and(|declared| declared.preserves_prior_contents());
+    if partial_preserving_draw {
+        crate::runtime::drain::note_store_route(
+            match (
+                pass_key.color0_load,
+                load_uses_gpu_content,
+                target_guest_backed,
+                target_content_ready,
+            ) {
+                (Color0Load::Preserve, true, _, true) => "engine_partial_preserve_with_gpu_content",
+                (Color0Load::Preserve, false, true, _) => {
+                    "engine_partial_preserve_guest_backed_without_gpu_content"
+                }
+                (Color0Load::Preserve, false, false, _) => {
+                    "engine_partial_preserve_resident_without_gpu_content"
+                }
+                (Color0Load::Undefined, false, _, _) => "engine_partial_preserve_undefined",
+                (Color0Load::Clear, _, _, _) => "engine_partial_preserve_clear",
+                _ => "engine_partial_preserve_other",
+            },
+        );
+    }
     let _multisample_source_image = if req.multisample_resolve {
         let (image, _view, framebuffer) = pools.acquire_multisample_target(
             ctx,
