@@ -8004,6 +8004,71 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                 } else {
                     (tw, th)
                 };
+                let folded_swizzle = view_swizzle.unwrap_or_default().after(&sampled_components);
+                // The remaining live corruption is concentrated in small glyphs,
+                // list rows, and buttons. Keep one bounded breadcrumb for the
+                // texture classes most likely to explain those pixels: the R8
+                // representation used by A8, resident ref-textures, and any
+                // non-identity component mapping. This is intentionally keyed by
+                // the contract rather than by texture_ref: a ref can be reused
+                // for unrelated resources over the lifetime of the guest.
+                let source_route = match &source {
+                    crate::backend::vulkan::engine::SampledSource::Bytes(_) => "bytes",
+                    crate::backend::vulkan::engine::SampledSource::Target(_) => "target",
+                    crate::backend::vulkan::engine::SampledSource::GuestRuns(..) => "guest_runs",
+                };
+                let origin_code: u64 = match byte_origin {
+                    crate::backend::vulkan::engine::SampledByteOrigin::Synthetic => 0,
+                    crate::backend::vulkan::engine::SampledByteOrigin::AttachmentAlias => 1,
+                    crate::backend::vulkan::engine::SampledByteOrigin::BufferBackedTexture => 2,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SerializedSurfaceView => 3,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SurfaceHostCache => 4,
+                    crate::backend::vulkan::engine::SampledByteOrigin::SurfaceGuestFallback => 5,
+                    crate::backend::vulkan::engine::SampledByteOrigin::LinearTexture => 6,
+                };
+                let route_code: u64 = match source_route {
+                    "bytes" => 1,
+                    "target" => 2,
+                    _ => 3,
+                };
+                let swizzle_code = folded_swizzle
+                    .source
+                    .iter()
+                    .enumerate()
+                    .fold(0_u64, |packed, (slot, source)| {
+                        packed | ((*source as u64) << (slot * 8))
+                    });
+                let inspect_sampled_contract = sampled_vk_format == ash::vk::Format::R8_UNORM
+                    || source_is_target
+                    || !folded_swizzle.is_identity();
+                if inspect_sampled_contract {
+                    let key = crate::backend::hash::hash_u64(
+                        sampled_vk_format.as_raw() as u64
+                            ^ (origin_code << 32)
+                            ^ (route_code << 60),
+                        swizzle_code ^ (u64::from(tw) << 32) ^ u64::from(th),
+                    );
+                    if crate::observe::first_sight("sampled_texture_contract", key) {
+                        crate::observe::off(format!(
+                            "sampled_texture_contract task={} pipe={} stage={} idx={} ref={} bind={} size={}x{} layers={} vk={:?} origin={:?} route={} components={:?} view_swizzle={:?} folded={:?}",
+                            req.task_id,
+                            req.pipeline_ref,
+                            if frag_stage { "frag" } else { "vert" },
+                            index,
+                            texture_ref,
+                            img_bind,
+                            tw,
+                            th,
+                            layers,
+                            sampled_vk_format,
+                            byte_origin,
+                            source_route,
+                            sampled_components,
+                            view_swizzle,
+                            folded_swizzle,
+                        ));
+                    }
+                }
                 images.push(crate::backend::vulkan::engine::SampledImageResource {
                     binding: img_bind,
                     array_element,
@@ -8028,7 +8093,7 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
                     // "does this need it" branch: identity is the unit on both
                     // sides, so the fold is a no-op for every bind that does not
                     // need it, and there is no case left to forget.
-                    swizzle: view_swizzle.unwrap_or_default().after(&sampled_components),
+                    swizzle: folded_swizzle,
                 });
                 Ok(())
             };
