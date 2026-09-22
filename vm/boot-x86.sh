@@ -583,7 +583,9 @@ QEMU_ARGS=(
 )
 
 # Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
-# window disappears and serial stays under vm/disks/run/serial-*.log.
+# window disappears and serial stays under vm/disks/run/serial-*.log. During
+# installation the caller selects `reset` explicitly so a guest reboot keeps
+# this QEMU process and its host window alive for the next installer stage.
 QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
 case "$QEMU_REBOOT_ACTION" in
   exit)
@@ -593,6 +595,7 @@ case "$QEMU_REBOOT_ACTION" in
     QEMU_ARGS+=(-action reboot=shutdown,shutdown=pause)
     ;;
   reset)
+    QEMU_ARGS+=(-action reboot=reset)
     ;;
   *)
     die "unknown QEMU_REBOOT_ACTION: $QEMU_REBOOT_ACTION (exit|pause|reset)"
