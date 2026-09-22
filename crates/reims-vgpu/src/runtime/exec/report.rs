@@ -109,13 +109,17 @@ pub(super) fn note_unimplemented_render_opcode(
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("");
-    let class = if crate::model::is_opengl_compat_render_opcode(opcode) {
+    let gl_record = crate::model::opengl_compat_render_opcode(opcode);
+    let class = if gl_record.is_some() {
         "opengl_compat"
     } else {
         "unknown"
     };
+    let selector = gl_record.map_or("-", |record| record.selector);
+    let expected_body_len = gl_record.map_or(0, |record| record.body_len);
+    let actual_body_len = cmd_bytes.len().saturating_sub(8);
     crate::observe::fail(format!(
-        "render_unimplemented reason=accepted_without_executor class={class} task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
+        "render_unimplemented reason=accepted_without_executor class={class} selector={selector} expected_body_len={expected_body_len} actual_body_len={actual_body_len} task={task_id} opcode={:#x} len={} target_refs={:?} pipeline={} vbufs={} fbufs={} ftex={} hex={}",
         opcode,
         cmd_bytes.len(),
         acc.color_targets,
