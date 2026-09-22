@@ -958,6 +958,11 @@ pub const TARGET_CONTENT_PROBE: &str = "REIMS_VGPU_TARGET_CONTENT_PROBE";
 /// classified without changing the default renderer.
 pub const BLEND_REPLACE_PROBE: &str = "REIMS_VGPU_BLEND_REPLACE_PROBE";
 
+/// Diagnostic-only A/B: include `MTLLoadActionDontCare` in GVA load-seed
+/// resolution. This is intentionally opt-in because the broader behavior has
+/// compatibility cost on the heavy blit battery.
+pub const DONTCARE_SEED_PROBE: &str = "REIMS_VGPU_DONTCARE_SEED_PROBE";
+
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an
 /// ordinary optimally-tiled device-local resident and its Store copies out.
