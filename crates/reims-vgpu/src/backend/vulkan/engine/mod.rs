@@ -3686,6 +3686,7 @@ impl GuestPageTarget {
     fn geometry(&self) -> reims_vgpu_paging::regions::WindowGeometry {
         reims_vgpu_paging::regions::WindowGeometry {
             pitch_bytes: self.pitch_bytes(),
+            bytes_per_texel: self.bytes_per_texel(),
             width_texels: self.width,
             height_texels: self.height,
         }
@@ -4678,15 +4679,41 @@ unsafe fn plan_guest_copies(
 ) -> Result<Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)>, DrawError> {
     use host_ram::GuestWriteDecline;
     let geom = dst.geometry();
+    let invalid = || DrawError::GuestPageWrite(GuestWriteDecline::InvalidCopyRegion);
+    let bpt = crate::backend::vulkan::translate::pixel::bytes_per_texel(dst.format)
+        .map(u64::from)
+        .ok_or_else(invalid)?;
+    if bpt == 0
+        || geom.bytes_per_texel != bpt
+        || u64::from(dst.row_length_texels).checked_mul(bpt) != Some(geom.pitch_bytes)
+        || dst.row_length_texels < dst.width
+    {
+        return Err(invalid());
+    }
     let mut grouped: Vec<(ash::vk::Buffer, Vec<ash::vk::BufferImageCopy>)> = Vec::new();
     for run in &dst.runs {
         let bound = unsafe { pools.bind_guest_ram(ctx, &run.guest) }
             .map_err(|inner| DrawError::GuestPageWrite(GuestWriteDecline::Import { inner }))?;
         // `head` is what the granularity rounding added in front of the byte the
         // caller asked for, so the run's first requested byte sits here.
-        let base = bound.offset + bound.head;
+        let base = bound.offset.checked_add(bound.head).ok_or_else(invalid)?;
         let start = run.window_offset;
-        let end = start.saturating_add(run.guest.requested());
+        let end = start
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let run_end = base
+            .checked_add(run.guest.requested())
+            .ok_or_else(invalid)?;
+        let bound_end = bound.offset.checked_add(bound.len).ok_or_else(invalid)?;
+        let allocation_size_bytes = run.guest.import().len();
+        if start % bpt != 0
+            || end % bpt != 0
+            || base % bpt != 0
+            || run_end > bound_end
+            || bound_end > allocation_size_bytes
+        {
+            return Err(invalid());
+        }
         for r in reims_vgpu_paging::regions::plan_regions(&geom, start, end) {
             let region = ash::vk::BufferImageCopy::default()
                 // The rectangle's own offset is in window bytes; `- start`
