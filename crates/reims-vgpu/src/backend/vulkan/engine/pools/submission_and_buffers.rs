@@ -2398,6 +2398,22 @@ impl ResourcePools {
             std::mem::swap(&mut g.viewports, &mut g.vp_scratch);
             unsafe { device.cmd_set_viewport(cb, 0, &g.viewports) };
         }
+        let scissor_key = g.sc_scratch.iter().fold(0u64, |key, scissor| {
+            key.rotate_left(7)
+                ^ u64::from(scissor.offset.x as u32)
+                ^ (u64::from(scissor.offset.y as u32) << 16)
+                ^ (u64::from(scissor.extent.width) << 32)
+                ^ (u64::from(scissor.extent.height) << 48)
+        });
+        if crate::observe::first_sight("dynstate_scissor_decision", scissor_key) {
+            let held = super::scissors_match(&g.sc_scratch, &g.scissors);
+            crate::observe::off(format!(
+                "dynstate_scissor_decision decision={} requested={:?} cached={:?}",
+                if held { "held" } else { "emitted" },
+                g.sc_scratch,
+                g.scissors
+            ));
+        }
         if super::scissors_match(&g.sc_scratch, &g.scissors) {
             counters
                 .dynstate_scissor_held
