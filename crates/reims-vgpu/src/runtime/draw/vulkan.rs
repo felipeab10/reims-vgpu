@@ -8879,20 +8879,52 @@ fn try_metal2vulkan_draw<M: HostMemory + HostOps>(
         // one scissor it is the whole answer, and with several it is the one a
         // single-rect damage bound would have to start from.
         if let Some(scissor) = req.scissors.first() {
+            let seeded = target_rgba8.is_some() || target_guest_seed.is_some();
+            let guest_backed = req
+                .colors
+                .first()
+                .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0);
+            if !scissor.covers(w, h)
+                && req.colors.first().is_some_and(|c| {
+                    reims_vgpu_protocol::pass_action::LoadAction::from_declared(c.load_action)
+                        .preserves_prior_contents()
+                })
+                && !seeded
+                && !chain_load_from_target
+                && crate::observe::first_sight(
+                    "partial_unseeded_draw",
+                    u64::from(req.pipeline_ref),
+                )
+            {
+                let color = req.colors.first();
+                crate::observe::off(format!(
+                    "partial_unseeded_draw pipe={} target_gva={:#x} mapping={} texture_ref={} target={}x{} scissor={},{},{},{} load={:#x} guest_backed={}",
+                    req.pipeline_ref,
+                    color.map(|c| c.target_gva).unwrap_or(0),
+                    color.map(|c| c.mapping_id).unwrap_or(0),
+                    color.map(|c| c.texture_ref).unwrap_or(0),
+                    w,
+                    h,
+                    scissor.x,
+                    scissor.y,
+                    scissor.width,
+                    scissor.height,
+                    color.map(|c| c.load_action).unwrap_or(0),
+                    guest_backed as u8,
+                ));
+            }
             note_draw_coverage(
                 *scissor,
                 w,
                 h,
                 req.colors.first().map(|c| c.load_action),
-                target_rgba8.is_some() || target_guest_seed.is_some(),
+                seeded,
                 chain_load_from_target,
                 // Guest-visible backing is a mapper-ref-texture mapping or a task GVA, and
                 // the two are exclusive — `ColorRtRequest::target_gva` documents
                 // that. Either one means the surface has pages the guest's own
                 // CPU can write without this device seeing it.
-                req.colors
-                    .first()
-                    .is_some_and(|c| c.mapping_id != 0 || c.target_gva != 0),
+                guest_backed,
             );
         }
         // The mode is the guest's raw `MTLVisibilityResultMode`; the engine
