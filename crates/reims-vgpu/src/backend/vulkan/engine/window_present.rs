@@ -10,6 +10,7 @@
 use ash::vk;
 use raw_window_handle::{RawDisplayHandle, RawWindowHandle};
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::OnceLock;
 use std::time::Instant;
 
 use super::context::DeviceContext;
@@ -43,6 +44,29 @@ use crate::backend::vulkan::translate;
 /// and a presenter that had to reach into it to say "I am still running" would
 /// be the coupling that move exists to remove.
 static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
+
+/// Diagnostic A/B switch for the resident-vs-CPU window source.
+///
+/// The normal path prefers the engine resident. The screenshot evidence from
+/// T009 shows a stable, corrupted frame being reused, so this switch lets a
+/// controlled runtime bypass that choice without changing the production
+/// default or the guest protocol. A corrected image here implicates resident
+/// content or its handoff; an unchanged image implicates the guest CPU frame
+/// or its writeback instead.
+static FORCE_CPU_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
+
+fn force_cpu_window_present() -> bool {
+    *FORCE_CPU_WINDOW_PRESENT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_WINDOW_FORCE_CPU")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
 
 /// Whether any host-window present is submitted and unretired.
 pub(crate) fn window_presents_in_flight() -> bool {
@@ -1172,7 +1196,7 @@ impl WindowPresenter {
         let stale =
             source.is_some_and(|source| source.epoch != super::pools::window_source_epoch());
         let selected = source
-            .filter(|_| !stale)
+            .filter(|_| !stale && !force_cpu_window_present())
             .map(|source| (source.identity.clone(), source.resolved));
         // Only reached when no resident carries this present: upload the CPU
         // bytes instead. `None` here means the window shows slate.
