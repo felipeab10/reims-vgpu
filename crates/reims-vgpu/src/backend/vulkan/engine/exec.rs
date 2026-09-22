@@ -272,6 +272,29 @@ fn pass_churn_probe_enabled() -> bool {
     })
 }
 
+fn geometry_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::TARGET_CONTENT_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
+fn geometry_probe_budget(req: &DrawRequest) -> bool {
+    static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let partial = req.scissors.iter().any(|scissor| {
+        !(scissor.x == 0
+            && scissor.y == 0
+            && scissor.width >= req.width
+            && scissor.height >= req.height)
+    });
+    geometry_probe_enabled()
+        && partial
+        && COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 128
+}
+
 fn compute_gather_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -5371,6 +5394,16 @@ pub(crate) unsafe fn execute_draw_inner(
             },
         }
     }));
+    if geometry_probe_budget(req) {
+        let raw_vp = req.viewports.first().copied().unwrap_or(default_vp);
+        let raw_sc = req.scissors.first().copied().unwrap_or(default_sc);
+        let effective_vp = vp_scratch.first().copied();
+        let effective_sc = sc_scratch.first().copied();
+        crate::observe::off(format!(
+            "geometry_probe target={:?} size={}x{} raw_vp={:?} vk_vp={:?} raw_sc={:?} vk_sc={:?}",
+            req.target_identity, req.width, req.height, raw_vp, effective_vp, raw_sc, effective_sc,
+        ));
+    }
     unsafe { pools.set_dynamic_viewport_scissor(&ctx.device, cb, counters) };
     // Dynamic blend colour (Metal `setBlendColorRed:green:blue:alpha:`) — one
     // encoder value, so one call per draw whatever the attachments declare,
