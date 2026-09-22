@@ -54,10 +54,24 @@ static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 /// content or its handoff; an unchanged image implicates the guest CPU frame
 /// or its writeback instead.
 static FORCE_CPU_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
+static FORCE_COPY_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
 
 fn force_cpu_window_present() -> bool {
     *FORCE_CPU_WINDOW_PRESENT.get_or_init(|| {
         std::env::var("REIMS_VGPU_WINDOW_FORCE_CPU")
+            .map(|value| {
+                matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "1" | "on" | "true"
+                )
+            })
+            .unwrap_or(false)
+    })
+}
+
+fn force_copy_window_present() -> bool {
+    *FORCE_COPY_WINDOW_PRESENT.get_or_init(|| {
+        std::env::var("REIMS_VGPU_WINDOW_FORCE_COPY")
             .map(|value| {
                 matches!(
                     value.trim().to_ascii_lowercase().as_str(),
@@ -1332,15 +1346,33 @@ impl WindowPresenter {
                     );
                 }
                 let src_layout = blit.record_read_barrier(&ctx.device, frame_cmd);
-                blit_rect(
-                    &ctx.device,
-                    frame_cmd,
-                    blit.image(),
-                    dst,
-                    src_layout,
-                    (0, 0, base_width, base_height),
-                    (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height),
-                );
+                let src_rect = (0, 0, base_width, base_height);
+                let dst_rect = (vp.x, vp.y, vp.x + vp.width, vp.y + vp.height);
+                if force_copy_window_present()
+                    && src_rect == dst_rect
+                    && base_width == self.extent.width
+                    && base_height == self.extent.height
+                {
+                    copy_rect(
+                        &ctx.device,
+                        frame_cmd,
+                        blit.image(),
+                        dst,
+                        src_layout,
+                        base_width,
+                        base_height,
+                    );
+                } else {
+                    blit_rect(
+                        &ctx.device,
+                        frame_cmd,
+                        blit.image(),
+                        dst,
+                        src_layout,
+                        src_rect,
+                        dst_rect,
+                    );
+                }
                 // The window's last contact with the resident registry, and the
                 // one that stays. Two ways out of it were looked for and both
                 // are unsound; recording that here so the third reader does not
@@ -1983,6 +2015,35 @@ unsafe fn blit_rect(
                 },
             ])],
         crate::backend::vulkan::translate::sampler::PRESENT_BLIT_FILTER,
+    );
+}
+
+unsafe fn copy_rect(
+    device: &ash::Device,
+    cmd: vk::CommandBuffer,
+    src: vk::Image,
+    dst: vk::Image,
+    src_layout: vk::ImageLayout,
+    width: u32,
+    height: u32,
+) {
+    let layers = vk::ImageSubresourceLayers::default()
+        .aspect_mask(vk::ImageAspectFlags::COLOR)
+        .layer_count(1);
+    device.cmd_copy_image(
+        cmd,
+        src,
+        src_layout,
+        dst,
+        vk::ImageLayout::TRANSFER_DST_OPTIMAL,
+        &[vk::ImageCopy::default()
+            .src_subresource(layers)
+            .dst_subresource(layers)
+            .extent(vk::Extent3D {
+                width,
+                height,
+                depth: 1,
+            })],
     );
 }
 
