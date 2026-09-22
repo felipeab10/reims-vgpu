@@ -1265,108 +1265,6 @@ pub const DEVICE_INFO_KEY_SERIALIZER_VERSION: u32 = 10;
 /// pathway that this checkout cannot take.
 pub const DEVICE_INFO_SERIALIZER_VERSION: u32 = 8;
 
-/// One record unlocked by the serializer's OpenGL compatibility rung.
-///
-/// These are deliberately kept separate from the executable render vocabulary:
-/// the PCI guest personality currently answers `supportsOpenGL` negatively, so
-/// a normal x86 guest must never emit them. The body lengths and selectors are
-/// the serializer inventory recorded in `reims-vgpu-wire::manifest`; this
-/// metadata only improves diagnosis and does not decode or execute the body.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct OpenGlCompatRenderOpcode {
-    pub opcode: u32,
-    pub selector: &'static str,
-    pub body_len: usize,
-}
-
-/// Render records unlocked by the serializer's OpenGL compatibility rung.
-pub const OPENGL_COMPAT_RENDER_OPCODES: &[OpenGlCompatRenderOpcode] = &[
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8a,
-        selector: "setAlphaTestReferenceValue:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8b,
-        selector: "setPointSize:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8c,
-        selector: "setClipPlane:p2:p3:p4:atIndex:",
-        body_len: 20,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8d,
-        selector: "setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
-        body_len: 20,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8e,
-        selector: "setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex:",
-        body_len: 20,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x8f,
-        selector: "setViewportTransformEnabled:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x90,
-        selector: "setProvokingVertexMode:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x91,
-        selector: "setPrimitiveRestartEnabled:index:",
-        body_len: 8,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x92,
-        selector: "setTriangleFrontFillMode:backFillMode:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x93,
-        selector: "setTransformFeedbackState:",
-        body_len: 4,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x94,
-        selector: "setDepthCleared",
-        body_len: 0,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x95,
-        selector: "setStencilCleared",
-        body_len: 0,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x96,
-        selector: "setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex:",
-        body_len: 16,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x97,
-        selector: "setDepthResolveTexture:slice:depthPlane:level:yInvert:",
-        body_len: 12,
-    },
-    OpenGlCompatRenderOpcode {
-        opcode: 0x98,
-        selector: "setStencilResolveTexture:slice:depthPlane:level:yInvert:",
-        body_len: 12,
-    },
-];
-
-/// Metadata for an OpenGL compatibility record, when `opcode` belongs to that
-/// surface. No wire fields are interpreted here.
-#[inline]
-pub fn opengl_compat_render_opcode(opcode: u32) -> Option<&'static OpenGlCompatRenderOpcode> {
-    OPENGL_COMPAT_RENDER_OPCODES
-        .iter()
-        .find(|record| record.opcode == opcode)
-}
-
 /// Wire key 11 — bitmask of the `MTLPrimitiveType` values the guest may draw.
 ///
 /// Not a count and not a maximum: the guest's `supportsPrimitiveType:` tests
@@ -2369,16 +2267,5 @@ mod tests {
             assert!(u32::from(height) <= MAX_SCANOUT_DIM);
         }
         assert_eq!(DISPLAY_PRODUCT_NAME.last(), Some(&0));
-    }
-
-    #[test]
-    fn opengl_compatibility_inventory_is_explicit_and_closed() {
-        assert_eq!(OPENGL_COMPAT_RENDER_OPCODES.len(), 15);
-        assert!(opengl_compat_render_opcode(0x8a).is_some());
-        assert!(opengl_compat_render_opcode(0x98).is_some());
-        assert_eq!(opengl_compat_render_opcode(0x94).unwrap().body_len, 0);
-        assert_eq!(opengl_compat_render_opcode(0x8d).unwrap().body_len, 20);
-        assert!(opengl_compat_render_opcode(0x89).is_none());
-        assert!(opengl_compat_render_opcode(0x99).is_none());
     }
 }

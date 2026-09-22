@@ -109,7 +109,7 @@ pub(super) fn note_unimplemented_render_opcode(
         .map(|b| format!("{:02x}", b))
         .collect::<Vec<_>>()
         .join("");
-    let gl_record = crate::model::opengl_compat_render_opcode(opcode);
+    let gl_record = crate::runtime::decode::render_spi::opengl_compat_opcode(opcode);
     let class = if gl_record.is_some() {
         "opengl_compat"
     } else {
