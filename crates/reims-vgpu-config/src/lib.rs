@@ -435,6 +435,12 @@ pub const UNUSED_BINDS: &str = "REIMS_VGPU_UNUSED_BINDS";
 /// less concurrency than several, never more.
 pub const PRESENT_DEPTH: &str = "REIMS_VGPU_PRESENT_DEPTH";
 
+/// **Diagnostic, default off.** When enabled, the Vulkan window presenter
+/// emits one aggregate line per second with retire, acquire, command recording,
+/// queue-submit, and end-to-end CPU timings. It is intentionally opt-in: the
+/// clock reads and counters are themselves part of the path being measured.
+pub const FRAME_TIMING: &str = "REIMS_VGPU_FRAME_TIMING";
+
 /// **Default on.** Setting this off restores one completion-stamp write per
 /// packet, which is what `drain_child_fifo` did before the stamps in a single
 /// drain of one channel were collapsed into a single write at its end.

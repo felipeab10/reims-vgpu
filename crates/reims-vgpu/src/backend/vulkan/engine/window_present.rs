@@ -55,6 +55,16 @@ static WINDOW_PRESENTS_IN_FLIGHT: AtomicU32 = AtomicU32::new(0);
 /// or its writeback instead.
 static FORCE_CPU_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
 static FORCE_COPY_WINDOW_PRESENT: OnceLock<bool> = OnceLock::new();
+static FRAME_TIMING: OnceLock<bool> = OnceLock::new();
+
+fn frame_timing_enabled() -> bool {
+    *FRAME_TIMING.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FRAME_TIMING).0,
+            crate::config::Switch::On
+        )
+    })
+}
 
 fn force_cpu_window_present() -> bool {
     *FORCE_CPU_WINDOW_PRESENT.get_or_init(|| {
@@ -584,6 +594,14 @@ pub(crate) struct WindowPresenter {
     /// no swapchain to acquire from. A minimized window, and its own counter
     /// because `busy = fence + acquire` was an identity worth keeping true.
     cadence_busy_no_area: u64,
+    timing_started: Instant,
+    timing_frames: u64,
+    timing_retire_us: u64,
+    timing_acquire_us: u64,
+    timing_record_us: u64,
+    timing_submit_us: u64,
+    timing_total_us: u64,
+    timing_max_total_us: u64,
     /// Whether the run in progress is a window with no area, so the reason is
     /// stated when the run starts and not on every frame of it.
     surface_had_no_area: bool,
@@ -853,6 +871,14 @@ impl WindowPresenter {
             cadence_busy_fence: 0,
             cadence_busy_acquire: 0,
             cadence_busy_no_area: 0,
+            timing_started: Instant::now(),
+            timing_frames: 0,
+            timing_retire_us: 0,
+            timing_acquire_us: 0,
+            timing_record_us: 0,
+            timing_submit_us: 0,
+            timing_total_us: 0,
+            timing_max_total_us: 0,
             surface_had_no_area: false,
             // Attach refused above unless this was true, so the presenter that
             // exists is one whose queue can address its surface.
@@ -1113,13 +1139,22 @@ impl WindowPresenter {
         source: Option<&WindowPresentSource>,
         cpu: Option<WindowCpuFrame<'_>>,
     ) -> Result<WindowPresentDispatch, DrawError> {
+        let timing = frame_timing_enabled();
+        let total_started = timing.then(Instant::now);
         if let Some(seq) = cpu.map(|frame| frame.seq) {
             if self.cadence_last_offered != Some(seq) {
                 self.cadence_last_offered = Some(seq);
                 self.cadence_offered = self.cadence_offered.saturating_add(1);
             }
         }
-        if !self.retire(ctx)? {
+        let retire_started = timing.then(Instant::now);
+        let retired = self.retire(ctx)?;
+        if let Some(started) = retire_started {
+            self.timing_retire_us = self
+                .timing_retire_us
+                .saturating_add(started.elapsed().as_micros() as u64);
+        }
+        if !retired {
             self.cadence_busy_fence = self.cadence_busy_fence.saturating_add(1);
             self.note_cadence(false, false);
             return Ok(WindowPresentDispatch::Complete(WindowPresentOutcome::Busy));
@@ -1145,7 +1180,9 @@ impl WindowPresenter {
         let acquire_timeout_ns: u64 = std::env::var("REIMS_VGPU_ACQUIRE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(100) * 1_000_000;
+            .unwrap_or(100)
+            * 1_000_000;
+        let acquire_started = timing.then(Instant::now);
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             acquire_timeout_ns,
@@ -1172,6 +1209,7 @@ impl WindowPresenter {
                 )));
             }
         };
+        let acquire_us = acquire_started.map(|started| started.elapsed().as_micros() as u64);
 
         // Keyed by the acquired image and not by the entry: the acquire is what
         // says this image's previous present has completed, and nothing says
@@ -1252,6 +1290,8 @@ impl WindowPresenter {
             })
             .or(staged);
 
+        let record_started = timing.then(Instant::now);
+        let mut submit_us = None;
         let submit_result = (|| {
             ctx.device
                 .reset_fences(&[frame_in_flight])
@@ -1437,7 +1477,8 @@ impl WindowPresenter {
             let wait_stages = [ACQUIRE_WAIT_STAGE];
             let signals = [frame_render_finished];
             let commands = [frame_cmd];
-            ctx.submit_present_transaction(super::context::PresentTransaction {
+            let submit_started = timing.then(Instant::now);
+            let result = ctx.submit_present_transaction(super::context::PresentTransaction {
                 command_buffers: &commands,
                 wait_semaphores: &waits,
                 wait_stages: &wait_stages,
@@ -1447,12 +1488,33 @@ impl WindowPresenter {
                 present_wait: frame_render_finished,
                 swapchain: self.swapchain,
                 image_index,
-            })
-            .map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
+            });
+            if let Some(started) = submit_started {
+                submit_us = Some(started.elapsed().as_micros() as u64);
+            }
+            result.map_err(|error| DrawError::VkCall(VkCall::new(VkOp::WindowSubmitPresent, error)))
         })();
         // A plain `?` now the failure arm has nothing to undo: it used to have to
         // drop the pins this present had taken before returning.
         let submission = submit_result?;
+        if timing {
+            let record_us = record_started
+                .map(|started| started.elapsed().as_micros() as u64)
+                .unwrap_or_default();
+            let submit_us = submit_us.unwrap_or_default();
+            let total_us = total_started
+                .map(|started| started.elapsed().as_micros() as u64)
+                .unwrap_or_default();
+            self.timing_frames = self.timing_frames.saturating_add(1);
+            self.timing_acquire_us = self
+                .timing_acquire_us
+                .saturating_add(acquire_us.unwrap_or_default());
+            self.timing_record_us = self.timing_record_us.saturating_add(record_us);
+            self.timing_submit_us = self.timing_submit_us.saturating_add(submit_us);
+            self.timing_total_us = self.timing_total_us.saturating_add(total_us);
+            self.timing_max_total_us = self.timing_max_total_us.max(total_us);
+            self.note_timing();
+        }
         // Claimed before the latch, so the slot is never observed clear while
         // the latch says an entry is outstanding.
         begin_present_in_flight();
@@ -1493,6 +1555,34 @@ impl WindowPresenter {
                 }))
             }
         }
+    }
+
+    fn note_timing(&mut self) {
+        let elapsed = self.timing_started.elapsed();
+        if elapsed < std::time::Duration::from_secs(1) {
+            return;
+        }
+        let frames = self.timing_frames.max(1);
+        crate::observe::off(format!(
+            "host_window_timing window_ms={} frames={} retire_avg_us={} acquire_avg_us={} \
+             record_avg_us={} submit_avg_us={} total_avg_us={} total_max_us={}",
+            elapsed.as_millis(),
+            self.timing_frames,
+            self.timing_retire_us / frames,
+            self.timing_acquire_us / frames,
+            self.timing_record_us / frames,
+            self.timing_submit_us / frames,
+            self.timing_total_us / frames,
+            self.timing_max_total_us,
+        ));
+        self.timing_started = Instant::now();
+        self.timing_frames = 0;
+        self.timing_retire_us = 0;
+        self.timing_acquire_us = 0;
+        self.timing_record_us = 0;
+        self.timing_submit_us = 0;
+        self.timing_total_us = 0;
+        self.timing_max_total_us = 0;
     }
 
     pub(crate) fn finish_present(
