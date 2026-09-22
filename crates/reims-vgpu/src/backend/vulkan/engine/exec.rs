@@ -3701,6 +3701,10 @@ pub(crate) unsafe fn execute_draw_inner(
     let mut target_guest_backed = false;
     let mut target_loads_guest_backing = false;
     let mut target_content_ready = false;
+    let target_registry_ready_before = req
+        .target_identity
+        .as_ref()
+        .is_some_and(|identity| pools.registry_content_ready(identity));
     let mut target_guest_footprint: Option<crate::runtime::guest_ram::GuestPageFootprint> = None;
     let (target_image, mut target_fb, target_access, target_view) =
         if let Some(identity) = &req.target_identity {
@@ -3855,6 +3859,23 @@ pub(crate) unsafe fn execute_draw_inner(
                 _ => "engine_partial_preserve_other",
             },
         );
+        if crate::observe::first_sight(
+            "target_registry_transition",
+            (u64::from(req.width) << 32) | u64::from(req.height),
+        ) {
+            crate::observe::off(format!(
+                "target_registry_transition target={:?} size={}x{} ready_before={} ready_after={} guest_backed={} load_gpu={} cpu_seed={} guest_seed={}",
+                req.target_identity,
+                req.width,
+                req.height,
+                u8::from(target_registry_ready_before),
+                u8::from(target_content_ready),
+                u8::from(target_guest_backed),
+                u8::from(load_uses_gpu_content),
+                u8::from(req.target_rgba8.is_some()),
+                u8::from(req.target_guest_seed.is_some()),
+            ));
+        }
     }
     let _multisample_source_image = if req.multisample_resolve {
         let (image, _view, framebuffer) = pools.acquire_multisample_target(
