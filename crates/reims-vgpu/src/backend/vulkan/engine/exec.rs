@@ -4027,6 +4027,35 @@ pub(crate) unsafe fn execute_draw_inner(
                     .is_none()
                     .then(|| pools.prior_reclaim(identity))
                     .flatten();
+                let admission_suspect = match held.as_ref() {
+                    None => true,
+                    Some((_, _, _, _, ready, width, height, samples, _)) => {
+                        !*ready
+                            || *width != resource.width
+                            || *height != resource.height
+                            || (*samples > 1) != resource.multisampled
+                    }
+                };
+                if admission_suspect {
+                    let key = (u64::from(resource.binding) << 48)
+                        ^ (u64::from(resource.width) << 24)
+                        ^ u64::from(resource.height);
+                    if crate::observe::first_sight("sampled_resident_admission_suspect", key) {
+                        let detail = held.as_ref().map(|(_, _, access, _, ready, width, height, samples, guest_backed)| {
+                            format!(
+                                "held=true ready={ready} access={access:?} geom={width}x{height} samples={samples} guest_backed={guest_backed}"
+                            )
+                        }).unwrap_or_else(|| "held=false".to_string());
+                        crate::observe::off(format!(
+                            "sampled_resident_admission_suspect binding={} requested={}x{} multisampled={} generation={} prior_reclaim={prior:?} {detail} identity={identity:?}",
+                            resource.binding,
+                            resource.width,
+                            resource.height,
+                            resource.multisampled,
+                            identity.generation(),
+                        ));
+                    }
+                }
                 if let Some((_, _, _, _, ready, width, height, samples, _)) = held.as_ref() {
                     if *samples > 1 {
                         crate::runtime::drain::note_store_route("sampled_resident_multisample");
