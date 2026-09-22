@@ -883,6 +883,16 @@ fn cursor_glyph_changed(
     }
 }
 
+fn cursor_force_visible() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::CURSOR_FORCE_VISIBLE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 /// The one user event this window's loop takes: the device wrote a new frame
 /// into the [`FrameSlot`].
 ///
@@ -2128,7 +2138,7 @@ impl App {
             }
         }
 
-        let visible = state.visible && self.native_cursor.is_some();
+        let visible = cursor_force_visible() || (state.visible && self.native_cursor.is_some());
         if visible != self.applied_cursor_visible {
             window.set_cursor_visible(visible);
             self.applied_cursor_visible = visible;

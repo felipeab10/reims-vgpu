@@ -1226,6 +1226,9 @@ pub const FULLSCREEN: &str = "REIMS_VGPU_FULLSCREEN";
 /// Distinct from [`WINDOW_SYSTEM`], which says *which* server the window opens
 /// on. This one says how the full-screen geometry is obtained from it.
 pub const X11_WMLESS: &str = "REIMS_VGPU_X11_WMLESS";
+/// Diagnostic-only host-window fallback that keeps a native pointer visible
+/// while the guest cursor glyph is changing between setup screens.
+pub const CURSOR_FORCE_VISIBLE: &str = "REIMS_VGPU_CURSOR_FORCE_VISIBLE";
 }
 
 counts! {
