@@ -964,6 +964,8 @@ pub const BLEND_REPLACE_PROBE: &str = "REIMS_VGPU_BLEND_REPLACE_PROBE";
 pub const DONTCARE_SEED_PROBE: &str = "REIMS_VGPU_DONTCARE_SEED_PROBE";
 pub const FIRST_MATERIALIZATION_CLEAR_PROBE: &str =
     "REIMS_VGPU_FIRST_MATERIALIZATION_CLEAR_PROBE";
+pub const FIRST_MATERIALIZATION_ZERO_SEED_PROBE: &str =
+    "REIMS_VGPU_FIRST_MATERIALIZATION_ZERO_SEED_PROBE";
 
 /// **Default on.** `off` stops the primary colour attachment being a linear
 /// `VkImage` bound to the guest surface's own pages, so the render target is an

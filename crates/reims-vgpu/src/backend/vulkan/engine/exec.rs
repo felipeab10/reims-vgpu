@@ -292,6 +292,16 @@ fn first_materialization_clear_probe_enabled() -> bool {
     })
 }
 
+fn first_materialization_zero_seed_probe_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            crate::config::read(crate::config::FIRST_MATERIALIZATION_ZERO_SEED_PROBE).0,
+            crate::config::Switch::On
+        )
+    })
+}
+
 fn geometry_probe_budget(req: &DrawRequest) -> bool {
     static COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     let partial = req.scissors.iter().any(|scissor| {
@@ -3106,6 +3116,20 @@ pub(crate) unsafe fn execute_draw_inner(
         && req
             .color0_declared
             .is_some_and(|declared| declared.preserves_prior_contents());
+    let first_materialization_zero_seed_probe = first_materialization_zero_seed_probe_enabled()
+        && req.target_rgba8.is_some()
+        && req.target_identity.as_ref().is_some_and(|identity| {
+            !pools.registry_content_ready(identity)
+        })
+        && req.scissors.iter().any(|scissor| {
+            !(scissor.x == 0
+                && scissor.y == 0
+                && scissor.width >= req.width
+                && scissor.height >= req.height)
+        })
+        && req
+            .color0_declared
+            .is_some_and(|declared| declared.preserves_prior_contents());
     let color0_load = if first_materialization_clear_probe {
         Color0Load::Clear
     } else if load_uses_gpu_content
@@ -3621,7 +3645,11 @@ pub(crate) unsafe fn execute_draw_inner(
         // its copy, done here as a step because a widening pass cannot also
         // exchange in place.
         let mut semantic;
-        let src = if matches!(req.target_seed_order, SeedOrder::Bgra8) {
+        let mut zero_seed = Vec::new();
+        let src = if first_materialization_zero_seed_probe {
+            zero_seed.resize(rgba8.len(), 0);
+            &zero_seed[..]
+        } else if matches!(req.target_seed_order, SeedOrder::Bgra8) {
             semantic = rgba8.to_vec();
             for px in semantic.chunks_exact_mut(4) {
                 px.swap(0, 2);
@@ -3660,7 +3688,10 @@ pub(crate) unsafe fn execute_draw_inner(
         // their damaged geometry. The attachment is BGRA when `output_bgra`; the
         // seed states its own order. Exchange exactly when they disagree, inside
         // the copy that has to happen anyway.
-        if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
+        if first_materialization_zero_seed_probe {
+            let zero_seed = vec![0; rgba8.len()];
+            pools.write_staging(ctx, &slot, &zero_seed)?;
+        } else if matches!(req.target_seed_order, SeedOrder::Bgra8) != output_bgra {
             let _s = stage_phase::Span::moving(stage_phase::Part::Swap, rgba8.len() as u64);
             pools.write_staging_swap_rb(ctx, &slot, rgba8)?;
         } else {
