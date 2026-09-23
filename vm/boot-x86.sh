@@ -212,6 +212,8 @@ Env: DISKS_DIR OVMF_DIR RAILS_DIR RAIL RUN_DIR PERSISTENT_DIR QEMU_BIN OVMF_CODE
      REIMS_VGPU_PCI_ATTACH=pcibridge|bus0   (default pcibridge; product secondary bus)
      REIMS_VGPU_GOP_ROM=path | REIMS_VGPU_GOP_ROM= (option ROM on reims-vgpu-pci; auto if built)
      QEMU_REBOOT_ACTION=exit|pause|reset
+     REIMS_VGPU_WINDOW_SYSTEM=auto|x11|wayland  window system for the host window
+     (default auto; x11 requires DISPLAY and removes WAYLAND_DISPLAY/WAYLAND_SOCKET)
      REIMS_VGPU_FULLSCREEN=1 native borderless fullscreen; =0 sized/windowed
      (set explicitly by the caller; no product default is applied here)
        (default exit — guest reboot/KP-reset → QEMU quits; serial already on disk)
@@ -581,7 +583,9 @@ QEMU_ARGS=(
 )
 
 # Guest KP often reboots (even with OpenCore DB_HALT). Default exit so the GTK
-# window disappears and serial stays under vm/disks/run/serial-*.log.
+# window disappears and serial stays under vm/disks/run/serial-*.log. During
+# installation the caller selects `reset` explicitly so a guest reboot keeps
+# this QEMU process and its host window alive for the next installer stage.
 QEMU_REBOOT_ACTION="${QEMU_REBOOT_ACTION:-exit}"
 case "$QEMU_REBOOT_ACTION" in
   exit)
@@ -591,6 +595,7 @@ case "$QEMU_REBOOT_ACTION" in
     QEMU_ARGS+=(-action reboot=shutdown,shutdown=pause)
     ;;
   reset)
+    QEMU_ARGS+=(-action reboot=reset)
     ;;
   *)
     die "unknown QEMU_REBOOT_ACTION: $QEMU_REBOOT_ACTION (exit|pause|reset)"
@@ -720,8 +725,20 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
   : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
-  : "${WAYLAND_DISPLAY:=wayland-0}"
-  : "${DISPLAY:=:0}"
+  # Which window system winit opens is decided here, once (see
+  # vm/window-system-env.sh). The historical fallbacks below are for `auto`
+  # only: they invent a Wayland socket and an X11 display so a development boot
+  # on a host with neither still opens a window. Under
+  # REIMS_VGPU_WINDOW_SYSTEM=x11 they must NOT run, or the recreated
+  # WAYLAND_DISPLAY would send winit to Wayland and quietly undo the dedicated
+  # X11 session. x11 requires a real DISPLAY and removes both Wayland names.
+  if [ "${REIMS_VGPU_WINDOW_SYSTEM:-auto}" = auto ]; then
+    : "${WAYLAND_DISPLAY:=wayland-0}"
+    : "${DISPLAY:=:0}"
+  fi
+  # shellcheck source=vm/window-system-env.sh
+  source "$SCRIPT_DIR/window-system-env.sh"
+  reims_resolve_window_system || exit $?
   # XAUTHORITY's suffix is a per-login random string, so it cannot be written
   # down: a hardcoded one goes stale at the next login and then points at a file
   # that does not exist. Discover the newest cookie in the runtime dir instead.
@@ -731,7 +748,8 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
       break
     done
   fi
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY
+  export XDG_RUNTIME_DIR DISPLAY
+  [ -n "${WAYLAND_DISPLAY:-}" ] && export WAYLAND_DISPLAY
   [ -n "${XAUTHORITY:-}" ] && export XAUTHORITY
 
   # A window with no display server still opens, still says "first frame
