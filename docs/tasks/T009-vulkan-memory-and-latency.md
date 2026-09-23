@@ -73,6 +73,39 @@ stability during the moderate phase and no short-term trim on stop, but cannot
 attribute the 1,552 MiB level to that phase alone. Compare future runs against
 a stable idle sample captured before navigation.
 
+### Controlled same-tab moderate run (23 Sep 2026, host 17:38–17:47)
+
+The probe was run in the already-open Safari tab (`layers=8&boxes=6&tex=512`),
+after a true 60-second idle baseline, then stopped by navigating that same tab
+to `about:blank`. During the first idle interval a single 8 MiB slab allocation
+occurred; the ledger then stabilized before the load phase. The comparable
+baseline, all three load samples (10/30/60 s), and the 30/60/90 s recovery
+samples stayed at 1,560 MiB device-local, 1,456 MiB image-slab backing, 228 MiB
+carved from that image slab, 98/83 MiB upload-slab held/carved, 1,593 MiB
+driver heap-0 usage, and 1,651 MiB NVML. No unmatched frees were reported.
+During load, host-window fresh draws were 53–55/s, `drain_duty` 0.599–0.631,
+`draw_us` 541–565 ms/s, and IRQ wait about 222–224 ms/s; flush remained
+negligible. After stopping, duty returned to ~0.002 and fresh draws to zero.
+QMP stayed `running`, the guest clock advanced, and screenshots through 90 s
+recovery showed no black frame or visible artifact.
+
+This controlled run shows no measurable memory change from the moderate phase
+and no short-term recovery in allocated slab backing. However, held minus
+carved leaves about 1,228 MiB free *inside slabs*; that is not equivalent to
+1,228 MiB of fully empty blocks that the allocator can return. Existing logs
+do not expose empty-block counts or free-space distribution by slab class, so
+they cannot yet tell whether the capacity is a useful live/cache working set or
+fragmentation pinned by a small number of live images. The current `slab_live`
+value is a live-image count, not bytes.
+
+To resolve this missing distinction, the working tree now adds a low-cost
+`image_slab_inventory` diagnostic, grouped by small, large, dedicated, and
+poisoned blocks. Each group reports block count, held/carved/free MiB, empty
+block count/bytes, and free-range count. A focused unit test validates the
+classification and accounting. This is diagnostic only; it changes no
+allocation or reclaim policy. It requires a rebuilt host runtime to collect
+real values.
+
 ## Test protocol
 
 1. Start from a recorded idle state. Record the QEMU command/build identity,
@@ -132,9 +165,10 @@ a stable idle sample captured before navigation.
 
 ## Next action
 
-Next, collect a true 60-second idle ledger before navigation, then run a fixed
-60-second moderate phase and 90-second idle recovery in that same tab. Add
-browser frame-time/FPS capture to the host telemetry. Before changing source,
-inspect the existing timing counters and allocator/pool ownership to identify
-missing attribution or the highest-cost interval. Preserve the current user
-changes and do not use `orca-ide`.
+Rebuild and run the new slab-inventory diagnostic, then repeat this same-tab
+idle → moderate 60 s → recovery 90 s sequence with browser frame-time/FPS
+capture. Correlate empty-block bytes versus free bytes pinned in partially
+carved blocks with the sampled cache population and presentation latency.
+Only then decide whether to change pool lifetime/reclaim behavior or profile a
+specific high-cost rendering interval. Preserve the current user changes and
+do not use `orca-ide`.
