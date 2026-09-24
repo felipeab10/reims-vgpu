@@ -1124,10 +1124,14 @@ impl WindowPresenter {
         let frame_cmd = self.frames[frame_ix].cmd;
         let frame_image_available = self.frames[frame_ix].image_available;
         let frame_in_flight = self.frames[frame_ix].in_flight;
+        // Not 0: NVIDIA's Wayland WSI only reads the compositor's
+        // wl_buffer.release events while an acquire is allowed to wait, so a
+        // zero-timeout acquire never sees an image come back.
         let acquire_timeout_ns: u64 = std::env::var("REIMS_VGPU_ACQUIRE_TIMEOUT_MS")
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
-            .unwrap_or(100) * 1_000_000;
+            .map(|ms| ms * 1_000_000)
+            .unwrap_or(2_000_000);
         let (image_index, acquire_suboptimal) = match self.swapchain_loader.acquire_next_image(
             self.swapchain,
             acquire_timeout_ns,
