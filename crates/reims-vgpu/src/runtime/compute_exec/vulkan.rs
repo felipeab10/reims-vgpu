@@ -1220,9 +1220,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
     let mut samplers = Vec::new();
     for s in &acc.samplers {
         let binding = crate::runtime::spirv_bind::SAMPLER_BINDING_BASE + s.index;
-        if reflected_samplers
+        if !reflected_samplers
             .binary_search_by_key(&binding, |sampler| sampler.binding)
-            .is_err()
+            .is_ok_and(|at| reflected_samplers[at].guest_bindable())
         {
             continue;
         }
@@ -1252,7 +1252,9 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
             .iter()
             .any(|sampler| sampler.binding == reflected.binding)
         {
-            if let Some(state) = reflected.static_state {
+            if let crate::runtime::spirv_bind::ReflectedSamplerSource::Static(state) =
+                reflected.source
+            {
                 let sampler = match crate::runtime::draw::vulkan::reflected_static_sampler_resource(
                     "kernel",
                     reflected.binding,
@@ -1269,6 +1271,14 @@ pub(crate) fn execute_dispatch_linux<M: HostMemory + HostOps>(
                     }
                 };
                 samplers.push(sampler);
+            } else if reflected.source
+                == crate::runtime::spirv_bind::ReflectedSamplerSource::SynthesizedRead
+            {
+                samplers.push(
+                    crate::backend::vulkan::engine::SamplerResource::read_placeholder(
+                        reflected.binding,
+                    ),
+                );
             } else {
                 samplers.push(
                     crate::backend::vulkan::engine::SamplerResource::normalized_default(
