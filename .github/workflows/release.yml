@@ -1,0 +1,104 @@
+name: Build & Release Reims vGPU
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag de versão do Release (ex: v1.0.0)'
+        required: true
+        default: 'v1.0.0'
+
+permissions:
+  contents: write
+
+jobs:
+  build-release:
+    name: Build x86_64 Linux Binary Release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Setup Rust & UEFI Target
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-uefi
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            meson \
+            ninja-build \
+            pkg-config \
+            libglib2.0-dev \
+            libpixman-1-dev \
+            libvulkan-dev \
+            libpulse-dev \
+            libslirp-dev \
+            libasound2-dev \
+            libx11-dev \
+            libxext-dev \
+            libxrandr-dev \
+            libgtk-3-dev \
+            flex \
+            bison \
+            python3 \
+            python3-pip \
+            python3-venv
+
+      - name: Build UEFI GOP ROM (reims-vgpu-gop.rom)
+        run: |
+          bash crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
+
+      - name: Build QEMU + Reims vGPU (Vulkan Backend)
+        run: |
+          bash scripts/qemu-build/qemu-build.sh --target x86_64 --backend vulkan
+
+      - name: Package Distributable Tarball
+        run: |
+          mkdir -p dist/vendor/qemu/build
+          mkdir -p dist/crates/reims-vgpu-efi/out
+          mkdir -p dist/vm/ovmf
+
+          cp vendor/qemu/build/qemu-system-x86_64 dist/vendor/qemu/build/
+          cp -r vendor/qemu/pc-bios dist/vendor/qemu/
+          cp crates/reims-vgpu-efi/out/reims-vgpu-gop.rom dist/crates/reims-vgpu-efi/out/
+          cp -r vm/ovmf/* dist/vm/ovmf/
+          cp vm/boot-x86.sh dist/vm/
+
+          # Empacota no tarball final
+          tar -czf reims-vgpu-linux-x86_64.tar.gz -C dist .
+          sha256sum reims-vgpu-linux-x86_64.tar.gz > reims-vgpu-linux-x86_64.tar.gz.sha256
+
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ github.event.inputs.tag_name }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: "Reims vGPU ${{ steps.vars.outputs.tag }} (x86_64 Linux)"
+          files: |
+            reims-vgpu-linux-x86_64.tar.gz
+            reims-vgpu-linux-x86_64.tar.gz.sha256
+          draft: false
+          prerelease: false
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
