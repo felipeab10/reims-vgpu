@@ -52,6 +52,7 @@ jobs:
             libgtk-3-dev \
             flex \
             bison \
+            ovmf \
             python3 \
             python3-pip \
             python3-venv
@@ -73,8 +74,17 @@ jobs:
           cp vendor/qemu/build/qemu-system-x86_64 dist/vendor/qemu/build/
           cp -r vendor/qemu/pc-bios dist/vendor/qemu/
           cp crates/reims-vgpu-efi/out/reims-vgpu-gop.rom dist/crates/reims-vgpu-efi/out/
-          cp -r vm/ovmf/* dist/vm/ovmf/
-          cp vm/boot-x86.sh dist/vm/
+
+          # Copia arquivos UEFI OVMF
+          if [ -d vm/ovmf ] && [ -n "$(ls -A vm/ovmf 2>/dev/null)" ]; then
+            cp -r vm/ovmf/* dist/vm/ovmf/
+          elif [ -d /usr/share/OVMF ]; then
+            cp -r /usr/share/OVMF/* dist/vm/ovmf/
+          fi
+
+          if [ -f vm/boot-x86.sh ]; then
+            cp vm/boot-x86.sh dist/vm/
+          fi
 
           # Empacota no tarball final
           tar -czf reims-vgpu-linux-x86_64.tar.gz -C dist .
