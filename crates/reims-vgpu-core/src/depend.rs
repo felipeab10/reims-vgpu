@@ -64,6 +64,19 @@ pub struct Census {
     /// two accesses of one transaction meeting one earlier ordinal counted
     /// twice against the one edge they made, and the fraction could exceed one.
     pub edges_from_unknown_mode: usize,
+    /// Index entries an admitted access was compared against, whatever came of
+    /// the comparison. The work [`DependencyGraph::admit`] actually does, as
+    /// opposed to what it found: the three counters below are subsets of it.
+    pub candidates_scanned: usize,
+    /// Of [`Self::candidates_scanned`], entries whose transaction had already
+    /// retired. They cannot create an edge, so every one is a comparison paid
+    /// for nothing — the cost of index entries [`DependencyGraph::retire`]
+    /// leaves behind until [`DependencyGraph::compact`] drops them.
+    pub retired_scanned: usize,
+    /// Of [`Self::candidates_scanned`], entries the admitting transaction had
+    /// itself inserted a moment earlier. Never an edge either; they grow with
+    /// the square of one transaction's accesses to one backing.
+    pub own_scanned: usize,
 }
 
 /// The live hazard state.
@@ -145,16 +158,22 @@ impl DependencyGraph {
     }
 
     /// Live accesses, for a test or a report. Not a bound anything enforces.
+    ///
+    /// `dead` is the retired count the compaction keeps, so this is O(1) and
+    /// is the same figure the amortised trigger in [`Self::admit`] reads.
     #[must_use]
     pub fn live_accesses(&self) -> usize {
         self.entries.len() - self.dead
     }
 
-    /// Slots held, live and retired, for a test or a report. What every
-    /// admission's candidate lists are drawn from, and the figure the
-    /// amortised compaction keeps within twice [`Self::live_accesses`].
+    /// Index entries held, live and retired, for a test or a report. What every
+    /// admission's candidate lists are drawn from, and the figure the amortised
+    /// compaction keeps within twice [`Self::live_accesses`].
+    ///
+    /// Named `retained_entries` to pair with the census that reports both this
+    /// and the live count; it is the same slot count as before.
     #[must_use]
-    pub fn entries(&self) -> usize {
+    pub fn retained_entries(&self) -> usize {
         self.entries.len()
     }
 
@@ -201,9 +220,15 @@ impl DependencyGraph {
         for intent in accesses {
             scratch.clear();
             self.gather(intent, &mut scratch);
+            self.census.candidates_scanned += scratch.len();
             for &candidate in &scratch {
                 let entry = self.entries[candidate];
-                if !entry.live || entry.ordinal == ordinal {
+                if !entry.live {
+                    self.census.retired_scanned += 1;
+                    continue;
+                }
+                if entry.ordinal == ordinal {
+                    self.census.own_scanned += 1;
                     continue;
                 }
                 if !requires_edge(&entry.intent, intent) {
@@ -335,6 +360,12 @@ impl DependencyGraph {
     /// and empty buckets are dropped, so a warm compaction makes no trip into
     /// the allocator.
     pub fn compact(&mut self) {
+        // The fork's in-place compaction is kept over the incoming rebuild:
+        // this one retains the slot vector's capacity and renumbers every index
+        // through `remap_buckets`, so a warm compaction makes no trip into the
+        // allocator, and the early return makes the common admission free.
+        // `dead` is the counterpart of the incoming `live` counter, and the
+        // trigger in `admit` is arithmetically the same predicate.
         if self.dead == 0 {
             return;
         }
@@ -579,6 +610,32 @@ mod tests {
         assert_eq!(g.live_accesses(), 1, "only the live access survives");
     }
 
+    /// What an admission scanned is counted apart from what it found, and the
+    /// two kinds of comparison that can never be an edge are named: an entry
+    /// whose transaction retired, and an entry the admitting transaction put
+    /// there itself.
+    #[test]
+    fn scanned_candidates_name_the_ones_that_cannot_order() {
+        let mut g = DependencyGraph::new();
+        let k = AccessKey::Whole(res(1));
+        g.admit(ord(1), &[intent(k, AccessMode::Write)]);
+        g.admit(ord(2), &[intent(k, AccessMode::Read)]);
+        g.retire(ord(1));
+        let before = g.census();
+        // Two accesses to one backing: the second meets the first.
+        let waits = g.admit(
+            ord(3),
+            &[intent(k, AccessMode::Write), intent(k, AccessMode::Write)],
+        );
+        assert_eq!(waits, vec![ord(2)]);
+        let after = g.census();
+        // First access: ord 1 (retired) and ord 2. Second: those and its twin.
+        assert_eq!(after.candidates_scanned - before.candidates_scanned, 5);
+        assert_eq!(after.retired_scanned - before.retired_scanned, 2);
+        assert_eq!(after.own_scanned - before.own_scanned, 1);
+        assert_eq!(g.live_accesses(), 3);
+    }
+
     /// Compaction is bookkeeping. It must not change an answer, and it must not
     /// rewrite the running totals — a census that reset on compaction would
     /// under-report exactly when the graph was busiest.
@@ -640,9 +697,9 @@ mod tests {
             // walked: the retirements below may push retired slots past the
             // live ones, and the next admission is what pays to drop them.
             assert!(
-                g.entries() <= 2 * g.live_accesses(),
+                g.retained_entries() <= 2 * g.live_accesses(),
                 "after admitting ordinal {n}: {} slots for {} live accesses",
-                g.entries(),
+                g.retained_entries(),
                 g.live_accesses()
             );
             if n > IN_FLIGHT {
