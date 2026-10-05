@@ -309,6 +309,11 @@ pub fn device_reset(id: u64) -> bool {
     if let Some(slot) = device_slot(id) {
         let mut d = lock_for_drain(&slot);
         let seq = slot.reset_count.fetch_add(1, Ordering::Relaxed) + 1;
+        // Logged before the work, not after: this runs on QEMU's main loop with
+        // the BQL held, so if the reset wedges, the completion line below never
+        // appears and the pair is the only evidence of where it stopped.
+        let started = std::time::Instant::now();
+        crate::observe::off(format!("device_reset_begin id={id} seq={seq}"));
         let state = &d.device.state;
         let mappings = state.mappings.len();
         let tasks = state.tasks.live_count();
@@ -328,7 +333,8 @@ pub fn device_reset(id: u64) -> bool {
             0
         };
         crate::observe::off(format!(
-            "device_reset id={id} seq={seq} mappings={mappings} tasks={tasks} host_surface={host_surfaces} host_texture={host_textures} host_gva={host_gvas} host_linear={host_linear} frame_valid={} frame_mapping={frame_mapping} boundary={} unmapped_views={views}",
+            "device_reset id={id} seq={seq} elapsed_ms={} mappings={mappings} tasks={tasks} host_surface={host_surfaces} host_texture={host_textures} host_gva={host_gvas} host_linear={host_linear} frame_valid={} frame_mapping={frame_mapping} boundary={} unmapped_views={views}",
+            started.elapsed().as_millis(),
             u8::from(frame_valid),
             u8::from(boundary)
         ));

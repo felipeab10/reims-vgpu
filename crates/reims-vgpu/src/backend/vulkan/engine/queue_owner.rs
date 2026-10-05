@@ -283,6 +283,27 @@ impl QueueOwner {
         Ok(PendingPresent { receiver })
     }
 
+    /// Bound on `wait_idle`. A wedged driver would otherwise park the caller
+    /// forever: this path is reached from the guest-reset flow, which runs on
+    /// QEMU's main loop inside the action BH while holding the BQL, so an
+    /// unbounded wait there freezes every device in the process and takes the
+    /// host compositor down with it (it draws through the same GPU). Exceeding
+    /// the bound reports `ERROR_DEVICE_LOST`; every caller of `queue_wait_idle`
+    /// already handles that error by taking its resource-teardown path, so the
+    /// reset completes instead of hanging.
+    ///
+    /// `REIMS_VGPU_WAIT_IDLE_TIMEOUT_MS=0` restores the unbounded wait.
+    fn wait_idle_timeout() -> Option<std::time::Duration> {
+        static TIMEOUT_MS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+        let ms = *TIMEOUT_MS.get_or_init(|| {
+            std::env::var("REIMS_VGPU_WAIT_IDLE_TIMEOUT_MS")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .unwrap_or(10_000)
+        });
+        (ms != 0).then(|| std::time::Duration::from_millis(ms))
+    }
+
     pub(crate) fn wait_idle(&self) -> Result<(), vk::Result> {
         // Unlike ordinary work this must reach the owner even after its failure
         // latch fired: callers destroy resources after it returns.
@@ -290,10 +311,30 @@ impl QueueOwner {
         self.sender
             .send(Request::WaitIdle { reply })
             .map_err(|_| vk::Result::ERROR_DEVICE_LOST)?;
-        receiver
-            .recv()
-            .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
-            .map(|_| ())
+        let Some(timeout) = Self::wait_idle_timeout() else {
+            return receiver
+                .recv()
+                .unwrap_or(Err(vk::Result::ERROR_DEVICE_LOST))
+                .map(|_| ());
+        };
+        let started = std::time::Instant::now();
+        match receiver.recv_timeout(timeout) {
+            Ok(result) => result.map(|_| ()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                // The owner thread is still inside `vkQueueWaitIdle` and cannot
+                // be reclaimed, so the engine is degraded from here on — but
+                // the main loop is free, which is what keeps the host alive.
+                crate::observe::fail(format!(
+                    "queue_wait_idle_timeout waited_ms={} timeout_ms={} owner_thread_wedged=1 \
+                     — vkQueueWaitIdle did not return; abandoning the wait so reset/teardown \
+                     proceeds instead of parking the caller (QEMU main loop) forever",
+                    started.elapsed().as_millis(),
+                    timeout.as_millis()
+                ));
+                Err(vk::Result::ERROR_DEVICE_LOST)
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(vk::Result::ERROR_DEVICE_LOST),
+        }
     }
 
     /// Wait until every request sent before this call has left the queue

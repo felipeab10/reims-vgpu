@@ -147,6 +147,8 @@ CPU_OPTIONS="${CPU_OPTIONS:-+ssse3,+sse4.2,+popcnt,+avx,+avx2,+aes,+xsave,+xsave
 # the first one this build has that is native to the host — see the AUDIO note
 # in the header for why SDL is the last resort rather than the default, and
 # scripts/audio-crackle-probe for the measurement.
+# Audio device model. ich9-intel-hda (ultimate-macOS-KVM standard) or usb-audio.
+AUDIO_DEVICE="${AUDIO_DEVICE:-ich9-intel-hda}"
 AUDIODEV="${AUDIODEV:-}"
 # How much audio QEMU's backend holds, in microseconds. The mixer that refills
 # it runs on QEMU's main loop at `timer-period`, so this is the jitter the host
@@ -416,6 +418,11 @@ ensure_rust_tools() {
 }
 
 build_reims_vgpu_efi() {
+  local rom_out="$REPO_ROOT/crates/reims-vgpu-efi/out/reims-vgpu-gop.rom"
+  if [ -f "$rom_out" ] && [ -s "$rom_out" ]; then
+    echo "boot-x86.sh: reims-vgpu-efi option ROM already present ($rom_out) — skipping build"
+    return 0
+  fi
   [ -x "$REIMS_VGPU_EFI_ROM_SCRIPT" ] || die "EFI ROM builder not executable: $REIMS_VGPU_EFI_ROM_SCRIPT"
   echo "boot-x86.sh: building reims-vgpu-efi option ROM ..."
   "$REIMS_VGPU_EFI_ROM_SCRIPT" || die "reims-vgpu-efi build failed"
@@ -517,8 +524,13 @@ case "$NET" in
   *) die "unknown NET: $NET (user | none)" ;;
 esac
 
-# Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init).
-if [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
+# Product Reims VGPU: Tahoe x86 kext path is sensitive to high SMP (StorageNode::init),
+# but allow override when CPUS is explicitly defined.
+if [ -n "${CPUS:-}" ]; then
+  CPU_THREADS="$CPUS"
+  CPU_CORES="$CPUS"
+  CPU_SOCKETS=1
+elif [ "$GFX_DEVICE" = "reims-vgpu-pci" ]; then
   if [ "${CPU_THREADS}" -gt 8 ] 2>/dev/null; then
     echo "boot-x86.sh: reims-vgpu-pci — capping SMP at 8 (was threads=$CPU_THREADS cores=$CPU_CORES)"
     CPU_THREADS=8
@@ -552,11 +564,15 @@ fi
 # --- Build the QEMU command line ------------------------------------------------
 # q35 + OVMF + AppleSMC + SATA OpenCore/HDD. Display is attached below.
 QEMU_ARGS=(
+  -L /usr/share/qemu
+  -L "$REPO_ROOT/vendor/qemu/pc-bios"
   -enable-kvm
   -m "$RAM"
   -object "memory-backend-memfd,id=reims-ram,size=$RAM,share=on"
   -cpu "${CPU_MODEL},-hle,-rtm,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,${CPU_OPTIONS}"
   -machine q35,memory-backend=reims-ram
+  -global ICH9-LPC.disable_s3=1
+  -global ICH9-LPC.disable_s4=1
   -smp "$CPU_THREADS",cores="$CPU_CORES",sockets="$CPU_SOCKETS"
   -device qemu-xhci,id=xhci
   -device usb-kbd,bus=xhci.0
@@ -566,8 +582,23 @@ QEMU_ARGS=(
   -drive "if=pflash,format=raw,readonly=on,file=$OVMF_CODE"
   -drive "if=pflash,format=raw,file=$OVMF_VARS"
   -smbios type=2
-  -audiodev "$AUDIODEV,id=audio0,out.buffer-length=$AUDIO_BUFFER_US"
-  -device "usb-audio,bus=xhci.0,audiodev=audio0,buffer=$AUDIO_USB_BUFFER"
+)
+
+# Audio hardware configuration: ich9-intel-hda (ultimate-macOS-KVM) vs legacy usb-audio
+if [ "$AUDIO_DEVICE" = "ich9-intel-hda" ]; then
+  QEMU_ARGS+=(
+    -audiodev "$AUDIODEV,id=audio0"
+    -device ich9-intel-hda
+    -device "hda-duplex,audiodev=audio0"
+  )
+else
+  QEMU_ARGS+=(
+    -audiodev "$AUDIODEV,id=audio0,out.buffer-length=$AUDIO_BUFFER_US"
+    -device "usb-audio,bus=xhci.0,audiodev=audio0,buffer=$AUDIO_USB_BUFFER"
+  )
+fi
+
+QEMU_ARGS+=(
   -device ich9-ahci,id=sata
   -drive "id=OpenCoreBoot,if=none,format=qcow2,file=$OPENCORE"
   -device ide-hd,bus=sata.2,drive=OpenCoreBoot
@@ -720,18 +751,17 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # per-login random suffix; override any of these in the environment if yours
   # differ (e.g. a different seat, DISPLAY, or Wayland socket).
   : "${XDG_RUNTIME_DIR:=/run/user/$(id -u)}"
-  : "${WAYLAND_DISPLAY:=wayland-0}"
-  : "${DISPLAY:=:0}"
-  # XAUTHORITY's suffix is a per-login random string, so it cannot be written
-  # down: a hardcoded one goes stale at the next login and then points at a file
-  # that does not exist. Discover the newest cookie in the runtime dir instead.
-  if [ -z "${XAUTHORITY:-}" ]; then
-    for _xauth in $(ls -t "$XDG_RUNTIME_DIR"/xauth_* 2>/dev/null); do
-      XAUTHORITY="$_xauth"
-      break
-    done
+  if [ "${FORCE_X11:-0}" = "1" ] || [ "${USE_X11:-0}" = "1" ]; then
+    unset WAYLAND_DISPLAY
+    export WINIT_UNIX_BACKEND=x11
+    : "${DISPLAY:=:1}"
+    echo "boot-x86.sh: Running host window in X11 mode (DISPLAY=$DISPLAY)"
+  else
+    : "${WAYLAND_DISPLAY:=wayland-1}"
+    : "${DISPLAY:=:1}"
+    export WAYLAND_DISPLAY
   fi
-  export XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY
+  export XDG_RUNTIME_DIR DISPLAY
   [ -n "${XAUTHORITY:-}" ] && export XAUTHORITY
 
   # A window with no display server still opens, still says "first frame
@@ -766,7 +796,7 @@ if [ -n "${REIMS_VGPU_WINDOW:-}" ]; then
   # so do not go looking for it here.
   :
 else
-  REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk}"
+  REIMS_VGPU_DISPLAY="${REIMS_VGPU_DISPLAY:-gtk,show-menubar=off,zoom-to-fit=on}"
 fi
 
 if [ "$BOOT_CLASS" = "interactive" ] || [ "$BOOT_CLASS" = "capture" ] || [ "$BOOT_CLASS" = "persistent" ]; then

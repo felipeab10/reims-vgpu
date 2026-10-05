@@ -56,6 +56,13 @@ Vulkan-Headers/
 # vendor/qemu is a git submodule (steelbrain/qemu-reims-vgpu, branch host-reims-vgpu-vmapple).
 # Its own build/ output is ignored by QEMU's own .gitignore.
 
+# Vendored crates.io/git dependencies for offline builds. Generated, not tracked:
+# ~279 MB (205 crates). Recreate with
+#   cargo vendor --versioned-dirs vendor/cargo
+# `appliance/build-iso.sh` does this automatically when the directory is missing.
+# The appliance reads it through /opt/reims-vgpu/.cargo/config.toml.
+/vendor/cargo/
+
 # OSX-KVM is an attributed source submodule; downloaded Apple media and local
 # conversion outputs remain outside Git.
 /third_party/OSX-KVM/BaseSystem.*
@@ -75,3 +82,4 @@ Vulkan-Headers/
 # what a stray instrumented `cargo test` drops in the tree).
 *.profraw
 *.profdata
+/.local/
