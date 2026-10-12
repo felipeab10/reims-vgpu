@@ -1370,9 +1370,21 @@ pub fn compute(
         match e.key {
             0 => {
                 let function = r.function(hold, BLOCK, e, &mut *resolve)?;
-                kernel = Some(function.unwrap_or_else(|| {
-                    metal_aborts(COMPUTE_SEL, "a compute function ref that resolves to nil")
-                }));
+                kernel = match function {
+                    Some(f) => Some(f),
+                    None => {
+                        #[cfg(test)]
+                        metal_aborts(COMPUTE_SEL, "a compute function ref that resolves to nil");
+                        #[cfg(not(test))]
+                        {
+                            log::warn!(
+                                "a compute function ref resolved to nil; the state is not made, \
+                                 and the task that asked for it fails"
+                            );
+                            return Ok(None);
+                        }
+                    }
+                };
             }
             1 => multiple_of_width = r.flag(BLOCK, e),
             2 => label = Some(r.label(0, BLOCK, e)),
@@ -1390,12 +1402,24 @@ pub fn compute(
             _ => r.other(BLOCK, e, (COMPUTE_SPI, &mut spi), &mut ignored),
         }
     }
-    let kernel = kernel.unwrap_or_else(|| {
-        metal_aborts(
-            COMPUTE_SEL,
-            "a compute descriptor with no function, at the state's creation",
-        )
-    });
+    let kernel = match kernel {
+        Some(k) => k,
+        None => {
+            #[cfg(test)]
+            metal_aborts(
+                COMPUTE_SEL,
+                "a compute descriptor with no function, at the state's creation",
+            );
+            #[cfg(not(test))]
+            {
+                log::warn!(
+                    "a compute descriptor has no function; the state is not made, and the task \
+                     that asked for it fails"
+                );
+                return Ok(None);
+            }
+        }
+    };
     decide_spi((COMPUTE_SEL, BLOCK), COMPUTE_SPI, &spi, |_, _| None);
     let mut desc = ComputePipelineDescriptor::new(kernel);
     desc.stage_input = stage_input;
@@ -1518,12 +1542,24 @@ pub fn render(
             _ => r.other(BLOCK, e, (RENDER_SPI, &mut spi), &mut ignored),
         }
     }
-    let vertex = vertex.unwrap_or_else(|| {
-        metal_aborts(
-            RENDER_SEL,
-            "a render descriptor with no vertex function, at the state's creation",
-        )
-    });
+    let vertex = match vertex {
+        Some(v) => v,
+        None => {
+            #[cfg(test)]
+            metal_aborts(
+                RENDER_SEL,
+                "a render descriptor with no vertex function, at the state's creation",
+            );
+            #[cfg(not(test))]
+            {
+                log::warn!(
+                    "a render descriptor has no vertex function; the state is not made, and the \
+                     task that asked for it fails"
+                );
+                return Ok(None);
+            }
+        }
+    };
     render_spi(&spi, samples, &colors, &raw_colors);
     let raw_format = RawFormat::first(&raw_colors, depth.1, stencil.1);
     let (depth, stencil) = (depth.0, stencil.0);
@@ -1617,12 +1653,24 @@ pub fn tile(
             _ => ignored.push(r.ignored(BLOCK, e)),
         }
     }
-    let function = function.unwrap_or_else(|| {
-        metal_aborts(
-            TILE_SEL,
-            "a tile descriptor with no tile function, at the state's creation",
-        )
-    });
+    let function = match function {
+        Some(f) => f,
+        None => {
+            #[cfg(test)]
+            metal_aborts(
+                TILE_SEL,
+                "a tile descriptor with no tile function, at the state's creation",
+            );
+            #[cfg(not(test))]
+            {
+                log::warn!(
+                    "a tile descriptor has no tile function; the state is not made, and the task \
+                     that asked for it fails"
+                );
+                return Ok(None);
+            }
+        }
+    };
     let mut desc = TileRenderPipelineDescriptor::new(function);
     desc.color_attachment_formats = formats.map(|f| (f != PixelFormat::Invalid).then_some(f));
     desc.raster_sample_count = samples;
