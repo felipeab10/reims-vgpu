@@ -3,7 +3,7 @@
 use crate::create::{self, DiskSource, ImportMode, Spec};
 use crate::host::{Host, Profile};
 use crate::vm::{self, Registry, Vm, format_mib, parse_size_mib};
-use crate::{gpu, install, logs, paths, qemu, runtime, update};
+use crate::{gpu, install, logs, paths, qemu, runtime, update, view};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
@@ -63,6 +63,20 @@ pub enum Cmd {
     Show { name: String },
     /// Change a VM's settings (they apply at its next start)
     Set(Box<SetArgs>),
+    /// Show a running VM's screen in this terminal, and use its keyboard and mouse from here
+    #[command(after_help = VIEW_HELP)]
+    View {
+        name: String,
+        /// The display to show, from 1
+        #[arg(long, default_value_t = 1)]
+        display: u32,
+        /// The most frames a second
+        #[arg(long, default_value_t = 15)]
+        fps: u32,
+        /// How to draw the screen (by default, the best the terminal answers it can show)
+        #[arg(long, value_enum)]
+        protocol: Option<view::Protocol>,
+    },
     /// Print the QEMU command that runs a VM, as a shell script
     Command {
         name: String,
@@ -126,6 +140,15 @@ pub enum Cmd {
         commit: String,
     },
 }
+
+const VIEW_HELP: &str = "\
+For a VM on a host with no screen, to set macOS up before it has screen sharing or remote \
+login. The screen is drawn with the terminal's graphics (kitty's, iTerm2's or sixel; half-block \
+characters where it has none), over SSH as well, and the terminal's keys, mouse and pasted text \
+go to the guest as a US keyboard's and a tablet's.
+
+Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
+buttons on the top row hold that key for the next key or click.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -213,7 +236,7 @@ pub struct CreateArgs {
     /// x86-64: OVMF's variables
     #[arg(long)]
     pub firmware_vars: Option<PathBuf>,
-    /// x86-64: QEMU's CPU model (default Haswell-noTSX)
+    /// x86-64: QEMU's CPU model (default Skylake-Client-noTSX-IBRS)
     #[arg(long)]
     pub cpu_model: Option<String>,
     /// x86-64: CPU flags after the model's
@@ -354,6 +377,22 @@ pub fn main(cli: Cli) -> Result<i32> {
         }
         Cmd::Show { name } => show(&Registry::load()?.open(&name)?, host),
         Cmd::Set(a) => set(*a, host)?,
+        Cmd::View {
+            name,
+            display,
+            fps,
+            protocol,
+        } => {
+            let vm = Registry::load()?.open(&name)?;
+            let opts = view::Options {
+                display,
+                fps,
+                protocol,
+            };
+            if let Some(m) = view::run(&vm, &opts)? {
+                println!("{m}");
+            }
+        }
         Cmd::Command { name, output } => {
             let vm = Registry::load()?.open(&name)?;
             let script =
@@ -600,6 +639,9 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         }
     })?;
     println!("created {name} in {}", paths::tilde(&vm.dir));
+    if vm.config.profile == Profile::Q35X86_64 {
+        println!("{name}: {}", runtime::SET_METAL_ERROR_MODE);
+    }
     if a.start {
         let pid = runtime::start(&vm, host)?;
         println!("{name}: running, pid {pid}");
@@ -833,7 +875,10 @@ pub fn set_installer(
     if !running {
         return Ok(match &path {
             Some(p) => format!("{name}: {} attached for the next start", paths::tilde(p)),
-            None => format!("{name}: installer removed"),
+            None => format!(
+                "{name}: installer removed; {}",
+                runtime::SET_METAL_ERROR_MODE
+            ),
         });
     }
     // Live: only a CD drive's disc changes; a disk installer changes at the next start.
@@ -842,8 +887,13 @@ pub fn set_installer(
         runtime::change_cd(vm, path.as_deref())?;
         Ok(match &path {
             Some(p) => format!("{name}: {} is in the CD drive", paths::tilde(p)),
-            None => format!("{name}: CD ejected"),
+            None => format!("{name}: CD ejected; {}", runtime::SET_METAL_ERROR_MODE),
         })
+    } else if path.is_none() {
+        let tip = runtime::SET_METAL_ERROR_MODE;
+        Ok(format!(
+            "{name}: the installer goes at the next start; {tip}"
+        ))
     } else {
         Ok(format!("{name}: the installer changes at the next start"))
     }
