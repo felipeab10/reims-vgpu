@@ -227,22 +227,22 @@ if [[ $SKIP_QEMU == 0 ]]; then
   # A linked worktree shares the main checkout's module repository: initialising
   # vendor/qemu here would rewrite that repository's core.worktree for every
   # worktree (docs/lessons.md).
-  gitdir="$(git -C "$ROOT" rev-parse --absolute-git-dir)"
-  commondir="$(cd "$ROOT" && cd "$(git rev-parse --git-common-dir)" && pwd)"
+  gitdir="$(git -C "$ROOT" rev-parse --absolute-git-dir 2>/dev/null || true)"
+  commondir="$(cd "$ROOT" && cd "$(git rev-parse --git-common-dir 2>/dev/null || true)" 2>/dev/null && pwd || true)"
   if [[ ! -f "$ROOT/vendor/qemu/configure" ]]; then
-    if [[ "$gitdir" != "$commondir" ]]; then
+    if [[ -n "$gitdir" && "$gitdir" != "$commondir" ]]; then
       die "this is a git worktree, and vendor/qemu is empty: run $0 in the main checkout, or clone vendor/qemu into this worktree yourself"
     fi
     say "Fetching QEMU's source (vendor/qemu, without its own submodules)"
     fetch_qemu
-  elif [[ $UPDATE == 1 && "$gitdir" == "$commondir" ]]; then
+  elif [[ $UPDATE == 1 && -n "$gitdir" && "$gitdir" == "$commondir" ]]; then
     fetch_qemu
   fi
 fi
 
 # ------------------------------------------------------------------ the library and QEMU
 
-COMMIT="$(git -C "$ROOT" rev-parse --short HEAD)"
+COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || (grep '^commit=' "$ROOT/SOURCE-PROVENANCE.txt" 2>/dev/null | cut -d= -f2 | cut -c1-8) || echo 'release')"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
 if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
 
