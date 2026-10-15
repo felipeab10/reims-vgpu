@@ -2,13 +2,17 @@
 //! prints as a shell script, so a printed script runs the VM exactly as reims-ctl does.
 //!
 //! Every profile gets:
-//! - the library's window for each display: `-display none` with `REIMS_VGPU_WINDOW` unset
-//!   (`0` would keep apple-gfx headless), never a window of QEMU's own;
+//! - on reims-vgpu, the library's window for each display: `-display none` with
+//!   `REIMS_VGPU_WINDOW` unset (`0` would keep apple-gfx headless), never a window of QEMU's own;
 //! - a QMP socket (`-qmp`), through which reims-ctl stops the VM;
 //! - QEMU's pid file;
-//! - user networking with virtio-net, and an optional SSH port forward;
+//! - user networking with virtio-net, and an optional SSH port forward; with networking off,
+//!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
+//!   q35 an e1000e in the first free slot, 1, where the root port's address is);
 //! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
 //!   driver, and Safari's Media Source players fail without an output device;
+//! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
+//!   for OpenCore's boot chime: its AudioDxe drives HDA, not USB audio;
 //! - with logs on: the library's log (`REIMS_VGPU_LOG`), the serial console, timestamps.
 //!
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
@@ -26,10 +30,17 @@
 //! stays dark and WindowServer waits on the GPU for good. Without S3, macOS's sleep stops at a
 //! dark wake, from which input wakes the display (docs/qemu.md).
 //!
+//! An x86-64 VM may have QEMU's `vmware-svga` in apple-gfx's slot instead (`graphics =
+//! "vmware-svga"`), with the device's id, `gfx`, which the terminal viewer's screendumps name.
+//! The library then draws nothing, so the window's and the GPU's variables are left out, and
+//! QEMU's own window, GTK's (`-display gtk`), shows the display. Where QEMU's environment names
+//! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
+//! `-display none` there, and the guest runs headless, as on the library's window.
+//!
 //! `vmapple-arm64` follows scripts/run_vmapple.sh.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::Vm;
+use crate::vm::{Graphics, Vm};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -55,6 +66,10 @@ pub struct Ctx {
     pub qemu: PathBuf,
     /// The audio backend for a VM that names none.
     pub audio_backend: String,
+    /// Whether the host's KVM offers VMX to guests ([`crate::host::kvm_nested_vmx`]).
+    pub nested_vmx: bool,
+    /// Whether QEMU's own window can open ([`crate::host::has_screen`]).
+    pub screen: bool,
 }
 
 /// A value inside a QEMU option list: commas doubled.
@@ -85,13 +100,15 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
     } else {
         unset.push("REIMS_VGPU_LOG".into());
     }
-    if c.display.borderless {
+    let library = c.graphics == Graphics::ReimsVgpu;
+    if library && c.display.borderless {
         env.push(("REIMS_VGPU_WINDOW_BORDERLESS".into(), "1".into()));
     }
-    if let Some(r) = c.display.refresh {
+    if library && let Some(r) = c.display.refresh {
         env.push(("REIMS_VGPU_WINDOW_REFRESH".into(), r.to_string()));
     }
-    if c.profile.gpu_choice(ctx.host)
+    if library
+        && c.profile.gpu_choice(ctx.host)
         && let Some(f) = &c.gpu.driver_file
     {
         // The loader reads VK_DRIVER_FILES; loaders before 1.3.207 read VK_ICD_FILENAMES.
@@ -121,7 +138,7 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let mem = format!("{}M", c.memory_mib);
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
     if c.profile.memfd_ram(ctx.host) {
-        push(&["-machine", "q35,memory-backend=ram"]);
+        push(&["-machine", "q35,memory-backend=ram,dump-guest-core=off"]);
         push(&[
             "-object",
             &format!("memory-backend-memfd,id=ram,size={mem},share=on"),
@@ -134,6 +151,13 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on",
         q.cpu_model
     );
+    // VMX lets the guest run VMs of its own (Hypervisor.framework, Docker). It is given only where
+    // KVM offers it, so `check` never drops it with a warning. It is `vmx=on`, not `+vmx`, so a
+    // VM's `-vmx` or `vmx=off` in `cpu_flags` takes it away: QEMU applies `name=value` flags in
+    // order, and `+` and `-` ones after them, so a `+vmx` here would outlive a `vmx=off`.
+    if ctx.nested_vmx {
+        cpu.push_str(",vmx=on");
+    }
     if !q.cpu_flags.trim().is_empty() {
         cpu.push(',');
         cpu.push_str(q.cpu_flags.trim());
@@ -216,11 +240,14 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ]);
     }
     push(&["-vga", "none"]);
-    let mut gfx = format!(
-        "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={}",
-        c.display.count
-    );
-    gfx.push_str(&format!(",resolution={}", c.display.qemu_resolution()?));
+    let gfx = match c.graphics {
+        Graphics::ReimsVgpu => format!(
+            "apple-gfx-pci,id=gfx,bus=pcie.0,addr=0x4,displays={},resolution={}",
+            c.display.count,
+            c.display.qemu_resolution()?
+        ),
+        Graphics::VmwareSvga => "vmware-svga,id=gfx,bus=pcie.0,addr=0x4".into(),
+    };
     push(&["-device", &gfx]);
     push(&[
         "-device",
@@ -235,6 +262,9 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
         push(&["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"]);
+        // At ICH9's own slot for it.
+        push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
+        push(&["-device", "hda-output,bus=hda.0,audiodev=snd0"]);
     }
     Ok(())
 }
@@ -316,7 +346,11 @@ fn audiodev(vm: &Vm, ctx: &Ctx) -> String {
 fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     let c = &vm.config;
     let mut push = |xs: &[&str]| a.extend(xs.iter().map(|s| s.to_string()));
-    push(&["-display", "none"]);
+    if !c.network.enabled {
+        push(&["-nic", "none"]);
+    }
+    let qemu_window = c.graphics == Graphics::VmwareSvga && ctx.screen;
+    push(&["-display", if qemu_window { "gtk" } else { "none" }]);
     if c.logs.enabled {
         push(&["-serial", &format!("file:{}", vm.serial_log().display())]);
         push(&["-msg", "timestamp=on"]);
@@ -329,7 +363,6 @@ fn common(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         &format!("unix:{},server=on,wait=off", optp(&vm.qmp_socket())),
     ]);
     push(&["-pidfile", &vm.pidfile().to_string_lossy()]);
-    let _ = ctx;
     Ok(())
 }
 
@@ -430,6 +463,7 @@ mod tests {
                 disk_format: ImageFormat::Qcow2,
                 stop_timeout_secs: 90,
                 extra_args: vec![],
+                graphics: Graphics::ReimsVgpu,
                 display: Display::default(),
                 gpu: Gpu::default(),
                 audio: Audio::default(),
@@ -460,6 +494,8 @@ mod tests {
             host,
             qemu: "/q/bin/qemu".into(),
             audio_backend: "pipewire".into(),
+            nested_vmx: false,
+            screen: true,
         }
     }
 
@@ -473,7 +509,7 @@ mod tests {
         let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
         let a = &inv.args;
         for pair in [
-            &["-machine", "q35,memory-backend=ram"][..],
+            &["-machine", "q35,memory-backend=ram,dump-guest-core=off"][..],
             &[
                 "-object",
                 "memory-backend-memfd,id=ram,size=12288M,share=on",
@@ -502,6 +538,8 @@ mod tests {
             ],
             &["-audiodev", "pipewire,id=snd0"],
             &["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"],
+            &["-device", "ich9-intel-hda,id=hda,addr=0x1b"],
+            &["-device", "hda-output,bus=hda.0,audiodev=snd0"],
             &["-display", "none"],
             &["-qmp", "unix:/vms/t/qmp.sock,server=on,wait=off"],
             &["-pidfile", "/vms/t/qemu.pid"],
@@ -519,6 +557,65 @@ mod tests {
     fn q35_offers_the_guest_no_s3_sleep() {
         let inv = invocation(&q35_vm(), &ctx(linux())).unwrap();
         assert!(has(&inv.args, &["-global", "ICH9-LPC.disable_s3=1"]));
+    }
+
+    #[test]
+    fn network_off_gives_the_machine_no_nic() {
+        let mut q35 = q35_vm();
+        q35.config.network.enabled = false;
+        let mut vmapple = q35.clone();
+        vmapple.config.profile = Profile::VmappleArm64;
+        vmapple.config.q35 = None;
+        vmapple.config.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        for (vm, host) in [(&q35, linux()), (&vmapple, mac())] {
+            let a = invocation(vm, &ctx(host)).unwrap().args;
+            assert!(has(&a, &["-nic", "none"]), "{a:?}");
+            assert!(!a.iter().any(|x| x == "-netdev" || x.contains("net-pci")));
+        }
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(!a.iter().any(|x| x == "-nic"));
+    }
+
+    #[test]
+    fn vmx_only_where_kvm_offers_it() {
+        let cpu = |nested_vmx| {
+            let inv = invocation(
+                &q35_vm(),
+                &Ctx {
+                    nested_vmx,
+                    ..ctx(linux())
+                },
+            )
+            .unwrap();
+            let i = inv.args.iter().position(|x| x == "-cpu").unwrap();
+            inv.args[i + 1].clone()
+        };
+        assert_eq!(
+            cpu(true),
+            format!(
+                "{},kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,vmx=on,{}",
+                default_cpu_model(),
+                default_cpu_flags()
+            )
+        );
+        assert!(!cpu(false).contains("vmx"));
+    }
+
+    #[test]
+    fn q35_without_audio_has_no_sound_devices() {
+        let mut vm = q35_vm();
+        vm.config.audio.enabled = false;
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        for x in ["-audiodev", "usb-audio", "ich9-intel-hda", "hda-output"] {
+            assert!(
+                !inv.args.iter().any(|a| a.contains(x)),
+                "{x} in {:?}",
+                inv.args
+            );
+        }
     }
 
     #[test]
@@ -578,6 +675,36 @@ mod tests {
     }
 
     #[test]
+    fn vmware_svga_takes_apple_gfx_slot_in_qemus_window() {
+        let mut vm = q35_vm();
+        vm.config.graphics = Graphics::VmwareSvga;
+        vm.config.display.count = 2;
+        vm.config.display.borderless = true;
+        vm.config.display.refresh = Some(120);
+        vm.config.gpu.driver_file = Some("/icd/nvidia.json".into());
+        let inv = invocation(&vm, &ctx(linux())).unwrap();
+        let a = &inv.args;
+        assert!(has(a, &["-vga", "none"]));
+        assert!(has(
+            a,
+            &["-device", "vmware-svga,id=gfx,bus=pcie.0,addr=0x4"]
+        ));
+        assert!(has(a, &["-display", "gtk"]));
+        assert!(!a.iter().any(|x| x.contains("apple-gfx")), "{a:?}");
+        assert!(inv.env.is_empty(), "{:?}", inv.env);
+        // Without a screen for the window, headless.
+        let headless = Ctx {
+            screen: false,
+            ..ctx(linux())
+        };
+        let a = invocation(&vm, &headless).unwrap().args;
+        assert!(has(&a, &["-display", "none"]));
+        // On reims-vgpu, the library's window, never QEMU's.
+        let a = invocation(&q35_vm(), &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-display", "none"]));
+    }
+
+    #[test]
     fn vmapple_follows_run_vmapple_sh() {
         let mut vm = q35_vm();
         vm.config.profile = Profile::VmappleArm64;
@@ -607,6 +734,7 @@ mod tests {
         }
         assert!(!a.iter().any(|x| x.contains("memfd")));
         assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
+        assert!(!a.iter().any(|x| x.contains("ICH9-LPC")));
     }
 
     #[test]

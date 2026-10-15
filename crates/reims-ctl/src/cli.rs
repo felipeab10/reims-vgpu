@@ -3,7 +3,7 @@
 use crate::create::{self, DiskSource, ImportMode, Spec};
 use crate::host::{Host, Profile};
 use crate::vm::{self, Registry, Vm, format_mib, parse_size_mib};
-use crate::{gpu, install, logs, paths, qemu, reims_util, runtime, update, view};
+use crate::{gpu, install, logs, opencore, paths, qemu, reims_util, runtime, update, view};
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, Parser, Subcommand};
 use std::io::Write;
@@ -89,6 +89,10 @@ pub enum Cmd {
     Insert { name: String, path: PathBuf },
     /// Take the installer out of a VM (x86-64)
     Eject { name: String },
+    /// Replace a VM's OpenCore image (x86-64) with one the installed reims-util makes, presenting
+    /// the same Mac
+    #[command(name = "update-opencore", after_help = UPDATE_OPENCORE_HELP)]
+    UpdateOpencore { name: String },
     /// List the GPUs a VM can be given (Linux)
     Gpus,
     /// Print the end of a VM's QEMU log, or its serial console's
@@ -149,6 +153,14 @@ go to the guest as a US keyboard's and a tablet's.
 
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
+
+const UPDATE_OPENCORE_HELP: &str = "\
+An image an older reims-util made lacks what a newer one's carries, such as ReimsVgpu.kext, which \
+macOS 26 needs for a display wider than 2048 pixels and for GPU-accelerated Chrome. The new image \
+presents the same Mac (its model, serial number, MLB, UUID and ROM, read from the old image's \
+config.plist), so macOS sees no new machine, and the VM keeps its OVMF variables, which hold its \
+boot entries. Whatever else was changed in the old image is not carried over. The VM must be \
+stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -273,7 +285,8 @@ pub struct CreateArgs {
     /// Keep the library's log and the serial console
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// A USB audio device on the host's sound
+    /// A USB audio device on the host's sound (on x86-64, also the HDA controller OpenCore's boot
+    /// chime plays on)
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
     /// Forward this port on 127.0.0.1 to the guest's SSH port
@@ -292,6 +305,10 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
+    /// x86-64: reims-vgpu, or vmware-svga for QEMU's VMware SVGA: one display with no GPU
+    /// acceleration, in QEMU's own window
+    #[arg(long)]
+    pub graphics: Option<String>,
     #[arg(long)]
     pub displays: Option<u32>,
     /// WIDTHxHEIGHT, or host
@@ -410,6 +427,13 @@ pub fn main(cli: Cli) -> Result<i32> {
             let mut vm = Registry::load()?.open(&name)?;
             println!("{}", set_installer(&mut vm, None, &mut |_| {})?);
         }
+        Cmd::UpdateOpencore { name } => {
+            let mut vm = Registry::load()?.open(&name)?;
+            println!(
+                "{}",
+                opencore::renew(&mut vm, &mut |p| println!("{name}: {p}"))?
+            );
+        }
         Cmd::Gpus => gpus(host),
         Cmd::Logs {
             name,
@@ -469,8 +493,15 @@ pub fn main(cli: Cli) -> Result<i32> {
 }
 
 pub fn script_comment(vm: &Vm) -> String {
+    let screen = match vm.config.graphics {
+        vm::Graphics::ReimsVgpu => "Its window opens under -display none",
+        vm::Graphics::VmwareSvga if crate::host::has_screen(&vm.config.extra_env) => {
+            "Its window is QEMU's own, under -display gtk"
+        }
+        vm::Graphics::VmwareSvga => "With no screen here, it runs headless under -display none",
+    };
     format!(
-        "{}: the QEMU command reims-ctl {} runs for this VM.\nIts window opens under -display none; QMP is at the -qmp socket.",
+        "{}: the QEMU command reims-ctl {} runs for this VM.\n{screen}; QMP is at the -qmp socket.",
         vm.name(),
         env!("CARGO_PKG_VERSION")
     )
@@ -518,7 +549,12 @@ fn list(json: bool) -> Result<()> {
                     state,
                     c.cpus,
                     format_mib(c.memory_mib),
-                    format!("{}x {}", c.display.count, c.display.resolution),
+                    match c.graphics {
+                        vm::Graphics::ReimsVgpu => {
+                            format!("{}x {}", c.display.count, c.display.resolution)
+                        }
+                        g => g.describe().into(),
+                    },
                     paths::tilde(&e.dir)
                 );
             }
@@ -745,8 +781,14 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
     if let Some(r) = c.display.refresh {
         disp.push_str(&format!(", {r} Hz"));
     }
-    add("displays", disp);
-    if c.profile.gpu_choice(host) {
+    match c.graphics {
+        vm::Graphics::ReimsVgpu => add("displays", disp),
+        vm::Graphics::VmwareSvga => add(
+            "graphics",
+            "VMware SVGA, no GPU acceleration, in QEMU's window".into(),
+        ),
+    }
+    if c.graphics == vm::Graphics::ReimsVgpu && c.profile.gpu_choice(host) {
         add(
             "gpu",
             match (&c.gpu.name, &c.gpu.driver_file) {
@@ -890,6 +932,9 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
     }
     if let Some(m) = &a.memory {
         c.memory_mib = parse_size_mib(m)?;
+    }
+    if let Some(g) = &a.graphics {
+        c.graphics = vm::Graphics::parse(g)?;
     }
     if let Some(n) = a.displays {
         c.display.count = n;

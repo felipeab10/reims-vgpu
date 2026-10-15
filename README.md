@@ -216,7 +216,8 @@ host side Apple ships as `ParavirtualizedGraphics.framework`. reims-vgpu replace
 It takes the guest's GPU command stream and runs it on Metal on a Mac, or on Vulkan on Linux
 through [`metal2vulkan`](https://github.com/steelbrain/metal2vulkan), and can draw each guest
 display into a window of its own. QEMU's `apple-gfx` devices link it, on a Mac as on Linux. There
-is no custom macOS kext and no guest driver to install.
+is no guest driver to install. On x86-64, the OpenCore image reims-util makes carries one small
+kext, ReimsVgpu.kext, which has macOS 26's driver use the GPU as its arm64 build does.
 
 The guest drivers were written against Apple's framework, so what the guest and the host observe is
 the contract: API results and refusals, host callbacks and their order, guest memory, MMIO reads,
@@ -258,7 +259,8 @@ build 25G229.
 
 On x86-64 Linux the library builds on the Vulkan platform alone, with no Mac and no Xcode. It needs
 the toolchain above (cargo fetches metal2vulkan at the commit the workspace's `Cargo.toml` names),
-CMake and a C compiler for SDL3, which the build compiles from its pinned source, and, for
+CMake and a C compiler for SDL3, which the build compiles from its pinned source, `make` for
+jemalloc, the allocator the library uses, which the build also compiles, and, for
 `cargo xtask dist`, clang, lld and binutils.
 
 ### Building

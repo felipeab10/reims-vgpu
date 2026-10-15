@@ -27,8 +27,8 @@
 #      (crates/reims-ctl/src/reims_util.rs).
 #
 # --yes       install what is missing without asking (rustup with -y too)
-# --update    pull this checkout first (git pull --ff-only); reims-ctl update
-#             runs this
+# --update    pull this checkout first (git pull --ff-only), putting back the
+#             committed Cargo.lock the build rewrote; reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
 # Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
@@ -80,7 +80,7 @@ case "$OS/$ARCH" in
     ;;
   Linux/x86_64)
     PLATFORM=linux-x86_64
-    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --disable-gtk --enable-slirp)
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp)
     QEMU_BINARY=qemu-system-x86_64
     ;;
   *) die "reims-ctl supports macOS on arm64 and Linux on x86-64; this is $OS on $ARCH" ;;
@@ -101,6 +101,10 @@ mkdir -p "$DATA" "$CACHE"
 if [[ $UPDATE == 1 ]]; then
   say "Pulling $ROOT"
   if git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+    # The build writes Cargo.lock again (cargo adds the git sources the
+    # committed lock leaves out), and a changed lock stops a pull that changes
+    # it too: the committed one goes back first.
+    git -C "$ROOT" checkout -q HEAD -- Cargo.lock
     git -C "$ROOT" pull --ff-only || die "git pull --ff-only failed: the checkout has local commits or changes; update it yourself, then run $0"
   else
     warn "the checkout's branch tracks no remote branch: building it as it is"
@@ -132,7 +136,8 @@ else
   fi
   # The library (cargo xtask dist: clang, lld and binutils for the option ROM;
   # CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
-  # which it builds from source), and QEMU (glib, pixman, libslirp; pipewire,
+  # which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
+  # its own window, which a VM on VMware SVGA shows its display in; pipewire,
   # pulse and ALSA for its audio backends; bzip2 unpacks its firmware). A new
   # x86-64 VM's OVMF comes from reims-util, with its OpenCore image.
   apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
@@ -140,11 +145,11 @@ else
     zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
     libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
-    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev)
+    libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
   pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
     glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib vulkan-icd-loader
     libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
-    wayland libdecor mesa libdrm dbus systemd-libs)
+    wayland libdecor mesa libdrm dbus systemd-libs gtk3)
   case " $distro_id $distro_like " in
     *" debian "* | *" ubuntu "*)
       for p in "${apt_pkgs[@]}"; do
@@ -258,17 +263,22 @@ if [[ $SKIP_QEMU == 0 ]]; then
   CONFIGURED="PKG_CONFIG_PATH=$PC ${CONFIGURE[*]}"
   # Configure again when the source, the options, the package's directory, or
   # the package itself changed: meson keeps the package's flags from configure
-  # (docs/lessons.md).
+  # (docs/lessons.md); and when ninja's dry run fails, as it does once a system
+  # update removed a library file build.ninja names (/usr/lib/libfdt.so.1.8.1).
   if [[ ! -f "$BUILD/build.ninja" ]] ||
     [[ "$(cat "$BUILD/configured-with" 2>/dev/null)" != "$CONFIGURED" ]] ||
-    ! cmp -s "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"; then
+    ! cmp -s "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured" ||
+    ! ninja -C "$BUILD" -n >/dev/null 2>&1; then
     say "Configuring QEMU"
     (cd "$BUILD" && PKG_CONFIG_PATH="$PC" "${CONFIGURE[@]}")
     cp "$PC/reims-vgpu.pc" "$BUILD/reims-vgpu.pc.configured"
     printf '%s\n' "$CONFIGURED" >"$BUILD/configured-with"
   fi
   say "Building QEMU"
-  ninja -C "$BUILD"
+  # A build that stops configures again on the next run: when ninja has meson
+  # regenerate build.ninja, meson reuses the dependencies it found before, a
+  # removed one too, which the dry run above does not catch.
+  ninja -C "$BUILD" || { rm -f "$BUILD/configured-with"; die "QEMU's build stopped; the next run configures it again"; }
   STAGE="$CACHE/qemu-stage"
   rm -rf "$STAGE"
   DESTDIR="$STAGE" ninja -C "$BUILD" install >/dev/null
