@@ -169,7 +169,28 @@ else
       if ((${#missing[@]})); then
         say "Missing packages: ${missing[*]}"
         ask "Install them with sudo pacman?" || die "install them (sudo pacman -S --needed ${missing[*]}), then run this again"
-        sudo pacman -S --needed --noconfirm "${missing[@]}"
+        # `pacman -S` resolves nothing without the sync databases, and a live
+        # image (an archiso appliance, for one) ships none: the install then
+        # stops at "database file for 'core' does not exist" followed by
+        # "target not found" for every name, which reads like a typo in the
+        # package names. Download them first when they are absent.
+        if ! compgen -G "/var/lib/pacman/sync/*.db" >/dev/null; then
+          say "No pacman sync databases: downloading them (sudo pacman -Sy)"
+          sudo pacman -Sy --noconfirm ||
+            die "pacman could not download its databases (is this machine offline?): install ${missing[*]} yourself, or run this on a host that already has them"
+        fi
+        sudo pacman -S --needed --noconfirm "${missing[@]}" ||
+          die "pacman could not install ${missing[*]}: an offline image cannot fetch them; provide them (or an image that carries them) and run this again"
+        # pacman exiting 0 does not mean every name is installed now (a group is
+        # not a package, a name can be provided by another): check before the
+        # five-minute build spends its time on a half-provisioned host.
+        still=()
+        for p in "${missing[@]}"; do
+          pacman -Qq "$p" >/dev/null 2>&1 || pacman -Qqg "$p" >/dev/null 2>&1 || still+=("$p")
+        done
+        if ((${#still[@]})); then
+          die "these packages are still missing after pacman: ${still[*]}"
+        fi
       fi
       ;;
     *)
