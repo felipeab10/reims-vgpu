@@ -25,3 +25,8 @@ __pycache__/
 *.spv.h
 .idea/
 *.swp
+
+# Artefatos do release.sh: o pacote é grande (~100 MB) e o lugar dele é o
+# Release do GitHub, não o histórico do git.
+/reims-vgpu-linux-x86_64.tar.gz
+/reims-vgpu-linux-x86_64.tar.gz.sha256

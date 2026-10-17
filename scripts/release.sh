@@ -186,28 +186,59 @@ fi
 # ------------------------------------------------------------------------------
 say "${BLUE}▶ Conferindo os artefatos do pacote...${NC}"
 
-QEMU_BIN="vendor/qemu/build/qemu-system-x86_64"
-ROM_BIN="crates/reims-vgpu-efi/out/reims-vgpu-gop.rom"
+# De onde este checkout realmente constrói: o install-ctl.sh deixa o QEMU em
+# ~/.cache/reims-ctl/qemu-build-<plataforma>/ e o bundle com as ROMs em
+# <target>/dist-vulkan/. A ROM do vGPU hoje é `ReimsVgpu.rom`, instalada pelo
+# próprio QEMU (vendor/qemu/meson.build); o antigo `reims-vgpu-gop.rom` vinha de
+# crates/reims-vgpu-efi, que o commit 98fe2a3b removeu da árvore.
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/reims-ctl"
+BUILD_PLATFORM="linux-x86_64"
+
+# Aceita o caminho que o usuário já tem; senão, procura no cache do install-ctl.
+if [[ -z "${QEMU_BIN_OVERRIDE:-}" ]]; then
+    QEMU_BIN="vendor/qemu/build/qemu-system-x86_64"
+    if [[ ! -f "${QEMU_BIN}" ]]; then
+        FOUND_QEMU="$(find "${CACHE_DIR}" -maxdepth 3 -name qemu-system-x86_64 -type f 2>/dev/null | head -n1 || true)"
+        [[ -n "${FOUND_QEMU}" ]] && QEMU_BIN="${FOUND_QEMU}"
+    fi
+else
+    QEMU_BIN="${QEMU_BIN_OVERRIDE}"
+fi
+
+# A ROM do vGPU: procura o nome atual e, só se não achar, o antigo.
+ROM_BIN=""
+for candidato in \
+    "crates/reims-vgpu-efi/out/reims-vgpu-gop.rom" \
+    "vendor/qemu/build/share/reims-vgpu/ReimsVgpu.rom" \
+    "vendor/qemu/pc-bios/ReimsVgpu.rom"
+do
+    [[ -f "${candidato}" ]] && { ROM_BIN="${candidato}"; break; }
+done
+if [[ -z "${ROM_BIN}" ]]; then
+    FOUND_ROM="$(find target vendor -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
+    [[ -z "${FOUND_ROM}" ]] && FOUND_ROM="$(find "${CACHE_DIR}" -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
+    [[ -n "${FOUND_ROM}" ]] && ROM_BIN="${FOUND_ROM}"
+fi
+
 MISSING=()
-[[ -f "${QEMU_BIN}" ]] || MISSING+=("${QEMU_BIN}")
-[[ -f "${ROM_BIN}" ]] || MISSING+=("${ROM_BIN}")
+[[ -f "${QEMU_BIN}" ]] || MISSING+=("QEMU (${QEMU_BIN})")
+[[ -n "${ROM_BIN}" && -f "${ROM_BIN}" ]] || MISSING+=("a ROM do vGPU (ReimsVgpu.rom)")
 [[ -d "vendor/qemu/pc-bios" ]] || MISSING+=("vendor/qemu/pc-bios/")
 
 if [[ "${#MISSING[@]}" -gt 0 ]]; then
     say "${RED}Erro: artefatos ausentes:${NC}"
     for m in "${MISSING[@]}"; do say "  - ${m}"; done
     say ""
-    say "Compile antes de publicar. O construtor deste checkout é o install-ctl.sh"
-    say "(ele deixa o QEMU em ~/.cache/reims-ctl/qemu-build-<plataforma>):"
+    say "Compile antes de publicar. O construtor deste checkout é o install-ctl.sh,"
+    say "que deixa o QEMU e as ROMs prontos no cache:"
     say "  ${GREEN}./scripts/install-ctl.sh --yes${NC}"
     say ""
-    say "E copie os artefatos para os caminhos que este script empacota:"
-    say "  ${QEMU_BIN}"
-    say "  ${ROM_BIN}"
+    say "Depois rode este script de novo: ele encontra o QEMU em"
+    say "  ${CACHE_DIR}/qemu-build-${BUILD_PLATFORM}/"
+    say "e a ROM em"
+    say "  target/dist-vulkan/share/reims-vgpu/ReimsVgpu.rom"
     say ""
-    say "Obs.: ${YELLOW}crates/reims-vgpu-efi${NC} e ${YELLOW}scripts/qemu-build${NC} não existem"
-    say "mais neste checkout (o commit 98fe2a3b substituiu a árvore). Se a sua ROM"
-    say "GOP vem de outro caminho, ajuste ROM_BIN no topo deste script."
+    say "Para apontar o QEMU na mão: ${GREEN}QEMU_BIN_OVERRIDE=/caminho/qemu-system-x86_64 $0${NC}"
     say ""
     say "Nada foi criado nem publicado (a tag seria ${NEXT_TAG})."
     exit 1
@@ -265,14 +296,29 @@ trap cleanup EXIT INT TERM
 say ""
 say "${BLUE}▶ Empacotando ${ASSET}...${NC}"
 
-# Mesmo layout que o workflow do GitHub e que o appliance espera.
-mkdir -p "${DIST_TMP}/vendor/qemu/build"
-mkdir -p "${DIST_TMP}/crates/reims-vgpu-efi/out"
+# Mesmo layout que o QEMU instalado pelo install-ctl.sh usa:
+#   bin/qemu-system-x86_64
+#   share/qemu/ReimsVgpu.rom   <- o QEMU a procura pelo `romfile`, relativo
+#                                 ao seu próprio prefixo
+#   share/qemu/... (pc-bios)   <- as ROMs padrão do QEMU
+# O appliance só precisa copiar esta árvore para o prefixo dele.
+mkdir -p "${DIST_TMP}/vendor/qemu/build/bin"
+mkdir -p "${DIST_TMP}/vendor/qemu/build/share/qemu"
 mkdir -p "${DIST_TMP}/vm/ovmf"
 
-cp -a "${QEMU_BIN}" "${DIST_TMP}/vendor/qemu/build/"
-cp -a "vendor/qemu/pc-bios" "${DIST_TMP}/vendor/qemu/"
-cp -a "${ROM_BIN}" "${DIST_TMP}/crates/reims-vgpu-efi/out/"
+cp -a "${QEMU_BIN}" "${DIST_TMP}/vendor/qemu/build/bin/qemu-system-x86_64"
+
+# A ROM do vGPU, com o nome que o binário pede (`romfile ReimsVgpu.rom`).
+ROM_DEST_NAME="$(basename "${ROM_BIN}")"
+if [[ "${ROM_DEST_NAME}" != "ReimsVgpu.rom" ]]; then
+    say "${YELLOW}  Aviso: a ROM encontrada é ${ROM_DEST_NAME}; ela será publicada como ReimsVgpu.rom, que é o nome que o binário procura.${NC}"
+fi
+cp -a "${ROM_BIN}" "${DIST_TMP}/vendor/qemu/build/share/qemu/ReimsVgpu.rom"
+
+# pc-bios: as ROMs padrão do QEMU (pxe, vgabios, edk2), ao lado da do vGPU.
+if [[ -d "vendor/qemu/pc-bios" ]]; then
+    cp -a vendor/qemu/pc-bios/. "${DIST_TMP}/vendor/qemu/build/share/qemu/"
+fi
 
 # OVMF: do repositório, se houver; senão do sistema.
 if [[ -d vm/ovmf ]] && [[ -n "$(ls -A vm/ovmf 2>/dev/null)" ]]; then
@@ -292,10 +338,21 @@ sha256sum "${OUT_TAR}" > "${OUT_TAR}.sha256"
 say "  ✓ ${ASSET} ($(du -h "${OUT_TAR}" | cut -f1))"
 say "  ✓ ${ASSET}.sha256"
 
-# Sanidade: o tarball contém o que o appliance procura?
-if ! tar -tzf "${OUT_TAR}" | grep -q 'vendor/qemu/build/qemu-system-x86_64'; then
-    die "o tarball gerado não contém vendor/qemu/build/qemu-system-x86_64"
-fi
+# Sanidade: o tarball contém o que o appliance procura? Publicar um pacote
+# incompleto cria uma release que só falha na mão do usuário.
+# Uma listagem só, em memória: `tar | grep -q` fecha o pipe no primeiro match e
+# o `tar` morre com SIGPIPE, que sob `pipefail` viraria falha do script.
+TAR_LIST="$(tar -tzf "${OUT_TAR}")" || die "não consegui listar o tarball gerado"
+
+for esperado in \
+    'vendor/qemu/build/bin/qemu-system-x86_64' \
+    'vendor/qemu/build/share/qemu/ReimsVgpu.rom' \
+    'vendor/qemu/build/share/qemu/'
+do
+    if [[ "${TAR_LIST}" != *"${esperado}"* ]]; then
+        die "o tarball gerado não contém ${esperado}"
+    fi
+done
 
 # ------------------------------------------------------------------------------
 # 4. Tag, push e Release
@@ -308,6 +365,24 @@ TAG_CREATED=1
 if [[ "${SKIP_PUSH}" -eq 0 ]]; then
     say "${BLUE}▶ Empurrando a tag para origin...${NC}"
     git push origin "${NEXT_TAG}"
+fi
+
+# `--skip-push` significa "não toque no remoto": pular só o `git push` deixava
+# o `gh release create` publicar de verdade — foi assim que ele criou Releases
+# de teste indesejadas. Aqui ele para antes de qualquer escrita remota.
+if [[ "${SKIP_PUSH}" -eq 1 ]]; then
+    say ""
+    say "${YELLOW}▶ --skip-push: parei antes de qualquer escrita no remoto.${NC}"
+    say "  Tag local criada: ${GREEN}${NEXT_TAG}${NC} (não empurrada)"
+    say "  Pacote:           ${OUT_TAR} (mantido neste diretório)"
+    say "  ${CYAN}Nenhum Release foi publicado.${NC}"
+    say ""
+    say "Para publicar de verdade, rode sem --skip-push:"
+    say "  ./scripts/release.sh --tag ${NEXT_TAG}"
+    TAG_CREATED=0
+    # Sem publicação: a tag é local e o pacote fica para inspeção.
+    trap - EXIT
+    exit 0
 fi
 
 say "${BLUE}▶ Publicando o Release ${NEXT_TAG} em ${REPO}...${NC}"

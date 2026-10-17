@@ -1,3 +1,22 @@
+# ==============================================================================
+# DESATIVADO — NÃO REATIVE SEM CORRIGIR (renomeie para release.yml quando for).
+#
+# Dois motivos:
+#
+# 1. Os dois passos de build abaixo chamam scripts que NÃO existem mais:
+#      crates/reims-vgpu-efi/scripts/reims-vgpu-efi-rom/reims-vgpu-efi-rom.sh
+#      scripts/qemu-build/qemu-build.sh
+#    Ambos foram removidos pelo commit 98fe2a3b ("Replace the tree with
+#    libreims_vgpu and its C API"). O construtor atual é scripts/install-ctl.sh.
+#    Enquanto isso, todo push de tag `v*` ficava vermelho (rc=127).
+#
+# 2. Ele competiria com scripts/release.sh, que é o produtor canônico: aquele
+#    script empurra a tag e depois publica, e o gatilho `push: tags: 'v*'`
+#    acordaria este workflow para publicar na MESMA tag.
+#
+# A ROM também mudou: hoje é `ReimsVgpu.rom`, instalada pelo próprio QEMU
+# (vendor/qemu/meson.build), e não `reims-vgpu-gop.rom`.
+# ==============================================================================
 name: Build & Release Reims vGPU
 
 on:
