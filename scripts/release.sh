@@ -205,10 +205,14 @@ else
     QEMU_BIN="${QEMU_BIN_OVERRIDE}"
 fi
 
-# A ROM do vGPU: procura o nome atual e, só se não achar, o antigo.
+# A ROM do vGPU. Procura pelo NOME ATUAL (`ReimsVgpu.rom`, 5632 bytes), que é o
+# que o QEMU carrega pelo `romfile`. A antiga `reims-vgpu-gop.rom` (26112 bytes,
+# sha256 distinto) fica FORA de propósito: o QEMU aceita as duas como romfile sem
+# reclamar, então empacotar a antiga renomeada publicaria a release com o
+# firmware errado e nenhum erro na tela.
 ROM_BIN=""
 for candidato in \
-    "crates/reims-vgpu-efi/out/reims-vgpu-gop.rom" \
+    "vendor/qemu/build/share/qemu/ReimsVgpu.rom" \
     "vendor/qemu/build/share/reims-vgpu/ReimsVgpu.rom" \
     "vendor/qemu/pc-bios/ReimsVgpu.rom"
 do
@@ -218,6 +222,18 @@ if [[ -z "${ROM_BIN}" ]]; then
     FOUND_ROM="$(find target vendor -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
     [[ -z "${FOUND_ROM}" ]] && FOUND_ROM="$(find "${CACHE_DIR}" -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
     [[ -n "${FOUND_ROM}" ]] && ROM_BIN="${FOUND_ROM}"
+fi
+if [[ -z "${ROM_BIN}" ]]; then
+    say "${RED}Erro: não achei a ROM do vGPU (ReimsVgpu.rom).${NC}"
+    say "  Sem ela o QEMU sobe sem GPU virtual. A ROM é gerada pelo build do QEMU"
+    say "  (vendor/qemu/meson.build) — rode o install-ctl.sh antes de publicar."
+    # Diagnóstico: se só existir a ROM antiga, dizer isso em vez de "não achei".
+    if [[ -f "crates/reims-vgpu-efi/out/reims-vgpu-gop.rom" ]]; then
+        say "  ${YELLOW}Achei crates/reims-vgpu-efi/out/reims-vgpu-gop.rom, mas ela não é a"
+        say "  ROM do vGPU: tem outro tamanho e outro conteúdo. Não vou publicá-la"
+        say "  renomeada como ReimsVgpu.rom.${NC}"
+    fi
+    exit 1
 fi
 
 MISSING=()
