@@ -9,7 +9,9 @@
 # distributions get the list of what to install). It:
 #   1. checks the build's dependencies, and offers to install those missing
 #      (Homebrew on macOS; apt or pacman on Linux, through sudo), and Rust
-#      through rustup.rs, whose installer asks its own questions;
+#      through rustup.rs, whose installer asks its own questions. A toolchain
+#      already on PATH is used as it is when it meets the version
+#      rust-toolchain.toml pins (a distro's `rust`, as the appliance ships);
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
@@ -219,19 +221,72 @@ if ! command -v cargo >/dev/null 2>&1 && [[ -x "$HOME/.cargo/bin/cargo" ]]; then
   # shellcheck disable=SC1091
   . "$HOME/.cargo/env"
 fi
+# The toolchain rust-toolchain.toml pins, and the floor Cargo.toml's
+# `rust-version` states: cargo refuses a crate whose rust-version is newer than
+# the compiler, so a toolchain at or above it builds this tree.
+RUST_MIN="1.98.1"
+
+# `rustc --version` prints "rustc 1.98.1 (48a229cea 2026-09-01)"; the number is
+# the second word. A distro's rustc answers it too, so this reads whichever
+# toolchain is actually on PATH.
+rustc_version() {
+  command -v rustc >/dev/null 2>&1 || return 1
+  local out
+  out="$(rustc --version 2>/dev/null)" || return 1
+  local version="${out#rustc }"
+  version="${version%% *}"
+  [[ $version =~ ^[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s\n' "$version"
+}
+
+# Semver order, component by component: "1.99.0" clears "1.98.1", "2.0.0" clears
+# both, and "1.98.0" does not. A missing component counts as 0, so "1.98" is
+# "1.98.0". Returns 0 when $1 is at least $2.
+rustc_at_least() {
+  local -a have want
+  IFS=. read -r -a have <<<"$1"
+  IFS=. read -r -a want <<<"$2"
+  local i h w
+  for i in 0 1 2; do
+    h="${have[i]:-0}" w="${want[i]:-0}"
+    # A non-number would abort under `set -e`; treat it as equal and let the
+    # version regex in rustc_version keep such input out.
+    [[ $h =~ ^[0-9]+$ ]] || h=0
+    [[ $w =~ ^[0-9]+$ ]] || w=0
+    ((10#$h > 10#$w)) && return 0
+    ((10#$h < 10#$w)) && return 1
+  done
+  return 0
+}
+
 if ! command -v rustup >/dev/null 2>&1; then
-  if command -v cargo >/dev/null 2>&1; then
-    die "cargo is installed without rustup: the build needs the toolchain rust-toolchain.toml pins, which rustup installs (https://rustup.rs)"
-  fi
-  say "Rust is not installed"
-  ask "Install it from https://rustup.rs?" || die "install Rust (https://rustup.rs), then run this again"
-  if [[ $YES == 1 ]]; then
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+  if have_rustc="$(rustc_version)"; then
+    # A distro's rust, without rustup: the archiso appliance ships exactly this
+    # (`rust` in archiso/packages.x86_64, which brings cargo and rustc but not
+    # rustup). Refusing it here would make the appliance unable to build the
+    # very sources it carries, since a live image has no rustup and may have no
+    # network to reach rustup.rs either.
+    if rustc_at_least "$have_rustc" "$RUST_MIN"; then
+      # The macOS targets rust-toolchain.toml lists are for cross-checking from
+      # a Mac; on Linux only x86_64-unknown-linux-gnu is built, which every
+      # Linux rustc has. rustfmt and clippy are not needed to build.
+      say "Using the toolchain on PATH (rustc $have_rustc, without rustup)"
+    else
+      die "rustc $have_rustc is older than the $RUST_MIN this tree requires (Cargo.toml's rust-version): install rustup (https://rustup.rs), or a newer rust, then run this again"
+    fi
+  elif command -v cargo >/dev/null 2>&1; then
+    die "cargo is installed without rustup, and no rustc was found: the build needs the toolchain rust-toolchain.toml pins, which rustup installs (https://rustup.rs)"
   else
-    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    say "Rust is not installed"
+    ask "Install it from https://rustup.rs?" || die "install Rust (https://rustup.rs), then run this again"
+    if [[ $YES == 1 ]]; then
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    else
+      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+    fi
+    # shellcheck disable=SC1091
+    . "$HOME/.cargo/env"
   fi
-  # shellcheck disable=SC1091
-  . "$HOME/.cargo/env"
 fi
 
 # ------------------------------------------------------------------ sources
