@@ -293,9 +293,18 @@ fi
 DIST_TMP="$(mktemp -d)"
 TAG_CREATED=0
 OUT_TAR="${REPO_ROOT}/${ASSET}"
+KEEP_OUT_TAR=0
+# A árvore de empacotamento é SEMPRE descartada — são ~481 MB (o binário do QEMU
+# mais as OVMF). Já o tarball final é preservado no `--skip-push`, para inspeção.
+# As duas coisas moravam no mesmo `cleanup`, e o `trap - EXIT` do `--skip-push`
+# desarmava as duas: cada execução deixava um `/tmp/tmp.XXXXXXXXXX` órfão de
+# 481 MB. Num tmpfs isso transborda depois de algumas rodadas.
+limpa_dist() {
+    [[ -n "${DIST_TMP:-}" ]] && rm -rf "${DIST_TMP}"
+}
 cleanup() {
     local rc=$?
-    rm -rf "${DIST_TMP}"
+    limpa_dist
     # Se falhamos depois de criar a tag e antes de publicar, desfaz a tag local
     # para não deixar o repositório mentindo sobre o que existe.
     if [[ "${rc}" -ne 0 && "${TAG_CREATED}" -eq 1 ]]; then
@@ -304,7 +313,9 @@ cleanup() {
     fi
     # Em qualquer saída, o tarball não fica no diretório de trabalho: ele já foi
     # publicado (ou não vai ser), e sobrar sujaria o `git status` da próxima vez.
-    rm -f "${OUT_TAR}" "${OUT_TAR}.sha256"
+    if [[ "${KEEP_OUT_TAR}" -eq 0 ]]; then
+        rm -f "${OUT_TAR}" "${OUT_TAR}.sha256"
+    fi
     exit "${rc}"
 }
 trap cleanup EXIT INT TERM
@@ -397,6 +408,10 @@ if [[ "${SKIP_PUSH}" -eq 1 ]]; then
     say "  ./scripts/release.sh --tag ${NEXT_TAG}"
     TAG_CREATED=0
     # Sem publicação: a tag é local e o pacote fica para inspeção.
+    # Só o DESCARTE DO TARBALL é cancelado; a árvore de empacotamento continua
+    # sendo limpa, senão cada `--skip-push` deixaria 481 MB em `/tmp`.
+    KEEP_OUT_TAR=1
+    limpa_dist
     trap - EXIT
     exit 0
 fi
