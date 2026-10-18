@@ -49,7 +49,12 @@ Uso típico (dentro do checkout do fork):
   ./scripts/release.sh --patch         # força o componente patch
   ./scripts/release.sh --tag v2.0.0    # usa uma tag exata, sem inferência
   ./scripts/release.sh --yes           # não pede confirmação
-  ./scripts/release.sh --skip-push     # cria a tag e o Release, sem `git push`
+  ./scripts/release.sh --skip-push     # empacota e cria SÓ a tag local; não publica
+
+Depois de um `--skip-push`, rodar de novo SEM ele publica a MESMA tag: enquanto
+ela não existir no remoto e apontar para o mesmo commit, é reaproveitada em vez
+de dar "a tag já existe". Sem terminal (stdin não é um tty) a confirmação é
+dispensada; em automação prefira `--yes` para deixar a intenção explícita.
 
 O que ele faz, em ordem:
   1. Lê a última tag `v*` e os commits desde então, e sugere a próxima versão
@@ -102,8 +107,12 @@ CURRENT_BRANCH="$(git rev-parse --abbrev-ref HEAD)"
 if [[ "${CURRENT_BRANCH}" != "master" && "${CURRENT_BRANCH}" != "main" && "${DRY_RUN}" -eq 0 ]]; then
     say "${YELLOW}Aviso: você está em '${CURRENT_BRANCH}', não em master/main.${NC}"
     if [[ "${ASSUME_YES}" -eq 0 ]]; then
-        read -r -p "Continuar mesmo assim? [s/N] " _ans
-        [[ "${_ans,,}" == "s" || "${_ans,,}" == "y" ]] || die "cancelado pelo usuário"
+        if [[ -t 0 ]]; then
+            read -r -p "Continuar mesmo assim? [s/N] " _ans
+            [[ "${_ans,,}" == "s" || "${_ans,,}" == "y" ]] || die "cancelado pelo usuário"
+        else
+            say "${YELLOW}  stdin não é um terminal: seguindo sem confirmar.${NC}"
+        fi
     fi
 fi
 
@@ -177,8 +186,31 @@ say "  bump sugerido: ${YELLOW}${BUMP}${NC}  →  ${GREEN}${NEXT_TAG}${NC}"
 say "${CYAN}────────────────────────────────────────────────────────${NC}"
 say ""
 
+# A tag pode já existir LOCALMENTE por causa de um `--skip-push` anterior: ele
+# cria a tag para inspeção e manda rodar de novo sem ele. Se ela ainda NÃO está
+# no remoto e aponta para o mesmo commit, reaproveitamos. Sem isso o caminho que
+# o próprio script imprime ("para publicar, rode sem --skip-push") morre com
+# "a tag já existe", e o usuário tem de apagar a tag na mão.
+REUSE_TAG=0
 if git rev-parse --verify --quiet "refs/tags/${NEXT_TAG}" >/dev/null; then
-    die "a tag ${NEXT_TAG} já existe. Use --tag para escolher outra, ou --minor/--major."
+    _tag_commit="$(git rev-parse "${NEXT_TAG}^{commit}" 2>/dev/null || true)"
+    _head_commit="$(git rev-parse HEAD)"
+    # `ls-remote` num remoto inacessível devolve vazio igual a "tag não existe".
+    # Tratar os dois casos como o mesmo já apagaria a tag do usuário por engano,
+    # então distinguimos a FALHA da AUSÊNCIA.
+    _remote_tag="$(git ls-remote --tags origin "refs/tags/${NEXT_TAG}" 2>/dev/null)" || _remote_tag="__ERRO__"
+    if [[ "${_remote_tag}" == "__ERRO__" ]]; then
+        die "não consegui consultar a origin para saber se ${NEXT_TAG} já foi publicada; sem isso não sei se é seguro reaproveitar a tag local"
+    fi
+    if [[ -n "${_tag_commit}" ]] \
+       && [[ "${_tag_commit}" == "${_head_commit}" ]] \
+       && [[ -z "${_remote_tag}" ]]; then
+        REUSE_TAG=1
+        say "${YELLOW}Aviso: a tag ${NEXT_TAG} já existe localmente (de um --skip-push) e"
+        say "ainda não está no remoto, apontando para o mesmo commit. Vou reaproveitá-la.${NC}"
+    else
+        die "a tag ${NEXT_TAG} já existe. Use --tag para escolher outra, ou --minor/--major."
+    fi
 fi
 
 # ------------------------------------------------------------------------------
@@ -286,8 +318,17 @@ fi
 
 if [[ "${ASSUME_YES}" -eq 0 ]]; then
     say ""
-    read -r -p "Criar a tag ${NEXT_TAG} e publicar o Release em ${REPO}? [s/N] " _confirm
-    [[ "${_confirm,,}" == "s" || "${_confirm,,}" == "y" ]] || die "cancelado pelo usuário"
+    if [[ -t 0 ]]; then
+        read -r -p "Criar a tag ${NEXT_TAG} e publicar o Release em ${REPO}? [s/N] " _confirm
+        [[ "${_confirm,,}" == "s" || "${_confirm,,}" == "y" ]] || die "cancelado pelo usuário"
+    else
+        # Sem tty o `read` volta vazio e o script morria com "cancelado pelo
+        # usuário" + exit 1: parecia recusa do usuário, mas era falta de
+        # terminal. Dizemos o que está acontecendo e seguimos (é uma publicação
+        # deliberada; quem não quer isso não roda o script).
+        say "${YELLOW}▶ stdin não é um terminal: não há como confirmar, seguindo como --yes.${NC}"
+        say "${YELLOW}  Para exigir a confirmação, rode num terminal de verdade.${NC}"
+    fi
 fi
 
 DIST_TMP="$(mktemp -d)"
@@ -385,9 +426,16 @@ done
 # 4. Tag, push e Release
 # ------------------------------------------------------------------------------
 say ""
-say "${BLUE}▶ Criando a tag anotada ${NEXT_TAG}...${NC}"
-git tag -a "${NEXT_TAG}" -m "Reims vGPU ${NEXT_TAG}"
-TAG_CREATED=1
+if [[ "${REUSE_TAG}" -eq 1 ]]; then
+    say "${BLUE}▶ Reaproveitando a tag anotada ${NEXT_TAG} (já existia, ainda não publicada)...${NC}"
+    # NÃO marcamos TAG_CREATED: a tag é anterior a esta execução, então uma
+    # falha no meio não deve apagá-la — isso deixaria o repositório num estado
+    # diferente do que estava antes de rodar.
+else
+    say "${BLUE}▶ Criando a tag anotada ${NEXT_TAG}...${NC}"
+    git tag -a "${NEXT_TAG}" -m "Reims vGPU ${NEXT_TAG}"
+    TAG_CREATED=1
+fi
 
 if [[ "${SKIP_PUSH}" -eq 0 ]]; then
     say "${BLUE}▶ Empurrando a tag para origin...${NC}"
@@ -400,7 +448,11 @@ fi
 if [[ "${SKIP_PUSH}" -eq 1 ]]; then
     say ""
     say "${YELLOW}▶ --skip-push: parei antes de qualquer escrita no remoto.${NC}"
-    say "  Tag local criada: ${GREEN}${NEXT_TAG}${NC} (não empurrada)"
+    if [[ "${REUSE_TAG}" -eq 1 ]]; then
+        say "  Tag local reaproveitada: ${GREEN}${NEXT_TAG}${NC} (não empurrada)"
+    else
+        say "  Tag local criada: ${GREEN}${NEXT_TAG}${NC} (não empurrada)"
+    fi
     say "  Pacote:           ${OUT_TAR} (mantido neste diretório)"
     say "  ${CYAN}Nenhum Release foi publicado.${NC}"
     say ""
