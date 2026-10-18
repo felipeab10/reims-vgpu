@@ -13,14 +13,20 @@
 # O que ele faz, em ordem:
 #   1. Lê a última tag `v*` e os commits desde então, e sugere a próxima versão
 #      (feat/:new: sobem minor; fix/:bug: sobem patch; BREAKING sobe major).
-#   2. Confere que os artefatos do pacote existem ANTES de mexer no git.
+#   2. Confere que os artefatos do pacote existem ANTES de mexer no git: o QEMU,
+#      a ROM do vGPU, o pc-bios e o motor `reims-ctl`.
 #   3. Empacota no mesmo layout que o appliance consome (ver
-#      core/reims_release.py no vhackintosh e o workflow
-#      .github/workflows/release.yml — os três têm de concordar).
+#      core/reims_release.py e core/reims_build.py no vhackintosh — os três têm
+#      de concordar). O pacote leva `bin/reims-ctl`: sem o motor, a compilação
+#      empacotada não sobe VM nenhuma.
 #   4. Cria a tag anotada, empurra e publica o Release com o `gh`.
 #
 # Se algo falhar no meio, a tag local é removida para o repositório não ficar
 # com uma tag apontando para um Release que não existe.
+#
+# Variáveis de ambiente:
+#   QEMU_BIN_OVERRIDE=/caminho/qemu-system-x86_64   usa esse QEMU no pacote
+#   CTL_BIN_OVERRIDE=/caminho/reims-ctl             usa esse motor no pacote
 # ==============================================================================
 set -euo pipefail
 
@@ -59,14 +65,20 @@ dispensada; em automação prefira `--yes` para deixar a intenção explícita.
 O que ele faz, em ordem:
   1. Lê a última tag `v*` e os commits desde então, e sugere a próxima versão
      (feat/:new: sobem minor; fix/:bug: sobem patch; BREAKING sobe major).
-  2. Confere que os artefatos do pacote existem ANTES de mexer no git.
+  2. Confere que os artefatos do pacote existem ANTES de mexer no git: o QEMU,
+     a ROM do vGPU, o pc-bios e o motor `reims-ctl`.
   3. Empacota no mesmo layout que o appliance consome (ver
-     core/reims_release.py no vhackintosh e o workflow
-     .github/workflows/release.yml — os três têm de concordar).
+     core/reims_release.py e core/reims_build.py no vhackintosh — os três têm
+     de concordar). O pacote leva `bin/reims-ctl`: sem o motor, a compilação
+     empacotada não sobe VM nenhuma.
   4. Cria a tag anotada, empurra e publica o Release com o `gh`.
 
 Se algo falhar no meio, a tag local é removida para o repositório não ficar
 com uma tag apontando para um Release que não existe.
+
+Variáveis de ambiente:
+  QEMU_BIN_OVERRIDE=/caminho/qemu-system-x86_64   usa esse QEMU no pacote
+  CTL_BIN_OVERRIDE=/caminho/reims-ctl             usa esse motor no pacote
 USAGE
 }
 
@@ -268,9 +280,29 @@ if [[ -z "${ROM_BIN}" ]]; then
     exit 1
 fi
 
+# O motor `reims-ctl` vai no bundle. O conjunto QEMU + ROM é o que dá GPU virtual
+# à VM, mas quem cria, configura e sobe a VM é o motor — sem ele a ISO instala a
+# compilação e ainda assim a VM não inicia, que foi exatamente o sintoma relatado.
+# O alvo preferido é o deste checkout: `~/.cargo/bin/reims-ctl` NÃO é usado como
+# candidato, porque pode ser de um commit antigo e publicaria um motor fora de
+# sincronia com o QEMU empacotado ao lado dele.
+CTL_BIN=""
+if [[ -n "${CTL_BIN_OVERRIDE:-}" ]]; then
+    CTL_BIN="${CTL_BIN_OVERRIDE}"
+else
+    for candidato in \
+        "target/release/reims-ctl" \
+        "target/x86_64-unknown-linux-gnu/release/reims-ctl" \
+        "${CACHE_DIR}/ctl-target/release/reims-ctl"
+    do
+        [[ -f "${candidato}" ]] && { CTL_BIN="${candidato}"; break; }
+    done
+fi
+
 MISSING=()
 [[ -f "${QEMU_BIN}" ]] || MISSING+=("QEMU (${QEMU_BIN})")
 [[ -n "${ROM_BIN}" && -f "${ROM_BIN}" ]] || MISSING+=("a ROM do vGPU (ReimsVgpu.rom)")
+[[ -n "${CTL_BIN}" && -f "${CTL_BIN}" ]] || MISSING+=("o motor reims-ctl (target/release/reims-ctl)")
 [[ -d "vendor/qemu/pc-bios" ]] || MISSING+=("vendor/qemu/pc-bios/")
 
 if [[ "${#MISSING[@]}" -gt 0 ]]; then
@@ -281,22 +313,34 @@ if [[ "${#MISSING[@]}" -gt 0 ]]; then
     say "que deixa o QEMU e as ROMs prontos no cache:"
     say "  ${GREEN}./scripts/install-ctl.sh --yes${NC}"
     say ""
+    say "Ele também instala o motor. Se só o motor estiver faltando:"
+    say "  ${GREEN}cargo build --release -p reims-ctl${NC}"
+    say ""
     say "Depois rode este script de novo: ele encontra o QEMU em"
     say "  ${CACHE_DIR}/qemu-build-${BUILD_PLATFORM}/"
+    say "o motor em"
+    say "  target/release/reims-ctl"
     say "e a ROM em"
     say "  target/dist-vulkan/share/reims-vgpu/ReimsVgpu.rom"
     say ""
     say "Para apontar o QEMU na mão: ${GREEN}QEMU_BIN_OVERRIDE=/caminho/qemu-system-x86_64 $0${NC}"
+    say "Para apontar o motor na mão: ${GREEN}CTL_BIN_OVERRIDE=/caminho/reims-ctl $0${NC}"
     say ""
     say "Nada foi criado nem publicado (a tag seria ${NEXT_TAG})."
     exit 1
 fi
 say "  ✓ QEMU: ${QEMU_BIN} ($(du -h "${QEMU_BIN}" | cut -f1))"
 say "  ✓ ROM:  ${ROM_BIN}"
+say "  ✓ Motor: ${CTL_BIN} ($(du -h "${CTL_BIN}" | cut -f1))"
 say "  ✓ pc-bios presente"
 
 if ! "${QEMU_BIN}" --version >/dev/null 2>&1; then
     say "${YELLOW}Aviso: '${QEMU_BIN} --version' falhou; o binário pode não ser executável neste host.${NC}"
+fi
+
+if ! "${CTL_BIN}" --version >/dev/null 2>&1 && ! "${CTL_BIN}" --help >/dev/null 2>&1; then
+    say "${YELLOW}Aviso: '${CTL_BIN}' não respondeu a --version nem a --help;"
+    say "confira se ele é mesmo o motor compilado para este host.${NC}"
 fi
 
 if [[ -n "$(git status --porcelain)" ]]; then
@@ -373,8 +417,15 @@ say "${BLUE}▶ Empacotando ${ASSET}...${NC}"
 mkdir -p "${DIST_TMP}/vendor/qemu/build/bin"
 mkdir -p "${DIST_TMP}/vendor/qemu/build/share/qemu"
 mkdir -p "${DIST_TMP}/vm/ovmf"
+mkdir -p "${DIST_TMP}/bin"
 
 cp -a "${QEMU_BIN}" "${DIST_TMP}/vendor/qemu/build/bin/qemu-system-x86_64"
+
+# O motor, em `bin/reims-ctl`: é onde `core.reims_build` o procura no pacote
+# (`PREBUILT_REIMS_CTL_RELS`). O appliance o instala em `~/.cargo/bin`, o mesmo
+# diretório que `core.reims_ctl.reims_ctl_bin()` consulta.
+cp -a "${CTL_BIN}" "${DIST_TMP}/bin/reims-ctl"
+chmod 0755 "${DIST_TMP}/bin/reims-ctl"
 
 # A ROM do vGPU, com o nome que o binário pede (`romfile ReimsVgpu.rom`).
 ROM_DEST_NAME="$(basename "${ROM_BIN}")"
@@ -415,7 +466,8 @@ TAR_LIST="$(tar -tzf "${OUT_TAR}")" || die "não consegui listar o tarball gerad
 for esperado in \
     'vendor/qemu/build/bin/qemu-system-x86_64' \
     'vendor/qemu/build/share/qemu/ReimsVgpu.rom' \
-    'vendor/qemu/build/share/qemu/'
+    'vendor/qemu/build/share/qemu/' \
+    'bin/reims-ctl'
 do
     if [[ "${TAR_LIST}" != *"${esperado}"* ]]; then
         die "o tarball gerado não contém ${esperado}"
@@ -477,8 +529,18 @@ gh release create "${NEXT_TAG}" "${OUT_TAR}" "${OUT_TAR}.sha256" \
 Linux x86-64. Carrega o Vulkan em runtime via dlopen(\"libvulkan.so.1\"),
 então o mesmo binário serve em qualquer host com Vulkan 1.2+.
 
+Conteúdo do pacote:
+  vendor/qemu/build/bin/qemu-system-x86_64   QEMU com apple-gfx (Vulkan)
+  vendor/qemu/build/share/qemu/ReimsVgpu.rom ROM do vGPU (romfile)
+  vendor/qemu/build/share/qemu/              pc-bios do QEMU
+  vm/ovmf/                                   firmware UEFI
+  bin/reims-ctl                              motor que cria e sobe a VM
+
 O appliance (vhackintosh) baixa este asset automaticamente:
-  appliance/build-iso.sh --release ${NEXT_TAG}" \
+  appliance/build-iso.sh --release ${NEXT_TAG}
+
+E o item \"Atualizar reims-vgpu\" da TUI instala este mesmo pacote em runtime,
+sem recompilar." \
     || die "falha ao publicar o Release ${NEXT_TAG}"
 
 # Publicado: a tag não deve mais ser desfeita em caso de saída normal.
