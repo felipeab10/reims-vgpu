@@ -82,7 +82,18 @@ case "$OS/$ARCH" in
     ;;
   Linux/x86_64)
     PLATFORM=linux-x86_64
-    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp)
+    # Portable, not host-tailored: the bundle is built on a workstation and run
+    # inside the vhackintosh live ISO, whose package set is much smaller than a
+    # desktop install. QEMU's configure *auto-detects* these three and links
+    # them when it finds them on the BUILD host, so a machine with brltty,
+    # libiscsi or sndio installed produced a bundle that could not even start
+    # elsewhere -- measured: the published v1.2.0 binary died on
+    # `libbrlapi.so.0.8: cannot open shared object file`, and those three were
+    # the only NEEDED entries (3 of 62) missing from the ISO. None of them is
+    # used by the vGPU path: brlapi is a braille display, libiscsi a remote
+    # SCSI transport, sndio an audio backend for BSD.
+    QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
+      --disable-brlapi --disable-libiscsi --disable-sndio)
     QEMU_BINARY=qemu-system-x86_64
     ;;
   *) die "reims-ctl supports macOS on arm64 and Linux on x86-64; this is $OS on $ARCH" ;;
