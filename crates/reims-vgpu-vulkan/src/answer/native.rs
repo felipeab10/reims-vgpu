@@ -15,9 +15,10 @@
 //! is the process's.
 //!
 //! **A native relay** writes the runtime's line for the kind's first occurrence, as a relayed
-//! kind's, and counts every occurrence ([`counts`]): the runtime announces each kind of
-//! [`DIES`](super::DIES) at every occurrence (`announce_each`). Each kind stays on the list of
-//! differences to bring to Metal's answer; the count is how often a run met it.
+//! kind's, and counts each occurrence the runtime announces ([`counts`]): every occurrence of
+//! each kind of [`DIES`](super::DIES) in strict and census mode, and elsewhere its first on each
+//! device (`announce_each`, `crate::platform`'s `announced_each`). Each kind stays on the list of
+//! differences to bring to Metal's answer; the count is how often a run met it, as announced.
 
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 
@@ -71,17 +72,19 @@ pub struct NativeRelay {
 /// else that the runtime records it: `F16FmaDoubleRounding` and `F16IntConvDoubleRounding`,
 /// `DeviceArithmetic` and `DeviceDenormals` (maths); `FloatSampleFilter`, `HalfSampleFilter`,
 /// `CubeGradientFootprint`, `CompressedTexelDecode`, `ViewBaseTexelOffset`, `SrgbTexelDecode`,
-/// `BicubicFilterArithmetic` and `HalfTexelConversion` (sampling). Then the notes of the
-/// runtime's native defaults off Apple's GPUs, whose exact forms are the device policy's opt-ins
-/// this platform takes only where `REIMS_VGPU_EXACT` names them, each with the bound the runtime
-/// records: `NativeTranscendentals`,
+/// `BicubicFilterArithmetic`, `HalfTexelConversion` and `DeviceSampleLevel` (sampling). Then the
+/// notes of the runtime's native defaults off Apple's GPUs, whose exact forms are the device
+/// policy's opt-ins this platform takes only where `REIMS_VGPU_EXACT` names them, each with the
+/// bound the runtime records: `NativeTranscendentals`,
 /// `NativeDivision`, `NativeFma`, `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`,
-/// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling` and
-/// `DeviceTexelConversion` (sampling). A device that runs on Metal (MoltenVK) is an Apple GPU,
-/// where each still dies.
+/// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling`,
+/// `DeviceTexelConversion` and `DecodedTexelPrecision` (sampling); `DeviceRoundedResolve` (the
+/// device's rounding of a resolve's average). A device that runs on Metal (MoltenVK) is an Apple
+/// GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
-/// depth and layout are neither maths nor sampling.
+/// depth, layout, a pass's tile store and when a command buffer is seen complete are neither
+/// maths nor sampling.
 /// - those whose exact form the hardware allows, built or not: `BlendedWriteRounding` (a blended
 ///   float write to a half-float channel under `textureWriteRoundingMode` 2, whose exact form is
 ///   the blend in the function under the pixel interlock) and `RotatedBlendRounding` (a blend
@@ -95,7 +98,7 @@ pub struct NativeRelay {
 ///   device's maths and sampling does not name it;
 /// - `TessellationFactorScale`, whose rule on Metal is not read (whether Metal's fractional
 ///   partitions take a scaled factor in `float` or rounded up to `half`): tessellation, not maths;
-/// - three precision notes no fact of the device decides. `TessellationFactorInstance` (the
+/// - four precision notes no fact of the device decides. `TessellationFactorInstance` (the
 ///   factors of a draw with a base instance past 0 read at an offset counted from it, where
 ///   Metal's count is not read) and `Fp8Value` (an 8-bit float's integer conversion from the
 ///   format's value, where Metal on an Apple M3 answers the carrier byte's integer) are other
@@ -103,8 +106,14 @@ pub struct NativeRelay {
 ///   `QuadsCountedBeforeDiscard` (a simdgroup operation other than a quad one before a discard,
 ///   in a shape where Apple's compiler's placement of it is not known, whose lanes include the
 ///   quads the discard drops) differs from Metal's where Apple's compiler moves the operation past
-///   the discard: where that compiler places it decides the answer, not the device.
-pub const NATIVE_RELAYED: [NativeRelay; 31] = [
+///   the discard: where that compiler places it decides the answer, not the device. So does
+///   `UnmeasuredGroupSpeculation` (a quad or simdgroup operation in a branch arm of a shape no
+///   probe says Metal's backend speculates, kept over the AIR's lanes): where that backend
+///   speculates decides the answer;
+/// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
+///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
+///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
+pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -161,7 +170,10 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  evaluates at the pixel's centre, which the device evaluates at a position \
                  within the fragment Vulkan leaves to the implementation (the runtime's D212 \
                  note): `[[position]]`'s z or w, a centre-sampled or centroid varying, \
-                 `[[point_coord]]` or `[[barycentric_coord]]`",
+                 `[[point_coord]]` or `[[barycentric_coord]]`; or one that runs per sample \
+                 under sample shading reads one of them but a centre-sampled varying, which \
+                 Vulkan evaluates for its sample where Metal reads it as the pixel's; each \
+                 within its change over half the pixel's diagonal",
     },
     NativeRelay {
         kind: rt::Degradation::ImplementationDefinedReconvergence,
@@ -263,6 +275,16 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  its grid first: one `half` unit apart; the runtime records the device's bound",
     },
     NativeRelay {
+        kind: rt::Degradation::DeviceSampleLevel,
+        ground: "class (e), owner 2026-10-11: the device's sampling. Under Metal's sampler \
+                 emulated (`SamplingPolicy::Exact`), a sample whose level the device's level \
+                 arithmetic chooses, an LOD query's among them: Vulkan's level of detail may \
+                 approximate its scale factor, and a nearest mip filter reads ceil(lambda + 1/2) \
+                 - 1 where Metal rounds the level to half and truncates its fraction onto \
+                 sixty-fourths, so near a boundary the sample may read another level or filter \
+                 than Metal's; the runtime records the device's bound",
+    },
+    NativeRelay {
         kind: rt::Degradation::NativeTranscendentals,
         ground: "class (e), owner 2026-10-11: the device's maths, the runtime's default off \
                  Apple's GPUs (`FloatMathsPolicy::Native`). A math-library call the device's \
@@ -340,7 +362,9 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  within 0.919 of a code of Metal's on NVIDIA 615.71.09, 0.548 on RADV, 0.918 on \
                  ANV and 1.0 on lavapipe, an sRGB texture's within 1.832, 0.764, 0.912 and \
                  0.781, and a nearest sample's texel Metal's neighbour at 0.1% of coordinates \
-                 at most (the runtime's D906); the runtime records the rest",
+                 at most (the runtime's D906); a two-plane YCbCr texture's linear filter \
+                 (`YCbCrFilterPolicy::Device`) within 1.18 codes of Metal's sum on an RTX 3090, \
+                 0.88 on RADV and 1.06 on ANV; the runtime records the rest",
     },
     NativeRelay {
         kind: rt::Degradation::DeviceTexelConversion,
@@ -349,6 +373,26 @@ pub const NATIVE_RELAYED: [NativeRelay; 31] = [
                  device: an 8- or 16-bit normalized code within one `f32` ulp of Metal's, a 5- or \
                  6-bit channel within 0.18 of a code, and a half-float or small-float NaN in the \
                  device's encoding (the runtime's D905)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DecodedTexelPrecision,
+        ground: "class (e): the runtime's default off Apple's GPUs \
+                 (`DecodedTexelsPolicy::Compact`), for a texture of a format the device lacks \
+                 held in a carrier, whose reads, samples and gathers read a decoded twin of \
+                 compact codes: an ASTC LDR channel the 8-bit code nearest Metal's 12-bit \
+                 value, at most 1/510 off it, and an EAC 11-bit channel the 16-bit normalized \
+                 code nearest Metal's 11-bit value, at most half a 16-bit step off it (the \
+                 runtime's record of the bound)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DeviceRoundedResolve,
+        ground: "class (e): the device's own rounding of an average, the runtime's default off \
+                 Apple's GPUs (`ResolvePolicy::Device`), for a pass's resolve of a multisampled \
+                 colour attachment by the device's `AVERAGE`: a resolved channel up to one code \
+                 off Metal's (an sRGB one two) near a rounding boundary, a float channel off in \
+                 its last bits, and wholly where a sample is a NaN or an infinity, measured at 2 \
+                 and 4 samples on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit unorm \
+                 tie down",
     },
 ];
 
@@ -455,7 +499,8 @@ pub fn relayed(kind: rt::Degradation) -> bool {
     NATIVE_RELAYED.iter().any(|r| r.kind == kind)
 }
 
-/// How many times this process met each kind of [`NATIVE_RELAYED`], in its order.
+/// How many times the runtime announced each kind of [`NATIVE_RELAYED`] in this process, in its
+/// order.
 static COUNTS: [AtomicU64; NATIVE_RELAYED.len()] =
     [const { AtomicU64::new(0) }; NATIVE_RELAYED.len()];
 
@@ -465,7 +510,7 @@ pub fn count(kind: rt::Degradation) -> bool {
     count_in(&COUNTS, kind)
 }
 
-/// Each kind of [`NATIVE_RELAYED`] this process met, with how many times.
+/// Each kind of [`NATIVE_RELAYED`] this process met, with how many times the runtime announced it.
 pub fn counts() -> Vec<(rt::Degradation, u64)> {
     counts_in(&COUNTS)
 }

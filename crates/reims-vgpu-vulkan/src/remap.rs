@@ -309,6 +309,17 @@ pub(crate) fn unmap_waits(at: HostPtr, length: u64) -> bool {
     HOLDS.lock().waits(&(first..first.saturating_add(length)))
 }
 
+/// The host bytes of each run of core's mappings of the guest's pages that shows a page of
+/// `source` (named by the memory map's host addresses), for tests: a run leaves at the unmap of
+/// its pages through [`VulkanVm`], whether or not that unmap waits for a hold.
+#[cfg(test)]
+pub(crate) fn guest_mappings_of(source: Range<u64>) -> Vec<Range<u64>> {
+    (GUEST_MAPPINGS.lock().0.iter())
+        .filter(|&(&first, &(end, from))| from < source.end && source.start < from + (end - first))
+        .map(|(&first, &(end, _))| first..end)
+        .collect()
+}
+
 /// The platform's `HostVm`: the OS's ([`OsVm`]: Mach VM on macOS, its calls over `mmap` on
 /// Linux), each call that changes pages then reported (module docs), and an unmap of pages a
 /// runtime import holds made once its hold goes ([`UnmapHold`]).
@@ -359,6 +370,14 @@ impl HostVm for VulkanVm {
 
     fn allocate_anywhere(&self, len: u64) -> Result<HostAddr, KernReturn> {
         let at = self.vm.allocate_anywhere(len)?;
+        self.changed(at, len);
+        Ok(at)
+    }
+
+    /// A range a view can be made of ([`crate::os::allocate_aliasable`]): Mach's allocation on
+    /// macOS, a file's on Linux, whose anonymous memory no view can be made of.
+    fn allocate_aliasable(&self, len: u64) -> Result<HostAddr, KernReturn> {
+        let at = crate::os::allocate_aliasable(len)?;
         self.changed(at, len);
         Ok(at)
     }
@@ -546,6 +565,39 @@ mod tests {
         assert!(vm.remap_shared_overwrite(src, at, page).is_err());
         assert_eq!(take(), []);
         assert!(OsVm::new().deallocate(src, 2 * page).is_success());
+    }
+
+    /// Core's aliasable range (the detach heap's temporary) reports its pages as a fresh range
+    /// does, and a view can be made of it, as Mach's remap of any allocation: on Linux a range
+    /// of `allocate_anywhere`'s has no file behind it, and a view of it is refused
+    #[test]
+    fn an_aliasable_range_reports_its_pages_and_takes_a_view() {
+        let vm = VulkanVm {
+            vm: OsVm::new(),
+            report: seen,
+        };
+        let page = vm.page_size();
+        let at = vm.allocate_aliasable(page + 0x100).unwrap();
+        assert_eq!(take(), [(at, 2 * page, true)]);
+        let view = vm.allocate_anywhere(2 * page).unwrap();
+        let _ = take();
+        vm.remap_shared_overwrite(view, at, 2 * page).unwrap();
+        // SAFETY: both ranges are mapped, read and write, and show the same pages.
+        unsafe {
+            at.wrapping_add(page + 5)
+                .as_ptr::<u8>()
+                .write_volatile(0x3c);
+            assert_eq!(
+                view.wrapping_add(page + 5).as_ptr::<u8>().read_volatile(),
+                0x3c
+            );
+        }
+        let anonymous = vm.allocate_anywhere(page).unwrap();
+        let refused = vm.remap_shared_overwrite(view, anonymous, page);
+        assert_eq!(refused.is_err(), cfg!(target_os = "linux"));
+        for (range, length) in [(view, 2 * page), (at, 2 * page), (anonymous, page)] {
+            assert!(vm.deallocate(range, length).is_success());
+        }
     }
 
     /// A mapping's runs name its bytes by the pages they show, cut where a run starts or ends,

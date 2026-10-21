@@ -281,12 +281,11 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
-/// its fast native forms but those `REIMS_VGPU_EXACT` names ([`exact_policy`]), and the
-/// degradations the
+/// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
+/// names ([`exact_policy`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
-/// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), each
-/// announced at every occurrence (`announce_each`, [`crate::answer::DIES`]), as are those a
-/// creator learns of ([`crate::answer::HEARD`]). One set,
+/// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
+/// kinds announced at every occurrence ([`announced_each`]). One set,
 /// so the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
@@ -299,6 +298,23 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
 /// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
 /// them (`timing`'s `gpu_times_from_host_latency`).
+/// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
+/// call here hears ([`crate::answer::HEARD`]) and those that die by default
+/// ([`crate::answer::DIES_BY_DEFAULT`]), and every other kind of [`crate::answer::DIES`] where
+/// `every_dies`, in strict and census mode, which die at or record each occurrence. Elsewhere the
+/// runtime announces such a kind once per device, its first occurrence, the only one the default
+/// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
+/// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
+/// itself took 0.09 ms per frame of the FIFO thread's 16.3, measured).
+fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradation> {
+    let dies: &[rt::Degradation] = if every_dies {
+        &crate::answer::DIES
+    } else {
+        &crate::answer::DIES_BY_DEFAULT
+    };
+    (dies.iter().copied()).chain(crate::answer::HEARD).collect()
+}
+
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
@@ -307,10 +323,8 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
         options.messages = Some(rt::MessageSink::new(crate::answer::notice));
-        options.announce_each = crate::answer::DIES
-            .into_iter()
-            .chain(crate::answer::HEARD)
-            .collect();
+        options.announce_each =
+            announced_each(crate::answer::strict_process() || crate::answer::census::on());
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
             reims_vgpu_core::trace::set_clock(crate::gpu::timing::trace_clock);
             if crate::answer::trace_degradations() && reims_vgpu_core::trace::on() {
@@ -332,7 +346,9 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 
 /// The fields of the runtime's device policy (`metal2vulkan::device::DevicePolicy`) whose exact
 /// form `REIMS_VGPU_EXACT` can name, each by the field's own name: Metal's sampler emulated
-/// (`sampling`, `SamplingPolicy::Exact`), the translation's routines for the maths functions,
+/// (`sampling`, `SamplingPolicy::Exact`), Metal's filter of a two-plane YCbCr texture under
+/// native sampling, in a pipeline the draw binding one makes (`ycbcr_filter`,
+/// `YCbCrFilterPolicy::Exact`), the translation's routines for the maths functions,
 /// divisions and fused multiply-adds Metal answers beyond Vulkan's precision table
 /// (`float_maths`, `FloatMathsPolicy::Exact`), Metal's texel conversion (`texel_conversion`,
 /// `TexelConversionPolicy::Exact`: every read's, and a sample's or gather's with `sampling`),
@@ -341,19 +357,28 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
 /// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
 /// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`), and the runtime's shadow copy of a texture that only
-/// reads over a buffer whose rows lie with bytes between them, so that no byte between the rows is
-/// reached through an image (`padded_reads`, `PaddedReadsPolicy::Shadow`). [`EXACT_ALL`] names
-/// every one but `sampling`.
-pub const EXACT_FORMS: [&str; 8] = [
+/// (`half_blend`, `HalfBlendPolicy::Exact`), Metal's values in the decoded twin of a texture
+/// whose format the device lacks, an ASTC LDR or EAC 11-bit one (`decoded_texels`,
+/// `DecodedTexelsPolicy::Exact`), Metal's tile store of a loaded signed normalized or
+/// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
+/// multisampled colour attachment (`resolve`, `ResolvePolicy::Exact`), and each batch of a queue
+/// ordered after the earlier ones by the accesses it depends on (`batch_order`,
+/// `BatchOrderPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`. The policy's
+/// `completion` and `heap_compression` are no names of these: every device takes their exact
+/// forms ([`exact_policy`]).
+pub const EXACT_FORMS: [&str; 12] = [
     "sampling",
+    "ycbcr_filter",
     "float_maths",
     "texel_conversion",
     "half_rounding",
     "nan_and_min_max",
     "rounding_order",
     "half_blend",
-    "padded_reads",
+    "decoded_texels",
+    "tile_store",
+    "resolve",
+    "batch_order",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -363,30 +388,57 @@ pub const EXACT_ALL: &str = "all";
 
 /// The device policy every device is made with: the runtime's default, whose native forms are
 /// fast to make and run and record their bounds off Apple's GPUs (docs/accuracy-ledger.md: the
-/// fast method by default, the accurate one behind a switch), but for each field of
-/// [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated list, names, which takes
-/// the runtime's exact form, and for [`EXACT_ALL`], which takes every such form but `sampling`'s:
-/// larger modules and longer pipeline creation, and `padded_reads`' copy before each use. A
-/// device that runs on Metal (MoltenVK) answers as Metal under either, but for the NaN a `half`
-/// read, sample or gather hands back for a NaN texel, Metal's only under `nan_and_min_max`. A
-/// name of neither changes nothing, and a line on stderr says so.
+/// fast method by default, the accurate one behind a switch), but for its completion, which is
+/// always the exact form (`CompletionPolicy::Exact`): each command buffer goes to the driver in a
+/// submission of its own and is seen complete at its own end, as Metal's, where the runtime's
+/// default would take up to four ready together in one kernel submission on Mesa's drivers and
+/// see each but the last complete only once the last completed. When the host sees a command
+/// buffer complete is the guest's to observe (the stamps and interrupts core writes as its work
+/// completes), and the grouped form bought no frame rate in a guest's drag on the Iris Xe (15.7
+/// to 17.3 frames a second, against 16.4 to 17.6 exact), so no switch takes it. Its heap
+/// compression is always the exact form too, with no switch either: a heap's colour texture Metal
+/// keeps losslessly compressed takes an image the driver keeps uncompressed in the heap's bytes
+/// (`HeapCompressionPolicy::Uncompressed`), as one Metal keeps uncompressed does, where the
+/// runtime's default would take the driver's compressed image on a driver whose compressed images
+/// may keep their texels apart from their bytes (ANV). That image changes what
+/// `heapTextureSizeAndAlignWithDescriptor:` answers the guest (on the Iris Xe, 0x4100 bytes at
+/// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
+/// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
+/// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
+/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
+/// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
+/// draw, `decoded_texels`' larger twins, `tile_store`'s load pass before a pass, `resolve`'s render
+/// pass instance after one, and `batch_order`'s barriers between batches. A device that runs on
+/// Metal (MoltenVK) answers as Metal under either, but for the NaN a `half` read, sample or gather
+/// hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a linear sample of a
+/// two-plane YCbCr texture, which Metal's own sampler filters by default (within one step of the
+/// format's grid, announced) and Metal's filter of the format only under `ycbcr_filter`. A name of
+/// neither changes nothing, and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-        PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+        BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
+        HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy, ResolvePolicy,
+        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
+        YCbCrFilterPolicy,
     };
     let mut policy = DevicePolicy::default();
+    policy.completion = CompletionPolicy::Exact;
+    policy.heap_compression = HeapCompressionPolicy::Uncompressed;
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
             "sampling" => policy.sampling = SamplingPolicy::Exact,
+            "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
             "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
             "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
             "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
             "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
             "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
             "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
-            "padded_reads" => policy.padded_reads = PaddedReadsPolicy::Shadow,
+            "decoded_texels" => policy.decoded_texels = DecodedTexelsPolicy::Exact,
+            "tile_store" => policy.tile_store = TileStorePolicy::Exact,
+            "resolve" => policy.resolve = ResolvePolicy::Exact,
+            "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -607,6 +659,27 @@ pub(crate) mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
+    /// The kinds a call hears and those that die by default are announced at every occurrence in
+    /// every mode, and every other kind of `DIES` only in strict and census mode
+    #[test]
+    fn only_strict_and_census_mode_hear_every_occurrence_of_every_kind_that_dies() {
+        use crate::answer::{DIES, DIES_BY_DEFAULT, HEARD};
+        let each = announced_each(true);
+        assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
+        let by_default = announced_each(false);
+        assert!(
+            HEARD
+                .iter()
+                .chain(&DIES_BY_DEFAULT)
+                .all(|k| by_default.contains(k))
+        );
+        let once = DIES
+            .iter()
+            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k));
+        assert!(once.clone().count() > 100, "most kinds of DIES");
+        assert!(once.clone().all(|k| !by_default.contains(k)));
+    }
+
     /// A launcher no test launches through.
     struct NoLauncher;
 
@@ -624,32 +697,56 @@ pub(crate) mod tests {
         VulkanPlatform::new(Box::new(NoLauncher))
     }
 
-    /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms;
-    /// each name of `EXACT_FORMS` takes that field's exact form alone, in any order, spaces
-    /// around a name ignored; `all` takes the runtime's `exact_answers()`, every one but
-    /// `sampling`; another name changes nothing
+    /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
+    /// but for its exact completion and uncompressed heap textures, which every device takes and
+    /// no name selects; each name of `EXACT_FORMS` takes that field's exact form alone, in any
+    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every one
+    /// but `sampling`; another name, `completion` and `heap_compression` among them, changes
+    /// nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            DevicePolicy, FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, NanMinMaxPolicy,
-            PaddedReadsPolicy, RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy,
+            BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
+            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy,
+            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
+            TexelConversionPolicy, TileStorePolicy, YCbCrFilterPolicy,
         };
-        let fast = DevicePolicy::default();
+        let runtimes = DevicePolicy::default();
+        assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
+        assert_eq!(runtimes.heap_compression, HeapCompressionPolicy::Compressed);
+        let mut fast = runtimes;
+        fast.completion = CompletionPolicy::Exact;
+        fast.heap_compression = HeapCompressionPolicy::Uncompressed;
         assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
+        assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
         assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
         assert_eq!(fast.texel_conversion, TexelConversionPolicy::Device);
         assert_eq!(fast.half_rounding, HalfRoundingPolicy::Native);
         assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
         assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
         assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
-        assert_eq!(fast.padded_reads, PaddedReadsPolicy::Alias);
-        for unchanged in [None, Some(""), Some(","), Some("exact, bicubic, All")] {
+        assert_eq!(fast.decoded_texels, DecodedTexelsPolicy::Compact);
+        assert_eq!(fast.tile_store, TileStorePolicy::Device);
+        assert_eq!(fast.resolve, ResolvePolicy::Device);
+        assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
+        for unchanged in [
+            None,
+            Some(""),
+            Some(","),
+            Some("exact, bicubic, All"),
+            Some("padded_reads"),
+            Some("completion"),
+            Some("heap_compression"),
+        ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 8] = [
+        let alone: [(&str, Set); 12] = [
             ("sampling", |p| p.sampling = SamplingPolicy::Exact),
+            ("ycbcr_filter", |p| {
+                p.ycbcr_filter = YCbCrFilterPolicy::Exact
+            }),
             ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
             ("texel_conversion", |p| {
                 p.texel_conversion = TexelConversionPolicy::Exact;
@@ -664,9 +761,12 @@ pub(crate) mod tests {
                 p.rounding_order = RoundingOrderPolicy::Exact
             }),
             ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
-            ("padded_reads", |p| {
-                p.padded_reads = PaddedReadsPolicy::Shadow
+            ("decoded_texels", |p| {
+                p.decoded_texels = DecodedTexelsPolicy::Exact
             }),
+            ("tile_store", |p| p.tile_store = TileStorePolicy::Exact),
+            ("resolve", |p| p.resolve = ResolvePolicy::Exact),
+            ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -678,7 +778,8 @@ pub(crate) mod tests {
             set(&mut every);
         }
         let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,padded_reads,float_maths";
+                     nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
+                     tile_store,decoded_texels";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         let answers = fast.exact_answers();
