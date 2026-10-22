@@ -186,9 +186,9 @@ reims-vgpu-vulkan  <-  reims-vgpu, reims-vgpu-c  (their `vulkan` feature: off by
   - the pure logic, each module unit-tested with no AppKit: `geometry` (the image's rectangle in
     the window, the pointer's position in the guest's mode, the buttons), `keymap` (macOS key
     codes to USB usages, by position), `keys` (modifiers and held keys), `capture` (who gets the
-    keyboard), `scroll` (wheel and trackpad deltas to notches, or smooth with their gestures'
-    phases), `policy` (the modes and density offered for a host screen) and `env` (the
-    `REIMS_VGPU_WINDOW_*` variables);
+    keyboard, and where the pointer may go), `scroll` (wheel and trackpad deltas to notches, or
+    smooth with their gestures' phases), `policy` (the modes and density offered for a host
+    screen) and `env` (the `REIMS_VGPU_WINDOW_*` variables);
   - `screens.rs`: the host's screens from CoreGraphics, which answers on any thread;
   - the AppKit side (`native/macos/`, behind `native/macos.rs`), on the main thread (7.3), whose
     state lives in statics only that thread reaches (`main_thread::MainOnly`):
@@ -518,7 +518,9 @@ process.
   values, callable more than once.
 - `tasks/remote/completions.rs` is the one piece of status-4 code every launcher shares: a crash
   signals every outstanding token 4 in ascending id order, and every token issued after it is born
-  4. Its table drops the tokens it still holds in ascending id order.
+  4. The first token born 4 writes one warning, `task <n>: its service has ended: this command and
+  every later one fault (4)`, the only line a dead task's later faults leave. Its table drops the
+  tokens it still holds in ascending id order.
 - `RemoteTask`'s drop waits, with no timeout, until every token is completed or crashed, then
   invalidates the link.
 

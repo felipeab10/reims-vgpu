@@ -12,13 +12,13 @@ nothing to install in the guest.
 Alongside the GPU, we ship a QEMU build that uses it, and `reims-ctl`, a small tool that creates
 and runs macOS VMs for you.
 
-![reims-vgpu running an arm64 macOS 13 Ventura guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
+![reims-vgpu running an arm64 macOS 26 Tahoe guest desktop on an Apple Silicon host](assets/readme/reims-vgpu-macos-arm64-desktop.png)
 
-*arm64 macOS 13 Ventura guest on an Apple Silicon host.*
+*arm64 macOS 26 Tahoe guest on an Apple Silicon host.*
 
-![reims-vgpu running an x86_64 macOS 13 Ventura guest desktop on a Linux host](assets/readme/reims-vgpu-macos-x86-desktop.png)
+![reims-vgpu running an x86_64 macOS 26 Tahoe guest desktop on a Linux host](assets/readme/reims-vgpu-macos-x86-desktop.png)
 
-*x86_64 macOS 13 Ventura guest on a Linux host.*
+*x86_64 macOS 26 Tahoe guest on a Linux host.*
 
 ## Getting started
 
@@ -82,10 +82,14 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
    wallpaper with no menu bar and no Dock, or it comes up gray, with a menu bar but no Dock. Since
    you can't count on a desktop yet, you set it from macOS Recovery:
 
-   1. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
+   1. Turn on the VM's boot selection, so that OpenCore shows its picker: in reims-ctl, press
+      `e` on the VM, switch **Boot selection** on and save (or run
+      `reims-ctl update-opencore NAME --boot-selection`). It's off by default, and then the VM
+      boots straight into macOS.
+   2. Start the VM, and pick the Recovery entry in OpenCore's picker before it boots macOS (it
       waits 5 seconds; any arrow key stops the countdown, and Space shows the entry if it's
       hidden).
-   2. In Recovery, open Utilities > Terminal and type this as one line:
+   3. In Recovery, open Utilities > Terminal and type this as one line:
 
       ```sh
       cd /Volumes/*Data/Library/Preferences && defaults write "$PWD/.GlobalPreferences" METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot
@@ -94,7 +98,8 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
       The VM restarts only if every step worked. If it doesn't, read the error: the setting
       wasn't saved, and macOS will keep crashing until it is. Don't drop the `chmod`: without it,
       macOS can't read the setting.
-   3. Pick macOS in the picker. The desktop should come up.
+   4. Pick macOS in the picker. The desktop should come up. You can turn the boot selection off
+      again the same way.
 
    If you already have a desktop, run this in its Terminal instead, then restart:
 
@@ -141,12 +146,13 @@ reims-ctl update --channel development   # switch to the development branch firs
 `reims-ctl help` lists every command; every option takes `--name value` or `--name=value`. A running
 VM keeps the QEMU it started with across an update.
 
-### The window takes your keyboard shortcuts
+### The window takes your keyboard shortcuts and your mouse
 
 Each guest display opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the
-guest's picture to capture the keyboard:** shortcuts and system keys then go to the guest instead
-of the host. Keys reach the guest by position, so the guest's own layout applies, and on Linux the
-Super key is the guest's ⌘.
+guest's picture to capture the keyboard and the mouse:** shortcuts and system keys then go to the
+guest instead of the host, and the pointer stays inside the picture until you release it, so you
+can throw it at the guest's corners and edges without landing on another window. Keys reach the
+guest by position, so the guest's own layout applies, and on Linux the Super key is the guest's ⌘.
 
 | Host | While captured | Release |
 |---|---|---|
@@ -154,9 +160,9 @@ Super key is the guest's ⌘.
 | Linux (SDL3's window, on Wayland or X11) | the whole keyboard, which the window grabs, so the compositor's shortcuts (Super, Alt+Tab) reach the guest | **Ctrl+Alt+Super** together |
 
 The title says when input is captured and how to release it. Losing focus releases capture too,
-and gives the host back its system keys. Uncaptured, ⌘ shortcuts drive the host's menu on a Mac.
-Losing focus, releasing capture or closing the window sends a key-up for every key still down, so
-nothing sticks. Closing a window powers the VM off.
+and gives the host back its system keys and its pointer. Uncaptured, ⌘ shortcuts drive the host's
+menu on a Mac. Losing focus, releasing capture or closing the window sends a key-up for every key
+still down, so nothing sticks. Closing a window powers the VM off.
 
 Fn/Globe does not reach the guest (QEMU's USB keyboard cannot carry it), and there is no HDR output.
 [`crates/reims-vgpu-window/features.md`](crates/reims-vgpu-window/features.md) lists everything the

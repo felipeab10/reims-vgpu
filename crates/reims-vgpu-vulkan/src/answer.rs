@@ -48,9 +48,10 @@
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
 //! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
 //! runtime announces each kind of degradation once per device, but these kinds at every
-//! occurrence (`DeviceOptions::announce_each`, [`crate::platform`]).
+//! occurrence in strict and census mode, and those of [`DIES_BY_DEFAULT`] in every mode
+//! (`DeviceOptions::announce_each`, [`crate::platform`]).
 //! By default the process goes on: the first occurrence of each kind writes the runtime's line,
-//! and every occurrence is counted ([`relayed_counts`]), as a native device's relay is
+//! and each occurrence announced is counted ([`relayed_counts`]), as a native device's relay is
 //! (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a death of its
 //! own). **Strict mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
 //! deaths, for tests and audits: the call that announced it dies once it returns, at its selector,
@@ -61,17 +62,17 @@
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
-//! blend, a resolve's rounding, a NaN or bfloat clear, a bfloat attachment's codes, a
-//! `textureWriteRoundingMode` the runtime does not take), or an answer it gives otherwise (a
-//! texture of protection options made unprotected), is relayed alike, its first occurrence
-//! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
+//! blend, a NaN or bfloat clear, a bfloat attachment's codes, a `textureWriteRoundingMode` the
+//! runtime does not take), or an answer it gives otherwise (a texture of protection options made
+//! unprotected), is relayed alike, its first occurrence writing a line naming the kind, and dies
+//! in strict mode. A death where Metal itself ends the
 //! process, or where the runtime cannot perform the call at all, is a death in either mode.
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
-//! occurrence's line written and every occurrence counted; every other kind is placed as above,
-//! as it is on MoltenVK. The placement is the process's: native only while every device it
-//! adopted is.
+//! occurrence's line written and each occurrence announced counted; every other kind is placed
+//! as above, as it is on MoltenVK. The placement is the process's: native only while every device
+//! it adopted is.
 //!
 //! **In census mode** (`REIMS_VGPU_CENSUS_DIR`, a diagnostic for inventory runs on Linux alone,
 //! [`census`]), a degradation of [`DIES`] is recorded with the selector of the call it was
@@ -299,13 +300,23 @@ pub fn create<T>(
 ///   answer is not Metal's measured one ([`crate::gpu::encode_blit`]);
 /// - `YCbCrFilterNotExact`: a pipeline's filtered sample of a texture slot bound to a two-plane
 ///   YCbCr texture (any of the 24 formats of [`crate::gpu::ycbcr`]'s family) that does not take
-///   Metal's exact filter of the format (a swizzle that moves its channels on MoltenVK, whose own
-///   sampler composes it, where another device filters exactly and swizzles the result; a
-///   constexpr sampler with a mip filter; a sample the emulation does not
-///   reach), which reads off Metal's grid (of 1/2048 for a converted format, of 1/8192 for an
-///   `_sRGB` twin), naming the slot and the format: the runtime's generic sample filter notes
-///   (`HalfSampleFilter`, `FloatSampleFilter`) cover no slot bound to a YCbCr texture, and a
+///   Metal's exact filter of the format, which reads off Metal's grid (of 1/2048 for a converted
+///   format, of 1/8192 for an `_sRGB` twin), naming the slot and the format: the runtime's generic
+///   sample filter notes (`HalfSampleFilter`, `FloatSampleFilter`) cover no slot bound to a YCbCr
+///   texture. On MoltenVK, under the runtime's default `ycbcr_filter`, every such sample: Metal's
+///   own sampler filters the slot's converted texels (an `RGBA16Float` view on the grid of
+///   1/2048, an `RGBA32Float` one on 1/8192), which hold Metal's reads exactly, at Metal's weights
+///   but without the format's truncated sum on its grid, within one step of the grid of Metal's
+///   answer into floats and 1/2048 into halves (`ycbcr::sampling`'s
+///   `the_default_filter_samples_within_its_bound_of_metals`), announced at each draw or dispatch
+///   that binds such a texture, through a runtime sampler whatever its state. Under
+///   `REIMS_VGPU_EXACT=ycbcr_filter` (or `sampling`) the slot takes Metal's filter of the format
+///   in a variant of the pipeline, and the kind is a sample the emulation does not reach: a
+///   swizzle that moves its channels on MoltenVK, whose own sampler composes it, where another
+///   device filters exactly and swizzles the result; a constexpr sampler with a mip filter. A
 ///   runtime sampler's mip filter over its one level takes the exact filter, announcing nothing.
+///   Under the default a device that samples natively filters such a slot itself, under
+///   `DeviceSampling`, and announces none of this kind.
 ///   Announced at each dispatch, tile dispatch and draw that binds the pipeline's variant, on the
 ///   encoding thread, inside its call, which dies at its selector: not where the variant is made,
 ///   which may be the runtime's pipeline-making thread, off every call here. An indirect command's
@@ -419,8 +430,6 @@ pub fn create<T>(
 ///   - `NonStrictResidency` and the note `SparseResidency`: a sparse texture's unmapped texels as
 ///     the device reads them, where MoltenVK binds no sparse memory;
 ///   - the note `DeviceRayIntersection`: a ray query, which MoltenVK's profile lacks;
-///   - the note `UnorderedFramebufferFetch`: a framebuffer fetch without rasterization-order
-///     access, whose pipeline the runtime refuses where it makes it, whatever its policy;
 /// - the note `ViewBaseTexelOffset`: a sample or gather of an argument buffer's texture with a
 ///   constant texel offset on an axis that may repeat or mirror, which the runtime places by
 ///   Metal's rule on the bound view's own base-level size, where Metal reads its parent's: on a
@@ -474,6 +483,16 @@ pub fn create<T>(
 ///   read or wrote, which the device may run after those fragments, and does across a split of
 ///   the pass, where Metal's vertex, object and mesh functions ran before the pass's fragments
 ///   in every run measured. Announced at the draw, inside its call, which dies at its selector;
+/// - `AttachmentReadInPlace`: a draw whose functions read or write, other than as an attachment,
+///   memory an attachment of its render pass instance renders, where no copy or snapshot the
+///   runtime makes serves the access (a texture reached through a handle or an argument buffer, a
+///   storage binding of a colour attachment's texture, the depth or stencil attachment's texture,
+///   another texture or a buffer over its bytes, a texture whose copy is not served, an
+///   execution's or a capture's command): the access sees the attachment as the device holds it
+///   inside the pass, which Vulkan leaves undefined, where Metal's read at the draw's own pixel
+///   gives the texel from before the pass. The hardware allows the exact form, the runtime's copy
+///   or snapshot as for a sampled slot's binding, which it has not built for those routes, so it
+///   dies on every device. Announced at the draw, inside its call, which dies at its selector;
 /// - `MipmapsWithinSpread`: `generateMipmapsForTexture:` of a texture whose levels the
 ///   device's linear blit makes, within 1 unit in the last place (2 for 32-bit float) of an
 ///   Apple M3 Max's or an Apple M4's on the inputs checked, at neither's exactly. Announced at the
@@ -486,6 +505,21 @@ pub fn create<T>(
 ///   or texture over its bytes changes none of its texels, or not all, and its writes change
 ///   none of those resources' bytes. Announced inside the heap's creator of the texture, which
 ///   dies at its selector;
+/// - `HeapTextureCompressed`: on a driver whose compressed images may keep their texels apart
+///   from the memory they are bound to (ANV's `CompressedImagesHideAliasedWrites`), under the
+///   runtime's `HeapCompressionPolicy::Compressed`, a heap's colour texture that Metal keeps
+///   losslessly compressed too (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView`
+///   or `ShaderAtomic` usage, 16 texels or more a side), made as the driver's compressed image: a
+///   write through a buffer or texture over its bytes may leave its texels as they were, where
+///   Metal's texture reads opaque magenta (`0xffff00ff`) in every texel of drawn content the write
+///   covered and the written bytes where it held only a clear (an M3 Max), and its own writes may
+///   show in those bytes compressed otherwise than Metal's. Every device here takes
+///   `HeapCompressionPolicy::Uncompressed` ([`crate::platform`]'s `exact_policy`), which makes its
+///   image one the driver keeps uncompressed in the heap's bytes, where the device can (else
+///   `HeapTextureHidesAliasedWrites`), so the runtime announces it for none of them. No device on
+///   Metal announces it, and a native device does not relay it: a texture's layout is neither
+///   maths nor sampling. Announced inside the heap's creator of the texture, which would die at
+///   its selector;
 /// - a resource a function may reach through its ID or address without the command naming it,
 ///   which the read would find other than Metal's, each announced where the reach becomes
 ///   possible, not where a function reads it, inside the call that makes it possible, which
@@ -513,10 +547,48 @@ pub fn create<T>(
 ///   - `UncoveredColorKept`: a draw of a state that lacks a colour attachment of the pass, whose
 ///     texels it keeps where Metal's compiler may fold the output to a constant that stores zero.
 ///     Announced at the draw;
+///   - `SnormMinimumKept` and `SharedExponentKept`: under the runtime's default `tile_store`, a
+///     draw in a pass that loads and stores a single-sampled colour attachment of a signed
+///     normalized format or of `RGB9E5Float`, whose texels the pass's draws do not write keep
+///     their bytes, where Metal's pass writes each 32 by 32 tile a draw reaches back through its
+///     values: a channel's minimum code (-128, or -32768) as the code above it, which reads as the
+///     same -1.0, and a shared-exponent word whose largest mantissa is below 256 under an exponent
+///     above 0 normalized, of the same value. Only uploaded or copied bytes hold such a code or
+///     word. `REIMS_VGPU_EXACT=tile_store` rewrites them as Metal's tile store does, in the
+///     runtime's load pass before the pass. MoltenVK's pass is a Metal pass (the runtime's
+///     `TileStoreIsMetals`), so no device on Metal announces either, and a native device does not
+///     relay them: a pass's tile store is neither maths nor sampling. Announced at the draw;
+///   - `DeviceRoundedResolve`: a pass's resolve of a multisampled colour attachment that the
+///     device averages and rounds: under the runtime's default `resolve` (`ResolvePolicy::Device`)
+///     every one but an attachment a fetching pass holds in sample planes, and under
+///     `REIMS_VGPU_EXACT=resolve` one of a format without the runtime's rules of Metal's resolve
+///     (which cover the 16-bit float, `RG11B10Float` and `RGB9E5Float` formats at 2 and 4
+///     samples, the counts Metal's devices take, and every other format they name at every
+///     count), or of an attachment whose image the runtime's resolve can neither read nor copy. A
+///     resolved channel is up to one code off Metal's (an sRGB one two) near a rounding boundary,
+///     a float channel off in its last bits, and wholly where a sample is a NaN or an infinity,
+///     measured at 2 and 4 samples on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit unorm
+///     tie down. The runtime's notice names the attachment. MoltenVK's average is Metal's own (the
+///     runtime's `ColorResolveAverageIsMetals`), so no device on Metal announces it; a native
+///     device relays it, the device's own rounding of an average and the runtime's default off
+///     Apple's GPUs, as the class of a native device's own maths and sampling
+///     ([`native::NATIVE_RELAYED`]), so a strict run there, this crate's tests on Linux among them,
+///     goes on past it. Announced as the pass ends, inside `endEncoding`;
 /// - `CappedAnisotropy`: a sampler state of a `maxAnisotropy` past 16, which Metal samples with
 ///   32, where the device filters with its largest (16), so a footprint more than 16 times as
 ///   long as it is wide reads a coarser level. Announced at the state's creation, which dies at
 ///   its selector;
+/// - `NotMipmappedAnisotropicSampler` and the note `NotMipmappedAnisotropicFilter`: on a device
+///   that samples through Metal's own sampler (MoltenVK on Apple's GPU), a sampler state, or a
+///   constexpr sampler a sample at an implicit level or with gradients goes through, with
+///   anisotropy, no mip filter and different minification and magnification filters. Vulkan has
+///   no sampler without mipmapping, so the device's sampler takes a nearest mip filter with the
+///   level clamp `[0, 0.25]`, which keeps Metal's choice of filter, and Metal's anisotropic filter
+///   then reads another footprint than Metal's `NotMipmapped` at `maxAnisotropy` 2 to 16. Metal's
+///   footprint for such a sampler is not known as a state MoltenVK takes, so nothing here holds it
+///   Metal's, and it dies there; no other device announces either. The state's announced at its
+///   creation, which dies at its selector, the note at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - `CombinedArchiveStages`: a render pipeline state the runtime makes from binary archives
 ///   where Metal may refuse it with an archive miss (its two adds' fragment functions reading
 ///   different vertex outputs). Announced at the state's creation, which dies at its selector;
@@ -569,6 +641,28 @@ pub fn create<T>(
 ///   one rounding of `64/91`, every lane measured Metal's; an anisotropic one's ellipse laid on
 ///   the face's diagonal), and an implicit-level cube sample's level, where Metal's rule is not
 ///   measured. A kernel hands Metal's own gradients there and notes nothing;
+/// - the note `UnmeasuredGroupSpeculation`: a stage with a branch whose arms hold a quad or
+///   simdgroup operation that Metal's backend makes answer over every lane of the branch's block
+///   where it speculates the arms, of a shape no measurement says it speculates (an arm of an
+///   instruction, size or shape no probe covers): the branch keeps the AIR's lanes, so the
+///   operation may answer over the lanes that take the arm where Metal's answers over the
+///   block's. It dies on every device, a native one included, as `QuadsCountedBeforeDiscard`
+///   does: where Apple's compiler speculates decides the answer, not the device. Announced at each
+///   draw or dispatch that binds the pipeline's variant, inside its call, which dies at its
+///   selector;
+/// - the note `DeviceSampleLevel`: on a native device under Metal's sampler emulated
+///   (`REIMS_VGPU_EXACT=sampling`), a sample whose level the device's level arithmetic still
+///   chooses (a fragment function's implicit-level sample, its bias within the device's limit; a
+///   sample with explicit gradients; a fragment function's LOD query; an explicit level Metal's
+///   level rule is not handed on, such as an integer texture's), of a texture other than a cube,
+///   without comparison, where no sample-filter note covers it: Vulkan's level of detail may
+///   approximate its scale factor and rounds a nearest mip level otherwise than Metal, so near a
+///   boundary the sample may read another level or filter than Metal's, and the query answers the
+///   device's level. MoltenVK samples through Metal's own sampler, and the default's native
+///   sampling records `DeviceSampling` in its place, so neither announces it. A native device
+///   relays it, the device's level arithmetic, as the class of a native device's own maths and
+///   sampling ([`native::NATIVE_RELAYED`]). Announced at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
 ///   functions, where the runtime does not number them as Metal does. It notes a stage that
 ///   links two or more with constexpr samplers, whose order Metal itself does not decide (two
@@ -729,6 +823,17 @@ pub fn create<T>(
 ///   device relays the device's decode, its sampling, as the class of a native device's own
 ///   maths and sampling ([`native::NATIVE_RELAYED`]). Announced where the texture or view is made,
 ///   inside its creator's call, which dies at its selector elsewhere;
+/// - `DecodedTexelPrecision`: under the runtime's default `decoded_texels`, a texture of an ASTC
+///   LDR format (not an sRGB one) on a device without that ASTC format, or of an EAC 11-bit
+///   format on one without ETC2, which the runtime holds in a carrier, its reads, samples and
+///   gathers reading a decoded twin of compact codes: an ASTC channel the 8-bit code nearest
+///   Metal's 12-bit value, at most 1/510 off it, an EAC 11-bit one the 16-bit normalized code
+///   nearest Metal's value, at most half a 16-bit step off it. `REIMS_VGPU_EXACT=decoded_texels`
+///   holds Metal's values in a twin of floats. Apple's GPUs have the formats, so no device on
+///   Metal announces it; a native device relays it, the runtime's default sampling off Apple's
+///   GPUs, as the class of a native device's own maths and sampling
+///   ([`native::NATIVE_RELAYED`]). Announced where the texture is made, inside its creator's
+///   call, which dies at its selector elsewhere;
 /// - `HeapTextureLargerThanMetal`: a texture sized or placed in a heap whose image on the device
 ///   takes more bytes or a coarser alignment than the runtime's model of Metal's answer, not one
 ///   `OptimizedDepthStencilTexture` covers (on NVIDIA 615.71.09, a 4x4
@@ -758,19 +863,21 @@ pub fn create<T>(
 ///   runtime announces it for none of them. Announced once per device, on the thread that lets go
 ///   of the buffer, inside its release here or on one of the runtime's as a command buffer
 ///   completes, outside every call here: it dies where it is announced;
-/// - `UnrestoredFirstMoveBytes`: a texture's first move over a no-copy buffer's host pages (or a
-///   rebind's new pages) changed bytes the host kept across it, on pages the process maps
-///   without write permission when the host writes them back (pages made read-only after the
-///   buffer was made, as Linux refuses read-only pages at the import; on macOS also pages
-///   read-only from the start, which Metal reads), so those bytes keep what the image's move from
-///   `UNDEFINED` wrote, where Metal's texture leaves its pages as they were. The runtime writes
-///   back only the bytes the move changed, and only where the pages are writable; its moves
-///   changed none on the M3 Max, lavapipe, the RTX 5080 or RADV (`first_move_restored_bytes` 0 on
-///   every keep, measured by the runtime). The exact form is a shadow of the pages rather than an
-///   import of read-only ones, so no fact of the hardware forces it, and a native device does not
-///   relay it. It is not among [`DIES_BY_DEFAULT`]: the driver's move is what writes the bytes,
-///   and no run has met it. Announced once per device, on the thread that makes the submission
-///   that takes the move, outside every call here: it dies where it is announced;
+/// - `GroupedCompletion`: on a driver whose queue merges a submission that signals nothing into the
+///   next one (Mesa's: ANV, RADV, lavapipe), under the runtime's `CompletionPolicy::Grouped`, up
+///   to four batches of command buffers of one queue that its scheduler found ready together, or
+///   held while two or more earlier submissions of their queue ran, went to the driver in one
+///   submission, only the last signalling: each command buffer of it but the last is seen complete
+///   (its status, its completed handlers, which core's completion of the guest's work runs in, and
+///   its waits), and the event values it signals are reached, once the last completed, late by the
+///   GPU time of the batches after it, at most three, never early and in commit order, where
+///   Metal's host sees each complete at its own end. Every device here takes
+///   `CompletionPolicy::Exact` ([`crate::platform`]'s `exact_policy`), which submits each batch
+///   alone, so the runtime announces it for none of them, and a strict run on Mesa's drivers, this
+///   crate's tests among them, never dies of it. MoltenVK merges no submissions, and no fact of
+///   the hardware forces it, so a native device does not relay it. Announced once per device
+///   whatever `announce_each` asks, on the runtime's scheduler thread, outside every call here: it
+///   would die where it is announced;
 /// - six kinds no device on Metal announces, each dying where a device announces it, at its
 ///   selector, as no fact of the hardware forces it:
 ///   - `VisibilityCountPerColor`: a draw counted by a `Counting` visibility result whose
@@ -852,7 +959,12 @@ pub fn create<T>(
 ///   than its 8-bit slot, a packed or depth format and the rest) or of an argument buffer's
 ///   element, which keeps the runtime's rounding of the device's `f32` texel to nearest even,
 ///   where Metal rounds a 32-bit float texel toward zero and an 8- or 16-bit normalized one onto
-///   its format's grid first. The function can convert by Metal's
+///   its format's grid first; and, on MoltenVK under the runtime's default `ycbcr_filter`, a
+///   `half` sample through a runtime sampler of a texture bound in a two-plane YCbCr format on the
+///   grid of 1/8192 (an `_sRGB` twin), whose nearest texel Metal's own sampler converts as a
+///   filtered value, to nearest even, where Metal rounds a tie away from zero (one `half` unit in
+///   the last place at a tie), announced at each draw or dispatch that binds such a texture
+///   whatever the sampler's state. The function can convert by Metal's
 ///   rule, as the runtime already does for the formats it measured, so nothing in the hardware
 ///   forces the difference, and it dies on MoltenVK; a native device relays it, its sampling, as
 ///   the class of a native device's own maths and sampling ([`native::NATIVE_RELAYED`]). Announced
@@ -922,7 +1034,8 @@ pub fn create<T>(
 ///   of a `half` result (`NativeHalfConversion` and `NativeHalfQuantize`) and its sampling
 ///   (`DeviceSampling` and `DeviceTexelConversion`). On a device that runs on Metal (MoltenVK) the
 ///   runtime answers as Metal's own functions, sampler and conversions, so none is announced
-///   there; a native device relays each as the class of a native device's own maths and
+///   there (its default filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact`
+///   instead); a native device relays each as the class of a native device's own maths and
 ///   sampling ([`native::NATIVE_RELAYED`]). Announced at each draw or dispatch that binds the
 ///   pipeline's variant, inside its call, which dies at its selector.
 ///
@@ -933,7 +1046,7 @@ pub fn create<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 115] = [
+pub const DIES: [rt::Degradation; 124] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -969,7 +1082,6 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::NonStrictResidency,
     rt::Degradation::SparseResidency,
     rt::Degradation::DeviceRayIntersection,
-    rt::Degradation::UnorderedFramebufferFetch,
     rt::Degradation::PointGuardBand,
     rt::Degradation::NanDepth,
     rt::Degradation::ClippedDepthPieces,
@@ -978,9 +1090,11 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::SignedDepthTest,
     rt::Degradation::InPlaceVertexReads,
     rt::Degradation::FragmentsBeforeGeometry,
+    rt::Degradation::AttachmentReadInPlace,
     rt::Degradation::MipmapsWithinSpread,
     rt::Degradation::HeapDepthStencilApart,
     rt::Degradation::HeapTextureHidesAliasedWrites,
+    rt::Degradation::HeapTextureCompressed,
     rt::Degradation::ResourceIdTakeover,
     rt::Degradation::UnreadableHandleTexture,
     rt::Degradation::UnnamedTextureUnviewable,
@@ -989,7 +1103,12 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::DetachedStorageKeepsWrites,
     rt::Degradation::MixedDepthStencilResolve,
     rt::Degradation::UncoveredColorKept,
+    rt::Degradation::SnormMinimumKept,
+    rt::Degradation::SharedExponentKept,
+    rt::Degradation::DeviceRoundedResolve,
     rt::Degradation::CappedAnisotropy,
+    rt::Degradation::NotMipmappedAnisotropicSampler,
+    rt::Degradation::NotMipmappedAnisotropicFilter,
     rt::Degradation::CombinedArchiveStages,
     rt::Degradation::ImplementationDefinedReconvergence,
     rt::Degradation::F16FmaDoubleRounding,
@@ -1004,6 +1123,8 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::CubeGradientFootprint,
     rt::Degradation::QuadsCountedBeforeDiscard,
     rt::Degradation::BlendedWriteRounding,
+    rt::Degradation::UnmeasuredGroupSpeculation,
+    rt::Degradation::DeviceSampleLevel,
     rt::Degradation::LinkedSamplerNumbering,
     rt::Degradation::PixelSamplerScaling,
     rt::Degradation::ArgumentPixelSamplerScaling,
@@ -1013,9 +1134,10 @@ pub const DIES: [rt::Degradation; 115] = [
     rt::Degradation::CrossClassTextureNeutral,
     rt::Degradation::IndirectNilBufferOffset,
     rt::Degradation::CompressedTexelDecode,
+    rt::Degradation::DecodedTexelPrecision,
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
-    rt::Degradation::UnrestoredFirstMoveBytes,
+    rt::Degradation::GroupedCompletion,
     rt::Degradation::VisibilityCountPerColor,
     rt::Degradation::ColorAttachmentGroups,
     rt::Degradation::DevicePointSize,
@@ -1072,20 +1194,11 @@ pub const DIES: [rt::Degradation; 115] = [
 ///   `MTLCopyAllDevices()`), which keeps it. A host below every measured release, or whose
 ///   release does not read, still dies at the creator (`Problem::HostReleaseUnmeasured`). The
 ///   measured hosts' releases are measured, so the runtime announces nothing there;
-/// - `DeviceRoundedResolve`, a pass's colour resolve the device averages and rounds: one of a
-///   format without the runtime's own resolve rules (which cover the 16-bit float,
-///   `RG11B10Float` and `RGB9E5Float` formats at 2 and 4 samples, the counts Metal's devices
-///   take, and every other format they name at every count), or of an attachment whose image the
-///   runtime's resolve can neither read nor copy. MoltenVK's average is Metal's own, so no device
-///   here announces it. Announced as the pass ends, inside `endEncoding`, which hears it and
-///   relays it as [`Inexact::RoundedResolve`] (in strict mode dies at its selector), naming the
-///   first attachment without the rules (`crate::gpu::encode_render`'s `device_rounded`).
-///   Relayed the first time alone ([`RELAYED_ONCE`]);
 /// - `OptimizedDepthStencilTexture`, a depth or stencil texture without
 ///   `allowGPUOptimizedContents`, whose layout MoltenVK keeps GPU-optimized: the runtime sizes it
 ///   as Metal's texture with the property on, larger than Metal's with it off (16512 bytes for a 64
 ///   by 64 `Depth32Float` texture, where Metal answers 16384). Announced where such a texture is
-///   sized or made. Its reads and writes are Metal's, so its creation relays it, a device's
+///   sized or placed. Its reads and writes are Metal's, so its creation relays it, a device's
 ///   texture's, whose range or slot of Metal's space is of Metal's size, the runtime's model of
 ///   Metal's answer, which asks no image and hears nothing, else made of the runtime's answers for
 ///   colour formats ([`crate::gpu::metal_space::own_heap_size`]), and a heap's placement's that
@@ -1182,10 +1295,9 @@ pub const DIES: [rt::Degradation; 115] = [
 ///   16-bit float format's `half` unblended or blended by `Min` or `Max`, and a 32-bit float
 ///   format's value, as measured. An execution's commands announce it at the commit, which hears
 ///   nothing and relays it. Relayed the first time alone ([`RELAYED_ONCE`]).
-pub const HEARD: [rt::Degradation; 9] = [
+pub const HEARD: [rt::Degradation; 8] = [
     rt::Degradation::HeapTwoPlaneTexture,
     rt::Degradation::MetalLevelBelowHost,
-    rt::Degradation::DeviceRoundedResolve,
     rt::Degradation::OptimizedDepthStencilTexture,
     rt::Degradation::RasterizationRateMap,
     rt::Degradation::HeapTextureUntiledLayout,
@@ -1197,8 +1309,7 @@ pub const HEARD: [rt::Degradation; 9] = [
 /// The kinds of [`HEARD`] the runtime would announce once per device but for `announce_each`,
 /// which asks for each occurrence only so a call here can hear it: relayed the first time alone,
 /// as without a sink, so a guest's every pass does not log one ([`notice`]).
-const RELAYED_ONCE: [rt::Degradation; 7] = [
-    rt::Degradation::DeviceRoundedResolve,
+const RELAYED_ONCE: [rt::Degradation; 6] = [
     rt::Degradation::OptimizedDepthStencilTexture,
     rt::Degradation::RasterizationRateMap,
     rt::Degradation::HeapTextureUntiledLayout,
@@ -1231,6 +1342,11 @@ pub fn strict() -> bool {
     if let Some(strict) = TEST_STRICT.with(Cell::get) {
         return strict;
     }
+    strict_process()
+}
+
+/// [`strict`] as the process is set, whatever a test's thread runs under ([`relaxed`]).
+pub(crate) fn strict_process() -> bool {
     static STRICT: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         cfg!(test) || std::env::var_os("REIMS_VGPU_STRICT").is_some_and(|v| v == "1")
     });
@@ -1273,7 +1389,9 @@ fn count_relayed(kind: rt::Degradation) -> bool {
         .is_some_and(|c| c.fetch_add(1, Ordering::Relaxed) == 0)
 }
 
-/// Each kind of [`DIES`] this process relayed outside strict mode, with how many times.
+/// Each kind of [`DIES`] this process relayed outside strict mode, with how many times the runtime
+/// announced it: once per device by default, but in census mode or in a strict process whose
+/// thread runs [`relaxed`] ([`crate::platform`]'s `announced_each`).
 pub fn relayed_counts() -> Vec<(rt::Degradation, u64)> {
     use std::sync::atomic::Ordering;
     (DIES.iter().zip(&RELAYED_DIES))
@@ -1815,10 +1933,6 @@ pub enum Inexact {
     /// or converted at its attachment (`HalfOutputPrecision`, `crate::gpu::encode_render`'s
     /// `half_apart`).
     HalfOutputBlend,
-    /// A colour resolve the device averages and rounds, of a format and sample count without the
-    /// runtime's rules of Metal's resolve, or of an image its resolve cannot reach
-    /// (`DeviceRoundedResolve`).
-    RoundedResolve,
     /// An attachment cleared to a NaN, or a bfloat one to a value, the runtime stores otherwise
     /// than Metal.
     Clear,
@@ -1863,9 +1977,8 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 13] = [
         Self::HalfOutputBlend,
-        Self::RoundedResolve,
         Self::Clear,
         Self::BfloatLoaded,
         Self::WriteRounding,
@@ -1884,7 +1997,6 @@ impl Inexact {
     pub const fn code(self) -> &'static str {
         match self {
             Self::HalfOutputBlend => "inexact-half-output-blend",
-            Self::RoundedResolve => "inexact-rounded-resolve",
             Self::Clear => "inexact-clear",
             Self::BfloatLoaded => "inexact-bfloat-loaded",
             Self::WriteRounding => "inexact-write-rounding",
@@ -2146,7 +2258,9 @@ mod tests {
         //   the rest (an M4). The runtime takes the first two exactly, and in the third keeps
         //   the tiles outside its draws' viewports and scissors, clearing or rewriting the tiles
         //   inside them that no primitive touches. In a pass whose load
-        //   rewrites an extended-range or padded colour's unused bits, of one sample, one layer and
+        //   rewrites an extended-range or padded colour's unused bits (or, under
+        //   `REIMS_VGPU_EXACT=tile_store`, a signed normalized or `RGB9E5Float` colour's minimum
+        //   codes and unnormalized words, as Metal's tile store does), of one sample, one layer and
         //   32 by 32 tiles, with no rotated frame, whose draws are direct triangle lists or
         //   strips the runtime can record again, it finds the tiles their primitives reach before
         //   the pass from the positions its vertex functions compute, and rewrites those alone,
@@ -2179,7 +2293,9 @@ mod tests {
         //   every value Metal's but the edges, which Metal keeps bit for bit, where MoltenVK stores
         //   a value with the sign bit set (-0, a negative value, -inf, a negative NaN) as +0 and
         //   one past 1 or +inf as 1, a positive NaN writing nothing, and NVIDIA flushes denormals
-        //   and stores NaN as -inf (the notice names which): the device forces
+        //   and stores NaN as -inf (the notice names which), and on a driver whose fragment depth
+        //   is not measured (any other, and lavapipe releases not measured) the values Vulkan
+        //   leaves to it (outside `[0, 1]`, denormals, -0) may land changed: the device forces
         //   those edges, as a fragment's depth reaches the attachment through the device's depth
         //   unit, which clamps and flushes them, and no other write of a multisampled depth exists
         //   there. Relayed on the rule for native devices: as close as the hardware allows, the
@@ -2226,7 +2342,24 @@ mod tests {
         //     passes `Equal` and fails `Greater` against it where Metal's fails and passes, as
         //     the notice says. No exact form is the device's but a depth test run in the shader,
         //     an interpreter's, which the rule for native devices does not ask for.
-        const PRECISION: [D; 12] = [
+        // - `ExactFormsOverCompilerLimit`: only a device made with exact forms
+        //   (`REIMS_VGPU_EXACT`, [`crate::platform`]'s `exact_policy`) meets it. A render, mesh
+        //   render, tile render or compute pipeline whose largest stage module under those forms
+        //   passes the device's compiler word bound (ANV's register allocator faults past it) takes
+        //   the default policy's native forms for the forms the notice names, so its answers are
+        //   the default's, within the bounds docs/accuracy-ledger.md states, and the reduced stages
+        //   announce their own precision notes, each placed by its kind.
+        // - `FloatTininessAfterRounding`: the device's maths under the default's native device
+        //   maths, whose exact form is the device policy's opt-in (`float_maths`), as
+        //   `NativeFma`'s: a `float` product or fused multiply-add within half a unit below
+        //   `2^-126` answers `2^-126` of its sign where Metal flushes it to the zero of its sign.
+        //   MoltenVK's float functions are Metal's own, so a device that runs on Metal never
+        //   announces it, and on a native device it would be relayed as `NativeFma` is
+        //   ([`native::NATIVE_RELAYED`]). It is announced once, as the runtime makes the device,
+        //   before this platform adopts the device's class ([`crate::gpu::device`]'s `adopt`), where
+        //   a kind of [`DIES`] would die in strict mode on every native device's first creation:
+        //   relayed instead, the same answer on every device.
+        const PRECISION: [D; 14] = [
             D::UncalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
@@ -2239,6 +2372,8 @@ mod tests {
             D::UnmeasuredUniqueIdentifier,
             D::IndirectValuePastRecord,
             D::DepthDenormals,
+            D::ExactFormsOverCompilerLimit,
+            D::FloatTininessAfterRounding,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and
@@ -2318,7 +2453,11 @@ mod tests {
         // position or order; then, as the class of a native device's own maths and sampling, the
         // device's maths
         // and sampling, each with its bound or the runtime's record of it, the notes of the
-        // runtime's native defaults off Apple's GPUs last.
+        // runtime's native defaults off Apple's GPUs last, the device's resolve
+        // (`DeviceRoundedResolve`) among them. With these, and every device on the exact
+        // completion (`GroupedCompletion` never announced), a strict run on Mesa's drivers, this
+        // crate's tests on Linux among them, dies neither at a grouped submission nor at a
+        // resolve the device averages.
         let natively: Vec<D> = native::NATIVE_RELAYED.iter().map(|r| r.kind).collect();
         assert_eq!(
             natively,
@@ -2343,6 +2482,7 @@ mod tests {
                 D::SrgbTexelDecode,
                 D::BicubicFilterArithmetic,
                 D::HalfTexelConversion,
+                D::DeviceSampleLevel,
                 D::NativeTranscendentals,
                 D::NativeDivision,
                 D::NativeFma,
@@ -2354,17 +2494,23 @@ mod tests {
                 D::NativeHalfQuantize,
                 D::DeviceSampling,
                 D::DeviceTexelConversion,
+                D::DecodedTexelPrecision,
+                D::DeviceRoundedResolve,
             ]
         );
         // These stay deaths on native devices too, as neither a fact of the device nor the
         // class of the device's own maths and sampling covers them: two precision notes
-        // are other values, not other bits, the third is where Apple's compiler places an
-        // operation, Metal's rule for tessellation factors is not read, blending and storage are
-        // neither maths nor sampling, and the anisotropic emulation is a fitted model.
+        // are other values, not other bits, the next two are where Apple's compiler places or
+        // speculates an operation, Metal's rule for tessellation factors is not read, blending,
+        // storage, an attachment's memory read in place, a heap texture's compressed image, a
+        // pass's tile store and when a command buffer is seen complete are neither maths nor
+        // sampling, and the anisotropic emulation is a fitted model.
         for kind in [
             D::TessellationFactorInstance,
             D::Fp8Value,
             D::QuadsCountedBeforeDiscard,
+            D::UnmeasuredGroupSpeculation,
+            D::AttachmentReadInPlace,
             D::TessellationFactorScale,
             D::BlendedWriteRounding,
             D::RotatedBlendRounding,
@@ -2372,6 +2518,10 @@ mod tests {
             D::DeviceNanEncoding,
             D::TessellationWinding,
             D::TessellationFactorEdgeCases,
+            D::HeapTextureCompressed,
+            D::SnormMinimumKept,
+            D::SharedExponentKept,
+            D::GroupedCompletion,
         ] {
             assert!(DIES.contains(&kind) && !native::relayed(kind), "{kind:?}");
         }
@@ -2484,7 +2634,6 @@ mod tests {
         for kind in Inexact::ALL {
             match kind {
                 Inexact::HalfOutputBlend
-                | Inexact::RoundedResolve
                 | Inexact::Clear
                 | Inexact::BfloatLoaded
                 | Inexact::WriteRounding

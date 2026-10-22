@@ -7,8 +7,8 @@
 //! reference is shared by the handle (for `iosurface`) and the runtime's deallocator of the
 //! no-copy buffer over the surface's memory, which lets it go when the runtime releases the
 //! buffer, after the last command buffer that used it. A command buffer that may reach a released
-//! texture on the surface through its resource ID alone, or that made its image's first move,
-//! keeps that image's memory and not the buffer, so it holds no reference of the surface.
+//! texture on the surface through its resource ID alone keeps that image's memory and not the
+//! buffer, so it holds no reference of the surface.
 
 use std::ptr::NonNull;
 use std::sync::atomic::AtomicU64;
@@ -4245,6 +4245,39 @@ pub(crate) mod tests {
             line.contains("heap-texture-block-compressed-layout"),
             "{line}"
         );
+    }
+
+    /// A writable heap of 4 KiB over a page of the guest's, as core's detach heap makes one of
+    /// an x86_64 guest's pages, is made on every host. The runtime's heap covers 16 KiB
+    /// ([`crate::gpu::backing::HEAP_GRANULE`]), so on a host of 4 KiB pages its alias has zeros
+    /// past the page: on Linux a file of their own, which the runtime imports with the guest's
+    /// page as dma-bufs (`crate::gpu::backing::gather`); anonymous zeros beside them would import
+    /// neither as host memory nor as a dma-buf
+    #[test]
+    fn a_heap_over_less_than_its_granule_is_made() {
+        use reims_vgpu_core::platform::types::ResourceAddressRange;
+
+        const SIZE: u64 = 0x1000;
+        let (p, d) = (platform(), dev());
+        // Left mapped: the heap's alias shares them until the process ends.
+        let pages = crate::os::allocate_aliasable(SIZE).unwrap();
+        let ranges = p
+            .new_address_range_array(&[ResourceAddressRange {
+                address: u64::try_from(pages.addr()).unwrap(),
+                length: SIZE,
+            }])
+            .unwrap();
+        let desc = HeapDesc {
+            size: SIZE,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+            address_ranges: Some(&ranges),
+            pinned_gpu_address: None,
+        };
+        *crate::answer::LAST_LINE.lock() = None;
+        let made = catch_death(|| d.new_heap(&desc).unwrap().heap.is_some());
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert!(matches!(made, Ok(true)), "{line}");
     }
 
     /// The least size of [`heap_over_pages`]' heaps ([`over_pages`]).

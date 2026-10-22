@@ -184,7 +184,8 @@
 // host screen the window opens on, in place of the config's size; rvg_display_set_modes still
 // replaces the modes. With RvgWindowConfig's `mode_width` and `mode_height`, the modes are that
 // mode and the standard sizes within it, at a 1× density or `mode_pixels_per_inch`'s; without,
-// the screen's own, at its density.
+// the screen's own, at its density. With no screen to match (as with no window system to
+// reach), they are those of the config's mode, or of 1920 × 1080 at 1× without one, at 60 Hz.
 #define RVG_WINDOW_MATCH_HOST_SCREEN 1
 
 // The left button, in an RvgWindowPointerFn's `buttons`.
@@ -420,7 +421,8 @@ typedef struct {
   // Run each isolated guest task with the task service's semantics (needs a memory map).
   bool process_isolation;
   // Withhold argument buffers from the guest. They are offered only with process isolation, on
-  // a Metal device that can detach backing and is not itself paravirtual.
+  // a Metal device that can detach backing and is not itself paravirtual, and, with
+  // `process_isolation_follows_guest`, only while the IOSurface device has a descriptor table.
   bool disable_argument_buffers;
   // The guest's RAM, or NULL to reach it through the host callbacks.
   const RvgMemoryMap *memory_map;
@@ -437,6 +439,15 @@ typedef struct {
   // not a multiple of the host's page size: RVG_ERR_INVALID_ARGUMENT, in that order, before
   // any file is duplicated.
   const RvgMemoryRangeFile *memory_files;
+  // With `process_isolation`: isolate a guest task other than task 0 only when, as the guest
+  // defines it, the RvgIOSurfaceDevice the device maps through (`use_iosurface_mapper`) has a
+  // descriptor table base other than 0; otherwise the task runs as without isolation. The
+  // guest's mapper driver writes the base at its start, before Apple's arm64 GPU driver makes
+  // a task. Apple's x86-64 driver never touches the IOSurface device, and references
+  // IOSurfaces through task 0's backings, which an isolated task does not serve. Device info's
+  // argument-buffer answer follows the same rule, read when the guest asks, since only
+  // isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
+  bool process_isolation_follows_guest;
 } RvgDeviceConfig;
 
 // Bytes the library allocated; free them with rvg_bytes_free.
@@ -630,7 +641,8 @@ typedef struct {
   // guest runs a 1× desktop at that mode (measured up to 3811 pixels wide; 5832 ran HiDPI)
   // and the window scales it to its size on the GPU; `mode_pixels_per_inch` tells another
   // density. 0 in either is none: the screen's own modes, at its density. Ignored without
-  // the flag.
+  // the flag. With no screen to match, the mode is offered at 60 Hz, and none is 1920 × 1080
+  // at 1×.
   uint16_t mode_width;
   // As `mode_width`.
   uint16_t mode_height;
@@ -885,7 +897,8 @@ void rvg_device_did_resume(RvgDevice *device);
 // its scale factor and its first modes are those of the window's host screen, where there is
 // one, or, with the window config's mode, that mode's at a 1× density or the config's
 // `mode_pixels_per_inch`, and the screen's refresh rate; a later rvg_display_set_modes
-// replaces the modes.
+// replaces the modes. With no screen, the size, scale factor and first modes are those of the
+// config's mode, or of 1920 × 1080 at 1× without one, at 60 Hz.
 //
 // # Safety
 // `device` is NULL or a live device handle; `config` is NULL or a live config; `display` is
