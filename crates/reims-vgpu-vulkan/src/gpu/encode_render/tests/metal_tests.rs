@@ -656,6 +656,161 @@ fn private_primitive_types_draw_as_on_metal() {
     assert!(drawn > 40, "{drawn} draws drew anything");
 }
 
+/// The functions of a state whose colour is each primitive's `[[primitive_id]]`.
+const PRIMITIVES: (&str, &str) = ("vertex_ids:ids_vertex", "vertex_ids:primitive_fragment");
+
+/// Quads and quad strips, of which Metal counts a quad one primitive, give a fragment function's
+/// `[[primitive_id]]` as Metal's, directly at every count from 4 to 10, from vertex 0 and from
+/// vertex 2 as two instances, at `setProvokingVertexMode:` 0 and 1; over indices and from
+/// indirect arguments in `private_types_draw_over_indices_and_arguments_as_metals`
+#[test]
+fn quads_give_metals_primitive_ids() {
+    let (p, d) = (platform(), dev());
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    for primitive_type in [7, 8] {
+        for count in 4..=10 {
+            for (start, instances) in [(0, 1), (2, 2)] {
+                for mode in [0, 1] {
+                    let draw = (primitive_type, start, count, instances);
+                    let ours = flat_pass(&p, &d, PRIMITIVES, mode, draw);
+                    assert!(ours != clear, "{draw:?} at mode {mode}");
+                    let theirs = flat_pass(&mp, &md, PRIMITIVES, mode, draw);
+                    assert!(ours == theirs, "{draw:?} at mode {mode}");
+                }
+            }
+        }
+    }
+}
+
+/// Metal's private types, and its public ones but points (which this state, of no point size,
+/// does not size), drawn directly from a vertex start whose last vertex passes `i32::MAX`
+/// (`2^31 - 3`, `2^31 + 3`, and `2^32 - 4`, whose vertex IDs wrap past `u32::MAX`), of one instance
+/// and two, draw what Metal draws, pixel for pixel, each vertex's `[[vertex_id]]` and the draw's
+/// `[[base_vertex]]` Metal's (`wrapped_vertex`), at `setProvokingVertexMode:` 0 and 1, but lines,
+/// line strips and the line loop's lines at 1 (`lines_take_metals_flat_inputs_at_the_last_vertex`).
+/// A public type's at 1 the runtime draws as the list of its primitives too, where it refused one
+#[test]
+fn private_types_from_far_vertex_starts_draw_as_metals() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    let mut differ = Vec::new();
+    for t in 1..=8 {
+        let modes: &[u64] = if matches!(t, 1 | 2 | 5) {
+            &[0]
+        } else {
+            &[0, 1]
+        };
+        for start in [(1 << 31) - 3, (1 << 31) + 3, (1 << 32) - 4] {
+            for (count, instances) in [(8, 1), (10, 2)] {
+                for &mode in modes {
+                    let draw = (t, start, count, instances);
+                    *crate::answer::LAST_LINE.lock() = None;
+                    let ours = catch_death(|| flat_pass(&p, &d, wrapped, mode, draw));
+                    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                    let ours = match ours {
+                        Ok(ours) => ours,
+                        Err(site) => {
+                            differ
+                                .push(format!("{draw:?} at mode {mode}: died at {site:?}: {line}"));
+                            continue;
+                        }
+                    };
+                    if ours == clear {
+                        differ.push(format!("{draw:?} at mode {mode}: drew nothing"));
+                    }
+                    if let Some((mp, md)) = &metal {
+                        let theirs = flat_pass(mp, md, wrapped, mode, draw);
+                        if ours != theirs {
+                            differ.push(format!("{draw:?} at mode {mode}: pixels differ"));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
+}
+
+/// Indices of twelve vertices out of order; of twelve with 3 again among them, which a quad strip
+/// restarts at after `setPrimitiveRestartEnabled:index:` of 3 and the other private types take as
+/// a vertex; and of twelve with the 16-bit all-ones index (the 32-bit one at the same place)
+/// after six, which a quad strip restarts at.
+const SCRAMBLED: &[u32] = &[5, 0, 9, 1, 7, 3, 2, 8, 4, 10, 11, 6];
+const SCRAMBLED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 5, 6, 3, 7, 8, 9, 10, 11];
+const QUADS_RESTARTED: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff, 6, 7, 8, 9, 10, 11];
+const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9, 10, 11];
+
+/// Metal's private types 5 to 8 draw what Metal draws over 16- and 32-bit indices, from a base
+/// vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad strip restarting at
+/// its index type's all-ones index, and from indirect arguments, over indices too, at
+/// `setProvokingVertexMode:` 0 and 1, but the line loop's lines at 1
+/// (`lines_take_metals_flat_inputs_at_the_last_vertex`), and as an indirect command buffer's
+/// command, over its vertices and over indices, inheriting the encoder's state and buffers or
+/// with its own: under a state whose colour is each vertex's, flat, one whose colour is its
+/// provoking vertex's `[[vertex_id]]`, and one whose colour is its primitive's
+/// `[[primitive_id]]`. All but a fan or quads after the restart index set draw something
+#[test]
+fn private_types_draw_over_indices_and_arguments_as_metals() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    let executed = |inherits, primitive_type, count, indices| Provoked::Executed {
+        inherits,
+        primitive_type,
+        count,
+        indices,
+    };
+    let clear = vec![[0, 0, 0, 0xff]; 256];
+    let mut blank = 0;
+    for t in 5..=8 {
+        let mut cases = vec![
+            (over((t, U16), SCRAMBLED, (1, 2)), None),
+            (over((t, U32), SCRAMBLED, (0, 1)), None),
+            (over((t, U16), SCRAMBLED_AT_3, (0, 1)), Some((true, 3))),
+            (Provoked::Indirect(t, [10, 1, 2, 0]), None),
+            (Provoked::Indirect(t, [9, 2, 0, 0]), None),
+            (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
+            (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+            (executed(false, t, 10, None), None),
+            (executed(true, t, 9, None), None),
+            (executed(false, t, 0, Some((U16, SCRAMBLED))), None),
+            (executed(true, t, 0, Some((U32, SCRAMBLED))), None),
+        ];
+        if t == 8 {
+            cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
+            cases.push((over((t, U32), QUADS_RESTARTED_WIDE, (0, 1)), None));
+        }
+        let modes: &[u64] = if t == 5 { &[0] } else { &[0, 1] };
+        for (draw, restart) in cases {
+            for functions in [FLAT, ids, PRIMITIVES] {
+                for &mode in modes {
+                    let ours = provoked(&p, &d, functions, (mode, restart), draw);
+                    blank += usize::from(ours == clear);
+                    if let Some((mp, md)) = &metal {
+                        let theirs = provoked(mp, md, functions, (mode, restart), draw);
+                        assert!(ours == theirs, "{draw:?} of {functions:?} at mode {mode}");
+                    }
+                }
+            }
+        }
+    }
+    assert!(blank <= 12, "{blank} draws drew nothing");
+}
+
 /// The pixels of [`pass_pixels`] after `instances` instances of `count` of [`scattered`]'s
 /// vertices from `start`, as `primitive_type`, under `setProvokingVertexMode:` of `mode` and
 /// a state of the fixtures `functions`, over [`flat_vertices`] in buffers 0 and 1.
@@ -725,75 +880,644 @@ fn set_draw<P: Platform>(
     )
 }
 
-/// A list or strip of triangles under a state with a flat input draws what Metal draws at
-/// every provoking vertex mode, the last vertex's colour filling each triangle after a
-/// nonzero one, from vertex 0 and later, one instance and two
+/// A guest's state of the fixtures `vertex` and `fragment` for a BGRA8 target, with the render
+/// descriptor's `entries` past its functions' (key 11 the input primitive topology class, 12 the
+/// tessellation partition mode, 25 indirect command buffer support), decoded from a blob as core
+/// decodes one.
+fn blob_state<P: Platform>(
+    d: &P::Device,
+    (vertex, fragment): (&str, &str),
+    entries: &[&str],
+) -> P::RenderPipeline {
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::serialized::tests::hex;
+
+    let functions = [fixture::<P>(d, vertex), fixture::<P>(d, fragment)];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    // The colour attachments' array follows the entries, its own entry among them, at a 4-byte
+    // boundary.
+    let n = entries.len() + 3;
+    let end = 1 + 6 * n;
+    let at = end.next_multiple_of(4);
+    let blob = hex(&format!(
+        "{n:02x} 08 04 {at:02x}000000 01 04 01000000 02 04 02000000 {} {} \
+         01000000 08000000 02 00 04 00000000 01 04 50000000",
+        entries.join(" "),
+        "00".repeat(at - end)
+    ));
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
+        .unwrap()
+        .unwrap()
+        .unwrap()
+}
+
+/// A draw of [`provoked`]'s: `(type, start, count, instances)` over the vertices; over `indices`
+/// of an index type, from a base vertex, of instances; from indirect arguments, over `indices`
+/// too; or an execution of an indirect command buffer's one command of a type, of `count` vertices
+/// from vertex 0, or of `indices` of an index type where it has them, which inherits the
+/// encoder's state and buffers or sets its own.
+#[derive(Clone, Copy, Debug)]
+enum Provoked<'a> {
+    Vertices(u64, u64, u64, u64),
+    Indices {
+        primitive_type: u64,
+        index_type: u64,
+        indices: &'a [u32],
+        base_vertex: i64,
+        instances: u64,
+    },
+    Indirect(u64, [u32; 4]),
+    IndexedIndirect {
+        primitive_type: u64,
+        index_type: u64,
+        indices: &'a [u32],
+        arguments: [u32; 5],
+    },
+    Executed {
+        inherits: bool,
+        primitive_type: u64,
+        count: u64,
+        indices: Option<(u64, &'a [u32])>,
+    },
+}
+
+/// The bytes of `indices` as indices of `index_type`, a 16-bit one each index's low half.
+fn index_bytes(index_type: u64, indices: &[u32]) -> Vec<u8> {
+    if index_type == U16 {
+        let low = |i: u32| u16::try_from(i & 0xffff).unwrap();
+        indices.iter().flat_map(|&i| low(i).to_le_bytes()).collect()
+    } else {
+        u32s(indices)
+    }
+}
+
+/// The pixels of [`pass_pixels`] after `draw` under a state of the fixtures `functions` (of
+/// indirect command buffer support for an execution) over [`flat_vertices`] in buffers 0 and 1,
+/// at `setProvokingVertexMode:` of `mode`, after `restart`'s `setPrimitiveRestartEnabled:index:`
+/// where it has one.
+fn provoked<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    functions: (&str, &str),
+    (mode, restart): (u64, Option<(bool, u64)>),
+    draw: Provoked<'_>,
+) -> Vec<[u8; 4]> {
+    use reims_vgpu_core::platform::icb::{
+        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+    };
+    use reims_vgpu_core::platform::values::IcbDesc;
+
+    let executed = matches!(draw, Provoked::Executed { .. });
+    let entries: &[&str] = if executed { &["19 04 01000000"] } else { &[] };
+    let state = blob_state::<P>(d, functions, entries);
+    let (pos, colours) = flat_vertices::<P>(d, 64);
+    let (index_buffer, indirect_buffer) = provoked_buffers::<P>(d, draw);
+    let icb = match draw {
+        Provoked::Executed {
+            inherits,
+            primitive_type,
+            count,
+            indices,
+        } => {
+            let icb = d
+                .new_indirect_command_buffer(
+                    &IcbDesc {
+                        // `MTLIndirectCommandTypeDrawIndexed`, or `Draw`.
+                        command_types: if indices.is_some() { 2 } else { 1 },
+                        inherit_pipeline_state: inherits,
+                        inherit_buffers: inherits,
+                        max_vertex_buffer_bind_count: 2,
+                        ..IcbDesc::default()
+                    },
+                    1,
+                    0,
+                )
+                .unwrap()
+                .unwrap();
+            let c = icb.render_command(0).unwrap().unwrap();
+            let mut cmds = Vec::new();
+            if !inherits {
+                cmds.extend([
+                    IcbRenderCmd::SetRenderPipelineState {
+                        pipeline_state: Some(&state),
+                    },
+                    IcbRenderCmd::SetVertexBuffer {
+                        buffer: Some(&pos),
+                        offset: 0,
+                        index: 0,
+                    },
+                    IcbRenderCmd::SetVertexBuffer {
+                        buffer: Some(&colours),
+                        offset: 0,
+                        index: 1,
+                    },
+                ]);
+            }
+            cmds.push(match indices {
+                Some((index_type, indices)) => IcbRenderCmd::DrawIndexedPrimitives {
+                    primitive_type,
+                    index_count: u64::try_from(indices.len()).unwrap(),
+                    index_type,
+                    index_buffer: Some(&index_buffer),
+                    index_buffer_offset: 0,
+                    instance_count: 1,
+                    base_vertex: 0,
+                    base_instance: 0,
+                },
+                None => IcbRenderCmd::DrawPrimitives {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: count,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
+            });
+            for cmd in cmds {
+                c.encode(cmd).unwrap();
+            }
+            Some(icb)
+        }
+        _ => None,
+    };
+    let used = icb.as_ref().map(|icb| {
+        [
+            Some(ResourceRef::Icb(icb)),
+            Some(ResourceRef::Buffer(&pos)),
+            Some(ResourceRef::Buffer(&colours)),
+            Some(ResourceRef::Buffer(&index_buffer)),
+        ]
+    });
+    let mut cmds = vec![
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&pos),
+            offset: 0,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&colours),
+            offset: 0,
+            index: 1,
+        },
+    ];
+    if let Some((enabled, index)) = restart {
+        cmds.push(RenderCmd::SetPrimitiveRestartEnabled { enabled, index });
+    }
+    cmds.push(RenderCmd::SetProvokingVertexMode { mode });
+    match provoked_draw(draw, (&index_buffer, &indirect_buffer)) {
+        Some(drawn) => cmds.push(drawn),
+        None => {
+            let (icb, used) = (icb.as_ref().unwrap(), used.as_ref().unwrap());
+            cmds.extend([
+                RenderCmd::UseResources {
+                    resources: used,
+                    usage: 1,
+                },
+                RenderCmd::ExecuteCommandsInBuffer {
+                    indirect_command_buffer: icb,
+                    execution_range: NsRange::new(0, 1),
+                },
+            ]);
+        }
+    }
+    pass_pixels(p, d, cmds)
+}
+
+/// The index and indirect buffers of `draw`, a draw of [`provoked`]'s, on `d`: its indices and its
+/// arguments, each empty where it has none.
+fn provoked_buffers<P: Platform>(d: &P::Device, draw: Provoked<'_>) -> (P::Buffer, P::Buffer) {
+    let (indices, arguments) = match draw {
+        Provoked::Indices {
+            index_type,
+            indices,
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
+        Provoked::Indirect(_, arguments) => (Vec::new(), u32s(&arguments)),
+        Provoked::IndexedIndirect {
+            index_type,
+            indices,
+            arguments,
+            ..
+        } => (index_bytes(index_type, indices), u32s(&arguments)),
+        Provoked::Executed {
+            indices: Some((index_type, indices)),
+            ..
+        } => (index_bytes(index_type, indices), Vec::new()),
+        _ => (Vec::new(), Vec::new()),
+    };
+    (
+        buffer::<P>(d, 256, 0, &indices),
+        buffer::<P>(d, 64, 0, &arguments),
+    )
+}
+
+/// The command of `draw`, a draw of [`provoked`]'s, over `index_buffer` and `indirect_buffer`
+/// ([`provoked_buffers`]); `None` for an execution, which [`provoked`] encodes itself.
+fn provoked_draw<'a, P: Platform>(
+    draw: Provoked<'_>,
+    (index_buffer, indirect_buffer): (&'a P::Buffer, &'a P::Buffer),
+) -> Option<RenderCmd<'a, P>> {
+    Some(match draw {
+        Provoked::Vertices(primitive_type, start, count, instances) => {
+            RenderCmd::DrawPrimitivesInstances {
+                primitive_type,
+                vertex_start: start,
+                vertex_count: count,
+                instance_count: instances,
+            }
+        }
+        Provoked::Indices {
+            primitive_type,
+            index_type,
+            indices,
+            base_vertex,
+            instances,
+        } => RenderCmd::DrawIndexedPrimitivesBase {
+            primitive_type,
+            index_count: u64::try_from(indices.len()).unwrap(),
+            index_type,
+            index_buffer,
+            index_buffer_offset: 0,
+            instance_count: instances,
+            base_vertex,
+            base_instance: 0,
+        },
+        Provoked::Indirect(primitive_type, _) => RenderCmd::DrawPrimitivesIndirect {
+            primitive_type,
+            indirect_buffer,
+            indirect_buffer_offset: 0,
+        },
+        Provoked::IndexedIndirect {
+            primitive_type,
+            index_type,
+            ..
+        } => RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type,
+            index_type,
+            index_buffer,
+            index_buffer_offset: 0,
+            indirect_buffer,
+            indirect_buffer_offset: 0,
+        },
+        Provoked::Executed { .. } => return None,
+    })
+}
+
+/// A draw of `indices` of `index_type` as `primitive_type`, from `base_vertex`, of `instances`.
+fn over<'a>(
+    (primitive_type, index_type): (u64, u64),
+    indices: &'a [u32],
+    (base_vertex, instances): (i64, u64),
+) -> Provoked<'a> {
+    Provoked::Indices {
+        primitive_type,
+        index_type,
+        indices,
+        base_vertex,
+        instances,
+    }
+}
+
+/// Indices of a list of three triangles, of a strip of six, of a strip restarting at the 16-bit
+/// all-ones index after one triangle, then of five more (the 32-bit all-ones index at the same
+/// place), and of a strip of eleven indices restarting at 3 after one triangle.
+const LIST: &[u32] = &[5, 0, 9, 1, 7, 3, 2, 8, 4];
+const STRIP_OF_SIX: &[u32] = &[0, 3, 1, 4, 2, 5, 7, 6];
+const RESTARTED: &[u32] = &[0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 8];
+const RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 0xffff_ffff, 4, 5, 6, 7, 8];
+const RESTARTED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9];
+
+/// A state with a flat input draws at `setProvokingVertexMode:` 0 and 1 what Metal draws at
+/// every kind of draw of triangles: lists and strips over their vertices, from vertex 0 and
+/// later, of one instance and two; over 16- and 32-bit indices from a base vertex; strips
+/// restarting at the all-ones index and at the index `setPrimitiveRestartEnabled:index:` set,
+/// each piece its own parity; from indirect arguments, over indices too; Metal's private types
+/// 6 to 8; and an execution of an indirect command buffer's strip or list, whose commands take
+/// the first vertex at both modes, inheriting the encoder's state or with their own. The last
+/// vertex's colours fill the triangles at mode 1, but an execution's. A draw of too few
+/// vertices for a triangle draws nothing at either mode
 #[test]
-fn a_flat_input_takes_the_provoking_vertex_metal_takes() {
+fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    let executed = |inherits, primitive_type, count| Provoked::Executed {
+        inherits,
+        primitive_type,
+        count,
+        indices: None,
+    };
+    let cases = [
+        (Provoked::Vertices(3, 0, 6, 1), None),
+        (Provoked::Vertices(3, 1, 9, 2), None),
+        (Provoked::Vertices(STRIP, 0, 5, 1), None),
+        (Provoked::Vertices(STRIP, 3, 8, 2), None),
+        (Provoked::Vertices(6, 2, 6, 2), None),
+        (Provoked::Vertices(7, 1, 8, 1), None),
+        (Provoked::Vertices(8, 0, 8, 1), None),
+        (over((3, U16), LIST, (2, 1)), None),
+        (over((3, U32), LIST, (0, 2)), None),
+        (over((STRIP, U16), STRIP_OF_SIX, (0, 1)), None),
+        (over((STRIP, U32), STRIP_OF_SIX, (1, 1)), None),
+        (over((STRIP, U16), RESTARTED, (0, 1)), None),
+        (over((STRIP, U32), RESTARTED_WIDE, (0, 2)), None),
+        (over((STRIP, U16), RESTARTED_AT_3, (0, 1)), Some((true, 3))),
+        (over((STRIP, U32), RESTARTED_AT_3, (0, 1)), Some((false, 3))),
+        (Provoked::Indirect(3, [9, 2, 1, 0]), None),
+        (Provoked::Indirect(STRIP, [8, 1, 3, 0]), None),
+        (indirect(STRIP, U16, RESTARTED, [10, 1, 0, 0, 0]), None),
+        (indirect(3, U32, LIST, [9, 1, 0, 2, 0]), None),
+        (executed(true, STRIP, 7), None),
+        (executed(false, STRIP, 7), None),
+        (executed(false, 3, 9), None),
+    ];
     let clear = vec![[0, 0, 0, 0xff]; 256];
-    for draw in [
-        (3, 0, 6, 1),
-        (3, 1, 10, 2),
-        (4, 0, 5, 1),
-        (4, 3, 8, 2),
-        (3, 0, 2, 1),
-        (4, 0, 2, 1),
-    ] {
-        let first = flat_pass(&p, &d, FLAT, 0, draw);
-        let last = flat_pass(&p, &d, FLAT, 1, draw);
-        assert_eq!(flat_pass(&p, &d, FLAT, 7, draw), last, "{draw:?}");
-        if draw.2 >= 3 {
-            assert_ne!(first, last, "{draw:?}: the last vertex's colours");
-            assert_ne!(last, clear, "{draw:?}");
-        } else {
-            assert_eq!(last, clear, "{draw:?}");
-        }
+    for (draw, restart) in cases {
+        let first = provoked(&p, &d, FLAT, (0, restart), draw);
+        let last = provoked(&p, &d, FLAT, (1, restart), draw);
+        assert_ne!(first, clear, "{draw:?}");
+        let execution = matches!(draw, Provoked::Executed { .. });
+        assert_eq!(first == last, execution, "{draw:?}");
         if let Some((mp, md)) = &metal {
             for (mode, ours) in [(0, &first), (1, &last)] {
-                let theirs = flat_pass(mp, md, FLAT, mode, draw);
-                assert_eq!(*ours, theirs, "{draw:?} at mode {mode}");
+                let theirs = provoked(mp, md, FLAT, (mode, restart), draw);
+                assert!(*ours == theirs, "{draw:?} at mode {mode}");
+            }
+        }
+    }
+    for draw in [
+        Provoked::Vertices(3, 0, 2, 1),
+        Provoked::Vertices(STRIP, 0, 2, 1),
+    ] {
+        for mode in [0, 1] {
+            assert_eq!(
+                provoked(&p, &d, FLAT, (mode, None), draw),
+                clear,
+                "{draw:?}"
+            );
+        }
+    }
+}
+
+/// The set of colours `pixels` hold, black aside.
+fn colours_of(pixels: &[[u8; 4]]) -> std::collections::BTreeSet<[u8; 4]> {
+    (pixels.iter().copied())
+        .filter(|&px| px != [0, 0, 0, 0xff])
+        .collect()
+}
+
+/// A state with a flat input draws lines, line strips and Metal's line loop at
+/// `setProvokingVertexMode:` 0 as Metal does, over their vertices, over indices (restarting too)
+/// and from indirect arguments. At 1 it draws them as Metal does where the device has the last
+/// vertex; elsewhere the runtime draws each line from its last vertex to its first, which dies in
+/// strict mode (`provoking-vertex-lines`), and by default draws, relayed, the colours Metal's
+/// lines take, over pixels a few of which differ from Metal's
+#[test]
+fn lines_take_metals_flat_inputs_at_the_last_vertex() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let kind = rt::Degradation::ProvokingVertexLines;
+    for draw in [
+        Provoked::Vertices(1, 0, 8, 1),
+        Provoked::Vertices(2, 3, 7, 2),
+        Provoked::Vertices(5, 0, 6, 1),
+        over((1, U16), STRIP_OF_SIX, (0, 1)),
+        over((2, U16), RESTARTED, (0, 1)),
+        Provoked::Indirect(2, [7, 1, 3, 0]),
+    ] {
+        let first = provoked(&p, &d, FLAT, (0, None), draw);
+        let native = super::last_vertex_native();
+        let last = if native {
+            provoked(&p, &d, FLAT, (1, None), draw)
+        } else {
+            crate::answer::dies_of(kind, || provoked(&p, &d, FLAT, (1, None), draw));
+            let before = super::relayed_kind(kind);
+            let last = crate::answer::relaxed(|| provoked(&p, &d, FLAT, (1, None), draw));
+            assert!(super::relayed_kind(kind) > before, "{draw:?}");
+            last
+        };
+        assert!(first != last, "{draw:?}");
+        if let Some((mp, md)) = &metal {
+            assert!(first == provoked(mp, md, FLAT, (0, None), draw), "{draw:?}");
+            let theirs = provoked(mp, md, FLAT, (1, None), draw);
+            if native {
+                assert!(last == theirs, "{draw:?}");
+            } else {
+                assert_eq!(colours_of(&last), colours_of(&theirs), "{draw:?}");
             }
         }
     }
 }
 
-/// At the last vertex, a state whose fragment function reads `[[barycentric_coord]]` and no
-/// flat input draws a list of triangles as it stands, as Metal draws it, and dies at a strip,
-/// whose odd triangles' weights Metal moves; one that also reads a flat input dies at both,
-/// as its rotated draw would move them. At the first vertex all of them draw
+/// At `setProvokingVertexMode:` 1, a state whose fragment function reads `[[barycentric_coord]]`
+/// and no flat input draws what Metal draws: a list's weights in mode 0's order and a strip's odd
+/// triangles' moved, over their vertices, over indices, restarting, from indirect arguments, and
+/// Metal's triangle fan. One that also reads a flat input draws as Metal does where the device
+/// has the last vertex; elsewhere the runtime draws its triangles from their last vertices, their
+/// first weights Metal's and the other two Metal's but for rounding, which dies in strict mode
+/// (`provoking-vertex-unmatched`). At mode 0 all of them draw as Metal's
 #[test]
-fn a_barycentric_reader_draws_only_lists_at_the_last_vertex() {
+fn barycentric_weights_take_metals_order_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let smooth = ("barycentric:smooth_vertex", "barycentric:smooth_weights");
     let flat = ("barycentric:flat_vertex", "barycentric:flat_weights");
-    let list = (3, 1, 9, 2);
-    let ours = flat_pass(&p, &d, smooth, 1, list);
-    assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(ours, flat_pass(&mp, &md, smooth, 1, list));
-    }
-    let draw = "drawPrimitives:vertexStart:vertexCount:";
-    for (functions, list_draws) in [(smooth, true), (flat, false)] {
-        let (e, _indices) = drawing_encoder(functions.0, functions.1);
-        send_all(&e, vec![three(3, None), three(STRIP, None)]);
-        send_all(&e, vec![RenderCmd::SetProvokingVertexMode { mode: 1 }]);
-        if list_draws {
-            send_all(&e, vec![three(3, None)]);
-        } else {
-            assert_eq!(dies_at(&e, three(3, None)), draw, "{functions:?}");
+    let draws = [
+        Provoked::Vertices(3, 1, 9, 2),
+        Provoked::Vertices(STRIP, 3, 8, 1),
+        Provoked::Vertices(6, 0, 6, 1),
+        over((STRIP, U16), STRIP_OF_SIX, (0, 1)),
+        over((STRIP, U16), RESTARTED, (0, 1)),
+        Provoked::Indirect(STRIP, [8, 1, 3, 0]),
+    ];
+    for draw in draws {
+        for mode in [0, 1] {
+            let ours = provoked(&p, &d, smooth, (mode, None), draw);
+            assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256], "{draw:?}");
+            if let Some((mp, md)) = &metal {
+                let theirs = provoked(mp, md, smooth, (mode, None), draw);
+                assert!(ours == theirs, "{draw:?} at mode {mode}");
+            }
         }
-        assert_eq!(dies_at(&e, three(STRIP, None)), draw, "{functions:?}");
+    }
+    for draw in [
+        Provoked::Vertices(3, 1, 9, 1),
+        Provoked::Vertices(STRIP, 3, 8, 1),
+        over((3, U16), LIST, (0, 1)),
+    ] {
+        let first = provoked(&p, &d, flat, (0, None), draw);
+        let kind = rt::Degradation::ProvokingVertexUnmatched;
+        let last = if super::last_vertex_native() {
+            Some(provoked(&p, &d, flat, (1, None), draw))
+        } else {
+            crate::answer::dies_of(kind, || provoked(&p, &d, flat, (1, None), draw));
+            None
+        };
+        if let Some((mp, md)) = &metal {
+            assert!(first == provoked(mp, md, flat, (0, None), draw), "{draw:?}");
+            if let Some(last) = last {
+                assert!(last == provoked(mp, md, flat, (1, None), draw), "{draw:?}");
+            }
+        }
     }
 }
 
-/// A draw over indices of its own, of a private type or of a list or strip of triangles at
-/// the last vertex under a state that reads a flat input, gives each vertex's
-/// `[[vertex_id]]` as Metal's non-indexed draw gives it, its indices relative to its first
-/// vertex, its base vertex
+/// The pixels of [`pass_pixels`] after a draw of two triangle patches of `corner_patch_vertex`
+/// and `ids_fragment` (`vertex_ids.metal`), each tessellated at factor 1, at
+/// `setProvokingVertexMode:` of `mode`: each patch's triangle in the colour of the corner its
+/// provoking vertex lies at.
+fn patch_pixels<P: Platform>(p: &P, d: &P::Device, mode: u64) -> Vec<[u8; 4]> {
+    let functions = ("vertex_ids:corner_patch_vertex", "vertex_ids:ids_fragment");
+    let state = blob_state::<P>(d, functions, &["0c 04 01000000"]);
+    let corners = [
+        -0.9, -0.9, 0.9, -0.8, 0.1, 0.9, 0.9, 0.9, -0.9, 0.8, -0.1, -0.9,
+    ];
+    let corners = buffer::<P>(d, 64, 0, &bytes(&corners));
+    let factors = buffer::<P>(d, 64, 0, &[0x00, 0x3c].repeat(8));
+    pass_pixels(
+        p,
+        d,
+        vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetVertexBuffer {
+                buffer: Some(&corners),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::SetTessellationFactorBuffer {
+                buffer: Some(&factors),
+                offset: 0,
+                instance_stride: 0,
+            },
+            RenderCmd::SetProvokingVertexMode { mode },
+            RenderCmd::DrawPatches {
+                number_of_patch_control_points: 3,
+                patch_start: 0,
+                patch_count: 2,
+                patch_index_buffer: None,
+                patch_index_buffer_offset: 0,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        ],
+    )
+}
+
+/// Triangle patches draw at `setProvokingVertexMode:` 0 what Metal draws, each triangle in its
+/// first vertex's flat colour, where Metal's mode 1 takes another. Where the device lacks the
+/// last vertex, the runtime takes the first at mode 1 too, relayed (`provoking-vertex-unmatched`);
+/// where it has it, it relays nothing of the provoking vertex. At a mode from 2 up they draw as
+/// at mode 0, as Metal's do, relaying nothing. A patch draw dies in strict mode on every device
+/// here ([`super::patch_draw_death`]), so each runs by default
+#[test]
+fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
+    let (p, d) = (platform(), dev());
+    let kind = rt::Degradation::ProvokingVertexUnmatched;
+    let first = crate::answer::relaxed(|| patch_pixels(&p, &d, 0));
+    assert_ne!(first, vec![[0, 0, 0, 0xff]; 256]);
+    let before = super::relayed_kind(kind);
+    let last = crate::answer::relaxed(|| patch_pixels(&p, &d, 1));
+    let native = super::last_vertex_native();
+    assert_eq!(super::relayed_kind(kind) > before, !native);
+    if !native {
+        assert!(last == first);
+    }
+    for mode in [2, u64::MAX] {
+        let before = super::relayed_kind(kind);
+        let third = crate::answer::relaxed(|| patch_pixels(&p, &d, mode));
+        assert!(third == first, "{mode:#x}");
+        assert_eq!(super::relayed_kind(kind), before, "{mode:#x}");
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        let theirs = patch_pixels(&mp, &md, 0);
+        assert!(first == theirs);
+        assert!(patch_pixels(&mp, &md, 1) != theirs);
+        for mode in [2, u64::MAX] {
+            assert!(patch_pixels(&mp, &md, mode) == theirs, "Metal at {mode:#x}");
+        }
+    }
+}
+
+/// Metal draws every `setProvokingVertexMode:` mode from 2 up alike, its top bit set or not: a
+/// list's triangles as at mode 1, and a strip, a line strip and points as at neither 0 nor 1.
+/// This platform draws each as mode 1: a list's triangles as Metal's, relaying nothing, and the
+/// strip, the line strip and the sized points relayed at the draw (`provoking-vertex-unmatched`,
+/// which dies there in strict mode)
+#[test]
+fn modes_past_1_draw_metals_third_way() {
+    let (p, d) = (platform(), dev());
+    let modes = [
+        2,
+        7,
+        0xff,
+        0x8000_0000,
+        0xffff_ffff,
+        1 << 32,
+        1 << 62,
+        (1 << 63) - 1,
+        1 << 63,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+    let kind = rt::Degradation::ProvokingVertexUnmatched;
+    let list = (FLAT, Provoked::Vertices(3, 1, 9, 1));
+    let others = [
+        (FLAT, Provoked::Vertices(STRIP, 0, 7, 1)),
+        (FLAT, Provoked::Vertices(2, 3, 7, 1)),
+        (SIZED, Provoked::Vertices(0, 0, 3, 1)),
+    ];
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    for (at, (functions, draw)) in [list].into_iter().chain(others).enumerate() {
+        let ours =
+            |mode| crate::answer::relaxed(|| provoked(&p, &d, functions, (mode, None), draw));
+        let last = ours(1);
+        for mode in modes {
+            let before = super::relayed_kind(kind);
+            assert!(ours(mode) == last, "{draw:?} at {mode:#x}");
+            let relayed = super::relayed_kind(kind) > before;
+            assert_eq!(relayed, at != 0, "{draw:?} at {mode:#x}");
+        }
+        let Some((mp, md)) = &metal else {
+            continue;
+        };
+        let theirs = |mode| provoked(mp, md, functions, (mode, None), draw);
+        let third = theirs(2);
+        for mode in modes {
+            assert!(theirs(mode) == third, "{draw:?} at {mode:#x}");
+        }
+        if at == 0 {
+            assert!(third == last, "{draw:?}");
+        } else {
+            assert!(third != theirs(0) && third != theirs(1), "{draw:?}");
+        }
+    }
+}
+
+/// A draw the runtime draws over a list of its own, of a private type, or of a list or strip of
+/// triangles at the last vertex under a state that reads a flat input without the device's last
+/// vertex, gives each vertex's `[[vertex_id]]` as Metal's non-indexed draw gives it
 #[test]
 fn re_indexed_draws_keep_metals_vertex_ids() {
     let (p, d) = (platform(), dev());
@@ -1036,11 +1760,12 @@ fn commit_dies(cmds: Vec<RenderCmd<'_, VulkanPlatform>>) -> String {
 /// An execution's draws of points die at the commit where a direct draw's die, its commands'
 /// records read as they stand then: under a state of its own that writes no `[[point_size]]`
 /// outside the point input primitive topology class, or under such a state of the encoder's
-/// that its commands inherit; and an execution of a buffer whose records the GPU may have
-/// written (a blit's reset of another of its commands) dies there too, as its commands are not
-/// read before they run. A draw of no points, and one under a state of the point class or one
-/// that writes its point size, own or inherited, draw as the direct draws do, which are Metal's
-/// ([`points_die_where_metal_sizes_none`]). A command buffer committed while a command buffer
+/// that its commands inherit. An execution of a buffer whose records the GPU may have written (a
+/// blit's reset of another of its commands) is asked at the runtime's host step instead, as its
+/// commands run (`gpu_written_points_die_at_the_host_step`). A draw of no points, and one under a
+/// state of the point class or one that writes its point size, own or inherited, draw as the
+/// direct draws do, which are Metal's ([`points_die_where_metal_sizes_none`]), the GPU-written
+/// buffer's included. A command buffer committed while a command buffer
 /// executes the buffer as its commit read it, and before it ends, dies at a blit's reset of
 /// the buffer's commands
 #[test]
@@ -1094,11 +1819,7 @@ fn executed_points_die_where_metal_sizes_none() {
     }
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
-    let line = commit_dies(execute_first(&written, None));
-    assert!(
-        line.contains("whose records the GPU may have written"),
-        "{line}"
-    );
+    assert_eq!(pass_pixels(&p, &d, execute_first(&written, None)), lit);
     // A reset while an execution that read the records waits.
     let read = points_icb(&d, Some(&classed), 3);
     let (_, pass) = pass_of(&p, &d, (16, 16));
@@ -1138,20 +1859,62 @@ fn executed_points_die_where_metal_sizes_none() {
     blit.encode(OnFault::Die, reset).unwrap();
 }
 
+reims_vgpu_core::death_test!(
+    /// An execution of a buffer whose records the GPU may have written (a blit's reset of another
+    /// of its commands) is asked at the runtime's host step, once the work before it completed:
+    /// its draw of points under a state of its own that writes no `[[point_size]]` outside the
+    /// point input primitive topology class dies there, at `commit`, as a commit that read the
+    /// records dies at it ([`executed_points_die_where_metal_sizes_none`])
+    gpu_written_points_die_at_the_host_step,
+    |_child| {
+        let (p, d) = (platform(), dev());
+        let unsizing = classed_state(
+            &d,
+            ("point_vertex", true),
+            PrimitiveTopologyClass::Unspecified,
+        );
+        let written = points_icb(&d, Some(&unsizing), 3);
+        let cb = (d.new_command_queue().unwrap())
+            .command_buffer(OnFault::Die)
+            .unwrap()
+            .unwrap();
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let reset = BlitCmd::ResetCommandsInBuffer {
+            buffer: &written,
+            range: NsRange::new(1, 1),
+        };
+        for cmd in [reset, BlitCmd::EndEncoding] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        pass_pixels(&p, &d, execute_first(&written, None));
+    },
+    |report| {
+        use reims_vgpu_core::raise::death::{DeathId, DeathKind};
+        report.assert_died(
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call: "commit",
+            }
+            .site(),
+        );
+    }
+);
+
 /// A draw of points, and an execution of commands that inherit the encoder's state, under a
-/// state of the point class whose vertex function can encode indirect commands die in an encoder that made resident for writing
-/// an indirect command buffer whose ID is not the runtime's (one made after a reservation the
-/// runtime is not given), as a compute dispatch does (`crate::gpu::encode_compute`); an execution
-/// whose command's own state can dies at the commit, which reads its record. A draw under a
-/// state that cannot runs, and so does one under the state that can where the buffer made
-/// resident for writing has the runtime's ID
+/// state of the point class whose vertex function can encode indirect commands run in an encoder
+/// that made resident for writing an indirect command buffer numbered past a reservation of 2
+/// and 2^23 + 1, which the runtime takes as Metal does, so the buffer's ID, 3, is the runtime's
+/// and Metal's alike, as a compute dispatch does (`crate::gpu::encode_compute`); so does an
+/// execution whose command's own state can, which its commit reads, a draw under a state that
+/// cannot, and one where the buffer made resident for writing is numbered 1
 #[test]
-fn work_that_can_encode_after_an_icb_made_writable_dies() {
+fn work_that_can_encode_after_an_icb_made_writable_runs() {
     use reims_vgpu_core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
     use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::raise::death::DeathKind;
 
     let (p, d) = (platform(), dev());
     d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
@@ -1169,7 +1932,10 @@ fn work_that_can_encode_after_an_icb_made_writable_dies() {
         .unwrap()
     };
     let (reaching, written) = (make(false), make(false));
-    assert!(reaching.reaches_its_records() && !written.reaches_its_records());
+    assert_eq!(
+        (reaching.gpu_resource_id(), written.gpu_resource_id()),
+        (1, 3)
+    );
     let encoding = classed_state(&d, ("encoding_vertex", true), PrimitiveTopologyClass::Point);
     let other = classed_state(&d, ("point_vertex", true), PrimitiveTopologyClass::Point);
     let drawn = || RenderCmd::DrawPrimitives {
@@ -1226,20 +1992,19 @@ fn work_that_can_encode_after_an_icb_made_writable_dies() {
         indirect_command_buffer: icb,
         execution_range: NsRange::new(0, 1),
     };
-    for (last, sel) in [
-        (drawn(), "drawPrimitives:vertexStart:vertexCount:"),
-        (execution(&inheriting), "executeCommandsInBuffer:withRange:"),
-    ] {
-        let (e, _dst) = open_encoder();
-        send_all(&e, opening(&encoding, "written"));
-        let site = catch_death(|| e.encode(OnFault::Return, last)).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-    }
+    let mut inherited = opening(&encoding, "written");
+    inherited.push(execution(&inheriting));
     let mut executed = opening(&other, "written");
     executed.push(execution(&own));
-    commit_dies(executed);
+    for cmds in [inherited, executed] {
+        pass_pixels(&p, &d, cmds);
+    }
     let unlit = pass_pixels(&p, &d, Vec::new());
-    for (state, resident) in [(&other, "written"), (&encoding, "reaching")] {
+    for (state, resident) in [
+        (&other, "written"),
+        (&encoding, "written"),
+        (&encoding, "reaching"),
+    ] {
         let mut cmds = opening(state, resident);
         cmds.push(drawn());
         assert_ne!(pass_pixels(&p, &d, cmds), unlit);
@@ -1257,35 +2022,45 @@ fn vertex_runs<P: Platform>(
     mode: u64,
     (primitive_type, start, count, instances): (u64, u64, u64, u64),
 ) -> Vec<u32> {
+    let draw = Provoked::Vertices(primitive_type, start, count, instances);
+    provoked_runs(p, d, (mode, None), draw)
+}
+
+/// The runs of `counting_vertex` at each of the first [`RUNS`] vertex IDs after `draw`, a draw
+/// of [`provoked`]'s but an execution, under a state of `counting_vertex` and `ids_fragment`
+/// over [`flat_vertices`] in buffer 0 and the runs in buffer 1, at `setProvokingVertexMode:` of
+/// `mode`, after `restart`'s `setPrimitiveRestartEnabled:index:` where it has one.
+fn provoked_runs<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    (mode, restart): (u64, Option<(bool, u64)>),
+    draw: Provoked<'_>,
+) -> Vec<u32> {
     let state = fixture_state::<P>(d, "vertex_ids:counting_vertex", SIZED.1);
     let (pos, _) = flat_vertices::<P>(d, RUNS);
     let runs = buffer::<P>(d, 4 * RUNS as u64, 0, &[0; 4 * RUNS]);
-    pass_pixels(
-        p,
-        d,
-        vec![
-            RenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(&state),
-            },
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&pos),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&runs),
-                offset: 0,
-                index: 1,
-            },
-            RenderCmd::SetProvokingVertexMode { mode },
-            RenderCmd::DrawPrimitivesInstances {
-                primitive_type,
-                vertex_start: start,
-                vertex_count: count,
-                instance_count: instances,
-            },
-        ],
-    );
+    let (index_buffer, indirect_buffer) = provoked_buffers::<P>(d, draw);
+    let mut cmds = vec![
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&pos),
+            offset: 0,
+            index: 0,
+        },
+        RenderCmd::SetVertexBuffer {
+            buffer: Some(&runs),
+            offset: 0,
+            index: 1,
+        },
+    ];
+    if let Some((enabled, index)) = restart {
+        cmds.push(RenderCmd::SetPrimitiveRestartEnabled { enabled, index });
+    }
+    cmds.push(RenderCmd::SetProvokingVertexMode { mode });
+    cmds.extend(provoked_draw(draw, (&index_buffer, &indirect_buffer)));
+    pass_pixels(p, d, cmds);
     // SAFETY: a Shared buffer of `4 * RUNS` bytes, read after the pass completed.
     let bytes = unsafe { std::slice::from_raw_parts(runs.contents().as_ptr::<u8>(), 4 * RUNS) };
     bytes
@@ -1296,9 +2071,9 @@ fn vertex_runs<P: Platform>(
         .collect()
 }
 
-/// A draw over indices of its own (a private type, or triangles the last vertex rotates)
-/// runs its vertex function as many times at each vertex as Metal's draw, as a draw as it
-/// stands does: once for each primitive the vertex is in, on both
+/// A draw the runtime draws over a list of its own (a private type's, or a strip's at the last
+/// vertex without the device's) runs its vertex function as many times at each vertex as Metal's
+/// draw, as a draw as it stands does: once for each primitive the vertex is in, on both
 #[test]
 fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     let (p, d) = (platform(), dev());
@@ -1341,6 +2116,51 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
         assert!(ours.iter().any(|&n| n > 1), "{mode} {draw:?}");
         if let Some((mp, md)) = &metal {
             assert_eq!(ours, vertex_runs(mp, md, mode, draw), "{mode} {draw:?}");
+        }
+    }
+}
+
+/// Metal's private types run a vertex function that writes memory as many times at each vertex
+/// as Metal's draws, once for each vertex of the list Metal draws them as, over 16- and 32-bit
+/// indices, from a base vertex, of instances, after `setPrimitiveRestartEnabled:index:`, a quad
+/// strip restarting at its index type's all-ones index, and from indirect arguments, over indices
+/// too, at `setProvokingVertexMode:` 0 and 1 (the line loop's lines at 1 relayed,
+/// `provoking-vertex-lines`, where the device lacks the last vertex). Each draw runs some vertex
+/// more than once
+#[test]
+fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
+        primitive_type,
+        index_type,
+        indices,
+        arguments,
+    };
+    for t in 5..=8 {
+        let mut cases = vec![
+            (over((t, U16), SCRAMBLED, (1, 2)), None),
+            (over((t, U32), SCRAMBLED, (0, 1)), None),
+            (over((t, U16), SCRAMBLED_AT_3, (0, 1)), Some((true, 3))),
+            (Provoked::Indirect(t, [10, 1, 2, 0]), None),
+            (Provoked::Indirect(t, [9, 2, 0, 0]), None),
+            (indirect(t, U16, SCRAMBLED, [12, 1, 0, 2, 0]), None),
+            (indirect(t, U32, SCRAMBLED, [8, 2, 3, 0, 0]), None),
+        ];
+        if t == 8 {
+            cases.push((over((t, U16), QUADS_RESTARTED, (0, 1)), None));
+            cases.push((over((t, U32), QUADS_RESTARTED_WIDE, (0, 1)), None));
+        }
+        for (draw, restart) in cases {
+            for mode in [0, 1] {
+                let ours = crate::answer::relaxed(|| provoked_runs(&p, &d, (mode, restart), draw));
+                assert!(ours.iter().any(|&n| n > 1), "{draw:?} at mode {mode}");
+                if let Some((mp, md)) = &metal {
+                    let theirs = provoked_runs(mp, md, (mode, restart), draw);
+                    assert_eq!(ours, theirs, "{draw:?} at mode {mode}");
+                }
+            }
         }
     }
 }
@@ -1580,10 +2400,9 @@ fn texture_writes_round_as_metals_at_the_modes_they_decode() {
 /// first blend and under source and destination factor one is made, and the runtime notes it
 /// `extended-range-float-blend-source`, which it announces at each draw that binds
 /// the state's variant: a draw of it over an attachment a pass clears dies there, naming the
-/// kind ([`crate::answer::DIES`]), where Metal draws it. One into `RGB10A8_2P_XR10_sRGB`
-/// under source and destination factor one, whose blend in the `_sRGB` form the runtime has
-/// not fitted, dies as the state is made, naming its refusal,
-/// `ExtendedRangeBlend(FloatOutput)`, where Metal makes it
+/// kind ([`crate::answer::DIES`]), where Metal draws it. So does one into
+/// `RGB10A8_2P_XR10_sRGB` under source and destination factor one, whose blend the runtime
+/// computes in the `_sRGB` form as in the linear one, which Metal's lanes measured equal
 #[test]
 fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
     use reims_vgpu_core::platform::resource::Library as _;
@@ -1655,7 +2474,6 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
     }
-    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device();
@@ -1667,11 +2485,7 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         ((("fetch_half_fragment", 550), (4, 5)), DRAW, half_source),
         ((("fetch_float_fragment", 550), (0, 5)), DRAW, float_source),
         ((("fetch_float_fragment", 550), (1, 1)), DRAW, float_source),
-        (
-            (("fetch_float_fragment", 551), (1, 1)),
-            STATE,
-            "ExtendedRangeBlend(FloatOutput)",
-        ),
+        ((("fetch_float_fragment", 551), (1, 1)), DRAW, float_source),
     ];
     for ((fragment, blend), sel, named) in dies {
         *crate::answer::LAST_LINE.lock() = None;
@@ -1864,6 +2678,112 @@ impl XrSide<MetalPlatform> {
         }
         theirs
     }
+}
+
+/// The answer of `newRenderPipelineStateWithDescriptor:options:reflection:error:` on `d` for a
+/// state of `sweep_vertex` and `fragment` of `library` into colour 0 of `format`, under `blend`
+/// ([`XR_DUAL_BLENDS`]'s layout) or unblended: `Ok` where it is made, else the `NSError`'s code.
+fn blended_state<P: Platform>(
+    d: &P::Device,
+    (library, fragment): (&[u8], &str),
+    format: u32,
+    blend: Option<[u32; 6]>,
+) -> Result<(), i64> {
+    use reims_vgpu_core::platform::resource::Library as _;
+    use reims_vgpu_core::rt::Hold;
+
+    use crate::gpu::serialized::tests::rounded_render_of;
+
+    let library = d.new_library(library).unwrap().unwrap().unwrap();
+    let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+    let functions = [function("sweep_vertex"), function(fragment)];
+    let mut resolve = |_: Hold<'_>, r: u64| {
+        let at = usize::try_from(r - 1).unwrap();
+        Ok(Some(functions[at].clone_ref()))
+    };
+    let mut colour = vec![(0, 0), (1, format)];
+    if let Some(blend) = blend {
+        colour.push((2, 1));
+        colour.extend((3..).zip(blend));
+    }
+    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
+    let desc = d
+        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
+        .unwrap()
+        .unwrap();
+    match d.new_render_pipeline_state_from_descriptor(Some(&desc), 0) {
+        Ok(Ok(Some(_))) => Ok(()),
+        Ok(Ok(None)) => panic!("{fragment} {format}: nil with no error"),
+        Ok(Err(e)) => Err(e.code),
+        Err(raise) => panic!("{fragment} {format}: raised {raise:?}"),
+    }
+}
+
+/// A render state blended by a factor of the second source whose fragment function writes no
+/// second output (`xr_half_fragment`, `xr_float_fragment`) is answered as Metal answers it, nil
+/// and an `NSError` of Metal's code, 3, where Metal refuses it, or made where Metal makes it:
+/// into the extended-range forms and twins, `RGBA8Unorm`, `BGRA8Unorm` and `RGBA16Float`,
+/// compiled with fast math and without, under each blend of [`XR_DUAL_BLENDS`], each of which
+/// reads the second source. The runtime refuses such a state with Metal's error
+/// (`InvalidDescriptor(ColorAttachment)`), which the creator answers
+/// ([`crate::gpu::states::pipeline_error`]), where this platform died at the runtime's refusal
+/// of an extended-range one. A function that writes a second output (`xr_dual_half_fragment`) is
+/// made as on Metal, but compiled with fast math into an extended-range form or twin, which dies
+/// at the creator, naming the runtime's refusal (`ExtendedRangeBlend(DualSource)`, and
+/// `ExtendedRangeBlend(SrgbForm)` into `BGRA10_XR_sRGB`), where Metal makes it. And a state of a `half4` output into `RGBA8Uint`, unblended, whose output the
+/// runtime refuses for its type class (`InvalidDescriptor(ColorAttachment)` too), is answered as
+/// Metal answers it
+#[test]
+fn second_source_blends_without_a_second_output_are_refused_as_metals() {
+    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let d = dev();
+    let mut differ = Vec::new();
+    let formats = [552, 554, 553, 555, 70, 80, 115];
+    let fragments = [
+        "xr_half_fragment",
+        "xr_float_fragment",
+        "xr_dual_half_fragment",
+    ];
+    // Each state: its library, fragment function, format and blend.
+    type Case = (&'static [u8], &'static str, u32, Option<[u32; 6]>);
+    let mut cases: Vec<Case> = Vec::new();
+    for format in formats {
+        for library in [ROUNDING, ROUNDING_SAFE] {
+            for fragment in fragments {
+                cases.extend(XR_DUAL_BLENDS.map(|blend| (library, fragment, format, Some(blend))));
+            }
+        }
+    }
+    cases.push((ROUNDING_SAFE, "xr_half_fragment", 73, None));
+    for (library, fragment, format, blend) in cases {
+        let fast = if library == ROUNDING { "fast" } else { "safe" };
+        let what = format!("{fragment} ({fast}) format {format} blend {blend:?}");
+        let theirs = blended_state::<MetalPlatform>(&md, (library, fragment), format, blend);
+        *crate::answer::LAST_LINE.lock() = None;
+        let ours =
+            catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        let refused = library == ROUNDING
+            && fragment == "xr_dual_half_fragment"
+            && XR_LINEAR.into_iter().chain(XR_SRGB).any(|f| f == format);
+        match ours {
+            Ok(ours) if !refused && ours == theirs => {}
+            Err(site)
+                if refused
+                    && theirs.is_ok()
+                    && site.file == STATE
+                    && line.contains("ExtendedRangeBlend(") => {}
+            Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
+            Err(site) => differ.push(format!(
+                "{what}: died at {}: {line}; Metal {theirs:?}",
+                site.file
+            )),
+        }
+    }
+    assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
 /// This platform's side and Metal's, where the host has a Metal device: one command queue of
@@ -2786,222 +3706,21 @@ fn a_blend_onto_a_clear_between_codes_is_metals() {
     }
 }
 
-/// The bytes of `target`, a Private 256 by 256 `BGRA10_XR` texture, after a command buffer on
-/// platform `P` that copies `first` into it, then runs a pass that loads and stores it and
-/// draws `state` once, a triangle of the three vertices of `positions` (`reach_vertex`), then
-/// copies it into a buffer.
-fn reach_pass<P: Platform>(
-    p: &P,
-    d: &P::Device,
-    (state, target): (&P::RenderPipeline, &P::Texture),
-    first: &[u8],
-    positions: &P::Buffer,
-) -> Vec<u8> {
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-
-    // `MTLLoadActionLoad`.
-    const LOAD: u64 = 1;
-    let length = u64::try_from(first.len()).unwrap();
-    let up = buffer::<P>(d, length, 0, first);
-    let down = buffer::<P>(d, length, 0, &[]);
-    let all = MtlSize::new(256, 256, 1);
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-    for cmd in [
-        BlitCmd::CopyBufferToTexture {
-            source_buffer: &up,
-            source_offset: 0,
-            source_bytes_per_row: 256 * 8,
-            source_bytes_per_image: length,
-            source_size: all,
-            destination_texture: target,
-            destination_slice: 0,
-            destination_level: 0,
-            destination_origin: MtlOrigin::new(0, 0, 0),
-        },
-        BlitCmd::EndEncoding,
-    ] {
-        blit.encode(OnFault::Die, cmd).unwrap();
-    }
-    let pass = p.render_pass_descriptor();
-    let attachment = ColorAttachmentSet {
-        texture: Some(Some(target)),
-        load_action: Some(LOAD),
-        store_action: Some(STORE),
-        ..ColorAttachmentSet::default()
-    };
-    pass.set_color_attachment(OnFault::Die, 0, &attachment)
-        .unwrap();
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    for cmd in [
-        RenderCmd::SetRenderPipelineState {
-            pipeline_state: Some(state),
-        },
-        RenderCmd::SetVertexBuffer {
-            buffer: Some(positions),
-            offset: 0,
-            index: 0,
-        },
-        RenderCmd::DrawPrimitives {
-            primitive_type: 3,
-            vertex_start: 0,
-            vertex_count: 3,
-        },
-        RenderCmd::EndEncoding,
-    ] {
-        e.encode(OnFault::Die, cmd).unwrap();
-    }
-    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-    for cmd in [
-        BlitCmd::CopyTextureToBuffer {
-            source_texture: target,
-            source_slice: 0,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: all,
-            destination_buffer: &down,
-            destination_offset: 0,
-            destination_bytes_per_row: 256 * 8,
-            destination_bytes_per_image: length,
-        },
-        BlitCmd::EndEncoding,
-    ] {
-        blit.encode(OnFault::Die, cmd).unwrap();
-    }
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    assert!(cb.error().is_none(), "{:?}", cb.error());
-    let n = usize::try_from(length).unwrap();
-    // SAFETY: a Shared buffer's bytes, read after the command buffer completed.
-    unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), n) }.to_vec()
-}
-
-/// A pass that loads and stores a 256 by 256 `BGRA10_XR` target of random codes (unused bits
-/// set, alpha codes past [384, 894]) and draws one small triangle, a direct triangle list,
-/// whose primitive reaches a few of its 64 tiles of 32 by 32. Metal rewrites only the tiles
-/// the primitive reaches (unused bits canonical, alpha clamped) and keeps the rest's bytes.
-/// The runtime's first pass of the pipeline rewrites every tile of the draw's viewport and
-/// announces `unreached-tiles-rewritten`, relayed; once the draw's capture form is made, on
-/// the runtime's own threads, a pass finds the tiles from the positions
-/// the vertex function computes and rewrites those alone, as Metal. The runtime announces a
-/// relayed kind once per device (`crate::platform::device_options`), so the test requires the
-/// first pass to announce it, runs the pass again, 100 ms apart, until its bytes are Metal's,
-/// byte for byte (at most 50 passes), and requires the same of two passes after it
-#[test]
-fn captured_reach_rewrites_the_tiles_metal_does() {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
-
-    use crate::gpu::serialized::tests::rounded_render_of;
-
-    fn made<P: Platform>(d: &P::Device) -> P::RenderPipeline {
-        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let functions = [function("reach_vertex"), function("xr_constant_fragment")];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
-        let blob = rounded_render_of(&["02 04 02000000"], &[&[(0, 0), (1, 552)]], 0);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap()
-    }
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let shape = TextureDesc {
-        pixel_format: 552,
-        width: 256,
-        height: 256,
-        usage: READ | TARGET,
-        resource_options: Some(0x20),
-        ..TextureDesc::default()
-    };
-    // A triangle over pixels (40, 40) to (100, 100): tiles (1, 1) to (3, 3).
-    let corners: [[f32; 4]; 3] = [
-        [-0.6875, 0.6875, 0.5, 1.0],
-        [-0.21875, 0.6875, 0.5, 1.0],
-        [-0.6875, 0.21875, 0.5, 1.0],
-    ];
-    let positions: Vec<u8> = corners
-        .iter()
-        .flatten()
-        .flat_map(|v| v.to_le_bytes())
-        .collect();
-    let first = (0..256 * 256 * 8u32)
-        .map(|i| u8::try_from((i.wrapping_mul(2_654_435_761) >> 24) & 0xff).unwrap())
-        .collect::<Vec<u8>>();
-    let length = u64::try_from(positions.len()).unwrap();
-    let theirs = {
-        let target = md.new_texture(OnFault::Die, &mp.texture_descriptor(&shape));
-        let target = target.unwrap().unwrap();
-        let at = buffer::<MetalPlatform>(&md, length, 0, &positions);
-        reach_pass(
-            &mp,
-            &md,
-            (&made::<MetalPlatform>(&md), &target),
-            &first,
-            &at,
-        )
-    };
-    assert_ne!(theirs, first, "Metal rewrote no tile");
-    let state = made::<VulkanPlatform>(&d);
-    let target = d.new_texture(OnFault::Die, &p.texture_descriptor(&shape));
-    let target = target.unwrap().unwrap();
-    let at = buffer::<VulkanPlatform>(&d, length, 0, &positions);
-    let kind = rt::Degradation::UnreachedTilesRewritten;
-    // How many tiles of each pass differ from Metal's.
-    let mut passes = Vec::new();
-    for _ in 0..50 {
-        let ours = reach_pass(&p, &d, (&state, &target), &first, &at);
-        if passes.is_empty() {
-            assert!(heard(kind), "the first pass announced no {}", kind.code());
-        }
-        let tiles = (ours.chunks(8).zip(theirs.chunks(8)).enumerate())
-            .filter(|(_, (o, t))| o != t)
-            .map(|(i, _)| (i % 256 / 32, i / 256 / 32))
-            .collect::<std::collections::BTreeSet<_>>();
-        passes.push(tiles.len());
-        if tiles.is_empty() {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(100));
-    }
-    assert_eq!(
-        passes.last(),
-        Some(&0),
-        "no pass's bytes were Metal's; tiles off Metal's by pass: {passes:?}"
-    );
-    for _ in 0..2 {
-        let ours = reach_pass(&p, &d, (&state, &target), &first, &at);
-        assert!(
-            ours == theirs,
-            "a later pass: bytes off Metal's ({passes:?})"
-        );
-    }
-}
-
 /// A render blob of `textureWriteRoundingMode` 2 decodes, and its state is decided once made,
 /// as Metal's: a compile's refusal is the `NSError` (a float fragment's colour 0 of
 /// `R32Uint`, beside a half-float colour 1); a half-float attachment of write mask none makes
 /// its state, and so does one the function has no output for (colour 1 of `RGBA16Float`
-/// beside a written colour 0 of `RGBA8Unorm`), and one it writes, unblended, of 1 sample, of 2
-/// or of 4; one it writes blended by one and one, or whose alpha alpha to coverage reads dies
-/// as the state is made, where Metal makes each
+/// beside a written colour 0 of `RGBA8Unorm`), one it writes, unblended, of 1 sample, of 2
+/// or of 4, and one it writes blended by one and one, whose draw dies naming the runtime's
+/// notice (`blended-write-rounding`: the device's blend rounds the result by its own rule), and
+/// `RGBA16Float` at colour 0 whose alpha alpha to coverage reads, whose draw dies naming the
+/// runtime's notice (`coverage-reads-rounded-alpha`). Metal makes each. That draw by default
+/// (`answer::relaxed`) stores Metal's alpha past 1 by float steps and past the largest half,
+/// rounded by the function as Metal stores it, but not through unorm values, where the coverage
+/// reads the rounded alpha and Metal's the alpha before rounding
 #[test]
 fn mode_2_render_states_are_decided_once_made() {
     use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::raise::death::DeathKind;
     use reims_vgpu_core::rt::Hold;
 
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3057,32 +3776,53 @@ fn mode_2_render_states_are_decided_once_made() {
         (7, 1),
         (8, 0),
     ]];
-    let dies: [Blob<'_>; 2] = [(&[], &additive), (&["05 04 01000000"], &written)];
+    let made: [Blob<'_>; 7] = [
+        made[0],
+        made[1],
+        made[2],
+        made[3],
+        made[4],
+        (&[], &additive),
+        (&["05 04 01000000"], &written),
+    ];
     for (entries, colours) in made {
         assert!(
             matches!(state::<VulkanPlatform>(&d, entries, colours), Ok(Some(_))),
-            "{colours:?}"
-        );
-    }
-    for (entries, colours) in dies {
-        let site =
-            catch_death(|| state::<VulkanPlatform>(&d, entries, colours).is_ok()).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                DeathKind::Abort,
-                "newRenderPipelineStateWithDescriptor:options:reflection:error:"
-            ),
             "{entries:?} {colours:?}"
         );
     }
+    let blended = Drawn {
+        colour: &additive[0][2..],
+        ..PLAIN
+    };
+    let p = platform();
+    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, blended)
+    });
+    assert!(line.contains("blended-write-rounding"), "{line}");
+    let covered = Drawn {
+        render: &["05 04 01000000"],
+        ..PLAIN
+    };
+    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, covered)
+    });
+    assert!(line.contains("coverage-reads-rounded-alpha"), "{line}");
     if let Some(md) = &metal {
         assert!(state::<MetalPlatform>(md, &[], &refused).is_err());
-        for (entries, colours) in made.into_iter().chain(dies) {
+        for (entries, colours) in made {
             assert!(
                 matches!(state::<MetalPlatform>(md, entries, colours), Ok(Some(_))),
                 "{entries:?} {colours:?}"
             );
+        }
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        for (kind, metals) in [(0, false), (1, true), (3, true)] {
+            let ours = crate::answer::relaxed(|| {
+                swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, covered)
+            });
+            let theirs = swept(&mp, md, (false, NEAREST_EVEN), (115, 8), kind, covered);
+            assert_eq!(ours == theirs, metals, "the covered alpha's sweep {kind}");
         }
     }
 }
@@ -3660,8 +4400,8 @@ fn bfloat_draws_store_metals_codes() {
 /// as Metal's, byte for byte, over the sweeps through unorm values, past 1 by float steps
 /// and past the largest half, and so does one of mode 0 of it: `R16Float` and `RG16Float` at
 /// colour 0 under alpha to coverage; `RGBA16Float` at colour 0 under alpha to coverage of a
-/// write mask without alpha; and `R16Float`, `RG16Float` and `RGBA16Float` at colours 1 and
-/// 3, beside an `RGBA8Unorm` colour 0
+/// write mask without alpha, whose coverage reads the alpha before rounding, as Metal's; and
+/// `R16Float`, `RG16Float` and `RGBA16Float` at colours 1 and 3, beside an `RGBA8Unorm` colour 0
 #[test]
 fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3716,23 +4456,51 @@ fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
 }
 
 /// The bytes of a 256 by 256 texture of `format`, `bytes` a texel, after `write_fragment`
-/// writes the sweep `kind` (`rounding.metal`) into it, bound at fragment texture 0, under a
-/// [`texture_writing_state`] of `textureWriteRoundingMode` `mode`, drawn over an `RGBA8Unorm`
-/// colour attachment.
+/// writes the sweep `kind` (`rounding.metal`) into it, bound at fragment texture 0, or, where
+/// `held`, `write_args_fragment` through the argument buffer at fragment buffer 1 that holds its
+/// ID, made resident for writing, under a [`texture_writing_state`] of
+/// `textureWriteRoundingMode` `mode`, drawn over an `RGBA8Unorm` colour attachment.
 fn fragment_written<P: Platform>(
     p: &P,
     d: &P::Device,
-    mode: u32,
+    (mode, held): (u32, bool),
     (format, bytes): (u64, u64),
     kind: u32,
 ) -> Vec<u8> {
-    let state = texture_writing_state::<P>(d, mode, "write_fragment", false)
+    use reims_vgpu_core::platform::blit::ResourceRef;
+    use reims_vgpu_core::platform::resource::Texture as _;
+
+    let fragment = if held {
+        "write_args_fragment"
+    } else {
+        "write_fragment"
+    };
+    let state = texture_writing_state::<P>(d, mode, fragment, false)
         .unwrap()
         .unwrap()
         .unwrap();
     let t = texture(p, d, format, READ | 2, (256, 256), None);
     let target = texture(p, d, 70, READ | TARGET, (256, 256), None);
     let kinds = buffer::<P>(d, 4, 0, &kind.to_le_bytes());
+    let args = buffer::<P>(d, 8, 0, &t.gpu_resource_id().to_le_bytes());
+    let resident = [Some(ResourceRef::Texture(&t))];
+    let bind = match held {
+        true => vec![
+            RenderCmd::SetFragmentBuffer {
+                buffer: Some(&args),
+                offset: 0,
+                index: 1,
+            },
+            RenderCmd::UseResources {
+                resources: &resident,
+                usage: 2,
+            },
+        ],
+        false => vec![RenderCmd::SetFragmentTexture {
+            texture: Some(&t),
+            index: 0,
+        }],
+    };
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let pass = p.render_pass_descriptor();
@@ -3754,19 +4522,26 @@ fn fragment_written<P: Platform>(
             offset: 0,
             index: 0,
         },
-        RenderCmd::SetFragmentTexture {
-            texture: Some(&t),
-            index: 0,
-        },
+    ]
+    .into_iter()
+    .chain(bind)
+    .chain([
         RenderCmd::DrawPrimitives {
             primitive_type: 3,
             vertex_start: 0,
             vertex_count: 3,
         },
         RenderCmd::EndEncoding,
-    ] {
+    ]) {
         e.encode(OnFault::Die, cmd).unwrap();
     }
+    // The draw's command buffer completes before the copy's is made: in one command buffer,
+    // Metal's copy read some texels the draw writes through the argument buffer before the
+    // writes landed (measured here, other texels each run).
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let length = 256 * 256 * bytes;
     let out = buffer::<P>(d, length, 0, &[]);
     let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -3802,9 +4577,9 @@ fn fragment_written<P: Platform>(
 /// `RG16Float`, `RGBA16Float`), which Metal's mode 2 rounds to nearest even, or of
 /// `RG11B10Float`, which it rounds otherwise than its default (in the sweep through unorm
 /// values; past 1 and past the largest half as its default), dies at the draw's selector,
-/// and so does one writing `RGBX16Float` or `RGB9E5Float`, which nothing measured at the mode
-/// ([`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`]). At modes 0 and 1 every format's
-/// writes that Metal's are compared with are Metal's
+/// naming the runtime's refusal of a write at the mode it has not built, and so does one writing
+/// `RGBX16Float` or `RGB9E5Float`, which nothing measured at the mode. At modes 0 and 1 every
+/// format's writes that Metal's are compared with are Metal's
 #[test]
 fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     use crate::gpu::serialized::NEAREST_EVEN;
@@ -3815,15 +4590,12 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let draw = |format: (u64, u64), kind| {
-        let site =
-            catch_death(|| fragment_written(&p, &d, NEAREST_EVEN, format, kind)).unwrap_err();
-        assert_eq!(
-            (site.kind, site.file),
-            (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
-                "drawPrimitives:vertexStart:vertexCount:"
-            ),
-            "{format:?} sweep {kind}"
+        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+            fragment_written(&p, &d, (NEAREST_EVEN, false), format, kind)
+        });
+        assert!(
+            line.contains("TextureWriteRounding"),
+            "{format:?} sweep {kind}: {line}"
         );
     };
     let half = [(25, 2), (65, 4), (115, 8)];
@@ -3835,10 +4607,10 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
     for kind in [0, 1, 3] {
         for format in rest.into_iter().chain(rounded) {
             for mode in 0..=2 {
-                let theirs = fragment_written(&mp, &md, mode, format, kind);
+                let theirs = fragment_written(&mp, &md, (mode, false), format, kind);
                 if mode == NEAREST_EVEN && rounded.contains(&format) {
                     draw(format, kind);
-                    let rounds = theirs != fragment_written(&mp, &md, 0, format, kind);
+                    let rounds = theirs != fragment_written(&mp, &md, (0, false), format, kind);
                     if format == rg11b10 {
                         rg11b10_rounded.extend(rounds.then_some(kind));
                     } else {
@@ -3849,7 +4621,7 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
                     }
                     continue;
                 }
-                let ours = fragment_written(&p, &d, mode, format, kind);
+                let ours = fragment_written(&p, &d, (mode, false), format, kind);
                 assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
             }
         }
@@ -3865,84 +4637,51 @@ fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
 }
 
 /// A render state of `textureWriteRoundingMode` 2 whose fragment function writes a texture
-/// through an argument buffer is made, as Metal's is, and its draw dies, as which textures
-/// it writes no draw tells; one of `supportIndirectCommandBuffers`, whose indirect commands'
-/// draws tell nothing either, dies as it is made, where Metal makes it. At modes 0 and 1
-/// both are made
+/// through an argument buffer is made, as Metal's is, of `supportIndirectCommandBuffers` or not,
+/// and so is each at modes 0 and 1. Its draw writes Metal's bytes into an `RGBA8Unorm` or an
+/// `RGBA32Float` texture the buffer holds, which Metal's mode 2 writes as its default does, as a
+/// state of mode 0 does, over the sweeps through unorm values, past 1 by float steps and past
+/// the largest half; it dies at the draw, naming the runtime's refusal, where the buffer holds a
+/// texture of a half-float format or `RG11B10Float`, whose write at the mode the runtime has not
+/// built
 #[test]
-fn mode_2_fragment_writes_through_handles_die() {
+fn mode_2_fragment_writes_through_handles_are_metals_or_die_at_the_draw() {
     use crate::gpu::serialized::NEAREST_EVEN;
-    use reims_vgpu_core::raise::death::DeathKind;
 
     type V = crate::platform::VulkanPlatform;
     let d = dev();
     let p = platform();
-    if let Some(md) = MetalPlatform::system_default_device() {
-        for mode in 0..=2 {
-            for icb in [false, true] {
+    let md = MetalPlatform::system_default_device();
+    for mode in 0..=2 {
+        for icb in [false, true] {
+            let made = texture_writing_state::<V>(&d, mode, "write_args_fragment", icb);
+            assert!(matches!(made, Ok(Ok(Some(_)))), "{mode} {icb}");
+            if let Some(md) = &md {
                 let made =
-                    texture_writing_state::<MetalPlatform>(&md, mode, "write_args_fragment", icb);
+                    texture_writing_state::<MetalPlatform>(md, mode, "write_args_fragment", icb);
                 assert!(matches!(made, Ok(Ok(Some(_)))), "Metal: {mode} {icb}");
             }
         }
     }
-    for mode in [0, 1] {
-        for icb in [false, true] {
-            let made = texture_writing_state::<V>(&d, mode, "write_args_fragment", icb);
-            assert!(matches!(made, Ok(Ok(Some(_)))), "{mode} {icb}");
+    for format in [(115, 8), (25, 2), (92, 4)] {
+        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
+            fragment_written(&p, &d, (NEAREST_EVEN, true), format, 0)
+        });
+        assert!(line.contains("TextureWriteRounding"), "{format:?}: {line}");
+    }
+    let Some(md) = md else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    for format in [(70, 4), (125, 16)] {
+        for kind in [0, 1, 3] {
+            for mode in [0, NEAREST_EVEN] {
+                let ours = fragment_written(&p, &d, (mode, true), format, kind);
+                let theirs = fragment_written(&mp, &md, (mode, true), format, kind);
+                assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
+            }
         }
     }
-    let site = catch_death(|| {
-        texture_writing_state::<V>(&d, NEAREST_EVEN, "write_args_fragment", true).is_ok()
-    })
-    .unwrap_err();
-    assert_eq!(
-        (site.kind, site.file),
-        (
-            DeathKind::Abort,
-            "newRenderPipelineStateWithDescriptor:options:reflection:error:"
-        )
-    );
-    let state = texture_writing_state::<V>(&d, NEAREST_EVEN, "write_args_fragment", false)
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let target = texture(&p, &d, 70, READ | TARGET, (16, 16), None);
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let pass = p.render_pass_descriptor();
-    let attachment = ColorAttachmentSet {
-        texture: Some(Some(&target)),
-        load_action: Some(CLEAR),
-        store_action: Some(STORE),
-        ..ColorAttachmentSet::default()
-    };
-    pass.set_color_attachment(OnFault::Die, 0, &attachment)
-        .unwrap();
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    e.encode(
-        OnFault::Die,
-        RenderCmd::SetRenderPipelineState {
-            pipeline_state: Some(&state),
-        },
-    )
-    .unwrap();
-    let site = catch_death(|| {
-        e.encode(
-            OnFault::Die,
-            RenderCmd::DrawPrimitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-            },
-        )
-        .is_ok()
-    })
-    .unwrap_err();
-    assert_eq!(
-        (site.kind, site.file),
-        (DeathKind::Abort, "drawPrimitives:vertexStart:vertexCount:")
-    );
 }
 
 /// The resolved bytes of a 256 by 256 `format` (`bytes` a texel) colour attachment of
@@ -4108,7 +4847,8 @@ fn mode_2_multisampled_half_float_attachments_resolve_as_metals() {
 
 /// The resolved bytes of a 64 by 64 `format` (`bytes` a texel) colour attachment of
 /// `samples` samples after `xr_loaded_fragment` draws two tables of `float4`s, a value a
-/// pixel, into it ([`drawn_specials`]): the first over every sample, the second over the
+/// pixel, into it (`tables`, [`drawn_specials`]'s or [`drawn_extended`]'s): the first over every
+/// sample, the second over the
 /// viewport from half a pixel in, which covers part of the first row's and column's samples,
 /// so their resolve averages a value of each table. Resolved by the drawing pass's store
 /// action `store` (`MultisampleResolve` or `StoreAndMultisampleResolve`), or, where `store`
@@ -4118,6 +4858,7 @@ fn drawn_resolved<P: Platform>(
     d: &P::Device,
     (format, bytes, samples): (u64, u64, u64),
     store: u64,
+    tables: &[Vec<[f32; 4]>; 2],
 ) -> Vec<u8> {
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::rt::Hold;
@@ -4166,7 +4907,7 @@ fn drawn_resolved<P: Platform>(
         .unwrap()
         .unwrap();
     let target = texture(p, d, format, READ | TARGET, (64, 64), None);
-    let words: Vec<u8> = (drawn_specials().iter().flatten().flatten())
+    let words: Vec<u8> = (tables.iter().flatten().flatten())
         .flat_map(|v| v.to_le_bytes())
         .collect();
     let values = buffer::<P>(d, 2 * 4096 * 16, 0, &words);
@@ -4314,14 +5055,122 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
         for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
             for (format, bytes) in [(25, 2), (65, 4), (115, 8), (55, 4), (92, 4)] {
                 let case = (format, bytes, samples);
-                let theirs = drawn_resolved(&mp, &md, case, store);
-                let ours = drawn_resolved(&p, &d, case, store);
+                let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
+                let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
                 let texel = usize::try_from(bytes).unwrap();
                 let pairs = ours.chunks(texel).zip(theirs.chunks(texel));
                 let off = pairs.filter(|(o, m)| o != m).count();
                 if off != 0 {
                     differ.push(format!(
                         "{format} {samples}x store {store}: {off} of 4096 texels"
+                    ));
+                }
+            }
+        }
+    }
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// The two tables [`drawn_resolved`] draws into an extended-range attachment, as
+/// [`drawn_specials`]' are laid out: each lane one of eight values within the formats' range
+/// (-0.75 to 1.25), in another order in each lane and table.
+fn drawn_extended() -> [Vec<[f32; 4]>; 2] {
+    let values = [-0.75, -0.3, 0.0, 0.1, 0.33, 0.5, 0.9, 1.25];
+    let at = |i: usize, c: usize| [(i + c) % 8, (i + i / 8 + 2 * c) % 8];
+    [0, 1].map(|table| {
+        (0..4096)
+            .map(|i| [0, 1, 2, 3].map(|c| values[at(i, c)[table]]))
+            .collect()
+    })
+}
+
+/// The 10-bit codes of `bytes`, texels of extended-range `format`, and whether each is alpha: a
+/// `BGRA10_XR` form's four 16-bit words a texel, each code in the high 10 bits and its 6 low bits
+/// padding, here kept beside the code (the code then the padding); a `BGR10_XR` form's three
+/// fields of a 32-bit word, from bit 0, its top two bits padding (as a fourth value).
+fn extended_codes(format: u64, bytes: &[u8]) -> Vec<(u32, u32, bool)> {
+    match format {
+        552 | 553 => (bytes.as_chunks::<2>().0.iter().enumerate())
+            .map(|(i, w)| {
+                let w = u32::from(u16::from_le_bytes(*w));
+                (w >> 6, w & 0x3f, i % 4 == 3)
+            })
+            .collect(),
+        _ => (bytes.as_chunks::<4>().0.iter())
+            .flat_map(|w| {
+                let w = u32::from_le_bytes(*w);
+                [w & 0x3ff, (w >> 10) & 0x3ff, (w >> 20) & 0x3ff].map(|c| (c, w >> 30, false))
+            })
+            .collect(),
+    }
+}
+
+/// A multisampled extended-range colour attachment whose samples draws wrote, two values in some
+/// pixels' samples ([`drawn_resolved`] of [`drawn_extended`]'s tables), resolves as Metal's, at
+/// 2 and 4 samples, by the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`)
+/// and by a later pass that loads the samples: `BGR10_XR`'s, byte for byte, announcing nothing.
+/// The runtime resolves the other forms, whose resolve Metal averages from values finer than
+/// the codes they hold, by a near-equivalent, and announces `extended-range-resolve` as the
+/// pass ends, which dies there, at `endEncoding`, naming it; relayed, `BGRA10_XR`'s colour is
+/// Metal's and its alpha within a code, and an `_sRGB` twin's colour within 7 codes (its alpha
+/// within one), the bounds the runtime measured on the M3 Max (macOS 27.0.1), every padding bit
+/// Metal's
+#[test]
+fn drawn_extended_range_samples_resolve_as_metals() {
+    /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
+    const RESOLVE: u64 = 2;
+    const STORE_AND_RESOLVE: u64 = 3;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let tables = drawn_extended();
+    let mut differ = Vec::new();
+    for samples in [2, 4] {
+        for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
+            for (format, bytes, [colour, alpha]) in [
+                (554, 4, [0, 0]),
+                (552, 8, [0, 1]),
+                (555, 4, [7, 0]),
+                (553, 8, [7, 1]),
+            ] {
+                let case = (format, bytes, samples);
+                let what = format!("{format} {samples}x store {store}");
+                let theirs = drawn_resolved(&mp, &md, case, store, &tables);
+                let ours = || drawn_resolved(&p, &d, case, store, &tables);
+                *crate::answer::LAST_LINE.lock() = None;
+                let strict = catch_death(ours);
+                let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                let ours = match (strict, format) {
+                    (Ok(ours), 554) => ours,
+                    (Err(site), 552 | 553 | 555)
+                        if site.file == "endEncoding"
+                            && line.contains("(metal2vulkan-degrade-extended-range-resolve)") =>
+                    {
+                        crate::answer::relaxed(ours)
+                    }
+                    (Ok(_), _) => {
+                        differ.push(format!("{what}: resolved, announcing nothing"));
+                        continue;
+                    }
+                    (Err(site), _) => {
+                        differ.push(format!("{what}: died at {site:?}: {line}"));
+                        continue;
+                    }
+                };
+                let codes = extended_codes(format, &ours).into_iter();
+                let pairs = codes.zip(extended_codes(format, &theirs));
+                let (mut worst, mut padding) = ([0, 0], 0);
+                for ((o, o_pad, is_alpha), (m, m_pad, _)) in pairs {
+                    let at = usize::from(is_alpha);
+                    worst[at] = worst[at].max(o.abs_diff(m));
+                    padding += usize::from(o_pad != m_pad);
+                }
+                if worst[0] > colour || worst[1] > alpha || padding != 0 {
+                    differ.push(format!(
+                        "{what}: colour {} and alpha {} codes off at most, {padding} paddings off",
+                        worst[0], worst[1]
                     ));
                 }
             }
@@ -5104,7 +5953,8 @@ fn resolving_pass<P: Platform>(
 /// it, the pass dies at its creation naming both formats and the shape Metal was measured at
 /// ([`refused_resolve_format`]); into the other attachment format of the pair, the twin, the
 /// resolve writes, its bytes Metal's, in every shape of [`SHAPES`], which shows each read sees a
-/// resolve's writes
+/// resolve's writes (the samples `MultisampleResolve` leaves there:
+/// `samples_resolved_into_the_twin_are_metals`)
 #[test]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
@@ -5377,6 +6227,44 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
         assert!(line.contains(measured), "{c:?}: {line}");
     }
     assert!(metal.is_none() || compared.get() > 0);
+    assert!(differ.is_empty(), "{differ:#?}");
+}
+
+/// A 4-sample `BGRA8Unorm` or `BGRA8Unorm_sRGB` colour attachment, cleared and stored by an
+/// earlier pass, then cleared or loaded, drawn and resolved into a texture of the other format of
+/// the pair by `MultisampleResolve`, at 16 by 16 into each shape of [`SHAPES`]
+/// ([`resolved_into`]), keeps the samples the earlier pass stored, as Metal's does (measured
+/// beside them, M3 Max, macOS 27.0.1, 2026-10-25). The runtime resolves into the twin by a
+/// resolve of its own, whose texels are Metal's
+/// (`resolves_into_other_formats_are_metals_or_die_named`)
+#[test]
+fn samples_resolved_into_the_twin_are_metals() {
+    let (p, d) = (platform(), dev());
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (ours, theirs) = (
+        States::<VulkanPlatform>::new(&d),
+        States::<MetalPlatform>::new(&md),
+    );
+    let mut differ = Vec::new();
+    for (from, twin) in [(80, 81), (81, 80)] {
+        for load in [CLEAR, LOAD] {
+            for made in SHAPES {
+                let c = Resolve::of(from, (twin, 4), made, (load, RESOLVE));
+                let (o, m) = (
+                    resolved_into(&p, &d, &ours, c),
+                    resolved_into(&mp, &md, &theirs, c),
+                );
+                if o.samples != m.samples {
+                    let head = |b: &[u8]| b.iter().take(8).copied().collect::<Vec<u8>>();
+                    let (o, m) = (head(&o.samples), head(&m.samples));
+                    differ.push(format!("{c:?}: ours {o:02x?}, Metal's {m:02x?}"));
+                }
+            }
+        }
+    }
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
@@ -6025,51 +6913,30 @@ fn resolves_as_metals(samples: u64) {
 }
 
 /// A guest's state of the fixture `vertex` and `vertex_ids`' `plain_fragment` for a BGRA8
-/// target, of the triangle input primitive topology class, which Metal asks of a vertex
-/// function that writes a layer or viewport index, decoded from a blob as core decodes one.
-fn routed_state<P: Platform>(d: &P::Device, vertex: &str) -> P::RenderPipeline {
-    use reims_vgpu_core::rt::Hold;
-
-    use crate::gpu::serialized::tests::hex;
-
-    let functions = [
-        fixture::<P>(d, vertex),
-        fixture::<P>(d, "vertex_ids:plain_fragment"),
-    ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
-    let blob = hex(
-        "04 08 04 1c000000 01 04 01000000 02 04 02000000 0b 04 03000000 000000 \
-         01000000 08000000 02 00 04 00000000 01 04 50000000",
-    );
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+/// target, of the input primitive topology `class` (2 lines, 3 triangles), which Metal asks of a
+/// vertex function that writes a layer or viewport index, decoded from a blob as core decodes
+/// one.
+fn routed_state<P: Platform>(d: &P::Device, vertex: &str, class: u8) -> P::RenderPipeline {
+    let class = format!("0b 04 {class:02x}000000");
+    blob_state::<P>(d, (vertex, "vertex_ids:plain_fragment"), &[&class])
 }
 
 /// The pixels of both slices of a 16 by 16 BGRA8 2D array of 2, cleared to black, after
 /// `draw` in a pass of both, its render target array length 2, under a [`routed_state`] of
-/// `vertex` over [`flat_vertices`] in buffer 0 and `indices`, each vertex's layer or
+/// `vertex` and `class` over [`flat_vertices`] in buffer 0 and `indices`, each vertex's layer or
 /// viewport, in buffer 1, at `setProvokingVertexMode:` of `mode`, with two viewports, the
 /// target's left and right halves.
 fn routed_pass<P: Platform>(
     p: &P,
     d: &P::Device,
-    vertex: &str,
+    (vertex, class): (&str, u8),
     (indices, mode): (&[u32], u64),
     draw: RenderCmd<'_, P>,
 ) -> Vec<[u8; 4]> {
     use reims_vgpu_core::platform::types::MtlViewport;
     use reims_vgpu_core::platform::values::PassSet;
 
-    let state = routed_state::<P>(d, vertex);
+    let state = routed_state::<P>(d, vertex, class);
     let (pos, _) = flat_vertices::<P>(d, 16);
     let mut words: Vec<u8> = indices.iter().flat_map(|i| i.to_le_bytes()).collect();
     words.resize(64, 0);
@@ -6163,52 +7030,93 @@ fn routed_pass<P: Platform>(
     texels.as_chunks::<4>().0.to_vec()
 }
 
-/// Under a vertex function that writes a layer or a viewport index, a list or strip of
-/// triangles at the last vertex lands where Metal's does, each primitive in its last
-/// vertex's layer or viewport, and at the first in its first's; what has no rotation dies
+/// Under a vertex function that writes a layer or a viewport index, triangles land where Metal's
+/// do at either provoking vertex, each primitive in its first vertex's layer or viewport at mode 0
+/// and in its last's at mode 1: lists and strips over their vertices, over indices and from
+/// indirect arguments. Line strips land where Metal's do where the device has the last vertex;
+/// elsewhere the runtime draws each line from its last vertex to its first, which dies in strict
+/// mode at mode 1 (`provoking-vertex-lines`), and by default lands, relayed
 #[test]
 fn the_last_vertex_routes_layers_and_viewports_as_metals() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
         .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
-    fn draw<'a, P: Platform>(primitive_type: u64, count: u64) -> RenderCmd<'a, P> {
-        RenderCmd::DrawPrimitives {
+    /// The draw of `kind`: 0 a list of 6 vertices, 1 a strip of 6, 2 a list over [`LIST`]'s
+    /// first 6 indices, 3 a strip over [`STRIP_OF_SIX`], 4 a strip of 6 from indirect
+    /// arguments, 5 a line strip of 6, over `bytes`, the indices or arguments.
+    fn draw<'a, P: Platform>(kind: usize, bytes: &'a P::Buffer) -> RenderCmd<'a, P> {
+        let indexed = |primitive_type, index_count| RenderCmd::DrawIndexedPrimitives {
+            primitive_type,
+            index_count,
+            index_type: U16,
+            index_buffer: bytes,
+            index_buffer_offset: 0,
+        };
+        let vertices = |primitive_type| RenderCmd::DrawPrimitives {
             primitive_type,
             vertex_start: 0,
-            vertex_count: count,
+            vertex_count: 6,
+        };
+        match kind {
+            0 => vertices(3),
+            1 => vertices(STRIP),
+            2 => indexed(3, 6),
+            3 => indexed(STRIP, 8),
+            4 => RenderCmd::DrawPrimitivesIndirect {
+                primitive_type: STRIP,
+                indirect_buffer: bytes,
+                indirect_buffer_offset: 0,
+            },
+            _ => vertices(2),
         }
     }
+    /// The buffer of [`draw`]'s `kind`.
+    fn bytes<P: Platform>(d: &P::Device, kind: usize) -> P::Buffer {
+        let contents = match kind {
+            2 => index_bytes(U16, &LIST[..6]),
+            3 => index_bytes(U16, STRIP_OF_SIX),
+            _ => u32s(&[6, 1, 0, 0]),
+        };
+        buffer::<P>(d, 64, 0, &contents)
+    }
     let routes: [&[u32]; 3] = [
-        &[0, 0, 1, 1, 1, 0],
-        &[0, 1, 0, 1, 1, 0],
-        &[1, 0, 0, 0, 1, 1],
+        &[0, 0, 1, 1, 1, 0, 0, 1],
+        &[0, 1, 0, 1, 1, 0, 1, 1],
+        &[1, 0, 0, 0, 1, 1, 1, 0],
     ];
+    let native = super::last_vertex_native();
     for vertex in ["vertex_ids:layer_vertex", "vertex_ids:viewport_vertex"] {
         for indices in routes {
             for mode in [0, 1] {
-                for (primitive_type, count) in [(3, 6), (STRIP, 6)] {
+                for kind in 0..6 {
+                    let class = if kind == 5 { 2 } else { 3 };
                     let shape = (indices, mode);
-                    let ours = routed_pass(&p, &d, vertex, shape, draw(primitive_type, count));
+                    let ours_bytes = bytes::<VulkanPlatform>(&d, kind);
+                    let ours =
+                        || routed_pass(&p, &d, (vertex, class), shape, draw(kind, &ours_bytes));
+                    let ours = if kind == 5 && mode == 1 && !native {
+                        let lines = rt::Degradation::ProvokingVertexLines;
+                        crate::answer::dies_of(lines, ours);
+                        crate::answer::relaxed(ours)
+                    } else {
+                        ours()
+                    };
                     let lit = ours.iter().filter(|px| **px != [0, 0, 0, 0xff]).count();
-                    assert!(lit > 0, "{vertex} {indices:?} {mode} {primitive_type}");
-                    if let Some((mp, md)) = &metal {
+                    assert!(lit > 0, "{vertex} {indices:?} {mode} {kind}");
+                    if let Some((mp, md)) = &metal
+                        && (kind < 5 || mode == 0 || native)
+                    {
+                        let theirs_bytes = bytes::<MetalPlatform>(md, kind);
                         let theirs =
-                            routed_pass(mp, md, vertex, shape, draw(primitive_type, count));
+                            routed_pass(mp, md, (vertex, class), shape, draw(kind, &theirs_bytes));
                         assert!(
                             ours == theirs,
-                            "{vertex} {indices:?} at mode {mode}, type {primitive_type}"
+                            "{vertex} {indices:?} at mode {mode}, draw {kind}"
                         );
                     }
                 }
             }
         }
-        let (e, indices) = open_drawing(&routed_state::<VulkanPlatform>(&d, vertex));
-        send_all(&e, vec![RenderCmd::SetProvokingVertexMode { mode: 1 }]);
-        let sel = "drawPrimitives:vertexStart:vertexCount:";
-        let indexed = "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:";
-        assert_eq!(dies_at(&e, three(1, None)), sel, "{vertex}");
-        assert_eq!(dies_at(&e, three(6, None)), sel, "{vertex}");
-        assert_eq!(dies_at(&e, three(3, Some(&indices))), indexed, "{vertex}");
     }
 }
 
@@ -6356,10 +7264,7 @@ fn executed_strip(
     use reims_vgpu_core::platform::values::IcbDesc;
 
     let function = |name: &str| {
-        let path = format!(
-            "{}/../../tests/suite/fixtures/shaders/{name}.metallib",
-            env!("CARGO_MANIFEST_DIR")
-        );
+        let path = crate::gpu::device::tests::fixture_shaders().join(format!("{name}.metallib"));
         d.raw
             .new_library_with_data(&std::fs::read(path).unwrap())
             .unwrap()
@@ -6708,6 +7613,128 @@ fn unknown_stores_over_resolves_resolve_nothing() {
     }
 }
 
+/// The bytes of a 16 by 16 resolve texture of `format` (`bytes` a texel), a depth or the stencil
+/// one, that a pass cleared (depth to 0.75, stencil to `0x5a`) and stored, after a pass of a
+/// 4-sample attachment of `format` (Memoryless where `memoryless`, else Private) beside no other,
+/// cleared, stored by `store`, a store action that does not resolve, with that resolve texture,
+/// drawing nothing.
+fn unused_resolve<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    (format, bytes): (u64, u64),
+    store: u64,
+    memoryless: bool,
+) -> Vec<u8> {
+    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    let resolve = d
+        .new_texture(
+            OnFault::Die,
+            &p.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 16,
+                height: 16,
+                usage: TARGET,
+                resource_options: Some(PRIVATE_OPTIONS),
+                ..TextureDesc::default()
+            }),
+        )
+        .unwrap()
+        .unwrap();
+    let options = if memoryless {
+        MEMORYLESS
+    } else {
+        PRIVATE_OPTIONS
+    };
+    let samples = multisampled(p, d, format, options);
+    // A pass of `texture` alone, cleared, stored by `store`, into `resolve_texture`.
+    let pass = |texture, resolve_texture, store, (depth, stencil)| {
+        let pass = p.render_pass_descriptor();
+        if format == STENCIL8 {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture: Some(resolve_texture),
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_stencil: Some(stencil),
+                ..StencilAttachmentSet::default()
+            });
+        } else {
+            pass.set_depth_attachment(&DepthAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture: Some(resolve_texture),
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_depth: Some(depth),
+                ..DepthAttachmentSet::default()
+            });
+        }
+        pass
+    };
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    for pass in [
+        pass(&resolve, None, STORE, (0.75, 0x5a)),
+        pass(&samples, Some(&resolve), store, (0.25, 0x11)),
+    ] {
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+    }
+    let length = 16 * 16 * bytes;
+    let out = buffer::<P>(d, length, 0, &[]);
+    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &resolve,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(16, 16, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 16 * bytes,
+            destination_bytes_per_image: length,
+        },
+        BlitCmd::EndEncoding,
+    ] {
+        blit.encode(OnFault::Die, cmd).unwrap();
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{:?}", cb.error());
+    let n = usize::try_from(length).unwrap();
+    // SAFETY: a Shared buffer's bytes, read after the blit completed.
+    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
+}
+
+/// `MTLPixelFormatStencil8`.
+const STENCIL8: u64 = 253;
+
+/// A depth or stencil attachment beside a resolve texture its store action does not use
+/// (`Store` or `DontCare`, of a Private attachment, and `DontCare` of a Memoryless one) ends its
+/// pass, and the resolve texture keeps its texels, as on Metal
+#[test]
+fn unused_depth_and_stencil_resolves_leave_their_textures() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let depth: Vec<u8> = (0..256).flat_map(|_| 0.75f32.to_ne_bytes()).collect();
+    let stencil = vec![0x5a; 256];
+    for (format, kept) in [((DEPTH32F, 4), &depth), ((STENCIL8, 1), &stencil)] {
+        for (store, memoryless) in [(STORE, false), (DONT_CARE, false), (DONT_CARE, true)] {
+            let case = format!("{format:?} store {store} memoryless {memoryless}");
+            let ours = unused_resolve(&p, &d, format, store, memoryless);
+            assert_eq!(&ours, kept, "{case}");
+            if let Some((mp, md)) = &metal {
+                assert_eq!(
+                    unused_resolve(mp, md, format, store, memoryless),
+                    ours,
+                    "{case}"
+                );
+            }
+        }
+    }
+}
+
 /// A load action, store action or store action options the runtime has no value of is
 /// taken, as Metal's setters take it, and read back as set; the encoder's creation dies at
 /// it, where Metal asserts ("-[MTLRenderPassDescriptorInternal validate:width:height:]:2401:
@@ -6886,12 +7913,14 @@ fn a_display_pipeline_answers_metals_values() {
     }
 }
 
-/// A pass over a rasterization rate map of no layers, made from an immutable descriptor or
-/// by a mutable map's reset, that only loads or clears its target and stores it stores what
-/// Metal's does, in a process that has released no map of layers and after one was made,
-/// drawn with and released, which makes Metal's draws in such a pass draw (its fresh side
-/// first); a draw in such a pass dies at its selector, naming the map, and a draw of
-/// primitive type 9 of no vertices and a tile dispatch there die by their own lines
+/// A pass over a rasterization rate map of no layers made from an immutable descriptor that
+/// only loads or clears its target and stores it stores what Metal's does, in a process that has
+/// released no map of layers and after one was made, drawn with and released, which makes
+/// Metal's draws in such a pass draw (its fresh side first). Over a mutable map reset to no
+/// layers both store the same, each pass ending with a draw of no vertices
+/// (`crate::gpu::rate_map::no_draw`, the Metal platform's `gpu::rate_map`). A draw in such a pass,
+/// of a public or a private type, and one of primitive type 9 that fails the command buffer,
+/// dies at its selector, naming the map, and a tile dispatch there dies by its own line
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     use reims_vgpu_core::platform::rate_map::{
@@ -7061,11 +8090,13 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     }
     let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
     let q = d.new_command_queue().unwrap();
-    // A draw, named by the map; a draw of primitive type 9 of no vertices, by its own count;
-    // and a tile dispatch, by its own line.
+    // A draw, of a public type, of a private one (a triangle fan and quads) and of primitive
+    // type 9 that hangs the GPU, named by the map; and a tile dispatch, by its own line.
     let deaths = [
         (3, 3, "rate map of no layers"),
-        (9, 0, "primitive type 9 of 0 vertices"),
+        (6, 4, "rate map of no layers"),
+        (7, 4, "rate map of no layers"),
+        (9, 3, "rate map of no layers"),
         (
             0,
             0,
@@ -7125,6 +8156,448 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
             assert!(o == t, "after a released map, reset, load {shape:?}");
         }
     }
+}
+
+/// A pass of no draw call over a rasterization rate map made of a `Mutable` descriptor, whose
+/// `mutability` answers 1, runs and stores its clear, as the Metal platform's does, each ending
+/// with a draw of no vertices (`crate::gpu::rate_map::no_draw`, the Metal platform's
+/// `gpu::rate_map`), without which the runtime fails its command buffer as a GPU hang, as
+/// Metal's GPU does: its state set or not, over a map of one layer not yet reset, reset to the
+/// identity, reset to half its rate on each axis, and over one made of no layers, in a pass of
+/// one BGRA8 target and, with no state set (the fixtures' state is of one sample, which neither
+/// binds in a pass of four), in one of a 4-sample BGRA8 target resolved into another, each in a
+/// command buffer of its own queue, before any command buffer drew over a mutable map
+#[test]
+fn drawless_passes_over_mutable_maps_store_as_metals() {
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+
+    const SIDE: u64 = 64;
+    /// `MTLMutabilityMutable`.
+    const MUTABLE: u64 = 1;
+    /// `MTLTextureType2DMultisample`, `MTLStoreActionMultisampleResolve` and
+    /// `MTLResourceStorageModePrivate`.
+    const MULTISAMPLE: u64 = 4;
+    const RESOLVE: u64 = 2;
+    const PRIVATE: u64 = 0x20;
+
+    /// A descriptor of a `SIDE` by `SIDE` screen of `mutability`, with one layer of one sample
+    /// of `rate` on each axis where `rate` is some, else no layers.
+    fn map_desc<P: Platform>(
+        p: &P,
+        mutability: Option<u64>,
+        rate: Option<f32>,
+    ) -> P::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(SIDE, SIDE, 1),
+            mutability,
+            ..RateMapDesc::default()
+        });
+        if let Some(rate) = rate {
+            let layer = p
+                .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+                .unwrap()
+                .unwrap();
+            for at in [
+                layer.horizontal_sample_storage(),
+                layer.vertical_sample_storage(),
+            ] {
+                // SAFETY: the layer's storage holds one sample on each axis.
+                unsafe { *at.as_ptr::<f32>() = rate };
+            }
+            desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        }
+        desc
+    }
+
+    /// A `SIDE` by `SIDE` BGRA8 target, a pass that clears it and stores it, or with
+    /// `multisample` clears a 4-sample one and resolves it into it, and the 4-sample one.
+    fn target<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        multisample: bool,
+    ) -> (P::Texture, P::RenderPassDescriptor, Option<P::Texture>) {
+        if !multisample {
+            let (dst, pass) = pass_of(p, d, (SIDE, SIDE));
+            return (dst, pass, None);
+        }
+        let samples = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: MULTISAMPLE,
+                    pixel_format: BGRA8,
+                    width: SIDE,
+                    height: SIDE,
+                    sample_count: 4,
+                    usage: TARGET,
+                    resource_options: Some(PRIVATE),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let dst = texture(p, d, BGRA8, TARGET | READ, (SIDE, SIDE), None);
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&samples)),
+            resolve_texture: Some(Some(&dst)),
+            load_action: Some(CLEAR),
+            store_action: Some(RESOLVE),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        (dst, pass, Some(samples))
+    }
+
+    /// A drawless pass over a mutable map made of `made` and reset to `reset` where some, the
+    /// state set where `state`, into a target of `multisample` ([`target`]), in a command buffer
+    /// of a queue of its own that then copies the target out, committed and completed: the
+    /// map's `mutability`, the command buffer's status and error code, and the target's bytes.
+    fn drawless<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        (made, reset, state): (Option<f32>, Option<Option<f32>>, bool),
+        multisample: bool,
+    ) -> (u64, u64, Option<i64>, Vec<u8>) {
+        let map = d
+            .new_rate_map(&map_desc(p, Some(MUTABLE), made))
+            .unwrap()
+            .unwrap();
+        let mutability = map.mutability();
+        if let Some(rate) = reset {
+            map.reset(&map_desc(p, None, rate));
+        }
+        let (dst, pass, _samples) = target(p, d, multisample);
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&map)),
+            ..Default::default()
+        });
+        let pipeline = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        if state {
+            let set = RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&pipeline),
+            };
+            e.encode(OnFault::Die, set).unwrap();
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let out = buffer::<P>(d, SIDE * SIDE * 4, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(SIDE, SIDE, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: SIDE * 4,
+                destination_bytes_per_image: SIDE * SIDE * 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        let n = usize::try_from(SIDE * SIDE * 4).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after the command buffer completed.
+        let bytes = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) };
+        let code = cb.error().map(|e| e.code);
+        (mutability, cb.status().0, code, bytes.to_vec())
+    }
+
+    let cases = [
+        (Some(1.0), None, false),
+        (Some(1.0), None, true),
+        (Some(1.0), Some(Some(1.0)), false),
+        (Some(0.5), Some(Some(0.5)), false),
+        (Some(0.5), Some(Some(0.5)), true),
+        (None, None, false),
+    ];
+    let clear = [0, 0, 0, 0xff].repeat(usize::try_from(SIDE * SIDE).unwrap());
+    let runs: Vec<_> = [false, true]
+        .into_iter()
+        .flat_map(|multisample| cases.map(|case| (case, multisample)))
+        .filter(|&((_, _, state), multisample)| !(state && multisample))
+        .collect();
+    let (p, d) = (platform(), dev());
+    let ours: Vec<_> = (runs.iter())
+        .map(|&(case, multisample)| drawless(&p, &d, case, multisample))
+        .collect();
+    for (run, answer) in runs.iter().zip(&ours) {
+        assert_eq!(answer, &(MUTABLE, 4, None, clear.clone()), "{run:?}");
+    }
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    for (&(case, multisample), answer) in runs.iter().zip(&ours) {
+        let theirs = drawless(&mp, &md, case, multisample);
+        assert!(
+            &theirs == answer,
+            "Metal: {case:?}, multisample {multisample}"
+        );
+    }
+}
+
+/// A pass that draws over a mutable rasterization rate map draws as Metal's GPU reads the map
+/// as it runs the pass: not yet reset by then, it rasterizes nothing and stores its clear; reset
+/// after the pass ended and before its command buffer's commit, or after the commit while the
+/// command buffer waits for an event signalled after the reset, to the identity over the map's
+/// screen, it draws by the map as reset, as Metal's does, and a map of the identity made over a
+/// screen smaller than the target draws its corner, as Metal's. Reset so to the identity of
+/// another screen size, it draws over the screen the map had at the encoder's creation, to the
+/// 32-pixel tiles of the new screen where that spans one tile fewer, as Metal's GPU does: all of
+/// a 16-pixel target from a 16-pixel screen reset to 8, the corner from 8 reset to 16, the 32 by
+/// 32 corner of a 64-pixel target from a 64-pixel screen reset to 32 or to 24, and all of it
+/// reset to 48
+#[test]
+fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
+    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use reims_vgpu_core::raise::death::DeathSite;
+
+    const SIDE: u64 = 16;
+    const HALF: u64 = SIDE / 2;
+    /// The side of the target and screen whose resets cross a 32-pixel tile.
+    const WIDE: u64 = 64;
+
+    /// How the pass's map is made, and when it is reset, if at all.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Reset {
+        /// A mutable map, never reset.
+        Never,
+        /// A mutable map, reset after the pass ended and before the commit.
+        BeforeCommit,
+        /// A mutable map, reset after the commit, before the event its command buffer waits for.
+        AfterCommit,
+        /// An immutable map, never reset.
+        Made,
+    }
+
+    /// A descriptor of a `side` by `side` screen of `mutability` (Immutable when unset), with
+    /// one layer of one sample of 1 on each axis.
+    fn identity<P: Platform>(p: &P, side: u64, mutability: Option<u64>) -> P::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            mutability,
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 1.0 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    /// The `target` by `target` texture's bytes after a full-screen triangle in a pass, which a
+    /// command buffer waiting for an event runs, over a map of the identity over a `from` by
+    /// `from` screen: mutable and not yet reset, reset `when` to an immutable descriptor of the
+    /// identity over a `to` by `to` screen; or, `Made`, an immutable map of `to`. The event is
+    /// signalled after the commit. A death at the reset is answered once the command buffer, if
+    /// committed, completed.
+    fn drawn<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        (when, target, from, to): (Reset, u64, u64, u64),
+    ) -> Result<Vec<u8>, DeathSite> {
+        let map = match when {
+            Reset::Made => d.new_rate_map(&identity(p, to, None)),
+            _ => d.new_rate_map(&identity(p, from, Some(1))),
+        };
+        let map = map.unwrap().unwrap();
+        let (dst, pass) = pass_of(p, d, (target, target));
+        pass.set_pass(&PassSet {
+            rasterization_rate_map: Some(Some(&map)),
+            ..Default::default()
+        });
+        let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+        let q = d.new_command_queue().unwrap();
+        let event = d.new_shared_event().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        cb.encode_wait(Some(EventRef::Shared(&event)), 1).unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        let out = buffer::<P>(d, target * target * 4, 0, &[]);
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::CopyTextureToBuffer {
+                source_texture: &dst,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(target, target, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: target * 4,
+                destination_bytes_per_image: target * target * 4,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Die, cmd).unwrap();
+        }
+        let reset = |at| match when == at {
+            true => catch_death(|| map.reset(&identity(p, to, None))),
+            false => Ok(()),
+        };
+        let before = reset(Reset::BeforeCommit);
+        if before.is_ok() {
+            cb.commit(OnFault::Die).unwrap();
+        }
+        let after = reset(Reset::AfterCommit);
+        event.set_signaled_value(1).unwrap();
+        before?;
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        after?;
+        let n = usize::try_from(target * target * 4).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after the blit completed.
+        Ok(unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec())
+    }
+
+    /// A `target` by `target` texture as cleared, with the top left `side` by `side` texels of
+    /// the fragment function's colour, (1, 0.5, 0.25, 1) as BGRA8.
+    fn shaded(target: u64, side: u64) -> Vec<u8> {
+        (0..target * target)
+            .flat_map(|i| match (i % target < side, i / target < side) {
+                (true, true) => [64, 128, 255, 255],
+                _ => [0, 0, 0, 255],
+            })
+            .collect()
+    }
+
+    let cases = [
+        ((Reset::Never, SIDE, SIDE, SIDE), 0),
+        ((Reset::BeforeCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, SIDE), SIDE),
+        ((Reset::Never, SIDE, HALF, HALF), 0),
+        ((Reset::BeforeCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, HALF), HALF),
+        ((Reset::Made, SIDE, 0, HALF), HALF),
+        ((Reset::BeforeCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::AfterCommit, SIDE, SIDE, HALF), SIDE),
+        ((Reset::BeforeCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::AfterCommit, SIDE, HALF, SIDE), HALF),
+        ((Reset::BeforeCommit, WIDE, WIDE, 32), 32),
+        ((Reset::AfterCommit, WIDE, WIDE, 24), 32),
+        ((Reset::BeforeCommit, WIDE, WIDE, 48), WIDE),
+    ];
+    let p = platform();
+    let d = dev();
+    for (case, side) in cases {
+        assert!(drawn(&p, &d, case) == Ok(shaded(case.1, side)), "{case:?}");
+    }
+    if let Some(md) = MetalPlatform::system_default_device() {
+        let mp = MetalPlatform::new(Box::new(NoLauncher));
+        for (case, side) in cases {
+            assert!(
+                drawn(&mp, &md, case) == Ok(shaded(case.1, side)),
+                "{case:?}"
+            );
+        }
+    }
+}
+
+/// A reset of a mutable rasterization rate map whose rates vary to one of another screen size,
+/// after a pass took it and before the pass ran, dies at the reset: no measurement says what
+/// Metal's GPU draws then ([`crate::gpu::rate_map`])
+#[test]
+fn a_reset_of_a_varying_map_to_another_screen_dies_while_its_pass_may_run() {
+    use reims_vgpu_core::platform::rate_map::{
+        RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+    };
+    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+
+    /// An immutable descriptor of a `side` by `side` screen of one layer of one sample of 0.5
+    /// on each axis.
+    fn half(p: &VulkanPlatform, side: u64) -> <VulkanPlatform as Platform>::RateMapDescriptor {
+        let desc = p.rate_map_descriptor(&RateMapDesc {
+            screen_size: MtlSize::new(side, side, 1),
+            ..RateMapDesc::default()
+        });
+        let layer = p
+            .new_rate_map_layer(OnFault::Die, MtlSize::new(1, 1, 0))
+            .unwrap()
+            .unwrap();
+        for at in [
+            layer.horizontal_sample_storage(),
+            layer.vertical_sample_storage(),
+        ] {
+            // SAFETY: the layer's storage holds one sample on each axis.
+            unsafe { *at.as_ptr::<f32>() = 0.5 };
+        }
+        desc.set_layer(OnFault::Die, &layer, 0).unwrap();
+        desc
+    }
+
+    let (p, d) = (platform(), dev());
+    let made = p.rate_map_descriptor(&RateMapDesc {
+        screen_size: MtlSize::new(128, 128, 1),
+        mutability: Some(1),
+        ..RateMapDesc::default()
+    });
+    let map = d.new_rate_map(&made).unwrap().unwrap();
+    map.reset(&half(&p, 128));
+    let (_dst, pass) = pass_of(&p, &d, (128, 128));
+    pass.set_pass(&PassSet {
+        rasterization_rate_map: Some(Some(&map)),
+        ..Default::default()
+    });
+    let state = fixture_state::<VulkanPlatform>(&d, "vert:tri_vert", "frag:tri_frag");
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    crate::answer::relaxed(|| {
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+    });
+    *crate::answer::LAST_LINE.lock() = None;
+    let site = catch_death(|| map.reset(&half(&p, 64))).unwrap_err();
+    let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+    assert_eq!(site.file, "resetUsingDescriptor:", "{line}");
+    assert!(line.contains("of a 64 by 64 screen"), "{line}");
 }
 
 /// The tile size of a one-sample pass is Metal's
@@ -7882,6 +9355,46 @@ fn after_a_failure<P: Platform>(
     lines
 }
 
+/// [`after_a_failure`]'s lines without what depends on time: when each command buffer was
+/// committed, the hang's status then, and how long the hang took.
+fn untimed(lines: Vec<String>) -> Vec<String> {
+    lines
+        .into_iter()
+        .map(|line| {
+            let line = match line.split_once(" after ") {
+                Some((head, _)) if !line.starts_with(' ') => head.to_owned(),
+                _ => line,
+            };
+            match (line.find(" (committed at "), line.find("): ")) {
+                (Some(from), Some(to)) => format!("{}{}", &line[..from], &line[to + 1..]),
+                _ => line,
+            }
+        })
+        .collect()
+}
+
+/// Command buffers committed on the queue of one whose draw of primitive type 9 hangs the GPU, at
+/// once after its commit, run nothing and complete without an error, their event signals
+/// firing, and one of another queue runs, here as on Metal ([`after_a_failure`]): each one's
+/// status, error, bytes and signal, and what the completed handlers saw, in their order. Under
+/// macOS 27.0.1 Metal runs one committed once the hang's command buffer reads scheduled, about
+/// 1 ms on, in most runs and nothing of it in others (`metal_runs_after_a_type_9_hang_here`),
+/// so only the commit at once is compared
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs Metal's GPU"]
+fn later_command_buffers_of_a_hang_run_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for _ in 0..3 {
+        let theirs = untimed(after_a_failure(&mp, &md, Failure::Hang, Later::AtOnce));
+        let ours = untimed(after_a_failure(&p, &d, Failure::Hang, Later::AtOnce));
+        assert_eq!(ours, theirs);
+    }
+}
+
 /// Measures what Metal's GPU does to command buffers committed on the queue of one whose draw of
 /// primitive type 9 hangs it, and on another, at once, once it is scheduled and after 1 to 8 ms
 /// ([`after_a_failure`]). One line a command buffer.
@@ -7912,5 +9425,368 @@ fn metal_runs_after_a_type_9_hang_here() {
                 println!("{line}");
             }
         }
+    }
+}
+
+/// A draw of primitive type 9 of [`type_9_pass`]'s: directly, `(count, instances)`; over
+/// `(count, instances)` of the 16-bit indices 0, 1 and 2; from indirect arguments of 3 vertices
+/// and an instance; or from indirect arguments of those indices and an instance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Nine {
+    Direct(u64, u64),
+    Indexed(u64, u64),
+    Indirect,
+    IndexedIndirect,
+}
+
+/// What a command buffer of a new queue shows on `p`'s device `d` whose render pass, over a 4 by
+/// 4 target filled with 0x11, draws primitive type 9 as `draw` says ([`type_9_pass_on`]).
+fn type_9_pass<P: Platform>(p: &P, d: &P::Device, draw: Nine) -> String {
+    type_9_pass_on(p, d, &d.new_command_queue().unwrap(), draw)
+}
+
+/// What a command buffer of `q` shows on `p`'s device `d` whose render pass, over a 4 by 4 target
+/// filled with 0x11, draws primitive type 9 as `draw` says, a blit before it filling a buffer
+/// with 0x5a and one after it another with 0x6b, then an event signal: its status and error, the
+/// first byte of each buffer, whether the signal fired, and the target's first texel, black
+/// where the pass's clear ran, read through a new queue.
+fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: Nine) -> String {
+    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    let (dst, pass) = pass_of(p, d, (4, 4));
+    let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+    dst.replace_region(region, 0, 0, HostRange::of_slice(&[0x11; 64]), 16, 0)
+        .unwrap();
+    let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
+    let (before, after) = (
+        buffer::<P>(d, 16, 0, &[0; 16]),
+        buffer::<P>(d, 16, 0, &[0; 16]),
+    );
+    let indices = buffer::<P>(d, 16, 0, &index_bytes(U16, &[0, 1, 2]));
+    let arguments = match draw {
+        Nine::IndexedIndirect => u32s(&[3, 1, 0, 0, 0]),
+        _ => u32s(&[3, 1, 0, 0]),
+    };
+    let arguments = buffer::<P>(d, 32, 0, &arguments);
+    let event = d.new_shared_event().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let fill = |b: &P::Buffer, value| {
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let range = NsRange::new(0, 16);
+        let fill = BlitCmd::FillBuffer {
+            buffer: b,
+            range,
+            value,
+        };
+        blit.encode(OnFault::Die, fill).unwrap();
+        blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    };
+    fill(&before, 0x5a);
+    let drawn = match draw {
+        Nine::Direct(count, instances) => RenderCmd::DrawPrimitivesInstances {
+            primitive_type: 9,
+            vertex_start: 0,
+            vertex_count: count,
+            instance_count: instances,
+        },
+        Nine::Indexed(count, instances) => RenderCmd::DrawIndexedPrimitivesInstances {
+            primitive_type: 9,
+            index_count: count,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            instance_count: instances,
+        },
+        Nine::Indirect => RenderCmd::DrawPrimitivesIndirect {
+            primitive_type: 9,
+            indirect_buffer: &arguments,
+            indirect_buffer_offset: 0,
+        },
+        Nine::IndexedIndirect => RenderCmd::DrawIndexedPrimitivesIndirect {
+            primitive_type: 9,
+            index_type: U16,
+            index_buffer: &indices,
+            index_buffer_offset: 0,
+            indirect_buffer: &arguments,
+            indirect_buffer_offset: 0,
+        },
+    };
+    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+    for cmd in [
+        RenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(&state),
+        },
+        drawn,
+        RenderCmd::EndEncoding,
+    ] {
+        e.encode(OnFault::Die, cmd).unwrap();
+    }
+    fill(&after, 0x6b);
+    cb.encode_signal(Some(EventRef::Shared(&event)), 5).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    let out = buffer::<P>(d, 4, 0, &[]);
+    let read = d.new_command_queue().unwrap();
+    let read = read.command_buffer(OnFault::Die).unwrap().unwrap();
+    let blit = read.blit_encoder(OnFault::Die).unwrap().unwrap();
+    for cmd in [
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &dst,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(1, 1, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 4,
+            destination_bytes_per_image: 4,
+        },
+        BlitCmd::EndEncoding,
+    ] {
+        blit.encode(OnFault::Die, cmd).unwrap();
+    }
+    read.commit(OnFault::Die).unwrap();
+    read.wait_until_completed(OnFault::Die).unwrap();
+    // SAFETY: Shared buffers' bytes, read after their command buffers completed.
+    let first = |b: &P::Buffer| unsafe { *b.contents().as_ptr::<u8>() };
+    // SAFETY: as above, the 4 bytes of `out`.
+    let texel = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), 4) };
+    format!(
+        "status {} error {:?} before {:#x} after {:#x} signal {} texel {texel:x?}",
+        cb.status().0,
+        cb.error().map(|e| e.code),
+        first(&before),
+        first(&after),
+        event.wait_until_signaled_value(5, 1),
+    )
+}
+
+/// [`type_9_pass`]'s lines on Metal, each of its draws: directly, of 3 vertices or more and an
+/// instance it hangs the GPU, failing the command buffer with `MTLCommandBufferErrorTimeout`
+/// (status 5, code 2), the blit before the pass run and neither the pass's clear nor the blit
+/// after it, the signal firing; of fewer, or of no instance, it fails nothing. Over indices, of
+/// any count or instances, it faults the GPU (`MTLCommandBufferErrorPageFault`, code 3), and from
+/// indirect arguments, over indices or not, fails the command buffer as a victim of the GPU's
+/// recovery (`MTLCommandBufferErrorInternal`, code 1), each as a hang fails it: Metal's answer in
+/// a steady stream of work, which the runtime takes. There Metal's GPU races: in some runs the
+/// blit after the pass runs too ([`after_a_fault_runs`]), as where the GPU was idle for some
+/// seconds before (measured on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`, which
+/// draws these after the hangs).
+const METALS_TYPE_9: [(Nine, &str); 11] = [
+    (
+        Nine::Direct(0, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        Nine::Direct(1, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        Nine::Direct(2, 1),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        Nine::Direct(3, 0),
+        "status 4 error None before 0x5a after 0x6b signal true texel [0, 0, 0, ff]",
+    ),
+    (
+        Nine::Direct(3, 1),
+        "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Direct(6, 2),
+        "status 5 error Some(2) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(3, 1),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(0, 1),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indexed(3, 0),
+        "status 5 error Some(3) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::Indirect,
+        "status 5 error Some(1) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+    (
+        Nine::IndexedIndirect,
+        "status 5 error Some(1) before 0x5a after 0x0 signal true texel [11, 11, 11, 11]",
+    ),
+];
+
+/// [`memoryless_slot_pass`]'s lines on Metal are [`METALS_MEMORYLESS_SLOT`]'s, and this
+/// platform's the same
+#[test]
+fn memoryless_slots_fail_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for (fragment, metals) in METALS_MEMORYLESS_SLOT {
+        assert_eq!(
+            memoryless_slot_pass(&mp, &md, fragment),
+            metals,
+            "{fragment}"
+        );
+        assert_eq!(memoryless_slot_pass(&p, &d, fragment), metals, "{fragment}");
+    }
+}
+
+/// A draw of primitive type 9 fails its command buffer as Metal's GPU does ([`METALS_TYPE_9`]):
+/// directly it hangs at 3 vertices or more and an instance, and fails nothing at fewer or no
+/// instance; over indices it faults, and from indirect arguments it fails a victim of the GPU's
+/// recovery, each of a new queue
+#[test]
+fn type_9_draws_fail_their_command_buffers_as_metals() {
+    let (p, d) = (platform(), dev());
+    for (draw, metals) in METALS_TYPE_9 {
+        assert_eq!(type_9_pass(&p, &d, draw), metals, "{draw:?}");
+    }
+}
+
+/// `line`, a line of [`METALS_TYPE_9`]'s of a draw over indices or from indirect arguments, as
+/// Metal's GPU answers it in the runs where it runs the blit after the faulted pass: the same
+/// but for that blit's buffer, filled. `None` for a direct draw's line, which has one answer.
+fn after_a_fault_runs(draw: Nine, line: &str) -> Option<String> {
+    match draw {
+        Nine::Direct(..) => None,
+        _ => Some(line.replace("after 0x0", "after 0x6b")),
+    }
+}
+
+/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`]'s, or after a fault or a victim the
+/// same with the blit after the pass run ([`after_a_fault_runs`]), the other answer of Metal's
+/// race, and this platform's are [`METALS_TYPE_9`]'s, each of a new queue, three times over. Each
+/// fault's and victim's draw has Metal's answer of [`METALS_TYPE_9`] in some run
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
+fn type_9_draws_fail_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let mut steady = vec![0; METALS_TYPE_9.len()];
+    for _ in 0..3 {
+        for (at, (draw, metals)) in METALS_TYPE_9.into_iter().enumerate() {
+            let theirs = type_9_pass(&mp, &md, draw);
+            let raced = after_a_fault_runs(draw, metals);
+            assert!(
+                theirs == metals || Some(&theirs) == raced.as_ref(),
+                "{draw:?}: {theirs}"
+            );
+            steady[at] += usize::from(theirs == metals);
+            assert_eq!(type_9_pass(&p, &d, draw), metals, "{draw:?}");
+        }
+    }
+    assert!(steady.iter().all(|&n| n > 0), "{steady:?}");
+}
+
+/// What a new queue of `p`'s device `d` shows once `draws`, command buffers of
+/// [`type_9_pass_on`]'s, were committed on it in turn, each once the one before completed: each
+/// one's status and error, then a command buffer's committed on it once the last completed,
+/// which fills a buffer and signals an event ([`filling`]), and one's committed so on another
+/// new queue: each one's status and error, the buffer's first byte and whether the signal fired.
+/// What else of a type-9 command buffer ran is left out: on Metal it races, the encoders
+/// after a fault running where the GPU was idle before (the process's first fault here), and the
+/// queue's second fault running nothing of its command buffer, the blit before it included, in
+/// some runs (the runtime's measurement, `command_buffer/revocation.rs`), where
+/// [`type_9_draws_fail_as_metals`] compares it on a GPU that ran just before.
+fn after_type_9s<P: Platform>(p: &P, d: &P::Device, draws: &[Nine]) -> Vec<String> {
+    use reims_vgpu_core::platform::event::SharedEvent as _;
+    let q = d.new_command_queue().unwrap();
+    let mut lines: Vec<String> = (draws.iter())
+        .map(|&draw| {
+            let line = type_9_pass_on(p, d, &q, draw);
+            let failed = line.split(" before ").next().unwrap_or_default();
+            format!("{draw:?}: {failed}")
+        })
+        .collect();
+    let seen = Seen::default();
+    for (what, q) in [
+        ("its queue", &q),
+        ("a new queue", &d.new_command_queue().unwrap()),
+    ] {
+        let (cb, b, event) = filling::<P>(d, q, (0x11, None), &seen);
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        lines.push(format!(
+            "{what}: status {} error {:?} filled {first:#x} signal {}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            event.wait_until_signaled_value(1, 1),
+        ));
+    }
+    lines
+}
+
+/// [`after_type_9s`]'s draws: two faults, a hang then a fault, and a victim of the GPU's recovery
+/// then a fault.
+const REVOKING: [&[Nine]; 3] = [
+    &[Nine::Indexed(3, 1), Nine::Indexed(3, 1)],
+    &[Nine::Direct(3, 1), Nine::Indexed(3, 1)],
+    &[Nine::Indirect, Nine::Indexed(3, 1)],
+];
+
+/// The last two of [`after_type_9s`]'s lines on Metal after each of [`REVOKING`]'s: a queue whose
+/// second command buffer that a draw of primitive type 9 faulted or hung completed fails every
+/// command buffer committed on it after that with `MTLCommandBufferErrorAccessRevoked` (status 5,
+/// code 4), running none of its work and firing none of its signals, where a new queue runs; a
+/// victim of the GPU's recovery does not count (measured on the M3 Max, macOS 27.0.1,
+/// `type_9_faults_revoke_queues_as_metals`).
+const METALS_REVOKING: [[&str; 2]; 3] = [
+    [
+        "its queue: status 5 error Some(4) filled 0x0 signal false",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+    [
+        "its queue: status 5 error Some(4) filled 0x0 signal false",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+    [
+        "its queue: status 4 error None filled 0x11 signal true",
+        "a new queue: status 4 error None filled 0x11 signal true",
+    ],
+];
+
+/// A queue's second command buffer that a draw of primitive type 9 faulted or hung revokes it,
+/// as Metal's ([`METALS_REVOKING`]), and a victim of the GPU's recovery does not: the type-9
+/// command buffers fail with the status and error [`METALS_TYPE_9`] says
+#[test]
+fn type_9_faults_revoke_queues_as_on_metal() {
+    let (p, d) = (platform(), dev());
+    for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
+        let lines = after_type_9s(&p, &d, draws);
+        let (failed, later) = lines.split_at(draws.len());
+        for (line, draw) in failed.iter().zip(draws) {
+            let (_, metals) = METALS_TYPE_9.iter().find(|(d, _)| d == draw).unwrap();
+            let status = metals.split(" before ").next().unwrap_or_default();
+            assert_eq!(*line, format!("{draw:?}: {status}"));
+        }
+        assert_eq!(later, metals, "{draws:?}");
+    }
+}
+
+/// [`after_type_9s`]'s lines on Metal after each of [`REVOKING`]'s end in
+/// [`METALS_REVOKING`]'s, and this platform's are Metal's, each of new queues
+#[test]
+#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
+fn type_9_faults_revoke_queues_as_metals() {
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
+        let theirs = after_type_9s(&mp, &md, draws);
+        assert_eq!(theirs[draws.len()..], metals, "{draws:?}: {theirs:#?}");
+        assert_eq!(after_type_9s(&p, &d, draws), theirs, "{draws:?}");
     }
 }

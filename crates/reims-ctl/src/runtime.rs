@@ -12,7 +12,7 @@
 use crate::host::{Host, Os, Profile};
 use crate::qemu::{self, Ctx, Invocation};
 use crate::qmp;
-use crate::vm::{Graphics, Vm};
+use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -22,15 +22,16 @@ use std::time::{Duration, Instant};
 
 /// QEMU's pid, while it runs.
 pub fn pid(vm: &Vm) -> Option<i32> {
-    let pid: i32 = std::fs::read_to_string(vm.pidfile())
-        .ok()?
-        .trim()
-        .parse()
-        .ok()?;
+    pid_at(&vm.pidfile())
+}
+
+/// The pid of the QEMU that writes `pidfile`, while it runs: what [`pid`] reads, for a VM whose
+/// settings may not read.
+pub fn pid_at(pidfile: &Path) -> Option<i32> {
+    let pid: i32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
     if pid <= 0 || !alive(pid) {
         return None;
     }
-    let pidfile = vm.pidfile();
     let needle = pidfile.as_os_str().as_encoded_bytes();
     let cmd = cmdline(pid)?;
     cmd.windows(needle.len())
@@ -162,19 +163,121 @@ pub fn host_max_map_count() -> Option<u64> {
         .and_then(|s| s.trim().parse().ok())
 }
 
-/// The `vm.max_map_count` a guest of `memory_mib` needs on Linux, and the value to suggest
-/// raising it to. docs/qemu.md, "Linux hosts: vm.max_map_count": guest memory views take a
-/// mapping per run of 16 KiB pages; the stock 65,530 holds about 770 MiB of them.
+/// The `vm.max_map_count` at which an NVIDIA GPU takes all of a guest of `memory_mib` without
+/// copies, and the value to suggest raising it to; scripts/install-ctl.sh keeps the same rule.
+/// docs/qemu.md, "Linux hosts: vm.max_map_count": a view of an x86-64 guest's memory mapped from
+/// its files takes a mapping per 4 KiB page, which a GPU that pins a pointer's pages (NVIDIA's)
+/// needs; past the library's budget, the limit less 16,384 kept for the rest of the process and
+/// 8,192 more, its buffers are copied instead, which works and is slower. Other GPUs take the
+/// views through udmabuf, a mapping per 4 MiB, so the limit is only a speed-up, and only there.
 pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
-    let want = (memory_mib * 64).max(262_144) + 16_384 + 65_536;
-    // 2097152 covers a guest of up to 30 GiB, a new VM's default of up to 16 GiB among them.
-    (want, want.next_power_of_two().max(2_097_152))
+    let want = memory_mib * 256 + 16_384 + 8_192;
+    (want, want.next_power_of_two().max(1 << 20))
+}
+
+/// What keeps the library from opening `/dev/udmabuf`, which every Linux host needs: the guest's
+/// memory reaches the GPU through it, and without it the library's views of that memory take a
+/// kernel mapping per 4 KiB page, past `vm.max_map_count` at 3840 x 2160 even at the guest's
+/// desktop (docs/qemu.md, "Linux hosts: vm.max_map_count"). None where it opens.
+pub fn udmabuf_problem() -> Option<String> {
+    use std::os::unix::fs::MetadataExt;
+    const NODE: &str = "/dev/udmabuf";
+    let e = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(NODE)
+        .err()?;
+    let group = std::fs::metadata(NODE).ok().map(|m| m.gid());
+    let over_ssh = std::env::var_os("SSH_CONNECTION").is_some();
+    Some(udmabuf_message(
+        &e,
+        group.map(|gid| (gid, group_name(gid))),
+        over_ssh,
+    ))
+}
+
+/// The name of group `gid`, from /etc/group, else its number.
+fn group_name(gid: u32) -> String {
+    std::fs::read_to_string("/etc/group")
+        .ok()
+        .and_then(|groups| group_in(&groups, gid))
+        .unwrap_or_else(|| gid.to_string())
+}
+
+/// The name `groups`, in /etc/group's form, gives group `gid`.
+fn group_in(groups: &str, gid: u32) -> Option<String> {
+    groups.lines().find_map(|l| {
+        let mut f = l.split(':');
+        let name = f.next()?;
+        (f.nth(1)?.parse() == Ok(gid)).then(|| name.to_owned())
+    })
+}
+
+/// [`udmabuf_problem`]'s message for `e`, the node's group (its id and name) where it exists, and
+/// whether reims-ctl runs over ssh.
+fn udmabuf_message(e: &std::io::Error, group: Option<(u32, String)>, over_ssh: bool) -> String {
+    const WHY: &str = "the guest's memory reaches the GPU through it, and without it the guest \
+                       can crash at higher resolutions, at 4K even at its desktop";
+    let load = "Load it with sudo modprobe udmabuf, and put udmabuf in a file in \
+                /etc/modules-load.d to keep it";
+    let Some((gid, name)) = group else {
+        return format!("There's no /dev/udmabuf: {WHY}. {load}");
+    };
+    if e.kind() != std::io::ErrorKind::PermissionDenied {
+        return format!("/dev/udmabuf doesn't open ({e}): {WHY}. {load}");
+    }
+    if gid == 0 {
+        return format!(
+            "Only root can open /dev/udmabuf ({e}): {WHY}. Give it to the kvm group with a udev \
+             rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", \
+             MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm $USER), and restart"
+        );
+    }
+    let ssh = if over_ssh {
+        ". Over ssh, the access a desktop session gets to it doesn't apply, so you need the \
+         group there"
+    } else {
+        ""
+    };
+    format!(
+        "You can't open /dev/udmabuf ({e}): {WHY}. Add yourself to the {name} group that owns it \
+         (sudo usermod -aG {name} $USER) and log in again{ssh}"
+    )
+}
+
+/// Whether the host has an NVIDIA GPU (Linux): a card of its PCI vendor id.
+pub fn host_has_nvidia() -> bool {
+    std::fs::read_dir("/sys/class/drm")
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|card| std::fs::read_to_string(card.path().join("device/vendor")).ok())
+        .any(|v| v.trim() == "0x10de")
+}
+
+/// What `vm.max_map_count` costs a host whose GPU is NVIDIA's, for `reims-ctl doctor`: where
+/// `/dev/udmabuf` opens (else [`udmabuf_problem`] says what to do) and the limit falls short of
+/// [`max_map_count`] for a guest of `memory_mib`, how much of it stays uncopied and the value
+/// that keeps all of it so. A speed-up only: the guest works either way.
+pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
+    let (want, raise) = max_map_count(memory_mib);
+    if n >= want {
+        return None;
+    }
+    let uncopied = n.saturating_sub(16_384 + 8_192) / 256;
+    Some(format!(
+        "on an NVIDIA GPU, past about {uncopied} MiB of a {} GiB guest's memory the GPU gets \
+         copies of it, which is slower; sudo sysctl -w vm.max_map_count={raise}, and a file in \
+         /etc/sysctl.d to keep it, avoids them",
+        memory_mib / 1024
+    ))
 }
 
 /// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
-/// whose Reinstall macOS installs it.
+/// whose Reinstall macOS installs it. For a disk on NVMe, they first say to move it to SATA
+/// ([`DiskController`]).
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -186,12 +289,20 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
     } else {
         "pick Reinstall macOS"
     };
+    let name = vm.name();
+    let first = match q.disk_controller {
+        DiskController::Ahci => String::new(),
+        DiskController::Nvme => format!(
+            "Its disk is on NVMe, where macOS's installer may find no disk: first move it to \
+             SATA (reims-ctl set {name} --disk-controller ahci, or Disk controller in its edit \
+             form). "
+        ),
+    };
     Some(format!(
-        "To install macOS, start {name}: OpenCore boots its installer into macOS Recovery. If the \
-         VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as APFS and quit \
-         Disk Utility. Then {last}. Once macOS is installed, eject the installer (reims-ctl \
-         eject {name}) and set Metal's error mode (README).",
-        name = vm.name()
+        "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
+         Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
+         APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
+         (reims-ctl eject {name}) and set Metal's error mode (README)."
     ))
 }
 
@@ -224,56 +335,12 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
             ));
         }
     }
-    if host.os == Os::Linux {
-        if let Some(n) = host_max_map_count() {
-            let (want, raise) = max_map_count(vm.config.memory_mib);
-            if n < want {
-                w.push(format!(
-                    "vm.max_map_count is {n}: a {} GiB guest needs about {want}. Raise it with \
-                     sudo sysctl -w vm.max_map_count={raise} (and in /etc/sysctl.d to keep it)",
-                    vm.config.memory_mib / 1024
-                ));
-            }
-        }
-        // docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf": RADV imports the guest's memory as
-        // dma-bufs udmabuf makes.
-        if may_run_on_radv(&vm.config.gpu) {
-            let usable = std::fs::OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open("/dev/udmabuf");
-            if let Err(e) = usable {
-                w.push(format!(
-                    "/dev/udmabuf cannot be opened ({e}): an AMD GPU needs it for the guest's \
-                     memory, or the guest dies at boot. Add yourself to the group that owns it \
-                     (kvm on Ubuntu; sudo usermod -aG kvm $USER, then log in again)"
-                ));
-            }
-        }
+    if host.os == Os::Linux
+        && let Some(problem) = udmabuf_problem()
+    {
+        w.push(problem);
     }
     w
-}
-
-/// Whether a VM may run on RADV, Mesa's driver for AMD GPUs: its GPU is one, or none is set and
-/// the host has an AMD GPU and no NVIDIA one, which the library would pick first as discrete.
-fn may_run_on_radv(gpu: &crate::vm::Gpu) -> bool {
-    let radv = |file: &Path| {
-        file.file_name()
-            .is_some_and(|f| f.to_string_lossy().starts_with("radeon_icd"))
-    };
-    match &gpu.driver_file {
-        Some(file) => radv(file) || gpu.name.as_deref().is_some_and(|n| n.contains("RADV")),
-        None => {
-            let vendors: Vec<String> = std::fs::read_dir("/sys/class/drm")
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|card| std::fs::read_to_string(card.path().join("device/vendor")).ok())
-                .map(|v| v.trim().to_owned())
-                .collect();
-            vendors.iter().any(|v| v == "0x1002") && !vendors.iter().any(|v| v == "0x10de")
-        }
-    }
 }
 
 /// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
@@ -404,10 +471,78 @@ pub fn now_stamp(fmt: &str) -> String {
     }
 }
 
+/// Another VM that runs on `vm`'s disk, which both use in place. QEMU on Linux would refuse the
+/// second's start on its lock of the image; on macOS QEMU locks no image, and both would write
+/// the disk.
+fn running_on_disk(vm: &Vm) -> Option<String> {
+    let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    let disk = real(&vm.disk());
+    let reg = crate::vm::Registry::load().ok()?;
+    reg.vms
+        .iter()
+        .filter(|e| e.name != vm.name())
+        .filter_map(|e| Vm::load(&e.dir).ok())
+        .find(|other| real(&other.disk()) == disk && pid(other).is_some())
+        .map(|other| other.name().to_string())
+}
+
+/// Readies the VM's directory for a run of QEMU: its logs rotated, and the QMP socket's
+/// directory made. Returns the socket.
+///
+/// The pid file and the socket an earlier run left stay where they are. QEMU locks its pid file
+/// before it opens anything else, so a second QEMU of a VM that already runs, from a start
+/// racing this one, ends there, before it opens the VM's disks or replaces the first one's
+/// socket; and QEMU replaces a stale socket itself. Deleted here, the second QEMU would lock a
+/// new file and run on the disks the first one writes, which on macOS, where QEMU locks no
+/// image, nothing else stops.
+fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
+    std::fs::create_dir_all(vm.logs_dir())?;
+    rotate(&vm.qemu_log());
+    if vm.config.logs.enabled {
+        rotate(&vm.serial_log());
+    }
+    let sock = vm.qmp_socket();
+    if let Some(d) = sock.parent().filter(|d| *d != vm.dir) {
+        private_dir(d)?;
+    }
+    Ok(sock)
+}
+
+/// Makes `d`, a directory for QMP sockets outside the VMs' own, the user's alone (0700) where it
+/// is new, and refuses one that is not a directory, another user owns, or others may write into:
+/// whoever could write there could put a socket of theirs in QMP's place and drive the VM. Some
+/// of them are under `/tmp`, which every user writes into (`paths::short_runtime_dir`).
+fn private_dir(d: &Path) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(d)
+        .with_context(|| format!("create {}", d.display()))?;
+    let m = std::fs::symlink_metadata(d).with_context(|| format!("read {}", d.display()))?;
+    // SAFETY: getuid has no preconditions.
+    let uid = unsafe { libc::getuid() };
+    if !m.is_dir() || m.uid() != uid || m.mode() & 0o022 != 0 {
+        bail!(
+            "{} is not a directory of this user's that others cannot write into, so it holds no \
+             QMP socket: remove it, or make it so",
+            d.display()
+        );
+    }
+    Ok(())
+}
+
 /// Starts the VM, and returns QEMU's pid once QMP answers.
 pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     if let Some(p) = pid(vm) {
         bail!("{} already runs (pid {p})", vm.name());
+    }
+    if let Some(other) = running_on_disk(vm) {
+        bail!(
+            "{other} is running on {}'s disk, {}: stop it first. Two VMs on one disk corrupt it",
+            vm.name(),
+            crate::paths::tilde(&vm.disk())
+        );
     }
     preflight(vm, host)?;
     if vm.config.profile == Profile::VmappleArm64 {
@@ -415,19 +550,7 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     }
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
-
-    let logs = vm.logs_dir();
-    std::fs::create_dir_all(&logs)?;
-    rotate(&vm.qemu_log());
-    if vm.config.logs.enabled {
-        rotate(&vm.serial_log());
-    }
-    let sock = vm.qmp_socket();
-    if let Some(d) = sock.parent() {
-        std::fs::create_dir_all(d)?;
-    }
-    let _ = std::fs::remove_file(&sock);
-    let _ = std::fs::remove_file(vm.pidfile());
+    let sock = prepare_run(vm)?;
 
     let mut log = std::fs::OpenOptions::new()
         .create(true)
@@ -495,12 +618,20 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
 /// Stops the VM: macOS's Control-Option-Command-Power on the USB keyboard ("quit all apps,
 /// then shut down", which asks about unsaved documents), then, a third of `timeout` in, the
 /// machine's power button (ACPI's on q35, a GPIO on vmapple), and at `timeout` a power-off; with
-/// `force`, the power-off at once. `progress` hears each step.
+/// `force`, the power-off at once. With no `timeout` it waits until the guest shuts down, the
+/// button a third of [`DEFAULT_STOP_TIMEOUT`] in, and never powers the VM off: where neither the
+/// keys nor the button reach the guest, it ends with an error instead. `progress` hears each
+/// step.
 ///
 /// The keys come first because the power button alone does not shut a guest down: a macOS 26
 /// vmapple guest did nothing with vmapple's in 90 s, where the keys shut it down in under 6 s
 /// (2026-10-11, M3 Max).
-pub fn stop(vm: &Vm, force: bool, timeout: Duration, mut progress: impl FnMut(&str)) -> Result<()> {
+pub fn stop(
+    vm: &Vm,
+    force: bool,
+    timeout: Option<Duration>,
+    mut progress: impl FnMut(&str),
+) -> Result<()> {
     let Some(p) = pid(vm) else {
         progress("not running");
         return Ok(());
@@ -523,16 +654,23 @@ pub fn stop(vm: &Vm, force: bool, timeout: Duration, mut progress: impl FnMut(&s
             }
         };
         let start = Instant::now();
+        let button_at = timeout.unwrap_or(DEFAULT_STOP_TIMEOUT) / 3;
         let mut button = false;
-        while start.elapsed() < timeout {
+        while timeout.is_none_or(|t| start.elapsed() < t) {
             if !alive(p) {
                 progress("shut down");
                 return Ok(());
             }
-            if !button && (!asked || start.elapsed() >= timeout / 3) {
+            if !button && (!asked || start.elapsed() >= button_at) {
                 button = true;
-                if qmp::run(&sock, "system_powerdown", None).is_ok() {
-                    progress("still running: pressed its power button");
+                match qmp::run(&sock, "system_powerdown", None) {
+                    Ok(_) => progress("still running: pressed its power button"),
+                    Err(e) if !asked && timeout.is_none() => bail!(
+                        "{e:#}: neither the keys nor the power button reach {}, which runs on; \
+                         a forced stop powers it off",
+                        vm.name()
+                    ),
+                    Err(_) => {}
                 }
             }
             std::thread::sleep(Duration::from_millis(300));
@@ -592,40 +730,258 @@ pub fn tail(path: &Path, n: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::vm::Gpu;
-    use std::path::PathBuf;
 
+    /// The limit at which an NVIDIA GPU takes a guest uncopied is a mapping per 4 KiB page of it
+    /// past the library's 16,384 and 8,192, as the library's own line names it
     #[test]
-    fn the_suggested_max_map_count_covers_new_vms() {
-        // A new VM's default is up to 16 GiB; CachyOS's stock 1048576 falls short of it.
-        assert_eq!(max_map_count(16 * 1024), (1_130_496, 2_097_152));
-        assert_eq!(max_map_count(4096), (344_064, 2_097_152));
-        let (want, raise) = max_map_count(30 * 1024);
-        assert!(want <= raise && raise == 2_097_152);
-        assert_eq!(max_map_count(32 * 1024).1, 4_194_304);
+    fn the_suggested_max_map_count_covers_a_guest_in_4k_pages() {
+        assert_eq!(max_map_count(16 * 1024), (4_218_880, 8_388_608));
+        assert_eq!(max_map_count(4096), (1_073_152, 2_097_152));
+        assert_eq!(max_map_count(2048), (548_864, 1_048_576));
+        assert!(map_count_note(8_388_608, 16 * 1024).is_none());
+        let note = map_count_note(65_530, 16 * 1024).unwrap();
+        assert!(
+            note.contains("past about 159 MiB of a 16 GiB guest's memory"),
+            "{note}"
+        );
+        assert!(note.contains("vm.max_map_count=8388608"), "{note}");
     }
 
-    /// A VM pinned to Mesa's radeon driver, or to a GPU named RADV, may run on RADV; one pinned
-    /// to NVIDIA's may not
+    /// The udmabuf message names the group that owns the node, says what to do where root alone
+    /// may open it or there is none, and says why the group is needed over ssh
     #[test]
-    fn a_pinned_gpu_decides_radv() {
-        let gpu = |file: &str, name: &str| Gpu {
-            driver_file: Some(PathBuf::from(file)),
-            device_id: None,
-            name: Some(name.to_owned()),
+    fn the_udmabuf_message_names_the_fix() {
+        let denied = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        let m = udmabuf_message(&denied, Some((992, "kvm".into())), false);
+        assert!(m.contains("crash at higher resolutions"), "{m}");
+        assert!(
+            m.contains("sudo usermod -aG kvm $USER) and log in again"),
+            "{m}"
+        );
+        assert!(!m.contains("ssh"), "{m}");
+        let m = udmabuf_message(&denied, Some((78, "render".into())), true);
+        assert!(m.contains("usermod -aG render"), "{m}");
+        assert!(m.contains("Over ssh"), "{m}");
+        let m = udmabuf_message(&denied, Some((0, "root".into())), false);
+        assert!(
+            m.contains("Only root") && m.contains("GROUP=\"kvm\""),
+            "{m}"
+        );
+        let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
+        assert!(udmabuf_message(&missing, None, false).contains("modprobe udmabuf"));
+        let no_module = std::io::Error::from_raw_os_error(libc::ENODEV);
+        let m = udmabuf_message(&no_module, Some((992, "kvm".into())), false);
+        assert!(
+            m.contains("doesn't open") && m.contains("modprobe udmabuf"),
+            "{m}"
+        );
+    }
+
+    /// A group's name is read from /etc/group's form by its id
+    #[test]
+    fn a_group_is_named_by_its_id() {
+        let groups = "root:x:0:\nkvm:x:992:anees\nrender:x:989:\n";
+        assert_eq!(group_in(groups, 992).as_deref(), Some("kvm"));
+        assert_eq!(group_in(groups, 0).as_deref(), Some("root"));
+        assert_eq!(group_in(groups, 5), None);
+    }
+
+    /// A VM does not start on a disk another VM, using it in place too, runs on.
+    #[test]
+    fn a_vm_does_not_start_on_a_disk_another_runs_on() {
+        let env = crate::testenv::Env::new("start-shared");
+        let disk = env.root.join("disk.img");
+        std::fs::write(&disk, "").unwrap();
+        let mut reg = crate::vm::Registry::default();
+        let mut vms = Vec::new();
+        for name in ["a", "b"] {
+            let dir = env.root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = format!(
+                r#"
+                name = "{name}"
+                profile = "vmapple-arm64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "{}"
+                [vmapple]
+                aux = "aux.img"
+                ecid = 1
+                "#,
+                disk.display()
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            reg.add(name, &dir).unwrap();
+            vms.push(Vm::load(&dir).unwrap());
+        }
+        reg.save().unwrap();
+        // a runs: a process whose command line names its pid file, as QEMU's does.
+        let mut qemu = std::process::Command::new("sh")
+            .args(["-c", "sleep 30; :"])
+            .arg(vms[0].pidfile())
+            .spawn()
+            .unwrap();
+        std::fs::write(vms[0].pidfile(), format!("{}\n", qemu.id())).unwrap();
+        let r = start(&vms[1], Host::current());
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.starts_with("a is running on b's disk"), "{e}");
+    }
+
+    /// A start leaves the pid file and the QMP socket where they are, a running QEMU's among
+    /// them: QEMU's lock on its pid file is what ends a second QEMU of the VM, from a start
+    /// racing this one, before it opens the disks the first one writes.
+    #[test]
+    fn a_start_leaves_the_pid_file_and_socket_to_qemu() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-prepare-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        let vm = Vm {
+            dir: d.clone(),
+            config: toml::from_str(config).unwrap(),
         };
-        assert!(may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/radeon_icd.json",
-            "AMD Radeon 780M Graphics (RADV PHOENIX)"
-        )));
-        assert!(may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/radeon_icd.x86_64.json",
-            "AMD Radeon 780M Graphics"
-        )));
-        assert!(!may_run_on_radv(&gpu(
-            "/usr/share/vulkan/icd.d/nvidia_icd.json",
-            "NVIDIA GeForce RTX 3090"
-        )));
+        let sock = vm.qmp_socket();
+        std::fs::create_dir_all(sock.parent().unwrap()).unwrap();
+        std::fs::write(&sock, "").unwrap();
+        std::fs::write(vm.pidfile(), "1234\n").unwrap();
+        assert_eq!(prepare_run(&vm).unwrap(), sock);
+        assert_eq!(std::fs::read_to_string(vm.pidfile()).unwrap(), "1234\n");
+        assert!(sock.exists());
+        assert!(vm.logs_dir().is_dir());
+        let _ = std::fs::remove_file(&sock);
+        std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// A QMP server at `sock` that greets, answers every command, and records each command but
+    /// qmp_capabilities.
+    fn fake_qmp(sock: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
+        use std::io::BufRead;
+        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = seen.clone();
+        std::thread::spawn(move || {
+            for mut conn in listener.incoming().map_while(Result::ok) {
+                let _ = conn.write_all(b"{\"QMP\": {}}\n");
+                let reader = std::io::BufReader::new(conn.try_clone().unwrap());
+                for line in reader.lines().map_while(Result::ok) {
+                    let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+                    let command = v["execute"].as_str().unwrap_or_default().to_string();
+                    if command != "qmp_capabilities" {
+                        record.lock().unwrap().push(command);
+                    }
+                    let _ = conn.write_all(b"{\"return\": {}}\n");
+                }
+            }
+        });
+        seen
+    }
+
+    /// A stop timeout of 0 is no limit, as an SSH port of 0 is no forward: stop asks the guest
+    /// to shut down, waits for it and powers nothing off. Where nothing reaches the guest, it
+    /// ends with an error rather than wait for good.
+    /// A QMP socket's directory is made the user's alone, and one others may write into is
+    /// refused: one made 0755 by an earlier reims-ctl is taken as it is
+    #[test]
+    fn a_qmp_socket_directory_others_may_write_into_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = std::env::temp_dir().join(format!("reims-ctl-private-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        let new = d.join("made");
+        private_dir(&new).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&new), 0o700);
+        let earlier = d.join("earlier");
+        std::fs::create_dir(&earlier).unwrap();
+        std::fs::set_permissions(&earlier, std::fs::Permissions::from_mode(0o755)).unwrap();
+        private_dir(&earlier).unwrap();
+        let open = d.join("open");
+        std::fs::create_dir(&open).unwrap();
+        std::fs::set_permissions(&open, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let refused = private_dir(&open);
+        let file = d.join("file");
+        std::fs::write(&file, "").unwrap();
+        let not_dir = private_dir(&file);
+        let _ = std::fs::remove_dir_all(&d);
+        assert!(refused.is_err(), "{refused:?}");
+        assert!(not_dir.is_err(), "{not_dir:?}");
+    }
+
+    #[test]
+    fn a_stop_timeout_of_0_waits_for_the_guest() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            stop_timeout_secs = 0
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        let vm = Vm {
+            dir: d.clone(),
+            config: toml::from_str(config).unwrap(),
+        };
+        // QEMU: a process whose command line names its pid file, as QEMU's does.
+        let qemu = || {
+            let q = std::process::Command::new("sh")
+                .args(["-c", "sleep 10; :"])
+                .arg(vm.pidfile())
+                .spawn()
+                .unwrap();
+            std::fs::write(vm.pidfile(), format!("{}\n", q.id())).unwrap();
+            q
+        };
+        let mut running = qemu();
+        let asked = fake_qmp(&vm.qmp_socket());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let stopping = {
+            let vm = vm.clone();
+            std::thread::spawn(move || {
+                stop(&vm, false, vm.config.stop_timeout(), |s| {
+                    let _ = tx.send(s.to_string());
+                })
+            })
+        };
+        std::thread::sleep(Duration::from_secs(1));
+        let commands = asked.lock().unwrap().clone();
+        let waited = alive(running.id() as i32);
+        // The guest shuts down.
+        let _ = running.kill();
+        let _ = running.wait();
+        let stopped = stopping.join().unwrap();
+        let steps: Vec<String> = rx.try_iter().collect();
+
+        std::fs::remove_file(vm.qmp_socket()).unwrap();
+        let mut running = qemu();
+        let unreached = stop(&vm, false, vm.config.stop_timeout(), |_| {});
+        let _ = running.kill();
+        let _ = running.wait();
+        std::fs::remove_dir_all(&d).unwrap();
+
+        assert_eq!(commands, ["send-key"]);
+        assert!(waited);
+        stopped.unwrap();
+        assert_eq!(
+            steps.last().map(String::as_str),
+            Some("shut down"),
+            "{steps:?}"
+        );
+        let e = format!("{:#}", unreached.unwrap_err());
+        assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
 
     #[test]
@@ -666,5 +1022,39 @@ mod tests {
         append(fault);
         assert_eq!(emptied_entry_lines(&log), 1);
         std::fs::remove_dir_all(&d).unwrap();
+    }
+
+    /// An x86-64 VM with an installer has install steps, which for a disk on NVMe first say to
+    /// move it to SATA.
+    #[test]
+    fn install_steps_move_a_disk_on_nvme_to_sata_first() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let steps = install_steps(&vm).unwrap();
+        assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
+        let q = vm.config.q35.as_mut().unwrap();
+        q.disk_controller = DiskController::Nvme;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.starts_with("Its disk is on NVMe")
+                && steps.contains("reims-ctl set t --disk-controller ahci"),
+            "{steps}"
+        );
+        vm.config.q35.as_mut().unwrap().installer = None;
+        assert_eq!(install_steps(&vm), None);
     }
 }

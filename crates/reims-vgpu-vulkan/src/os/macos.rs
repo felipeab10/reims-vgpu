@@ -10,6 +10,7 @@
 
 mod drawables;
 
+use std::collections::BTreeMap;
 use std::ffi::{CStr, c_void};
 use std::path::PathBuf;
 use std::sync::Weak;
@@ -85,11 +86,6 @@ pub(crate) fn open_loader() -> Result<ash::Entry, ash::LoadingError> {
     opened
 }
 
-/// The macOS release whose Metal the runtime's devices answer as where releases differ
-/// (`DeviceOptions::metal_level`): none named, so the host's own, or the newest measured release
-/// below it, as the host's Metal answers ([`crate::platform::metal_level`]).
-pub const METAL_LEVEL: Option<rt::MetalLevel> = None;
-
 /// `registryID` of the system default `MTLDevice` (`MTLCreateSystemDefaultDevice()`), asked
 /// of Metal once, on the first call that finds a device: `None` where Metal has none. It is
 /// the registry ID of the device MoltenVK runs the runtime's default device on where the Mac
@@ -122,8 +118,12 @@ pub fn default_gpu_core_count() -> Option<u64> {
 #[derive(Debug)]
 pub struct GuestMemoryLease;
 
-/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]).
-pub fn lease_guest_memory(_: impl IntoIterator<Item = super::GuestRamFile>) -> GuestMemoryLease {
+/// The lease of the guest's RAM a device holds: nothing on Mach ([`GuestMemoryLease`]). A
+/// device's dirty log is not used: the Mac's GPUs read the guest's RAM in place.
+pub fn lease_guest_memory(
+    _: impl IntoIterator<Item = super::GuestRamFile>,
+    _: Option<std::sync::Arc<reims_vgpu_core::memory::dirty::DirtyLog>>,
+) -> GuestMemoryLease {
     GuestMemoryLease
 }
 
@@ -142,6 +142,12 @@ pub(crate) const TWINS_READ_ONLY: bool = false;
 pub(crate) struct ImportView {
     at: std::ptr::NonNull<u8>,
 }
+
+// SAFETY: an address only, which nothing here reads through: it is handed to the runtime.
+unsafe impl Send for ImportView {}
+
+// SAFETY: as for `Send`: a shared view only answers where it is.
+unsafe impl Sync for ImportView {}
 
 impl ImportView {
     /// The first byte the runtime imports.
@@ -177,7 +183,7 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
 /// # Safety
 ///
 /// `rt::HostMemory::new`'s contract, for the memory at `at`.
-pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>) -> rt::HostMemory {
+pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
     unsafe { rt::HostMemory::new(at) }
 }
@@ -325,6 +331,22 @@ pub(crate) fn plane_shape(surface: &MetalSurface, plane: u64) -> Option<(u64, u6
 /// reference of the surface, which the guest counts, keeps it.
 pub(crate) fn surface_memory_hold(_surface: &MetalSurface) -> impl Send + 'static {}
 
+/// The alias of `surface`'s allocation its buffers lie over where it is the surface's own
+/// mapping (`crate::os::surface_alias`): none on macOS, where IOSurface's mapping goes with the
+/// surface's last release, which a buffer's alias may outlive.
+pub(crate) fn own_alias(_surface: &MetalSurface) -> Option<crate::gpu::backing::Alias> {
+    None
+}
+
+/// Whether `surface`'s base address lies in a view of the guest's pages the CPU may write through
+/// as it writes the pages (`crate::os::lend_surface_bytes`): never here. IOSurface's own mapping
+/// of several pages takes the CPU's writes under IOSurface's lock (reims-vgpu-metal's
+/// `os/surface_bytes.rs`), which a lend here does not take, and is read-only for a surface made
+/// read-only for its clients (`crate::os::gpu_read_only`).
+pub(crate) fn base_views_pages(_surface: &MetalSurface) -> bool {
+    false
+}
+
 /// The surface's key that names its YCbCr matrix (`kIOSurfaceYCbCrMatrix`).
 pub(crate) const MATRIX_KEY: &str = "IOSurfaceYCbCrMatrix";
 
@@ -395,12 +417,7 @@ pub(crate) fn recorded_mut<T>(
     change: impl FnOnce(&mut MadeOver) -> T,
 ) -> Option<T> {
     let key = key(surface)?;
-    let mut recorded = CLIENT_PAGES.lock();
-    recorded
-        .entries
-        .iter_mut()
-        .find(|(k, _)| *k == key)
-        .map(|(_, made)| change(made))
+    CLIENT_PAGES.lock().entries.get_mut(&key).map(change)
 }
 
 /// The key of a surface's record, its `IOSurfaceID`: every object over the same IOSurface
@@ -420,15 +437,16 @@ fn key(surface: &MetalSurface) -> Option<SurfaceKey> {
 /// into its allocation, was made over, by its `IOSurfaceID` ([`SurfaceKey`]). An ID names one
 /// live surface, so a surface made here drops the entry of one gone that had its ID
 /// ([`ClientPages::forget`]), and entries whose ID no surface holds are dropped as it grows.
+/// Each record a command's objects read at its encode is found by its ID.
 struct ClientPages {
-    entries: Vec<(SurfaceKey, MadeOver)>,
+    entries: BTreeMap<SurfaceKey, MadeOver>,
     /// The length at which the next record drops the entries of surfaces gone.
     prune_at: usize,
 }
 
 static CLIENT_PAGES: reims_vgpu_core::sync::Mutex<ClientPages> =
     reims_vgpu_core::sync::Mutex::new(ClientPages {
-        entries: Vec::new(),
+        entries: BTreeMap::new(),
         prune_at: 64,
     });
 
@@ -436,7 +454,7 @@ impl ClientPages {
     /// Drops the entry of `surface`'s ID, one of a surface gone where `surface` was just made.
     fn forget(&mut self, surface: &MetalSurface) {
         if let Some(key) = key(surface) {
-            self.entries.retain(|(k, _)| *k != key);
+            self.entries.remove(&key);
         }
     }
 
@@ -454,20 +472,21 @@ impl ClientPages {
             return;
         };
         let runs = page_runs(pages.iter().copied());
-        self.entries.retain(|(k, _)| *k != key);
+        self.entries.remove(&key);
         if self.entries.len() >= self.prune_at {
-            self.entries.retain(|&(id, _)| alive(id));
+            self.entries.retain(|&id, _| alive(id));
             self.prune_at = (self.entries.len() * 2).max(64);
         }
-        self.entries.push((
+        self.entries.insert(
             key,
             MadeOver {
                 pages: runs,
                 offset,
                 gpu_read_only,
                 alias: Weak::new(),
+                lent: false,
             },
-        ));
+        );
     }
 }
 
@@ -598,7 +617,9 @@ mod tests {
     }
 
     /// A surface made with the ID of one gone, which IOSurface hands out again at once, answers
-    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`
+    /// no record of that one's, made by `IOSurfaceCreate` or by `initWithProperties:`. Another
+    /// process's surface can take the freed ID first: with 8 tries, 2 of 5 runs alone found no
+    /// ID handed out again on the M3 Max (macOS 27.0.1), and 0 of 40 with 64
     #[test]
     fn a_surface_taking_the_id_of_one_gone_takes_none_of_its_record() {
         use reims_vgpu_core::platform::os::surface::{BackingPlaneSpec, BackingSurfaceSpec};
@@ -619,7 +640,7 @@ mod tests {
             VulkanSurfaces::new().create_backing(&backing).unwrap()
         }];
         for make in makers {
-            let reused = (0..8).any(|_| {
+            let reused = (0..64).any(|_| {
                 let (gone, pages, length) = bgra_surface_over_at(16, 16, 0x100);
                 let id = key(&gone);
                 drop(gone);

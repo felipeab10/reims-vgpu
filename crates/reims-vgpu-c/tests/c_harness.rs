@@ -18,8 +18,12 @@ fn deps_dir() -> PathBuf {
         .to_path_buf()
 }
 
+/// The crate's directory, which cargo and nextest give a test process: read at run time, so the
+/// test is the same binary in every worktree (docs/development.md, "Building through kache").
 fn crate_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+    std::env::var_os("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
 }
 
 /// Compiles `source` into `out`; panics with the compiler's output.
@@ -107,7 +111,7 @@ fn c_harness_calls_every_function() {
             Some(&rest[..end])
         })
         .collect();
-    assert_eq!(declared.len(), 35, "{declared:?}");
+    assert_eq!(declared.len(), 48, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()
         .copied()

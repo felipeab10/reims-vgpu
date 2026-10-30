@@ -83,6 +83,26 @@ pub trait HostVm: Send + Sync {
         src: HostAddr,
         len: u64,
     ) -> Result<HostAddr, KernReturn>;
+    /// A view of `runs` laid one after another from `dst`: for each `(src, len)` in order,
+    /// [`HostVm::remap_shared_overwrite`] of `len` bytes from `src` at `dst` plus the lengths of
+    /// the runs before it, each a whole number of pages. It stops at the first refusal, which it
+    /// answers with the run's index and code, the runs before it left mapped, as those remaps one
+    /// at a time leave them. Mach's calls are those remaps; a platform whose views take a kernel
+    /// mapping for each run of pages (Linux) maps the whole view at once in fewer, where a
+    /// refusal leaves the runs before it mapped or none.
+    fn remap_runs_shared_overwrite(
+        &self,
+        dst: HostAddr,
+        runs: &[(HostAddr, u64)],
+    ) -> Result<(), (usize, KernReturn)> {
+        let mut at = dst;
+        for (i, &(src, len)) in runs.iter().enumerate() {
+            self.remap_shared_overwrite(at, src, len)
+                .map_err(|kr| (i, kr))?;
+            at = at.wrapping_add(len);
+        }
+        Ok(())
+    }
     /// `mach_vm_protect(task, addr, len, TRUE, prot)`: sets the **maximum** protection
     /// (`set_maximum = TRUE`), not mprotect semantics. A later write to a read-only range is a
     /// SIGBUS, a process death.

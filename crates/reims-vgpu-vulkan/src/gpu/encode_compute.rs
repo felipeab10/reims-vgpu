@@ -11,25 +11,21 @@
 //!   refusal of the records dies naming the execution, at the commit or as the command buffer
 //!   completes ([`crate::gpu::command`]); a range past its size, which Metal runs without
 //!   validation, dies at the call.
-//! - **Work of a pipeline that can encode indirect commands, in an encoder that made resident for
-//!   writing an indirect command buffer whose ID is not the runtime's,** dies
-//!   ([`encodes_resident`]): its kernel could write the buffer's commands through Metal's ID of
-//!   it, which reaches another buffer's records or none ([`crate::gpu::icb`]), where Metal's GPU
-//!   writes them. A buffer plain allocation numbered has the runtime's ID, and a kernel writing
-//!   through it reaches its records. Which pipelines can encode indirect commands is the
-//!   runtime's `can_encode_indirect_commands`, read from the kernel's AIR (an indirect command
-//!   buffer it takes, through an argument buffer at any depth); work of any other runs. The work
-//!   is a direct dispatch, which dies at its call ([`dispatchable`]), and an execution's
-//!   commands: where they inherit the encoder's pipeline, the execution dies at its call, as a
-//!   dispatch; where they name their own, the commit reads their records and dies there at a
-//!   command whose pipeline can, or names one released since
-//!   ([`crate::gpu::command::executions`]). A render encoder's functions die alike
-//!   ([`crate::gpu::encode_render`]). A dispatch of such a pipeline, and every execution, whose
-//!   commands' pipelines (their own or the encoder's) nothing here reads, opens on each buffer
-//!   the encoder made resident for writing a span in which the GPU may write its records
-//!   ([`may_write_resident`]), which decides the pipeline state a record names
-//!   ([`crate::gpu::icb`]); where the pipeline can encode, its records are written for good,
-//!   which a later execution's check at its commit reads (`executions::gpu_writes`).
+//! - **Work of a pipeline that can encode indirect commands** writes the records of a buffer the
+//!   encoder made resident for writing through the buffer's ID, the runtime's, Metal's
+//!   ([`crate::gpu::icb`]), so it reaches them as Metal's GPU does ([`encodes_resident`]). Which
+//!   pipelines can encode indirect commands is the runtime's `can_encode_indirect_commands`, read
+//!   from the kernel's AIR (an indirect command buffer it takes, through an argument buffer at
+//!   any depth). The work is a direct dispatch ([`dispatchable`]), and an execution's commands:
+//!   where they inherit the encoder's pipeline, the execution decides at its call, as a dispatch;
+//!   where they name their own, the commit reads their records, or, for records the GPU may have
+//!   written, the runtime's host step asks them ([`crate::gpu::command::executions`]). A render
+//!   encoder's functions go alike ([`crate::gpu::encode_render`]). The encoder's making a buffer
+//!   resident for writing marks the runtime's buffer written for good (`gpu_written`), so a later
+//!   execution's commands are asked at the runtime's host step, and the runtime keeps when the
+//!   GPU may write its records, which decides the pipeline state a record names
+//!   ([`crate::gpu::icb`]); where the pipeline can encode, a command buffer that executes the
+//!   buffer as its commit read it dies at the write (`executions::gpu_writes`).
 //! - **Command predication** (`encodeStart*`, `encodeEnd*`) is the adapter's ([`predication`]):
 //!   every command passes it
 //!   first, and the dispatches and executions are sent through it. The runtime's own
@@ -37,15 +33,17 @@
 //! - **A nil entry of `useResources:count:usage:`, `useHeaps:count:` or
 //!   `memoryBarrierWithResources:count:`** is skipped, as Metal skips it
 //!   (`compute_err_resource_lists`: a pipeline's ref and an unknown one are nil and the pass
-//!   runs), but in a concurrent encoder's residency it dies: Metal ends the process at a nil
-//!   resource there (`interplay_decodewalk_26`), and a nil heap there is not measured. A barrier
+//!   runs), but a nil resource in a concurrent encoder's residency dies: Metal ends the process at
+//!   one there (`interplay_decodewalk_26`). A nil heap is skipped in a concurrent encoder too, as
+//!   Metal's skips it (measured on an M3 Max under macOS 27.0.1, without API validation). A barrier
 //!   of nil entries alone is a barrier over buffers and textures, as the runtime's barrier of
 //!   resources is.
-//! - **What the runtime has no form for dies**: a nil pipeline, indirect buffer or heap, an index
-//!   past `u32`, a slice of another length than its range, a scope or usage no Metal value is,
+//! - **What the runtime has no form for dies**: a nil pipeline or indirect buffer, an index past
+//!   `u32`, a slice of another length than its range, a scope or usage no Metal value is,
 //!   and a command after `endEncoding`. A rotated texture bound to the kernel is the runtime's,
 //!   which reads it as Metal's functions do ([`crate::gpu::resource::TextureObject::texels`]).
 
+use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
@@ -54,17 +52,15 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::Handle as _;
 use reims_vgpu_core::platform::blit::ResourceRef;
 use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use crate::answer::{Policy, plain, send, unrepresentable};
 use crate::gpu::command::executions::{self, Execution, Points};
 use crate::gpu::icb::VulkanIcb;
 use crate::gpu::predication::{self, PredicatedEncoder, Work};
-use crate::gpu::resource::{Named, VulkanBuffer, reach};
-use crate::gpu::{metal_value, region};
+use crate::gpu::resource::VulkanBuffer;
+use crate::gpu::{listed, metal_value, region};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// `id<MTLComputeCommandEncoder>`.
@@ -73,66 +69,6 @@ pub type VulkanComputeEncoder = Obj<PredicatedEncoder>;
 /// A binding index or a length core passes as `NSUInteger`, which the runtime takes as `u32`.
 fn small(sel: &'static str, value: u64) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| unrepresentable(sel, &format!("{value} as a u32")))
-}
-
-/// The buffers `cmd` names, each with the bytes it reaches where they are exact
-/// ([`crate::gpu::resource::Named`]): the arguments of an indirect dispatch
-/// (`MTLDispatchThreadgroupsIndirectArguments`, 12 bytes), an indirect stage-in region
-/// (`MTLStageInRegionIndirectArguments`, 24) and an indirect execution range
-/// (`MTLIndirectCommandBufferExecutionRange`, 8), and a condition's word ([`condition_word`]);
-/// all of a bound buffer, and of the arguments of `dispatchThreadsWithIndirectBuffer:`, whose
-/// layout nothing states. Each is a use of those bytes
-/// ([`crate::gpu::resource::BufferObject::used`]).
-fn named_buffers<'a>(cmd: &ComputeCmd<'a, VulkanPlatform>) -> Vec<Named<'a>> {
-    match *cmd {
-        ComputeCmd::DispatchThreadgroupsIndirect {
-            indirect_buffer,
-            indirect_buffer_offset,
-            ..
-        } => vec![(indirect_buffer, reach(indirect_buffer_offset, 12))],
-        ComputeCmd::DispatchThreadsIndirect {
-            indirect_buffer, ..
-        } => vec![(indirect_buffer, None)],
-        ComputeCmd::EncodeStartIf { buffer, offset, .. }
-        | ComputeCmd::EncodeStartWhile { buffer, offset, .. } => {
-            vec![(buffer, Some(condition_word(offset)))]
-        }
-        ComputeCmd::ExecuteCommandsIndirect {
-            indirect_range_buffer,
-            indirect_buffer_offset,
-            ..
-        } => vec![(
-            Some(indirect_range_buffer),
-            reach(indirect_buffer_offset, 8),
-        )],
-        ComputeCmd::SetStageInRegionIndirect {
-            indirect_buffer,
-            indirect_buffer_offset,
-        } => vec![(Some(indirect_buffer), reach(indirect_buffer_offset, 24))],
-        ComputeCmd::SetBuffersAttributeStrides { buffers, .. }
-        | ComputeCmd::SetBuffers { buffers, .. } => buffers.iter().map(|&b| (b, None)).collect(),
-        ComputeCmd::UseResources { resources, .. } => resident_buffers(resources),
-        _ => Vec::new(),
-    }
-}
-
-/// The bytes a condition at `offset` reads: the 32-bit word at `offset & !3`
-/// ([`crate::gpu::predication`]).
-fn condition_word(offset: u64) -> std::ops::Range<u64> {
-    let word = offset & !3;
-    word..word.saturating_add(4)
-}
-
-/// The buffers `useResources:` makes resident, all of each ([`crate::gpu::resource::Named`]).
-pub(crate) fn resident_buffers<'a>(
-    resources: &'a [Option<ResourceRef<'a, VulkanPlatform>>],
-) -> Vec<Named<'a>> {
-    (resources.iter().flatten())
-        .filter_map(|r| match *r {
-            ResourceRef::Buffer(b) => Some((Some(b), None)),
-            _ => None,
-        })
-        .collect()
 }
 
 /// The first index of `range`, whose length every slice bound with it has.
@@ -166,41 +102,19 @@ fn resources<'a>(
         .collect()
 }
 
-/// Work `sel` of `encoder` may write the records of each indirect command buffer the encoder made
-/// resident for writing: a span on each, to its command buffer's end
-/// (`may_be_written`, [`crate::gpu::icb`]).
-fn may_write_resident(encoder: &VulkanComputeEncoder, sel: &'static str) {
-    let writable: Vec<_> = plain(|| {
-        let writable = encoder.writable_icbs.lock();
-        writable.iter().map(|icb| icb.clone_ref()).collect()
-    });
-    for icb in writable {
-        icb.may_be_written(encoder.progress(sel));
-    }
-}
-
-/// A direct dispatch `sel` of `encoder`: where its pipeline can encode indirect commands and the
-/// encoder made resident for writing an indirect command buffer whose ID is not the runtime's,
-/// it dies, as its kernel could write the buffer's commands through Metal's ID of it, which
-/// reaches another buffer's records or none (the module docs); where its pipeline can, its
-/// kernel may write the records of each buffer the encoder made resident for writing.
+/// A direct dispatch `sel` of `encoder`: where its pipeline can encode indirect commands, its
+/// kernel may write the records of each buffer the encoder made resident for writing (the module
+/// docs).
 fn dispatchable(encoder: &VulkanComputeEncoder, sel: &'static str) {
     if plain(|| encoder.encodes_icbs.load(Ordering::Relaxed)) {
-        encodes_resident(encoder, sel, "a dispatch");
+        encodes_resident(encoder, sel);
     }
 }
 
-/// Work `sel` of `encoder`, `what`, runs the pipeline state the encoder set last, which can encode
-/// indirect commands: it dies where the encoder made resident for writing an indirect command
-/// buffer whose ID is not the runtime's ([`encodes_through_guest_id`]), and may write the records
-/// of each buffer the encoder made resident for writing
-/// ([`crate::gpu::command::executions::gpu_writes`]).
-fn encodes_resident(encoder: &VulkanComputeEncoder, sel: &'static str, what: &str) {
-    may_write_resident(encoder, sel);
-    if let Some(id) = plain(|| *encoder.icb_written.lock()) {
-        let what = format!("{what} of a pipeline that can encode indirect commands");
-        encodes_through_guest_id(sel, &what, id);
-    }
+/// Work `sel` of `encoder` runs the pipeline state the encoder set last, which can encode
+/// indirect commands: it may write the records of each buffer the encoder made resident for
+/// writing ([`crate::gpu::command::executions::gpu_writes`]).
+fn encodes_resident(encoder: &VulkanComputeEncoder, sel: &'static str) {
     for icb in writable(encoder) {
         executions::gpu_writes(sel, &icb);
     }
@@ -214,31 +128,11 @@ fn writable(encoder: &VulkanComputeEncoder) -> Vec<VulkanIcb> {
     })
 }
 
-/// Dies at `sel`, `what`, work of a pipeline state that can encode indirect commands, in an
-/// encoder that made resident for writing the indirect command buffer of Metal's ID `id`, which is
-/// not the runtime's ID of it: its function could write the buffer's commands through that ID,
-/// which reaches another buffer's records or none, where Metal's GPU writes them.
-pub(crate) fn encodes_through_guest_id(sel: &'static str, what: &str, id: u64) -> ! {
-    fatal_with_detail(
-        DeathId::Platform {
-            kind: DeathKind::Abort,
-            call: sel,
-        },
-        &format!(
-            "{what}, in an encoder that made the indirect command buffer of ID {id} resident for \
-             writing: its function could write the buffer's commands through that ID, which is \
-             not the Vulkan runtime's ID of the buffer and reaches another buffer's records or \
-             none, where Metal's GPU writes them"
-        ),
-    )
-}
-
 /// An execution `sel` of `icb`'s commands `range` (`None`: a range a buffer holds) in `encoder`,
 /// which runs nothing where it is `empty`. Where its commands inherit the encoder's pipeline
 /// state, that state decides as a dispatch's does ([`encodes_resident`]). Where they name their
-/// own, its commit reads them where the encoder made resident for writing an indirect command
-/// buffer whose ID is not the runtime's, or any indirect command buffer, whose records a command
-/// may write ([`crate::gpu::command::executions`]).
+/// own, its commit reads them where the encoder made resident for writing any indirect command
+/// buffer, whose records a command may write ([`crate::gpu::command::executions`]).
 fn executes(
     encoder: &VulkanComputeEncoder,
     sel: &'static str,
@@ -250,7 +144,7 @@ fn executes(
     }
     if icb.inherits.pipeline {
         if plain(|| encoder.encodes_icbs.load(Ordering::Relaxed)) {
-            encodes_resident(encoder, sel, "an execution of commands that inherit");
+            encodes_resident(encoder, sel);
         }
         return None;
     }
@@ -258,7 +152,6 @@ fn executes(
         sel,
         icb: icb.clone_ref(),
         range,
-        guest_id: plain(|| *encoder.icb_written.lock()),
         points: Points::Unasked,
         writable: writable(encoder),
     };
@@ -289,11 +182,6 @@ impl Concurrent for VulkanComputeEncoder {
 impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
     fn encode(&self, _on: OnFault, cmd: ComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        for (buffer, bytes) in named_buffers(&cmd) {
-            if let Some(buffer) = buffer {
-                buffer.used(sel, bytes);
-            }
-        }
         predication::observe(self, &cmd);
         let caught =
             |call: &mut dyn FnMut(&mut rt::ComputeCommandEncoder) -> Result<(), rt::Error>| {
@@ -307,13 +195,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 | ComputeCmd::DispatchThreadsIndirect { .. }
         ) {
             dispatchable(self, sel);
-        }
-        if matches!(
-            cmd,
-            ComputeCmd::ExecuteCommandsInBuffer { .. } | ComputeCmd::ExecuteCommandsIndirect { .. }
-        ) {
-            // Its commands' pipelines, their own or the encoder's, may encode commands.
-            may_write_resident(self, sel);
         }
         match cmd {
             ComputeCmd::DispatchThreadgroups {
@@ -390,6 +271,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     buffer: &indirect_range_buffer.raw,
                     offset: indirect_buffer_offset,
                     inherits: indirect_commandbuffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);
@@ -413,6 +295,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     icb: &indirect_command_buffer.raw,
                     range,
                     inherits: indirect_command_buffer.inherits,
+                    check: Cell::new(checked.as_ref().and_then(Execution::host_step_check)),
                 };
                 predication::work(self, sel, work)?;
                 checked_at_commit(self, checked);
@@ -463,8 +346,13 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len(), strides.len()]);
-                let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
-                caught(&mut |e| e.set_buffers_with_strides(&buffers, offsets, strides, at))
+                listed(
+                    buffers,
+                    |b| b.map(|b| &b.raw),
+                    |buffers| {
+                        caught(&mut |e| e.set_buffers_with_strides(buffers, offsets, strides, at))
+                    },
+                )
             }
             ComputeCmd::SetBuffers {
                 buffers,
@@ -472,8 +360,11 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 range,
             } => {
                 let at = first(sel, range, &[buffers.len(), offsets.len()]);
-                let buffers: Vec<_> = buffers.iter().map(|b| b.map(|b| &b.raw)).collect();
-                caught(&mut |e| e.set_buffers(&buffers, offsets, at))
+                listed(
+                    buffers,
+                    |b| b.map(|b| &b.raw),
+                    |buffers| caught(&mut |e| e.set_buffers(buffers, offsets, at)),
+                )
             }
             ComputeCmd::SetComputePipelineState { state } => {
                 let state = some(sel, state, "pipeline state");
@@ -495,20 +386,28 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             } => {
                 let lengths = [samplers.len(), lod_min_clamps.len(), lod_max_clamps.len()];
                 let at = first(sel, range, &lengths);
-                let samplers: Vec<_> = samplers.iter().map(|s| s.map(|s| &**s)).collect();
-                caught(&mut |e| {
-                    e.set_sampler_states_with_lod_clamps(
-                        &samplers,
-                        lod_min_clamps,
-                        lod_max_clamps,
-                        at,
-                    )
-                })
+                listed(
+                    samplers,
+                    |s| s.map(|s| &**s),
+                    |samplers| {
+                        caught(&mut |e| {
+                            e.set_sampler_states_with_lod_clamps(
+                                samplers,
+                                lod_min_clamps,
+                                lod_max_clamps,
+                                at,
+                            )
+                        })
+                    },
+                )
             }
             ComputeCmd::SetSamplerStates { samplers, range } => {
                 let at = first(sel, range, &[samplers.len()]);
-                let samplers: Vec<_> = samplers.iter().map(|s| s.map(|s| &**s)).collect();
-                caught(&mut |e| e.set_sampler_states(&samplers, at))
+                listed(
+                    samplers,
+                    |s| s.map(|s| &**s),
+                    |samplers| caught(&mut |e| e.set_sampler_states(samplers, at)),
+                )
             }
             ComputeCmd::SetStageInRegion { region: r } => {
                 caught(&mut |e| e.set_stage_in_region(region(r)))
@@ -526,8 +425,11 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::SetTextures { textures, range } => {
                 let at = first(sel, range, &[textures.len()]);
-                let textures: Vec<_> = textures.iter().map(|t| t.map(|t| t.texels(sel))).collect();
-                caught(&mut |e| e.set_textures(&textures, at))
+                listed(
+                    textures,
+                    |t| t.map(|t| t.texels(sel)),
+                    |textures| caught(&mut |e| e.set_textures(textures, at)),
+                )
             }
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 let (length, index) = (small(sel, length), small(sel, index));
@@ -535,15 +437,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
             }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
-                if heaps.iter().any(Option::is_none) && self.concurrent(sel) {
-                    unrepresentable(
-                        sel,
-                        "a nil heap in a concurrent encoder, which Metal is not measured at",
-                    );
-                }
-                for heap in heaps.iter().flatten() {
-                    heap.made_resident(sel);
-                }
                 let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();
                 caught(&mut |e| e.use_heaps(&heaps))
             }
@@ -564,7 +457,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     // A kernel may copy any of their commands.
                     let progress = self.progress(sel);
                     for icb in &icbs {
-                        icb.resident(sel, progress.as_ref());
+                        icb.resident(sel, progress.as_ref(), usage.contains(ResourceUsage::WRITE));
                     }
                 }
                 caught(&mut |e| e.use_resources(&some, usage))?;
@@ -572,14 +465,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                     plain(|| {
                         let mut writable = self.writable_icbs.lock();
                         writable.extend(icbs.iter().map(|icb| icb.clone_ref()));
-                    });
-                }
-                if usage.contains(ResourceUsage::WRITE)
-                    && let Some(icb) = icbs.iter().find(|icb| !icb.reaches_its_records())
-                {
-                    let id = icb.gpu_resource_id();
-                    plain(|| {
-                        self.icb_written.lock().get_or_insert(id);
                     });
                 }
                 if !icbs.is_empty() {
@@ -599,9 +484,6 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
         reference_value: u32,
     ) -> RaiseResult<bool> {
         let sel = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        if let Some(buffer) = buffer {
-            buffer.used(sel, Some(condition_word(offset)));
-        }
         predication::end_do_while(self, sel, buffer, offset, comparison, reference_value)
     }
 
@@ -711,7 +593,7 @@ mod tests {
 
     /// A dispatch through a buffer over pages mapped read-only runs where its kernel reads the
     /// buffer, at a `const` pointer, and dies where it is encoded where the kernel may write it,
-    /// by its reflection, or the buffer is made resident for writing: on Linux the runtime
+    /// by its slot writes, or the buffer is made resident for writing: on Linux the runtime
     /// imports a writable twin of the pages, which the write would reach, where Metal's GPU drops
     /// it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
     #[cfg(target_os = "linux")]
@@ -778,6 +660,98 @@ mod tests {
         assert_eq!(first, 0);
         drop((cb, e, ro));
         assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+    }
+
+    /// Prints how long 512 one-thread dispatches take to encode after one `useResources` of 0,
+    /// 1, 256 and 4096 Shared buffers, and of one buffer 4096 times: through this platform's
+    /// compute encoder, and through the runtime's alone, on the same device and pipeline, the
+    /// best of 3 runs each.
+    ///
+    /// Measured on the M3 Max (MoltenVK, a dev build), platform against runtime alone, in ms:
+    /// 6.6 against 5.7 with none resident, 15.8 against 15.1 with one, 99.5 against 97.3 with
+    /// 256, 1542 against 1498 with 4096, and 22.3 against 15.8 with one buffer 4096 times. The
+    /// runtime takes its dispatch memo only in an encoder that made nothing resident, so each
+    /// dispatch after a `useResources` settles its bind state again (about 18 us more), and
+    /// that settling copies, shapes and hashes every resident resource (about 0.7 us more for
+    /// each).
+    #[test]
+    #[ignore = "a measurement, run by hand: prints the times"]
+    fn dispatches_after_a_large_residency() {
+        use reims_vgpu_core::platform::os::Clock as _;
+        let now = || crate::os::OsClock::new().now_mono();
+        let add = pipeline(ADD, "add_one");
+        let (input, out) = (shared(1024), shared(1024));
+        let resident: Vec<VulkanBuffer> = (0..4096).map(|_| shared(256)).collect();
+        let d = dev();
+        let raw_q = d.raw.new_command_queue().unwrap();
+        let one = vec![&resident[0]; 4096];
+        let all: Vec<_> = resident.iter().collect();
+        for (name, list) in [
+            ("0 buffers", &all[..0]),
+            ("1 buffer", &all[..1]),
+            ("256 buffers", &all[..256]),
+            ("4096 buffers", &all[..]),
+            ("one buffer 4096 times", &one[..]),
+        ] {
+            let refs: Vec<_> = (list.iter())
+                .map(|b| Some(ResourceRef::Buffer(*b)))
+                .collect();
+            let raw_refs: Vec<_> = (list.iter())
+                .map(|b| rt::ResourceRef::Buffer(&b.raw))
+                .collect();
+            let (mut ours, mut runtime) = (u128::MAX, u128::MAX);
+            for _ in 0..3 {
+                let cb = command_buffer();
+                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+                let setup = [
+                    ComputeCmd::SetComputePipelineState { state: Some(&add) },
+                    ComputeCmd::SetBuffers {
+                        buffers: &[Some(&out), Some(&input)],
+                        offsets: &[0, 0],
+                        range: NsRange::new(0, 2),
+                    },
+                    ComputeCmd::UseResources {
+                        resources: &refs,
+                        usage: 1,
+                    },
+                ];
+                for cmd in setup {
+                    e.encode(OnFault::Return, cmd).unwrap();
+                }
+                let start = now();
+                for _ in 0..512 {
+                    let dispatch = ComputeCmd::DispatchThreads {
+                        threads_per_grid: MtlSize::new(1, 1, 1),
+                        threads_per_threadgroup: MtlSize::new(1, 1, 1),
+                    };
+                    e.encode(OnFault::Return, dispatch).unwrap();
+                }
+                ours = ours.min(now().saturating_duration_since(start).as_micros());
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+
+                let cb = raw_q.command_buffer().unwrap();
+                let mut e = cb.compute_command_encoder().unwrap();
+                e.set_compute_pipeline_state(&add.raw).unwrap();
+                e.set_buffers(&[Some(&out.raw), Some(&input.raw)], &[0, 0], 0)
+                    .unwrap();
+                e.use_resources(&raw_refs, ResourceUsage::READ).unwrap();
+                let start = now();
+                for _ in 0..512 {
+                    let one = rt::Size::new(1, 1, 1);
+                    e.dispatch_threads(one, one).unwrap();
+                }
+                runtime = runtime.min(now().saturating_duration_since(start).as_micros());
+                e.end_encoding().unwrap();
+                cb.commit().unwrap();
+                cb.wait_until_completed().unwrap();
+            }
+            println!(
+                "{name} resident: 512 dispatches through the platform {ours} us, through the \
+                 runtime alone {runtime} us"
+            );
+        }
     }
 
     /// Dispatches run their kernels: threads over bound buffers, threadgroups after a buffer
@@ -876,9 +850,9 @@ mod tests {
 
     /// A nil entry of useResources:count:usage:, useHeaps:count: and
     /// memoryBarrierWithResources:count: is skipped, and a buffer offset at a slot of no buffer,
-    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil entry in
-    /// useResources:count:usage: of a concurrent encoder, which ends Metal's process, dies at its
-    /// selector
+    /// which the runtime takes, changes nothing, and the pass runs, as on Metal; a nil heap is
+    /// skipped in a concurrent encoder too, and a nil entry in useResources:count:usage: of one,
+    /// which ends Metal's process, dies at its selector
     #[test]
     fn nil_resources_are_skipped_but_in_a_concurrent_encoders_residency() {
         let add = pipeline(ADD, "add_one");
@@ -921,6 +895,8 @@ mod tests {
                 dispatch_type: Some(1),
             })
             .unwrap()
+            .unwrap();
+        e.encode(OnFault::Return, ComputeCmd::UseHeaps { heaps: &[None] })
             .unwrap();
         let site = catch_death(|| {
             e.encode(
@@ -1029,16 +1005,16 @@ mod tests {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "encodeEndIf"));
     }
 
-    /// A direct dispatch, in each form, of a pipeline that can encode indirect commands dies in an
-    /// encoder that made resident for writing an indirect command buffer whose ID is not the
-    /// runtime's (one made after a reservation the runtime is not given, of 2 and 2^23 + 1:
-    /// Metal's pool hands out 1 then 3, the runtime's 1 then 2), after that. One before it, one
-    /// where the buffer was made resident only for reading, one of a pipeline that cannot encode
-    /// indirect commands, one where the buffer written has the runtime's ID (its kernel resetting
-    /// the buffer's commands through the ID), and an execution of the buffer, whose command
-    /// dispatches nothing, in such an encoder run
+    /// A direct dispatch, in each form, of a pipeline that can encode indirect commands runs in an
+    /// encoder that made resident for writing an indirect command buffer numbered past a
+    /// reservation of 2 and 2^23 + 1, which the runtime takes as Metal does, so the buffers'
+    /// IDs, 1 then 3, are the runtime's and Metal's alike. So do one before it, one where the
+    /// buffer was made resident only for reading, one of a pipeline that cannot encode indirect
+    /// commands, one whose kernel resets the buffer's commands through its ID, and an execution
+    /// of the buffer, whose command dispatches nothing
     #[test]
-    fn a_dispatch_after_an_icb_made_writable_dies() {
+    fn a_dispatch_after_an_icb_made_writable_runs() {
+        use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
         use reims_vgpu_core::platform::values::IcbDesc;
 
         let d = dev();
@@ -1062,7 +1038,7 @@ mod tests {
             .unwrap()
         };
         let (plain, icb) = (make(), make());
-        assert!(plain.reaches_its_records() && !icb.reaches_its_records());
+        assert_eq!((plain.gpu_resource_id(), icb.gpu_resource_id()), (1, 3));
         let (input, out) = (holding(&[1, 2, 3, 4]), holding(&[0; 4]));
         let id = plain.gpu_resource_id();
         let held = holding(&[u32::try_from(id).unwrap(), 0]);
@@ -1120,7 +1096,8 @@ mod tests {
             dispatch(),
         ]);
         run_serial(ran);
-        let indirect = holding(&[1, 1, 1]);
+        // Threads per grid, then per threadgroup: what the thread form reads.
+        let indirect = holding(&[1; 6]);
         for (usage, last) in [
             (2, dispatch()),
             (3, dispatch()),
@@ -1147,127 +1124,9 @@ mod tests {
                 },
             ),
         ] {
-            let cb = command_buffer();
-            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-            for cmd in set(&reset) {
-                e.encode(OnFault::Return, cmd).unwrap();
-            }
-            e.encode(OnFault::Return, resident(usage)).unwrap();
-            let sel = last.selector();
-            let site = catch_death(|| e.encode(OnFault::Return, last)).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        }
-    }
-
-    /// An execution in an encoder that made resident for writing an indirect command buffer
-    /// whose ID is not the runtime's (as [`a_dispatch_after_an_icb_made_writable_dies`] makes
-    /// one) dies where a dispatch of its commands' pipeline would: where they inherit the
-    /// encoder's pipeline that can encode indirect commands, at the execution; where a command's
-    /// own pipeline can, at the commit, which reads the commands' records. One whose command's
-    /// own pipeline cannot runs, as does one whose commands inherit a pipeline that cannot
-    #[test]
-    fn an_execution_after_an_icb_made_writable_dies_where_a_dispatch_would() {
-        use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-        use reims_vgpu_core::platform::icb::{
-            IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
-        };
-        use reims_vgpu_core::platform::values::IcbDesc;
-
-        let d = dev();
-        d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
-        let state = |bytes, name| {
-            let library = d.raw.new_library_with_data(bytes).unwrap();
-            let function = library.new_function_with_name(name).unwrap();
-            let mut desc = ComputePipelineDescriptor::new(StageSource::Function(
-                function.function_descriptor(),
-            ));
-            desc.support_indirect_command_buffers = true;
-            let raw = d
-                .raw
-                .new_compute_pipeline_state(&desc, &rt::PipelineOptions::default())
-                .unwrap();
-            Obj::new(crate::gpu::resource::ComputePipelineObject::new(raw))
-        };
-        let (add, reset) = (state(ADD, "add_one"), state(ICB_ENCODE, "reset_commands"));
-        let make = |inherit_pipeline_state| {
-            d.new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 0x40,
-                    max_kernel_buffer_bind_count: 2,
-                    inherit_pipeline_state,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap()
-        };
-        let (_, written) = (make(false), make(false));
-        assert!(!written.reaches_its_records());
-        let (input, out) = (holding(&[1, 2, 3, 4]), holding(&[0; 4]));
-        let commands = |state: Option<&VulkanComputePipeline>| {
-            let icb = make(state.is_none());
-            let c = icb.compute_command(0).unwrap().unwrap();
-            let set = state.map(|state| IcbComputeCmd::SetComputePipelineState {
-                pipeline_state: Some(state),
-            });
-            for cmd in set.into_iter().chain([
-                IcbComputeCmd::SetKernelBuffer {
-                    buffer: Some(&out),
-                    offset: 0,
-                    index: 0,
-                },
-                IcbComputeCmd::SetKernelBuffer {
-                    buffer: Some(&input),
-                    offset: 0,
-                    index: 1,
-                },
-                IcbComputeCmd::ConcurrentDispatchThreads {
-                    threads_per_grid: MtlSize::new(4, 1, 1),
-                    threads_per_threadgroup: MtlSize::new(4, 1, 1),
-                },
-            ]) {
-                c.encode(cmd).unwrap();
-            }
-            icb
-        };
-        let the_written = [Some(ResourceRef::Icb(&written))];
-        let encoder = |icb, state| {
-            let cb = command_buffer();
-            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-            for cmd in [
-                ComputeCmd::SetComputePipelineState { state: Some(state) },
-                ComputeCmd::UseResources {
-                    resources: &the_written,
-                    usage: 3,
-                },
-            ] {
-                e.encode(OnFault::Return, cmd).unwrap();
-            }
-            let execution = ComputeCmd::ExecuteCommandsInBuffer {
-                indirect_command_buffer: icb,
-                execution_range: NsRange::new(0, 1),
-            };
-            (cb, e, execution)
-        };
-        let (own, inheriting) = (commands(Some(&reset)), commands(None));
-        let (cb, e, execution) = encoder(&own, &add);
-        e.encode(OnFault::Return, execution).unwrap();
-        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
-        let site = catch_death(|| cb.commit(OnFault::Return)).unwrap_err();
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
-        let (_, e, execution) = encoder(&inheriting, &reset);
-        let site = catch_death(|| e.encode(OnFault::Return, execution)).unwrap_err();
-        let sel = "executeCommandsInBuffer:withRange:";
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        let own = commands(Some(&add));
-        for (icb, state) in [(&own, &reset), (&inheriting, &add)] {
-            // SAFETY: the Shared buffer's 16 bytes, no command buffer using it pending.
-            unsafe { std::ptr::write_bytes(out.contents().as_ptr::<u32>(), 0, 4) };
-            let (cb, e, execution) = encoder(icb, state);
-            run(&cb, &e, vec![execution]);
-            assert_eq!(words(&out), [2, 3, 4, 5]);
+            let mut ran = set(&reset);
+            ran.extend([resident(usage), last]);
+            run_serial(ran);
         }
     }
 

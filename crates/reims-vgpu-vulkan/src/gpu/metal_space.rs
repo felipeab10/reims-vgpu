@@ -72,11 +72,12 @@
 //!   ([`FirstUse`]), which lie among the guest's ranges. How they grow with more work is not
 //!   modelled.
 
+mod gaps;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 use std::sync::{Arc, OnceLock, Weak};
 
-use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::types::SizeAndAlign;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
@@ -197,13 +198,11 @@ pub fn texture_allocation(
 }
 
 /// The bytes of a texture of `desc` by Apple's layout ([`texture_allocation`]), for `sel`, the
-/// call that asks, from Metal's description of its format at macOS 26.7, where the layout was
-/// measured: a format another release describes and 26.7 does not dies there
-/// ([`crate::gpu::format_info::block`]).
+/// call that asks, from Metal's description of its format ([`crate::gpu::format_info::block`]).
 fn allocation_of(sel: &'static str, desc: &rt::TextureDescriptor) -> u64 {
     use metal2vulkan::metal::TextureType;
     let raw = u64::from(desc.pixel_format.as_raw());
-    let block = crate::gpu::format_info::block(sel, raw, "Apple's layout of a texture of");
+    let block = crate::gpu::format_info::block(sel, raw);
     let layers = match desc.texture_type {
         TextureType::Cube | TextureType::CubeArray => desc.array_length.max(1).saturating_mul(6),
         _ => desc.array_length,
@@ -234,168 +233,6 @@ pub fn own_memory(
     }
 }
 
-/// The colour formats whose answers to `heapTextureSizeAndAlignWithDescriptor:` make Metal's
-/// for a depth or stencil texture of `desc` without GPU-optimized contents
-/// ([`metal_size_and_align`]), of a descriptor Metal's answer is measured to follow them for:
-/// for a format of one aspect, the colour format of its element bytes (`Depth16Unorm`'s
-/// `R16Unorm`, `Depth32Float`'s `R32Float`, `Stencil8`'s `R8Unorm`), and for
-/// `Depth32Float_Stencil8` its depth's and its stencil's (`R32Float`, then `R8Unorm`,
-/// [`paired`]). `None` for any other format, `X32_Stencil8` among them, whose answers are neither
-/// rule's, and for a descriptor of these formats Metal asserts at or the measurements did not
-/// make:
-/// - `ShaderAtomic`, at which Metal asserts ("is not a valid format to be used with texture
-///   atomics"), as the runtime refuses the descriptor first (`Invalid`, `UsageForFormat`), so no
-///   size query here asks;
-/// - a texture type but 2D, 2D array, 2D multisample, 2D multisample array, cube and cube
-///   array, a sample count but 1, 2 and 4, and a storage but `Private` and `Shared`, at which
-///   Metal asserts or no measurement asked (Metal asserts at a 1D, 1D array, 3D or texture
-///   buffer depth texture and at 8 samples, where the runtime refuses the descriptor first).
-///
-/// Every other usage takes the rules, measured exact: a usage that holds neither `ShaderRead`
-/// nor `RenderTarget` but some other bit (`ShaderWrite`, `PixelFormatView`, or Apple's private
-/// 0x4000, 0x8000 or 0x10000, alone or together) among them. The runtime answers a colour
-/// texture's size by its usage as Metal does, plain where Metal keeps it uncompressed
-/// (`ShaderWrite` and `PixelFormatView` among them), and plans that image so MoltenVK keeps it
-/// uncompressed. `depth_stencil_sizes_of_more_usages_and_properties_against_the_rules`, on the
-/// M3 Max under
-/// macOS 26.7, found every row of those usages the rule's: 930 rows (62 usage sets at 15
-/// representative shapes) of each of the four formats, at `Private` and at `Shared` storage.
-///
-/// Metal lays out a format of one aspect as the colour format of its bytes: `vaprobe
-/// depthsizes` (the M3 Max, macOS 26.7: private textures read by shaders and rendered to, 4x4 to
-/// 128x128, of 1 and 4 samples) answered each depth and stencil one as its colour format, size,
-/// alignment and `allocatedSize`, with `allowGPUOptimizedContents` unset, on and off, and the
-/// runtime's measure of Metal's layout counts depth and stencil formats among every type
-/// (its `heap_tiled.rs`). A `Depth32Float_Stencil8` texture's answer was its depth's rounded up
-/// to a page, then its stencil's, at every row (the 4x4 one's 0x80 then 0x80 bytes 0x4080, the
-/// 128x128 one's 0x10000 then 0x4000 bytes 0x14000). The measurements, against the Metal
-/// platform on the M3 Max under macOS 26.7, found both rules at every row they asked of
-/// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8`, at `Private` and
-/// `Shared` storage:
-/// - `depth_stencil_sizes_against_the_rules`: one image (2D, and 2D multisample at 4 samples),
-///   two levels and every level, 2D arrays of 2 and of 3 of every level, cubes of one and of
-///   every level, cube arrays of 2 of one and of every level and of 3 of two levels, and
-///   multisample arrays of 2 at 4 samples, 4x4 to 128x128, of usages `ShaderRead`,
-///   `ShaderRead | ShaderWrite`, `RenderTarget`, `ShaderRead | RenderTarget` and
-///   `ShaderRead | ShaderWrite | PixelFormatView`;
-/// - `depth_stencil_sizes_of_more_sides_and_levels_against_the_rules`, at those five usages: 2D
-///   of one level and of every level count at 48 extents (square sides from 1 to 16384, odd
-///   ones and ones a texel past a power of two among them, and 1440x1080, 3840x2160, 1920x1080,
-///   2560x1600, 5120x2880, 1024x768, 3x5, 7x3, 100x37, 129x64, 64x129, 333x777, 1x1000,
-///   1000x1, 16384x1 and 1x16384), and cubes and cube arrays of 1 to 4 of every level count at
-///   each square side;
-/// - `depth_stencil_sizes_of_more_arrays_and_samples_against_the_rules`, at those five usages:
-///   2D arrays of 2 to 8 of one, two and every level at the 48 extents, of 16, 64 and 2048 at
-///   six, and of every length to 2048 at 129x129 (at `ShaderRead | RenderTarget`); cube arrays
-///   of 8 and 341 at four sides and of every length to 341 at 129; 2D multisample at 2 and 4
-///   samples at the 48 extents; multisample arrays of 1 to 8 at 2 and 4 samples at the 48
-///   extents, of 16, 64 and 2048 at six, and of every length to 2048 at 129x64;
-/// - `depth_stencil_sizes_of_more_usages_and_properties_against_the_rules`, at 15 shapes of
-///   those classes: every set of `ShaderRead`, `ShaderWrite`, `RenderTarget`, 0x8,
-///   `PixelFormatView`, 0x4000, 0x8000 and 0x10000, the rule's at every row (the 62 that hold
-///   neither `ShaderRead` nor `RenderTarget` but another bit, above);
-///   and at the five usages, the write-combined CPU cache mode, untracked and tracked hazard
-///   tracking, `framebufferOnly`, `isDrawable`, protection options 0x1, 0x2 and bit 63,
-///   `writeSwizzleEnabled`, and a swizzle at `ShaderRead`.
-///
-/// `X32_Stencil8` answered the pair rule at no row of the first measurement's shapes and
-/// storages: Metal's answer was smaller by a page or more (0x80 for the 4x4 one, where the pair
-/// rule gives 0x4080), and no other rule was measured for it: the query answers it by the
-/// runtime's model of Metal's answer, a `Stencil8` texture of its shape
-/// (`crate::gpu::device`). The device test
-/// `heap_depth_stencil_shapes_with_optimized_contents_off_are_metals` compares the query's
-/// answers with Metal's at `Private` and `Shared` storage, over a row of each class above, a
-/// multisample texture at `Shared` among them, which the runtime makes in memory of its own
-/// apart from a heap's bytes. `unmeasured_depth_sizes_die_at_the_size_query` checks
-/// that the query dies for the descriptors left out that the runtime refuses.
-fn twins(desc: &rt::TextureDescriptor) -> Option<(PixelFormat, Option<PixelFormat>)> {
-    use metal2vulkan::metal::{TextureType as T, TextureUsage as U};
-    let storage = matches!(
-        desc.resource_options.storage_mode(),
-        Ok(rt::StorageMode::Private | rt::StorageMode::Shared)
-    );
-    let texture_type = matches!(
-        desc.texture_type,
-        T::Type2D
-            | T::Type2DArray
-            | T::Type2DMultisample
-            | T::Type2DMultisampleArray
-            | T::Cube
-            | T::CubeArray
-    );
-    let samples = matches!(desc.sample_count, 1 | 2 | 4);
-    let usage = !desc.usage.contains(U::SHADER_ATOMIC);
-    if !(storage && texture_type && samples && usage) {
-        return None;
-    }
-    match desc.pixel_format {
-        PixelFormat::Depth16Unorm => Some((PixelFormat::R16Unorm, None)),
-        PixelFormat::Depth32Float => Some((PixelFormat::R32Float, None)),
-        PixelFormat::Stencil8 => Some((PixelFormat::R8Unorm, None)),
-        PixelFormat::Depth32FloatStencil8 => {
-            Some((PixelFormat::R32Float, Some(PixelFormat::R8Unorm)))
-        }
-        _ => None,
-    }
-}
-
-/// Metal's answer to `heapTextureSizeAndAlignWithDescriptor:` for a depth or stencil texture of
-/// `desc` without GPU-optimized contents, whose image the runtime keeps GPU-optimized and whose
-/// size it answers larger (`OptimizedDepthStencilTexture`, [`crate::gpu::caps`]' list: 66048
-/// bytes for a 128x128 `Depth32Float` texture, where Metal answers 65536), made of `answer`, the
-/// runtime's answers for colour formats, which are Metal's ([`twins`]): its colour format's
-/// answer, or for `Depth32Float_Stencil8` its depth's size rounded up to a page, then its
-/// stencil's, at the larger of their alignments (0x80 at every row of `vaprobe depthsizes`).
-/// `None` for any other descriptor, one [`twins`] names none for, and where the runtime answers
-/// none for a colour format.
-pub fn metal_size_and_align(
-    desc: &rt::TextureDescriptor,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    if desc.allow_gpu_optimized_contents {
-        return None;
-    }
-    let (first, stencil) = twins(desc)?;
-    let Some(stencil) = stencil else {
-        return twin(desc, first, &answer);
-    };
-    pair(twin(desc, first, &answer)?, twin(desc, stencil, &answer)?)
-}
-
-/// `answer` for `desc` of `pixel_format`.
-fn twin(
-    desc: &rt::TextureDescriptor,
-    pixel_format: PixelFormat,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    let mut twin = *desc;
-    twin.pixel_format = pixel_format;
-    answer(&twin)
-}
-
-/// A two-aspect texture's size and alignment of its depth's and its stencil's: the depth's size
-/// rounded up to a page, then the stencil's, at the larger of their alignments.
-fn pair(depth: SizeAndAlign, stencil: SizeAndAlign) -> Option<SizeAndAlign> {
-    Some(SizeAndAlign {
-        size: (depth.size.checked_next_multiple_of(PAGE))?.checked_add(stencil.size)?,
-        align: depth.align.max(stencil.align),
-    })
-}
-
-/// The size and alignment [`metal_size_and_align`]'s rule for `Depth32Float_Stencil8` ([`pair`])
-/// gives a texture of `desc` of any shape and format, of `answer`'s answers for it as `R32Float`
-/// and as `R8Unorm`: what the measurement `depth_stencil_sizes_against_the_rules` compares
-/// Metal's answers for `Depth32Float_Stencil8` and `X32_Stencil8` textures with ([`twins`]).
-pub fn paired(
-    desc: &rt::TextureDescriptor,
-    answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
-) -> Option<SizeAndAlign> {
-    pair(
-        twin(desc, PixelFormat::R32Float, &answer)?,
-        twin(desc, PixelFormat::R8Unorm, &answer)?,
-    )
-}
-
 /// The heap size Metal's space takes for a texture of its own memory of `desc`
 /// ([`own_memory`]): `metal`, the runtime's model of Metal's answer to
 /// `heapTextureSizeAndAlignWithDescriptor:` for it
@@ -403,15 +240,12 @@ pub fn paired(
 /// Metal's on every device, where the device's own answer, which a heap places the texture by,
 /// may be larger (`heap-texture-larger-than-metal`: every texture on NVIDIA, whose
 /// `bufferImageGranularity` is 1024 bytes) or is for a depth or stencil texture without
-/// GPU-optimized contents (`optimized-depth-stencil-texture`). Where the model has none (a format
-/// or a sample count whose layout is not measured), of `answer`, the runtime's answer to the
-/// query for a descriptor: Metal's for a depth or stencil texture without GPU-optimized contents
-/// ([`metal_size_and_align`]), else the runtime's for `desc`, which is Metal's but for such a
-/// texture of a format or storage Metal's is not measured for, at which a device's texture dies
-/// (`crate::gpu::device`), and but for the texture the model has none for (a PVRTC format; 8
-/// samples are refused first), whose size the runtime answers as its device's image's, larger
-/// or smaller than Metal's, and announces so (`unmeasured-heap-texture-size`,
-/// [`crate::answer::HEARD`]), at which a device's texture dies too ([`unmeasured_size`]).
+/// GPU-optimized contents (`optimized-depth-stencil-texture`), each of which the model answers.
+/// Where the model has none (a format or a sample count whose layout is not measured), of `answer`,
+/// the runtime's answer to the query for `desc`, which the runtime answers as its device's image's,
+/// larger or smaller than Metal's, and announces so (`unmeasured-heap-texture-size`,
+/// [`crate::answer::HEARD`]: 8 samples, which are refused first), at which a device's texture
+/// dies ([`unmeasured_size`]).
 ///
 /// The space takes a range or a slot by that size as for any texture ([`texture_space`]):
 /// `vaprobe depthsizes` took a slot of the size rounded up to [`SLOT_STEP`] in the private pool
@@ -422,24 +256,18 @@ pub fn own_heap_size(
     metal: Option<SizeAndAlign>,
     answer: impl Fn(&rt::TextureDescriptor) -> Option<SizeAndAlign>,
 ) -> Option<u64> {
-    metal
-        .or_else(|| metal_size_and_align(desc, &answer))
-        .or_else(|| answer(desc))
-        .map(|answer| answer.size)
+    metal.or_else(|| answer(desc)).map(|answer| answer.size)
 }
 
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of `what` a
 /// texture of `desc` whose layout in Metal's heaps the runtime does not model, which `sel` heard
-/// the runtime announce (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]): a PVRTC
-/// format (8 samples, which its model has no answer for either, its
-/// descriptor check refuses first on every device), whose size and alignment the runtime answers
-/// as its device's image's, larger or smaller than Metal's, and the call goes on with them. The
-/// line names the texture.
+/// the runtime announce (`unmeasured-heap-texture-size`, [`crate::answer::HEARD`]: 8 samples,
+/// which its descriptor check refuses first on every device), whose size and alignment the
+/// runtime answers as its device's image's, larger or smaller than Metal's, and the call goes on
+/// with them. The line names the texture.
 pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescriptor) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::HeapLayout,
-        &format!(
+    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+        format!(
             "{what} a texture whose layout in Metal's heaps the runtime does not model, which it \
              sizes as its device's image, larger or smaller than Metal's \
              (unmeasured-heap-texture-size): a {:?} texture of pixel format {}, {}x{}x{}, {} \
@@ -452,8 +280,8 @@ pub fn unmeasured_size(sel: &'static str, what: &str, desc: &rt::TextureDescript
             desc.mipmap_level_count,
             desc.sample_count,
             desc.array_length
-        ),
-    );
+        )
+    });
 }
 
 /// A shareable texture of `desc`, made by `sel`.
@@ -989,6 +817,10 @@ impl Default for Samplers {
 pub struct MetalSpace {
     /// Each held run's first byte and its end. Runs never overlap.
     held: BTreeMap<u64, u64>,
+    /// The gaps between the held runs, for the lowest start a range fits at
+    /// ([`MetalSpace::lowest_gap`]), changed with `held` alone ([`MetalSpace::hold`],
+    /// [`MetalSpace::unhold`]).
+    gaps: gaps::Gaps,
     /// Whether the device's heap is held ([`BASE`]): from the space's first use.
     device: bool,
     /// Metal's own allocations made ([`FirstUse`]).
@@ -1006,6 +838,7 @@ impl MetalSpace {
     pub const fn new() -> MetalSpace {
         MetalSpace {
             held: BTreeMap::new(),
+            gaps: gaps::Gaps::new(),
             device: false,
             own: BTreeSet::new(),
             pools: Vec::new(),
@@ -1027,7 +860,7 @@ impl MetalSpace {
         if !self.device {
             self.device = true;
             let (_, span) = MetalSpace::plain_span(DEVICE_HEAP).unwrap_or_default();
-            self.held.insert(BASE, BASE + span);
+            self.hold(BASE, BASE + span);
         }
     }
 
@@ -1218,8 +1051,34 @@ impl MetalSpace {
             .map(|(&start, _)| start.max(range.start))
     }
 
-    /// The lowest [`SLOT`]-aligned start from [`BASE`] where `span` bytes are free.
+    /// `start..end` held from now on, in place of a run held from `start` before.
+    fn hold(&mut self, start: u64, end: u64) {
+        if self.held.contains_key(&start) {
+            self.unhold(start);
+        }
+        self.held.insert(start, end);
+        self.gaps.made(&self.held, start);
+    }
+
+    /// The run held from `start`, if any, free from now on.
+    fn unhold(&mut self, start: u64) {
+        if self.held.remove(&start).is_some() {
+            self.gaps.gone(&self.held, start);
+        }
+    }
+
+    /// The lowest [`SLOT`]-aligned start from [`BASE`] where `span` bytes are free: walking the
+    /// held runs in order, [`BASE`] or the first run's end rounded up to [`SLOT`] whose bytes end
+    /// at or before the next run's start, or past every run; `None` where they would pass [`END`].
+    /// The gaps answer the walk's start in O(log n) ([`gaps`]).
     fn lowest_gap(&self, span: u64) -> Option<u64> {
+        let at = self.gaps.lowest(span)?;
+        (at.checked_add(span)? <= END).then_some(at)
+    }
+
+    /// [`MetalSpace::lowest_gap`] by the walk itself, which the gaps answer as.
+    #[cfg(test)]
+    fn walked_gap(&self, span: u64) -> Option<u64> {
         let mut at = BASE;
         for (&start, &end) in &self.held {
             if end <= at {
@@ -1243,7 +1102,7 @@ impl MetalSpace {
         let (pages, span) = MetalSpace::plain_span(length)?;
         let start = self.lowest_gap(span)?;
         let end = start.checked_add(span)?;
-        self.held.insert(start, end);
+        self.hold(start, end);
         let pages_end = start.checked_add(pages)?;
         Some(Held {
             address: start,
@@ -1274,7 +1133,7 @@ impl MetalSpace {
         if let Some(held) = self.first_held(&requested) {
             return Err(PinRefused::Held { requested, held });
         }
-        self.held.insert(first, span_end);
+        self.hold(first, span_end);
         Ok(Held {
             address,
             pages: first..end,
@@ -1313,7 +1172,7 @@ impl MetalSpace {
     /// `held`'s resource released, or never made after all: its whole span free again, a
     /// pin's as a plain range's.
     pub fn release(&mut self, held: Held) {
-        self.held.remove(&held.pages.start);
+        self.unhold(held.pages.start);
     }
 }
 
@@ -1341,9 +1200,47 @@ pub fn process() -> MutexGuard<'static, MetalSpace> {
     space
 }
 
+/// Whether the process's space took `first` through [`first_use`]: what it takes is held for
+/// good, so a later use takes nothing.
+pub fn taken(first: FirstUse) -> bool {
+    FIRST_USES.load(std::sync::atomic::Ordering::Acquire) & first.bit() != 0
+}
+
 /// The process's device used so ([`FirstUse`]): Metal's own allocations for it, the first time.
+/// Each blit command, encoder and tiler submission is one, so a use the process's space made
+/// already ([`FIRST_USES`]) is answered without its lock: it changes nothing of the space, and
+/// the lock's other work, the sampler mempool's growth ([`process`]), is placed by the next
+/// lock that changes it, before that change, where this one would have placed it.
 pub fn first_use(first: FirstUse) {
-    process().first_use(first);
+    let bit = first.bit();
+    if FIRST_USES.load(std::sync::atomic::Ordering::Acquire) & bit != 0 {
+        return;
+    }
+    let mut space = process();
+    space.first_use(first);
+    FIRST_USES.fetch_or(bit, std::sync::atomic::Ordering::Release);
+}
+
+/// The first uses the process's space made through [`first_use`], a bit each
+/// ([`FirstUse::bit`]): each made once, with every allocation it takes held for good, so a later
+/// one of the same kind is no change.
+static FIRST_USES: std::sync::atomic::AtomicU16 = std::sync::atomic::AtomicU16::new(0);
+
+impl FirstUse {
+    /// Its bit in [`FIRST_USES`].
+    const fn bit(self) -> u16 {
+        1 << match self {
+            FirstUse::Queue => 0,
+            FirstUse::Texture => 1,
+            FirstUse::ComputeEncoder => 2,
+            FirstUse::BlitCommand => 3,
+            FirstUse::RenderEncoder => 4,
+            FirstUse::TilerBlit => 5,
+            FirstUse::TilerSubmission => 6,
+            FirstUse::SmallShared => 7,
+            FirstUse::SmallPrivate => 8,
+        }
+    }
 }
 
 /// A resource's hold on the process's space: its ranges, given back when it goes.
@@ -1861,7 +1758,7 @@ mod tests {
         fn taken(&mut self, span: u64) -> u64 {
             self.device();
             let start = self.lowest_gap(span).unwrap();
-            self.held.insert(start, start + span);
+            self.hold(start, start + span);
             start
         }
     }
@@ -3280,178 +3177,60 @@ mod tests {
         }
     }
 
-    /// Where the runtime's model of Metal's answer has none, a depth or stencil texture without
-    /// GPU-optimized contents takes Metal's heap size, made of the runtime's answers for colour
-    /// formats (`vaprobe depthsizes`: the colour formats' answers with
-    /// `allowGPUOptimizedContents` off, 4x4 to 128x128, of 1 and 4 samples, make every depth and
-    /// stencil one's), a `Depth32Float_Stencil8` texture of more slices by the same pair rule, at
-    /// `Private` or `Shared` storage; with it on, at `Managed` storage, or of `X32_Stencil8`, the
-    /// runtime's own answer. Metal's is made of any usage but `ShaderAtomic`, none and one that
-    /// holds neither `ShaderRead` nor `RenderTarget` but another bit among them, and of a cube;
-    /// none is of `ShaderAtomic`, of a 3D texture, or of 8 samples ([`twins`]). Where the model
-    /// has one, it is the size, whatever the runtime's answers
+    /// A depth or stencil texture without GPU-optimized contents takes the runtime's model of
+    /// Metal's heap size where the model has one, whatever the runtime's own answer, of every
+    /// format, sample count, storage and slice count; where the model has none, the runtime's
+    /// answer; where neither answers, none
     #[test]
     fn depth_and_stencil_textures_take_metals_heap_size() {
-        use metal2vulkan::metal::{TextureType, TextureUsage};
-        const SIDES: [u64; 6] = [4, 8, 16, 64, 100, 128];
-        // Each colour format's answer, by side, of 1 sample and then of 4.
-        const R32F: [[u64; 6]; 2] = [
-            [0x80, 0x100, 0x400, 0x4000, 0x1_0000, 0x1_0000],
-            [0x100, 0x400, 0x1000, 0x1_0000, 0x4_0000, 0x4_0000],
-        ];
-        const R16: [[u64; 6]; 2] = [
-            [0x80, 0x80, 0x200, 0x2000, 0x8000, 0x8000],
-            [0x80, 0x200, 0x800, 0x8000, 0x2_0000, 0x2_0000],
-        ];
-        const R8: [[u64; 6]; 2] = [
-            [0x80, 0x80, 0x100, 0x1000, 0x4000, 0x4000],
-            [0x80, 0x100, 0x400, 0x4000, 0x1_0000, 0x1_0000],
-        ];
-        const D32S8: [[u64; 6]; 2] = [
-            [0x4080, 0x4080, 0x4100, 0x5000, 0x1_4000, 0x1_4000],
-            [0x4080, 0x4100, 0x4400, 0x1_4000, 0x5_0000, 0x5_0000],
-        ];
-        /// What the runtime answers here for a depth or stencil descriptor: not Metal's.
+        use metal2vulkan::metal::{PixelFormat, TextureType};
+        /// What the runtime answers here for a descriptor: not Metal's.
         const RUNTIMES: u64 = 0x7_0000;
-        let answer = |desc: &rt::TextureDescriptor| {
-            let i = SIDES.iter().position(|&side| side == desc.width).unwrap();
-            let n = usize::from(desc.sample_count > 1);
-            let size = match desc.pixel_format {
-                PixelFormat::R32Float => R32F[n][i],
-                PixelFormat::R16Unorm => R16[n][i],
-                PixelFormat::R8Unorm => R8[n][i],
-                _ => RUNTIMES,
-            };
-            Some(SizeAndAlign { size, align: 0x80 })
+        let answer = |_: &rt::TextureDescriptor| {
+            Some(SizeAndAlign {
+                size: RUNTIMES,
+                align: 0x80,
+            })
         };
-        let desc = |pf, side, samples: u64, allow| {
-            let mut desc = rt::TextureDescriptor::texture_2d(pf, side, side, false);
+        let none = |_: &rt::TextureDescriptor| None;
+        let modelled = SizeAndAlign {
+            size: 0x4080,
+            align: 0x80,
+        };
+        let desc = |pf, samples: u64| {
+            let mut desc = rt::TextureDescriptor::texture_2d(pf, 64, 64, false);
             if samples > 1 {
                 desc.texture_type = TextureType::Type2DMultisample;
                 desc.sample_count = samples;
             }
             desc.resource_options = rt::ResourceOptions::private();
-            desc.allow_gpu_optimized_contents = allow;
+            desc.allow_gpu_optimized_contents = false;
             desc
         };
-        let formats = [
-            (PixelFormat::Depth32Float, R32F),
-            (PixelFormat::Depth16Unorm, R16),
-            (PixelFormat::Stencil8, R8),
-            (PixelFormat::Depth32FloatStencil8, D32S8),
-        ];
-        for (pf, metal) in formats {
-            for (n, samples) in [1, 4].into_iter().enumerate() {
-                for (i, side) in SIDES.into_iter().enumerate() {
-                    let off = own_heap_size(&desc(pf, side, samples, false), None, answer);
-                    assert_eq!(off, Some(metal[n][i]), "{pf:?} {side} {samples}");
-                    let on = own_heap_size(&desc(pf, side, samples, true), None, answer);
-                    assert_eq!(on, Some(RUNTIMES), "{pf:?} {side} {samples} on");
-                }
-            }
-        }
-        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 4, 1, false);
+        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 1);
         slices.texture_type = TextureType::Type2DArray;
         slices.array_length = 2;
-        let pair = SizeAndAlign {
-            size: 0x4080,
-            align: 0x80,
-        };
-        assert_eq!(
-            metal_size_and_align(&slices, answer),
-            Some(pair),
-            "two slices"
-        );
-        assert_eq!(
-            own_heap_size(&slices, None, answer),
-            Some(0x4080),
-            "two slices"
-        );
-        let x32s8 = desc(PixelFormat::X32Stencil8, 4, 1, false);
-        assert_eq!(metal_size_and_align(&x32s8, answer), None, "X32_Stencil8");
-        assert_eq!(
-            own_heap_size(&x32s8, None, answer),
-            Some(RUNTIMES),
-            "X32_Stencil8"
-        );
-        let modelled = SizeAndAlign {
-            size: 0x80,
-            align: 0x80,
-        };
-        for desc in [
-            &x32s8,
-            &slices,
-            &desc(PixelFormat::Depth32Float, 4, 1, true),
-        ] {
-            let size = own_heap_size(desc, Some(modelled), answer);
-            assert_eq!(size, Some(0x80), "the model's: {desc:?}");
-        }
-        let d32s8 = desc(PixelFormat::Depth32FloatStencil8, 128, 1, false);
-        let metal = SizeAndAlign {
-            size: 0x1_4000,
-            align: 0x80,
-        };
-        assert_eq!(metal_size_and_align(&d32s8, answer), Some(metal));
-        let on = desc(PixelFormat::Depth32Float, 4, 1, true);
-        assert_eq!(metal_size_and_align(&on, answer), None, "on");
-        let mut shared = desc(PixelFormat::Depth32Float, 4, 1, false);
+        let mut shared = desc(PixelFormat::Depth32Float, 1);
         shared.resource_options = rt::ResourceOptions::shared();
-        let r32f = SizeAndAlign {
-            size: 0x80,
-            align: 0x80,
-        };
-        assert_eq!(metal_size_and_align(&shared, answer), Some(r32f), "Shared");
-        let mut managed = shared;
-        managed.resource_options = rt::ResourceOptions::new(
-            rt::StorageMode::Managed,
-            rt::CpuCacheMode::DefaultCache,
-            rt::HazardTrackingMode::Default,
-        );
-        assert_eq!(metal_size_and_align(&managed, answer), None, "Managed");
-        let mut slices = desc(PixelFormat::Depth32FloatStencil8, 128, 1, false);
-        slices.texture_type = TextureType::Type2DArray;
-        slices.array_length = 2;
-        assert_eq!(paired(&slices, answer), Some(metal), "the pair rule");
-        assert_eq!(metal_size_and_align(&slices, answer), Some(metal), "slices");
-        let none = |_: &rt::TextureDescriptor| None;
-        let off = desc(PixelFormat::Depth32Float, 4, 1, false);
-        assert_eq!(own_heap_size(&off, None, none), None, "no answer");
-        let size = own_heap_size(&off, Some(modelled), none);
-        assert_eq!(size, Some(0x80), "the model's, no answer");
-        let used = |usage| {
-            let mut d = desc(PixelFormat::Depth32Float, 4, 1, false);
-            d.usage = usage;
-            metal_size_and_align(&d, answer)
-        };
-        for usage in [
-            TextureUsage::UNKNOWN,
-            TextureUsage::RENDER_TARGET,
-            TextureUsage::SHADER_READ | TextureUsage::PIXEL_FORMAT_VIEW,
-            TextureUsage::RENDER_TARGET | TextureUsage::BLOCK_WRITES_ONLY,
-            TextureUsage::SHADER_WRITE,
-            TextureUsage::PIXEL_FORMAT_VIEW,
-            TextureUsage::NO_CONCURRENT_ACCESS,
-            TextureUsage::VIDEO,
-            TextureUsage::BLOCK_WRITES_ONLY,
-            TextureUsage::SHADER_WRITE | TextureUsage::PIXEL_FORMAT_VIEW,
+        let mut descs = vec![slices, shared];
+        for pf in [
+            PixelFormat::Depth16Unorm,
+            PixelFormat::Depth32Float,
+            PixelFormat::Stencil8,
+            PixelFormat::Depth32FloatStencil8,
+            PixelFormat::X32Stencil8,
         ] {
-            assert_eq!(used(usage), Some(r32f), "{usage:?}");
+            descs.extend([desc(pf, 1), desc(pf, 4)]);
         }
-        for usage in [
-            TextureUsage::SHADER_ATOMIC,
-            TextureUsage::SHADER_READ | TextureUsage::SHADER_ATOMIC,
-        ] {
-            assert_eq!(used(usage), None, "{usage:?}");
+        for desc in &descs {
+            let size = own_heap_size(desc, Some(modelled), answer);
+            assert_eq!(size, Some(0x4080), "the model's: {desc:?}");
+            let size = own_heap_size(desc, Some(modelled), none);
+            assert_eq!(size, Some(0x4080), "the model's, no answer: {desc:?}");
+            let size = own_heap_size(desc, None, answer);
+            assert_eq!(size, Some(RUNTIMES), "the runtime's: {desc:?}");
+            assert_eq!(own_heap_size(desc, None, none), None, "none: {desc:?}");
         }
-        let mut cube = desc(PixelFormat::Depth32Float, 4, 1, false);
-        cube.texture_type = TextureType::Cube;
-        assert_eq!(metal_size_and_align(&cube, answer), Some(r32f), "a cube");
-        let mut volume = desc(PixelFormat::Depth32Float, 4, 1, false);
-        volume.texture_type = TextureType::Type3D;
-        assert_eq!(metal_size_and_align(&volume, answer), None, "3D");
-        let mut eight = desc(PixelFormat::Depth32Float, 4, 4, false);
-        eight.sample_count = 8;
-        assert_eq!(metal_size_and_align(&eight, answer), None, "8 samples");
     }
 
     #[test]
@@ -3519,6 +3298,82 @@ mod tests {
             })
             .collect();
         assert_eq!(spans, [0x8000, 0x10000, 0x10000, 0x18000, 0x18000]);
+    }
+
+    /// The gaps answer the lowest start where a range fits as the walk of the held runs does
+    /// ([`MetalSpace::lowest_gap`]), over random sequences of placements, pins (below the base,
+    /// over it, among the ranges and past the space's end) and releases, at spans of whole slots,
+    /// of parts of one, of none and past the space; and the space places the same ranges
+    #[test]
+    fn the_gaps_answer_the_lowest_start_as_the_walk_does() {
+        let mut seed = 0x2545_f491_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for round in 0..8 {
+            let mut space = MetalSpace::new();
+            let mut held: Vec<Held> = Vec::new();
+            for step in 0..3000 {
+                let roll = next() % 16;
+                if roll < 8 {
+                    // A placement, mostly of a few pages, now and then of many.
+                    let pages = if next() % 8 == 0 {
+                        next() % 512
+                    } else {
+                        next() % 6
+                    };
+                    let length = pages * PAGE + next() % PAGE;
+                    // A placement holds the device's range first.
+                    space.device();
+                    let expected =
+                        MetalSpace::plain_span(length).and_then(|(_, span)| space.walked_gap(span));
+                    let placed = space.place(length);
+                    let lowest = placed.as_ref().map(Held::address);
+                    assert_eq!(lowest, expected, "round {round} step {step}");
+                    held.extend(placed);
+                } else if roll < 10 {
+                    // A pin, aligned or not, below the base, among the ranges or far past them.
+                    let around = match next() % 4 {
+                        0 => BASE - (next() % 64) * SLOT,
+                        1 => START + (next() % 4096) * SLOT,
+                        2 => END - (next() % 8) * SLOT,
+                        _ => START + (next() % 4096) * PAGE,
+                    };
+                    let length = (next() % 8) * PAGE + next() % 0x100;
+                    if let Ok(pinned) = space.pin(around + next() % 2 * 0x10, length) {
+                        held.push(pinned);
+                    }
+                } else if !held.is_empty() {
+                    let at = usize::try_from(next()).unwrap() % held.len();
+                    space.release(held.swap_remove(at));
+                }
+                for span in [
+                    0,
+                    1,
+                    SLOT - 1,
+                    SLOT,
+                    SLOT + 1,
+                    2 * SLOT,
+                    3 * SLOT,
+                    (next() % 64) * SLOT,
+                    (next() % 1024) * SLOT,
+                    next() % (64 * SLOT),
+                    END - BASE,
+                    END,
+                    u64::MAX - next() % SLOT,
+                    u64::MAX,
+                ] {
+                    assert_eq!(
+                        space.lowest_gap(span),
+                        space.walked_gap(span),
+                        "round {round} step {step} span {span:#x}"
+                    );
+                }
+            }
+        }
     }
 
     /// The lowest freed range goes first, not the one freed last.

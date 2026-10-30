@@ -338,10 +338,11 @@ mod tests {
         }
     }
 
-    mod map_physical_range {
+    mod mapping_pieces {
         use super::*;
 
-        /// `MemoryMap::map_physical_range`'s remap is a shared alias both ways
+        /// The remap that maps a guest mapping's pieces (core's `memory::map`) is a shared alias
+        /// both ways
         #[test]
         fn remap_is_shared_both_ways() {
             let v = vm();

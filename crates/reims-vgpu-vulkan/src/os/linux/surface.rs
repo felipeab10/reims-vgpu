@@ -5,15 +5,26 @@
 //!   release, and the retain count, which the guest sees, is the number of references to the
 //!   object. Its ID is the object's address, unique among live surfaces. A lookup
 //!   (`lookup_by_port`) is another object over the same memory, with a count of its own, as
-//!   IOSurface's lookup in the process that made the surface answers.
+//!   IOSurface's lookup in the process that made the surface answers. While the thread unwinds
+//!   or releases an isolated task that died
+//!   ([`leaks_objects`](reims_vgpu_core::tasks::isolation::life::leaks_objects)), `Drop` leaks
+//!   the reference instead, as every platform handle of a dead task's is
+//!   ([`crate::platform::Obj`]): its object, and the memory the object holds, stay until the
+//!   process exits. What a dead task holds is its own object over a surface the host lent it,
+//!   never the host's: the surface reaches it through a lookup. So the leak changes no count the
+//!   host reads.
 //! - **Memory.** A surface of its own memory is a file of its own, mapped and registered in the
 //!   backing table ([`super::vm::OwnMemory`]), so a view can be made of it (an alias of its
 //!   allocation, a buffer over it) and no `deallocate` frees it. One over the guest's pages
 //!   (`kIOSurfaceClientAddressRanges`) of one range is that range, its base address its offset
 //!   into it; one of several ranges is a view of them ([`super::vm::LinuxVm`]), read-only for
 //!   the CPU where it is read-only for the GPU (`kIOSurfaceClientDirection` 2), as IOSurface maps
-//!   it on macOS. A protected surface (protection options other than 0) has no memory the CPU
-//!   reaches: its base address is NULL.
+//!   it on macOS. The view runs on past the allocation's whole pages by the zeros a buffer over
+//!   the surface at its offset reads past its end, so that the surface's buffers lie over the
+//!   view itself ([`own_alias`]) rather than over a second view of the same pages: each view
+//!   takes a kernel mapping for each run of the pages, counted against `vm.max_map_count`. A
+//!   protected surface (protection options other than 0) has no memory the CPU reaches: its base
+//!   address is NULL.
 //!   The mapping goes with the surface's last object, or later with the last hold on it
 //!   ([`surface_memory_hold`]): a device's import of the pages at the surface's base address
 //!   holds one until the runtime has freed the import, so the pages stay mapped while it lives
@@ -27,6 +38,10 @@
 //!   reference: the retain count stays the objects'. Measured on an Iris Xe (Mesa 26.2.4's ANV,
 //!   i915): ANV puts every live import in each execbuffer, and one whose pages are unmapped
 //!   fails it with `EFAULT`, which ANV answers as the device lost.
+//! - **Attachments.** What a host attaches to a surface ([`attachment`]) lives as long as the
+//!   surface does, every object over it, its lookups among them, and goes with its last object:
+//!   the video device keys a device's imports of the surface's memory by it, so that they go with
+//!   the surface, and a surface mapped again is a new one (`super::device_lend`).
 //! - **What it answers** is the spec's: its planes, rows and sizes, its allocation size exactly
 //!   as given. It holds no values (`IOSurfaceCopyValue`): nothing in the process sets one.
 //!   `lock` and `unlock` do nothing.
@@ -54,6 +69,9 @@
 //! byte per element and rows of its width rounded up to 128 bytes (measured on the M3 Max:
 //! widths 16, 17, 32 and 65535).
 
+use std::any::Any;
+use std::fmt;
+use std::mem::ManuallyDrop;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
@@ -66,7 +84,8 @@ use reims_vgpu_core::platform::os::vm::{HostVm as _, KernReturn, VmProt};
 use reims_vgpu_core::platform::{Handle, ObjId};
 use reims_vgpu_core::sync::Mutex;
 
-use super::vm::{LinuxVm, OwnMemory};
+use super::vm::{LinuxVm, OwnMemory, allocate_aliasable};
+use crate::gpu::backing::Alias;
 use crate::os::{MadeOver, READ_ONLY_DIRECTION, page_runs};
 use crate::platform::VulkanPlatform;
 
@@ -80,9 +99,10 @@ const PROTECTION_OPTIONS: u64 = 0xf;
 /// The bytes a row of a surface made from plane properties is rounded up to.
 const BACKING_ROW_ALIGNMENT: u64 = 128;
 
-/// One reference to an IOSurface stand-in (module docs).
+/// One reference to an IOSurface stand-in (module docs): `Drop` is the release, or a leak while
+/// the thread unwinds or releases an isolated task that died.
 #[derive(Debug)]
-pub struct LinuxSurface(Arc<Object>);
+pub struct LinuxSurface(ManuallyDrop<Arc<Object>>);
 
 /// An object over a surface: the one made, or a lookup of it.
 #[derive(Debug)]
@@ -116,6 +136,11 @@ struct Data {
     memory: Arc<Memory>,
     /// What it was made over ([`crate::os::surface_memory`] and the helpers beside it).
     made: Mutex<MadeOver>,
+    /// What the host attached to it ([`attachment`]).
+    attached: Attached,
+    /// For a surface whose GPU writes never reach its memory, its count among the objects whose
+    /// GPU writes may reach read-only memory ([`crate::gpu::writes::any_kept`]).
+    _kept: Option<crate::gpu::writes::Keeping>,
 }
 
 /// The memory a surface mapped: its own, or its view of the guest's pages; none for one over a
@@ -124,7 +149,8 @@ struct Data {
 struct Memory {
     /// Its own memory.
     own: Option<OwnMemory>,
-    /// The view of the guest's pages it made, its first byte and length.
+    /// The view of the guest's pages it made, its first byte and length: its allocation's whole
+    /// pages, then the zeros its buffers at its offset read past them ([`view`]).
     view: Option<(u64, u64)>,
 }
 
@@ -140,26 +166,90 @@ impl Drop for Memory {
 
 /// A hold on the memory `surface` mapped, which keeps it mapped while it lives, the surface gone
 /// or not, and counts no reference of the surface; for one over a single range of the guest's
-/// pages, which maps nothing, an unmap hold on that range, which defers nothing for a range of
-/// the host's own RAM, the only one core makes such a surface over (module docs).
+/// pages, which maps nothing, an unmap hold on that range, its allocation's bytes from the
+/// range's first, before the base address by the surface's offset, which defers nothing for a
+/// range of the host's own RAM, the only one core makes such a surface over (module docs).
 pub(crate) fn surface_memory_hold(surface: &LinuxSurface) -> impl Send + 'static {
-    let data = surface.data();
-    let memory = &data.memory;
-    let cores_unmap = (memory.own.is_none() && memory.view.is_none())
-        .then(|| {
-            NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
-                data.base.to_usize(),
-            ))
-        })
-        .flatten()
-        .map(|first| crate::remap::UnmapHold::new(first, data.alloc_size));
-    (Arc::clone(memory), cores_unmap)
+    MemoryHolder::of(surface).hold()
+}
+
+/// What makes holds on the memory a surface mapped ([`surface_memory_hold`]), the surface gone or
+/// not: the memory, and for a surface over a single range of the guest's pages the range's first
+/// byte and its allocation's size. Itself a hold: the memory stays mapped while it lives. It
+/// keeps no reference of the surface, nor the surface's record, so its attachments go with the
+/// surface's last object as ever.
+#[derive(Debug, Clone)]
+pub(crate) struct MemoryHolder {
+    memory: Arc<Memory>,
+    range: Option<(NonNull<u8>, u64)>,
+}
+
+// SAFETY: the range is an address and a length, which nothing reads through; the memory is the
+// surface's, `Send` and `Sync`.
+unsafe impl Send for MemoryHolder {}
+// SAFETY: as above.
+unsafe impl Sync for MemoryHolder {}
+
+impl MemoryHolder {
+    /// The holder of `surface`'s memory.
+    pub(crate) fn of(surface: &LinuxSurface) -> MemoryHolder {
+        let data = surface.data();
+        let memory = &data.memory;
+        let range = (memory.own.is_none() && memory.view.is_none())
+            .then(|| {
+                let first = data.base.saturating_sub(data.made.lock().offset);
+                NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
+                    first.to_usize(),
+                ))
+            })
+            .flatten()
+            .map(|first| (first, data.alloc_size));
+        MemoryHolder {
+            memory: Arc::clone(memory),
+            range,
+        }
+    }
+
+    /// A new hold on the memory, as [`surface_memory_hold`] makes.
+    pub(crate) fn hold(&self) -> impl Send + Sync + use<> {
+        let cores_unmap = self
+            .range
+            .map(|(first, length)| crate::remap::UnmapHold::new(first, length));
+        (Arc::clone(&self.memory), cores_unmap)
+    }
+}
+
+/// What the host attached to a surface ([`attachment`]): a value of one type, made at the first
+/// ask, dropped with the surface's record.
+#[derive(Default)]
+struct Attached(Mutex<Option<Box<dyn Any + Send + Sync>>>);
+
+impl fmt::Debug for Attached {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let attached = self.0.lock().is_some();
+        f.debug_tuple("Attached").field(&attached).finish()
+    }
+}
+
+/// `read` of the value of type `T` the host attached to `surface`, which `make` makes at the
+/// first ask (module docs, "Attachments"): it lives as long as the surface does, every object
+/// over it, its lookups among them, and goes with the last. `None` where a value of another type
+/// is attached. `make` and `read` run under the record's lock, so they must call nothing that
+/// reaches the surface.
+pub fn attachment<T: Any + Send + Sync, R>(
+    surface: &LinuxSurface,
+    make: impl FnOnce() -> T,
+    read: impl FnOnce(&T) -> R,
+) -> Option<R> {
+    let mut attached = surface.data().attached.0.lock();
+    let value = attached.get_or_insert_with(|| Box::new(make()));
+    value.downcast_ref::<T>().map(read)
 }
 
 impl LinuxSurface {
     /// A new surface: one reference to a new object over `data`.
     fn new(data: Data) -> LinuxSurface {
-        LinuxSurface(Arc::new(Object(Arc::new(data))))
+        LinuxSurface(ManuallyDrop::new(Arc::new(Object(Arc::new(data)))))
     }
 
     /// The surface the object is over.
@@ -168,9 +258,20 @@ impl LinuxSurface {
     }
 }
 
+impl Drop for LinuxSurface {
+    /// The release, or nothing while the thread unwinds or releases an isolated task that died.
+    fn drop(&mut self) {
+        if reims_vgpu_core::tasks::isolation::life::leaks_objects() {
+            return;
+        }
+        // SAFETY: the reference is released once, here, and never touched after.
+        unsafe { ManuallyDrop::drop(&mut self.0) }
+    }
+}
+
 impl Handle for LinuxSurface {
     fn clone_ref(&self) -> Self {
-        LinuxSurface(Arc::clone(&self.0))
+        LinuxSurface(ManuallyDrop::new(Arc::clone(&self.0)))
     }
 
     fn id(&self) -> ObjId {
@@ -234,7 +335,9 @@ impl Surface for LinuxSurface {
     }
 
     fn lookup_by_port(&self) -> Option<Self> {
-        Some(LinuxSurface(Arc::new(Object(Arc::clone(&self.0.0)))))
+        Some(LinuxSurface(ManuallyDrop::new(Arc::new(Object(
+            Arc::clone(&self.0.0),
+        )))))
     }
 }
 
@@ -385,39 +488,91 @@ fn checked_ranges(ranges: &[PhysicalMemoryRange], alloc_size: u64) -> Option<()>
     (!ranges.is_empty() && alloc_size <= total).then_some(())
 }
 
-/// A view of the first `length` bytes of `ranges`, in their order, read-only when `read_only`:
-/// its first byte, or `None` where a range has no file behind it or the host gives no address
-/// space, nothing left mapped.
-fn view(ranges: &[PhysicalMemoryRange], length: u64, read_only: bool) -> Option<u64> {
+/// A view of the first `length` bytes of `runs`, the guest's pages in their order with those that
+/// follow on in the host's memory merged ([`page_runs`]), then `zeros` bytes of zeros, whole
+/// pages, read-only when `read_only`: one remap for each run, as core names the pages one by one.
+/// Its first byte, or `None` where a run has no file behind it or the host gives no address space
+/// or zeros, nothing left mapped.
+///
+/// The zeros are the tail the buffers over the surface at an offset read past its allocation,
+/// which lie over the view ([`own_alias`]), as an alias of the allocation would give them
+/// (`crate::gpu::backing::gather`): a writable view's are a file of its own, which the runtime
+/// imports with the guest's pages, as host memory or as dma-bufs (`super::dma_buf`), which
+/// udmabuf makes of files alone; a read-only view's map the block of zeros, whose twin, which the
+/// runtime imports, is zeros of its own (`super::import`).
+fn view(runs: &[std::ops::Range<u64>], length: u64, zeros: u64, read_only: bool) -> Option<u64> {
     let vm = LinuxVm::new();
-    let at = vm.allocate_anywhere(length).ok()?;
+    let whole = length.checked_add(zeros)?;
+    let at = if zeros > 0 && !read_only {
+        allocate_aliasable(whole)
+    } else {
+        vm.allocate_anywhere(whole)
+    }
+    .ok()?;
+    let refused = |what: &str| {
+        log::warn!(
+            target: "reims_vgpu_vulkan::os",
+            "IOSurface over the guest's pages: {what}; refused"
+        );
+        let _ = vm.deallocate(at, whole);
+        None
+    };
+    // The runs as far as the allocation's length reaches, viewed at once (`LinuxVm`'s
+    // `remap_runs_shared_overwrite`: through dma-bufs of the pages where the host makes them).
     let mut offset = 0u64;
-    for r in ranges {
+    let mut sources = Vec::with_capacity(runs.len());
+    for run in runs {
         if offset >= length {
             break;
         }
-        let now = r.physical_length.min(length - offset);
-        let source = HostPtr::from_addr(r.physical_address.to_usize());
-        if vm
-            .remap_shared_overwrite(at.wrapping_add(offset), source, now)
-            .is_err()
-        {
-            log::warn!(
-                target: "reims_vgpu_vulkan::os",
-                "IOSurface over the guest's pages: no view of {now:#x} bytes at {:#x}, which the \
-                 library has no file of; refused",
-                r.physical_address
-            );
-            let _ = vm.deallocate(at, length);
-            return None;
-        }
+        let now = (run.end - run.start).min(length - offset);
+        sources.push((HostPtr::from_addr(run.start.to_usize()), now));
         offset += now;
     }
-    if read_only && vm.protect_max(at, length, VmProt::READ).is_err() {
-        let _ = vm.deallocate(at, length);
-        return None;
+    if let Err((i, _)) = vm.remap_runs_shared_overwrite(at, &sources) {
+        let (source, now) = sources[i];
+        return refused(&format!(
+            "no view of {now:#x} bytes at {:#x}, which the library has no file of",
+            source.addr()
+        ));
+    }
+    if read_only {
+        if let Err(z) = crate::gpu::backing::map_zeros(&vm, at, length, whole) {
+            return refused(&format!(
+                "the host refused {} of {:#x} bytes (kern_return {})",
+                z.what, z.length, z.kr.0
+            ));
+        }
+        if vm.protect_max(at, whole, VmProt::READ).is_err() {
+            return refused("the host refused the view's read-only protection");
+        }
     }
     Some(at.addr().to_u64())
+}
+
+/// The alias of `surface`'s allocation its buffers lie over, where it is the surface's own view
+/// of the guest's pages (`crate::os::surface_alias`), borrowed: the view holds the allocation's
+/// pages and the zeros a buffer at the surface's offset reads past them ([`view`]), read-only
+/// where the surface is read-only for the GPU, as an alias of the allocation would be
+/// (`crate::gpu::backing::gather`), and stays mapped while the alias holds the surface's memory
+/// ([`surface_memory_hold`]). `None` for a surface with no view: its own memory, one range of the
+/// guest's pages, or none.
+pub(crate) fn own_alias(surface: &LinuxSurface) -> Option<Alias> {
+    let memory = &surface.data().memory;
+    let (first, length) = memory.view?;
+    let at = NonNull::new(std::ptr::with_exposed_provenance_mut::<u8>(
+        first.to_usize(),
+    ))?;
+    Some(Alias::borrowing(at, length, Arc::clone(memory)))
+}
+
+/// Whether `surface`'s base address lies in its own view of the guest's pages it was made over
+/// ([`view`]), as one of several ranges of them has, rather than in the pages themselves: the
+/// view maps the pages, so the CPU's reads through it read them and its writes, where it is not
+/// read-only ([`crate::os::gpu_read_only`]), reach them. Its bytes from the base address to the
+/// allocation's end lie in the view's pages, never in the zeros past them.
+pub(crate) fn base_views_pages(surface: &LinuxSurface) -> bool {
+    surface.data().memory.view.is_some()
 }
 
 /// IOSurface's creation on Linux (module docs).
@@ -472,9 +627,13 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 match ranges.as_slice() {
                     [one] => (one.physical_address, None, None),
                     _ => {
-                        let length = spec.alloc_size.checked_next_multiple_of(page_size())?;
-                        let at = view(ranges, length, made.gpu_read_only)?;
-                        (at, None, Some((at, length)))
+                        let page = page_size();
+                        let length = spec.alloc_size.checked_next_multiple_of(page)?;
+                        let zeros = (spec.alloc_size.checked_add(spec.offset)?)
+                            .checked_next_multiple_of(page)?
+                            - length;
+                        let at = view(&made.pages, length, zeros, made.gpu_read_only)?;
+                        (at, None, Some((at, length + zeros)))
                     }
                 }
             }
@@ -484,6 +643,7 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 (own.first(), Some(own), None)
             }
         };
+        let kept = made.gpu_read_only.then(crate::gpu::writes::Keeping::new);
         Some(LinuxSurface::new(Data {
             pixel_format: spec.pixel_format,
             width: spec.width,
@@ -499,6 +659,8 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: view_made,
             }),
             made: Mutex::new(made),
+            attached: Attached::default(),
+            _kept: kept,
         }))
     }
 
@@ -544,6 +706,8 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
                 view: None,
             }),
             made: Mutex::new(MadeOver::default()),
+            attached: Attached::default(),
+            _kept: None,
         }))
     }
 
@@ -557,7 +721,6 @@ impl IoSurfaces<VulkanPlatform> for LinuxSurfaces {
 mod tests {
     use reims_vgpu_core::platform::os::surface::BackingPlaneSpec;
 
-    use super::super::vm::allocate_aliasable;
     use super::super::vm::tests::mapped;
     use super::*;
 
@@ -644,6 +807,35 @@ mod tests {
         assert!(mapped(base));
         drop(s);
         assert!(!mapped(base));
+    }
+
+    /// A reference an isolated task's death unwinds past, or that the release of a task that
+    /// died drops, is leaked, as every platform handle of the task's is, and the surface's
+    /// memory with it; one the task's work drops is released
+    #[test]
+    fn a_dead_tasks_unwind_leaks_its_surface_references() {
+        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
+        use reims_vgpu_core::tasks::isolation::TaskLife;
+
+        let s = LinuxSurfaces::new().create(&host_only()).unwrap();
+        let life = TaskLife::new();
+        assert_eq!(life.run(|| drop(s.clone_ref())), Some(()));
+        assert_eq!(s.retain_count(), 1);
+        let r: Option<()> = life.run(|| {
+            let _held = s.clone_ref();
+            reims_vgpu_core::fatal!(DeathSite {
+                kind: DeathKind::Abort,
+                file: "surface.test",
+                line: 0,
+            })
+        });
+        assert_eq!(r, None);
+        assert_eq!(s.retain_count(), 2);
+        assert_eq!(life.releasing(|| drop(s.clone_ref())), Some(()));
+        assert_eq!(s.retain_count(), 3);
+        let base = s.base_address();
+        drop(s);
+        assert!(mapped(base), "the leaked references hold the memory");
     }
 
     /// A lookup is another object over the same memory, whose count is its own, and the
@@ -837,6 +1029,33 @@ mod tests {
         assert!(s.base_address().is_null());
     }
 
+    /// A surface whose GPU writes never reach its memory is counted among the objects whose GPU
+    /// writes may reach read-only memory while it or a lookup of it lives; one whose writes
+    /// reach its memory is not (in one process per test, as nextest runs them)
+    #[test]
+    fn read_only_surfaces_are_counted_while_they_live() {
+        use crate::gpu::writes::any_kept;
+        let page = page_size();
+        let (_, ranges) = guest_pages(2);
+        let surfaces = LinuxSurfaces::new();
+        let over = |direction| SurfaceSpec {
+            alloc_size: 2 * page,
+            client_direction: direction,
+            client_address_ranges: Some(ranges.clone()),
+            ..host_only()
+        };
+        let writable = surfaces.create(&over(None)).unwrap();
+        assert!(!any_kept());
+        let read_only = surfaces.create(&over(Some(READ_ONLY_DIRECTION))).unwrap();
+        assert!(any_kept());
+        let looked_up = read_only.lookup_by_port().unwrap();
+        drop(read_only);
+        assert!(any_kept());
+        drop(looked_up);
+        assert!(!any_kept());
+        drop(writable);
+    }
+
     /// A surface over one range of the guest's pages is that range, at its offset; one over
     /// several is a view of them, read-only where the GPU's writes never reach them
     #[test]
@@ -866,8 +1085,10 @@ mod tests {
             [3, 2, 1]
         );
         assert!(recorded_mut(&several, |made| made.gpu_read_only).unwrap());
+        // The allocation's pages, then a page of zeros a buffer at the offset reads past them.
         let (view, length) = mapped_range(&several).unwrap();
-        assert_eq!((view, length), (base - 0x40, 3 * page));
+        assert_eq!((view, length), (base - 0x40, 4 * page));
+        assert_eq!(read(view + 3 * page), 0);
         let pieces = super::super::files::pieces(view, length).unwrap();
         assert!(pieces.iter().all(|p| p.prot == libc::PROT_READ));
         assert_eq!(
@@ -898,6 +1119,125 @@ mod tests {
             assert!(surfaces.create(&spec).is_none(), "{spec:?}");
         }
         drop((one, several));
+        free(at, 4 * page);
+    }
+
+    /// A hold on a surface over one range of the guest's pages, at an offset, holds the range's
+    /// pages, from its first byte before the base address, and none past the range: an unmap of
+    /// the range's page through the platform's VM waits for the hold, and one of the page past
+    /// the range is made at once
+    #[test]
+    fn a_single_range_surfaces_hold_is_its_range() {
+        use reims_vgpu_core::platform::os::vm::HostVm as _;
+
+        let page = page_size();
+        let (at, ranges) = guest_pages(4);
+        let spec = SurfaceSpec {
+            alloc_size: page,
+            offset: 0x40,
+            client_address_ranges: Some(ranges[1..2].to_vec()),
+            ..host_only()
+        };
+        let one = LinuxSurfaces::new().create(&spec).unwrap();
+        let ptr = |first: u64| HostPtr::from_addr(first.to_usize());
+        let hold = surface_memory_hold(&one);
+        let vm = crate::remap::VulkanVm::new();
+        assert!(vm.deallocate(ptr(at + page), page).is_success());
+        assert!(
+            crate::remap::unmap_waits(ptr(at + page), page),
+            "the range's page"
+        );
+        assert!(mapped(ptr(at + page)));
+        assert!(vm.deallocate(ptr(at + 2 * page), page).is_success());
+        assert!(
+            !crate::remap::unmap_waits(ptr(at + 2 * page), page),
+            "the page past it"
+        );
+        assert!(!mapped(ptr(at + 2 * page)));
+        drop((hold, one));
+        assert!(!crate::remap::unmap_waits(ptr(at + page), page));
+        assert!(!mapped(ptr(at + page)));
+        free(at, page);
+        free(at + 3 * page, page);
+    }
+
+    /// A surface over several ranges of the guest's pages lends its own view as the alias its
+    /// buffers lie over ([`own_alias`]): the allocation's whole pages, then zeros as far as a
+    /// buffer at its offset reads, writable or read-only as the surface is for the GPU, the
+    /// zeros of a writable one a file of their own and of a read-only one the block of zeros, as
+    /// an alias of the allocation's would be (`crate::gpu::backing::gather`). The alias keeps the
+    /// view mapped past the surface's last reference, and frees nothing of its own. A surface of
+    /// one range, or of its own memory, has no view to lend
+    #[test]
+    fn a_surface_lends_its_view_as_its_buffers_alias() {
+        use super::super::vm::tests::writable;
+        use reims_vgpu_core::platform::os::vm::HostAddr;
+
+        let page = page_size();
+        let (at, ranges) = guest_pages(3);
+        let backwards: Vec<_> = ranges.iter().rev().copied().collect();
+        let surfaces = LinuxSurfaces::new();
+        let over = |ranges: &[PhysicalMemoryRange], alloc_size, direction| SurfaceSpec {
+            alloc_size,
+            offset: 0x40,
+            client_direction: direction,
+            client_address_ranges: Some(ranges.to_vec()),
+            ..host_only()
+        };
+        for direction in [None, Some(READ_ONLY_DIRECTION)] {
+            let s = surfaces
+                .create(&over(&backwards, 3 * page, direction))
+                .unwrap();
+            let alias = own_alias(&s).unwrap();
+            let first = alias.first().as_ptr().addr().to_u64();
+            assert_eq!(first, s.base_address().addr().to_u64() - 0x40);
+            assert_eq!(
+                [read(first), read(first + 2 * page), read(first + 3 * page)],
+                [2, 0, 0],
+                "the pages in their order, then zeros: {direction:?}"
+            );
+            let tail = HostAddr::from_addr((first + 3 * page).to_usize());
+            assert_eq!(writable(tail, page), direction.is_none(), "{direction:?}");
+            let zeros = super::super::files::pieces(first + 3 * page, page).unwrap();
+            assert_eq!(
+                super::super::import::of_zeros(&zeros),
+                [direction.is_some()],
+                "{direction:?}"
+            );
+            drop(s);
+            assert!(mapped(tail), "the alias holds the view: {direction:?}");
+            drop(alias);
+            assert!(!mapped(tail), "{direction:?}");
+        }
+        let one = surfaces.create(&over(&ranges[..1], page, None)).unwrap();
+        assert!(own_alias(&one).is_none(), "one range");
+        let own = surfaces.create(&host_only()).unwrap();
+        assert!(own_alias(&own).is_none(), "its own memory");
+        drop((one, own));
+        free(at, 3 * page);
+    }
+
+    /// A surface over guest pages core names one by one views each run of them that follows on
+    /// in the host's memory with one remap, in their order: one for pages in order, one each out
+    /// of order
+    #[test]
+    fn a_surface_views_each_run_of_following_pages_at_once() {
+        let page = page_size();
+        let (at, ranges) = guest_pages(4);
+        let backwards: Vec<_> = ranges.iter().rev().copied().collect();
+        // The pages, the runs their view takes, and the guest page its second page shows.
+        for (pages, runs, second) in [(&ranges, 1, 1), (&backwards, 4, 2)] {
+            let spec = SurfaceSpec {
+                alloc_size: 4 * page,
+                client_address_ranges: Some(pages.clone()),
+                ..host_only()
+            };
+            let s = LinuxSurfaces::new().create(&spec).unwrap();
+            let (view, length) = mapped_range(&s).unwrap();
+            assert_eq!(super::super::files::runs_between(view, view + length), runs);
+            assert_eq!(read(view + page), second);
+            drop(s);
+        }
         free(at, 4 * page);
     }
 

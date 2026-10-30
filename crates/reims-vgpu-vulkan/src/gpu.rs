@@ -1,11 +1,9 @@
 //! The runtime's GPU objects: the device's queries and creators ([`device`]), capabilities
 //! ([`caps`]) and pixel format descriptions ([`format_info`]), resources and state objects
-//! ([`resource`]) and the guest's pages under them ([`backing`]), with the textures kept apart
-//! over those pages ([`over_pages`]), the descriptors ([`desc`]) and
+//! ([`resource`]) and the guest's pages under them ([`backing`]), the descriptors ([`desc`]) and
 //! Apple's serialized pipeline descriptors ([`serialized`]), the
 //! encoders, the indirect command buffers, rate maps, the command queue and buffer, and the
-//! events; the pipeline states' unique identifiers ([`unique_id`]), which the runtime has none
-//! of; Metal's GPU address space, which buffers and heaps are placed by ([`metal_space`]); the
+//! events; Metal's GPU address space, which buffers and heaps are placed by ([`metal_space`]); the
 //! two-plane YCbCr formats ([`ycbcr`]) and the formats it makes no texture of
 //! ([`no_texture`]); what GPU work may write, where a write that never reaches a surface's memory
 //! dies ([`writes`]); and the debug lines that time the runtime's compiles ([`timing`]).
@@ -30,10 +28,11 @@ pub mod encode_render;
 pub mod event;
 pub mod fill;
 pub mod format_info;
+#[cfg(test)]
+mod frame_cost;
 pub mod icb;
 pub mod metal_space;
 pub mod no_texture;
-pub mod over_pages;
 #[cfg(test)]
 mod paging_discard;
 pub mod predication;
@@ -42,17 +41,19 @@ pub mod resource;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod rgbx;
+pub mod scaler;
 pub mod serialized;
 pub mod shaders;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod slice_write_repro;
+#[cfg(test)]
+mod spin;
 pub mod states;
 pub mod timing;
 #[cfg(test)]
 #[cfg(target_os = "macos")]
 mod undefined;
-pub mod unique_id;
 pub mod writes;
 pub mod ycbcr;
 
@@ -65,6 +66,30 @@ use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize, NsRange, Swizzle};
 
 use crate::answer::unrepresentable;
+
+/// The most elements a bind's list holds on the stack ([`listed`]): Metal's 31 buffer slots of a
+/// stage, and as many textures or samplers.
+const LISTED: usize = 31;
+
+/// Runs `call` with each element of `list` as `map` makes it, in order: a bind's list of core's
+/// objects as the runtime's, which every bind of several slots makes, on the stack where it holds
+/// at most [`LISTED`], else in a `Vec`. The runtime reads the slice alone, so where it lies
+/// changes nothing it answers.
+pub(crate) fn listed<A, B: Copy + Default, R>(
+    list: &[A],
+    mut map: impl FnMut(&A) -> B,
+    call: impl FnOnce(&[B]) -> R,
+) -> R {
+    if list.len() > LISTED {
+        let all: Vec<B> = list.iter().map(map).collect();
+        return call(&all);
+    }
+    let mut on_stack = [B::default(); LISTED];
+    for (to, from) in on_stack.iter_mut().zip(list) {
+        *to = map(from);
+    }
+    call(&on_stack[..list.len()])
+}
 
 /// `MTLSize`.
 pub(crate) fn size(s: MtlSize) -> rt::Size {
@@ -110,23 +135,9 @@ pub(crate) fn runtime_pixel_format(raw: u64) -> Option<PixelFormat> {
 /// has no format of it or Metal describes none for it (`Depth24Unorm_Stencil8` and `X24_Stencil8`,
 /// which the runtime has), but `MTLPixelFormatInvalid`: a texture or a state of a raw value dies
 /// where it is made, or is nil, as Metal's ([`crate::gpu::desc::lacked`],
-/// [`crate::gpu::serialized::RawFormat`]). Where the releases the runtime measured describe `raw`
-/// otherwise (no value at the runtime's levels, which describe the same formats), what `sel` makes
-/// of it depends on the release, so on a host whose
-/// release the runtime has not measured `sel` dies there, naming the level
-/// ([`crate::gpu::format_info::describes_answer`]).
+/// [`crate::gpu::serialized::RawFormat`]). `sel` asks Metal's description
+/// ([`crate::gpu::format_info::described`]).
 pub(crate) fn held_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
-    held_by(raw, |raw| {
-        crate::gpu::format_info::describes_answer(sel, raw)
-    })
-}
-
-/// [`held_format`] as a descriptor's setter (`sel`) holds `raw`, which never dies: the setter
-/// answers alike at every release, and holds the value as the devices' level describes it
-/// ([`crate::gpu::format_info::described`]), which only decides how the descriptor keeps it,
-/// as its pixel format answers the same value either way. A texture of it asks the level where
-/// it is made ([`crate::gpu::desc::TextureFields::descriptor`]).
-pub(crate) fn set_format(sel: &'static str, raw: u64) -> Result<PixelFormat, u64> {
     held_by(raw, |raw| crate::gpu::format_info::described(sel, raw))
 }
 
@@ -268,5 +279,20 @@ mod tests {
         let site =
             catch_death(|| resource_options("newBufferWithLength:options:", 1 << 25)).unwrap_err();
         assert_eq!(site.file, "newBufferWithLength:options:");
+    }
+
+    /// A bind's list reaches the runtime as the elements `map` makes, in order, at every length:
+    /// on the stack up to [`LISTED`], in a `Vec` past it
+    #[test]
+    fn listed_lists_are_the_mapped_elements_in_order() {
+        for len in [0, 1, 2, LISTED - 1, LISTED, LISTED + 1, 128] {
+            let list: Vec<Option<u32>> = (0..len)
+                .map(|i| u32::try_from(i).ok().filter(|i| i % 3 != 1))
+                .collect();
+            let map = |v: &Option<u32>| v.map(|v| u64::from(v) * 7);
+            let expected: Vec<Option<u64>> = list.iter().map(map).collect();
+            let got = listed(&list, map, <[Option<u64>]>::to_vec);
+            assert_eq!(got, expected, "{len} elements");
+        }
     }
 }

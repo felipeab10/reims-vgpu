@@ -115,6 +115,7 @@
 //! - **Residency.** The guest's buffers a step reads are bound to the step, which makes them
 //!   resident as any bound buffer is.
 
+use std::cell::Cell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Weak};
@@ -140,7 +141,7 @@ use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::resource::{
     VulkanBuffer, VulkanComputePipeline, VulkanHeap, VulkanSamplerState, VulkanTexture,
 };
-use crate::gpu::writes::{Memory, Slot, Whether, texture_memory};
+use crate::gpu::writes::{Bound, Slot, Whether, texture_bound};
 use crate::gpu::{metal_value, region, resource_options, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -1225,6 +1226,10 @@ struct Unit {
     encoders: u64,
     bindings: Bindings,
     used: Vec<Use>,
+    /// Whether a texture `used` holds lies on a surface whose GPU writes never reach its memory,
+    /// or is one whose writes the runtime refuses ([`Unit::reaches_dropped_texels`]), which a
+    /// texture answers alike for its life: asked once, as it is made resident.
+    used_dropped: bool,
     /// Whether the runtime encoder holds a pipeline the guest did not set.
     foreign: bool,
     /// The dispatch type of the unit's first compute encoder, once it has one.
@@ -1442,26 +1447,34 @@ impl Unit {
     /// whose GPU writes never reach its memory ([`crate::os::gpu_read_only`]). A kernel's stores
     /// into a buffer on one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
     fn reaches_dropped_texels(&self) -> bool {
-        let reaches = |t: &VulkanTexture| t.gpu_read_only() || t.writes_refused();
-        let textures = self.bindings.textures.values().any(reaches);
-        let used = self.used.iter().any(|u| match u {
-            Use::Resources(list, _) => (list.iter()).any(|r| match r {
-                Resource::Texture(t) => reaches(t),
-                Resource::Buffer(_) | Resource::Icb(_) => false,
-            }),
-            Use::Heaps(_) => false,
-        });
-        textures || used
+        self.used_dropped || self.bindings.textures.values().any(drops_texels)
+    }
+
+    /// The open encoder made `list` resident with `usage`: kept until the encoder ends, as a fresh
+    /// runtime encoder is given it again ([`Unit::refresh`]), with whether one of its textures
+    /// drops texels ([`Unit::reaches_dropped_texels`]).
+    fn made_resident(&mut self, list: Vec<Resource>, usage: ResourceUsage) {
+        self.used_dropped |=
+            (list.iter()).any(|r| matches!(r, Resource::Texture(t) if drops_texels(t)));
+        self.used.push(Use::Resources(list, usage));
+    }
+
+    /// The open encoder ended or went, and what it made resident with it.
+    fn let_go(&mut self) {
+        self.encoder = None;
+        self.bindings = Bindings::default();
+        self.used.clear();
+        self.used_dropped = false;
     }
 
     /// What the open encoder's next work may write through textures, `inherits` what an
     /// execution's commands take of the encoder, one entry an object, with whether it does: the
-    /// textures bound at slots its kernel writes, by its pipeline's reflection (every bound
-    /// texture where the kernel writes any and the reflection cannot tell; none where the
+    /// textures bound at slots its kernel writes, by its pipeline's slot writes (every bound
+    /// texture where the kernel writes any and they cannot tell; none where the
     /// commands run pipeline states of their own, as Metal makes no state that supports
     /// indirect command buffers of a kernel with a texture argument, measured: the render
     /// encoder's `Reach::at_slots`), and the textures made resident with write usage.
-    fn texel_writes(&self, inherits: Option<Inherits>) -> Vec<(Whether, Memory)> {
+    fn texel_writes(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
         let mut written = Vec::new();
         let kernel = match inherits {
             Some(i) if !i.pipeline => None,
@@ -1482,7 +1495,7 @@ impl Unit {
                     ),
                     None => Whether::Writes,
                 };
-                written.push((whether, texture_memory(t)));
+                written.push((whether, texture_bound(t)));
             }
         }
         for u in &self.used {
@@ -1490,13 +1503,13 @@ impl Unit {
                 && usage.contains(ResourceUsage::WRITE)
             {
                 let textures = list.iter().filter_map(|r| match r {
-                    Resource::Texture(t) => Some(texture_memory(t)),
+                    Resource::Texture(t) => Some(texture_bound(t)),
                     Resource::Buffer(_) | Resource::Icb(_) => None,
                 });
                 written.extend(textures.map(|m| (Whether::Writes, m)));
             }
         }
-        written.retain(|(_, m)| !m.is_empty());
+        written.retain(|(_, m)| m.meets);
         written
     }
 
@@ -1504,7 +1517,7 @@ impl Unit {
     /// encoder, writes through an object over memory the runtime imports through a writable twin
     /// of read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture bound
     /// at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at a slot
-    /// the kernel writes, by its reflection (every slot where the reflection cannot tell, and
+    /// the kernel writes, by its slot writes (every slot where they cannot tell, and
     /// every bound buffer an execution's commands take where they run pipeline states of their
     /// own); and a texture or buffer made resident with write usage (a heap made resident is
     /// read, as Metal's are). `None` where it writes none, and where no pipeline state is set for
@@ -1591,6 +1604,12 @@ impl Unit {
     }
 }
 
+/// Whether `t` lies on a surface whose GPU writes never reach its memory, or is one whose writes
+/// the runtime refuses ([`Unit::reaches_dropped_texels`]).
+fn drops_texels(t: &VulkanTexture) -> bool {
+    t.gpu_read_only() || t.writes_refused()
+}
+
 /// `id<MTLComputeCommandEncoder>`'s object: the runtime's encoder, with its command buffer's
 /// predication.
 #[derive(Debug)]
@@ -1618,9 +1637,7 @@ impl Drop for PredicatedEncoder {
     fn drop(&mut self) {
         let mut u = self.predication.unit.lock();
         if u.encoder == Some(self.number) {
-            u.encoder = None;
-            u.bindings = Bindings::default();
-            u.used.clear();
+            u.let_go();
         }
     }
 }
@@ -1639,10 +1656,9 @@ pub fn encoder(
         if u.recording() {
             u.log.push(Arc::new(Logged::Encoder));
         }
+        u.let_go();
         u.encoders += 1;
         u.encoder = Some(u.encoders);
-        u.bindings = Bindings::default();
-        u.used.clear();
         u.foreign = false;
         u.encoders
     };
@@ -1689,9 +1705,7 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
         // What the encoder bound and made resident goes with it: what the runtime's command
         // buffer holds until it completes is the runtime's to hold.
         ComputeCmd::EndEncoding => {
-            u.encoder = None;
-            u.bindings = Bindings::default();
-            u.used.clear();
+            u.let_go();
             return;
         }
         ComputeCmd::UpdateFence { .. } | ComputeCmd::WaitForFence { .. }
@@ -1710,7 +1724,7 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
         } => {
             let usage: ResourceUsage = metal_value(cmd.selector(), "resource usage", *usage);
             let list = list.iter().flatten().map(Resource::of).collect();
-            u.used.push(Use::Resources(list, usage));
+            u.made_resident(list, usage);
         }
         ComputeCmd::UseHeaps { heaps } => {
             let heaps = heaps.iter().flatten().map(|h| h.clone_ref()).collect();
@@ -1728,7 +1742,8 @@ pub fn observe(enc: &VulkanComputeEncoder, cmd: &ComputeCmd<'_, VulkanPlatform>)
 
 /// A dispatch or an indirect command buffer execution, in the runtime's terms: each variant's
 /// fields are its selector's arguments, and an execution's what its buffer's commands take of
-/// the encoder.
+/// the encoder and the check its host step runs on them, which the one send takes
+/// (`crate::gpu::command::executions::Execution::host_step_check`).
 #[expect(missing_docs, reason = "the fields are the selector's arguments")]
 pub enum Work<'a> {
     /// `dispatchThreadgroups:threadsPerThreadgroup:`.
@@ -1751,6 +1766,7 @@ pub enum Work<'a> {
         icb: &'a rt::IndirectCommandBuffer,
         range: Range<u64>,
         inherits: Inherits,
+        check: Cell<Option<(rt::IndirectCommandCheck, rt::IndirectCommandCheckNeeds)>>,
     },
     /// `executeCommandsInBuffer:indirectBuffer:indirectBufferOffset:`.
     ExecuteIndirect {
@@ -1758,6 +1774,7 @@ pub enum Work<'a> {
         buffer: &'a rt::Buffer,
         offset: u64,
         inherits: Inherits,
+        check: Cell<Option<(rt::IndirectCommandCheck, rt::IndirectCommandCheckNeeds)>>,
     },
 }
 
@@ -1845,15 +1862,33 @@ impl Work<'_> {
                 e.dispatch_threads(size(threads), size(per_group))
             }
             Work::ThreadsIndirect { buffer, offset } => e.dispatch_threads_indirect(buffer, offset),
-            Work::Execute { icb, ref range, .. } => {
-                e.execute_commands_in_buffer(icb, range.clone())
-            }
+            Work::Execute {
+                icb,
+                ref range,
+                ref check,
+                ..
+            } => match check.take() {
+                Some((check, needs)) => {
+                    e.execute_commands_in_buffer_checked(icb, range.clone(), check, needs)
+                }
+                None => e.execute_commands_in_buffer(icb, range.clone()),
+            },
             Work::ExecuteIndirect {
                 icb,
                 buffer,
                 offset,
+                ref check,
                 ..
-            } => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
+            } => match check.take() {
+                Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
+                    icb,
+                    buffer,
+                    offset,
+                    check,
+                    rt::IndirectCommandCheckNeeds::ALL,
+                ),
+                None => e.execute_commands_in_buffer_indirect(icb, buffer, offset),
+            },
         }
     }
 
@@ -1929,8 +1964,17 @@ impl Work<'_> {
             Work::Threads { .. } | Work::ThreadsIndirect { .. } => {
                 e.dispatch_threads_indirect(chunk, at)
             }
-            Work::Execute { icb, .. } | Work::ExecuteIndirect { icb, .. } => {
-                e.execute_commands_in_buffer_indirect(icb, chunk, at)
+            Work::Execute { icb, ref check, .. } | Work::ExecuteIndirect { icb, ref check, .. } => {
+                match check.take() {
+                    Some((check, _)) => e.execute_commands_in_buffer_indirect_checked(
+                        icb,
+                        chunk,
+                        at,
+                        check,
+                        rt::IndirectCommandCheckNeeds::ALL,
+                    ),
+                    None => e.execute_commands_in_buffer_indirect(icb, chunk, at),
+                }
             }
         }
     }
@@ -1966,9 +2010,10 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     // An execution of no command runs nothing: it writes and samples nothing.
     let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
     // A write through an object over memory the runtime imports through a writable twin of
-    // read-only pages dies, at every extent.
+    // read-only pages dies, at every extent; with no such object, none is looked for.
     if crate::os::TWINS_READ_ONLY
         && !empty
+        && crate::gpu::writes::any_kept()
         && let Some(whether) = u.kept_write_through(work.inherits())
     {
         drop(u);

@@ -136,7 +136,8 @@ crates/
 xtask/               testkit, header, dist, metallibs, smoke, check
 firmware/            the option ROM: the PCI device's UEFI driver, in C, and its Makefile (11.4)
 tests/suite/         the behaviour-lock suite (pgtest, pgrun.m, scenarios, expected files)
-scripts/             run_vmapple.sh, vm_drive.py, vm_ocr.swift: VM boots (docs/qemu.md);
+scripts/             install-ctl.sh: installs reims-ctl and its QEMU
+scripts/internal/    run_vmapple.sh, vm_drive.py, vm_ocr.swift: VM boots (docs/qemu.md);
                      walk_window_macos.sh: the window's manual walk (features.md)
 vendor/qemu          QEMU, whose apple-gfx is C on the C API
 ```
@@ -486,10 +487,11 @@ crate keeps its library.
 Under isolation, each guest task other than task 0 runs in a fresh service of its own, a
 `GpuTask`, on threads of its own in the host's process (`tasks::isolation::TaskThreads`, D10):
 the task's connection queue (the handshake and the host's messages, in order), its service
-queue (its jobs) and Metal's completion threads. There is no pooling, no reuse and no second task
-in one service; a define after a death makes a new service. The service's objects come from the
-host's Metal device, and it reads guest RAM through the host's own mapping of it. The XR10 blit
-pipelines and the resource-index rebuild are the task's own, made or done once per task.
+queue (its jobs) and Metal's completion threads. An exec's job runs on the FIFO thread that sent
+it instead, in the same order (5.4). There is no pooling, no reuse and no second task in one
+service; a define after a death makes a new service. The service's objects come from the host's
+Metal device, and it reads guest RAM through the host's own mapping of it. The XR10 blit pipelines
+and the resource-index rebuild are the task's own, made or done once per task.
 
 ### 5.2 Which task runs where
 
@@ -513,7 +515,9 @@ process.
 
 - `TaskLauncher::launch` makes a new service per call. `ServiceLink::send` is ordered and
   asynchronous; replies come back on the link's one serial queue, which also delivers the
-  service's messages, so a reply and a later message never reorder.
+  service's messages, so a reply and a later message never reorder. `ServiceLink::send_here`
+  is `send` delivered on the caller's thread, in the same order (5.4): the remote exec's, whose
+  FIFO thread waits for the reply anyway.
 - `tasks/wire.rs`: `ToService` (17 variants) and `ToHost` (4); a reply is a `Reply` of its
   values, callable more than once.
 - `tasks/remote/completions.rs` is the one piece of status-4 code every launcher shares: a crash
@@ -529,7 +533,19 @@ process.
 `tasks/isolation/link.rs`:
 - **The connection queue** delivers the host's messages to the service one at a time, in send
   order, each as the task's code (`TaskLife::run`). The handshake runs there, and so does the
-  task's end: the service's state is released, then the host is told.
+  task's end: the service's state is released, then the host is told. A message sent with
+  `send_here` (an exec) is delivered on the sender's thread, which takes the connection queue's
+  turn and then the service queue's (`SerialQueue::sync`), so it runs after every message and job
+  before it and holds both queues while the service runs its job there. What the delivery holds
+  with no holder goes when it returns, as the queues' workers release theirs once they have left
+  them (`rt::held::LastResortScope`). A death there unwinds to
+  the delivery's `TaskLife::run` and ends only the task, as on the queues' workers. The reply,
+  made there, runs there too when the link's queue is idle with nothing queued: its turn on that
+  queue, taken under the state lock, is its place in the queue's order (`hold_if_idle`), and the
+  link queue's worker runs it otherwise. Of the exec's four waits for a woken thread (the
+  connection queue's worker, the service queue's, the link queue's and the FIFO thread's), the
+  delivery saves the first two when both queues are idle, and the reply the last two when the
+  link's queue is.
 - **The link's queue** makes every `HostSide` call and runs every reply, one at a time, in the
   order the service sent them. A message or reply the service hands over while the task runs is
   always delivered, before the end the host is told of.
@@ -656,7 +672,10 @@ resolver's callback through Metal. What the resolver's lookups hold deep goes to
 the hold the pipeline creation is passed (4.2), and the resolver answers `RaiseResult`: its raise
 comes back as `Err` (the handler Metal's call forces), goes back through Metal as an
 `NSException`, and once Metal has unwound, the caller raises it again. Every caller is a pipeline
-creation, reached only under a handler, so it is `Err`.
+creation, reached only under a handler, so it is `Err`. A death or a stop inside the resolver of
+an isolated task's code is a Rust unwind (5.5), which never crosses Metal's frames: the context
+catches it in the callback, raises through Metal in its place, and the deserialization goes on
+with the unwind once Metal has returned.
 
 ### 6.4 Deaths
 
@@ -684,11 +703,11 @@ A panic is a bug, never control flow, and it ends the process as a death does: o
 panic of the library's reaches the host's frames. The API's singleton
 (`reims-vgpu/src/singleton.rs`) installs a chained panic hook that does this when the panicking
 thread is running the library's code (the FIFO thread, a worker running one of core's blocks, a
-Metal completion handler, a public entry point, or a C export, each marked by `rt::enter_ours`),
-and leaves any other panic, the host's own, to the host's hook (D9). Every C export is
-`extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which installs the
-hook and marks the thread first: the `extern "C"` frame would end the process too, but only after
-the frames below it had run their drops. `panic = "unwind"` stays because objc2's
+Metal completion handler or buffer deallocator, a public entry point, or a C export, each marked
+by `rt::enter_ours`), and leaves any other panic, the host's own, to the host's hook (D9). Every C
+export is `extern "C"` and runs its body in `ffi::export` (`reims-vgpu-c/src/ffi.rs`), which
+installs the hook and marks the thread first: the `extern "C"` frame would end the process too,
+but only after the frames below it had run their drops. `panic = "unwind"` stays because objc2's
 `exception::catch` needs it.
 
 ### 6.6 Values kept for good
@@ -730,7 +749,7 @@ shows it.
 | add and or signals | `rt::CoalescingSignal`: a display's new-frame signal, the EFI display's present source and timer, the stamp-wait report, the IOSurface device's doorbell | merges before the handler runs give one call; a release without a cancel drops pending data; the cancel callout frees the handler on the target |
 | the EFI timer | `rt::Timer`: a thread of its own on the platform's clock merging fires into a `CoalescingSignal` on the queue | starts at the wall time of its start, every 100 ms; missed fires coalesce; dropped uncancelled it keeps firing |
 | once | `rt::ProcessOnce` (`OnceLock`), held by its owner: an isolated task's XR10 blit pipelines, once per task | concurrent callers wait for the first; the block runs under `Hold::NONE`, whatever the caller's hold (6.2) |
-| the FIFO thread | a named thread (512 KiB) the platform starts (`rt::thread::spawn_named`) | its body, then what was held on it under a hold with no holder (its last-resort holder), then the FIFO (its target) dropped, on the thread |
+| the FIFO thread | a named thread (576 KiB: a queue worker's 512 KiB, which an isolated task's exec job it runs gets, and room for its own frames) the platform starts (`rt::thread::spawn_named`) | its body, then what was held on it under a hold with no holder (its last-resort holder), then the FIFO (its target) dropped, on the thread |
 | mutexes and condition variables | `parking_lot::{Mutex, Condvar, ReentrantMutex}` | each mutex guards its own fields and nothing more; every timed wait goes through `Clock::wait_until` |
 | reader-writer locks (a task's, the range tracker's) | `sync::WriterPrefRwLock` (`parking_lot::RwLock`) | writer preference: a thread's first read waits behind a queued writer, and `try_write` fails while a writer is queued; a read on a thread that already holds one goes through at once, so a nested read never hangs |
 | fields read both with and without a lock | `sync::StagedMutex` | unlocked readers see a guard's stores at its drop or explicit `publish()`, never store by store |
@@ -767,6 +786,8 @@ endpoint.lock         -> iosurface queue (sync)
                       (a surface retain holds the endpoint's lock across the IOSurface device's
                        lookup, which syncs onto its queue)
 device.displays       -> guest_display.guest_display_mutex (an attach or detach sets its client)
+device.displays       -> efi.present_queue (sync)
+                      (an EFI register write's mode rebuild stops presentation there)
 guest_display.guest_display_mutex -> display.display_mutex (a present)
 display.mode_list_update -> display.display_mutex -> display.guest_display
 display.mode_list_update -> guest_display.guest_display_mutex (set_mode_list, after the display's
@@ -786,6 +807,12 @@ Rules beyond the chains:
   to a `RemoteTask` drops inside a reply while a token is outstanding, its drain waits for a
   completion queued behind it on the same queue: a hang the host sees (`tasks/remote.rs`,
   `the_last_reference_in_a_reply_with_a_token_outstanding_hangs`).
+- **An EFI display that ends a display hangs, as Apple's does.** The display's end detaches it
+  under `device.displays`. A present that holds the last reference after the host's release ends
+  it on the present queue, while an EFI register write holds `device.displays` and syncs onto
+  that queue; a mode-count or mode-value read ends it under the `device.displays` its own thread
+  holds (`display/efi.rs`, testing.md 7.3,
+  `device::displays::tests::efi_display_holding_the_last_reference`).
 - **A FIFO delete's wait for the tasks' completions** counts them down under a lock of its own
   (`Countdown` in `device/fifos.rs`): the last completion notifies under that lock, and the wait
   checks the count and parks under it, so no completion is lost between the two.
@@ -1012,7 +1039,14 @@ section 3 has its types and signatures.
   `window::vulkan`'s `SwapchainSink` makes a presenter over a swapchain of the window's surface
   (on macOS one of its `CAMetalLayer`), which encodes the frame into the swapchain's next image,
   commits, and presents the image on the swapchain's presenting queue once the runtime has
-  scheduled the command buffer, on either OS. Neither waits for the GPU. `Display`
+  scheduled the command buffer, on either OS. Neither waits for the GPU. Where the guest's
+  cursor position, which the window reads through the sink at each cursor doorbell, changes with
+  no pointer event of the window's in the second before (a mouse passed through to the guest),
+  the window hands each draw the guest's cursor at that position, and the sink draws its glyph
+  over the frame in the same command buffer (`window::cursor`: the display's quad buffers and an
+  overlay pipeline of its shaders blending by alpha, both the display's, and a glyph texture
+  that on the Vulkan platform takes no resource ID or range of Metal's space, made before the
+  frame's encode), while the host's cursor is invisible over the image. `Display`
   holds a `WindowLink` every `clone_ref` shares; its explicit `Drop` lets go of that share
   before the reference itself, so the last reference closes the window before it releases the
   display (15.3). A refused create closes the window before it returns.
@@ -1229,9 +1263,11 @@ reviewed in the same commit.
 Before every commit of code: the testkit manifest check (D50), `header --check` (the committed
 header is cbindgen's output, 11.2), `cargo fmt --check`, `clippy -D warnings` over every target,
 once with every feature and once with the tested features without the default ones, `cargo
-nextest run --workspace --no-fail-fast` (each test in its own process) with the tested features,
-and the doc-tests, which nextest does not run (`cargo test --workspace --doc`). The tested
-features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in `xtask/src/main.rs`):
+nextest run --workspace --no-fail-fast` (each test in its own process, in the order
+`.config/nextest.toml` sets on a Mac: the tests that act on the whole GPU first and alone) with
+the tested features, and the doc-tests, which nextest does not run (`cargo test --workspace
+--doc`). The tested features are every feature but the C API's `vulkan` (`TESTED_FEATURES` in
+`xtask/src/main.rs`):
 it makes the C API's platform the Vulkan one (11.1), and the pins and the C harness (13.5) drive
 the product's. On Linux, where the Vulkan platform is the only one, the C API's `vulkan` is among
 them. On a Mac the check also runs clippy for `x86_64-unknown-linux-gnu`, which type-checks every

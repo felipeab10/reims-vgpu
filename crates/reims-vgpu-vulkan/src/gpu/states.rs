@@ -70,9 +70,8 @@
 //!   arguments' roles alone, so an argument whose reflection Metal's answer has not been measured
 //!   for decides nothing; where it refuses to decide (the decode's or the
 //!   specialization's own refusal), the runtime refuses the state, unproven, and the creator dies
-//!   there, naming the refusal. Once the runtime made such a state, the creator asks the compile
-//!   layer as the runtime did, and dies naming a refusal there too
-//!   ([`direct_arguments_decided`], [`kernel_direct_arguments_decided`]). The runtime
+//!   there, naming the refusal. The runtime decides it once, as it makes the state: a state it
+//!   made is one whose use it decided, and nothing here decodes its functions again. The runtime
 //!   refuses a render state with rasterization off whose vertex function returns a value with
 //!   Metal's error too (`UnrasterizedVertexReturn`, code 3). With rasterization off the descriptor
 //!   keeps the fragment function, which the runtime checks as Metal links it and leaves out of the
@@ -109,19 +108,14 @@
 //!   the runtime fails the command buffer of a function that reached a cubic one, which dies
 //!   where its failure is first read ([`crate::gpu::command`]), where Metal samples; one that
 //!   never reaches a cubic sampler runs as Metal's while a cubic state is alive. A fragment
-//!   stage tests none: while any cubic state is alive on the device, whether or not an argument
-//!   buffer holds it, a draw whose fragment stage samples through an argument buffer's sampler,
-//!   of any filter, dies at its selector, naming the refusal, as the runtime lists every live
-//!   sampler state as an argument sampler and refuses that stage while the list holds a cubic
-//!   one. The runtime lists the live states again as a command buffer commits, and fails it,
-//!   whether or not a function reaches the state it leaves out, where a command of any stage
-//!   that samples through an argument buffer's sampler meets more states than its set-1 sampler
-//!   arrays (at most 65536 elements each, fewer where the device's limits are) or its sampler
-//!   tables hold, or such a draw meets a cubic state made after it was encoded: that dies where
-//!   its failure is first read (`UnlistedArgumentSampler`, [`crate::gpu::command`]), where
-//!   Metal's functions reach every live state by its ID. A command a host step records after
-//!   the commit, which no commit lists, fails it the same way where it meets more states than
-//!   its set-1 sampler arrays hold.
+//!   stage tests none: the runtime leaves a cubic state out of its sampler tables while a render
+//!   pipeline samples argument samplers, and so a state the tables cannot hold, as more states
+//!   live than a pipeline's set-1 sampler arrays hold (at most 65536 elements each, fewer where
+//!   the device's limits are), whether or not a function reaches it
+//!   (`unlisted-argument-sampler`, of [`crate::answer::DIES`]): a function that reads it through
+//!   its ID reads the neutral sampler, where Metal's functions reach every live state by its ID.
+//!   The runtime announces it as the state is made, or as a command is encoded while it lives;
+//!   it is relayed, and in strict mode dies there, at the call's selector.
 //! - **A texture slot sampled through an argument buffer's sampler**, whatever its filter, is a
 //!   function the runtime refuses where its pipeline state is made (`ArgumentBufferTextures`),
 //!   which dies there, where Metal makes and runs it. A texture an argument buffer holds, sampled
@@ -138,6 +132,7 @@
 //!   (`PipelineOptions::label`), which no answer to the guest reads and the runtime compiles
 //!   nothing of.
 
+use std::collections::BTreeMap;
 use std::sync::Weak;
 
 use metal2vulkan::bind::SamplerDescriptor;
@@ -170,24 +165,31 @@ use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::platform::{Obj, VulkanPlatform};
 
-/// The render pipeline states made with indirect command buffer support, held weakly: an
-/// indirect command names one by the runtime's state, whose input primitive topology class only
-/// this platform holds ([`points_sized`]).
-static INDIRECT_STATES: Mutex<Vec<Weak<RenderPipelineObject>>> = Mutex::new(Vec::new());
+/// The render pipeline states made with indirect command buffer support, held weakly, by the
+/// runtime's `gpuResourceID` of each: an indirect command names one by the runtime's state, whose
+/// input primitive topology class only this platform holds ([`points_sized`]), and the runtime's
+/// state keeps its ID while it lives.
+static INDIRECT_STATES: Mutex<BTreeMap<u64, Vec<Weak<RenderPipelineObject>>>> =
+    Mutex::new(BTreeMap::new());
 
 /// Whether the runtime's state `raw`, which an indirect command names, sizes its points as Metal
 /// does (`crate::gpu::encode_render`'s `sized`): its vertex function writes `[[point_size]]`, or
 /// each live state of the program's that is `raw` is of the point input primitive topology class.
 /// `None` where it writes none and no live state of the program's is `raw` (the program released
-/// it).
+/// it). Asked once an indirect command, it reads only the states of `raw`'s ID.
 pub(crate) fn points_sized(raw: &rt::RenderPipelineState) -> Option<bool> {
     if plain(|| raw.writes_point_size()) {
         return Some(true);
     }
-    let states: Vec<_> = plain(|| INDIRECT_STATES.lock().clone());
+    let id = plain(|| raw.gpu_resource_id()).0;
+    // Each is let go of past the lock: a program's last reference may be among them.
+    let states: Vec<_> = plain(|| {
+        let states = INDIRECT_STATES.lock();
+        let held = states.get(&id).map_or(&[][..], Vec::as_slice);
+        held.iter().filter_map(Obj::upgrade).collect()
+    });
     let classes: Vec<_> = states
         .iter()
-        .filter_map(Obj::upgrade)
         .filter(|state| state.raw == *raw)
         .map(|state| state.input_primitive_topology)
         .collect();
@@ -391,7 +393,12 @@ pub(crate) fn new_depth_stencil_state(
 ///   this device, by a GPU family the device lacks (`Needs::MetalGpuFamily`: a render state set
 ///   on an indirect render command) or by the devices Metal was measured to refuse it on
 ///   (`Needs::MetalRefuses`: a fragment function's read of a program-scope
-///   `thread_index_in_quadgroup`).
+///   `thread_index_in_quadgroup`); and a colour attachment the fragment function's outputs do
+///   not fit (`InvalidDescriptor(ColorAttachment)`), measured: a blend of the second source whose
+///   function writes no second output ("Fragment shader does not write to render target
+///   color(0), index(1) that is required for blending"), and a `half4` output into an
+///   `RGBA8Uint` attachment (`encode_render`'s
+///   `second_source_blends_without_a_second_output_are_refused_as_metals`).
 /// - Code 2 ([`UNDEFINED_SYMBOLS`]): a function whose import no linked dynamic library exports,
 ///   or whose install name loaded no library (`NeedsInput` of `DynamicSymbol` or
 ///   `DynamicLibrary`).
@@ -405,8 +412,11 @@ pub(crate) fn new_depth_stencil_state(
 /// An answer the runtime cannot prove ([`rt::Error::Unproven`]) dies, naming it (`unproven`), as
 /// does every other refusal.
 pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
-    use metal2vulkan::error::{Error as Compile, Needs, RuntimeInput};
+    use metal2vulkan::error::{DescriptorError, Error as Compile, Needs, RuntimeInput};
     let code = match e {
+        rt::Error::Compile(Compile::InvalidDescriptor(DescriptorError::ColorAttachment {
+            ..
+        })) => METAL_REFUSES,
         rt::Error::Compile(Compile::InvalidInput(_) | Compile::InvalidDescriptor(_)) => 0,
         rt::Error::Invalid(i) if i.problem == rt::Problem::PointSizeTopology => 0,
         rt::Error::Unsupported(u)
@@ -429,7 +439,8 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 /// The `NSError` code of Metal's pipeline creators for a function its compiler refuses on the
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
 /// `air.get_thread_index_in_quadgroup.i32`), at the compute, render and tile creators (measured:
-/// the module docs).
+/// the module docs), and of the render creator for a colour attachment the fragment function's
+/// outputs do not fit ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
 /// The `NSError` code of Metal's pipeline creators for a function whose import no library it
@@ -444,20 +455,32 @@ fn color_attachment(raw: u64) -> Option<ColorAttachmentDescriptor> {
         .then(|| ColorAttachmentDescriptor::new(crate::gpu::pixel_format("setPixelFormat:", raw)))
 }
 
-/// `newRenderPipelineStateWithDescriptor:error:` of the display's value: its two functions and
-/// colour 0's format, blending off, no vertex descriptor, the resource index as the placement.
-/// The compile's refusal of a format the functions cannot write (an integer target) is the
+/// `newRenderPipelineStateWithDescriptor:error:` of the display's value, or a window cursor's:
+/// its two functions and colour 0's format, blending off or, with `blend_over`, the fragment's
+/// premultiplied colour over by its alpha, no vertex descriptor, the resource index as the placement. The
+/// compile's refusal of a format the functions cannot write (an integer target) is the
 /// `NSError`, as Metal answers nil and an error there; no path reaches it under a handler, so
 /// every other refusal dies at the send.
 pub(crate) fn new_render_pipeline_state(
     device: &VulkanDevice,
     desc: &RenderPipelineDesc<'_, VulkanPlatform>,
 ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    use metal2vulkan::metal::BlendFactor;
+
     let sel = "newRenderPipelineStateWithDescriptor:error:";
     let mut d =
         RenderPipelineDescriptor::new(StageSource::Function(desc.vertex.function_descriptor()));
     d.fragment = Some(StageSource::Function(desc.fragment.function_descriptor()));
     d.color_attachments[0] = color_attachment(desc.color0_pixel_format);
+    if desc.blend_over
+        && let Some(c) = d.color_attachments[0].as_mut()
+    {
+        c.blending_enabled = true;
+        c.source_rgb_blend_factor = BlendFactor::One;
+        c.destination_rgb_blend_factor = BlendFactor::OneMinusSourceAlpha;
+        c.source_alpha_blend_factor = BlendFactor::One;
+        c.destination_alpha_blend_factor = BlendFactor::OneMinusSourceAlpha;
+    }
     let mut options = rt::PipelineOptions::default();
     options.placement = placement(desc.resource_index);
     options.label = desc.label.map(str::to_owned);
@@ -497,9 +520,9 @@ fn pipeline_options(
 /// A pipeline creator's answer to core: the state, of the descriptor's input primitive topology
 /// `class`, the `NSError` ([`pipeline_error`]), or a death at the selector for the rest: an ID past
 /// Metal's limit, a gap of the runtime (an unspecialized function constant among them, which
-/// Metal aborts for), and its other refusals, as Metal raises at none. A state the runtime made
-/// that supports indirect command buffers dies where whether Metal refuses it is not decided
-/// ([`direct_arguments_decided`]).
+/// Metal aborts for), an answer it cannot prove ([`unproven`]: a state that supports indirect
+/// command buffers whose functions' use of a direct texture or sampler argument the compile layer
+/// refused to decide among them), and its other refusals, as Metal raises at none.
 fn made(
     sel: &'static str,
     (class, descriptor): (PrimitiveTopologyClass, RenderDescriptor),
@@ -509,17 +532,16 @@ fn made(
         Ok(state) => {
             let indirect = matches!(&descriptor,
                 RenderDescriptor::Render(d) if d.support_indirect_command_buffers);
-            if let RenderDescriptor::Render(d) = &descriptor
-                && indirect
-            {
-                direct_arguments_decided(sel, d);
-            }
             let made = render_pipeline_of(state, class, Some(descriptor));
             if indirect {
+                let id = plain(|| made.raw.gpu_resource_id()).0;
                 plain(|| {
                     let mut states = INDIRECT_STATES.lock();
-                    states.retain(|state| state.strong_count() > 0);
-                    states.push(made.downgrade());
+                    states.retain(|_, held| {
+                        held.retain(|state| state.strong_count() > 0);
+                        !held.is_empty()
+                    });
+                    states.entry(id).or_default().push(made.downgrade());
                 });
             }
             Ok(Ok(Some(made)))
@@ -533,80 +555,6 @@ fn made(
                 _ => decide_describing(sel, Policy::Dies, e, Some(&formats(&descriptor))),
             },
         },
-    }
-}
-
-/// Dies at `sel`, the creation of a render state of `d`, which supports indirect command buffers
-/// and the runtime made, where the compile layer refuses to say whether its functions use a
-/// direct texture or sampler argument once linked (`stages_using_direct_arguments`, under the
-/// standard budget, as the runtime asks it): it decides from the arguments' roles alone, and
-/// refuses where it cannot decode or specialize a function, among others. Metal answers nil and
-/// an `NSError` for a state whose functions use one (the module docs). The stages are asked with
-/// the dynamic libraries their imports reach loaded, as the runtime asks them
-/// ([`with_dependencies`]).
-fn direct_arguments_decided(sel: &'static str, d: &RenderPipelineDescriptor) {
-    let mut loaded = d.clone();
-    loaded.vertex = with_dependencies(&d.vertex);
-    loaded.fragment = d.fragment.as_ref().map(with_dependencies);
-    let entries = metal2vulkan::pipeline::StageEntries::new();
-    let budget = metal2vulkan::Budget::standard();
-    if let Err(e) = plain_at(sel, || {
-        loaded.stages_using_direct_arguments(&budget, &entries)
-    }) {
-        undecided_direct_arguments(sel, &e, &render_formats(d));
-    }
-}
-
-/// Dies at `sel`, the creation of a compute state of `d`, which supports indirect command buffers
-/// and the runtime made, where the compile layer refuses to say whether the kernel uses a direct
-/// texture or sampler argument (`uses_direct_arguments`, as the runtime asks it), as
-/// [`direct_arguments_decided`] dies for a render state's functions.
-pub(crate) fn kernel_direct_arguments_decided(sel: &'static str, d: &ComputePipelineDescriptor) {
-    let mut loaded = d.clone();
-    loaded.kernel = with_dependencies(&d.kernel);
-    let budget = metal2vulkan::Budget::standard();
-    if let Err(e) = plain_at(sel, || loaded.uses_direct_arguments(&budget)) {
-        undecided_direct_arguments(sel, &e, &compute_formats(d));
-    }
-}
-
-/// The death at `sel` of a state that supports indirect command buffers whose functions' use of
-/// a direct texture or sampler argument the compile layer refused to decide, with `e`; `formats`
-/// are the descriptor's.
-fn undecided_direct_arguments(
-    sel: &'static str,
-    e: &metal2vulkan::error::Error,
-    formats: &str,
-) -> ! {
-    unrepresentable(
-        sel,
-        &format!(
-            "whether a state that supports indirect command buffers has a function that uses a \
-             direct texture or sampler argument, for which Metal answers nil and an NSError: the \
-             compile layer refused to decide it ({e}), and the runtime made the state without \
-             deciding; {formats}"
-        ),
-    )
-}
-
-/// `stage` with the dynamic libraries its imports reach loaded from the files their install
-/// names name, as the runtime loads them as it makes a pipeline state (its
-/// `stage_with_dependencies`): a name that is no absolute path, or a file that holds no dynamic
-/// library, loads nothing.
-fn with_dependencies(stage: &StageSource) -> StageSource {
-    match stage {
-        StageSource::Function(function) => {
-            StageSource::Function(function.clone().with_loaded_dependencies(|name| {
-                let path = std::path::Path::new(name);
-                if !path.is_absolute() {
-                    return None;
-                }
-                let bytes = std::fs::read(path).ok()?;
-                let library = metal2vulkan::library::Library::from_metallib(&bytes).ok()?;
-                metal2vulkan::library::DynamicLibrary::loaded(library).ok()
-            }))
-        }
-        StageSource::Compiled(_) => stage.clone(),
     }
 }
 
@@ -748,9 +696,8 @@ pub(crate) fn compute_formats(d: &ComputePipelineDescriptor) -> String {
 /// for one ([`nil_pipeline_descriptor`]). A pixel format the runtime holds raw dies here
 /// ([`serialized::RawFormat`]). A blob's `textureWriteRoundingMode` of
 /// [`serialized::NEAREST_EVEN`] is decided once the runtime made the state, its compile's refusal
-/// staying the `NSError`: it dies where Metal rounds a write the state may make otherwise than
-/// the runtime ([`serialized::rounded_writes`]), but a texture write of a state without indirect
-/// command buffer support, which its draws decide ([`serialized::rounded_texture_writes`]).
+/// staying the `NSError`: it dies where the state writes what nothing measured at the mode
+/// ([`serialized::rounded_writes`]).
 pub(crate) fn new_render_pipeline_state_from_descriptor(
     device: &VulkanDevice,
     descriptor: Option<&VulkanRenderPipelineDescriptor>,
@@ -777,13 +724,8 @@ pub(crate) fn new_render_pipeline_state_from_descriptor(
                 });
             if descriptor.nearest_even
                 && let Ok(raw) = &state
-                && let Some(what) = plain(|| {
-                    serialized::rounded_writes(
-                        &d,
-                        &raw.fragment_color_outputs(),
-                        d.support_indirect_command_buffers && raw.fragment_writes_textures(),
-                    )
-                })
+                && let Some(what) =
+                    plain(|| serialized::rounded_writes(&d, &raw.fragment_color_outputs()))
             {
                 serialized::rounded_writes_inexact(sel, &what);
             }
@@ -997,6 +939,38 @@ mod tests {
         assert_eq!(b.clone_ref().unique_identifier(), b.unique_identifier());
     }
 
+    /// A state of indirect command buffer support sizes its points, as an indirect command that
+    /// names its runtime state asks, where it is of the point input primitive topology class
+    /// and not otherwise; once the program released it, and for a state made without that
+    /// support, nothing answers
+    #[test]
+    fn indirect_states_answer_their_classes_while_they_live() {
+        let d = dev();
+        let functions = indirect_functions();
+        let made = |class, indirect| {
+            let desc = guest_descriptor(&functions, PixelFormat::BGRA8Unorm, None);
+            plain(|| {
+                let mut held = desc.desc.lock();
+                held.support_indirect_command_buffers = indirect;
+                held.input_primitive_topology = class;
+            });
+            (d.new_render_pipeline_state_from_descriptor(Some(&desc), 0))
+                .unwrap()
+                .unwrap()
+                .unwrap()
+        };
+        let points = made(PrimitiveTopologyClass::Point, true);
+        let triangles = made(PrimitiveTopologyClass::Triangle, true);
+        let direct = made(PrimitiveTopologyClass::Point, false);
+        assert_eq!(points_sized(&points.raw), Some(true));
+        assert_eq!(points_sized(&triangles.raw), Some(false));
+        assert_eq!(points_sized(&direct.raw), None);
+        let raw = triangles.raw.clone();
+        drop(triangles);
+        assert_eq!(points_sized(&raw), None);
+        assert_eq!(points_sized(&points.raw), Some(true));
+    }
+
     /// `desc` again, labelled `label`.
     fn labelled(
         desc: &VulkanRenderPipelineDescriptor,
@@ -1044,6 +1018,7 @@ mod tests {
                 vertex,
                 fragment,
                 color0_pixel_format: 80,
+                blend_over: false,
                 resource_index: None,
             })
             .unwrap()
@@ -1171,8 +1146,9 @@ mod tests {
         (site.file, line)
     }
 
-    /// Any depth-stencil value is a state; its resource ID raises below Apple10, as Metal's
-    /// does on this host
+    /// Any depth-stencil value is a state; below Apple10 its resource ID is plain Metal's, 0, and
+    /// its resource index raises, as Metal's do on the M3 Max (the Metal platform's
+    /// `depth_stencil_state_getters_raise`)
     #[test]
     fn depth_stencil_states_are_made_and_their_ids_raise() {
         let d = dev();
@@ -1193,8 +1169,9 @@ mod tests {
             })
             .unwrap()
             .unwrap();
-        assert!(s.gpu_resource_id().is_err());
-        assert!(s.resource_index().is_err());
+        assert!(matches!(s.gpu_resource_id(), Ok(0)));
+        let raised = s.resource_index().unwrap_err();
+        assert_eq!(raised.site().file, "resourceIndex");
         let site = catch_death(|| {
             d.new_depth_stencil_state(&DepthStencilDesc {
                 depth_compare_function: Some(8),

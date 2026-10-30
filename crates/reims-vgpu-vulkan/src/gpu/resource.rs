@@ -11,7 +11,6 @@
 //! buffer, so it holds no reference of the surface.
 
 use std::ptr::NonNull;
-use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
@@ -27,7 +26,7 @@ use reims_vgpu_core::platform::resource::{
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
 use reims_vgpu_core::platform::{Handle, HostRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
+use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
@@ -58,50 +57,20 @@ pub struct BufferObject {
     /// The heap it is placed in, which its detach detaches, held while it lives
     /// ([`crate::gpu::backing`]).
     pub heap: Option<VulkanHeap>,
-    /// The epoch of the pages of the heap or buffer its bytes lie in, plus one, at which a use of
-    /// all of it was last kept ([`crate::gpu::over_pages::used`]); 0 for none.
-    pub kept_whole: AtomicU64,
-    /// Whether it was made over the guest's pages, which no replace gave it: on a surface made
-    /// over them ([`crate::os::over_guest_pages`]), or over one of core's mappings of them, a
-    /// no-copy buffer core makes over a task's pages ([`crate::remap::shows_guest_pages`]). Read
-    /// once, as it is made: a surface's pages, and a mapping's, stay while the buffer lives.
-    pub over_guest_pages: bool,
+    /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
+    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`). Read once, as it is made, as
+    /// commands ask it at every dispatch and pass: the buffer holds the surface, and a live
+    /// surface's record, which decides it, stays as it was made. It is made before the surface is
+    /// handed out, a lookup of the surface reads the same record, and only a surface made with the
+    /// ID of one gone, or the dropping of the records of surfaces gone, changes or drops one
+    /// (`records_of_live_surfaces_outlast_the_pruning`,
+    /// `a_surface_taking_the_id_of_one_gone_takes_none_of_its_record`,
+    /// `a_lookup_of_a_surface_answers_its_record`).
+    pub gpu_read_only: bool,
 }
 
 /// `id<MTLBuffer>`.
 pub type VulkanBuffer = Obj<BufferObject>;
-
-/// A buffer a command names, and the bytes of it the command reaches where they are known: `None`
-/// for all of them, as for a bind, whose reach a shader decides ([`BufferObject::used`]).
-pub(crate) type Named<'a> = (Option<&'a VulkanBuffer>, Option<std::ops::Range<u64>>);
-
-/// The `length` bytes from `offset`, a command's reach of a buffer; `None`, all of the buffer,
-/// past `u64::MAX`.
-pub(crate) fn reach(offset: u64, length: u64) -> Option<std::ops::Range<u64>> {
-    offset.checked_add(length).map(|end| offset..end)
-}
-
-impl BufferObject {
-    /// A command's use `sel` of the buffer's bytes `bytes`, all of them where `bytes` is `None`,
-    /// as for a bind, whose reach a shader decides. It dies where they lie over the guest's pages
-    /// under a texture of a heap nothing may share a byte with that lives
-    /// ([`crate::gpu::over_pages`]). The use is kept where the buffer is over the guest's pages:
-    /// given them by a replace, or made over them ([`BufferObject::over_guest_pages`]).
-    pub(crate) fn used(&self, sel: &'static str, bytes: Option<std::ops::Range<u64>>) {
-        // A placed buffer's bytes lie in its heap's, whose use it is.
-        let owner = self
-            .heap
-            .as_ref()
-            .map_or(&self.backing, |heap| &heap.backing);
-        let guests = self.over_guest_pages || owner.seen.guests();
-        let whole = bytes.is_none().then_some(&self.kept_whole);
-        let keep = guests && !owner.is_detached();
-        crate::gpu::over_pages::used(sel, &owner.seen, keep, whole, || {
-            let bytes = bytes.unwrap_or_else(|| 0..plain(|| self.raw.length()));
-            crate::gpu::writes::buffer_bytes_memory(self, bytes).ranges
-        });
-    }
-}
 
 /// A runtime texture, with the device that made it and what it is over.
 #[derive(Debug)]
@@ -121,7 +90,7 @@ pub struct TextureObject {
     /// it lives ([`Under`]).
     pub under: Option<Under>,
     /// The usage bits it answers beyond the runtime texture's: for one whose GPU writes never
-    /// reach its memory ([`TextureObject::gpu_read_only`]), the whole usage it answers
+    /// reach its memory ([`TextureObject::gpu_read_only()`]), the whole usage it answers
     /// ([`read_only_usage`]); its texture's for a view and for one opened from a shared handle;
     /// 0 for any other. Apple's private bits Metal answers (0x4000, 0x8000 and 0x10000) are the
     /// runtime's, which keeps them for a texture, its views and a texture opened from its
@@ -134,6 +103,21 @@ pub struct TextureObject {
     /// texture, or of the buffer it is over, holds it too, until the runtime frees that
     /// ([`crate::gpu::metal_space::Hold`]).
     pub space: Arc<Hold>,
+    /// Whether the GPU's writes to its texels never reach their memory
+    /// ([`TextureObject::gpu_read_only()`]), read once, as it is made ([`writes_never_reach`]),
+    /// as a buffer's is: the texture holds its surface, or the buffer it is over, for its life.
+    pub gpu_read_only: bool,
+}
+
+/// Whether the GPU's writes to the texels of a texture on `surface`, or over `under`, never
+/// reach their memory: it lies on a surface of [`crate::os::gpu_read_only`], made on it, or over
+/// a buffer made on it ([`BufferObject::gpu_read_only()`]). A view's is its texture's.
+pub(crate) fn writes_never_reach(surface: Option<&OsSurface>, under: Option<&Under>) -> bool {
+    match (surface, under) {
+        (Some(s), _) => crate::os::gpu_read_only(s),
+        (None, Some(Under::Buffer(b, _))) => b.gpu_read_only,
+        _ => false,
+    }
 }
 
 /// `id<MTLTexture>`.
@@ -191,11 +175,10 @@ fn texel_bytes(
 
 impl BufferObject {
     /// Whether the GPU's writes to its bytes never reach their memory: it was made on a surface
-    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`).
+    /// of [`crate::os::gpu_read_only`] (`newBufferWithIOSurface:`), as it was made (the field of
+    /// the same name).
     pub(crate) fn gpu_read_only(&self) -> bool {
-        self.surface
-            .as_deref()
-            .is_some_and(crate::os::gpu_read_only)
+        self.gpu_read_only
     }
 }
 
@@ -222,13 +205,13 @@ const UNKNOWN_USAGE: TextureUsage = TextureUsage::SHADER_READ
     .union(RENDER_TARGET)
     .union(TextureUsage::PIXEL_FORMAT_VIEW);
 
-/// `desc`, of a texture whose GPU writes never reach its memory ([`TextureObject::gpu_read_only`]),
-/// made without `RenderTarget` usage, and the whole usage the texture answers
-/// ([`TextureObject::private_usage`]): its descriptor's, as Metal answers it, Apple's private
-/// bits among them, which the runtime's usage holds. The runtime keeps a texture of
-/// `RenderTarget` usage over a buffer's bytes in an image of its own, copying it back into the
-/// bytes after each encoder that writes it, a copy the GPU faults on into such memory, where
-/// Metal writes nothing of its own; no pass takes such a texture as an attachment
+/// `desc`, of a texture whose GPU writes never reach its memory
+/// ([`TextureObject::gpu_read_only()`]), made without `RenderTarget` usage, and the whole usage
+/// the texture answers ([`TextureObject::private_usage`]): its descriptor's, as Metal answers
+/// it, Apple's private bits among them, which the runtime's usage holds. The runtime keeps a
+/// texture of `RenderTarget` usage over a buffer's bytes in an image of its own, copying it back
+/// into the bytes after each encoder that writes it, a copy the GPU faults on into such memory,
+/// where Metal writes nothing of its own; no pass takes such a texture as an attachment
 /// ([`crate::os::dropped_write`]). The usage answered is the descriptor's, [`UNKNOWN_USAGE`] for
 /// `Unknown`, and of a swizzled texture only its `ShaderRead` and `PixelFormatView`, as the
 /// runtime's texture answers (its `effective_usage` and `texture_usage`, measured). The texture
@@ -237,11 +220,14 @@ const UNKNOWN_USAGE: TextureUsage = TextureUsage::SHADER_READ
 /// target. But a swizzle other than the default with `ShaderWrite` or `RenderTarget` usage keeps
 /// the descriptor's usage, which the runtime refuses as it refuses it over any memory: Metal's
 /// validation stops it (`SwizzleWithWrites`), and with `writeSwizzleEnabled` Metal writes
-/// through the swizzle, which the runtime does not build (`RuntimeGap::WriteSwizzle`).
+/// through the swizzle, which the runtime does not build (`RuntimeGap::WriteSwizzle`). Bit 0x8
+/// is answered by no texture (`TextureUsage::DROPPED`): one of it alone answers 0, as Metal's
+/// does, and is made of `ShaderRead`, as Metal reads it as one of that usage (the module docs of
+/// [`crate::gpu::desc`]).
 pub(crate) fn read_only_usage(desc: &mut rt::TextureDescriptor) -> u64 {
     let mut usage = match desc.usage.is_empty() {
         true => UNKNOWN_USAGE,
-        false => desc.usage,
+        false => desc.usage.without_dropped(),
     };
     if !desc.swizzle.is_default() {
         let kept = TextureUsage::SHADER_READ.union(TextureUsage::PIXEL_FORMAT_VIEW);
@@ -260,8 +246,7 @@ pub(crate) fn read_only_usage(desc: &mut rt::TextureDescriptor) -> u64 {
 }
 
 impl TextureObject {
-    /// The texture's life as [`Placements`] and [`crate::gpu::over_pages`] read it, which neither
-    /// revives: its [`space`](TextureObject::space), which every view of it shares, views of views
+    /// The texture's life as [`Placements`] reads it, which it does not revive: its [`space`](TextureObject::space), which every view of it shares, views of views
     /// included ([`Hold::sharing`]), so its bytes stay taken while it or a view of it lives, as a
     /// Metal view's `parentTexture` keeps the texture and its bytes. A texture on a surface's
     /// lasts until the runtime frees the buffer under it too, whose range token holds it, once
@@ -274,13 +259,9 @@ impl TextureObject {
 
     /// Whether the GPU's writes to its texels never reach their memory: it lies on a surface of
     /// [`crate::os::gpu_read_only`], made on it, a view of one made on it, or over a buffer made
-    /// on it.
+    /// on it ([`writes_never_reach`]), as it was made (the field of the same name).
     pub(crate) fn gpu_read_only(&self) -> bool {
-        match (&self.surface, &self.under) {
-            (Some(s), _) => crate::os::gpu_read_only(s),
-            (None, Some(Under::Buffer(b, _))) => b.gpu_read_only(),
-            _ => false,
-        }
+        self.gpu_read_only
     }
 
     /// Whether the runtime refuses the GPU's writes of its texels: one over a surface of a 4:4:4
@@ -306,7 +287,7 @@ impl TextureObject {
     }
 
     /// `replaceRegion:` (`sel`) of `region` of `level` and `slice` from `bytes`, rows and images
-    /// `rows` apart, of one whose GPU writes never reach its memory ([`Self::gpu_read_only`]),
+    /// `rows` apart, of one whose GPU writes never reach its memory ([`Self::gpu_read_only()`]),
     /// whose runtime texture lies over a read-only alias the CPU cannot write: refused as the
     /// runtime refuses it, by its read of the same region (`getBytes:`, which takes the same
     /// checks), then written row by row into the guest's page of its surface, where its base
@@ -354,8 +335,7 @@ impl TextureObject {
             );
         }
         let pf = plain(|| raw.pixel_format());
-        let what = "a CPU write of a texture on a surface made read-only for the GPU, of";
-        let block = crate::gpu::format_info::block(sel, u64::from(pf.as_raw()), what);
+        let block = crate::gpu::format_info::block(sel, u64::from(pf.as_raw()));
         if block.compressed() {
             unrepresentable(
                 sel,
@@ -423,16 +403,20 @@ pub struct HeapObject {
 
 /// A heap's buffers and textures, while they live, and their ranges of the heap.
 ///
-/// A two-plane XR10 texture (550, 551) of a heap is one of two kinds. A 2D texture of one level,
-/// slice and sample within the device's limits keeps its two planes in the heap's bytes, where
-/// Metal lays them out, the runtime's shadow of them (`shadowed-texture`), so a buffer or texture
-/// over its range sees and changes its texels as Metal's does. Any other lies in memory of its
-/// own, apart from the heap's bytes, which the runtime announces at its creation, on the
-/// caller's thread (`heap-two-plane-texture`, [`crate::answer::HEARD`]): only those are
-/// [`Alone::TwoPlane`] here, the kind the creation heard, not one the format and shape would
-/// predict. So is a depth or stencil texture without `allowGPUOptimizedContents` whose creation
-/// heard `optimized-depth-stencil-texture` [`Alone::Optimized`], and a texture of a heap over the
-/// guest's pages whose creation heard `heap-texture-untiled-layout` [`Alone::Untiled`].
+/// A two-plane XR10 texture (550, 551) of a heap is one of three kinds. A texture of one level
+/// within the device's limits, but for a 1D array, keeps its first level's slices in the heap's
+/// bytes, where Metal lays them out, the runtime's shadow of them (`shadowed-texture`), so a
+/// buffer or texture over its range sees and changes its texels as Metal's does: a 3D one its
+/// first depth slice, over which Metal lays every other. A mipmapped one and a 1D array keep the first level's slices there too, as Metal's
+/// CPU copies and GPU writes lay them, where Metal's paths address the later levels, and a 1D
+/// array's GPU reads, at bytes that differ by path (`heap-two-plane-layout`, relayed, and in strict
+/// mode dying at its creation, [`crate::answer::DIES`]). Any other lies in memory of its own, apart
+/// from the heap's bytes, which the runtime announces at its creation, on the caller's thread
+/// (`heap-two-plane-texture`, [`crate::answer::HEARD`]): only those are [`Alone::TwoPlane`] here,
+/// the kind the creation heard, not one the format and shape would predict. So is a depth or
+/// stencil texture without `allowGPUOptimizedContents` whose creation heard
+/// `optimized-depth-stencil-texture` [`Alone::Optimized`], and a texture of a heap over the guest's
+/// pages whose creation heard `heap-texture-untiled-layout` [`Alone::Untiled`].
 ///
 /// Core makes a buffer over all of the bytes the heap's descriptor asked for with each heap, at
 /// its creation, before anything else is asked of it: a detached heap's cover buffer, which a
@@ -450,11 +434,12 @@ pub struct HeapObject {
 /// apart; an untiled one's in the runtime's layout, where Metal's are its tiles; an optimized
 /// one's laid out and sized by the runtime, larger than Metal's.
 ///
-/// A depth or stencil texture made in a legacy heap dies, and a colour texture whose bytes there
-/// a stated rule does not show are Metal's is announced, once per device: core's copies through
-/// the heap's private buffer carry those bytes to and from the guest's pages
-/// ([`HeapObject::legacy_made`]). Objects of other heaps and buffers over the same guest's pages
-/// meet a texture kept apart through those pages: [`crate::gpu::over_pages`] decides them.
+/// In a legacy heap, core's copies through the heap's private buffer carry the bytes of its
+/// textures to and from the guest's pages: the runtime lays a texture out there in Metal's tiles
+/// where it holds them (on MoltenVK, a texture of one sample that Metal keeps uncompressed, of a
+/// colour format, `Depth16Unorm`, `Depth32Float`, `Stencil8` or `Depth32Float_Stencil8`), and
+/// else announces its layout there (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`),
+/// which its creation relays, the first time alone ([`crate::answer::HEARD`]).
 #[derive(Debug, Default)]
 pub struct Placements {
     /// Its textures nothing may share a byte with, and why.
@@ -498,8 +483,8 @@ impl Alone {
     fn reason(self) -> &'static str {
         match self {
             Alone::TwoPlane => {
-                "a two-plane XR10 texture (550, 551) of its heap, other than a 2D texture of one \
-                 level: the runtime keeps the texture's texels in memory of their own \
+                "a two-plane XR10 texture (550, 551) of its heap past the device's limits: the \
+                 runtime keeps the texture's texels in memory of their own \
                  (heap-two-plane-texture), where Metal's lie in the heap's bytes"
             }
             Alone::Optimized => {
@@ -544,39 +529,6 @@ impl Alone {
             ),
         )
     }
-
-    /// The death at `sel` of a command's use of bytes, or a texture made or placed over them,
-    /// that lie over the guest's pages under such a texture of another heap that lives, or of
-    /// such a texture placed over pages another heap's, a buffer's or a surface's texture lies
-    /// over, or of a replace that brings them together ([`crate::gpu::over_pages`]).
-    pub(crate) fn dies_over_pages(self, sel: &'static str) -> ! {
-        unrepresentable(
-            sel,
-            &format!(
-                "bytes over the guest's pages that a texture of a heap over them lies over while \
-                 it lives, used by a command or under a texture made over another buffer's, \
-                 heap's or surface's bytes, or such a texture placed over pages another buffer's, \
-                 heap's or surface's texture lies over, or a replace of a heap's or buffer's \
-                 backing that brings them together, the texture {}",
-                self.reason()
-            ),
-        )
-    }
-
-    /// The death at `sel` of such a texture placed over the guest's pages, or brought over them
-    /// by a replace, that a command used through another heap or a buffer since that one took
-    /// them ([`crate::gpu::over_pages`]).
-    pub(crate) fn dies_over_used_pages(self, sel: &'static str) -> ! {
-        unrepresentable(
-            sel,
-            &format!(
-                "a texture of a heap over the guest's pages placed over pages, or brought over \
-                 them by a replace of its heap's backing, that a command used through another \
-                 heap or a buffer since that one took them, the texture {}",
-                self.reason()
-            ),
-        )
-    }
 }
 
 /// The relay at `sel`, or its death in strict mode ([`crate::answer::inexact`]), of `what` a
@@ -584,14 +536,12 @@ impl Alone {
 /// the runtime announced (`optimized-depth-stencil-texture`, [`crate::answer::HEARD`]): MoltenVK
 /// keeps its layout GPU-optimized, so the runtime sizes it as Metal's texture with the property
 /// on, larger than Metal's with it off, where the runtime's size decides a placement, or Metal's
-/// is not measured ([`crate::gpu::metal_space::metal_size_and_align`]); the call goes on with
+/// is not modelled (`crate::gpu::device::VulkanDevice::metal_answer_at`); the call goes on with
 /// the runtime's size.
 pub(crate) fn optimized_size(sel: &'static str, what: &str) {
-    crate::answer::inexact(
-        sel,
-        crate::answer::Inexact::HeapLayout,
-        &optimized_line(what),
-    );
+    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+        optimized_line(what)
+    });
 }
 
 /// The line of [`optimized_size`] for `what`.
@@ -601,109 +551,6 @@ fn optimized_line(what: &str) -> String {
          sizes as Metal's texture with the property on, larger than Metal's with it off \
          (optimized-depth-stencil-texture)"
     )
-}
-
-/// Whether Metal keeps a colour texture of `desc` uncompressed, by the rule the runtime measured
-/// of Metal's lossless compression on an Apple M3 Max under macOS 26.7 and an Apple M4 under
-/// 27.0.1 (its `heap_tiled.rs`, `metal_compresses`): without `allowGPUOptimizedContents`, at a
-/// level 0 whose shorter side is under 16 texels (a 1D texture's is its one row), or of an
-/// unknown usage (every usage) or of `ShaderWrite`, `PixelFormatView` or `ShaderAtomic` usage.
-pub(crate) fn metal_keeps_plain(desc: &rt::TextureDescriptor) -> bool {
-    let one_row = matches!(
-        desc.texture_type,
-        TextureType::Type1D | TextureType::Type1DArray
-    );
-    let shorter = if one_row {
-        1
-    } else {
-        desc.width.min(desc.height)
-    };
-    let plain = TextureUsage::SHADER_WRITE
-        .union(TextureUsage::PIXEL_FORMAT_VIEW)
-        .union(TextureUsage::SHADER_ATOMIC);
-    !desc.allow_gpu_optimized_contents
-        || shorter < 16
-        || desc.usage.is_empty()
-        || desc.usage.intersects(plain)
-}
-
-/// Whether `device`'s driver is MoltenVK, which places each image as a Metal texture in the
-/// Metal heap under its memory ([`HeapObject::legacy_made`]).
-pub(crate) fn on_moltenvk(device: &VulkanDevice) -> bool {
-    plain(|| device.raw.properties().description.driver_id)
-        == Some(metal2vulkan::vk::DriverId::MOLTENVK)
-}
-
-/// Why a colour texture's bytes in a heap over no address ranges may not be Metal's, which
-/// [`HeapObject::legacy_made`] announces once per device for each: an interim notice, pending a
-/// probe of Metal's bytes there and the runtime's laying such textures out in Metal's layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LegacyLayout {
-    /// The device's driver is not MoltenVK, and lays the runtime's image out in its own layout.
-    Driver,
-    /// Metal may keep the texture losslessly compressed, which MoltenVK's texture, of the
-    /// runtime's usage, need not be ([`metal_keeps_plain`]).
-    Compressible,
-    /// The texture has more than one sample, whose bytes there nothing measured.
-    Multisample,
-}
-
-impl LegacyLayout {
-    /// The notice's line, naming the first texture of `desc` met for it.
-    fn notice(self, desc: &rt::TextureDescriptor) -> String {
-        let (name, why) = match self {
-            LegacyLayout::Driver => (
-                "legacy-heap-driver-layout",
-                "the device's driver lays the runtime's image out in its own layout",
-            ),
-            LegacyLayout::Compressible => (
-                "legacy-heap-compression-layout",
-                "Metal may keep the texture losslessly compressed (allowGPUOptimizedContents, a \
-                 level 0 whose shorter side is 16 texels or more, and none of ShaderWrite, \
-                 PixelFormatView and ShaderAtomic usage), which MoltenVK's texture of the \
-                 runtime's usage need not be",
-            ),
-            LegacyLayout::Multisample => (
-                "legacy-heap-multisample-layout",
-                "no measurement shows a multisample texture's bytes there as Metal's",
-            ),
-        };
-        format!(
-            "reims-vgpu-vulkan: {name}: a texture placed in a heap over no address ranges (first \
-             met: pixel format {}, {} sample(s), {}x{}x{}), whose bytes core copies to and from \
-             the guest's pages, carries the runtime's layout of the texture there, not Metal's: \
-             the guest's pages and the texture after a page-in hold bytes that differ from \
-             Metal's where the two layouts differ: {why}. Announced once per device; an interim \
-             notice, pending a probe of Metal's bytes there and their replication",
-            desc.pixel_format.as_raw(),
-            desc.sample_count,
-            desc.width,
-            desc.height,
-            desc.depth,
-        )
-    }
-}
-
-/// The devices, by registry ID, with each [`LegacyLayout`] they announced.
-static LEGACY_ANNOUNCED: Mutex<Vec<(u64, LegacyLayout)>> = Mutex::new(Vec::new());
-
-#[cfg(test)]
-std::thread_local! {
-    /// Each [`LegacyLayout`] [`HeapObject::legacy_made`] met on this thread, announced or not,
-    /// which a test reads.
-    pub(crate) static LEGACY_LAYOUTS: std::cell::RefCell<Vec<LegacyLayout>> =
-        const { std::cell::RefCell::new(Vec::new()) };
-}
-
-/// Whether the device of registry ID `device` meets `layout` for the first time, which it then
-/// has.
-fn first_legacy_layout(device: u64, layout: LegacyLayout) -> bool {
-    let mut announced = LEGACY_ANNOUNCED.lock();
-    if announced.contains(&(device, layout)) {
-        return false;
-    }
-    announced.push((device, layout));
-    true
 }
 
 /// Whether the ranges share a byte.
@@ -801,15 +648,14 @@ impl Placements {
 impl HeapObject {
     /// The runtime's nil `sel` at `offset` inside the heap of a depth or stencil texture of `desc`
     /// without `allowGPUOptimizedContents`, whose size it answers larger than Metal's
-    /// (`optimized-depth-stencil-texture`): nil as well where Metal's own size and alignment
-    /// ([`crate::gpu::metal_space::metal_size_and_align`]) do not fit there either, as Metal
-    /// answers nil for an offset off its alignment and for bytes past the heap's end (measured);
-    /// where Metal's fit, or are not measured for the shape, it dies in either mode, as Metal may
-    /// make the texture the runtime makes none of.
+    /// (`optimized-depth-stencil-texture`): nil as well where Metal's own size and alignment, the
+    /// runtime's model of them (`crate::gpu::device::VulkanDevice::metal_answer_at`), do not fit
+    /// there either, as Metal answers nil for an offset off its alignment and for bytes past the
+    /// heap's end (measured); where Metal's fit, or the model has none for the shape, it dies in
+    /// either mode, as Metal may make the texture the runtime makes none of.
     fn optimized_nil(&self, sel: &'static str, desc: &rt::TextureDescriptor, offset: u64) {
-        let answer = |desc: &rt::TextureDescriptor| self.device.size_and_align_at(sel, desc);
         let heap_size = plain(|| self.raw.size());
-        let metal = crate::gpu::metal_space::metal_size_and_align(desc, answer);
+        let metal = self.device.metal_answer_at(sel, desc);
         let metal_nil = metal.is_some_and(|metal| {
             !offset.is_multiple_of(metal.align)
                 || offset
@@ -821,7 +667,7 @@ impl HeapObject {
                 sel,
                 &optimized_line(
                     "a placement inside its heap, which the runtime answers nil where Metal's \
-                     size fits or is not measured, of",
+                     size fits or is not modelled, of",
                 ),
             );
         }
@@ -829,14 +675,12 @@ impl HeapObject {
 
     /// The runtime's texture of `desc`, a depth or stencil texture without
     /// `allowGPUOptimizedContents` (`optimized-depth-stencil-texture`), made by `sel` at `offset`
-    /// in a heap over address ranges (in any other it has died, [`HeapObject::legacy_made`]), of
-    /// `size` bytes as the runtime answers them: it relays, or dies in strict mode
-    /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its bytes past the heap's end), where
-    /// the runtime answers fewer bytes than Metal's, or none (`HeapObject::new_texture`), and
-    /// where Metal's size and alignment are not measured for it
-    /// ([`crate::gpu::metal_space::metal_size_and_align`] names none: an `X32_Stencil8` texture,
-    /// a `Managed` one), as Metal may answer nil there, and as the runtime's nil dies there
-    /// ([`HeapObject::optimized_nil`]).
+    /// in a heap, of `size` bytes as the runtime answers them: it relays, or dies in strict mode
+    /// ([`optimized_size`]), where Metal answers nil (its alignment missing the offset, or its
+    /// bytes past the heap's end), where the runtime answers fewer bytes than Metal's, or none
+    /// (`HeapObject::new_texture`), and where the runtime's model of Metal's size and alignment
+    /// (`crate::gpu::device::VulkanDevice::metal_answer_at`) has none for it, as Metal may answer
+    /// nil there, and as the runtime's nil dies there ([`HeapObject::optimized_nil`]).
     fn optimized_made(
         &self,
         sel: &'static str,
@@ -844,12 +688,11 @@ impl HeapObject {
         offset: u64,
         size: Option<u64>,
     ) {
-        let answer = |desc: &rt::TextureDescriptor| self.device.size_and_align_at(sel, desc);
-        let Some(metal) = crate::gpu::metal_space::metal_size_and_align(desc, answer) else {
+        let Some(metal) = self.device.metal_answer_at(sel, desc) else {
             optimized_size(
                 sel,
-                "a placement whose size and alignment Metal's are not measured for, so that Metal \
-                 may answer nil where the runtime makes it, of",
+                "a placement whose size and alignment the runtime does not model Metal's for, so \
+                 that Metal may answer nil where the runtime makes it, of",
             );
             return;
         };
@@ -867,92 +710,6 @@ impl HeapObject {
         }
     }
 
-    /// The runtime's texture of `desc`, made by `sel` in a heap over no address ranges, core's
-    /// legacy heap, whose bytes core copies through its buffer over all of the heap to and from
-    /// the guest's pages ([`Placements`]): the guest's pages hold, and the texture reads after a
-    /// copy into the heap, the bytes of the runtime's image in the heap's memory, where Metal's
-    /// are Metal's own layout of the texture. Those bytes are Metal's by this rule, and nothing is
-    /// said of such a texture:
-    /// - the device's driver is MoltenVK, which places each image as a Metal texture in the
-    ///   Metal heap under its memory, at its offset (`MVKDeviceMemory::ensureMTLHeap`, the
-    ///   runtime's `driver_defects.rs`), and Metal lays a texture it keeps uncompressed out by its
-    ///   format, type, extent, levels and slices alone, whatever its usage: the heap's bytes over
-    ///   such a texture are Metal's, both ways, at every colour format the runtime makes on this
-    ///   host and every type, level count and slice count measured
-    ///   (`tests::metal_tests::legacy_heap_textures_are_metals_where_metal_keeps_them_plain`), and
-    ///   a one-level 2D two-plane XR10 texture's planes lie in the heap's bytes as Metal lays them
-    ///   (`a_buffer_over_a_one_level_two_plane_heap_texture_sees_its_texels_as_metals`);
-    /// - the texture has one sample and a colour format;
-    /// - Metal keeps it uncompressed ([`metal_keeps_plain`]).
-    ///
-    /// A depth or stencil texture is made, relayed, and dies in strict mode, naming the heap
-    /// ([`crate::answer::Inexact::HeapLayout`]): the runtime keeps its image apart from the heap's
-    /// memory on MoltenVK (`DepthStencilImagesLieApart`; no shape measured alike), and a native
-    /// driver lays it out in its own layout.
-    ///
-    /// Any other colour texture is made, and its layout announced on stderr once per device for
-    /// each reason ([`LegacyLayout`]): its bytes there are not Metal's where they differ, the
-    /// value Metal leaves undefined that a buffer over the texture's bytes reads, which is to be
-    /// probed and replicated, not accepted. Until then the notice says so, and nothing dies:
-    /// - on a driver other than MoltenVK, which lays the runtime's image out in its own layout;
-    /// - on MoltenVK, a texture Metal may keep losslessly compressed: MoltenVK's texture has the
-    ///   runtime's usage, which can keep it uncompressed where Metal's of the guest's usage is
-    ///   compressed (a 16x16 or larger render target of an integer format or of a 3D type, and an
-    ///   extended-range texture, measured:
-    ///   `tests::metal_tests::legacy_heap_textures_metal_may_compress_are_announced`), and nothing
-    ///   here tells which;
-    /// - a multisample texture, whose bytes no blit reaches to measure.
-    fn legacy_made(&self, sel: &'static str, desc: &rt::TextureDescriptor) {
-        let moltenvk = on_moltenvk(&self.device);
-        let colour = !metal2vulkan::metal::format::is_depth_stencil(desc.pixel_format);
-        if !colour {
-            let why = if moltenvk {
-                "the runtime keeps a depth or stencil image apart from the heap's memory, its \
-                 bytes there in the runtime's layout"
-            } else {
-                "the device's driver lays the runtime's image out in its own layout"
-            };
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::HeapLayout,
-                &format!(
-                    "a texture of pixel format {}, {} sample(s), placed in a heap over no address \
-                     ranges, whose bytes core copies to and from the guest's pages, which would \
-                     carry the runtime's layout of the texture where Metal's carry its own: {why}",
-                    desc.pixel_format.as_raw(),
-                    desc.sample_count,
-                ),
-            );
-            return;
-        }
-        let layout = if !moltenvk {
-            LegacyLayout::Driver
-        } else if desc.sample_count > 1 {
-            LegacyLayout::Multisample
-        } else if !metal_keeps_plain(desc) {
-            LegacyLayout::Compressible
-        } else {
-            return;
-        };
-        #[cfg(test)]
-        LEGACY_LAYOUTS.with(|l| l.borrow_mut().push(layout));
-        if first_legacy_layout(self.device.registry_id, layout) {
-            let line = format!("{}\n", layout.notice(desc));
-            // One write, so the line never interleaves with another thread's.
-            let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
-        }
-    }
-
-    /// `useHeaps:` (`sel`) of the heap: it dies where the heap's bytes lie over the guest's pages
-    /// under a texture of another heap that [`Placements`] keeps apart
-    /// ([`crate::gpu::over_pages`]). No texture of its own is kept apart while its cover, core's
-    /// buffer over all of it, lives, which a task's argument buffers reach the heap through.
-    pub(crate) fn made_resident(&self, sel: &'static str) {
-        let keep = self.backing.seen.guests() && !self.backing.is_detached();
-        crate::gpu::over_pages::used(sel, &self.backing.seen, keep, None, || {
-            crate::gpu::writes::heap_memory(self).ranges
-        });
-    }
     /// `detachBacking`: detached from now on by the runtime, in no memory until a replace, for a
     /// heap made over address ranges ([`Backing::detach`]).
     pub(crate) fn detach(&self) {
@@ -1010,8 +767,8 @@ pub type VulkanLibrary = Obj<LibraryObject>;
 /// `id<MTLFunction>`.
 pub type VulkanFunction = Obj<rt::Function>;
 
-/// A runtime compute pipeline state, with the `uniqueIdentifier` this platform gave it when it was
-/// made ([`crate::gpu::unique_id`]). It derefs to the runtime's state.
+/// A runtime compute pipeline state, with the runtime's `uniqueIdentifier` of it, read when it
+/// was made (`identified`). It derefs to the runtime's state.
 #[derive(Debug)]
 pub struct ComputePipelineObject {
     /// The runtime's state.
@@ -1019,18 +776,17 @@ pub struct ComputePipelineObject {
     /// Its `uniqueIdentifier`.
     pub unique_identifier: u64,
     /// The reflection of the descriptor it was made of, where a creator of the guest's made it,
-    /// which tells which texture and buffer slots its kernel writes ([`Reflection::slots`]).
+    /// whose slot writes tell which texture and buffer slots its kernel writes
+    /// ([`Reflection::slots`]).
     pub reflection: Arc<Reflection>,
 }
 
 impl ComputePipelineObject {
-    /// `raw`, just made, with a fresh identifier: one per creation, even where the runtime
-    /// answers a state it made before for an equal request, as Metal gives a pipeline made from
-    /// an identical record a new one. It is kept by the state's resource ID, which an indirect
-    /// command's record names it by ([`crate::gpu::unique_id::next_of`]).
+    /// `raw`, just made, with the runtime's identifier of it: one per creation, as Metal gives a
+    /// pipeline made from an identical record a new one, and as the runtime makes a new state of
+    /// each request (`identified`).
     pub fn new(raw: rt::ComputePipelineState) -> ComputePipelineObject {
-        let unique_identifier =
-            crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+        let unique_identifier = identified(|| raw.unique_identifier());
         ComputePipelineObject {
             raw,
             unique_identifier,
@@ -1061,72 +817,56 @@ pub type VulkanComputePipeline = Obj<ComputePipelineObject>;
 pub struct RenderPipelineObject {
     /// The runtime's state.
     pub raw: rt::RenderPipelineState,
-    /// The identifier this creation took ([`crate::gpu::unique_id`]).
+    /// The runtime's identifier of it, read when it was made (`identified`).
     unique_identifier: u64,
     /// Its descriptor's `inputPrimitiveTopology`, which decides whether Metal sizes the points
     /// of a vertex function that writes no `[[point_size]]` ([`crate::gpu::encode_render`]);
     /// `Unspecified`, Metal's default, for a state of no guest descriptor's.
     pub input_primitive_topology: PrimitiveTopologyClass,
-    /// The reflection of the descriptor it was made of, which tells which slots each stage
-    /// writes ([`Reflection::slots`]); of none for a state made otherwise.
+    /// The reflection of the descriptor it was made of, whose slot writes tell which slots each
+    /// stage writes ([`Reflection::slots`]); of none for a state made otherwise.
     pub reflection: Arc<Reflection>,
+    /// What it tells a render encoder that sets it, read at its first set
+    /// ([`crate::gpu::encode_render::StateFacts`]).
+    pub(crate) drawn: std::sync::OnceLock<crate::gpu::encode_render::StateFacts>,
 }
 
-impl Drop for ComputePipelineObject {
-    /// A state of a nonzero resource ID that goes is noted: it no longer holds the ID, and Metal
-    /// may give a state made later its identifier ([`crate::gpu::unique_id::released`]).
-    fn drop(&mut self) {
-        let (device, id) = (
-            self.raw.device().registry_id(),
-            self.raw.gpu_resource_id().0,
+/// The runtime's `uniqueIdentifier` of a state it just made
+/// (`ComputePipelineState::unique_identifier`, `RenderPipelineState::unique_identifier`),
+/// `identifier`'s answer, read once as the state is made, which relays the runtime's notice of it
+/// once a device (`plain-state-unique-identifier`, `unmeasured-unique-identifier`,
+/// [`crate::answer`]): one nonzero value for the state's life, no other live state's, and a second
+/// state made from an identical record a new one. A state made without
+/// `supportIndirectCommandBuffers` answers one of a process-wide count, where Metal's is an address
+/// that differs from run to run (`plain-state-unique-identifier`); one made with it answers 2^36
+/// plus an offset in the runtime's allocation of such states, which reuses a released state's
+/// identifier, the last released first, by kind, as Metal's does, at offsets that are not Metal's
+/// (`unmeasured-unique-identifier`: Metal's follow its allocator and the process's history, as how
+/// the process was started). The guest's read of such a state's is relayed ([`guest_identifier`]).
+fn identified(identifier: impl FnOnce() -> u64) -> u64 {
+    plain(identifier)
+}
+
+/// What the guest reads (info command 460) of a pipeline state's runtime `uniqueIdentifier`,
+/// `identifier`: the same, but of a state made with indirect command buffer support (`indirect`)
+/// relayed as [`Inexact::UniqueIdentifier`](crate::answer::Inexact::UniqueIdentifier), not
+/// Metal's address, which dies in strict mode. A plain state's is one of a count, where Metal's
+/// is an address that differs from run to run (`plain-state-unique-identifier`, relayed).
+fn guest_identifier(identifier: u64, indirect: bool) -> u64 {
+    if indirect {
+        crate::answer::inexact(
+            "uniqueIdentifier",
+            crate::answer::Inexact::UniqueIdentifier,
+            || {
+                format!(
+                    "Metal's identifier of a pipeline state made with indirect command buffer \
+                     support: it answers the runtime's, {identifier:#x}, an offset of its own \
+                     allocation of such states"
+                )
+            },
         );
-        crate::gpu::unique_id::released(device, id, self.unique_identifier);
-    }
-}
-
-impl Drop for RenderPipelineObject {
-    /// As a compute state's ([`ComputePipelineObject`]'s drop).
-    fn drop(&mut self) {
-        let (device, id) = (
-            self.raw.device().registry_id(),
-            self.raw.gpu_resource_id().0,
-        );
-        crate::gpu::unique_id::released(device, id, self.unique_identifier);
-    }
-}
-
-/// The guest's read of a pipeline state's `uniqueIdentifier` (info command 460), of `kind`: a
-/// debug line, which tells how often guests read it, and for which states; then its identifier,
-/// or, for a state made with indirect command buffer support (`supports_icbs`), the death
-/// ([`identifier_of_an_icb_state`]).
-fn guest_identifier(kind: &str, supports_icbs: bool, identifier: u64) -> u64 {
-    log::debug!(
-        "info 460: uniqueIdentifier of a {kind} pipeline state {} indirect command buffer \
-         support: {}",
-        if supports_icbs { "with" } else { "without" },
-        if supports_icbs {
-            "dies".to_owned()
-        } else {
-            format!("answers {identifier}")
-        },
-    );
-    if supports_icbs {
-        identifier_of_an_icb_state();
     }
     identifier
-}
-
-/// The death of the guest's read of the `uniqueIdentifier` of a state made with indirect command
-/// buffer support: Metal's is an address of its own allocation of such states, the same in every
-/// run that makes and releases the same states in the same order, which this platform's counter
-/// does not reproduce ([`crate::gpu::unique_id`]).
-fn identifier_of_an_icb_state() -> ! {
-    unrepresentable(
-        "uniqueIdentifier",
-        "Metal's identifier of a pipeline state made with indirect command buffer support, an \
-         address of its allocation of such states that is the same from run to run, which this \
-         platform's counter does not reproduce",
-    )
 }
 
 /// The descriptor a render pipeline state was made of.
@@ -1138,29 +878,10 @@ pub enum RenderDescriptor {
     Tile(Box<TileRenderPipelineDescriptor>),
 }
 
-impl RenderPipelineObject {
-    /// Whether the state is of `textureWriteRoundingMode` 2, the runtime's
-    /// `TextureWriteRoundingMode::NearestEven` (a guest's blob of it), and its fragment function
-    /// may write a texture: its draws decide its texture writes of
-    /// [`crate::gpu::serialized::MODE_2_TEXTURE_FORMATS`], which Metal's mode 2 writes otherwise
-    /// than the runtime, or which nothing measured at the mode
-    /// ([`crate::gpu::serialized::rounded_texture_writes`]).
-    pub fn rounds_texture_writes(&self) -> bool {
-        let nearest_even = matches!(
-            self.reflection.descriptor(),
-            Some(Reflected::Render(RenderDescriptor::Render(d)))
-                if d.texture_write_rounding_mode
-                    == metal2vulkan::metal::TextureWriteRoundingMode::NearestEven
-        );
-        nearest_even && plain(|| self.raw.fragment_writes_textures())
-    }
-}
-
 /// `id<MTLRenderPipelineState>`.
 pub type VulkanRenderPipeline = Obj<RenderPipelineObject>;
 
-/// The handle of a state a creator made, with a fresh identifier: every creation takes one, even
-/// where the runtime answers a state it made before for an equal request. Its input primitive
+/// The handle of a state a creator made, with the runtime's identifier of it. Its input primitive
 /// topology is Metal's default.
 #[cfg(test)]
 pub(crate) fn render_pipeline(raw: rt::RenderPipelineState) -> VulkanRenderPipeline {
@@ -1174,13 +895,13 @@ pub(crate) fn render_pipeline_of(
     input_primitive_topology: PrimitiveTopologyClass,
     descriptor: Option<RenderDescriptor>,
 ) -> VulkanRenderPipeline {
-    let unique_identifier =
-        crate::gpu::unique_id::next_of(raw.device().registry_id(), raw.gpu_resource_id().0);
+    let unique_identifier = identified(|| raw.unique_identifier());
     Obj::new(RenderPipelineObject {
         raw,
         unique_identifier,
         input_primitive_topology,
         reflection: Reflection::new(descriptor.map(Reflected::Render)),
+        drawn: std::sync::OnceLock::new(),
     })
 }
 
@@ -1320,10 +1041,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             return Ok(None);
         };
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes.clone());
-        let texture = self.device.texture_in(raw, under, answered);
-        crate::gpu::over_pages::over_buffer(sel, self, bytes, texture.life());
-        Ok(Some(texture))
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
     /// A texture of the buffer's bytes from `offset`, rows `bytes_per_row` apart. Refused as
@@ -1355,10 +1074,8 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             return Ok(None);
         };
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
-        let under = Under::Buffer(self.clone_ref(), bytes.clone());
-        let texture = self.device.texture_in(raw, under, answered);
-        crate::gpu::over_pages::over_buffer(sel, self, bytes, texture.life());
-        Ok(Some(texture))
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, answered)))
     }
 
     /// A detached no-copy buffer over an alias of the ranges, which total its length, from now
@@ -1380,7 +1097,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
                     // keep-alive is dropped, as nothing else frees or remaps it.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
+                            crate::os::host_memory(first, true),
                             None,
                             Some(keep),
                         )
@@ -1436,28 +1153,6 @@ impl VulkanTexture {
             && no_view(sel, pixel_format)
     }
 
-    /// Relays for `sel`, or dies in strict mode ([`crate::answer::Inexact::YcbcrView`]), a view of
-    /// this texture, of the two-plane YCbCr family, in its own format (`pixel_format`, raw) as
-    /// another type than its own (`kind`): Metal makes it, but reads it otherwise than the
-    /// texture (a 2D array view reads its planes' codes unconverted, measured:
-    /// `own_format_views_are_metals`), where the runtime's view, made, reads as the texture.
-    fn retyped_ycbcr(&self, sel: &'static str, pixel_format: u64, kind: TextureType) {
-        let (source, own) = plain(|| (self.raw.pixel_format(), self.raw.texture_type()));
-        if crate::gpu::ycbcr::runtime_makes(source)
-            && u64::from(source.as_raw()) == pixel_format
-            && kind != own
-        {
-            crate::answer::inexact(
-                sel,
-                crate::answer::Inexact::YcbcrView,
-                &format!(
-                    "a {kind:?} view of a {source:?} texture, which Metal reads otherwise than \
-                     the texture, and the runtime as the texture"
-                ),
-            );
-        }
-    }
-
     /// The view `call` makes of this texture, for `sel`: of the same device, over the same surface
     /// (sharing this texture's reference of it, as a view shares its texels). Metal raises for no
     /// view (measured, without API validation): nil where the runtime answers it, as Metal
@@ -1471,7 +1166,10 @@ impl VulkanTexture {
     /// this texture's usage, and where `swizzled`, of a swizzle other than the default, only its
     /// `ShaderRead`, `PixelFormatView` and Apple bits 0x4000 and 0x10000, as the runtime's view
     /// answers ([`SWIZZLE_DROPPED`]); a view of a texture whose GPU writes never reach its memory
-    /// holds all it answers in its [`TextureObject::private_usage`] ([`read_only_usage`]).
+    /// holds all it answers in its [`TextureObject::private_usage`] ([`read_only_usage`]). A
+    /// swizzled view of a texture that answers no usage (one of usage 0x8 alone) dies, as Metal
+    /// asserts there (`_usage != MTLTextureUsageUnknown`, measured on the M3 Max under macOS
+    /// 27.0.1), where a view in a format alone answers 0 as the texture does.
     fn view(
         &self,
         sel: &'static str,
@@ -1480,6 +1178,9 @@ impl VulkanTexture {
         call: impl FnOnce(&rt::Texture) -> Result<rt::Texture, rt::Error>,
     ) -> RaiseResult<Option<VulkanTexture>> {
         use rt::ViewProblem as P;
+        if swizzled && Texture::usage(self) == 0 {
+            metal_aborts(sel, "a swizzled view of a texture of no usage");
+        }
         let raw = match plain_at(sel, || call(&self.raw)) {
             Ok(raw) => raw,
             Err(rt::Error::Invalid(rt::Invalid {
@@ -1493,6 +1194,7 @@ impl VulkanTexture {
                     | P::SliceRange
                     | P::SliceCount
                     | P::BufferSlices
+                    | P::SwizzledViewOfNoUsage
             ) =>
             {
                 metal_aborts(sel, &format!("a view it does not make ({problem:?})"))
@@ -1503,10 +1205,10 @@ impl VulkanTexture {
                 // twins in another format by the texture's format, though its refusal names the
                 // view's, but a view in a two-plane YCbCr format, which it refuses by that format
                 // first (such a view is nil before it reaches the runtime, `no_view_of`).
-                use metal2vulkan::metal::format::{padded_only_over_memory, ycbcr};
+                use metal2vulkan::metal::format::{padded_words, ycbcr};
                 let source = plain(|| self.raw.pixel_format());
                 let view = crate::gpu::held_format(sel, format).ok();
-                let padded = padded_only_over_memory(source) && !view.is_some_and(ycbcr);
+                let padded = padded_words(source) && !view.is_some_and(ycbcr);
                 let e = match padded {
                     true => {
                         let what = format!("a view in pixel format {format} of a texture of");
@@ -1528,6 +1230,7 @@ impl VulkanTexture {
                 false => self.private_usage,
             },
             space: Arc::new(Hold::sharing(Arc::clone(&self.space))),
+            gpu_read_only: self.gpu_read_only,
         })))
     }
 }
@@ -1542,12 +1245,6 @@ fn indices(sel: &'static str, r: NsRange) -> std::ops::Range<u64> {
 /// value Metal describes no format for ([`crate::gpu::format_info::described`]) but 255 and 262,
 /// `MTLPixelFormatInvalid`'s 0 among them (measured: `views_metal_answers_nil_are_nil`). Before
 /// anything else of the view is checked, as Metal's: its swizzle, type, levels and slices.
-///
-/// That was measured at macOS 26.7. A view in a value the releases the runtime measured describe
-/// otherwise (no value at the runtime's levels: [`crate::gpu::format_info::level_decides`])
-/// is answered by the level's description at any other level, relayed at `sel`, as nothing
-/// measured whether Metal makes it there, and dies in strict mode
-/// ([`crate::answer::Inexact::MetalLevel`]).
 fn no_view(sel: &'static str, pixel_format: u64) -> bool {
     if plain(|| crate::gpu::no_texture::no_view(pixel_format)) {
         return true;
@@ -1555,24 +1252,7 @@ fn no_view(sel: &'static str, pixel_format: u64) -> bool {
     if matches!(pixel_format, 255 | 262) {
         return false;
     }
-    let described = crate::gpu::format_info::describes_answer(sel, pixel_format);
-    let level = crate::platform::metal_level(sel);
-    if crate::gpu::format_info::level_decides(pixel_format) && level != rt::MetalLevel::MacOS26_7 {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
-                "a view in pixel format {pixel_format}, which Metal at {level} describes \
-                 {}: whether Metal makes such a view was measured at macOS 26.7 alone",
-                if described {
-                    "a format for"
-                } else {
-                    "no format for"
-                }
-            ),
-        );
-    }
-    !described
+    !crate::gpu::format_info::described(sel, pixel_format)
 }
 
 /// The runtime's format of a view in `raw`, which `sel` makes, a value [`no_view`] is not nil in:
@@ -1670,7 +1350,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_view_with_levels_slices(format, kind, levels, slices)
@@ -1692,7 +1371,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, level_range), indices(sel, slice_range));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_view_with_swizzle(format, kind, levels, slices, swizzle)
@@ -1715,7 +1393,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
         let swizzle = crate::gpu::swizzle(sel, swizzle);
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, !swizzle.is_default(), |t| {
             t.new_texture_subview_with_placement(
@@ -1743,7 +1420,6 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         }
         let kind = crate::gpu::texture_type(sel, texture_type);
         let (levels, slices) = (indices(sel, levels), indices(sel, slices));
-        self.retyped_ycbcr(sel, pixel_format, kind);
         let format = view_format(sel, pixel_format);
         self.view(sel, pixel_format, false, |t| {
             t.new_texture_subview_with_placement(
@@ -1766,12 +1442,13 @@ impl Texture<VulkanPlatform> for VulkanTexture {
         plain(|| self.raw.protection_options())
     }
 
-    /// The runtime reads `pixel_bytes` from a copy made first ([`host_bytes`]), as it takes only
-    /// a slice. Refused as Metal's validation refuses a region outside the level, rows that do
+    /// The runtime reads `pixel_bytes` in place, through their pointer ([`guest_bytes`]), each
+    /// byte once. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
-    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only`]),
+    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
     /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
-    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]).
+    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]). A surface's
+    /// reads a copy of them first ([`host_bytes`]), which it writes row by row.
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -1783,20 +1460,21 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     ) -> RaiseResult<()> {
         let sel = "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:";
         let raw = self.copied(sel);
-        let bytes = host_bytes(sel, pixel_bytes);
         if self.gpu_read_only() {
+            let bytes = host_bytes(sel, pixel_bytes);
             let rows = (bytes_per_row, bytes_per_image);
             return self.replaced_on_surface(sel, raw, (region, level, slice), &bytes, rows);
         }
+        let bytes = guest_bytes(sel, pixel_bytes);
         if crate::os::TWINS_READ_ONLY && crate::gpu::writes::texture_kept(self) {
             crate::gpu::writes::kept_write(sel, "a CPU write of a texture into");
         }
         send(sel, Policy::Dies, || {
-            raw.replace_region(
+            raw.replace_region_with_host_bytes(
                 crate::gpu::region(region),
                 level,
                 slice,
-                &bytes,
+                bytes,
                 bytes_per_row,
                 bytes_per_image,
             )
@@ -1845,19 +1523,49 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     }
 }
 
-/// A copy of the bytes of `range`, for a runtime call that takes only a slice. A non-empty range
-/// at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one that wraps past
-/// the top of the address space, dies at `sel`, as Metal's read of it faults: core's fill of a
-/// texture with bytes reads a buffer's `contents` plus an offset, NULL plus the offset for a
-/// buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:length:` ends
-/// the process with a segmentation fault there (measured on the M3 Max at offsets 0, 0x10 and
-/// 0x4000, on surfaces of their own memory and over the guest's pages).
+/// A copy of the bytes of `range`, for a write of this platform's own that takes a slice. A
+/// non-empty range at a NULL or near-NULL pointer, in the zero region (`ZERO_REGION_END`), or one
+/// that wraps past the top of the address space, dies at `sel`, as Metal's read of it faults:
+/// core's fill of a texture with bytes reads a buffer's `contents` plus an offset, NULL plus the
+/// offset for a buffer made on a surface, and Metal's `fillTexture:level:slice:region:bytes:
+/// length:` ends the process with a segmentation fault there (measured on the M3 Max at offsets
+/// 0, 0x10 and 0x4000, on surfaces of their own memory and over the guest's pages).
 ///
 /// The bytes are guest memory, which another vCPU or GPU work in flight may write while they are
 /// read: `HostRange` promises them mapped and readable for the call, never unchanged, so no
 /// shared slice is made over them. They are copied once, through the pointer, into memory this
-/// platform owns, and the runtime reads that copy.
+/// platform owns. A runtime call reads them in place instead ([`guest_bytes`]).
 pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
+    first_bytes(sel, range, usize::MAX)
+}
+
+/// The bytes of `range`, for a runtime call that reads them through their pointer, each byte
+/// once, into memory of its own (`rt::HostBytes`: `replaceRegion:` and `newBufferWithBytes:`),
+/// with no copy of this platform's first. Where the range lies dies as [`host_bytes`] dies.
+pub(crate) fn guest_bytes<'a>(sel: &'static str, range: HostRange<'a>) -> rt::HostBytes<'a> {
+    let length =
+        usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
+    if length == 0 {
+        return rt::HostBytes::from_slice(&[]);
+    }
+    let first = range.ptr().addr();
+    let start = NonNull::new(range.ptr().as_ptr::<u8>())
+        .filter(|_| first >= reims_vgpu_core::guest::ZERO_REGION_END)
+        .filter(|_| first.checked_add(length).is_some());
+    let Some(start) = start else {
+        crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
+    };
+    // SAFETY: `HostRange::new`'s contract keeps `start..start + length` mapped and readable for
+    // the call the bytes are given to, which reads them only while it runs and keeps nothing of
+    // the pointer. They are guest memory, which the guest's vCPUs and GPU work write outside the
+    // program's Rust while they are read, as `HostBytes::new` allows: the call copies each byte
+    // through the pointer, and no reference covers them.
+    unsafe { rt::HostBytes::new(start, length) }
+}
+
+/// The first `most` bytes of `range` (all of them where it holds fewer), copied as [`host_bytes`]
+/// copies them, whose checks of where the range lies take all of it.
+fn first_bytes(sel: &'static str, range: HostRange<'_>, most: usize) -> Vec<u8> {
     let length =
         usize::try_from(range.len()).unwrap_or_else(|_| unrepresentable(sel, "that length"));
     if length == 0 {
@@ -1868,15 +1576,16 @@ pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
     if first < reims_vgpu_core::guest::ZERO_REGION_END || first.checked_add(length).is_none() {
         crate::answer::metal_reads_near_null(sel, &format!("{length} bytes at {first:#x}"));
     }
-    let mut copy = Vec::with_capacity(length);
+    let read = length.min(most);
+    let mut copy = Vec::with_capacity(read);
     // SAFETY: `HostRange::new`'s contract keeps `start..start + length` mapped and readable for
-    // the call; `copy` owns `length` bytes of its own, which no other pointer reaches, so the two
-    // do not overlap. The copy is made through raw pointers alone: no reference ever covers the
-    // guest's bytes, which may change under it. `set_len` follows the copy, which wrote every one
-    // of the `length` bytes.
+    // the call, and `read` is at most `length`; `copy` owns `read` bytes of its own, which no
+    // other pointer reaches, so the two do not overlap. The copy is made through raw pointers
+    // alone: no reference ever covers the guest's bytes, which may change under it. `set_len`
+    // follows the copy, which wrote every one of the `read` bytes.
     unsafe {
-        std::ptr::copy_nonoverlapping(start, copy.as_mut_ptr(), length);
-        copy.set_len(length);
+        std::ptr::copy_nonoverlapping(start, copy.as_mut_ptr(), read);
+        copy.set_len(read);
     }
     copy
 }
@@ -1889,7 +1598,17 @@ pub(crate) fn host_bytes(sel: &'static str, range: HostRange<'_>) -> Vec<u8> {
 /// 0 texels, of depth 0 or 1 and of 16 or 0 bytes, complete, filling nothing; regions of 0 by 4,
 /// 4 by 0, 1 by 1 and 4 by 4 texels, of depth 0 or 1, and of 4 by 4 texels and 0 bytes, end the
 /// process with a segmentation fault.
-pub(crate) fn fill_bytes(sel: &'static str, region: MtlRegion, range: HostRange<'_>) -> Vec<u8> {
+///
+/// Only the range's first `most` bytes are copied, the most the fill reads
+/// ([`crate::gpu::fill::MOST_PATTERN_BYTES`], or a texture buffer's
+/// [`crate::gpu::fill::MOST_STREAMED_PATTERN_BYTES`]), so a range the guest sizes to the whole of
+/// a large buffer is no copy of it; the checks of where it lies take all of it.
+pub(crate) fn fill_bytes(
+    sel: &'static str,
+    region: MtlRegion,
+    range: HostRange<'_>,
+    most: usize,
+) -> Vec<u8> {
     if region.size.width == 0 && region.size.height == 0 {
         return Vec::new();
     }
@@ -1897,7 +1616,7 @@ pub(crate) fn fill_bytes(sel: &'static str, region: MtlRegion, range: HostRange<
     if range.is_empty() && first < reims_vgpu_core::guest::ZERO_REGION_END {
         crate::answer::metal_reads_near_null(sel, &format!("0 bytes at {first:#x}"));
     }
-    host_bytes(sel, range)
+    first_bytes(sel, range, most)
 }
 
 /// What the runtime answers making a texture over a buffer by `sel`,
@@ -2012,34 +1731,31 @@ impl Heap<VulkanPlatform> for VulkanHeap {
     /// depth or stencil texture without `allowGPUOptimizedContents`, and such a texture over
     /// another's, and a nil inside the heap of such a texture, whose size the runtime answers
     /// larger than Metal's (`optimized-depth-stencil-texture`), where Metal's own size fits there
-    /// or is not measured; where it does not fit either, the nil is Metal's
+    /// or is not modelled; where it does not fit either, the nil is Metal's
     /// ([`HeapObject::optimized_nil`]); and one over a
     /// byte of a texture over the guest's pages that the runtime does not lay out in Metal's
     /// tiles, and such a texture over another's (`heap-texture-untiled-layout`,
     /// [`Alone::Untiled`]). Each of the three kinds dies, too, where the heap's cover lives, so in
     /// every heap core makes ([`Placements`]). A 2- or 4-sample texture that Metal keeps losslessly
-    /// compressed, whose image the runtime keeps apart from the heap's bytes, over the guest's
-    /// pages or in a heap whose memory cannot hold its image (`heap-texture-lossless-layout`),
-    /// dies as it is made ([`crate::answer::HEARD`]). In
-    /// a heap over the guest's pages, a texture over the pages under such a texture of another
-    /// heap, and such a texture over pages another's texture lies over, die too
-    /// ([`crate::gpu::over_pages`]). So does, as it is placed or answered nil, a texture whose
-    /// layout in Metal's heaps the runtime does not model (a PVRTC format), placed by
+    /// compressed, whose image the runtime keeps apart from the heap's bytes over the guest's
+    /// pages (`heap-texture-lossless-layout`), dies as it is made ([`crate::answer::HEARD`]). So
+    /// does, as it is placed or answered nil, a texture whose layout in Metal's heaps the runtime
+    /// does not model, placed by
     /// its device's image's size and alignment, larger or smaller than Metal's
     /// (`unmeasured-heap-texture-size`, [`crate::gpu::metal_space::unmeasured_size`]): no suite
     /// case or guest run places one. Its nil at an offset at or past the heap's end is Metal's,
     /// whatever the size, and is answered.
     ///
-    /// An optimized texture made checks the runtime's size against Metal's where Metal's is
-    /// known ([`crate::gpu::metal_space::metal_size_and_align`]): one made where Metal's alignment
-    /// misses the offset or Metal's bytes pass the heap's end, where Metal answers nil, dies, and
-    /// so does one the runtime answers fewer bytes for than Metal's, whose range would end before
-    /// Metal's texture does.
+    /// An optimized texture made checks the runtime's size against Metal's where the runtime
+    /// models Metal's (`crate::gpu::device::VulkanDevice::metal_answer_at`): one made where
+    /// Metal's alignment misses the offset or Metal's bytes pass the heap's end, where Metal
+    /// answers nil, dies, and so does one the runtime answers fewer bytes for than Metal's, whose
+    /// range would end before Metal's texture does.
     ///
     /// In a heap over no address ranges, core's legacy heap, whose bytes core copies to and from
-    /// the guest's pages, a depth or stencil texture dies first, and a colour texture whose bytes
-    /// there are not Metal's by a stated rule is announced once per device
-    /// ([`HeapObject::legacy_made`]).
+    /// the guest's pages, what the runtime announces of a texture's layout there
+    /// (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`), its bytes in the heap's
+    /// memory not Metal's, is relayed alone ([`Placements`]).
     fn new_texture(
         &self,
         descriptor: &VulkanTextureDescriptor,
@@ -2075,26 +1791,23 @@ impl Heap<VulkanPlatform> for VulkanHeap {
         }
         made.map(|t| {
             t.map(|raw| {
-                if !self.backing.detaches() {
-                    self.legacy_made(sel, &desc);
-                }
-                let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout);
+                // Over the guest's pages alone, as an untiled one is (below).
+                let lossless = heard.contains(&rt::Degradation::HeapTextureLosslessLayout)
+                    && self.backing.detaches();
                 if lossless && desc.sample_count > 1 {
-                    crate::answer::inexact(
-                        sel,
-                        crate::answer::Inexact::HeapLayout,
-                        &format!(
+                    crate::answer::inexact(sel, crate::answer::Inexact::HeapLayout, || {
+                        format!(
                             "a {}-sample texture in a heap that Metal keeps losslessly \
                              compressed, whose image the runtime keeps in memory of its own, \
                              where Metal's lies in the heap's bytes, so a buffer or texture over \
                              them would neither see nor change it (heap-texture-lossless-layout)",
                             desc.sample_count
-                        ),
-                    );
+                        )
+                    });
                 }
-                // Its bytes in the heap; the rest of the heap where the size is not answered.
-                let size = plain_at(sel, || self.device.raw.heap_texture_size_and_align(&desc));
-                let size = size.ok().map(|size| size.size);
+                // Its bytes in the heap, the size the runtime placed it by, which its
+                // `allocatedSize` answers with no query; the rest of the heap where it has none.
+                let size = plain(|| raw.allocated_size());
                 let end = size.map_or(u64::MAX, |size| offset.saturating_add(size));
                 let heap_size = plain(|| self.raw.size());
                 if optimized {
@@ -2103,7 +1816,11 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let bytes = offset.min(heap_size)..end.min(heap_size);
                 let under = Under::Heap(self.clone_ref(), bytes.clone());
                 let texture = self.device.texture_in(raw, under, 0);
-                let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout);
+                // Over the guest's pages alone: in a legacy heap, over the device's memory, what
+                // the runtime announces of the texture's layout there (untiled, or lossless where
+                // Metal compresses it) is relayed alone.
+                let untiled = heard.contains(&rt::Degradation::HeapTextureUntiledLayout)
+                    && self.backing.detaches();
                 let alone = if heard.contains(&rt::Degradation::HeapTwoPlaneTexture) {
                     Some(Alone::TwoPlane)
                 } else if optimized {
@@ -2112,14 +1829,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     untiled.then_some(Alone::Untiled)
                 };
                 let object = texture.life();
-                plain(|| {
-                    self.placed
-                        .lock()
-                        .place(sel, bytes.clone(), object.clone(), alone)
-                });
-                if self.backing.detaches() {
-                    crate::gpu::over_pages::placed(sel, self, bytes, object, alone);
-                }
+                plain(|| self.placed.lock().place(sel, bytes, object, alone));
                 texture
             })
         })
@@ -2146,7 +1856,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                     // which is the runtime's import unit on this host.
                     unsafe {
                         (self.raw).rebind_bytes_no_copy(
-                            crate::os::host_memory(first),
+                            crate::os::host_memory(first, true),
                             None,
                             Some(keep),
                         )
@@ -2189,9 +1899,10 @@ impl SamplerState for VulkanSamplerState {
     }
 }
 
-/// Both getters raise below Apple10, the caller's to catch, as the reference host's stubs do: the
-/// runtime refuses the ID there as Metal's validation does, and has no index of its own, so
-/// `resourceIndex` answers as the ID.
+/// The getters below Apple10 are the host's stubs' (the Metal platform's
+/// `depth_stencil_state_getters_raise`, measured on the M3 Max): `gpuResourceID` is the runtime's,
+/// what plain Metal answers, 0; `resourceIndex` raises, and the runtime has no index of its own.
+/// So the guest's info request, which reads both, raises, as on Metal.
 impl DepthStencilState for VulkanDepthStencilState {
     fn gpu_resource_id(&self) -> RaiseResult<u64> {
         send("gpuResourceID", Policy::Caught, || {
@@ -2201,10 +1912,8 @@ impl DepthStencilState for VulkanDepthStencilState {
     }
 
     fn resource_index(&self) -> RaiseResult<u64> {
-        send("resourceIndex", Policy::Caught, || {
-            rt::DepthStencilState::gpu_resource_id(self)
-        })
-        .map(|id| id.0)
+        plain_at("resourceIndex", || ());
+        Err(Raise::platform("resourceIndex"))
     }
 }
 
@@ -2250,19 +1959,14 @@ impl ComputePipeline for VulkanComputePipeline {
         }))
     }
 
-    /// The identifier the state was given when it was made.
+    /// The runtime's identifier of the state, read when it was made.
     fn unique_identifier(&self) -> u64 {
         plain(|| self.unique_identifier)
     }
 
-    /// Its identifier, but for a state made with indirect command buffer support, which dies
-    /// ([`guest_identifier`]).
     fn guest_unique_identifier(&self) -> u64 {
-        guest_identifier(
-            "compute",
-            ComputePipeline::support_indirect_command_buffers(self),
-            ComputePipeline::unique_identifier(self),
-        )
+        let indirect = ComputePipeline::support_indirect_command_buffers(self);
+        guest_identifier(self.unique_identifier, indirect)
     }
 }
 
@@ -2312,12 +2016,10 @@ impl RenderPipeline for VulkanRenderPipeline {
         self.unique_identifier
     }
 
-    /// As a compute state's ([`guest_identifier`]).
     fn guest_unique_identifier(&self) -> u64 {
         guest_identifier(
-            "render",
-            RenderPipeline::support_indirect_command_buffers(self),
             self.unique_identifier,
+            self.support_indirect_command_buffers(),
         )
     }
 }
@@ -2470,6 +2172,64 @@ pub(crate) mod tests {
         // before reading.
         let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
         let site = catch_death(|| host_bytes("s", wraps)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
+    }
+
+    /// The bytes a runtime call reads in place are the range itself, at its pointer and of its
+    /// length; an empty range is no bytes, even at NULL; a non-empty range in the zero region, or
+    /// wrapping past the top of the address space, dies at the selector as a NULL access, as a
+    /// copy of it does
+    #[test]
+    fn guest_bytes_are_the_range_in_place() {
+        let memory = [1u8, 2, 3, 4, 5];
+        let bytes = guest_bytes("s", HostRange::of_slice(&memory));
+        let at = (bytes.pointer().as_ptr().cast_const(), bytes.len());
+        assert_eq!(at, (memory.as_ptr(), 5));
+        // SAFETY: an empty range is never read.
+        let empty = unsafe { HostRange::new(HostPtr::NULL, 0) };
+        assert!(guest_bytes("s", empty).is_empty());
+        let last = u64::try_from(reims_vgpu_core::guest::ZERO_REGION_END - 1).unwrap();
+        for at in [0, 0x10, last] {
+            // SAFETY: a range of 4 bytes in the zero region, which dies before any read.
+            let near_null = unsafe { HostRange::new(HostPtr::NULL.wrapping_add(at), 4) };
+            let site = catch_death(|| guest_bytes("s", near_null)).unwrap_err();
+            assert_eq!(
+                (site.kind, site.file),
+                (DeathKind::NullDeref, "s"),
+                "{at:#x}"
+            );
+        }
+        // SAFETY: a range that wraps past the top of the address space, which dies before any
+        // read.
+        let wraps = unsafe { HostRange::new(HostPtr::from_addr(usize::MAX - 1), 4) };
+        let site = catch_death(|| guest_bytes("s", wraps)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
+    }
+
+    /// A fill's bytes are the first of its range a fill may read, however long the range: one
+    /// the guest sizes to a large buffer is no copy of it; a shorter range is copied whole, and
+    /// one that wraps past the top of the address space dies at the selector as a NULL access,
+    /// though the bytes read lie below the top
+    #[test]
+    fn a_fill_copies_only_the_bytes_it_may_read() {
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
+        let long: Vec<u8> = (0..=255u8).cycle().take(1 << 20).collect();
+        let most = crate::gpu::fill::MOST_PATTERN_BYTES;
+        let bytes = fill_bytes("s", region, HostRange::of_slice(&long), most);
+        assert_eq!(bytes, long[..most]);
+        let streamed = crate::gpu::fill::MOST_STREAMED_PATTERN_BYTES;
+        let bytes = fill_bytes("s", region, HostRange::of_slice(&long), streamed);
+        assert_eq!(bytes, long[..streamed]);
+        let short = [7u8, 8, 9];
+        assert_eq!(
+            fill_bytes("s", region, HostRange::of_slice(&short), most),
+            short
+        );
+        // SAFETY: a range that wraps past the top of the address space, from a real start, which
+        // the fill dies at before reading.
+        let wraps =
+            unsafe { HostRange::new(HostPtr::from_ptr(long.as_ptr().cast_mut()), u64::MAX) };
+        let site = catch_death(|| fill_bytes("s", region, wraps, most)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::NullDeref, "s"));
     }
 
@@ -3184,52 +2944,6 @@ pub(crate) mod tests {
         )
     }
 
-    /// A legacy heap's layout is announced once per device for each reason
-    /// ([`HeapObject::legacy_made`]): a second texture of a reason on a device says nothing, and
-    /// another reason or another device is announced. The line names the reason, the texture
-    /// met first, and that it is an interim notice
-    #[test]
-    fn legacy_layouts_are_announced_once_per_device_and_reason() {
-        let device = u64::MAX - 0x1e6a;
-        assert!(first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(!first_legacy_layout(device, LegacyLayout::Compressible));
-        assert!(first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(!first_legacy_layout(device, LegacyLayout::Multisample));
-        assert!(first_legacy_layout(device - 1, LegacyLayout::Compressible));
-        let desc = platform().texture_descriptor(&TextureDesc {
-            pixel_format: 53,
-            width: 64,
-            height: 32,
-            usage: 0x5,
-            ..TextureDesc::default()
-        });
-        let desc = desc
-            .fields()
-            .descriptor("newTextureWithDescriptor:offset:", Maker::Other);
-        let line = LegacyLayout::Compressible.notice(&desc);
-        for part in [
-            "legacy-heap-compression-layout",
-            "a heap over no address ranges",
-            "pixel format 53, 1 sample(s), 64x32x1",
-            "not Metal's",
-            "losslessly compressed",
-            "Announced once per device",
-            "interim notice",
-        ] {
-            assert!(line.contains(part), "{part}: {line}");
-        }
-        assert!(
-            LegacyLayout::Driver
-                .notice(&desc)
-                .contains("its own layout")
-        );
-        assert!(
-            LegacyLayout::Multisample
-                .notice(&desc)
-                .contains("multisample")
-        );
-    }
-
     /// The size query of a mipmapped texture Metal keeps losslessly compressed, whose layout in
     /// Metal's heaps the runtime models, answers Metal's as the runtime models it
     /// (`Device::metal_heap_texture_size_and_align`) on Metal, and at least that on a native
@@ -3239,8 +2953,8 @@ pub(crate) mod tests {
     /// and the three-level `RGBA16Float` render targets the macOS 26 boots asked the size of,
     /// with `BlockWritesOnly` and without ([`LOSSLESS_MIPMAPPED_SHAPES`]). A texture
     /// of its own memory of each is made, and so is its placement in a heap of the query's size,
-    /// over no address ranges, whose layout there is noticed (Metal may compress it, or the
-    /// driver lays it out its own way: [`HeapObject::legacy_made`]). On every OS: what is checked
+    /// over no address ranges, whose layout there the runtime announces, Metal keeping it
+    /// compressed (`heap-texture-lossless-layout`). On every OS: what is checked
     /// is the runtime's answer and what is made of it, on whatever device; how it compares with
     /// Metal's is `metal_tests`' (`lossless_mipmapped_heap_texture_sizes_are_metals`)
     #[test]
@@ -3281,15 +2995,12 @@ pub(crate) mod tests {
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
-            LEGACY_LAYOUTS.with(|l| l.borrow_mut().clear());
+            let before = crate::answer::RELAYED.lock().len();
             let placed = heap.new_texture(&desc, 0).unwrap().unwrap();
             assert_eq!(placed.mipmap_level_count(), mipmap_level_count, "{name}");
-            let noticed = LEGACY_LAYOUTS.with(|l| std::mem::take(&mut *l.borrow_mut()));
-            let layout = match on_moltenvk(&d) {
-                true => LegacyLayout::Compressible,
-                false => LegacyLayout::Driver,
-            };
-            assert_eq!(noticed, [layout], "{name}");
+            let lossless = rt::Degradation::HeapTextureLosslessLayout;
+            let relayed = crate::answer::RELAYED.lock()[before..].to_vec();
+            assert!(relayed.contains(&lossless), "{name}: {relayed:?}");
         }
         let unmeasured = rt::Degradation::UnmeasuredHeapTextureSize;
         assert!(!crate::answer::RELAYED.lock().contains(&unmeasured));
@@ -3327,13 +3038,12 @@ pub(crate) mod tests {
         u64::from(width.max(height).ilog2()) + 1
     }
 
-    /// The usages of a depth or stencil texture without allowGPUOptimizedContents that
-    /// [`crate::gpu::metal_space::metal_size_and_align`] answers none for, of each of
-    /// `Depth16Unorm`, `Depth32Float`, `Stencil8` and `Depth32Float_Stencil8`, at `Private` and
-    /// `Shared` storage: `ShaderRead | ShaderAtomic`, at which Metal asserts, of a 64x64 2D
-    /// texture, which the runtime refuses `Invalid` (`UsageForFormat`). Each name, its usage and
-    /// its sample count. The usages holding neither `ShaderRead` nor `RenderTarget` but another
-    /// bit take the rules ([`DEPTH_MORE_USAGES`]).
+    /// The usages of a depth or stencil texture without allowGPUOptimizedContents at which Metal
+    /// asserts, of each of `Depth16Unorm`, `Depth32Float`, `Stencil8` and
+    /// `Depth32Float_Stencil8`, at `Private` and `Shared` storage: `ShaderRead | ShaderAtomic`,
+    /// of a 64x64 2D texture, which the runtime refuses `Invalid` (`UsageForFormat`). Each name,
+    /// its usage and its sample count. The usages holding neither `ShaderRead` nor
+    /// `RenderTarget` but another bit take Metal's layout ([`DEPTH_MORE_USAGES`]).
     const UNMEASURED_DEPTH_USAGES: [(&str, u64, u64); 1] = [("ShaderRead | ShaderAtomic", 0x21, 1)];
 
     /// `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with
@@ -4190,14 +3900,11 @@ pub(crate) mod tests {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
     }
 
-    /// A texture of a PVRTC format (`PVRTC_RGBA_4BPP`) placed in a heap over the guest's pages,
-    /// whose blocks the runtime lays out as its own at every level where Metal tiles them, dies
-    /// at the placement, its line naming `heap-texture-block-compressed-layout`
-    /// ([`crate::answer::DIES`]); a texture of a plain format of `ShaderWrite` usage there, and
-    /// one of `BC1_RGBA`, whose blocks lie in Metal's tiles at this host's macOS 26.7, are made
-    /// (the compressed ones of `ShaderRead` usage)
+    /// A texture of a plain format of `ShaderWrite` usage placed in a heap over the guest's pages
+    /// is made, and so are one of `BC1_RGBA` and one of a PVRTC format (`PVRTC_RGBA_4BPP`), of
+    /// `ShaderRead` usage, whose blocks lie in Metal's tiles at every level
     #[test]
-    fn a_heap_texture_over_guest_pages_in_the_runtimes_layout_dies() {
+    fn heap_textures_over_guest_pages_in_metals_block_layout_are_made() {
         use reims_vgpu_core::platform::types::ResourceAddressRange;
 
         const SIZE: u64 = 0x10000;
@@ -4233,18 +3940,7 @@ pub(crate) mod tests {
         };
         assert!(heap.new_texture(&desc(70, 0x3), 0).unwrap().is_some());
         assert!(heap.new_texture(&desc(130, 0x1), 0x8000).unwrap().is_some());
-        *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| heap.new_texture(&desc(166, 0x1), 0xc000).is_ok()).unwrap_err();
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        assert_eq!(
-            (site.kind, site.file),
-            (DeathKind::Abort, "newTextureWithDescriptor:offset:"),
-            "{line}"
-        );
-        assert!(
-            line.contains("heap-texture-block-compressed-layout"),
-            "{line}"
-        );
+        assert!(heap.new_texture(&desc(166, 0x1), 0xc000).unwrap().is_some());
     }
 
     /// A writable heap of 4 KiB over a page of the guest's, as core's detach heap makes one of
@@ -4365,6 +4061,7 @@ pub(crate) mod tests {
     }
 
     /// [`heap_over_pages`]' heap, texture and offset, the heap over the pages at `address`.
+    #[cfg(target_os = "macos")]
     pub(crate) fn heap_over_pages_at<P: Platform>(
         p: &P,
         d: &P::Device,
@@ -4376,6 +4073,7 @@ pub(crate) mod tests {
     }
 
     /// [`heap_over_pages`]' texture of `heap`'s options, and the offset past its bytes.
+    #[cfg(target_os = "macos")]
     fn depth_stencil_of<P: Platform>(
         p: &P,
         d: &P::Device,
@@ -4409,464 +4107,62 @@ pub(crate) mod tests {
         (depth_stencil, beside, answer.size)
     }
 
-    /// Every command that names a buffer uses it: each names a buffer over all of a second heap
-    /// over the guest's pages under a texture of the first that the runtime does not lay out in
-    /// Metal's tiles (`heap-texture-untiled-layout`), the second heap's cover, while the texture
-    /// lives, and dies at its selector, naming the kind, before the runtime sees it: a compute
-    /// pass's binds, indirect dispatches, conditions, stage-in region, indirect execution range
-    /// and resources made resident, and `encodeEndDoWhile:`; a render pass's visibility buffer,
-    /// binds, indices, indirect arguments, patch index buffers, indirect execution range and
-    /// resources made resident; a blit's fill and copies; and an indirect command's binds and
-    /// indices. Making the second heap resident (`useHeaps:`) uses all of its bytes, and dies too
-    /// ([`crate::gpu::over_pages`])
-    #[test]
-    fn each_command_naming_a_buffer_over_an_untiled_textures_pages_dies() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-        use reims_vgpu_core::platform::icb::{
-            IcbComputeCmd, IcbRenderCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
-            IndirectRenderCommand as _,
+    /// A two-plane XR10 texture (550, 551) of `pixel_format`, 16x16, of `shape`'s type, levels,
+    /// slices and depth.
+    fn xr10_shaped(pixel_format: u64, shape: fn(&mut TextureDesc)) -> VulkanTextureDescriptor {
+        let mut desc = TextureDesc {
+            pixel_format,
+            width: 16,
+            height: 16,
+            usage: 0x1,
+            resource_options: Some(0x120),
+            ..TextureDesc::default()
         };
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-        use reims_vgpu_core::platform::types::MtlOrigin;
-        use reims_vgpu_core::platform::values::{ColorAttachmentSet, IcbDesc, PassSet};
-
-        let (p, d) = (platform(), dev());
-        let at = guest_pages();
-        let (heap, depth_stencil, _) = heap_over_pages_at(&p, &d, at);
-        let t = heap.new_texture(&depth_stencil, 0).unwrap().unwrap();
-        let second = heap_at(&p, &d, at);
-        let options = second.resource_options();
-        let cover = second
-            .new_buffer_of_length(over_pages(), options, 0)
-            .unwrap()
-            .unwrap();
-        let other = d
-            .new_buffer_of_length(OnFault::Return, 0x1000, 0)
-            .unwrap()
-            .unwrap();
-        let target = d
-            .new_texture(
-                OnFault::Return,
-                &platform().texture_descriptor(&TextureDesc {
-                    pixel_format: 80,
-                    width: 16,
-                    height: 16,
-                    usage: 0x5,
-                    resource_options: Some(0x20),
-                    ..TextureDesc::default()
-                }),
-            )
-            .unwrap()
-            .unwrap();
-        let compute_icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 0x20,
-                    max_kernel_buffer_bind_count: 2,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let render_icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 0x3,
-                    max_vertex_buffer_bind_count: 2,
-                    max_fragment_buffer_bind_count: 2,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let covers = [Some(&cover)];
-        let (offsets, strides) = ([0u64], [4u64]);
-        let heaps = [Some(&second)];
-        let resources = [Some(ResourceRef::Buffer(&cover))];
-        let one = NsRange::new(0, 1);
-        let size = MtlSize::new(1, 1, 1);
-        let mut cases = 0;
-        let mut dies = |sel: &'static str, case: &str, run: &mut dyn FnMut()| {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(run).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!(
-                (site.kind, site.file),
-                (DeathKind::Abort, sel),
-                "{case}: {line}"
-            );
-            let pages = "bytes over the guest's pages that a texture of a heap over them lies over";
-            assert!(line.contains(pages), "{case}: {line}");
-            assert!(
-                line.contains("heap-texture-untiled-layout"),
-                "{case}: {line}"
-            );
-            cases += 1;
-        };
-
-        let compute = [
-            ComputeCmd::SetBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            ComputeCmd::SetBuffersAttributeStrides {
-                buffers: &covers,
-                offsets: &offsets,
-                strides: &strides,
-                range: one,
-            },
-            ComputeCmd::DispatchThreadgroupsIndirect {
-                indirect_buffer: Some(&cover),
-                indirect_buffer_offset: 0,
-                threads_per_threadgroup: size,
-            },
-            ComputeCmd::DispatchThreadsIndirect {
-                indirect_buffer: Some(&cover),
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::EncodeStartIf {
-                buffer: Some(&cover),
-                offset: 0,
-                comparison: 0,
-                reference_value: 0,
-            },
-            ComputeCmd::EncodeStartWhile {
-                buffer: Some(&cover),
-                offset: 0,
-                comparison: 0,
-                reference_value: 0,
-            },
-            ComputeCmd::SetStageInRegionIndirect {
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer: &compute_icb,
-                indirect_range_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            ComputeCmd::UseResources {
-                resources: &resources,
-                usage: 1,
-            },
-            ComputeCmd::UseHeaps { heaps: &heaps },
-        ];
-        for cmd in compute {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-        let end_do_while = "encodeEndDoWhile:offset:comparison:referenceValue:";
-        dies(end_do_while, end_do_while, &mut || {
-            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-            e.encode(OnFault::Return, ComputeCmd::EncodeStartDoWhile)
-                .unwrap();
-            e.encode_end_do_while(Some(&cover), 0, 0, 0).unwrap();
-        });
-
-        let pass = |visibility: Option<&VulkanBuffer>| {
-            let pass = p.render_pass_descriptor();
-            let attachment = ColorAttachmentSet {
-                texture: Some(Some(&target)),
-                load_action: Some(2),
-                store_action: Some(1),
-                ..ColorAttachmentSet::default()
-            };
-            pass.set_color_attachment(OnFault::Die, 0, &attachment)
-                .unwrap();
-            if let Some(visibility) = visibility {
-                pass.set_pass(&PassSet {
-                    visibility_result_buffer: Some(Some(visibility)),
-                    ..PassSet::default()
-                });
-            }
-            pass
-        };
-        let visibility = "renderCommandEncoderWithDescriptor:";
-        dies(visibility, "a visibility buffer", &mut || {
-            let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-            cb.render_encoder(OnFault::Return, &pass(Some(&cover)))
-                .unwrap();
-        });
-        let render = [
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetFragmentBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetTessellationFactorBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                instance_stride: 0,
-            },
-            RenderCmd::SetVertexBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::SetVertexBuffersAttributeStrides {
-                buffers: &covers,
-                offsets: &offsets,
-                strides: &strides,
-                range: one,
-            },
-            RenderCmd::SetFragmentBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::SetTileBuffers {
-                buffers: &covers,
-                offsets: &offsets,
-                range: one,
-            },
-            RenderCmd::DrawIndexedPrimitives {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-            },
-            RenderCmd::DrawIndexedPrimitivesInstances {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 1,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-                instance_count: 1,
-            },
-            RenderCmd::DrawIndexedPrimitivesBase {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: &cover,
-                index_buffer_offset: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-            RenderCmd::DrawIndexedPrimitivesIndirect {
-                primitive_type: 3,
-                index_type: 0,
-                index_buffer: &other,
-                index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawPrimitivesIndirect {
-                primitive_type: 3,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer: Some(&cover),
-                patch_index_buffer_offset: 0,
-                instance_count: 1,
-                base_instance: 0,
-            },
-            RenderCmd::DrawIndexedPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 1,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                control_point_index_buffer: &cover,
-                control_point_index_buffer_offset: 0,
-                instance_count: 1,
-                base_instance: 0,
-            },
-            RenderCmd::DrawPatchesIndirect {
-                number_of_patch_control_points: 3,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::DrawIndexedPatchesIndirect {
-                number_of_patch_control_points: 3,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                control_point_index_buffer: &other,
-                control_point_index_buffer_offset: 0,
-                indirect_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::ExecuteCommandsIndirect {
-                indirect_commandbuffer: &render_icb,
-                indirect_range_buffer: &cover,
-                indirect_buffer_offset: 0,
-            },
-            RenderCmd::UseResources {
-                resources: &resources,
-                usage: 1,
-            },
-            RenderCmd::UseResourcesStages {
-                resources: &resources,
-                usage: 1,
-                stages: 3,
-            },
-            RenderCmd::UseHeaps { heaps: &heaps },
-            RenderCmd::UseHeapsStages {
-                heaps: &heaps,
-                stages: 3,
-            },
-        ];
-        for cmd in render {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.render_encoder(OnFault::Return, &pass(None));
-                let e = e.unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-
-        let blit = [
-            BlitCmd::FillBuffer {
-                buffer: &cover,
-                range: NsRange::new(0, 16),
-                value: 0,
-            },
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer: Some(&cover),
-                source_offset: 0,
-                destination_buffer: Some(&other),
-                destination_offset: 0,
-                size: 16,
-            },
-            BlitCmd::CopyBufferToBuffer {
-                source_buffer: Some(&other),
-                source_offset: 0,
-                destination_buffer: Some(&cover),
-                destination_offset: 0,
-                size: 16,
-            },
-            BlitCmd::CopyBufferToTexture {
-                source_buffer: &cover,
-                source_offset: 0,
-                source_bytes_per_row: 64,
-                source_bytes_per_image: 1024,
-                source_size: MtlSize::new(16, 16, 1),
-                destination_texture: &target,
-                destination_slice: 0,
-                destination_level: 0,
-                destination_origin: MtlOrigin::default(),
-            },
-        ];
-        for cmd in blit {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
-                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-                e.encode(OnFault::Return, cmd.take().unwrap()).unwrap();
-            });
-        }
-
-        let render_command = render_icb.render_command(0).unwrap().unwrap();
-        let icb_render = [
-            IcbRenderCmd::SetVertexBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            IcbRenderCmd::SetFragmentBuffer {
-                buffer: Some(&cover),
-                offset: 0,
-                index: 0,
-            },
-            IcbRenderCmd::DrawIndexedPrimitives {
-                primitive_type: 3,
-                index_count: 3,
-                index_type: 0,
-                index_buffer: Some(&cover),
-                index_buffer_offset: 0,
-                instance_count: 1,
-                base_vertex: 0,
-                base_instance: 0,
-            },
-        ];
-        for cmd in icb_render {
-            let sel = cmd.selector();
-            let mut cmd = Some(cmd);
-            dies(sel, sel, &mut || {
-                render_command.encode(cmd.take().unwrap()).unwrap();
-            });
-        }
-        let compute_command = compute_icb.compute_command(0).unwrap().unwrap();
-        let kernel_buffer = IcbComputeCmd::SetKernelBuffer {
-            buffer: Some(&cover),
-            offset: 0,
-            index: 0,
-        };
-        let sel = kernel_buffer.selector();
-        let mut kernel_buffer = Some(kernel_buffer);
-        dies(sel, sel, &mut || {
-            compute_command
-                .encode(kernel_buffer.take().unwrap())
-                .unwrap();
-        });
-        assert_eq!(cases, 41, "every case ran");
-        drop((t, cover, second, heap));
+        shape(&mut desc);
+        platform().texture_descriptor(&desc)
     }
 
-    /// A two-plane XR10 texture (550, 551) whose texels the runtime keeps apart from the heap's
-    /// bytes (`heap-two-plane-texture`), a mipmapped one, dies at its placement beside the heap's
-    /// cover, core's buffer over all of it, made first, as in every heap core makes: no suite
-    /// case or round places one ([`Placements`]). A one-level 2D one, whose planes the heap's
-    /// bytes keep, is made beside it
+    /// A 3D two-plane XR10 texture of two depth slices, whose texels the runtime keeps over its
+    /// first slice's planes in the heap's bytes, where Metal's writes lay every slice.
+    const THREE_D: fn(&mut TextureDesc) = |d| {
+        d.texture_type = 7;
+        d.depth = 2;
+    };
+
+    /// A mipmapped two-plane XR10 texture (550, 551), whose first level's planes the heap's bytes
+    /// keep and whose later levels lie apart from them (`heap-two-plane-layout`,
+    /// [`crate::answer::DIES`]), dies at its placement beside the heap's cover, core's buffer over
+    /// all of it, made first, in strict mode, naming the kind. A one-level 2D one, a 2D array of
+    /// one level and a 3D one of two slices, whose planes the heap's bytes keep (a 3D one's first
+    /// slice's), are made beside the cover. One the runtime keeps apart from the heap's bytes
+    /// (`heap-two-plane-texture`), past the device's limits, dies beside it, as
+    /// `placements_tell_the_heaps_cover_apart` shows of [`Alone::TwoPlane`]
     #[test]
-    fn two_plane_textures_apart_die_beside_the_heaps_cover() {
+    fn two_plane_textures_beside_the_heaps_cover() {
         let texture_sel = "newTextureWithDescriptor:offset:";
+        let mipmapped: fn(&mut TextureDesc) = |d| d.mipmap_level_count = 2;
+        let array: fn(&mut TextureDesc) = |d| {
+            d.texture_type = 3;
+            d.array_length = 2;
+        };
         for pixel_format in [550, 551] {
-            let xr10 = |levels| {
-                platform().texture_descriptor(&TextureDesc {
-                    pixel_format,
-                    width: 16,
-                    height: 16,
-                    mipmap_level_count: levels,
-                    usage: 0x1,
-                    resource_options: Some(0x120),
-                    ..TextureDesc::default()
-                })
-            };
             let h = private_heap();
             let cover = h.new_buffer_of_length(0x8000, 0x120, 0).unwrap().unwrap();
             *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| h.new_texture(&xr10(2), 0)).unwrap_err();
+            let site = catch_death(|| h.new_texture(&xr10_shaped(pixel_format, mipmapped), 0))
+                .unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             assert_eq!(
                 (site.kind, site.file),
                 (DeathKind::Abort, texture_sel),
                 "{pixel_format}: {line}"
             );
-            assert!(line.contains("heap-two-plane-texture"), "{line}");
-            let one_level = h.new_texture(&xr10(1), 0).unwrap();
-            assert!(one_level.is_some(), "{pixel_format} one level");
-            drop((one_level, cover));
+            assert!(line.contains("heap-two-plane-layout"), "{line}");
+            for shape in [|_: &mut TextureDesc| {}, array, THREE_D] {
+                let made = h.new_texture(&xr10_shaped(pixel_format, shape), 0).unwrap();
+                assert!(made.is_some(), "{pixel_format}");
+            }
+            drop(cover);
         }
     }
 
@@ -4947,106 +4243,33 @@ pub(crate) mod tests {
         drop((guests, over, two_plane));
     }
 
-    /// A buffer or texture placed over a byte of a two-plane XR10 texture (550, 551) of its heap
-    /// whose texels lie apart from the heap's bytes, a mipmapped one or a 2D array, dies at the
-    /// placement while the texture lives, and so does such a texture placed over a byte of a
-    /// buffer or texture that lives: the runtime announced the texture at its creation
-    /// (`heap-two-plane-texture`, [`crate::answer::HEARD`]). A buffer and a texture are made
-    /// beside it, a buffer of no bytes over it, and each over one let go; and a one-level 2D
-    /// texture of the format, whose planes the heap's bytes keep, takes a buffer and a texture
-    /// over it
+    /// A buffer and a texture are made over a two-plane XR10 texture (550, 551) of its heap whose
+    /// planes the heap's bytes keep, while it lives, and such a texture over them: a one-level 2D
+    /// one, a 2D array of one level and a 3D one of two slices, whose texels lie over its first
+    /// slice's planes, where Metal lays them. One the runtime keeps apart from the heap's bytes
+    /// (`heap-two-plane-texture`), past the device's limits, is kept alone, as
+    /// `placements_tell_the_heaps_cover_apart` shows of [`Alone::TwoPlane`]
     #[test]
-    fn placements_over_two_plane_textures_apart_die() {
-        let xr10 = |pixel_format, shape: fn(&mut TextureDesc)| {
-            let mut desc = TextureDesc {
-                pixel_format,
-                width: 16,
-                height: 16,
-                usage: 0x1,
-                resource_options: Some(0x120),
-                ..TextureDesc::default()
-            };
-            shape(&mut desc);
-            platform().texture_descriptor(&desc)
-        };
-        let mipmapped: fn(&mut TextureDesc) = |d| d.mipmap_level_count = 2;
+    fn placements_over_two_plane_textures_in_the_heaps_bytes_are_made() {
+        let xr10 = xr10_shaped;
         let array: fn(&mut TextureDesc) = |d| {
             d.texture_type = 3;
             d.array_length = 2;
         };
         let one_level: fn(&mut TextureDesc) = |_| {};
-        let buffer_sel = "newBufferWithLength:options:offset:";
-        let texture_sel = "newTextureWithDescriptor:offset:";
-        let dies = |site: reims_vgpu_core::raise::death::DeathSite, sel, case: &str| {
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{case}");
-        };
         for pixel_format in [550, 551] {
-            for (shape, named) in [(mipmapped, "mipmapped"), (array, "array")] {
-                let case = format!("{pixel_format} {named}");
+            for shape in [one_level, array, THREE_D] {
                 let h = private_heap();
-                let size = dev()
-                    .heap_texture_size_and_align(&xr10(pixel_format, shape))
-                    .unwrap()
-                    .size;
-                let align = dev()
-                    .heap_texture_size_and_align(&bgra(16, 16, 0x120))
-                    .unwrap()
-                    .align;
-                let beside = size.next_multiple_of(align.max(0x100));
                 let t = h
                     .new_texture(&xr10(pixel_format, shape), 0)
                     .unwrap()
                     .unwrap();
-                let last = (size - 1) & !0xff;
-                dies(
-                    catch_death(|| h.new_buffer_of_length(0x100, 0x20, last)).unwrap_err(),
-                    buffer_sel,
-                    &case,
-                );
-                dies(
-                    catch_death(|| h.new_texture(&bgra(16, 16, 0x120), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                dies(
-                    catch_death(|| h.new_texture(&xr10(551, shape), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                let empty = h.new_buffer_of_length(0, 0x20, 0).unwrap().unwrap();
-                let b = h
-                    .new_buffer_of_length(0x100, 0x20, beside)
-                    .unwrap()
-                    .unwrap();
-                let u = h
-                    .new_texture(&bgra(16, 16, 0x120), beside)
-                    .unwrap()
-                    .unwrap();
-                drop(t);
                 let over = h.new_buffer_of_length(0x100, 0x20, 0).unwrap().unwrap();
-                dies(
-                    catch_death(|| h.new_texture(&xr10(pixel_format, shape), 0)).unwrap_err(),
-                    texture_sel,
-                    &case,
-                );
-                drop((over, b, u, empty));
-                assert!(
-                    h.new_texture(&xr10(pixel_format, shape), 0)
-                        .unwrap()
-                        .is_some(),
-                    "{case}"
-                );
+                let u = h.new_texture(&bgra(16, 16, 0x120), 0).unwrap().unwrap();
+                let again = h.new_texture(&xr10(pixel_format, shape), 0).unwrap();
+                assert!(again.is_some(), "{pixel_format}");
+                drop((t, over, u, again));
             }
-            let h = private_heap();
-            let t = h
-                .new_texture(&xr10(pixel_format, one_level), 0)
-                .unwrap()
-                .unwrap();
-            let over = h.new_buffer_of_length(0x100, 0x20, 0).unwrap().unwrap();
-            let u = h.new_texture(&bgra(16, 16, 0x120), 0).unwrap().unwrap();
-            let again = h.new_texture(&xr10(pixel_format, one_level), 0).unwrap();
-            assert!(again.is_some(), "{pixel_format} one level");
-            drop((t, over, u, again));
         }
     }
 

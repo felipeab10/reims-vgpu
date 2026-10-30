@@ -15,10 +15,10 @@
 //!   descriptors Metal makes from serialized data take only their resource index.
 //! - Setters and getters are `Fatal` sends: a raise inside one dies at the call ([`msg::get`]).
 //!   The attachment arrays' subscripts (`On` where the display's frame sets a colour attachment
-//!   with no handler and the decoder under one, `Caught` for the decoder's attachment state,
-//!   `Uncaught` for a display's pipeline) and `setSamplePositions:count:`
-//!   (`Caught`: only the decoder sends it) answer on the thrown channel the traits carry
-//!   ([`msg::send`]).
+//!   with no handler and the decoder under one, `Caught` for the decoder's attachment state)
+//!   and `setSamplePositions:count:` (`Caught`: only the decoder sends it) answer on the thrown
+//!   channel the traits carry ([`msg::send`]); a display's pipeline's subscript is a `Fatal`
+//!   send, as its setters are.
 //! - A raw guest value goes to Metal as it is: an enum or option set is its newtype over the
 //!   same word, whatever Metal makes of it.
 //! - A sub-object (an attachment, a stencil descriptor, an attachment array) comes back `+0`,
@@ -301,10 +301,13 @@ fn buffer_resource_options(d: &MetalBufferDescriptor, resource_options: u64) {
 }
 
 /// `setDeallocator:` of a block that runs `deallocator` at most once. Metal copies the block and
-/// calls it once, with the buffer's contents and length, when the buffer it made is released.
+/// calls it once, with the buffer's contents and length, after the buffer it made is released,
+/// on a thread of its own: the block runs marked as ours there, so a panic in `deallocator`
+/// aborts before it unwinds into Metal (6.5).
 fn set_buffer_deallocator(d: &MetalBufferDescriptor, deallocator: BufferDeallocator) {
     let once = Mutex::new(Some(deallocator));
     let block = RcBlock::new(move |pointer: *mut c_void, length: u64| {
+        let _ours = reims_vgpu_core::rt::enter_ours();
         if let Some(d) = once.lock().take() {
             d(HostPtr::from_ptr(pointer), length);
         }
@@ -652,8 +655,8 @@ pub fn apply_compute_pass(desc: &ComputePassDesc, d: &MetalComputePassDescriptor
 
 /// Makes `d` hold `desc`. Order: label, vertex function, fragment function, then colour
 /// attachment 0's pixel format (`colorAttachments`, then `objectAtIndexedSubscript:`, whose raise
-/// dies at the send: no path reaches it under a handler), then the resource index and its force
-/// flag.
+/// dies at the send: no path reaches it under a handler) and, with `blend_over`, its blending,
+/// then the resource index and its force flag.
 pub fn apply_render_pipeline(
     desc: &RenderPipelineDesc<'_, MetalPlatform>,
     d: &MetalRenderPipelineDescriptor,
@@ -680,10 +683,31 @@ pub fn apply_render_pipeline(
             MTLPixelFormat(desc.color0_pixel_format.to_usize()),
         );
         msg::get("setPixelFormat:", || a.setPixelFormat(v));
+        if desc.blend_over {
+            blend_over(a);
+        }
     }
     if let Some((index, force)) = desc.resource_index {
         pipeline_resource_index(o, index, force);
     }
+}
+
+/// Has `a` blend each fragment, its colour premultiplied, over the target by its alpha
+/// (`RenderPipelineDesc::blend_over`).
+fn blend_over(a: &MTLRenderPipelineColorAttachmentDescriptor) {
+    msg::get("setBlendingEnabled:", || a.setBlendingEnabled(true));
+    msg::get("setSourceRGBBlendFactor:", || {
+        a.setSourceRGBBlendFactor(MTLBlendFactor::One);
+    });
+    msg::get("setDestinationRGBBlendFactor:", || {
+        a.setDestinationRGBBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    });
+    msg::get("setSourceAlphaBlendFactor:", || {
+        a.setSourceAlphaBlendFactor(MTLBlendFactor::One);
+    });
+    msg::get("setDestinationAlphaBlendFactor:", || {
+        a.setDestinationAlphaBlendFactor(MTLBlendFactor::OneMinusSourceAlpha);
+    });
 }
 
 /// `setResourceIndex:` then `setForceResourceIndex:` on a render pipeline descriptor.
@@ -1248,6 +1272,7 @@ mod tests {
                 vertex: &k.function,
                 fragment: &k.function,
                 color0_pixel_format: 80,
+                blend_over: false,
                 resource_index: Some((2, true)),
             },
             &x,
@@ -1267,6 +1292,41 @@ mod tests {
         // SAFETY: index 0 of the colour attachments.
         let c = unsafe { a.objectAtIndexedSubscript(0) };
         assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
+        assert!(!c.isBlendingEnabled());
+    }
+
+    /// `blend_over` has colour attachment 0 blend the fragment, premultiplied, over by its alpha
+    #[test]
+    fn a_blended_pipeline_value_blends_over_by_alpha() {
+        let k = kit();
+        let x: MetalRenderPipelineDescriptor =
+            Obj::from_retained(MTLRenderPipelineDescriptor::new());
+        apply_render_pipeline(
+            &RenderPipelineDesc {
+                label: None,
+                vertex: &k.function,
+                fragment: &k.function,
+                color0_pixel_format: 80,
+                blend_over: true,
+                resource_index: None,
+            },
+            &x,
+        );
+        let a = x.get().colorAttachments();
+        // SAFETY: index 0 of the colour attachments.
+        let c = unsafe { a.objectAtIndexedSubscript(0) };
+        assert_eq!(c.pixelFormat(), MTLPixelFormat(80));
+        assert!(c.isBlendingEnabled());
+        assert_eq!(c.sourceRGBBlendFactor(), MTLBlendFactor::One);
+        assert_eq!(
+            c.destinationRGBBlendFactor(),
+            MTLBlendFactor::OneMinusSourceAlpha
+        );
+        assert_eq!(c.sourceAlphaBlendFactor(), MTLBlendFactor::One);
+        assert_eq!(
+            c.destinationAlphaBlendFactor(),
+            MTLBlendFactor::OneMinusSourceAlpha
+        );
     }
 
     /// setContents: and setDeallocator: (SPI) on the private buffer descriptor: the buffer Metal
@@ -1308,6 +1368,46 @@ mod tests {
             *seen.lock(),
             vec![(HostPtr::from_ptr(aligned), page.to_u64())]
         );
+        drop(mem);
+    }
+
+    /// Metal calls a descriptor's deallocator after the buffer's release, on a thread of its own:
+    /// the deallocator runs marked as ours there, so a panic in it aborts before it unwinds into
+    /// Metal's frames
+    #[test]
+    fn a_descriptor_deallocator_runs_marked_as_ours() {
+        use reims_vgpu_core::rt::is_our_thread;
+        let k = kit();
+        let page = 16384usize;
+        let mut mem = vec![0u8; page * 2];
+        let base = mem.as_mut_ptr();
+        let aligned = base.wrapping_add(base.align_offset(page));
+        // SAFETY: `aligned..aligned+page` lies in `mem`, which outlives the buffer (its
+        // deallocator has run before `mem` is dropped).
+        let contents = unsafe { HostRange::new(HostPtr::from_ptr(aligned), page.to_u64()) };
+        let ours = Arc::new(Mutex::new(None));
+        let o = ours.clone();
+        let b = k
+            .device
+            .new_buffer(BufferDesc {
+                length: page.to_u64(),
+                options: vec![],
+                pinned_gpu_address: None,
+                contents: Some(contents),
+                no_copy: true,
+                deallocator: Some(Box::new(move |_, _| *o.lock() = Some(is_our_thread()))),
+            })
+            .unwrap()
+            .unwrap();
+        drop(b);
+        for _ in 0..500 {
+            if ours.lock().is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        assert_eq!(*ours.lock(), Some(true));
+        assert!(!is_our_thread());
         drop(mem);
     }
 

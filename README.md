@@ -48,14 +48,16 @@ pins, and Cargo fetches metal2vulkan from its public repository, at the commit t
 ### x86-64 guest on Linux (KVM)
 
 1. **Host prep.** You need KVM (`/dev/kvm`) and a Vulkan driver; `reims-ctl gpus` lists the GPUs a
-   VM can be given. The library's views of guest memory take a kernel mapping for each run of
-   guest pages, so raise `vm.max_map_count`: `sudo sysctl -w vm.max_map_count=2097152` covers a
-   guest of up to 30 GiB, and a file in `/etc/sysctl.d` keeps it. `scripts/install-ctl.sh` and
-   `reims-ctl` warn when it is too low.
+   VM can be given. The guest's memory reaches the GPU through `/dev/udmabuf`, whatever your GPU,
+   so you need to be able to open it: without it the guest can crash at higher resolutions, at 4K
+   even at its desktop. That means being in the group that owns it (usually `kvm`, the same group
+   as `/dev/kvm`); a desktop session may let you open it anyway, but a VM started over ssh needs
+   the group. `scripts/install-ctl.sh` offers to add you, and `reims-ctl` warns when you can't.
 
-   On an AMD GPU, the guest's memory reaches the GPU through `/dev/udmabuf`, so you need to be in
-   the group that owns it (`kvm` on Ubuntu, the same group as `/dev/kvm`). `reims-ctl` warns when a
-   VM on an AMD GPU can't open it.
+   On an NVIDIA GPU, raising `vm.max_map_count` makes things faster: past a point the GPU gets
+   copies of the guest's memory instead of the memory itself. `reims-ctl doctor` and the
+   installer tell you the value that avoids the copies, if yours is lower. It's optional: the
+   guest works at your distribution's default.
 
 2. **Create a VM.** Run `reims-ctl`, press `n`, pick a macOS version and press Ctrl-S. It downloads
    the installer from Apple and makes the VM's OpenCore image and disk; then press `s` to start it.
@@ -196,11 +198,12 @@ set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
 |---|---|---|---|---|---|
 | **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `apple-gfx-pci` (`106b:eeee`) with its option ROM | **Vulkan** through metal2vulkan | `reims-ctl` |
 | **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
-| **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | QEMU configured on `cargo xtask dist --platform vulkan`'s tree |
+| **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | `reims-ctl`, installed with `GPU_ARM=vulkan scripts/install-ctl.sh` |
 
 On a Mac, Metal is the product and the default, and `reims-ctl` runs on it. The Vulkan platform
 builds there too, into `target/dist-vulkan`, so the smoke, the suite and a QEMU configured on that
-tree can run on it beside the Metal one.
+tree can run on it beside the Metal one. `GPU_ARM=vulkan scripts/install-ctl.sh` installs
+`reims-ctl`'s QEMU on it, and `GPU_ARM=metal` goes back.
 
 - The library: `crates/`. Core holds all behavior, generic over its platform; beside it are the
   Metal and Vulkan platforms, a display's window, the Rust API and the C API
@@ -258,10 +261,11 @@ the following.
   (`firmware/`) that `cargo xtask dist` builds with Xcode's clang.
 - For the QEMU targets: the `vendor/qemu` submodule (`git submodule update --init vendor/qemu`) and
   QEMU's build dependencies (Homebrew's `meson`, `ninja`, `pkg-config`, `glib`, `pixman` and so
-  on).
+  on), with Homebrew's `gnutls`, which gives QEMU the AES that `vmapple`'s AES engine needs:
+  `make qemu` configures QEMU with `--enable-gnutls`, and stops where it is missing.
 
 The suite's host-dependent expected files are recorded on an Apple M3 Max with a 40-core GPU, macOS
-build 25G229.
+27.0.1 (build 26A434).
 
 On x86-64 Linux the library builds on the Vulkan platform alone, with no Mac and no Xcode. It needs
 the toolchain above (cargo fetches metal2vulkan at the commit the workspace's `Cargo.toml` names),
@@ -285,6 +289,11 @@ make clean        # remove build/
 The Makefile's header describes every target and its variables. `make` runs `cargo`, which you can
 drive directly. [docs/development.md](docs/development.md) has the repository's layout, its tests,
 the crates, `cargo xtask` and the build profiles and features.
+
+If you have [kache](https://github.com/kunobi-ninja/kache) installed, run
+`. scripts/internal/dev-env.sh` before cargo and your builds go through it, so a new worktree reuses
+what other worktrees on your machine already compiled. It's optional: without kache, builds are
+cargo's own. See "Building through kache" in docs/development.md for the setup.
 
 On Linux, `cargo xtask dist` builds the library on the Vulkan platform into `target/dist-vulkan`.
 The Vulkan platform's shaders are metallibs, which only Apple's compiler makes. A Mac compiles its

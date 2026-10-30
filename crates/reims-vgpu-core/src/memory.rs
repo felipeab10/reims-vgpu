@@ -12,6 +12,8 @@
 //!   as runs in up to 128 blocks of 256.
 //! - [`cursor`]: [`Cursor`](cursor::Cursor), a read (and write) position over a list of host
 //!   ranges.
+//! - [`dirty`]: [`DirtyLog`](dirty::DirtyLog), which guest pages were written since a harvest of
+//!   the host's dirty source, for a runtime's copies of guest bytes in memory of its own.
 //!
 //! # Edges the guest and host see
 //!
@@ -48,6 +50,7 @@
 
 pub mod cursor;
 pub mod descriptor;
+pub mod dirty;
 pub mod map;
 pub mod mapping;
 pub mod page_table;

@@ -9,10 +9,12 @@
 //! - user networking with virtio-net, and an optional SSH port forward; with networking off,
 //!   `-nic none`, without which QEMU gives the machine its default NIC on user networking (on
 //!   q35 an e1000e in the first free slot, 1, where the root port's address is);
-//! - a USB Audio Class device on the host's audio backend: x86-64 macOS 26 has no Intel HDA
-//!   driver, and Safari's Media Source players fail without an output device;
+//! - a virtio sound device on the host's audio backend, one output stream and one input stream,
+//!   which arm64 macOS's AppleVirtIOSound drives (x86-64 macOS's is unchecked): Safari's Media
+//!   Source players fail without an output device;
 //! - on `q35-x86_64`, also an ICH9 Intel HDA controller with a line-out codec on that backend,
-//!   for OpenCore's boot chime: its AudioDxe drives HDA, not USB audio;
+//!   for OpenCore's boot chime: its AudioDxe drives HDA, not virtio sound, and x86-64 macOS 26
+//!   has no HDA driver, so the guest's only output is the virtio device;
 //! - the library's log (`REIMS_VGPU_LOG`) in QEMU's: with logs on at their level, with the
 //!   serial console and timestamps; with logs off its warnings and device resets alone
 //!   ([`LOGS_OFF`]), which reims-ctl's warnings read.
@@ -20,11 +22,13 @@
 //! `q35-x86_64` follows the command line the x86-64 guests were measured on (docs/qemu.md):
 //! RAM as a shared memfd, which the library on Linux requires; the keyboard and tablet on a
 //! qemu-xhci controller, since on ICH9's EHCI the guest stops re-arming a device's interrupt
-//! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller at
-//! slot 2, where OpenCore's boot entries name it); `isa-applesmc` with Apple's SMC key, [`OSK`];
+//! transfers under GPU load and its input freezes; fixed PCI addresses (the AHCI controller, which
+//! holds OpenCore's image, the installer and, on SATA, the system disk, at slot 2, where
+//! OpenCore's boot entries name it; on NVMe, the system disk's controller at slot 10,
+//! [`DiskController`]); `isa-applesmc` with Apple's SMC key, [`OSK`];
 //! VMX in the guest's CPU where the host's KVM offers it, for the guest's own VMs;
 //! `dump-guest-core=off`, which leaves guest RAM out of a core dump of QEMU: with it in, a
-//! crash's core takes the process tens of seconds to end (docs/qemu.md). QEMU refuses the
+//! crash's core takes the process tens of seconds to end. QEMU refuses the
 //! option where the OS cannot leave memory out of a core (macOS has no `MADV_DONTDUMP`); and no
 //! ACPI S3 (`ICH9-LPC.disable_s3`): a guest in S3 never wakes again with its display. Only PS/2
 //! input wakes QEMU from S3, not the USB keyboard and tablet, and QEMU's wake resets every
@@ -46,10 +50,20 @@
 //! no Wayland compositor or X server, GTK's window would end QEMU as it starts, so it is
 //! `-display none` there, and the guest runs headless, as on the library's window.
 //!
-//! `vmapple-arm64` follows scripts/run_vmapple.sh.
+//! Every VM on reims-vgpu also has the VideoToolbox device (`apple-videotoolbox-pci`, 106b:1a03)
+//! and the M2 scaler device (`apple-m2scaler-pci`, 106b:1a0b). arm64 macOS ships their guest
+//! drivers, which link the IOSurface mapper vmapple builds in. x86-64 macOS ships none:
+//! reims-util's images carry ports of them for macOS 26.7 (reims_util.rs), which link the port's
+//! mapper driver, so an x86-64 VM has the devices at slots 8 and 9, after its mapper, and one on
+//! `vmware-svga`, which has no mapper, has neither. A guest without the drivers leaves both
+//! devices without one (docs/qemu.md, "The VideoToolbox device" and "The M2 scaler device").
+//! A VM whose settings turn video acceleration off (`video_acceleration = false`) has neither,
+//! and its guest decodes, encodes and scales video in software.
+//!
+//! `vmapple-arm64` follows scripts/internal/run_vmapple.sh, with the video devices besides.
 
 use crate::host::{Host, Os, Profile};
-use crate::vm::{Graphics, Vm};
+use crate::vm::{DiskController, Graphics, Vm};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
@@ -131,6 +145,8 @@ pub fn invocation(vm: &Vm, ctx: &Ctx) -> Result<Invocation> {
         }
     }
     for (k, v) in &c.extra_env {
+        // A name the shell's export takes, so the printed script runs as start does.
+        crate::vm::check_env_name(k)?;
         env.retain(|(ek, _)| ek != k);
         unset.retain(|u| u != k);
         env.push((k.clone(), v.clone()));
@@ -218,21 +234,34 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         ),
     ]);
     push(&["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"]);
-    push(&[
-        "-drive",
-        &format!(
-            "id=disk,if=none,format={},file={}",
-            c.disk_format.as_str(),
-            optp(&vm.disk())
-        ),
-    ]);
-    push(&[
-        "-device",
-        &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
-    ]);
-    // The installer, on the next port after the disk's, past OpenCore's.
+    let disk = format!(
+        "id=disk,if=none,format={},file={}",
+        c.disk_format.as_str(),
+        optp(&vm.disk())
+    );
+    match q.disk_controller {
+        // `discard=unmap` passes the guest's TRIMs to the image, which frees their space. QEMU's
+        // NVMe controller needs a serial, and without an address takes slot 3, virtio-net's.
+        DiskController::Nvme => push(&[
+            "-drive",
+            &format!("{disk},discard=unmap"),
+            "-device",
+            "nvme,drive=disk,serial=reims-ctl,addr=0xa",
+        ]),
+        DiskController::Ahci => push(&[
+            "-drive",
+            &disk,
+            "-device",
+            &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
+        ]),
+    }
+    // The installer, on port 4, past OpenCore's, or on 5 past an AHCI disk on 4.
     if let Some(p) = q.installer.as_deref().map(|p| vm.path(p)) {
-        let port = if q.disk_port == 4 { 5 } else { 4 };
+        let port = if q.disk_controller == DiskController::Ahci && q.disk_port == 4 {
+            5
+        } else {
+            4
+        };
         push(&[
             "-drive",
             &format!(
@@ -271,6 +300,15 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             "-device",
             "apple-gfx-iosurface-pci,id=iosfc,gpu=gfx,bus=pcie.0,addr=0x6",
         ]);
+        // The video devices, whose guest drivers link the mapper's (the module doc).
+        if c.video_acceleration {
+            push(&[
+                "-device",
+                "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+                "-device",
+                "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+            ]);
+        }
     }
     push(&[
         "-device",
@@ -284,7 +322,10 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
     ]);
     if c.audio.enabled {
         push(&["-audiodev", &audiodev(vm, ctx)]);
-        push(&["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"]);
+        push(&[
+            "-device",
+            "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7",
+        ]);
         // At ICH9's own slot for it.
         push(&["-device", "ich9-intel-hda,id=hda,addr=0x1b"]);
         push(&["-device", "hda-output,bus=hda.0,audiodev=snd0"]);
@@ -340,10 +381,18 @@ fn vmapple(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
         "-global",
         &format!("apple-gfx-mmio.resolution={}", c.display.qemu_resolution()?),
     ]);
+    // The video devices, whose guest drivers arm64 macOS ships (the module doc).
+    if c.video_acceleration {
+        push(&[
+            "-device",
+            "apple-videotoolbox-pci,id=video",
+            "-device",
+            "apple-m2scaler-pci,id=scaler",
+        ]);
+    }
     if c.audio.enabled {
-        // On the USB bus of the machine's own xHCI controller, its only one.
         push(&["-audiodev", &audiodev(vm, ctx)]);
-        push(&["-device", "usb-audio,id=audio,audiodev=snd0"]);
+        push(&["-device", "virtio-sound-pci,id=audio,audiodev=snd0"]);
     }
     Ok(())
 }
@@ -487,6 +536,7 @@ mod tests {
                 stop_timeout_secs: 90,
                 extra_args: vec![],
                 graphics: Graphics::ReimsVgpu,
+                video_acceleration: true,
                 display: Display::default(),
                 gpu: Gpu::default(),
                 audio: Audio::default(),
@@ -504,6 +554,7 @@ mod tests {
                     installer: None,
                     cpu_model: default_cpu_model(),
                     cpu_flags: default_cpu_flags(),
+                    disk_controller: DiskController::Ahci,
                     disk_port: 3,
                 }),
                 vmapple: None,
@@ -546,7 +597,12 @@ mod tests {
             ],
             &["-device", "ich9-ahci,id=sata,addr=0x2"],
             &["-device", "ide-hd,bus=sata.2,drive=opencore,bootindex=1"],
-            &["-device", "ide-hd,bus=sata.3,drive=disk,rotation_rate=1"],
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2",
+                "-device",
+                "ide-hd,bus=sata.3,drive=disk,rotation_rate=1",
+            ],
             &[
                 "-netdev",
                 "user,id=net0,ipv6=off,hostfwd=tcp:127.0.0.1:2326-:22",
@@ -561,10 +617,21 @@ mod tests {
             ],
             &[
                 "-device",
+                "apple-videotoolbox-pci,id=video,bus=pcie.0,addr=0x8",
+            ],
+            &[
+                "-device",
+                "apple-m2scaler-pci,id=scaler,bus=pcie.0,addr=0x9",
+            ],
+            &[
+                "-device",
                 "qemu-xhci,id=xhci,addr=0x5,conditional-intr-mapping=on",
             ],
             &["-audiodev", "pipewire,id=snd0"],
-            &["-device", "usb-audio,id=audio,audiodev=snd0,bus=xhci.0"],
+            &[
+                "-device",
+                "virtio-sound-pci,id=audio,audiodev=snd0,addr=0x7",
+            ],
             &["-device", "ich9-intel-hda,id=hda,addr=0x1b"],
             &["-device", "hda-output,bus=hda.0,audiodev=snd0"],
             &["-display", "none"],
@@ -574,6 +641,11 @@ mod tests {
             assert!(has(a, pair), "missing {pair:?} in {a:?}");
         }
         assert!(!a.iter().any(|x| x == "-usb"), "no EHCI");
+        assert!(
+            !a.iter().any(|x| x.starts_with("nvme,")),
+            "the disk on SATA alone"
+        );
+        assert!(!a.iter().any(|x| x.contains("usb-audio")));
         let at = |device: &str| a.iter().position(|x| x.starts_with(device)).unwrap();
         assert!(
             at("apple-gfx-pci,") < at("apple-gfx-iosurface-pci,"),
@@ -668,6 +740,62 @@ mod tests {
                 inv.args
             );
         }
+        assert!(!inv.args.iter().any(|a| a.contains("virtio-sound")));
+    }
+
+    /// With video acceleration off, a VM's command line is the one with it on less the two video
+    /// devices, on q35 and on vmapple.
+    #[test]
+    fn video_acceleration_off_leaves_out_both_video_devices() {
+        let mut vmapple = q35_vm();
+        vmapple.config.profile = Profile::VmappleArm64;
+        vmapple.config.q35 = None;
+        vmapple.config.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        for (vm, host) in [(q35_vm(), linux()), (vmapple, mac())] {
+            let mut on = invocation(&vm, &ctx(host)).unwrap().args;
+            let i = on
+                .iter()
+                .position(|x| x.starts_with("apple-videotoolbox-pci,"))
+                .unwrap();
+            assert!(
+                on[i - 1] == "-device"
+                    && on[i + 1] == "-device"
+                    && on[i + 2].starts_with("apple-m2scaler-pci,"),
+                "{on:?}"
+            );
+            on.drain(i - 1..i + 3);
+            let mut off = vm.clone();
+            off.config.video_acceleration = false;
+            assert_eq!(invocation(&off, &ctx(host)).unwrap().args, on);
+        }
+    }
+
+    /// A disk moved to NVMe is on a controller of its own, off the AHCI controller.
+    #[test]
+    fn a_disk_on_nvme_has_a_controller_of_its_own() {
+        let mut vm = q35_vm();
+        vm.config.q35.as_mut().unwrap().disk_controller = DiskController::Nvme;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(
+            &a,
+            &[
+                "-drive",
+                "id=disk,if=none,format=qcow2,file=/vms/t/disk.qcow2,discard=unmap",
+                "-device",
+                "nvme,drive=disk,serial=reims-ctl,addr=0xa",
+            ]
+        ));
+        assert!(
+            !a.iter().any(|x| x.ends_with("drive=disk,rotation_rate=1")),
+            "{a:?}"
+        );
+        // The installer stays on AHCI, on port 4.
+        vm.config.q35.as_mut().unwrap().installer = Some("/isos/BaseSystem.img".into());
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
     }
 
     #[test]
@@ -684,6 +812,11 @@ mod tests {
             ]
         ));
         assert!(has(&a, &["-device", "ide-hd,bus=sata.4,drive=installer"]));
+        // Past an AHCI disk on port 4.
+        let q = vm.config.q35.as_mut().unwrap();
+        q.disk_port = 4;
+        let a = invocation(&vm, &ctx(linux())).unwrap().args;
+        assert!(has(&a, &["-device", "ide-hd,bus=sata.5,drive=installer"]));
         // The VM's copy of a DMG, in its directory.
         let q = vm.config.q35.as_mut().unwrap();
         q.installer = Some("installer.img".into());
@@ -743,6 +876,11 @@ mod tests {
         ));
         assert!(has(a, &["-display", "gtk"]));
         assert!(!a.iter().any(|x| x.contains("apple-gfx")), "{a:?}");
+        assert!(
+            !a.iter()
+                .any(|x| x.starts_with("apple-videotoolbox") || x.starts_with("apple-m2scaler")),
+            "no video devices without the mapper their drivers link: {a:?}"
+        );
         assert!(inv.env.is_empty(), "{:?}", inv.env);
         // Without a screen for the window, headless.
         let headless = Ctx {
@@ -780,13 +918,37 @@ mod tests {
             &["-device", "vmapple-virtio-blk-pci,variant=root,drive=root"],
             &["-global", "apple-gfx-mmio.displays=2"],
             &["-global", "apple-gfx-mmio.resolution=1920x1080"],
+            &["-device", "apple-videotoolbox-pci,id=video"],
+            &["-device", "apple-m2scaler-pci,id=scaler"],
             &["-audiodev", "coreaudio,id=snd0"],
+            &["-device", "virtio-sound-pci,id=audio,audiodev=snd0"],
         ] {
             assert!(has(&a, pair), "missing {pair:?} in {a:?}");
         }
+        assert!(
+            !a.iter()
+                .any(|x| x.contains("usb-audio") || x.contains("hda"))
+        );
         assert!(!a.iter().any(|x| x.contains("memfd")));
         assert!(!a.iter().any(|x| x.contains("dump-guest-core")));
         assert!(!a.iter().any(|x| x.contains("ICH9-LPC")));
+    }
+
+    /// A variable for QEMU's environment is named as the printed script's export takes it: a
+    /// space or a `;` in its name would break the script or run more than QEMU.
+    #[test]
+    fn an_environment_variable_is_named_as_the_shell_takes_it() {
+        let mut vm = q35_vm();
+        let ctx = ctx(linux());
+        for bad in ["A B", "X;touch /tmp/x;Y", "1A", "", "A-B", "A=B"] {
+            vm.config.extra_env = BTreeMap::from([(bad.to_string(), "1".to_string())]);
+            assert!(vm.config.check().is_err(), "{bad:?}");
+            assert!(invocation(&vm, &ctx).is_err(), "{bad:?}");
+        }
+        vm.config.extra_env = BTreeMap::from([("_Ab_9".to_string(), "1 2".to_string())]);
+        assert!(vm.config.check().is_ok());
+        let script = invocation(&vm, &ctx).unwrap().shell_script("");
+        assert!(script.contains("\nexport _Ab_9='1 2'\n"), "{script}");
     }
 
     #[test]

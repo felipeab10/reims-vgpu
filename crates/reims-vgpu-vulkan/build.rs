@@ -1,14 +1,18 @@
 //! Compiles the library's own shaders, the metal crate's `src/gpu/shaders.metal`, into
 //! `$OUT_DIR/shaders.metallib` with Apple's tools, which `src/gpu/shaders.rs` includes, and the
 //! command predication's step kernel, `src/gpu/predication.metal`, into
-//! `$OUT_DIR/predication.metallib`, which `src/gpu/predication.rs` includes, and the tests' kernel
+//! `$OUT_DIR/predication.metallib`, which `src/gpu/predication.rs` includes, the vertex function
+//! of the pipeline that ends a pass over a mutable rate map, `src/gpu/no_draw.metal`, into
+//! `$OUT_DIR/no_draw.metallib`, which `src/gpu/rate_map.rs` includes, and the tests' kernel
 //! that encodes indirect commands, `src/gpu/icb_encode.metal`, into `$OUT_DIR/icb_encode.metallib`,
 //! the tests' render functions that read barycentric weights, `src/gpu/barycentric.metal`, into
 //! `$OUT_DIR/barycentric.metallib`, those that read the vertex ID, `src/gpu/vertex_ids.metal`, into
 //! `$OUT_DIR/vertex_ids.metallib`, the kernel that reaches a buffer through an address it loads,
 //! `src/gpu/reach.metal`, into `$OUT_DIR/reach.metallib`, and those that write a sweep of values
 //! through textures, `src/gpu/rounding.metal`, into `$OUT_DIR/rounding.metallib`, and again
-//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the tests'
+//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the scaler
+//! device's kernel, the metal crate's `src/gpu/scaler.metal`, with fast math off into
+//! `$OUT_DIR/scaler.metallib`, which `src/gpu/scaler.rs` includes, the tests'
 //! kernels that read YCbCr textures, `src/gpu/ycbcr_probe.metal`, into
 //! `$OUT_DIR/ycbcr_probe.metallib`, the tests' functions Metal's compiler refuses,
 //! `src/gpu/refused.metal`, into `$OUT_DIR/refused.metallib`, those that use SIMD-group
@@ -65,8 +69,9 @@ const DYNAMIC: [&str; 4] = ["metal", "-std=metal4.0", "-dynamiclib", "-install_n
 const LINK: [&str; 2] = ["metal", "-std=metal4.0"];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 18] = [
+const TEST_LIBRARIES: [&str; 19] = [
     "predication",
+    "no_draw",
     "icb_encode",
     "barycentric",
     "vertex_ids",
@@ -130,6 +135,11 @@ fn steps(manifest: &Path) -> Vec<Step> {
     steps.push(one(
         "rounding_safe",
         gpu.join("rounding.metal"),
+        &COMPILE_SAFE,
+    ));
+    steps.push(one(
+        "scaler",
+        manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal"),
         &COMPILE_SAFE,
     ));
     steps.push(Step {
@@ -220,6 +230,11 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
         out.join("rounding_safe.air"),
         out.join("rounding_safe.metallib"),
     );
+    xcrun(&COMPILE_SAFE, &source, &air)?;
+    xcrun(&["metallib"], &air, &metallib)?;
+    // The scaler device's kernel, with fast math off, as the Metal platform compiles it.
+    let source = manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal");
+    let (air, metallib) = (out.join("scaler.air"), out.join("scaler.metallib"));
     xcrun(&COMPILE_SAFE, &source, &air)?;
     xcrun(&["metallib"], &air, &metallib)?;
     imports(&manifest.join("src/gpu"), out)

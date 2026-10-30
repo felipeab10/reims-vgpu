@@ -6,6 +6,7 @@
 use std::sync::{Arc, Weak};
 
 use metal2vulkan_runtime as rt;
+use reims_vgpu_core::memory::dirty::{host_write, host_wrote};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::os::surface::Surface;
 
@@ -25,6 +26,39 @@ pub(crate) fn plane(surface: &OsSurface, plane: u64) -> Option<rt::IoSurfacePlan
     }
     let (offset, bytes_per_row) = host_os::plane_at(surface, plane)?;
     Some(rt::IoSurfacePlane::new(offset, bytes_per_row, true))
+}
+
+/// One plane of a surface, as a host outside the runtime reads it (the video device, whose
+/// codecs read and write the guest's pixel buffers in place): its bytes' offset from the
+/// surface's base address, its size in elements, and its bytes per element and per row, as the
+/// surface was made.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct PlaneLayout {
+    /// Its bytes' offset from the surface's base address (`IOSurfaceGetBaseAddressOfPlane` less
+    /// `IOSurfaceGetBaseAddress`).
+    pub offset: u64,
+    /// `IOSurfaceGetWidthOfPlane`.
+    pub width: u64,
+    /// `IOSurfaceGetHeightOfPlane`.
+    pub height: u64,
+    /// `IOSurfaceGetBytesPerElementOfPlane`.
+    pub bytes_per_element: u64,
+    /// `IOSurfaceGetBytesPerRowOfPlane`.
+    pub bytes_per_row: u64,
+}
+
+/// Plane `plane` of `surface`, a surface with planes; `None` for a plane it lacks, and for every
+/// plane of a surface without planes, whose layout is the surface's own.
+pub fn plane_layout(surface: &OsSurface, plane: u64) -> Option<PlaneLayout> {
+    let (offset, bytes_per_row) = host_os::plane_at(surface, plane)?;
+    let (width, height, bytes_per_element) = host_os::plane_shape(surface, plane)?;
+    Some(PlaneLayout {
+        offset,
+        width,
+        height,
+        bytes_per_element,
+        bytes_per_row,
+    })
 }
 
 /// What a texture over plane `plane` of `surface`, a surface of two planes, reads of its layout,
@@ -72,10 +106,15 @@ pub(crate) fn ycbcr_facts(surface: &OsSurface, plane: u64) -> Option<rt::IoSurfa
 /// 0x1000 and 0x4000).
 pub(crate) fn surface_memory(surface: &OsSurface) -> Vec<std::ops::Range<u64>> {
     let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
-    let made = made_over(surface);
-    let first = base.saturating_sub(made.offset);
-    let own = std::iter::once(first..first.saturating_add(surface.alloc_size()));
-    own.chain(made.pages).collect()
+    let own = |offset: u64| {
+        let first = base.saturating_sub(offset);
+        first..first.saturating_add(surface.alloc_size())
+    };
+    recorded(surface, |made| {
+        let pages = made.pages.iter().cloned();
+        std::iter::once(own(made.offset)).chain(pages).collect()
+    })
+    .unwrap_or_else(|| vec![own(0)])
 }
 
 /// The host memory of `surface`'s bytes at `offsets`, each a first byte and an end counted from
@@ -89,15 +128,15 @@ pub(crate) fn surface_bytes_memory(
     let own = offsets
         .iter()
         .map(|o| base.saturating_add(o.start)..base.saturating_add(o.end));
-    let made = made_over(surface);
-    let at = |o: &std::ops::Range<u64>| {
-        made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
-    };
-    let paged: Vec<_> = offsets
-        .iter()
-        .flat_map(|o| in_runs(&made.pages, &at(o)))
-        .collect();
-    own.chain(paged).collect()
+    let paged = recorded(surface, |made| {
+        let at = |o: &std::ops::Range<u64>| {
+            made.offset.saturating_add(o.start)..made.offset.saturating_add(o.end)
+        };
+        (offsets.iter())
+            .flat_map(|o| in_runs(&made.pages, &at(o)))
+            .collect::<Vec<_>>()
+    });
+    own.chain(paged.into_iter().flatten()).collect()
 }
 
 /// The host ranges that hold the bytes `offsets` of memory laid out over `runs` in their order
@@ -127,18 +166,12 @@ pub(crate) fn in_runs(
 /// page-aligned mapping of `IOSurfaceGetAllocSize` bytes (measured on the M3 Max at 0x40, 0x1000
 /// and 0x4000, over the guest's pages); 0 for a surface made otherwise.
 pub(crate) fn surface_offset(surface: &OsSurface) -> u64 {
-    made_over(surface).offset
+    recorded(surface, |made| made.offset).unwrap_or(0)
 }
 
 /// Whether `surface` was made over the guest's pages (`OsSurfaces::create`).
 pub(crate) fn over_guest_pages(surface: &OsSurface) -> bool {
     recorded(surface, |made| !made.pages.is_empty()).unwrap_or(false)
-}
-
-/// What `surface` was made over, as its OS records it: no pages and offset 0 for a surface
-/// made over neither the guest's pages nor an offset into its allocation.
-fn made_over(surface: &OsSurface) -> MadeOver {
-    recorded(surface, |made| made.clone()).unwrap_or_default()
 }
 
 /// The `kIOSurfaceClientDirection` of a surface core makes over the guest's pages read-only for
@@ -200,17 +233,19 @@ pub(crate) fn dropped_write(sel: &'static str, what: &str) -> ! {
 
 /// The alias of the allocation of `surface`, one at an offset into it ([`surface_offset`]) or
 /// whose GPU writes never reach its memory, read-only then ([`gpu_read_only`]), that every buffer
-/// over it lies over while one lives: the live one, or the one `make` makes, kept for the next;
-/// `None` where `make` makes none. The buffers then lie in one import of the runtime's, as those
-/// over a surface at no offset whose writes land lie over its base address: a write through one
-/// reaches the later commands of its command buffer that read another, as on Metal
-/// (`tests/client_direction.rs`), and a buffer over the surface can share the range of another
-/// over the same first byte (the device's `new_buffer_on_surface`).
+/// over it lies over while one lives: the live one, or a new one, kept for the next: the surface's
+/// own view of the guest's pages where it has one (Linux's stand-in over several ranges of them,
+/// `own_alias`), borrowed, and otherwise the one `make` makes; `None` where `make` makes none.
+/// The buffers then lie in one import of the runtime's, as those over a surface at no offset
+/// whose writes land lie over its base address: a write through one reaches the later commands
+/// of its command buffer that read another, as on Metal (`tests/client_direction.rs`), and a
+/// buffer over the surface can share the range of another over the same first byte (the device's
+/// `new_buffer_on_surface`).
 pub(crate) fn surface_alias(
     surface: &OsSurface,
     make: impl FnOnce() -> Option<Alias>,
 ) -> Option<Arc<Alias>> {
-    let mut make = Some(make);
+    let mut make = Some(|| host_os::own_alias(surface).or_else(make));
     let kept = host_os::recorded_mut(surface, |made| {
         if let Some(alias) = made.alias.upgrade() {
             return Some(alias);
@@ -258,11 +293,15 @@ pub(crate) fn memory_kind(surface: &OsSurface) -> &'static str {
 /// reaches (`replaceRegion:`, measured: `tests/client_direction.rs`). False, writing nothing,
 /// for a surface not made over the guest's pages, and for bytes past them.
 pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]) -> bool {
-    let Some((pages, start)) = recorded(surface, |made| (made.pages.clone(), made.offset)) else {
+    let Some(held) = recorded(surface, |made| {
+        let first = made.offset.saturating_add(offset);
+        in_runs(
+            &made.pages,
+            &(first..first.saturating_add(bytes.len().to_u64())),
+        )
+    }) else {
         return false;
     };
-    let first = start.saturating_add(offset);
-    let held = in_runs(&pages, &(first..first.saturating_add(bytes.len().to_u64())));
     let total: u64 = held.iter().map(|r| r.end - r.start).sum();
     if total != bytes.len().to_u64() {
         return false;
@@ -280,9 +319,260 @@ pub(crate) fn write_surface_bytes(surface: &OsSurface, offset: u64, bytes: &[u8]
                 now.len(),
             );
         }
+        host_wrote(run.start, run.end - run.start);
         from = rest;
     }
     true
+}
+
+/// One lend of a surface's bytes at a time in the process ([`lend_surface_bytes`]), so no two
+/// lends' slices alias.
+static LENDING: reims_vgpu_core::sync::Mutex<()> = reims_vgpu_core::sync::Mutex::new(());
+
+/// Lends `surface`'s bytes, from its first byte to the end of its allocation, to `write`, for a
+/// host outside the runtime: the video device's decoders, which write decoded frames into the
+/// guest's pixel buffers. What `write` leaves in them is in the surface's memory when this
+/// returns.
+///
+/// - A surface over the guest's pages whose bytes lie in one run of them, in the host's memory,
+///   is lent in place, in the pages.
+/// - One whose bytes lie in several runs, as the pages of a guest's allocation mostly do, is lent
+///   in place on Linux, through its own view of the pages, a mapping of them at its base address
+///   (`host_os::base_views_pages`), so that what `write` writes lands in the pages as it writes
+///   it. Elsewhere it is lent a copy, gathered from the pages and scattered back into them: on
+///   macOS the surface's own mapping of them takes the CPU's writes under IOSurface's lock
+///   (reims-vgpu-metal's `os/surface_bytes.rs`), which this lend does not take, and is read-only
+///   for a surface made read-only for its clients ([`base_in_pages`]). Bytes past the pages read
+///   as zeros and are dropped.
+/// - A surface of its own memory is lent from its base address.
+///
+/// Refused, with why: a protected surface, whose memory the CPU never reaches, and one the guest
+/// made read-only for its clients ([`gpu_read_only`]), whose view is read-only. One lend runs at
+/// a time in the process, so `write` must not lend another.
+pub fn lend_surface_bytes(
+    surface: &OsSurface,
+    write: &mut dyn FnMut(&mut [u8]),
+) -> Result<(), &'static str> {
+    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
+    if surface.protection_options() != 0 || base == 0 {
+        return Err("a protected surface, whose memory the CPU never reaches");
+    }
+    if gpu_read_only(surface) {
+        return Err("a surface the guest made read-only for its clients");
+    }
+    let made = recorded(surface, |made| (made.pages.clone(), made.offset));
+    let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
+    let length = surface.alloc_size().saturating_sub(offset);
+    let _lend = LENDING.lock();
+    let pages = match made {
+        Some((pages, _)) if !pages.is_empty() => pages,
+        _ => {
+            // SAFETY: a surface of its own memory has `alloc_size` bytes from its allocation's
+            // first byte, its base address `offset` before them, readable and writable while the
+            // caller holds it; `LENDING` keeps every other lend's slice apart from this one.
+            let bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    std::ptr::with_exposed_provenance_mut::<u8>(base.to_usize()),
+                    length.to_usize(),
+                )
+            };
+            write(bytes);
+            return Ok(());
+        }
+    };
+    let held = in_runs(&pages, &(offset..offset.saturating_add(length)));
+    let lent = lent_where(surface, &held, length);
+    log_first_lend(surface, length, &held, lent);
+    if let Some(first) = lent.first(base, &held) {
+        // SAFETY: `first` is the first of `length` bytes in the guest's pages the surface was
+        // made over, in one run of them or in the surface's own writable view of them, which the
+        // host maps readable and writable while the surface lives, as core holds them, and the
+        // caller holds the surface; `LENDING` keeps every other lend's slice apart from this one.
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(
+                std::ptr::with_exposed_provenance_mut::<u8>(first.to_usize()),
+                length.to_usize(),
+            )
+        };
+        // The dirty log's bracket of the guest's pages `write` writes (`memory::dirty`).
+        let _written = host_write(first, length);
+        write(bytes);
+        return Ok(());
+    }
+    let mut copy = vec![0u8; length.to_usize()];
+    let mut at = 0usize;
+    for run in &held {
+        let len = (run.end - run.start).to_usize();
+        // SAFETY: as above, `run` lies in the guest's pages; `copy` is ours, apart from them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::with_exposed_provenance::<u8>(run.start.to_usize()),
+                copy.as_mut_ptr().add(at),
+                len,
+            );
+        }
+        at += len;
+    }
+    write(&mut copy);
+    let mut at = 0usize;
+    for run in &held {
+        let len = (run.end - run.start).to_usize();
+        // SAFETY: as above.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                copy.as_ptr().add(at),
+                std::ptr::with_exposed_provenance_mut::<u8>(run.start.to_usize()),
+                len,
+            );
+        }
+        host_wrote(run.start, run.end - run.start);
+        at += len;
+    }
+    Ok(())
+}
+
+/// Lends `surface`'s bytes, laid out as [`lend_surface_bytes`] lends them, to `read`, for a host
+/// outside the runtime that only reads them: the video devices' scaler sources and encoder
+/// frames. As [`lend_surface_bytes`], in place where the bytes lie in one run of the guest's
+/// pages or in the surface's view of them, and as a copy gathered from them elsewhere, but
+/// nothing is written back, so a surface the guest made read-only for its clients is lent too:
+/// reading it is what read-only allows. Refused, with why: a protected surface. One lend runs at
+/// a time in the process, so `read` must not lend another.
+pub fn lend_surface_bytes_for_reading(
+    surface: &OsSurface,
+    read: &mut dyn FnMut(&[u8]),
+) -> Result<(), &'static str> {
+    let base = surface.base_address().as_ptr::<u8>().addr().to_u64();
+    if surface.protection_options() != 0 || base == 0 {
+        return Err("a protected surface, whose memory the CPU never reaches");
+    }
+    let made = recorded(surface, |made| (made.pages.clone(), made.offset));
+    let offset = made.as_ref().map_or(0, |(_, offset)| *offset);
+    let length = surface.alloc_size().saturating_sub(offset);
+    let _lend = LENDING.lock();
+    let pages = match made {
+        Some((pages, _)) if !pages.is_empty() => pages,
+        _ => {
+            // SAFETY: a surface of its own memory has `alloc_size` bytes from its allocation's
+            // first byte, its base address `offset` before them, readable while the caller holds
+            // it; `LENDING` keeps every other lend's slice apart from this one.
+            let bytes = unsafe {
+                std::slice::from_raw_parts(
+                    std::ptr::with_exposed_provenance::<u8>(base.to_usize()),
+                    length.to_usize(),
+                )
+            };
+            read(bytes);
+            return Ok(());
+        }
+    };
+    let held = in_runs(&pages, &(offset..offset.saturating_add(length)));
+    let lent = lent_where(surface, &held, length);
+    log_first_lend(surface, length, &held, lent);
+    if let Some(first) = lent.first(base, &held) {
+        // SAFETY: `first` is the first of `length` bytes in the guest's pages the surface was
+        // made over, in one run of them or in the surface's own view of them, which the host maps
+        // readable while the surface lives, as core holds them, and the caller holds the surface;
+        // `LENDING` keeps every other lend's slice apart from this one.
+        let bytes = unsafe {
+            std::slice::from_raw_parts(
+                std::ptr::with_exposed_provenance::<u8>(first.to_usize()),
+                length.to_usize(),
+            )
+        };
+        read(bytes);
+        return Ok(());
+    }
+    let mut copy = vec![0u8; length.to_usize()];
+    let mut at = 0usize;
+    for run in &held {
+        let len = (run.end - run.start).to_usize();
+        // SAFETY: as above, `run` lies in the guest's pages; `copy` is ours, apart from them.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                std::ptr::with_exposed_provenance::<u8>(run.start.to_usize()),
+                copy.as_mut_ptr().add(at),
+                len,
+            );
+        }
+        at += len;
+    }
+    read(&copy);
+    Ok(())
+}
+
+/// Where a lend of a surface over the guest's pages reaches its bytes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Lent {
+    /// In the one run of the pages they lie in.
+    InTheRun,
+    /// Through the surface's own view of the pages, at its base address.
+    ThroughTheView,
+    /// In a copy, gathered from the pages.
+    AsACopy,
+}
+
+impl Lent {
+    /// The first byte lent in place, from the surface's `base` address or the run `held` names;
+    /// `None` for a copy.
+    fn first(self, base: u64, held: &[std::ops::Range<u64>]) -> Option<u64> {
+        match self {
+            Lent::InTheRun => held.first().map(|run| run.start),
+            Lent::ThroughTheView => Some(base),
+            Lent::AsACopy => None,
+        }
+    }
+}
+
+/// Where a lend of `surface`'s `length` bytes, which lie in the runs of the guest's pages
+/// `held`, reaches them ([`lend_surface_bytes`]).
+fn lent_where(surface: &OsSurface, held: &[std::ops::Range<u64>], length: u64) -> Lent {
+    if matches!(held, [run] if run.end - run.start == length) {
+        Lent::InTheRun
+    } else if host_os::base_views_pages(surface) {
+        Lent::ThroughTheView
+    } else {
+        Lent::AsACopy
+    }
+}
+
+/// Logs, at the first lend of `surface`'s `length` bytes over the guest's pages, how many runs of
+/// them the bytes lie in, `held`, and where they were lent, as a lend's cost depends on it: a copy
+/// of the whole surface where they lie in several and no view of them is writable (ours: a guest's
+/// 4K frame was copied so up to 2.2 times as slowly as a host buffer's). Once a surface, by its
+/// record.
+fn log_first_lend(surface: &OsSurface, length: u64, held: &[std::ops::Range<u64>], lent: Lent) {
+    let first = host_os::recorded_mut(surface, |made| !std::mem::replace(&mut made.lent, true));
+    if first != Some(true) {
+        return;
+    }
+    let sizes = held.iter().map(|run| run.end - run.start);
+    let (smallest, largest) = (sizes.clone().min().unwrap_or(0), sizes.max().unwrap_or(0));
+    let format = surface.pixel_format().to_be_bytes();
+    let format: String = format
+        .iter()
+        .map(|&b| {
+            if b.is_ascii_graphic() {
+                char::from(b)
+            } else {
+                '.'
+            }
+        })
+        .collect();
+    log::info!(
+        target: "reims_vgpu_vulkan::os",
+        "the first lend of the IOSurface at {:#x}, {}x{} '{format}': its {length} bytes lie in {} \
+         runs of the guest's pages, of {smallest} to {largest} bytes, and it is lent {}",
+        surface.base_address().as_ptr::<u8>().addr(),
+        surface.width(),
+        surface.height(),
+        held.len(),
+        match lent {
+            Lent::InTheRun => "in place, in the run",
+            Lent::ThroughTheView => "in place, through its view of the pages",
+            Lent::AsACopy => "as a copy",
+        },
+    );
 }
 
 /// What the OS's record of `surface` holds, read by `read`; `None` for a surface it did not
@@ -293,14 +583,16 @@ fn recorded<T>(surface: &OsSurface, read: impl FnOnce(&MadeOver) -> T) -> Option
 
 /// What a surface was made over: the guest's pages, in its bytes' order, merged into runs, and
 /// its bytes' offset into its allocation (`kIOSurfaceOffset`); whether the GPU's writes through
-/// it never reach them ([`gpu_read_only`]), and the alias of its allocation its buffers lie
-/// over while one lives, where they lie over one ([`surface_alias`]).
+/// it never reach them ([`gpu_read_only`]), the alias of its allocation its buffers lie over
+/// while one lives, where they lie over one ([`surface_alias`]), and whether it was lent yet.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct MadeOver {
     pub(crate) pages: Vec<std::ops::Range<u64>>,
     pub(crate) offset: u64,
     pub(crate) gpu_read_only: bool,
     pub(crate) alias: Weak<Alias>,
+    /// Whether its bytes were lent yet ([`log_first_lend`]).
+    pub(crate) lent: bool,
 }
 
 /// The runs of `pages`, each a host first byte and a length, those that follow on in the host's
@@ -436,5 +728,115 @@ pub(crate) mod tests {
         drop((t, s, looked_up, read_only));
         free(pages, length);
         free(guest, page);
+    }
+
+    /// The byte at `at` of host memory.
+    fn byte_at(at: u64) -> u8 {
+        // SAFETY: the tests name bytes of pages they allocated and have not freed.
+        unsafe { *std::ptr::with_exposed_provenance::<u8>(at.to_usize()) }
+    }
+
+    /// A surface's bytes are lent from its first byte to its allocation's end: in place where
+    /// they lie in one run of its pages, through its view of them where they lie in several on
+    /// Linux and as a copy gathered from and scattered back into them elsewhere, from its own
+    /// memory where it has none; one the guest made read-only is refused for writing, and lent
+    /// for reading
+    #[test]
+    fn a_surface_lends_its_bytes_where_they_lie() {
+        // One run, 0x100 bytes into it.
+        let (s, pages, length) = bgra_surface_over_at(16, 16, 0x100);
+        let first = pages.addr().to_u64();
+        let mut lent = 0;
+        lend_surface_bytes(&s, &mut |b| {
+            lent = b.len();
+            b[0] = 0xa5;
+            b[b.len() - 1] = 0x5a;
+        })
+        .unwrap();
+        assert_eq!(lent.to_u64(), length - 0x100);
+        assert_eq!(byte_at(first + 0x100), 0xa5);
+        assert_eq!(byte_at(first + length - 1), 0x5a);
+        drop(s);
+        free(pages, length);
+
+        // Two pages in reverse order, 0x40 bytes into the first named.
+        let page = OsVm::new().page_size();
+        let guest = allocate_aliasable(2 * page).unwrap();
+        let (low, high) = (guest.addr().to_u64(), guest.addr().to_u64() + page);
+        // SAFETY: the low page is ours, allocated above.
+        unsafe { *std::ptr::with_exposed_provenance_mut::<u8>(low.to_usize()) = 7 };
+        let spec = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            offset: 0x40,
+            alloc_size: 2 * page,
+            width: 16,
+            height: 16,
+            bytes_per_element: 4,
+            bytes_per_row: 64,
+            element_width: 1,
+            element_height: 1,
+            client_address_ranges: Some(
+                [high, low]
+                    .map(|at| PhysicalMemoryRange {
+                        physical_address: at,
+                        physical_length: page,
+                    })
+                    .to_vec(),
+            ),
+            ..SurfaceSpec::default()
+        };
+        let s = OsSurfaces::new().create(&spec).unwrap();
+        let split = (page - 0x40).to_usize();
+        let (mut before, mut at, mut landed) = (0, 0, 0);
+        lend_surface_bytes(&s, &mut |b| {
+            assert_eq!(b.len(), (2 * page - 0x40).to_usize());
+            before = b[split];
+            at = b.as_ptr().addr();
+            b[0] = 1;
+            landed = byte_at(high + 0x40);
+            b[split] = 2;
+        })
+        .unwrap();
+        assert_eq!(before, 7, "the bytes lent are the pages'");
+        let in_view = cfg!(target_os = "linux");
+        assert_eq!(
+            (at == s.base_address().as_ptr::<u8>().addr(), landed == 1),
+            (in_view, in_view),
+            "on Linux, lent in place through the surface's view of the pages; else a copy"
+        );
+        assert_eq!(byte_at(high + 0x40), 1);
+        assert_eq!(byte_at(low), 2);
+        let read_only = OsSurfaces::new()
+            .create(&SurfaceSpec {
+                client_direction: Some(READ_ONLY_DIRECTION),
+                ..spec
+            })
+            .unwrap();
+        assert!(lend_surface_bytes(&read_only, &mut |_| unreachable!()).is_err());
+        let mut gathered = (0, 0, 0);
+        lend_surface_bytes_for_reading(&read_only, &mut |b| {
+            gathered = (b.len(), b[0], b[split]);
+        })
+        .unwrap();
+        assert_eq!(
+            gathered,
+            ((2 * page - 0x40).to_usize(), 1, 2),
+            "a read-only surface is lent for reading, gathered from its pages"
+        );
+        drop((s, read_only));
+        free(guest, 2 * page);
+
+        // Its own memory.
+        let s = bgra_surface(16, 16);
+        let mut lent = 0;
+        lend_surface_bytes(&s, &mut |b| {
+            lent = b.len();
+            b.fill(3);
+        })
+        .unwrap();
+        assert_eq!(lent, 16 * 16 * 4);
+        let mut read = (0, 0);
+        lend_surface_bytes_for_reading(&s, &mut |b| read = (b.len(), b[b.len() - 1])).unwrap();
+        assert_eq!(read, (16 * 16 * 4, 3));
     }
 }

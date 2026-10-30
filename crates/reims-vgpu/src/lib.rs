@@ -8,8 +8,8 @@
 //! of a device, display or IOSurface device is its end, run on the releasing thread. They are
 //! generic over the platform with [`DefaultPlatform`] as the default, so their forwarding is
 //! unit-tested on core's fake platform. The `vulkan` feature adds `VulkanPlatform`, over
-//! metal2vulkan's runtime, whose window displays on macOS have Metal copy each frame the runtime
-//! draws into their window.
+//! metal2vulkan's runtime, whose window displays draw each frame into a swapchain of their
+//! window, on macOS one over the window's `CAMetalLayer`.
 //!
 //! **By OS.** On macOS the default platform is `MetalPlatform`, the product. On Linux the library
 //! is the Vulkan platform's: it builds only with the `vulkan` feature, and `VulkanPlatform` is the
@@ -33,6 +33,7 @@
 compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
 mod device;
+pub mod dirty;
 mod display;
 mod entry;
 mod error;
@@ -40,11 +41,14 @@ mod frame;
 mod iosurface;
 pub mod platform;
 mod retained;
+mod scaler;
 pub mod singleton;
 mod stats;
+mod video;
 mod window;
 
 pub use device::{Device, DeviceConfig, HostCallbacks, MemoryFile, MemoryMap};
+pub use dirty::{DirtyHost, DirtySource, KvmSlot};
 pub use display::{
     CursorGlyph, CursorGlyphFn, CursorMoveFn, CursorShowFn, Display, DisplayCallbacks,
     DisplayConfig, DisplayMode, ModeChangeFn, NewFrameFn,
@@ -61,8 +65,17 @@ pub use reims_vgpu_core::host::{
 pub use reims_vgpu_core::platform::os::Preferences;
 #[cfg(target_os = "macos")]
 pub use reims_vgpu_metal::MetalPlatform;
+/// reims-vgpu-video-core, for the tests of crates above this one: the scaler's CPU stand-in and
+/// its capabilities, which they make devices on.
+#[cfg(feature = "testkit")]
+pub use reims_vgpu_video_core;
 #[cfg(feature = "vulkan")]
 pub use reims_vgpu_vulkan::VulkanPlatform;
+pub use scaler::{GuestMemory, ScalerDevice, ScalerDeviceConfig, ScalerOutcome};
+pub use video::{
+    ALLOCATION_FAILED, INVALID_SESSION, MAX_MESSAGE_SIZE, SendToGuest, SurfacePlane, VideoDevice,
+    VideoDeviceConfig,
+};
 
 /// The platform every handle is made on by default: `MetalPlatform` on macOS.
 #[cfg(target_os = "macos")]

@@ -14,8 +14,7 @@
 use std::fmt;
 use std::mem::ManuallyDrop;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, LazyLock, Weak};
+use std::sync::{Arc, LazyLock, OnceLock, Weak};
 
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostBlocks;
@@ -29,7 +28,7 @@ use reims_vgpu_core::platform::{Handle, ObjId, Platform, ProcessState};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::tasks::launcher::TaskLauncher;
 
-use crate::answer::{get, plain, refused};
+use crate::answer::{get, plain, plain_at, refused};
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::desc::{
     RenderPassDescriptorObject, TextureDescriptorObject, TextureFields,
@@ -112,6 +111,13 @@ impl<T: Send + Sync + 'static> Handle for Obj<T> {
     }
 }
 
+/// The runtime listener every listener of the platform is a handle of. The runtime starts a thread
+/// for each listener it makes as its first notification is asked for (`SharedEventListener::new`,
+/// read from code), which ends once its last handle goes. Core makes one listener for each task:
+/// one listener of the process's life holds at most one such thread. Each handle is still an
+/// object of its own (`id`).
+static LISTENER: OnceLock<rt::SharedEventListener> = OnceLock::new();
+
 /// The process's platform: the runtime's GPU objects, and the OS's IOSurface, VM (reporting the
 /// pages it changes, [`crate::remap`]), clocks and threads ([`crate::os`]), with the task
 /// launcher.
@@ -157,21 +163,14 @@ impl VulkanPlatform {
             rt::Device::system_default_with(device_options()).map(|d| vec![d])
         })
         .pop()
-        .map(|raw| device::adopt("MTLCreateSystemDefaultDevice()", raw))
+        .map(device::adopt)
     }
 }
 
 /// The devices `make` makes, a creator standing for `sel` (`MTLCreateSystemDefaultDevice()`,
 /// `MTLCopyAllDevices()`): none where the runtime finds no Vulkan device it can use, or no Vulkan
-/// loader. Any other refusal dies at `sel`, naming it: a macOS host below every release whose
-/// Metal the runtime measured among them, or whose release does not read
-/// (`Problem::HostReleaseUnmeasured`), where the runtime refuses every device, as it cannot answer
-/// that release's Metal. On a host of a release the runtime has not measured above one it has,
-/// the runtime makes the devices at the newest measured release below the host's and announces
-/// it as it makes one, on this thread (`MetalLevelBelowHost`, [`crate::answer::HEARD`]): the
-/// devices are made, and [`BELOW_HOST`] keeps it, so each answer that depends on the release dies
-/// where it is asked ([`answering_level`]). A device that lists a window extension the options
-/// name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
+/// loader. Any other refusal dies at `sel`, naming it. A device that lists a window extension the
+/// options name but lacks its feature (`Error::ExtensionFeature`, `swapchainMaintenance1`) dies at `sel`
 /// too, naming the extension and the feature: the runtime refuses it rather than enable the
 /// extension without the feature, and the window's probe names the extension only where every
 /// device has the feature, asked as the runtime asks ([`crate::os::add_window_extensions`]). So
@@ -182,110 +181,83 @@ fn made_devices(
     sel: &'static str,
     make: impl FnOnce() -> Result<Vec<rt::Device>, rt::Error>,
 ) -> Vec<rt::Device> {
-    let (made, heard) = crate::answer::hearing(|| {
-        get(sel, || match make() {
-            Err(rt::Error::NoDevice | rt::Error::LoaderNotFound(_)) => Ok(Vec::new()),
-            made => made,
-        })
-    });
-    if heard.contains(&rt::Degradation::MetalLevelBelowHost) {
-        // Relaxed: stored before the level is kept ([`answered_at`], a `OnceLock`, whose read
-        // acquires it), and read after it.
-        BELOW_HOST.store(true, Ordering::Relaxed);
-    }
-    made
+    get(sel, || match make() {
+        Err(rt::Error::NoDevice | rt::Error::LoaderNotFound(_)) => Ok(Vec::new()),
+        made => made,
+    })
 }
 
-/// Whether the runtime announced that its devices answer as a release below the host's
-/// (`MetalLevelBelowHost`, [`made_devices`]): the host's release is not one it measured.
-static BELOW_HOST: AtomicBool = AtomicBool::new(false);
+/// The creator [`Platform::open_device`] stands for, which its deaths name.
+const OPEN_DEVICE: &str = "MTLCopyAllDevices()";
 
-/// The Metal level of an answer `sel` gives that depends on it ([`metal_level`]): `what`, which
-/// the releases the runtime measured answer otherwise. On a host whose own release the runtime
-/// has not measured ([`BELOW_HOST`]) the devices answer as the newest measured release below it,
-/// and the host's Metal may answer otherwise, so `sel` relays it there, naming `what` and the
-/// level, and dies in strict mode ([`crate::answer::Inexact::MetalLevel`]). The level either way.
-pub(crate) fn answering_level(sel: &'static str, what: impl FnOnce() -> String) -> rt::MetalLevel {
-    let level = metal_level(sel);
-    if BELOW_HOST.load(Ordering::Relaxed) {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
-                "{}, which Metal's releases answer differently: this host's macOS release is not \
-                 one the Vulkan runtime measured, and its devices answer as {level}, the newest \
-                 measured release below it",
-                what()
-            ),
-        );
+/// The device of registry ID `registry_id` ([`device::registry_id`]) that an open answers
+/// ([`Platform::open_device`]): the device of that ID the process adopted, where there is one,
+/// with no runtime call; else the runtime's system default device, of those `default` makes
+/// (none where the runtime refuses it, whose refusal `every` then decides), where its ID is
+/// `registry_id`; else the one of that ID among those `every` makes, the runtime's
+/// `Device::all_with`, which makes a device of every physical device there is. Each found is
+/// adopted ([`device::adopt`]).
+///
+/// So `every` runs only for an ID that is neither the default device's nor any adopted one's. A
+/// guest's every task opens its device at its handshake (`gpu_task/handshake.rs`), and a device of
+/// the runtime's lives only while a handle to it does: each open through `Device::all_with` made,
+/// primed and tore down a device on every GPU the process does not use (on a host of two GPUs,
+/// once per guest task), and died there when one of those refused, at an open of the GPU it uses.
+fn opened(
+    registry_id: u64,
+    default: impl FnOnce() -> Vec<rt::Device>,
+    every: impl FnOnce() -> Vec<rt::Device>,
+) -> Option<VulkanDevice> {
+    if let Some(kept) = device::kept(registry_id) {
+        return Some(kept);
     }
-    level
-}
-
-/// The Metal level every device of this process answers at (`rt::DeviceProperties::metal_level`):
-/// the macOS release whose Metal the runtime answers as where releases differ, which pixel format
-/// values a texture descriptor takes ([`rt::MetalLevel::knows`]) and which formats Metal describes
-/// ([`rt::MetalLevel::describes`]). [`device_options`] names the OS's
-/// ([`crate::os::METAL_LEVEL`]): on macOS none, so it is the host's release, or the newest
-/// measured release below it; on Linux macOS 26.7, the contract machine's. The same for every
-/// device. The first device the platform adopts sets it ([`answered_at`]); read before any is,
-/// it is the runtime's system default device's, made for it, which dies as [`made_devices`]
-/// does where the runtime makes none, at `sel`, the call that asks.
-pub(crate) fn metal_level(sel: &'static str) -> rt::MetalLevel {
-    if let Some(&level) = METAL_LEVEL.get() {
-        return level;
-    }
-    let made = made_devices(sel, || {
-        rt::Device::system_default_with(device_options()).map(|d| vec![d])
-    });
-    let Some(device) = made.first() else {
-        refused(sel, &rt::Error::NoDevice)
+    let of_id = |made: Vec<rt::Device>| {
+        made.into_iter()
+            .find(|d| device::registry_id(d) == registry_id)
     };
-    let level = device.properties().metal_level;
-    answered_at(sel, level);
-    level
+    of_id(default())
+        .or_else(|| of_id(every()))
+        .map(device::adopt)
 }
 
-/// The level of [`metal_level`], once known.
-static METAL_LEVEL: std::sync::OnceLock<rt::MetalLevel> = std::sync::OnceLock::new();
-
-/// Keeps `level`, a device's, as the process's Metal level ([`metal_level`]), and logs it the
-/// first time. A device of another level than the process's answers as its own, relayed at
-/// `sel`, the call that made it, and dies there in strict mode
-/// ([`crate::answer::Inexact::MetalLevel`]; unreachable: every device here is made with
-/// [`device_options`]).
-pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
-    let kept = *METAL_LEVEL.get_or_init(|| {
-        log::info!(
-            target: "reims_vgpu_vulkan::platform",
-            "the Vulkan runtime's devices answer Metal's pixel formats as {level}"
-        );
-        level
-    });
-    if kept != level {
-        crate::answer::inexact(
-            sel,
-            crate::answer::Inexact::MetalLevel,
-            &format!(
-                "a device answering Metal as {level}, where this process's devices answer as {kept}"
-            ),
-        );
+/// A device of the process, for an answer every device gives alike, at the one macOS release
+/// whose Metal the runtime answers as (`rt::MACOS_RELEASE`): a pixel format's description and a
+/// texture level's layout ([`crate::gpu::format_info`]). The first device the platform adopted;
+/// asked before any is, the runtime's system default device, made for it, which dies as
+/// [`made_devices`] does where the runtime makes none, at `sel`, the call that asks. Kept once
+/// found, as the platform keeps every device it adopts.
+pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
+    static DEVICE: OnceLock<rt::Device> = OnceLock::new();
+    if let Some(kept) = DEVICE.get() {
+        return kept;
     }
+    let device = device::first_adopted().unwrap_or_else(|| {
+        let made = made_devices(sel, || {
+            rt::Device::system_default_with(device_options()).map(|d| vec![d])
+        });
+        made.into_iter()
+            .next()
+            .unwrap_or_else(|| refused(sel, &rt::Error::NoDevice))
+    });
+    DEVICE.get_or_init(|| device)
 }
 
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
-/// OS's Metal level ([`crate::os::METAL_LEVEL`]: on Linux macOS 26.7, the contract machine's, where
-/// the runtime's default off macOS is its newest measured release), the shader cache in
+/// shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
 /// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
-/// names ([`exact_policy`]), and the degradations the
+/// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
+/// exact pipeline wait, under which no draw or dispatch is dropped while its pipeline is still
+/// being made (the runtime's `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`, kinds of
+/// [`crate::answer::DIES`]), and the degradations the
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
-/// kinds announced at every occurrence ([`announced_each`]). One set,
+/// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
+/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set,
 /// so the runtime keeps one device per physical device across `open_device` and every other open.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
@@ -300,8 +272,10 @@ pub(crate) fn answered_at(sel: &'static str, level: rt::MetalLevel) {
 /// them (`timing`'s `gpu_times_from_host_latency`).
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
 /// call here hears ([`crate::answer::HEARD`]) and those that die by default
-/// ([`crate::answer::DIES_BY_DEFAULT`]), and every other kind of [`crate::answer::DIES`] where
-/// `every_dies`, in strict and census mode, which die at or record each occurrence. Elsewhere the
+/// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
+/// may meet unheard as it is made ([`crate::answer::unheard`]), and every other kind of
+/// [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
+/// each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
 /// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
 /// a cost on the encoding thread (in a Finder drag on ms01's Iris Xe, 2026-10-18, the sink
@@ -312,17 +286,23 @@ fn announced_each(every_dies: bool) -> std::collections::BTreeSet<rt::Degradatio
     } else {
         &crate::answer::DIES_BY_DEFAULT
     };
-    (dies.iter().copied()).chain(crate::answer::HEARD).collect()
+    (dies.iter().copied())
+        .chain(crate::answer::HEARD)
+        .chain([rt::Degradation::CopiedHostPages])
+        .collect()
 }
 
 pub(crate) fn device_options() -> &'static rt::DeviceOptions {
     static OPTIONS: LazyLock<rt::DeviceOptions> = LazyLock::new(|| {
         let mut options = rt::DeviceOptions::default();
         crate::os::add_window_extensions(&mut options);
-        options.metal_level = crate::os::METAL_LEVEL;
         options.gpu_times_from_host = true;
         options.policy = exact_policy(std::env::var("REIMS_VGPU_EXACT").ok().as_deref());
-        options.messages = Some(rt::MessageSink::new(crate::answer::notice));
+        if crate::answer::strict_process() {
+            options.policy.pipeline_waits = metal2vulkan::device::PipelineWaitPolicy::Exact;
+        }
+        let sink = rt::MessageSink::new(crate::answer::notice);
+        options.messages = Some(sink.with_least_severity(crate::answer::least_severity()));
         options.announce_each =
             announced_each(crate::answer::strict_process() || crate::answer::census::on());
         if std::env::var_os(reims_vgpu_core::trace::ENV_VAR).is_some() {
@@ -345,45 +325,31 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 }
 
 /// The fields of the runtime's device policy (`metal2vulkan::device::DevicePolicy`) whose exact
-/// form `REIMS_VGPU_EXACT` can name, each by the field's own name: Metal's sampler emulated
-/// (`sampling`, `SamplingPolicy::Exact`), Metal's filter of a two-plane YCbCr texture under
-/// native sampling, in a pipeline the draw binding one makes (`ycbcr_filter`,
-/// `YCbCrFilterPolicy::Exact`), the translation's routines for the maths functions,
-/// divisions and fused multiply-adds Metal answers beyond Vulkan's precision table
-/// (`float_maths`, `FloatMathsPolicy::Exact`), Metal's texel conversion (`texel_conversion`,
-/// `TexelConversionPolicy::Exact`: every read's, and a sample's or gather's with `sampling`),
-/// Metal's `half` rounding (`half_rounding`, `HalfRoundingPolicy::Exact`), Metal's NaN bits and
-/// the operand its minimum and maximum functions pick at a NaN or a signed zero
-/// (`nan_and_min_max`, `NanMinMaxPolicy::Exact`), Metal's rounding order of `dot`, `mix` and
-/// `fast::sqrt` (`rounding_order`, `RoundingOrderPolicy::Exact`), Metal's `half` blend of a
-/// safe-math `half4` output into a 16-bit float attachment, which the function computes
-/// (`half_blend`, `HalfBlendPolicy::Exact`), Metal's values in the decoded twin of a texture
-/// whose format the device lacks, an ASTC LDR or EAC 11-bit one (`decoded_texels`,
-/// `DecodedTexelsPolicy::Exact`), Metal's tile store of a loaded signed normalized or
-/// `RGB9E5Float` colour attachment (`tile_store`, `TileStorePolicy::Exact`), Metal's resolve of a
-/// multisampled colour attachment (`resolve`, `ResolvePolicy::Exact`), and each batch of a queue
-/// ordered after the earlier ones by the accesses it depends on (`batch_order`,
-/// `BatchOrderPolicy::Exact`). [`EXACT_ALL`] names every one but `sampling`. The policy's
-/// `completion` and `heap_compression` are no names of these: every device takes their exact
-/// forms ([`exact_policy`]).
-pub const EXACT_FORMS: [&str; 12] = [
-    "sampling",
-    "ycbcr_filter",
-    "float_maths",
-    "texel_conversion",
-    "half_rounding",
-    "nan_and_min_max",
-    "rounding_order",
-    "half_blend",
-    "decoded_texels",
-    "tile_store",
-    "resolve",
+/// form `REIMS_VGPU_EXACT` can name, each by the field's own name: each batch of a queue ordered
+/// after the earlier ones by the accesses it depends on (`batch_order`,
+/// `BatchOrderPolicy::Exact`), a shadow, copied in before each use and merged back after each
+/// write, for every texture over the guest's pages where a texture that only samples or reads
+/// them would be a linear image in place on a driver whose own first-move check passes
+/// (`host_page_textures`, `HostPageTexturePolicy::Shadow`), and, on a device without
+/// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
+/// where it is computed, where the default rounds the chain where a value leaves it
+/// (`half_chains`, `HalfChainPolicy::EachOperation`), and a command buffer that waits for each
+/// pipeline the driver is still making until it is made, where the default waits 4.5 s from its
+/// commit and then drops the draws and dispatches whose pipeline is not made (`pipeline_waits`,
+/// `PipelineWaitPolicy::Exact`). [`EXACT_ALL`] names every one. The
+/// policy's `completion` and `heap_compression` are no names of these: every device takes their
+/// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
+/// device's own arithmetic, sampling and conversions, each difference a precision note it
+/// records, with no exact form to name.
+pub const EXACT_FORMS: [&str; 4] = [
     "batch_order",
+    "host_page_textures",
+    "half_chains",
+    "pipeline_waits",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
-/// field of [`EXACT_FORMS`] but `sampling` in its exact form, as the runtime's validation sets
-/// them. `sampling` may be named beside it.
+/// field of [`EXACT_FORMS`] in its exact form, as the runtime's validation sets them.
 pub const EXACT_ALL: &str = "all";
 
 /// The device policy every device is made with: the runtime's default, whose native forms are
@@ -405,21 +371,16 @@ pub const EXACT_ALL: &str = "all";
 /// 0x10000 for a 64x64 `BGRA8Unorm` texture, where the uncompressed one answers 0x4080 at 0x1000,
 /// and Metal 0x4080 at 0x80), and a write through a buffer or texture over its bytes may not show
 /// in its texels. Each field of [`EXACT_FORMS`] that `exact`, `REIMS_VGPU_EXACT`'s comma-separated
-/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form but
-/// `sampling`'s: larger modules and longer pipeline creation, `ycbcr_filter`'s pipeline made at a
-/// draw, `decoded_texels`' larger twins, `tile_store`'s load pass before a pass, `resolve`'s render
-/// pass instance after one, and `batch_order`'s barriers between batches. A device that runs on
-/// Metal (MoltenVK) answers as Metal under either, but for the NaN a `half` read, sample or gather
-/// hands back for a NaN texel, Metal's only under `nan_and_min_max`, and a linear sample of a
-/// two-plane YCbCr texture, which Metal's own sampler filters by default (within one step of the
-/// format's grid, announced) and Metal's filter of the format only under `ycbcr_filter`. A name of
-/// neither changes nothing, and a line on stderr says so.
+/// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
+/// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
+/// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
+/// each `half` operation on a device without `shaderFloat16`, and `pipeline_waits`' wait for
+/// every pipeline until it is made. A name of neither changes nothing,
+/// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy, FloatMathsPolicy,
-        HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy, NanMinMaxPolicy, ResolvePolicy,
-        RoundingOrderPolicy, SamplingPolicy, TexelConversionPolicy, TileStorePolicy,
-        YCbCrFilterPolicy,
+        BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
+        HostPageTexturePolicy, PipelineWaitPolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -427,18 +388,10 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     for name in (exact.unwrap_or_default().split(',').map(str::trim)).filter(|n| !n.is_empty()) {
         match name {
             EXACT_ALL => policy = policy.exact_answers(),
-            "sampling" => policy.sampling = SamplingPolicy::Exact,
-            "ycbcr_filter" => policy.ycbcr_filter = YCbCrFilterPolicy::Exact,
-            "float_maths" => policy.float_maths = FloatMathsPolicy::Exact,
-            "texel_conversion" => policy.texel_conversion = TexelConversionPolicy::Exact,
-            "half_rounding" => policy.half_rounding = HalfRoundingPolicy::Exact,
-            "nan_and_min_max" => policy.nan_and_min_max = NanMinMaxPolicy::Exact,
-            "rounding_order" => policy.rounding_order = RoundingOrderPolicy::Exact,
-            "half_blend" => policy.half_blend = HalfBlendPolicy::Exact,
-            "decoded_texels" => policy.decoded_texels = DecodedTexelsPolicy::Exact,
-            "tile_store" => policy.tile_store = TileStorePolicy::Exact,
-            "resolve" => policy.resolve = ResolvePolicy::Exact,
             "batch_order" => policy.batch_order = BatchOrderPolicy::Exact,
+            "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
+            "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
+            "pipeline_waits" => policy.pipeline_waits = PipelineWaitPolicy::Exact,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -532,9 +485,13 @@ impl Platform for VulkanPlatform {
         Obj::new(plain(RenderPassDescriptorObject::new))
     }
 
-    /// A listener with a thread of its own, which core never posts to.
+    /// A handle of the process's one runtime listener ([`LISTENER`]), made at the first call.
     fn new_shared_event_listener(&self) -> VulkanSharedEventListener {
-        Obj::new(get("new", rt::SharedEventListener::new))
+        Obj::new(
+            LISTENER
+                .get_or_init(|| plain_at("new", rt::SharedEventListener::new))
+                .clone(),
+        )
     }
 
     /// A descriptor of Metal's defaults, as `+new` makes.
@@ -554,12 +511,11 @@ impl Platform for VulkanPlatform {
         mipmapped: bool,
     ) -> RaiseResult<VulkanTextureDescriptor> {
         let sel = "texture2DDescriptorWithPixelFormat:width:height:mipmapped:";
-        let (format, ycbcr_format, no_texture_format, lacked_format) =
+        let (format, no_texture_format, lacked_format) =
             crate::gpu::desc::format_set(sel, pixel_format);
         let desc = plain(|| rt::TextureDescriptor::texture_2d(format, width, height, mipmapped));
         Ok(Obj::new(TextureDescriptorObject::new(TextureFields {
             desc,
-            ycbcr_format,
             no_texture_format,
             lacked_format,
             ..TextureFields::default()
@@ -598,14 +554,20 @@ impl Platform for VulkanPlatform {
     /// The device of the runtime's `Device::all_with` (`MTLCopyAllDevices`) whose registry ID, as
     /// this platform answers it ([`device::registry_id`]: Metal's for the default device), is
     /// `registry_id` (+1), or `None`, as where there is no Vulkan loader. In one process it is the
-    /// object every other handle to that device is ([`device::adopt`]).
+    /// object every other handle to that device is ([`device::adopt`]), asked for no further than
+    /// it must be ([`opened`]): a device made before is that object, answered with no runtime call
+    /// ([`device::kept`]).
     fn open_device(&self, registry_id: u64) -> Option<VulkanDevice> {
-        let all = made_devices("MTLCopyAllDevices()", || {
-            rt::Device::all_with(device_options())
-        });
-        all.into_iter()
-            .find(|d| device::registry_id(d) == registry_id)
-            .map(|raw| device::adopt("MTLCopyAllDevices()", raw))
+        opened(
+            registry_id,
+            || {
+                made_devices(OPEN_DEVICE, || {
+                    let default = rt::Device::system_default_with(device_options());
+                    Ok(default.ok().into_iter().collect())
+                })
+            },
+            || made_devices(OPEN_DEVICE, || rt::Device::all_with(device_options())),
+        )
     }
 
     fn surfaces(&self) -> &dyn IoSurfaces<VulkanPlatform> {
@@ -659,23 +621,22 @@ pub(crate) mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The kinds a call hears and those that die by default are announced at every occurrence in
-    /// every mode, and every other kind of `DIES` only in strict and census mode
+    /// The kinds a call hears, those that die by default and `CopiedHostPages`, which the
+    /// device's probe of its imports meets unheard, are announced at every occurrence in every
+    /// mode, and every other kind of `DIES` only in strict and census mode
     #[test]
     fn only_strict_and_census_mode_hear_every_occurrence_of_every_kind_that_dies() {
         use crate::answer::{DIES, DIES_BY_DEFAULT, HEARD};
         let each = announced_each(true);
         assert!(DIES.iter().chain(&HEARD).all(|k| each.contains(k)));
         let by_default = announced_each(false);
+        let copied = rt::Degradation::CopiedHostPages;
         assert!(
-            HEARD
-                .iter()
-                .chain(&DIES_BY_DEFAULT)
-                .all(|k| by_default.contains(k))
+            (HEARD.iter().chain(&DIES_BY_DEFAULT).chain([&copied])).all(|k| by_default.contains(k))
         );
         let once = DIES
             .iter()
-            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k));
+            .filter(|k| !DIES_BY_DEFAULT.contains(k) && !HEARD.contains(k) && **k != copied);
         assert!(once.clone().count() > 100, "most kinds of DIES");
         assert!(once.clone().all(|k| !by_default.contains(k)));
     }
@@ -697,19 +658,43 @@ pub(crate) mod tests {
         VulkanPlatform::new(Box::new(NoLauncher))
     }
 
+    /// Each listener the platform makes is an object of its own, and every one runs what is posted
+    /// to it on the one thread of the process's runtime listener, where the runtime would start a
+    /// thread for each
+    #[test]
+    fn every_listener_runs_its_notifications_on_the_one_thread_of_the_process() {
+        let p = platform();
+        let listeners: Vec<_> = (0..4).map(|_| p.new_shared_event_listener()).collect();
+        let mut ids: Vec<u64> = listeners.iter().map(|l| l.id().0).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        assert_eq!(ids.len(), listeners.len());
+        let event = dev().raw.new_shared_event().unwrap();
+        let (ran, threads) = std::sync::mpsc::channel();
+        for listener in &listeners {
+            let ran = ran.clone();
+            event.notify_listener(
+                listener,
+                0,
+                Box::new(move |_, _| ran.send(std::thread::current().id()).unwrap()),
+            );
+        }
+        let threads: Vec<_> = threads.iter().take(listeners.len()).collect();
+        assert!(threads.iter().all(|&t| t == threads[0]), "{threads:?}");
+        assert_ne!(threads[0], std::thread::current().id());
+    }
+
     /// Without `REIMS_VGPU_EXACT` the device policy is the runtime's default, its native forms,
     /// but for its exact completion and uncompressed heap textures, which every device takes and
     /// no name selects; each name of `EXACT_FORMS` takes that field's exact form alone, in any
-    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every one
-    /// but `sampling`; another name, `completion` and `heap_compression` among them, changes
+    /// order, spaces around a name ignored; `all` takes the runtime's `exact_answers()`, every
+    /// one; another name, `completion`, `heap_compression` and `sampling` among them, changes
     /// nothing
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            BatchOrderPolicy, CompletionPolicy, DecodedTexelsPolicy, DevicePolicy,
-            FloatMathsPolicy, HalfBlendPolicy, HalfRoundingPolicy, HeapCompressionPolicy,
-            NanMinMaxPolicy, ResolvePolicy, RoundingOrderPolicy, SamplingPolicy,
-            TexelConversionPolicy, TileStorePolicy, YCbCrFilterPolicy,
+            BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
+            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -717,18 +702,10 @@ pub(crate) mod tests {
         let mut fast = runtimes;
         fast.completion = CompletionPolicy::Exact;
         fast.heap_compression = HeapCompressionPolicy::Uncompressed;
-        assert_eq!(fast.sampling, SamplingPolicy::NativeDevice);
-        assert_eq!(fast.ycbcr_filter, YCbCrFilterPolicy::Device);
-        assert_eq!(fast.float_maths, FloatMathsPolicy::Native);
-        assert_eq!(fast.texel_conversion, TexelConversionPolicy::Device);
-        assert_eq!(fast.half_rounding, HalfRoundingPolicy::Native);
-        assert_eq!(fast.nan_and_min_max, NanMinMaxPolicy::Native);
-        assert_eq!(fast.rounding_order, RoundingOrderPolicy::Native);
-        assert_eq!(fast.half_blend, HalfBlendPolicy::Device);
-        assert_eq!(fast.decoded_texels, DecodedTexelsPolicy::Compact);
-        assert_eq!(fast.tile_store, TileStorePolicy::Device);
-        assert_eq!(fast.resolve, ResolvePolicy::Device);
         assert_eq!(fast.batch_order, BatchOrderPolicy::Ends);
+        assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
+        assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
+        assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
         for unchanged in [
             None,
             Some(""),
@@ -737,36 +714,23 @@ pub(crate) mod tests {
             Some("padded_reads"),
             Some("completion"),
             Some("heap_compression"),
+            Some("sampling"),
         ] {
             assert_eq!(exact_policy(unchanged), fast, "{unchanged:?}");
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 12] = [
-            ("sampling", |p| p.sampling = SamplingPolicy::Exact),
-            ("ycbcr_filter", |p| {
-                p.ycbcr_filter = YCbCrFilterPolicy::Exact
-            }),
-            ("float_maths", |p| p.float_maths = FloatMathsPolicy::Exact),
-            ("texel_conversion", |p| {
-                p.texel_conversion = TexelConversionPolicy::Exact;
-            }),
-            ("half_rounding", |p| {
-                p.half_rounding = HalfRoundingPolicy::Exact
-            }),
-            ("nan_and_min_max", |p| {
-                p.nan_and_min_max = NanMinMaxPolicy::Exact
-            }),
-            ("rounding_order", |p| {
-                p.rounding_order = RoundingOrderPolicy::Exact
-            }),
-            ("half_blend", |p| p.half_blend = HalfBlendPolicy::Exact),
-            ("decoded_texels", |p| {
-                p.decoded_texels = DecodedTexelsPolicy::Exact
-            }),
-            ("tile_store", |p| p.tile_store = TileStorePolicy::Exact),
-            ("resolve", |p| p.resolve = ResolvePolicy::Exact),
+        let alone: [(&str, Set); 4] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
+            ("host_page_textures", |p| {
+                p.host_page_textures = HostPageTexturePolicy::Shadow;
+            }),
+            ("half_chains", |p| {
+                p.half_chains = HalfChainPolicy::EachOperation;
+            }),
+            ("pipeline_waits", |p| {
+                p.pipeline_waits = PipelineWaitPolicy::Exact;
+            }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
         let mut every = fast;
@@ -777,19 +741,11 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_blend,half_rounding,sampling , rounding_order,texel_conversion,\
-                     nan_and_min_max,batch_order, resolve,float_maths,ycbcr_filter,\
-                     tile_store,decoded_texels";
+        let named = " half_chains,pipeline_waits,host_page_textures , batch_order";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
-        let answers = fast.exact_answers();
-        assert_eq!(one(EXACT_ALL), answers);
-        assert_eq!(answers.sampling, SamplingPolicy::NativeDevice);
-        let mut but_sampling = every;
-        but_sampling.sampling = SamplingPolicy::NativeDevice;
-        assert_eq!(answers, but_sampling);
-        assert_eq!(exact_policy(Some("sampling, all")), every);
-        assert_eq!(exact_policy(Some("all,sampling")), every);
+        assert_eq!(one(EXACT_ALL), fast.exact_answers());
+        assert_eq!(fast.exact_answers(), every);
     }
 
     /// Obj: clone_ref() is another reference to the same object, and the last drop releases it
@@ -834,107 +790,18 @@ pub(crate) mod tests {
     }
 
     /// A device creator dies at its selector where the runtime refuses its devices otherwise than
-    /// for having none, naming the refusal: a macOS host below every release whose Metal the
-    /// runtime measured among them (`Problem::HostReleaseUnmeasured`); with no device or no
-    /// loader it makes none
+    /// for having none, naming the refusal; with no device or no loader it makes none
     #[test]
-    fn a_host_whose_metal_the_runtime_cannot_answer_dies_at_the_creator() {
+    fn a_refused_device_dies_at_the_creator() {
         use reims_vgpu_core::raise::death::DeathKind;
         use reims_vgpu_core::testkit::capture::catch_death;
         for sel in ["MTLCreateSystemDefaultDevice()", "MTLCopyAllDevices()"] {
-            let unmeasured = rt::Error::Unproven(rt::Unproven::new(
-                "all_with",
-                rt::Problem::HostReleaseUnmeasured {
-                    macos: Some([15, 6, 1]),
-                },
-            ));
+            let refusal = rt::Error::NotImplemented(rt::RuntimeGap::Textures);
             *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| made_devices(sel, || Err(unmeasured))).unwrap_err();
+            let site = catch_death(|| made_devices(sel, || Err(refusal))).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-            assert!(line.contains("HostReleaseUnmeasured"), "{line}");
             assert!(made_devices(sel, || Err(rt::Error::NoDevice)).is_empty());
-        }
-    }
-
-    /// On a host whose macOS release the runtime has not measured, above one it has, the device
-    /// is made, at the newest measured release below the host's (`MetalLevelBelowHost`, kept by
-    /// `made_devices`, here set by hand, as this host's release is measured). An answer the
-    /// measured releases give otherwise dies where it is asked, naming it: the setter's at a
-    /// three-channel format (45, `RGB8Unorm`) and 586's description, whose flags differ. Every
-    /// other answer is the level's, with no death: the setter's at 80 and 630, a view in 81, a
-    /// shared texture of 80, and 80's description, whose cast class differs, which core does not
-    /// read, and a level's layout of it; and at 630, which no level describes, a view's nil, a
-    /// shared texture's nil at `Private` storage, its description and a level's layout of it. The
-    /// release is set back to a measured one as the test ends, whether it passes or not
-    #[test]
-    fn an_unmeasured_release_dies_only_where_an_answer_depends_on_it() {
-        use crate::gpu::format_info::setter_takes;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Texture as _;
-        use reims_vgpu_core::raise::death::DeathKind;
-        use reims_vgpu_core::testkit::capture::catch_death;
-        /// Sets the release back to a measured one when dropped.
-        struct Measured;
-        impl Drop for Measured {
-            fn drop(&mut self) {
-                BELOW_HOST.store(false, Ordering::Relaxed);
-            }
-        }
-        let d = dev();
-        let _measured = Measured;
-        BELOW_HOST.store(true, Ordering::Relaxed);
-        let p = platform();
-        let desc = |pixel_format, resource_options| {
-            p.texture_descriptor(&TextureDesc {
-                pixel_format,
-                width: 4,
-                height: 4,
-                usage: 1,
-                resource_options: Some(resource_options),
-                ..TextureDesc::default()
-            })
-        };
-        assert!(setter_takes("setPixelFormat:", 80));
-        assert!(setter_takes("setPixelFormat:", 630));
-        let t = d
-            .new_texture(OnFault::Return, &desc(80, 0))
-            .unwrap()
-            .unwrap();
-        assert!(t.new_texture_view(81).unwrap().is_some());
-        assert!(d.new_shared_texture(&desc(80, 0x20)).unwrap().is_some());
-        let level = |pixel_format| reims_vgpu_core::platform::types::TextureLevelQuery {
-            pixel_format,
-            width: 4,
-            height: 4,
-            depth: 1,
-            array_length: 1,
-            options: 0,
-            flags: 0,
-        };
-        assert_eq!(d.pixel_format_info(80).block_bytes, 4);
-        assert_eq!(d.texture_level_info(&level(80)).bytes_per_row, 16);
-        assert!(t.new_texture_view(630).unwrap().is_none());
-        assert!(d.new_shared_texture(&desc(630, 0x20)).unwrap().is_none());
-        assert_eq!(d.pixel_format_info(630).flags, 0);
-        d.texture_level_info(&level(630));
-        let cases: [(&str, &dyn Fn()); 2] = [
-            ("setPixelFormat:", &|| {
-                setter_takes("setPixelFormat:", 45);
-            }),
-            ("MTLPixelFormatGetInfoForDevice()", &|| {
-                d.pixel_format_info(586);
-            }),
-        ];
-        for (sel, ask) in cases {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(ask).unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-            assert!(
-                line.contains("not one the Vulkan runtime measured"),
-                "{line}"
-            );
         }
     }
 
@@ -955,6 +822,36 @@ pub(crate) mod tests {
         assert_eq!(p.open_device(own).is_some(), id == own);
     }
 
+    /// An open of the default device, or of a device the process adopted, asks the runtime for
+    /// no other device: every device, one of each GPU, is asked for only for another ID. The
+    /// default device found is adopted, so an open of it again makes no runtime call at all
+    #[test]
+    fn an_open_of_the_default_device_makes_no_other() {
+        let raw = rt::Device::system_default_with(device_options()).unwrap();
+        let id = device::registry_id(&raw);
+        let every = || -> Vec<rt::Device> { panic!("every device was asked for") };
+        let default = || {
+            made_devices(OPEN_DEVICE, || {
+                Ok(rt::Device::system_default_with(device_options())
+                    .ok()
+                    .into_iter()
+                    .collect())
+            })
+        };
+        let found = opened(id, default, every).unwrap();
+        let nothing = || -> Vec<rt::Device> { panic!("the runtime was asked") };
+        let again = opened(id, nothing, every).unwrap();
+        assert_eq!(again.id(), found.id());
+        assert_eq!(found.id(), dev().id());
+        let mut asked = false;
+        let other = opened(id ^ 0xdead_beef, default, || {
+            asked = true;
+            Vec::new()
+        });
+        assert!(other.is_none() && asked);
+        drop(raw);
+    }
+
     /// The library's shader cache holds the runtime's default of 25 GiB, sized for a macOS 26
     /// guest's apps on an RTX 5080 laptop: a pin whose default differs fails here,
     /// for review. The unit tests' own directory holds 1 GiB
@@ -962,6 +859,16 @@ pub(crate) mod tests {
     fn the_shader_cache_holds_25_gib() {
         assert_eq!(rt::DEFAULT_CAPACITY, 25 << 30);
         assert_eq!(device_options().shader_cache.capacity, 1 << 30);
+    }
+
+    /// A strict process, as every test of this crate is, waits for each pipeline until it is
+    /// made: no draw or dispatch is dropped for its compile's time, which would die here
+    #[test]
+    fn a_strict_process_waits_for_every_pipeline() {
+        assert_eq!(
+            device_options().policy.pipeline_waits,
+            metal2vulkan::device::PipelineWaitPolicy::Exact
+        );
     }
 
     /// The services are the ones the platform was made with

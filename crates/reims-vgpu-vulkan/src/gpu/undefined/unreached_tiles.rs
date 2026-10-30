@@ -1,5 +1,5 @@
-//! `unreached-tiles-rewritten`: the bytes a render pass leaves in the tiles its draws never
-//! rasterise into, by load action, and what its store makes of the tiles they do reach.
+//! The bytes a render pass leaves in the tiles its draws never rasterise into, by load action,
+//! and what its store makes of the tiles they do reach.
 //!
 //! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs; random
 //! bytes uploaded by a blit, so NaN payloads, denormals, out-of-range and non-canonical codes
@@ -30,10 +30,10 @@
 //! stores every texel as loaded: it keeps the two rewrites above in reached tiles, which no kind
 //! names (not run here).
 //!
-//! **To answer as Metal** on a device whose tile store is not Metal's: the runtime's load pass of
-//! extended-range attachments, which rewrites the codes of the tiles a pass's draws reach, would
-//! take the signed normalized formats (the most negative code one up) and `Depth32Float` (the
-//! sign bit cleared, where a draw of the pass writes depth) too.
+//! **To answer as Metal** on a device whose tile store is not Metal's: a rewrite of the codes of
+//! the tiles a pass's draws reach, which the extended-range formats would take too
+//! ([`super::extended_range`]), would take the signed normalized formats (the most negative code
+//! one up) and `Depth32Float` (the sign bit cleared, where a draw of the pass writes depth).
 
 use reims_vgpu_core::platform::Platform;
 

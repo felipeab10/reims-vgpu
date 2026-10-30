@@ -7,9 +7,12 @@
 
 mod budget;
 mod clock;
+mod device_lend;
+pub mod dirty;
 mod dma_buf;
 mod files;
 mod hints;
+mod host_ram;
 mod import;
 mod surface;
 mod threads;
@@ -21,15 +24,22 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
+pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
 pub use files::{GuestMemoryLease, lease_guest_memory};
-pub use surface::{LinuxSurface, LinuxSurfaces};
+pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
+#[cfg(test)]
+pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{
-    TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view, shown_at,
+    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view,
+    learn_view_imports, shown_at,
 };
-pub(crate) use surface::{plane_at, plane_shape, recorded_mut, surface_memory_hold, ycbcr_matrix};
+pub(crate) use surface::{
+    base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
+    ycbcr_matrix,
+};
 pub(crate) use vm::allocate_aliasable;
 #[cfg(test)]
 pub(crate) use vm::tests::{PAGE, mapped, writable};
@@ -113,14 +123,6 @@ pub fn install_process_services() {
         }
     });
 }
-
-/// The macOS release whose Metal the runtime's devices answer as where releases differ
-/// (`DeviceOptions::metal_level`): macOS 26.7, the release of the M3 Max whose Metal the suite's
-/// expected files, the pins and the measurements here were taken on, so a Linux host answers the
-/// guest as that Mac does. The runtime's default off macOS is its newest measured release,
-/// which takes and describes other pixel formats ([`rt::MetalLevel::knows`],
-/// [`rt::MetalLevel::describes`]).
-pub const METAL_LEVEL: Option<rt::MetalLevel> = Some(rt::MetalLevel::MacOS26_7);
 
 /// The registry ID the platform answers for the runtime's default device in place of its own:
 /// none, as there is no Metal here to ask, so the runtime's own stands.

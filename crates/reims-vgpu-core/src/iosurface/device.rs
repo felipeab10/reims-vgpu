@@ -241,14 +241,12 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
         Self::latest(platform).map(HostDeviceHandle)
     }
 
-    /// The state of the process's last device, unretained, for the graphics device's mapper
-    /// service. The lookup's own reference goes before this returns: when it is the last, the
-    /// device's teardown runs here, inside the lookup.
+    /// The state of the process's last device, unretained, while the device is alive: for the
+    /// graphics device's mapper service and the video devices' surfaces, on their threads. The
+    /// lookup never retains the device, so the host's last release is always its teardown, on
+    /// the host's thread, whatever lookups run beside it.
     pub fn latest_core(platform: &P) -> Option<Weak<HostDeviceCore<P>>> {
-        let device = Self::latest(platform)?;
-        let core = device.core_weak();
-        drop(device);
-        Some(core)
+        platform.globals().latest_iosurface_core()
     }
 
     /// The process's last device created; `None` once its teardown has begun.
@@ -332,7 +330,7 @@ impl<P: Platform> IoSurfaceHostDevice<P> {
         // The last device created wins, process-wide.
         platform
             .globals()
-            .register_iosurface_device(Arc::downgrade(&device));
+            .register_iosurface_device(Arc::downgrade(&device), device.core_weak());
         log::info!("host device {:#x} created", Arc::as_ptr(&device).addr());
         Ok(HostDeviceHandle(device))
     }
@@ -642,6 +640,52 @@ mod tests {
             drop(second);
             assert!(Dev::latest_handle(&*r.p).is_none());
         }
+
+        /// A lookup of the latest device's state never retains the device: the host's last
+        /// release is its teardown, on the releasing thread, while another thread looks it up
+        /// over and over, as the video devices' session threads and the mapper service may.
+        #[test]
+        #[allow(clippy::disallowed_methods)] // test scaffolding: the looking thread
+        fn a_lookup_never_takes_the_teardown_from_the_release() {
+            for _ in 0..50 {
+                let r = rig();
+                r.mapped_v2(1, 1);
+                let Rig { p, dev, .. } = r;
+                let looking = Arc::new(AtomicBool::new(true));
+                let started = Arc::new(AtomicBool::new(false));
+                let looker = {
+                    let (p, looking, started) = (p.clone(), looking.clone(), started.clone());
+                    std::thread::Builder::new()
+                        .name("lookup".to_owned())
+                        .spawn(move || {
+                            while looking.load(Ordering::Acquire) {
+                                let _ = Dev::latest_core(&*p);
+                                started.store(true, Ordering::Release);
+                            }
+                        })
+                        .unwrap()
+                };
+                while !started.load(Ordering::Acquire) {
+                    std::hint::spin_loop();
+                }
+                let mark = p.call_log().mark();
+                drop(dev);
+                looking.store(false, Ordering::Release);
+                looker.join().unwrap();
+                let unmapped: Vec<Option<String>> = (p.call_log().since(mark).into_iter())
+                    .filter(|call| call.sel == "mach_vm_deallocate")
+                    .map(|call| call.thread)
+                    .collect();
+                assert_eq!(unmapped.len(), 3, "{unmapped:?}");
+                assert!(
+                    unmapped
+                        .iter()
+                        .all(|thread| thread.as_deref() != Some("lookup")),
+                    "the lookup ran the teardown: {unmapped:?}"
+                );
+                assert!(Dev::latest_core(&*p).is_none());
+            }
+        }
     }
 
     /// Out of range and empty slots answer nil; a mapped surface is one more reference, which
@@ -657,6 +701,29 @@ mod tests {
         assert_eq!(Some(s.id()), r.surface(1));
         assert_eq!(Surface::retain_count(&s), 2);
         assert_eq!(r.unmap(1), IoReturn::Busy);
+    }
+
+    /// A surface a host holds keeps its pages while it holds it: the guest's unmap of it is
+    /// Busy, and a map of its mapping ID changes nothing, its descriptor not read again though the
+    /// guest wrote another, so its memory, which a device may be writing a frame into, is the
+    /// guest's pages it was made over until the hold goes.
+    #[test]
+    fn a_held_surface_keeps_its_pages() {
+        let r = rig();
+        r.mapped_v2(1, 2);
+        let pages = r.dev.state.lock().slots[1].pages.clone();
+        let held = r.dev.retain_surface_with_mapping_id(1).unwrap();
+        assert_eq!(r.unmap(1), IoReturn::Busy);
+        // Another descriptor at the same mapping ID, of one page: not read while it is mapped.
+        r.put_v2(1, &v2(1, L2A));
+        assert_eq!(r.map(1), IoReturn::Success);
+        assert_eq!(r.created().len(), 1);
+        assert_eq!(r.surface(1), Some(held.id()));
+        assert_eq!(r.dev.state.lock().slots[1].pages, pages);
+        assert_eq!(r.unmap(1), IoReturn::Busy);
+        drop(held);
+        assert_eq!(r.unmap(1), IoReturn::Success);
+        assert!(r.surface(1).is_none());
     }
 
     /// The teardown unmaps the ring, the table and the descriptor page, and leaks the surface.

@@ -15,7 +15,9 @@ use crate::form::{self, Field, Form, opts};
 use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
-use crate::vm::{Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib};
+use crate::vm::{
+    DiskController, Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib,
+};
 use crate::{install, logs, opencore, paths, reims_util, runtime, update};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
@@ -944,7 +946,7 @@ impl App {
                 };
                 self.activity.remove(&name);
                 self.spawn(&name, "powering off", move |p| {
-                    runtime::stop(&vm, true, Duration::ZERO, |s| p(s))?;
+                    runtime::stop(&vm, true, None, |s| p(s))?;
                     Ok(format!("{}: powered off", vm.name()))
                 });
             }
@@ -976,7 +978,7 @@ impl App {
             self.say(&format!("{} is not running", vm.name()), Level::Info);
             return;
         }
-        let timeout = Duration::from_secs(vm.config.stop_timeout_secs);
+        let timeout = vm.config.stop_timeout();
         let first = if force {
             "powering off"
         } else {
@@ -1116,8 +1118,11 @@ impl App {
         let current = update::current_branch(&i.repo)
             .as_deref()
             .and_then(Channel::of);
-        // __record-install installs reims-util where the host makes x86-64 VMs (cli.rs).
-        let what = if self.host.default_profile() == Some(Profile::Q35X86_64) {
+        // __record-install installs reims-util where the host makes x86-64 VMs, or where one is
+        // beside reims-ctl (cli.rs).
+        let what = if self.host.default_profile() == Some(Profile::Q35X86_64)
+            || reims_util::beside().is_some()
+        {
             "reims-ctl, the library, QEMU and reims-util"
         } else {
             "reims-ctl, the library and QEMU"
@@ -1145,8 +1150,13 @@ impl App {
     }
 
     fn toggle_logs(&mut self) {
-        let Some(mut vm) = self.selected_vm() else {
+        let Some(vm) = self.selected_vm() else {
             return;
+        };
+        // As saved now, not as the list last read it: the toggle saves the whole of it.
+        let mut vm = match Vm::load(&vm.dir) {
+            Ok(vm) => vm,
+            Err(e) => return self.say(&format!("{e:#}"), Level::Error),
         };
         vm.config.logs.enabled = !vm.config.logs.enabled;
         match vm.save() {
@@ -1432,7 +1442,8 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The displays' and the GPU's fields are reims-vgpu's; an arm64 VM has no other.
+        // The displays', the GPU's and video acceleration's fields are reims-vgpu's; an arm64 VM
+        // has no other.
         let library = &["reims-vgpu"];
         if c.profile == Profile::Q35X86_64 {
             let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
@@ -1484,11 +1495,19 @@ impl App {
         }
         fields.extend([
             Field::toggle(
+                "video_acceleration",
+                "Video acceleration",
+                c.video_acceleration,
+                "The guest decodes, encodes and scales video on the host's hardware. Off, it \
+                 does all of that in software.",
+            )
+            .show_if("graphics", library),
+            Field::toggle(
                 "audio",
                 "Audio",
                 c.audio.enabled,
-                "A USB audio device on the host's sound (on x86-64, also the HDA controller \
-                 OpenCore's boot chime plays on).",
+                "A virtio sound device on the host's sound, with a microphone (on x86-64, also \
+                 the HDA controller OpenCore's boot chime plays on).",
             ),
             Field::toggle(
                 "logs",
@@ -1517,7 +1536,7 @@ impl App {
                     .ssh_port
                     .map(|p| p.to_string())
                     .unwrap_or_default(),
-                "A port on 127.0.0.1 forwarded to the guest's SSH; empty for none.",
+                "A port on 127.0.0.1 forwarded to the guest's SSH; empty or 0 for none.",
             )
             .placeholder("none")
             .show_if("network", &["yes"]),
@@ -1525,10 +1544,23 @@ impl App {
                 "stop_timeout",
                 "Shutdown timeout",
                 &c.stop_timeout_secs.to_string(),
-                "Seconds stop (x) waits for the guest to shut down before it powers the VM off.",
+                "Seconds stop (x) waits for the guest to shut down before it powers the VM off; \
+                 0 for no limit: stop waits until the guest shuts down, and only power off \
+                 (K) pulls the plug.",
             ),
         ]);
-        if c.q35.is_some() {
+        if let Some(q) = &c.q35 {
+            let options =
+                DiskController::ALL.map(|d| (d.id().to_string(), d.describe().to_string()));
+            fields.push(Field::choice(
+                "disk_controller",
+                "Disk controller",
+                options.to_vec(),
+                q.disk_controller.id(),
+                "SATA, which macOS's installers see, or NVMe, for macOS once installed: an \
+                 installer may find no disk on NVMe. macOS finds its disk on either; once it is \
+                 installed, eject the installer before a move, or OpenCore may start it instead.",
+            ));
             fields.push(
                 Field::path(
                     "installer",
@@ -1573,7 +1605,8 @@ impl App {
                 "extra_env",
                 "Extra environment",
                 &env,
-                "KEY=VALUE pairs for QEMU's environment, shell-quoted.",
+                "KEY=VALUE pairs for QEMU's environment, shell-quoted; a KEY is letters, digits \
+                 and _, not starting with a digit.",
             )
             .placeholder("none"),
         ]);
@@ -1730,12 +1763,7 @@ impl App {
         s.display.hidpi = f.toggle("hidpi");
         s.display.check()?;
         s.logs = f.toggle("logs");
-        let ssh = f.text("ssh_port");
-        s.ssh_port = if ssh.is_empty() {
-            None
-        } else {
-            Some(ssh.parse().context("SSH port: a number")?)
-        };
+        s.ssh_port = ssh_port_field(f)?;
         Ok(s)
     }
 
@@ -2217,6 +2245,11 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     if f.is_shown("graphics") {
         c.graphics = Graphics::parse(&f.choice("graphics"))?;
     }
+    if f.is_shown("disk_controller")
+        && let Some(q) = &mut c.q35
+    {
+        q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
+    }
     // Hidden on VMware SVGA, the displays' settings stay as they were.
     if f.is_shown("displays") {
         c.display.count = f.text("displays").parse().context("displays: a number")?;
@@ -2236,6 +2269,10 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
         }
     }
+    // Hidden on VMware SVGA, which has no video devices, it stays as it was.
+    if f.is_shown("video_acceleration") {
+        c.video_acceleration = f.toggle("video_acceleration");
+    }
     c.audio.enabled = f.toggle("audio");
     c.logs.enabled = f.toggle("logs");
     if f.is_shown("log_level") && !f.text("log_level").is_empty() {
@@ -2243,12 +2280,7 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     }
     c.network.enabled = f.toggle("network");
     if f.is_shown("ssh_port") {
-        let p = f.text("ssh_port");
-        c.network.ssh_port = if p.is_empty() {
-            None
-        } else {
-            Some(p.parse().context("SSH port: a number")?)
-        };
+        c.network.ssh_port = ssh_port_field(f)?;
     }
     c.stop_timeout_secs = f
         .text("stop_timeout")
@@ -2264,6 +2296,16 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         c.extra_env.insert(k.into(), v.into());
     }
     c.check()
+}
+
+/// The SSH port field's forward: none where it is empty or 0, as `set --ssh-port 0` has it.
+fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
+    let p = f.text("ssh_port");
+    if p.is_empty() {
+        return Ok(None);
+    }
+    let p = p.parse().context("SSH port: a number")?;
+    Ok(crate::vm::ssh_port(p))
 }
 
 /// Runs less on `files`, each at its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
@@ -2367,10 +2409,12 @@ reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in win
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
   e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
-              GPU, audio, network, logs, extra QEMU arguments (they apply at its next start),
-              and on x86-64 its installer image, its boot selection (OpenCore's picker, which
-              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware SVGA,
-              one display with no GPU acceleration, in QEMU's own window
+              GPU, video acceleration (the host's hardware video decode, encode and
+              scaling), audio, network, logs, extra QEMU arguments (they apply at its next
+              start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
+              installed), its installer image, its boot selection (OpenCore's picker, which
+              makes it a new OpenCore image) and graphics: reims-vgpu, or QEMU's VMware
+              SVGA, one display with no GPU acceleration, in QEMU's own window
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2580,6 +2624,8 @@ mod tests {
 
     #[test]
     fn a_create_that_fails_keeps_its_form_open_with_the_error() {
+        // The create and the list it reads again use these VMs, not the user's.
+        let _env = crate::testenv::Env::new("tui-create");
         let host = Host {
             os: Os::Linux,
             arch: Arch::X86_64,
@@ -2609,6 +2655,8 @@ mod tests {
 
     #[test]
     fn a_busy_form_closes_once_its_work_succeeds_and_opens_again_if_it_fails() {
+        // The list each work's end reads again is of these VMs, not the user's.
+        let _env = crate::testenv::Env::new("tui-busy");
         let mut app = App::with(Host::current());
         let busy = |app: &mut App, id| {
             let mut f = Form::new("t", "save", Vec::new());
@@ -2759,6 +2807,82 @@ mod tests {
         assert!(vm_menu(&broken, true).contains(&(ToggleLogs, "Turn logs on or off")));
     }
 
+    /// An x86-64 VM's edit form offers its disk's controller as its settings have it, and saves
+    /// the one picked; an arm64 VM's form has none.
+    #[test]
+    fn the_edit_form_picks_an_x86_64_vms_disk_controller() {
+        let mut nvme = vm_row("n", true);
+        let q = nvme.vm.as_mut().unwrap().config.q35.as_mut().unwrap();
+        q.disk_controller = DiskController::Nvme;
+        let mut app = test_app(vec![vm_row("t", true), vm_row("a", false), nvme]);
+        app.table.select(Some(2));
+        app.open_edit();
+        assert_eq!(form(&app).choice("disk_controller"), "nvme");
+        app.overlay = None;
+        app.table.select(Some(0));
+        app.open_edit();
+        assert_eq!(form(&app).choice("disk_controller"), "ahci");
+        for _ in 0..form(&app).fields.len() {
+            if form(&app).focused_key() == "disk_controller" {
+                break;
+            }
+            press(&mut app, [KeyCode::Down]);
+        }
+        press(&mut app, [KeyCode::Right]);
+        let mut vm = vm_row("t", true).vm.unwrap();
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Nvme);
+
+        app.overlay = None;
+        app.table.select(Some(1));
+        app.open_edit();
+        assert!(!form(&app).is_shown("disk_controller"));
+    }
+
+    /// The edit form turns video acceleration off on reims-vgpu, on either kind of VM, and has
+    /// no such field on VMware SVGA, which has no video devices, whose setting stays as it was.
+    #[test]
+    fn the_edit_form_turns_video_acceleration_off() {
+        let mut svga = vm_row("s", true);
+        let c = &mut svga.vm.as_mut().unwrap().config;
+        c.graphics = Graphics::VmwareSvga;
+        c.video_acceleration = false;
+        let mut arm64 = vm_row("a", false);
+        arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1234,
+        });
+        let mut app = test_app(vec![vm_row("t", true), arm64, svga]);
+        for row in [0, 1] {
+            app.overlay = None;
+            app.table.select(Some(row));
+            app.open_edit();
+            assert!(form(&app).toggle("video_acceleration"));
+            for _ in 0..form(&app).fields.len() {
+                if form(&app).focused_key() == "video_acceleration" {
+                    break;
+                }
+                press(&mut app, [KeyCode::Down]);
+            }
+            press(&mut app, [KeyCode::Right]);
+            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
+            apply_edit(&mut vm, form(&app), None).unwrap();
+            assert!(!vm.config.video_acceleration);
+        }
+
+        app.overlay = None;
+        app.table.select(Some(2));
+        app.open_edit();
+        assert!(!form(&app).is_shown("video_acceleration"));
+        let mut vm = app.rows[2].vm.as_ref().unwrap().clone();
+        vm.config.video_acceleration = true;
+        apply_edit(&mut vm, form(&app), None).unwrap();
+        assert!(
+            vm.config.video_acceleration,
+            "a hidden field changes nothing"
+        );
+    }
+
     #[test]
     fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
         let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
@@ -2891,6 +3015,38 @@ mod tests {
         assert_eq!(at(Position::new(35, 10)), Rect::new(18, 5, 22, 5));
         // Up where the cell is below the screen, as when the terminal shrinks.
         assert_eq!(at(Position::new(35, 20)), Rect::new(18, 7, 22, 5));
+    }
+
+    /// The logs toggle saves the VM's settings as they are saved now, not as the list last read
+    /// them (it reads them every 5 seconds): a reims-ctl set from a shell just before stays.
+    #[test]
+    fn toggling_logs_keeps_what_was_saved_since_the_list_was_read() {
+        let env = crate::testenv::Env::new("tui-logs");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let config = r#"
+            name = "t"
+            profile = "vmapple-arm64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.img"
+            [vmapple]
+            aux = "aux.img"
+            ecid = 1
+        "#;
+        std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+        let mut app = App::with(Host::current());
+        app.reload().unwrap();
+        let mut vm = Vm::load(&dir).unwrap();
+        vm.config.memory_mib = 8192;
+        vm.save().unwrap();
+        press(&mut app, [KeyCode::Char('l')]);
+        let saved = Vm::load(&dir).unwrap().config;
+        assert!(saved.logs.enabled);
+        assert_eq!(saved.memory_mib, 8192);
     }
 
     #[test]

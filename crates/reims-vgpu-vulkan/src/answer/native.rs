@@ -36,11 +36,11 @@ pub struct NativeRelay {
 
 /// The kinds of [`DIES`](super::DIES) a native device relays, each with its ground.
 ///
-/// The first eight are relayed on the rule for native devices: as close to the Mac GPUs as the
+/// The first seven are relayed on the rule for native devices: as close to the Mac GPUs as the
 /// hardware allows; a difference the hardware itself forces is logged as a typed
 /// degradation, relayed once per kind and counted, with no interpreter-level fallback for
 /// differences in the tenth decimal. Each is here on a fact of the device that its ground states:
-/// the device's own interpolation, level arithmetic, denormal reads, reduction order, float
+/// the device's own interpolation, level arithmetic, reduction order, float
 /// controls, evaluation position, reconvergence or memory granularity. The rest are the device's
 /// maths and sampling, as a class of their own (below). "Not built", "not measured" and "a
 /// guest or a suite case reaches it" are no grounds: a kind neither covers, whose exact form the
@@ -49,7 +49,7 @@ pub struct NativeRelay {
 /// answer. Each relayed kind stays a difference to bring to Metal's answer, its magnitude for the
 /// runtime team to confirm; one found visible is fixed toward Metal's answer, not relayed.
 ///
-/// `DeviceInterpolation`, `GradFromBias` and `DeviceTexelDenormals` differ in texel values
+/// `DeviceInterpolation` and `GradFromBias` differ in texel values
 /// alone, never in control flow, memory addresses or numbering. Their counts are a census-mode run
 /// of 2026-10-10 on an RTX 5080 Laptop GPU (macOS 13, 15 and
 /// 26 booted to an idle desktop, and macOS 14 and 12 through the built-in app sweep, with no
@@ -60,7 +60,7 @@ pub struct NativeRelay {
 /// gpuAddresses than on Metal. It never differs in texels, nor in the range of Metal's space a
 /// texture of its own memory takes.
 ///
-/// Of those eight, the last four are the precision notes of a pipeline's stage whose arithmetic
+/// Of those seven, the last four are the precision notes of a pipeline's stage whose arithmetic
 /// or ordering can give other bits than Metal's, as the runtime's documentation of each says: a
 /// note whose difference is the device's rounding, evaluation position or reduction order, or the
 /// lanes its driver runs together after divergence, is logged, not a death.
@@ -73,14 +73,15 @@ pub struct NativeRelay {
 /// `DeviceArithmetic` and `DeviceDenormals` (maths); `FloatSampleFilter`, `HalfSampleFilter`,
 /// `CubeGradientFootprint`, `CompressedTexelDecode`, `ViewBaseTexelOffset`, `SrgbTexelDecode`,
 /// `BicubicFilterArithmetic`, `HalfTexelConversion` and `DeviceSampleLevel` (sampling). Then the
-/// notes of the runtime's native defaults off Apple's GPUs, whose exact forms are the device
-/// policy's opt-ins this platform takes only where `REIMS_VGPU_EXACT` names them, each with the
-/// bound the runtime records: `NativeTranscendentals`,
-/// `NativeDivision`, `NativeFma`, `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`,
-/// `NativeHalfConversion` and `NativeHalfQuantize` (maths); `DeviceSampling`,
-/// `DeviceTexelConversion` and `DecodedTexelPrecision` (sampling); `DeviceRoundedResolve` (the
-/// device's rounding of a resolve's average). A device that runs on Metal (MoltenVK) is an Apple
-/// GPU, where each still dies.
+/// notes of the device's own answers off Apple's GPUs, which the runtime gives in place of Metal's,
+/// each with the bound the runtime records: `NativeTranscendentals`, `NativeDivision`, `NativeFma`,
+/// `NativeNanEncoding`, `NativeMinMax`, `NativeDot`, `NativeMix`, `NativeHalfConversion` and
+/// `NativeHalfQuantize` (maths); `DeviceSampling`, `DeviceTexelConversion` and
+/// `DecodedTexelPrecision` (sampling); `DeviceRoundedResolve` (the device's rounding of a resolve's
+/// average); `DevicePackConversion` (its conversions of packed normalized values),
+/// `DeviceVertexConversion` (its vertex input's conversion of a normalized attribute) and
+/// `DeviceAlphaCoverage` (its alpha to coverage). A device that runs on Metal (MoltenVK) is an
+/// Apple GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
 /// depth, layout, a pass's tile store and when a command buffer is seen complete are neither
@@ -113,7 +114,7 @@ pub struct NativeRelay {
 /// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
 ///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
 ///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
-pub const NATIVE_RELAYED: [NativeRelay; 34] = [
+pub const NATIVE_RELAYED: [NativeRelay; 36] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -130,12 +131,6 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
         ground: "a biased sample emulated with gradients: the device's level arithmetic and \
                  `exp2` may pick another level or anisotropic footprint than Metal's (the \
                  runtime's note). Census: 1220, 175 and 102 occurrences on macOS 13, 15 and 26",
-    },
-    NativeRelay {
-        kind: rt::Degradation::DeviceTexelDenormals,
-        ground: "a denormal 32-bit float texel, which Metal's sample and gather hand back as \
-                 it is, the device's gather may read as zero (the runtime's note). Census: 7 \
-                 occurrences on macOS 26, none on 13 and 15",
     },
     NativeRelay {
         kind: rt::Degradation::HeapTextureLargerThanMetal,
@@ -276,9 +271,8 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     },
     NativeRelay {
         kind: rt::Degradation::DeviceSampleLevel,
-        ground: "class (e), owner 2026-10-11: the device's sampling. Under Metal's sampler \
-                 emulated (`SamplingPolicy::Exact`), a sample whose level the device's level \
-                 arithmetic chooses, an LOD query's among them: Vulkan's level of detail may \
+        ground: "class (e), owner 2026-10-11: the device's sampling. A sample whose level the \
+                 device's level arithmetic chooses, an LOD query's among them: Vulkan's level of detail may \
                  approximate its scale factor, and a nearest mip filter reads ceil(lambda + 1/2) \
                  - 1 where Metal rounds the level to half and truncates its fraction onto \
                  sixty-fourths, so near a boundary the sample may read another level or filter \
@@ -286,8 +280,8 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     },
     NativeRelay {
         kind: rt::Degradation::NativeTranscendentals,
-        ground: "class (e), owner 2026-10-11: the device's maths, the runtime's default off \
-                 Apple's GPUs (`FloatMathsPolicy::Native`). A math-library call the device's \
+        ground: "class (e), owner 2026-10-11: the device's maths, the device's own answer \
+                 off Apple's GPUs. A math-library call the device's \
                  `GLSL.std.450` instruction answers, within Vulkan's precision table: `Exp2` and \
                  `Exp` 3 + 2|x| ulp, `Log2` and `Log` 3 ulp (2^-21 absolute in [0.5, 2]), \
                  `InverseSqrt` 2 ulp, `Sin` and `Cos` 2^-11 absolute in [-pi, pi], the inverse \
@@ -339,8 +333,8 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     },
     NativeRelay {
         kind: rt::Degradation::NativeHalfConversion,
-        ground: "class (e), owner 2026-10-11: the device's maths, the runtime's default off \
-                 Apple's GPUs (`HalfRoundingPolicy::Native`). A `half` result rounded by the \
+        ground: "class (e), owner 2026-10-11: the device's maths, the device's own answer \
+                 off Apple's GPUs. A `half` result rounded by the \
                  device's own conversion to 16 bits: within one unit in its last place, toward \
                  zero on some devices (65504 from 65520 up where Metal answers infinity), a \
                  result below 2^-14 the zero of its sign where the device flushes, and a NaN's \
@@ -356,28 +350,27 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     },
     NativeRelay {
         kind: rt::Degradation::DeviceSampling,
-        ground: "class (e), owner 2026-10-11: the device's sampling, the runtime's default off \
-                 Apple's GPUs (`SamplingPolicy::NativeDevice`). Samples, gathers and comparisons \
+        ground: "class (e), owner 2026-10-11: the device's sampling, the device's own answer \
+                 off Apple's GPUs. Samples, gathers and comparisons \
                  the device's sampler answers: measured against an Apple M4, a linear filter \
                  within 0.919 of a code of Metal's on NVIDIA 615.71.09, 0.548 on RADV, 0.918 on \
                  ANV and 1.0 on lavapipe, an sRGB texture's within 1.832, 0.764, 0.912 and \
                  0.781, and a nearest sample's texel Metal's neighbour at 0.1% of coordinates \
                  at most (the runtime's D906); a two-plane YCbCr texture's linear filter \
-                 (`YCbCrFilterPolicy::Device`) within 1.18 codes of Metal's sum on an RTX 3090, \
+                 within 1.18 codes of Metal's sum on an RTX 3090, \
                  0.88 on RADV and 1.06 on ANV; the runtime records the rest",
     },
     NativeRelay {
         kind: rt::Degradation::DeviceTexelConversion,
-        ground: "class (e), owner 2026-10-11: the device's sampling, the runtime's default off \
-                 Apple's GPUs (`TexelConversionPolicy::Device`). A texel's codes converted by the \
+        ground: "class (e), owner 2026-10-11: the device's sampling, the device's own answer \
+                 off Apple's GPUs. A texel's codes converted by the \
                  device: an 8- or 16-bit normalized code within one `f32` ulp of Metal's, a 5- or \
                  6-bit channel within 0.18 of a code, and a half-float or small-float NaN in the \
                  device's encoding (the runtime's D905)",
     },
     NativeRelay {
         kind: rt::Degradation::DecodedTexelPrecision,
-        ground: "class (e): the runtime's default off Apple's GPUs \
-                 (`DecodedTexelsPolicy::Compact`), for a texture of a format the device lacks \
+        ground: "class (e): the device's own answer off Apple's GPUs, for a texture of a format the device lacks \
                  held in a carrier, whose reads, samples and gathers read a decoded twin of \
                  compact codes: an ASTC LDR channel the 8-bit code nearest Metal's 12-bit \
                  value, at most 1/510 off it, and an EAC 11-bit channel the 16-bit normalized \
@@ -386,13 +379,39 @@ pub const NATIVE_RELAYED: [NativeRelay; 34] = [
     },
     NativeRelay {
         kind: rt::Degradation::DeviceRoundedResolve,
-        ground: "class (e): the device's own rounding of an average, the runtime's default off \
-                 Apple's GPUs (`ResolvePolicy::Device`), for a pass's resolve of a multisampled \
+        ground: "class (e): the device's own rounding of an average, the device's own answer \
+                 off Apple's GPUs, for a pass's resolve of a multisampled \
                  colour attachment by the device's `AVERAGE`: a resolved channel up to one code \
                  off Metal's (an sRGB one two) near a rounding boundary, a float channel off in \
                  its last bits, and wholly where a sample is a NaN or an infinity, measured at 2 \
                  and 4 samples on RADV, ANV, NVIDIA and lavapipe, each rounding an 8-bit unorm \
                  tie down",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DevicePackConversion,
+        ground: "class (e): the device's maths, for a conversion: its `GLSL.std.450` `Pack` and \
+                 `Unpack` of a normalized format, and its clamp, multiply, `RoundEven`, \
+                 reciprocal and `Pow` for the rest, where Metal rounds the exact product and \
+                 takes an sRGB colour through its twelve-bit table: a packed code within one of \
+                 Metal's, an unpacked value within 2.5 ulp of the correctly rounded quotient, an \
+                 sRGB colour within half a twelve-bit step of Metal's (the runtime's record of \
+                 the bound)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DeviceVertexConversion,
+        ground: "class (e): the device's conversion of a normalized vertex attribute's codes by \
+                 its fixed-function vertex input, as `DeviceTexelConversion` is its conversion of \
+                 a texel's: within one `f32` ulp of Metal's where measured, and lavapipe's \
+                 per-instance fetch reading the most negative signed code unclamped (the \
+                 runtime's record of the bound)",
+    },
+    NativeRelay {
+        kind: rt::Degradation::DeviceAlphaCoverage,
+        ground: "class (e): the device's alpha to coverage, which Vulkan leaves to the device: \
+                 its own algorithm where Metal covers by a 2x2 ordered dither, each pixel within \
+                 one sample of Metal's on lavapipe, unmeasured elsewhere (the runtime's record). \
+                 The runtime gives the device's answer with the note, as for its maths and \
+                 sampling, with no exact form to take",
     },
 ];
 

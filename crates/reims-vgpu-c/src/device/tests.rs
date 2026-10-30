@@ -317,7 +317,9 @@ fn a_first_version_device_config_is_48_bytes() {
         std::mem::offset_of!(RvgDeviceConfig, process_isolation_follows_guest),
         56
     );
-    assert_eq!(size_of::<RvgDeviceConfig>(), 64);
+    assert_eq!(std::mem::offset_of!(RvgDeviceConfig, dirty_source), 64);
+    assert_eq!(size_of::<RvgDeviceConfig>(), 72);
+    assert_eq!(size_of::<RvgDirtySource>(), 56);
     assert_eq!(size_of::<RvgMemoryRangeFile>(), 16);
     assert_eq!(std::mem::offset_of!(RvgMemoryRangeFile, flags), 4);
     assert_eq!(std::mem::offset_of!(RvgMemoryRangeFile, offset), 8);
@@ -584,4 +586,178 @@ fn memory_files_are_duplicated() {
     assert_eq!(open_fds(), fds + 1);
     drop(copy);
     assert_eq!(open_fds(), fds);
+}
+
+/// The fake host's slots: two, each passed to `rvg_dirty_slot`, and the host's writes, page 1 of
+/// each take.
+unsafe extern "C-unwind" fn t_slots(ctx: *mut c_void, slot_ctx: *mut c_void) -> bool {
+    Rec::push(ctx, "for_each_slot".into());
+    // SAFETY: the library's function over its own slot_ctx, inside this call.
+    unsafe {
+        rvg_dirty_slot(slot_ctx, 1 << 16 | 3, 0x10_0000, 0x4_0000, 0x8_0000);
+        rvg_dirty_slot(slot_ctx, 4, 0x20_0000, 0x8_0000, 0);
+    }
+    true
+}
+
+unsafe extern "C-unwind" fn t_take(ctx: *mut c_void, offset: u64, length: u64, words: *mut u64) {
+    Rec::push(ctx, format!("take {offset:#x} {length:#x}"));
+    // SAFETY: the library's words, a bit a page of `length`.
+    unsafe { *words |= 2 };
+}
+
+unsafe extern "C-unwind" fn t_flush(ctx: *mut c_void, timeout_ns: u64) -> bool {
+    Rec::push(ctx, format!("flush {timeout_ns}"));
+    true
+}
+
+unsafe extern "C-unwind" fn t_start(ctx: *mut c_void) {
+    Rec::push(ctx, "start".into());
+}
+
+fn dirty_table(rec: &Arc<Rec>, fd: i32) -> RvgDirtySource {
+    RvgDirtySource {
+        struct_size: crate::sized::size_u32::<RvgDirtySource>(),
+        kvm_vm_fd: fd,
+        ctx: rec.ctx(),
+        destroy: Some(t_destroy),
+        start: Some(t_start),
+        flush_vcpus: Some(t_flush),
+        for_each_slot: Some(t_slots),
+        take_host_writes: Some(t_take),
+    }
+}
+
+/// A source's functions reach the host with its ctx, each slot's fields in order, and the
+/// host's writes into the library's words.
+#[test]
+fn a_dirty_source_calls_the_host() {
+    let rec = Rec::new();
+    let d = dirty_table(&rec, 7);
+    let table = Table::new(d.ctx, d.destroy);
+    let source = dirty_source(&table, &d).unwrap();
+    assert_eq!(source.kvm_vm_fd, 7);
+    source.host.start();
+    assert!(source.host.flush_vcpus(Duration::from_millis(4)));
+    let mut slots = Vec::new();
+    assert!(source.host.for_each_slot(&mut |s| slots.push(s)));
+    assert_eq!(
+        slots,
+        [
+            KvmSlot {
+                slot: 1 << 16 | 3,
+                guest_physical_address: 0x10_0000,
+                length: 0x4_0000,
+                host_offset: 0x8_0000,
+            },
+            KvmSlot {
+                slot: 4,
+                guest_physical_address: 0x20_0000,
+                length: 0x8_0000,
+                host_offset: 0,
+            },
+        ]
+    );
+    let mut words = [0u64; 2];
+    source.host.take_host_writes(0x4_0000, 0x8_0000, &mut words);
+    assert_eq!(words, [2, 0]);
+    assert_eq!(
+        rec.lines(),
+        [
+            "start",
+            "flush 4000000",
+            "for_each_slot",
+            "take 0x40000 0x80000"
+        ]
+    );
+    drop(source);
+    assert!(rec.destroys().is_empty());
+    drop(table);
+    assert_eq!(rec.destroys().len(), 1);
+
+    let d = RvgDirtySource {
+        kvm_vm_fd: -1,
+        ..dirty_table(&rec, 0)
+    };
+    assert!(dirty_source(&Table::new(d.ctx, d.destroy), &d).is_none());
+    let d = RvgDirtySource {
+        for_each_slot: None,
+        ..dirty_table(&rec, 0)
+    };
+    assert!(dirty_source(&Table::new(d.ctx, d.destroy), &d).is_none());
+}
+
+/// A device over a memory map keeps its dirty source until its end; one without a map, a source
+/// that is none and a refusal end it before the create returns, and a source the create cannot
+/// read is refused, ending neither table.
+#[test]
+fn a_dirty_source_lives_with_its_device() {
+    let p = test_platform();
+    let rec = Rec::new();
+    let src = Rec::new();
+    let table = only_destroy(&rec);
+    let range = fake_range(&p, 0x10_0000);
+    let map = RvgMemoryMap {
+        ranges: &range,
+        range_count: 1,
+    };
+    let d = dirty_table(&src, 9);
+    let mut c = config(1, &table);
+    c.memory_map = &map;
+    c.dirty_source = &d;
+    let (s, dev) = create(&c);
+    assert_eq!(s, RVG_OK);
+    assert!(src.destroys().is_empty());
+    // SAFETY: the device made above.
+    unsafe { rvg_device_release(dev) };
+    assert_eq!(src.wait_destroys(1).len(), 1);
+    assert!(src.lines().is_empty(), "no harvest was wanted");
+
+    c.memory_map = std::ptr::null();
+    let (s, dev) = create(&c);
+    assert_eq!(s, RVG_OK);
+    assert_eq!(
+        src.destroys().len(),
+        2,
+        "no map: ended before the create returned"
+    );
+    // SAFETY: the device made above.
+    unsafe { rvg_device_release(dev) };
+
+    c.memory_map = &map;
+    let none = RvgDirtySource { kvm_vm_fd: -1, ..d };
+    c.dirty_source = &none;
+    let (s, dev) = create(&c);
+    assert_eq!(s, RVG_OK);
+    assert_eq!(
+        src.destroys().len(),
+        3,
+        "none: ended before the create returned"
+    );
+    // SAFETY: the device made above.
+    unsafe { rvg_device_release(dev) };
+
+    c.dirty_source = &d;
+    c.display_port_count = 0;
+    assert_eq!(create(&c).0, RVG_ERR_DISPLAY_PORT_COUNT);
+    assert_eq!(src.destroys().len(), 4, "a refusal ends it");
+    c.display_port_count = 1;
+
+    let small = RvgDirtySource {
+        struct_size: 4,
+        ..d
+    };
+    c.dirty_source = &small;
+    let before = rec.destroys().len();
+    assert_eq!(create(&c).0, RVG_ERR_INVALID_ARGUMENT);
+    assert_eq!(src.destroys().len(), 4);
+    assert_eq!(rec.destroys().len(), before);
+
+    c.dirty_source = &d;
+    c.struct_size = 64;
+    let (s, dev) = create(&c);
+    assert_eq!(s, RVG_OK, "a third-version config has no source");
+    assert_eq!(src.destroys().len(), 4);
+    // SAFETY: the device made above.
+    unsafe { rvg_device_release(dev) };
 }

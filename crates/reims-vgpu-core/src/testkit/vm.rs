@@ -526,6 +526,34 @@ mod tests {
         assert_eq!(vm.read(dst2, 4).unwrap(), vec![0; 4]);
     }
 
+    /// A view of runs is their remaps one after another, in order, each from the end of the
+    /// one before; a refused run answers its index, the runs before it mapped
+    #[test]
+    fn a_view_of_runs_is_their_remaps_in_order() {
+        let (vm, log, _) = vm();
+        let ram = GuestRam::with_range(0x1000_0000, 0x10000).unwrap();
+        vm.adopt(&ram);
+        ram.write_u32(0x1000_8000, 0xa);
+        ram.write_u32(0x1000_0000, 0xb);
+        let host = |pa| ram.host_addr(pa).unwrap();
+        let dst = vm.allocate_anywhere(0xc000).unwrap();
+        let mark = log.mark();
+        let runs = [(host(0x1000_8000), 0x4000), (host(0x1000_0000), 0x8000)];
+        assert_eq!(vm.remap_runs_shared_overwrite(dst, &runs), Ok(()));
+        assert_eq!(log.sels_since(mark), ["mach_vm_remap", "mach_vm_remap"]);
+        assert_eq!(vm.read(dst, 4).unwrap(), 0xau32.to_le_bytes());
+        assert_eq!(
+            vm.read(dst.wrapping_add(0x4000), 4).unwrap(),
+            0xbu32.to_le_bytes()
+        );
+        let refused = [(host(0x1000_8000), 0x4000), (HostPtr::NULL, 0x4000)];
+        assert_eq!(
+            vm.remap_runs_shared_overwrite(dst, &refused),
+            Err((1, KERN_INVALID_ADDRESS))
+        );
+        assert_eq!(vm.read(dst, 4).unwrap(), 0xau32.to_le_bytes());
+    }
+
     /// Maximum protection; a write to a read-only page is the SIGBUS marker
     #[test]
     fn protect_and_fault() {

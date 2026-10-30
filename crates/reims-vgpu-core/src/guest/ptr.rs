@@ -21,6 +21,9 @@
 //! - **A task that has ended writes nothing.** A write on a thread running the work of an
 //!   isolated task that died or was invalidated stops that thread before any byte is touched
 //!   ([`stop_if_task_ended`]), as the task's process would have been gone.
+//! - **Every write is stamped in the dirty log** (`memory::dirty::host_wrote`) once its bytes are
+//!   stored, so a runtime's copy of the guest's RAM takes the bytes the library wrote. It costs
+//!   one relaxed load while no device has a dirty source, and touches nothing the guest sees.
 
 // Guest data flows through here: arithmetic is spelt out.
 #![cfg_attr(not(test), deny(clippy::arithmetic_side_effects))]
@@ -28,6 +31,7 @@
 use std::sync::atomic::Ordering;
 
 use crate::host::HostPtr;
+use crate::memory::dirty::host_wrote;
 use crate::num::ToU64;
 use crate::raise::death::{DeathId, fatal};
 use crate::tasks::isolation::life::stop_if_task_ended;
@@ -52,6 +56,17 @@ fn check(base: HostPtr, off: u64, len: usize, death: impl Into<DeathId>) -> Host
         fatal(death)
     }
     a
+}
+
+/// A write of `.1` bytes at `.0`: stamps them in the dirty log as it drops, once the store is
+/// done (module docs). One relaxed load while no device has a dirty source.
+struct Wrote(HostPtr, usize);
+
+impl Drop for Wrote {
+    #[inline]
+    fn drop(&mut self) {
+        host_wrote(self.0.addr().to_u64(), self.1.to_u64());
+    }
 }
 
 /// Whether `a` is aligned to `n` (a power of two).
@@ -137,13 +152,16 @@ impl GuestPtr {
     /// A volatile byte store.
     pub fn write_u8(self, off: u64, v: u8, death: impl Into<DeathId>) {
         stop_if_task_ended();
-        raw::store_u8(check(self.addr, off, 1, death), v);
+        let a = check(self.addr, off, 1, death);
+        let _wrote = Wrote(a, 1);
+        raw::store_u8(a, v);
     }
 
     /// A volatile 16-bit store.
     pub fn write_u16(self, off: u64, v: u16, death: impl Into<DeathId>) {
         stop_if_task_ended();
         let a = check(self.addr, off, 2, death);
+        let _wrote = Wrote(a, 2);
         if aligned(a, 2) {
             raw::store_u16(a, v);
         } else {
@@ -155,6 +173,7 @@ impl GuestPtr {
     pub fn write_u32(self, off: u64, v: u32, death: impl Into<DeathId>) {
         stop_if_task_ended();
         let a = check(self.addr, off, 4, death);
+        let _wrote = Wrote(a, 4);
         if aligned(a, 4) {
             raw::store_u32(a, v);
         } else {
@@ -166,6 +185,7 @@ impl GuestPtr {
     pub fn write_u64(self, off: u64, v: u64, death: impl Into<DeathId>) {
         stop_if_task_ended();
         let a = check(self.addr, off, 8, death);
+        let _wrote = Wrote(a, 8);
         if aligned(a, 8) {
             raw::store_u64(a, v);
         } else {
@@ -178,7 +198,9 @@ impl GuestPtr {
     /// pair or the new one, never one word of each. `lo` is the word at `+0`.
     pub fn write_u32_pair(self, off: u64, lo: u32, hi: u32, death: impl Into<DeathId>) {
         stop_if_task_ended();
-        raw::stp_u32_pair(check(self.addr, off, 8, death), lo, hi);
+        let a = check(self.addr, off, 8, death);
+        let _wrote = Wrote(a, 8);
+        raw::stp_u32_pair(a, lo, hi);
     }
 
     /// A load of a `{u32, u32}` pair at `self + off` with one `ldp wLo, wHi`
@@ -192,7 +214,9 @@ impl GuestPtr {
     /// bytes or zero, never half of each.
     pub fn write_zero_16(self, off: u64, death: impl Into<DeathId>) {
         stop_if_task_ended();
-        raw::stp_zero_16(check(self.addr, off, 16, death));
+        let a = check(self.addr, off, 16, death);
+        let _wrote = Wrote(a, 16);
+        raw::stp_zero_16(a);
     }
 
     /// An acquire load of a guest word: the one of the child node's `written`. It is `ldapr`
@@ -232,6 +256,7 @@ impl GuestPtr {
     pub fn store_release_u32(self, off: u64, v: u32, death: impl Into<DeathId> + Copy) {
         stop_if_task_ended();
         let a = check(self.addr, off, 4, death);
+        let _wrote = Wrote(a, 4);
         if aligned(a, 4) {
             raw::atomic_u32(a).store(v, Ordering::Release);
             return;
@@ -249,6 +274,7 @@ impl GuestPtr {
     pub fn store_seqcst_u32(self, off: u64, v: u32, death: impl Into<DeathId> + Copy) {
         stop_if_task_ended();
         let a = check(self.addr, off, 4, death);
+        let _wrote = Wrote(a, 4);
         if aligned(a, 4) {
             raw::atomic_u32(a).store(v, Ordering::SeqCst);
             return;
@@ -267,6 +293,7 @@ impl GuestPtr {
     pub fn fetch_or_u32(self, off: u64, v: u32, death: impl Into<DeathId> + Copy) -> u32 {
         stop_if_task_ended();
         let a = check(self.addr, off, 4, death);
+        let _wrote = Wrote(a, 4);
         if aligned(a, 4) {
             return raw::atomic_u32(a).fetch_or(v, Ordering::SeqCst);
         }
@@ -286,7 +313,8 @@ impl GuestPtr {
         let a = check(self.addr, off, dst.len(), death);
         let mut i: usize = 0;
         let mut rest = dst;
-        // Bytes up to an 8-byte boundary, then words, then the tail: each a volatile load.
+        // Each a volatile load of the widest naturally aligned unit that fits: 8, 4, 2 or 1
+        // bytes. A load never crosses a page, so a fault comes at the same first byte.
         while !rest.is_empty() {
             let at = a.wrapping_add(i.to_u64());
             let taken = std::mem::take(&mut rest);
@@ -295,6 +323,16 @@ impl GuestPtr {
                 w.copy_from_slice(&raw::load_u64(at).to_ne_bytes());
                 rest = tail;
                 i = i.wrapping_add(8);
+            } else if aligned(at, 4) && taken.len() >= 4 {
+                let (w, tail) = taken.split_at_mut(4);
+                w.copy_from_slice(&raw::load_u32(at).to_ne_bytes());
+                rest = tail;
+                i = i.wrapping_add(4);
+            } else if aligned(at, 2) && taken.len() >= 2 {
+                let (w, tail) = taken.split_at_mut(2);
+                w.copy_from_slice(&raw::load_u16(at).to_ne_bytes());
+                rest = tail;
+                i = i.wrapping_add(2);
             } else if let Some((b, tail)) = taken.split_first_mut() {
                 *b = raw::load_u8(at);
                 rest = tail;
@@ -312,6 +350,7 @@ impl GuestPtr {
             return;
         }
         let a = check(self.addr, off, src.len(), death);
+        let _wrote = Wrote(a, src.len());
         let mut i: usize = 0;
         let mut rest = src;
         while !rest.is_empty() {

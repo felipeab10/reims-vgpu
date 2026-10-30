@@ -17,6 +17,12 @@
 //! platform's views map), from before core's device is made to after core's teardown: every
 //! reference to the device and each of its displays keep the lease, and each drops it after its
 //! core handle.
+//!
+//! A device made over a memory map with a host's dirty source ([`DeviceConfig::dirty_source`])
+//! keeps core's dirty log of the guest's RAM in that lease, harvested from the source on a thread
+//! of its own ([`crate::dirty`]), and hands the log to the platform's lease. The log is closed
+//! while each call that stops or rebuilds the device's work runs (reset, pause, stop, suspend and
+//! resume), so no wait inside one is left for a harvest, and retired with the lease.
 
 use std::any::Any;
 use std::os::fd::OwnedFd;
@@ -31,10 +37,12 @@ use reims_vgpu_core::host::{
 use reims_vgpu_core::memory::descriptor::{
     GuestPhysicalRange, MemoryMapDescriptor as CoreMemoryMap,
 };
+use reims_vgpu_core::memory::dirty::DirtyLog;
 use reims_vgpu_core::platform::Platform;
 use reims_vgpu_core::rt::Hold;
 
 use crate::DefaultPlatform;
+use crate::dirty::{DirtySource, Harvester};
 use crate::display::{Display, DisplayConfig};
 use crate::entry;
 use crate::error::{Error, ResumeError};
@@ -212,6 +220,10 @@ pub struct DeviceConfig {
     pub argument_buffers: bool,
     /// The callbacks.
     pub callbacks: HostCallbacks,
+    /// With `memory_map`: the host's dirty source, which tells the device which of the guest's
+    /// pages the guest wrote (QEMU under KVM), so that the Vulkan runtime copies again only
+    /// those; `None` for none, and without a memory map. Default `None`.
+    pub dirty_source: Option<DirtySource>,
 }
 
 impl Default for DeviceConfig {
@@ -227,6 +239,7 @@ impl Default for DeviceConfig {
             process_isolation_follows_guest: false,
             argument_buffers: true,
             callbacks: HostCallbacks::default(),
+            dirty_source: None,
         }
     }
 }
@@ -254,6 +267,20 @@ impl DeviceConfig {
 /// shared by the device's references and its displays.
 pub(crate) type GuestMemoryLease = Arc<dyn Any + Send + Sync>;
 
+/// Whether a device takes its host's dirty source: unless `REIMS_VGPU_DIRTY_PAGE_TRACKING` is `0`,
+/// read once per process.
+fn dirty_page_tracking_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("REIMS_VGPU_DIRTY_PAGE_TRACKING").is_none_or(|v| v != "0"))
+}
+
+/// What a device over a memory map holds of the guest's RAM: the platform's lease, then the
+/// harvest of the host's dirty source, whose drop retires the log after the lease has gone.
+struct Lease {
+    _platform: Box<dyn Any + Send + Sync>,
+    _dirty: Option<Harvester>,
+}
+
 /// One reference to a device. `P` is the platform: [`DefaultPlatform`] in the product, core's
 /// fake platform in tests.
 pub struct Device<P: Platform = DefaultPlatform> {
@@ -264,6 +291,8 @@ pub struct Device<P: Platform = DefaultPlatform> {
     /// after `handle`, so a reference drops it after its core handle: the last drop, core's
     /// teardown among them, runs before the lease goes.
     guest_memory: Option<GuestMemoryLease>,
+    /// The dirty log of a device made with a dirty source (the module docs).
+    dirty_log: Option<Arc<DirtyLog>>,
 }
 
 impl<P: Platform> std::fmt::Debug for Device<P> {
@@ -298,16 +327,30 @@ impl<P: ApiPlatform> Device<P> {
             if let Some(metal) = &metal {
                 drop(api_state(&platform).frame_queue(metal));
             }
-            let guest_memory: Option<GuestMemoryLease> = config
-                .memory_map
-                .as_ref()
-                .map(|map| Arc::from(platform.guest_memory(map)));
+            let mut guest_memory: Option<GuestMemoryLease> = None;
+            let mut dirty_log = None;
+            if let Some(map) = &config.memory_map {
+                let dirty = (config.dirty_source.clone())
+                    .filter(|_| dirty_page_tracking_on())
+                    .map(|source| {
+                        let ram: Vec<_> = (map.ranges().iter())
+                            .map(|r| r.physical_address..r.physical_address + r.physical_length)
+                            .collect();
+                        Harvester::new(&ram, source)
+                    });
+                dirty_log = dirty.as_ref().map(|h| h.log().clone());
+                guest_memory = Some(Arc::new(Lease {
+                    _platform: platform.guest_memory(map, dirty_log.clone()),
+                    _dirty: dirty,
+                }));
+            }
             let core = config.into_core::<P>(metal);
             match CoreDevice::new(platform.clone(), core) {
                 Ok(handle) => Ok(Device {
                     handle: Ours::new(handle),
                     platform: platform.clone(),
                     guest_memory,
+                    dirty_log,
                 }),
                 Err(refusal) => Err(refusal.into()),
             }
@@ -331,6 +374,7 @@ impl<P: Platform> Device<P> {
             handle: Ours::new(self.handle.clone_ref()),
             platform: self.platform.clone(),
             guest_memory: self.guest_memory.clone(),
+            dirty_log: self.dirty_log.clone(),
         }
     }
 
@@ -361,6 +405,17 @@ impl<P: Platform> Device<P> {
         entry::run(|hold| body(hold, &self.handle))
     }
 
+    /// As [`Device::entry`], with the dirty log closed while `body` runs (the module docs).
+    fn closed_entry<T>(&self, body: impl for<'u> FnOnce(Hold<'u>, &CoreDevice<P>) -> T) -> T {
+        let Some(log) = &self.dirty_log else {
+            return self.entry(body);
+        };
+        log.close();
+        let r = self.entry(body);
+        log.reopen();
+        r
+    }
+
     /// A 32-bit read at `offset` in the device's MMIO region. May block and may call back.
     pub fn mmio_read(&self, offset: u64) -> u32 {
         self.entry(|_, d| d.mmio_read(offset))
@@ -377,7 +432,7 @@ impl<P: Platform> Device<P> {
     /// Blocks as [`Device::stop`] does, and for the EFI display's present thread. At a
     /// `feature_level` above 4 it ends the process.
     pub fn reset(&self) {
-        self.entry(|hold, d| d.reset(hold));
+        self.closed_entry(|hold, d| d.reset(hold));
     }
 
     /// Pauses the device: each FIFO finishes the commands it started and stops, then the guest's
@@ -385,7 +440,7 @@ impl<P: Platform> Device<P> {
     /// completed, and hangs while one never does. Where the guest has given a port a display
     /// page, a second pause before [`Device::unpause`] ends the process.
     pub fn pause(&self) {
-        self.entry(|_, d| d.pause());
+        self.closed_entry(|_, d| d.pause());
     }
 
     /// Resumes the device after [`Device::pause`]: unpauses the guest's displays, starts every
@@ -401,14 +456,14 @@ impl<P: Platform> Device<P> {
     /// display pages are torn down. Blocks until each FIFO's thread has stopped and the commands
     /// it started have completed.
     pub fn stop(&self) {
-        self.entry(|hold, d| d.stop(hold));
+        self.closed_entry(|hold, d| d.stop(hold));
     }
 
     /// Starts a suspend: from here the device raises no interrupt, and drops those not yet
     /// raised. It quiesces the FIFOs without waiting for them, and pauses none of the guest's
     /// displays.
     pub fn will_suspend(&self) {
-        self.entry(|_, d| d.will_suspend());
+        self.closed_entry(|_, d| d.will_suspend());
     }
 
     /// Ends a suspend: the device's state. The device always has one to give, so
@@ -416,7 +471,8 @@ impl<P: Platform> Device<P> {
     /// process. Blocks until each FIFO's thread has stopped and the commands it started have
     /// completed, then flushes and ends the guest's tasks and pauses the guest's displays.
     pub fn finish_suspend(&self) -> Result<Vec<u8>, Error> {
-        self.entry(|_, d| d.finish_suspend()).ok_or(Error::Suspend)
+        self.closed_entry(|_, d| d.finish_suspend())
+            .ok_or(Error::Suspend)
     }
 
     /// Offers the device a state [`Device::finish_suspend`] gave, before the guest runs again.
@@ -426,7 +482,7 @@ impl<P: Platform> Device<P> {
     /// memory (the guest's root page write, for one) ends the process. A state whose binary
     /// version has no EFI display turns EFI off, which waits for the EFI display's present thread.
     pub fn will_resume(&self, state: Option<&[u8]>) -> Result<(), Error> {
-        self.entry(|_, d| {
+        self.closed_entry(|_, d| {
             let mut code = None;
             if d.will_resume(state, Some(&mut code)) {
                 Ok(())
@@ -440,7 +496,7 @@ impl<P: Platform> Device<P> {
     /// its FIFOs and raises one interrupt. Rebuilding the EFI display waits for its present
     /// thread, and a root the device still has is torn down as [`Device::stop`] does.
     pub fn did_resume(&self) {
-        self.entry(|hold, d| d.did_resume(hold));
+        self.closed_entry(|hold, d| d.did_resume(hold));
     }
 
     /// A frame target on this device's Metal device: `width` x `height` pixels of `format`,

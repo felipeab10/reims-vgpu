@@ -5,6 +5,16 @@
 #
 #   scripts/install-ctl.sh [--yes] [--update] [--skip-qemu]
 #
+# On macOS, GPU_ARM picks what VMs' graphics run on:
+#
+#   GPU_ARM=metal scripts/install-ctl.sh    Metal (the default)
+#   GPU_ARM=vulkan scripts/install-ctl.sh   Vulkan, on Homebrew's MoltenVK
+#
+# Run it again with the other value to switch; switching back to one built
+# before rebuilds only what changed since. Without GPU_ARM it keeps the arm
+# installed now (a Vulkan install's QEMU directory ends in -vulkan), so
+# reims-ctl update never switches it. Linux has Vulkan alone.
+#
 # macOS on arm64 and Linux on x86-64 (Ubuntu or Debian, Arch or CachyOS; other
 # distributions get the list of what to install). It:
 #   1. checks the build's dependencies, and offers to install those missing
@@ -15,27 +25,31 @@
 #   2. fetches vendor/qemu, QEMU's source, without QEMU's own submodules (its
 #      build fetches what it needs); cargo fetches metal2vulkan itself, at the
 #      commit the library's Cargo.toml names;
-#   3. builds the library (cargo xtask dist) and QEMU on it, in
-#      ~/.cache/reims-ctl, and installs QEMU into
+#   3. builds the library (cargo xtask dist) on GPU_ARM's platform and QEMU on
+#      it, in ~/.cache/reims-ctl, and installs QEMU into
 #      ~/.local/share/reims-ctl/qemu/<build>, linking qemu/current to it. A
 #      build never replaces another: a running VM keeps the binary it started
 #      with;
 #   4. installs reims-ctl with cargo install (into ~/.cargo/bin, or
 #      CARGO_INSTALL_ROOT's bin), signed on macOS with the virtualization
 #      entitlement, which installing macOS from an IPSW needs;
-#   5. on Linux, installs reims-util beside it, which makes a new x86-64 VM's
-#      OpenCore image and downloads its macOS installer from Apple: reims-ctl
-#      does (__record-install), at the commit it names
-#      (crates/reims-ctl/src/reims_util.rs).
+#   5. installs reims-util beside it, which makes a new x86-64 VM's OpenCore
+#      image and downloads its macOS installer from Apple: on Linux, and on any
+#      host where one is there already. reims-ctl does (__record-install), at
+#      the commit it names (crates/reims-ctl/src/reims_util.rs), replacing one
+#      from another commit and leaving one at that commit as it is.
 #
 # --yes       install what is missing without asking (rustup with -y too)
-# --update    pull this checkout first (git pull --ff-only), putting back the
-#             committed Cargo.lock the build rewrote; reims-ctl update runs this
+# --update    pull this checkout first (fast-forward only), putting back the
+#             committed Cargo.lock the build rewrote; where the remote branch
+#             was force-pushed, the checkout's commit is kept on a branch
+#             BRANCH-before-update-DATE and the checkout moves to the remote's;
+#             reims-ctl update runs this
 # --skip-qemu install reims-ctl alone, keeping the installed QEMU
 #
-# Environment: CARGO_TARGET_DIR, the library's build (default the checkout's
-# target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install and the build
-# from ~/.local/share and ~/.cache, where they are on macOS too.
+# Environment: GPU_ARM (above); CARGO_TARGET_DIR, the library's build (default
+# the checkout's target/); XDG_DATA_HOME and XDG_CACHE_HOME move the install
+# and the build from ~/.local/share and ~/.cache, where they are on macOS too.
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -77,7 +91,12 @@ OS="$(uname -s)" ARCH="$(uname -m)"
 case "$OS/$ARCH" in
   Darwin/arm64)
     PLATFORM=macos-arm64
-    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-hvf --disable-sdl --disable-gtk)
+    # gnutls gives QEMU its ciphers. Without a crypto library QEMU has no AES,
+    # which vmapple's AES engine needs (a macOS guest uses it as it mounts its
+    # root volume), and refuses to start a VM. It is enabled by name, so that
+    # configure stops where it is missing.
+    QEMU_CONFIGURE=(--target-list=aarch64-softmmu --enable-hvf --enable-gnutls --disable-sdl
+      --disable-gtk)
     QEMU_BINARY=qemu-system-aarch64
     ;;
   Linux/x86_64)
@@ -93,7 +112,9 @@ case "$OS/$ARCH" in
     # used by the vGPU path: brlapi is a braille display, libiscsi a remote
     # SCSI transport, sndio an audio backend for BSD.
     QEMU_CONFIGURE=(--target-list=x86_64-softmmu --enable-kvm --disable-sdl --enable-gtk --enable-slirp
-      --disable-brlapi --disable-libiscsi --disable-sndio)
+      --disable-brlapi --disable-libiscsi --disable-sndio --enable-libusb)
+    # libusb (usb-host, USB passthrough) is enabled by name: configure leaves
+    # out an optional feature whose library it does not find, saying nothing.
     QEMU_BINARY=qemu-system-x86_64
     ;;
   *) die "reims-ctl supports macOS on arm64 and Linux on x86-64; this is $OS on $ARCH" ;;
@@ -109,16 +130,76 @@ DATA="$(xdg XDG_DATA_HOME .local/share)/reims-ctl"
 CACHE="$(xdg XDG_CACHE_HOME .cache)/reims-ctl"
 mkdir -p "$DATA" "$CACHE"
 
+# The GPU arm (header). ARM_SUFFIX names a macOS build on Vulkan, its QEMU
+# build directory and its install, apart from the Metal one.
+case "$OS/${GPU_ARM:-}" in
+  Darwin/)
+    if [[ "$(readlink "$DATA/qemu/current" 2>/dev/null)" == *-vulkan ]]; then GPU_ARM=vulkan; else GPU_ARM=metal; fi
+    ;;
+  Linux/) GPU_ARM=vulkan ;;
+  Darwin/metal | Darwin/vulkan | Linux/vulkan) ;;
+  Linux/metal) die "GPU_ARM=metal is macOS's: on Linux the library runs on Vulkan alone" ;;
+  *) die "GPU_ARM is metal or vulkan, not $GPU_ARM" ;;
+esac
+ARM_SUFFIX=""
+[[ $OS == Darwin && $GPU_ARM == vulkan ]] && ARM_SUFFIX=-vulkan
+
 # ------------------------------------------------------------------ update
+
+# published BEFORE: whether HEAD is a commit the remote branch once held, as
+# BEFORE (its remote-tracking ref before the fetch) or an earlier value of that
+# ref contains it. The ref's reflog holds each value, an update's old one as
+# well as its new: a clone logs none, so the first fetch's old one is its only
+# record of what the clone took. A HEAD the new remote branch lacks was then
+# taken away by a force push; local commits never were the remote's.
+published() {
+  local c log
+  log=$(git -C "$ROOT" rev-parse --git-path "logs/$upref")
+  [[ $log == /* ]] || log=$ROOT/$log
+  while read -r c; do
+    git -C "$ROOT" merge-base --is-ancestor HEAD "$c" 2>/dev/null && return 0
+  done < <(echo "$1"; [[ -f $log ]] && awk '{ print $1; print $2 }' "$log")
+  return 1
+}
 
 if [[ $UPDATE == 1 ]]; then
   say "Pulling $ROOT"
-  if git -C "$ROOT" rev-parse --abbrev-ref --symbolic-full-name '@{u}' >/dev/null 2>&1; then
+  if upref=$(git -C "$ROOT" rev-parse --symbolic-full-name '@{u}' 2>/dev/null); then
     # The build writes Cargo.lock again (cargo adds the git sources the
     # committed lock leaves out), and a changed lock stops a pull that changes
     # it too: the committed one goes back first.
     git -C "$ROOT" checkout -q HEAD -- Cargo.lock
-    git -C "$ROOT" pull --ff-only || die "git pull --ff-only failed: the checkout has local commits or changes; update it yourself, then run $0"
+    start=$(git -C "$ROOT" rev-parse HEAD)
+    branch=$(git -C "$ROOT" symbolic-ref --short HEAD)
+    remote=$(git -C "$ROOT" config "branch.$branch.remote")
+    before=$(git -C "$ROOT" rev-parse "$upref")
+    if [[ $remote != . ]]; then
+      # Forced (+), so a remote branch that was force-pushed still moves its
+      # remote-tracking ref, where a plain fetch refuses it.
+      merge=$(git -C "$ROOT" config "branch.$branch.merge")
+      git -C "$ROOT" fetch -q "$remote" "+$merge:$upref" || die "git fetch from $remote failed"
+    fi
+    if git -C "$ROOT" merge-base --is-ancestor HEAD "$upref"; then
+      git -C "$ROOT" merge -q --ff-only "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+    elif published "$before"; then
+      # The checkout's commit is kept on a branch of its own, made once the
+      # move has worked; --keep refuses to move over a local change the move
+      # would overwrite.
+      old=$(git -C "$ROOT" rev-parse HEAD)
+      git -C "$ROOT" reset -q --keep "$upref" || die "the checkout's local changes stop the update: commit or set them aside, then run $0"
+      backup="$branch-before-update-$(date +%Y%m%d-%H%M%S)"
+      git -C "$ROOT" branch "$backup" "$old"
+      warn "${upref#refs/remotes/} was force-pushed: the checkout's earlier commit stays on the branch $backup"
+    else
+      die "the checkout has commits of its own that ${upref#refs/remotes/} lacks: update it yourself, then run $0"
+    fi
+    # bash reads on from the file it opened, which the move replaced: where the
+    # move changed this script, the new one runs the update instead, its pull
+    # then a no-op, so its dependencies and QEMU options reach this update.
+    if ! git -C "$ROOT" diff --quiet "$start" HEAD -- scripts/install-ctl.sh; then
+      say "The update changed scripts/install-ctl.sh: running the new one"
+      exec bash "$0" "$@"
+    fi
   else
     warn "the checkout's branch tracks no remote branch: building it as it is"
   fi
@@ -131,7 +212,11 @@ missing=()
 if [[ $OS == Darwin ]]; then
   xcode-select -p >/dev/null 2>&1 || die "Xcode's command line tools are missing: run xcode-select --install, then this again"
   command -v brew >/dev/null 2>&1 || die "Homebrew is missing (https://brew.sh): install it, then run this again"
-  for f in ninja pkgconf glib pixman libslirp lld; do
+  formulas=(ninja pkgconf glib pixman libslirp lld gnutls)
+  # The Vulkan arm's loader and driver, which metal2vulkan opens from
+  # Homebrew's lib.
+  [[ $GPU_ARM == vulkan ]] && formulas+=(vulkan-loader molten-vk)
+  for f in "${formulas[@]}"; do
     brew list --formula "$f" >/dev/null 2>&1 || missing+=("$f")
   done
   if ((${#missing[@]})); then
@@ -151,16 +236,17 @@ else
   # CMake and the X11, Wayland, xkbcommon and EGL headers for SDL3's video,
   # which it builds from source), and QEMU (glib, pixman, libslirp; GTK 3 for
   # its own window, which a VM on VMware SVGA shows its display in; pipewire,
-  # pulse and ALSA for its audio backends; bzip2 unpacks its firmware). A new
-  # x86-64 VM's OVMF comes from reims-util, with its OpenCore image.
+  # pulse and ALSA for its audio backends; libusb for USB passthrough; bzip2
+  # unpacks its firmware). A new x86-64 VM's OVMF comes from reims-util, with
+  # its OpenCore image.
   apt_pkgs=(build-essential git curl ca-certificates pkg-config python3 python3-venv ninja-build
     flex bison bzip2 cmake clang lld binutils libglib2.0-dev libpixman-1-dev libslirp-dev
-    zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libvulkan1
+    zlib1g-dev libfdt-dev libpipewire-0.3-dev libpulse-dev libasound2-dev libusb-1.0-0-dev libvulkan1
     libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev libxss-dev
     libxtst-dev libxkbcommon-dev libwayland-dev libwayland-bin libdecor-0-dev
     libegl-dev libgl-dev libdrm-dev libgbm-dev libdbus-1-dev libudev-dev libgtk-3-dev)
   pacman_pkgs=(base-devel git curl python ninja pkgconf flex bison bzip2 cmake clang lld
-    glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib vulkan-icd-loader
+    glib2 pixman libslirp zlib dtc pipewire libpulse alsa-lib libusb vulkan-icd-loader
     libx11 libxext libxrandr libxcursor libxi libxfixes libxss libxtst libxkbcommon
     wayland libdecor mesa libdrm dbus systemd-libs gtk3)
   case " $distro_id $distro_like " in
@@ -213,18 +299,47 @@ else
   if [[ ! -r /dev/kvm || ! -w /dev/kvm ]]; then
     warn "/dev/kvm is not usable by you: enable virtualization in the firmware and add yourself to the kvm group (sudo usermod -aG kvm \$USER; log in again), or VMs will not start"
   fi
-  # A new VM gets half the host's memory, 4 to 16 GiB, and its views of guest
-  # memory take about 64 mappings per MiB (reims-ctl's runtime::max_map_count).
+  # The guest's memory reaches the GPU through /dev/udmabuf, on every GPU: without
+  # it the library's views of that memory take a kernel mapping per 4 KiB page,
+  # past vm.max_map_count at 4K even at the guest's desktop (reims-ctl's
+  # runtime::udmabuf_problem, docs/qemu.md "Linux hosts: vm.max_map_count").
+  why="the guest's memory reaches the GPU through it, and without it the guest can crash at higher resolutions, at 4K even at its desktop"
+  udmabuf=0
+  if [[ ! -e /dev/udmabuf ]]; then
+    warn "there's no /dev/udmabuf: $why. Load it with sudo modprobe udmabuf, and put udmabuf in a file in /etc/modules-load.d to keep it"
+  else
+    group="$(stat -c %G /dev/udmabuf)"
+    if [[ -r /dev/udmabuf && -w /dev/udmabuf ]]; then
+      udmabuf=1
+      if [[ $group != root ]] && ! id -nG | tr ' ' '\n' | grep -qx "$group"; then
+        say "You can open /dev/udmabuf in this session, but you're not in its $group group: over ssh, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG $group \$USER) to start VMs there"
+      fi
+    elif [[ $group == root ]]; then
+      warn "only root can open /dev/udmabuf: $why. Give it to the kvm group with a udev rule, a file in /etc/udev/rules.d holding KERNEL==\"udmabuf\", GROUP=\"kvm\", MODE=\"0660\", add yourself to kvm (sudo usermod -aG kvm \$USER), and restart"
+    else
+      say "You can't open /dev/udmabuf: $why. You need its $group group"
+      if ask "Add you to the $group group with sudo usermod?"; then
+        sudo usermod -aG "$group" "$USER"
+        say "Added you to $group: log in again for it to take effect"
+      else
+        warn "add yourself to the $group group (sudo usermod -aG $group \$USER) and log in again, or the guest can crash at higher resolutions"
+      fi
+    fi
+  fi
+  # With udmabuf, vm.max_map_count is only a speed-up, on NVIDIA: a view of an
+  # x86-64 guest's memory takes a mapping per 4 KiB page there, and past the
+  # library's budget (the limit less 16,384 and 8,192) its buffers are copied,
+  # which works and is slower (reims-ctl's runtime::max_map_count). A new VM
+  # gets half the host's memory, 4 to 16 GiB.
   maps="$(cat /proc/sys/vm/max_map_count 2>/dev/null || echo 0)"
   vm_mib=$(($(awk '/^MemTotal:/ { print $2 }' /proc/meminfo) / 2 / 1048576 * 1024))
   vm_mib=$((vm_mib < 4096 ? 4096 : vm_mib > 16384 ? 16384 : vm_mib))
-  if ((maps < vm_mib * 64 + 81920)); then
-    warn "vm.max_map_count is $maps: a new VM's $((vm_mib / 1024)) GiB needs about $((vm_mib * 64 + 81920)) (sudo sysctl -w vm.max_map_count=2097152, and a file in /etc/sysctl.d to keep it)"
-  fi
-  # An AMD GPU (RADV) imports the guest's memory as dma-bufs made by udmabuf
-  # (docs/qemu.md, "Linux hosts: AMD GPUs and udmabuf").
-  if grep -qsx 0x1002 /sys/class/drm/*/device/vendor && [[ ! -r /dev/udmabuf || ! -w /dev/udmabuf ]]; then
-    warn "/dev/udmabuf is not usable by you: a VM on an AMD GPU needs it for the guest's memory (add yourself to the group that owns it, kvm on Ubuntu: sudo usermod -aG kvm \$USER; log in again)"
+  want=$((vm_mib * 256 + 24576))
+  if ((udmabuf && maps < want)) && grep -qsx 0x10de /sys/class/drm/*/device/vendor; then
+    raise=1048576
+    while ((raise < want)); do raise=$((raise * 2)); done
+    uncopied=$((maps > 24576 ? (maps - 24576) / 256 : 0))
+    say "vm.max_map_count is $maps: on an NVIDIA GPU, past about $uncopied MiB of a new VM's $((vm_mib / 1024)) GiB the GPU gets copies of its memory, which is slower; sudo sysctl -w vm.max_map_count=$raise, and a file in /etc/sysctl.d to keep it, avoids them"
   fi
 fi
 
@@ -329,16 +444,41 @@ fi
 
 # ------------------------------------------------------------------ the library and QEMU
 
+# The files running processes execute, their links resolved, a line each: on
+# Linux every process's /proc/PID/exe; on macOS the txt files lsof lists of
+# those whose name starts with qemu (QEMU, qemu-img). A QEMU's executable names
+# the build it started from, where its command line, and ps, show only
+# qemu/current, through which reims-ctl runs QEMU, and which a new build moves.
+qemu_executables() {
+  if [[ -d /proc/self ]]; then
+    readlink /proc/[0-9]*/exe 2>/dev/null || true
+  else
+    lsof -nP -a -c qemu -d txt -Fn 2>/dev/null | sed -n 's/^n//p' || true
+  fi
+}
+
+# prune_qemu DIR: removes the QEMU builds in DIR but the three newest and those
+# a running process executes a file of.
+prune_qemu() {
+  local real in_use old
+  real="$(cd "$1" && pwd -P)"
+  in_use="$(qemu_executables)"
+  ls -1d "$1/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
+    old="${old%/}"
+    grep -qF "$real/${old##*/}/" <<<"$in_use" || rm -rf "$old"
+  done
+}
+
 COMMIT="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null || (grep '^commit=' "$ROOT/SOURCE-PROVENANCE.txt" 2>/dev/null | cut -d= -f2 | cut -c1-8) || echo 'release')"
 TARGET="${CARGO_TARGET_DIR:-$ROOT/target}"
-if [[ $OS == Darwin ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
+if [[ $GPU_ARM == metal ]]; then DIST="$TARGET/dist"; else DIST="$TARGET/dist-vulkan"; fi
 
 if [[ $SKIP_QEMU == 0 ]]; then
-  say "Building the library (cargo xtask dist)"
-  (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist)
+  say "Building the library on $GPU_ARM (cargo xtask dist --platform $GPU_ARM)"
+  (cd "$ROOT" && CARGO_TARGET_DIR="$TARGET" cargo xtask dist --platform "$GPU_ARM")
   [[ -f "$DIST/lib/pkgconfig/reims-vgpu.pc" ]] || die "cargo xtask dist wrote no $DIST/lib/pkgconfig/reims-vgpu.pc"
 
-  BUILD="$CACHE/qemu-build-$PLATFORM"
+  BUILD="$CACHE/qemu-build-$PLATFORM$ARM_SUFFIX"
   PC="$DIST/lib/pkgconfig"
   # QEMU's install prefix: never used where it is, since QEMU finds its files
   # relative to its binary; the build is staged with DESTDIR and moved.
@@ -374,16 +514,12 @@ if [[ $SKIP_QEMU == 0 ]]; then
   if [[ $OS == Darwin ]] && ! codesign -d --entitlements - "$STAGE$PREFIX/bin/$QEMU_BINARY" 2>/dev/null | grep -q com.apple.security.hypervisor; then
     codesign -s - -f --entitlements "$ROOT/vendor/qemu/accel/hvf/entitlements.plist" "$STAGE$PREFIX/bin/$QEMU_BINARY"
   fi
-  ID="$(date +%Y%m%d-%H%M%S)-$COMMIT"
+  ID="$(date +%Y%m%d-%H%M%S)-$COMMIT$ARM_SUFFIX"
   mkdir -p "$DATA/qemu"
   mv "$STAGE$PREFIX" "$DATA/qemu/$ID"
   rm -rf "$STAGE"
   ln -sfn "$ID" "$DATA/qemu/current"
-  # Keep the three newest builds, and any build a running VM uses.
-  in_use="$(ps -axo command= 2>/dev/null | grep -o "$DATA/qemu/[^/ ]*/" | sort -u || true)"
-  ls -1d "$DATA/qemu/"[0-9]*/ 2>/dev/null | sort -r | tail -n +4 | while read -r old; do
-    grep -qF "$old" <<<"$in_use" || rm -rf "$old"
-  done
+  prune_qemu "$DATA/qemu"
   QEMU_DIR="$DATA/qemu/$ID"
 else
   QEMU_DIR="$(cd "$DATA/qemu/current" 2>/dev/null && pwd -P || true)"

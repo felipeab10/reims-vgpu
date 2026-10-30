@@ -11,12 +11,14 @@ use std::mem::MaybeUninit;
 use std::num::NonZeroU64;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::sync::Arc;
+use std::time::Duration;
 
 use reims_vgpu::{
     AddTraceRange, CreateTask, DestroyTask, Device, DeviceConfig, Error, HostCallbacks, HostPtr,
     HostTask, HostTraceRange, MapMemory, MemoryFile, MemoryMap, PhysicalMemoryRange,
     RaiseInterrupt, ReadMemory, RemoveTraceRange, UnmapMemory,
 };
+use reims_vgpu::{DirtyHost, DirtySource, KvmSlot};
 
 use crate::ffi;
 use crate::handle;
@@ -263,6 +265,68 @@ pub struct RvgMemoryRangeFile {
 
 const _: () = assert!(size_of::<RvgMemoryRangeFile>() == 16);
 
+/// `start(ctx)`: start logging the guest's RAM's dirty pages, with KVM's manual dirty-log
+/// protection and every page logged as written at its start (KVM_DIRTY_LOG_INITIALLY_SET).
+/// Called once, at the first harvest. It must not block: the log may start later, and until it
+/// does `for_each_slot` lists none of the RAM's slots. Without it, the log is taken as started.
+pub type RvgDirtyStartFn = Option<unsafe extern "C-unwind" fn(ctx: *mut c_void)>;
+
+/// `flush_vcpus(ctx, timeout_ns)`: wait until each vCPU that was inside KVM_RUN has returned from
+/// it once, so that KVM has drained the CPU's buffer of the vCPU's writes (Intel's
+/// page-modification log) into the slots' logs, `timeout_ns` at most; false at the timeout.
+/// Called only where `pml` of kvm_intel or kvm_amd is on. Without it, every harvest there takes
+/// every watched page as written.
+pub type RvgDirtyFlushVcpusFn =
+    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, timeout_ns: u64) -> bool>;
+
+/// `for_each_slot(ctx, slot_ctx)`: calls `rvg_dirty_slot(slot_ctx, ...)` for each memory slot of
+/// the VM that logs dirty pages, holding the host's lock on its slots, so none changes before it
+/// returns; false, calling none, where the host reads and clears the log itself (QEMU's global
+/// dirty tracking).
+pub type RvgDirtyForEachSlotFn =
+    Option<unsafe extern "C-unwind" fn(ctx: *mut c_void, slot_ctx: *mut c_void) -> bool>;
+
+/// `take_host_writes(ctx, host_offset, length, words)`: ORs into `words`, one bit a 4 KiB page
+/// from `host_offset`, the pages of `length` bytes the host itself wrote since its last take (its
+/// DMA into the guest's RAM), and clears them in its record, not in KVM's log. Called only inside
+/// `for_each_slot`'s `slot`, with `host_offset` and `length` multiples of 256 KiB. Without it,
+/// the host writes none of the guest's RAM.
+pub type RvgDirtyTakeHostWritesFn = Option<
+    unsafe extern "C-unwind" fn(ctx: *mut c_void, host_offset: u64, length: u64, words: *mut u64),
+>;
+
+/// The host's dirty source (RvgDeviceConfig.dirty_source): QEMU under KVM on Linux, which tells
+/// the device which of the guest's pages the guest wrote, so that the library's Vulkan runtime
+/// copies again, into a discrete GPU's memory or an iGPU's that cannot reference the guest's,
+/// only those. The device reads KVM's dirty log itself, on its thread `reims-vgpu.dirty`, from
+/// its first harvest on, which calls the functions below, one at a time; none may wait for the
+/// library, or take a lock the host holds while it calls the library (QEMU's BQL). Nothing else
+/// may clear the log of the guest's RAM while the device lives (QEMU's migration blocker). A
+/// source with `kvm_vm_fd` below 0, or without `for_each_slot`, is none. `destroy` runs once,
+/// after its last call: at the device's end, or before the create returns where the device takes
+/// none (no memory map, or a refusal).
+#[expect(
+    missing_docs,
+    reason = "the fields' names say what they hold, as the header shows them"
+)]
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct RvgDirtySource {
+    /// sizeof(RvgDirtySource) as the host was compiled.
+    pub struct_size: u32,
+    /// The KVM VM's file descriptor, open while the device lives.
+    pub kvm_vm_fd: i32,
+    pub ctx: *mut c_void,
+    pub destroy: RvgDestroyFn,
+    pub start: RvgDirtyStartFn,
+    pub flush_vcpus: RvgDirtyFlushVcpusFn,
+    pub for_each_slot: RvgDirtyForEachSlotFn,
+    pub take_host_writes: RvgDirtyTakeHostWritesFn,
+}
+
+// SAFETY: repr(C), a u32 first; an i32, a pointer and optional function pointers.
+unsafe impl HostStruct for RvgDirtySource {}
+
 /// The device's config.
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -314,6 +378,8 @@ pub struct RvgDeviceConfig {
     /// argument-buffer answer follows the same rule, read when the guest asks, since only
     /// isolated tasks serve argument buffers. Without `process_isolation` it changes nothing.
     pub process_isolation_follows_guest: bool,
+    /// With `memory_map`: the host's dirty source, or NULL for none.
+    pub dirty_source: *const RvgDirtySource,
 }
 
 // SAFETY: repr(C), a u32 first; integers, bools and pointers.
@@ -504,6 +570,108 @@ const _: () = assert!(
 
 /// The Rust API's closures over a host table: each holds the table, and calls its function
 /// with the table's `ctx`.
+/// The host's dirty source as the Rust API's, its functions called under `ffi::host_call`; `None`
+/// for a source that is none (`RvgDirtySource`).
+fn dirty_source(t: &Arc<Table>, d: &RvgDirtySource) -> Option<DirtySource> {
+    if d.kvm_vm_fd < 0 || d.for_each_slot.is_none() {
+        return None;
+    }
+    Some(DirtySource {
+        kvm_vm_fd: d.kvm_vm_fd,
+        host: Arc::new(CDirtyHost {
+            table: t.clone(),
+            source: *d,
+        }),
+    })
+}
+
+/// A host's `RvgDirtySource`, and its table.
+struct CDirtyHost {
+    table: Arc<Table>,
+    source: RvgDirtySource,
+}
+
+// SAFETY: the header's contract: the source's functions are called from the library's thread,
+// with its `ctx`.
+unsafe impl Send for CDirtyHost {}
+// SAFETY: as above.
+unsafe impl Sync for CDirtyHost {}
+
+/// One memory slot of the host's KVM VM that logs dirty pages, which a dirty source's
+/// `for_each_slot` reports with the `slot_ctx` it was given, inside that call
+/// (RvgDirtyForEachSlotFn). `slot` is as KVM_GET_DIRTY_LOG and KVM_CLEAR_DIRTY_LOG take it, the
+/// address space's ID << 16 | the slot's ID; `length` is a multiple of 4 KiB; `host_offset` is
+/// where its first page lies in the host's own record of its writes (RvgDirtyTakeHostWritesFn):
+/// QEMU's ram_addr_t. Called anywhere else, it is undefined behaviour.
+///
+/// # Safety
+///
+/// `slot_ctx` is the one `for_each_slot` was given, and the call is inside that call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn rvg_dirty_slot(
+    slot_ctx: *mut c_void,
+    slot: u32,
+    guest_physical_address: u64,
+    length: u64,
+    host_offset: u64,
+) {
+    ffi::export(|| {
+        // SAFETY: `for_each_slot` passes back the `slot_ctx` the library gave it, live for its
+        // call, which this call is inside.
+        let f = unsafe { &mut *slot_ctx.cast::<&mut dyn FnMut(KvmSlot)>() };
+        f(KvmSlot {
+            slot,
+            guest_physical_address,
+            length,
+            host_offset,
+        });
+    })
+}
+
+impl DirtyHost for CDirtyHost {
+    fn start(&self) {
+        if let Some(f) = self.source.start {
+            let ctx = self.table.ctx();
+            // SAFETY: the host's function over its ctx.
+            ffi::host_call("start", || unsafe { f(ctx) });
+        }
+    }
+
+    fn flush_vcpus(&self, timeout: Duration) -> bool {
+        let Some(f) = self.source.flush_vcpus else {
+            return false;
+        };
+        let (ctx, ns) = (
+            self.table.ctx(),
+            u64::try_from(timeout.as_nanos()).unwrap_or(u64::MAX),
+        );
+        // SAFETY: the host's function over its ctx.
+        ffi::host_call("flush_vcpus", || unsafe { f(ctx, ns) })
+    }
+
+    fn for_each_slot(&self, slot: &mut dyn FnMut(KvmSlot)) -> bool {
+        let Some(f) = self.source.for_each_slot else {
+            return false;
+        };
+        let mut slot = slot;
+        let (ctx, slot_ctx) = (self.table.ctx(), (&raw mut slot).cast::<c_void>());
+        // SAFETY: the host's function over its ctx; `slot_ctx` is `rvg_dirty_slot`'s, live for
+        // the call.
+        ffi::host_call("for_each_slot", || unsafe { f(ctx, slot_ctx) })
+    }
+
+    fn take_host_writes(&self, host_offset: u64, length: u64, words: &mut [u64]) {
+        if let Some(f) = self.source.take_host_writes {
+            let (ctx, out) = (self.table.ctx(), words.as_mut_ptr());
+            // SAFETY: the host's function over its ctx; `words` holds a bit for each page of
+            // `length`, the caller's contract.
+            ffi::host_call("take_host_writes", || unsafe {
+                f(ctx, host_offset, length, out)
+            });
+        }
+    }
+}
+
 pub(crate) fn host_callbacks(t: &Arc<Table>, c: &RvgHostCallbacks) -> HostCallbacks {
     HostCallbacks {
         create_task: c.create_task.map(|f| {
@@ -628,10 +796,19 @@ pub unsafe extern "C" fn rvg_device_create(
             Ok(t) => t,
             Err(s) => return s,
         };
-        // From here the table is the library's: a refusal ends it before it returns.
+        // SAFETY: the config's contract: NULL or a live source.
+        let dirty = match unsafe { sized::read(c.dirty_source) } {
+            Ok(d) => d,
+            Err(s) => return s,
+        };
+        // From here the tables are the library's: a refusal ends them before it returns.
         let table = Table::new(callbacks.ctx, callbacks.destroy);
+        let dirty = dirty.map(|d| (Table::new(d.ctx, d.destroy), d));
         let refuse = |s: RvgStatus| {
             table.end();
+            if let Some((t, _)) = &dirty {
+                t.end();
+            }
             s
         };
         if device.is_null() {
@@ -653,6 +830,7 @@ pub unsafe extern "C" fn rvg_device_create(
             process_isolation_follows_guest: c.process_isolation_follows_guest,
             argument_buffers: !c.disable_argument_buffers,
             callbacks: host_callbacks(&table, &callbacks),
+            dirty_source: dirty.as_ref().and_then(|(t, d)| dirty_source(t, d)),
         };
         match Device::with_platform(<Plat as reims_vgpu::ApiPlatform>::process(), config) {
             Ok(d) => {
