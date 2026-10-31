@@ -148,6 +148,33 @@ reims-ctl update --channel development   # switch to the development branch firs
 `reims-ctl help` lists every command; every option takes `--name value` or `--name=value`. A running
 VM keeps the QEMU it started with across an update.
 
+### Additional disks
+
+An x86-64 VM can attach existing images as additional read/write disks. Edit its `vm.toml` and add
+one `[[additional_disks]]` table per image; `order` starts at zero and must be contiguous:
+
+```toml
+[[additional_disks]]
+path = "data.qcow2" # relative to this VM's directory, or an absolute path
+format = "qcow2"    # qcow2 or raw; defaults to qcow2
+controller = "ahci" # ahci or nvme
+order = 0
+
+[[additional_disks]]
+path = "/images/archive.img"
+format = "raw"
+controller = "nvme"
+order = 1
+```
+
+The VM must be stopped while editing its settings. The image files must already exist and each
+must be a distinct file from the system disk and firmware images. AHCI uses one dedicated
+controller per additional image; NVMe and AHCI controllers receive stable PCI slots based on
+`order`. Reims attaches the images as-is and does not create, resize, or remove them. Existing
+`vm.toml` files without `additional_disks` keep their original single-disk behavior.
+Management clients can detect support without guessing from the release number with
+`reims-ctl capabilities --json`; its versioned `schema_features` array names `additional_disks`.
+
 ### The window takes your keyboard shortcuts and your mouse
 
 Each guest display opens in a window the library owns (`crates/reims-vgpu-window`). **Click into the

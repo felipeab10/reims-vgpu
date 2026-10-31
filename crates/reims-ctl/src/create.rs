@@ -288,6 +288,7 @@ fn base_config(spec: &Spec, profile: Profile, disk: PathBuf, disk_format: ImageF
         memory_mib: spec.memory_mib.unwrap_or_else(default_memory_mib),
         disk,
         disk_format,
+        additional_disks: vec![],
         stop_timeout_secs: 90,
         extra_args: vec![],
         graphics: Graphics::ReimsVgpu,

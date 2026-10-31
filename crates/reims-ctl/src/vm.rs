@@ -24,6 +24,10 @@ pub struct VmConfig {
     pub disk: PathBuf,
     #[serde(default)]
     pub disk_format: ImageFormat,
+    /// Additional writable disks, in explicit boot-independent presentation order. The system
+    /// disk remains `disk` above; entries here are never created, resized or deleted by reims-ctl.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub additional_disks: Vec<AdditionalDisk>,
     /// How long `stop` waits for the guest to shut down before it powers the VM off; 0 for no
     /// limit ([`VmConfig::stop_timeout`]).
     #[serde(default = "default_stop_timeout")]
@@ -155,6 +159,20 @@ pub enum DiskController {
     /// container on either controller.
     Nvme,
 }
+
+/// An existing image attached as another read/write disk. Paths are relative to the VM directory
+/// unless absolute. `order` is zero-based and contiguous, and keeps QEMU's device order stable.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AdditionalDisk {
+    pub path: PathBuf,
+    #[serde(default)]
+    pub format: ImageFormat,
+    pub controller: DiskController,
+    pub order: u32,
+}
+
+/// The PCI slots reserved for additional disk controllers by the Q35 builder, in order.
+const ADDITIONAL_DISK_PCI_SLOTS: std::ops::RangeInclusive<u32> = 0x0c..=0x1a;
 
 impl DiskController {
     pub const ALL: [DiskController; 2] = [DiskController::Ahci, DiskController::Nvme];
@@ -450,6 +468,78 @@ fn default_disk_port() -> u32 {
     3
 }
 
+fn check_additional_disks(c: &VmConfig) -> Result<()> {
+    if c.additional_disks.is_empty() {
+        return Ok(());
+    }
+    let q = c
+        .q35
+        .as_ref()
+        .filter(|_| c.profile == Profile::Q35X86_64)
+        .with_context(|| "additional disks are supported only on Q35 x86-64 VMs")?;
+    if c.additional_disks.len() > ADDITIONAL_DISK_PCI_SLOTS.size_hint().0 {
+        bail!(
+            "at most {} additional disks are supported",
+            ADDITIONAL_DISK_PCI_SLOTS.size_hint().0
+        );
+    }
+
+    let mut seen = std::collections::BTreeSet::new();
+    let mut reserved = vec![
+        c.disk.clone(),
+        q.opencore.clone(),
+        q.firmware_code.clone(),
+        q.firmware_vars.clone(),
+    ];
+    reserved.extend(q.installer.iter().cloned());
+    for path in reserved {
+        seen.insert(normalized_image_path(&path)?);
+    }
+
+    for (expected_order, disk) in c.additional_disks.iter().enumerate() {
+        if disk.order != expected_order as u32 {
+            bail!(
+                "additional disk orders must be unique and contiguous from 0; expected {}, got {}",
+                expected_order,
+                disk.order
+            );
+        }
+        let path = normalized_image_path(&disk.path)?;
+        if !seen.insert(path) {
+            bail!(
+                "additional disk {} reuses a path already assigned to another VM image",
+                disk.order
+            );
+        }
+        if !ADDITIONAL_DISK_PCI_SLOTS.contains(&(0x0c + disk.order)) {
+            bail!("additional disk {} has no free Q35 PCI slot", disk.order);
+        }
+    }
+    Ok(())
+}
+
+/// Reject empty and traversing paths before they become QEMU's file values. A plain relative
+/// path remains relative to the VM directory; an absolute path may name an existing image
+/// elsewhere, as the system disk can.
+fn normalized_image_path(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    if path.as_os_str().is_empty() {
+        bail!("a disk image path cannot be empty");
+    }
+    let has_dot_component = path
+        .as_os_str()
+        .to_string_lossy()
+        .split(std::path::MAIN_SEPARATOR)
+        .any(|part| part == "." || part == "..");
+    if has_dot_component || path.components().any(|c| c == Component::ParentDir) {
+        bail!(
+            "disk image paths cannot contain '.' or '..' components: {}",
+            path.display()
+        );
+    }
+    Ok(path.to_path_buf())
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Vmapple {
     /// The auxiliary storage Virtualization.framework made, relative to the VM's directory. QEMU
@@ -473,6 +563,7 @@ impl VmConfig {
             check_env_name(k)?;
         }
         check_mac(&self.network.mac)?;
+        check_additional_disks(self)?;
         if self.graphics == Graphics::VmwareSvga && self.profile != Profile::Q35X86_64 {
             bail!(
                 "{}: VMware SVGA is for x86-64 VMs: an arm64 macOS guest drives only apple-gfx",
@@ -700,6 +791,12 @@ impl Vm {
     /// and installer, or its auxiliary storage and the trimmed copy QEMU boots.
     pub fn files(&self) -> Vec<PathBuf> {
         let mut v = vec![self.disk()];
+        v.extend(
+            self.config
+                .additional_disks
+                .iter()
+                .map(|d| self.path(&d.path)),
+        );
         if let Some(q) = &self.config.q35 {
             v.extend([&q.opencore, &q.firmware_code, &q.firmware_vars].map(|p| self.path(p)));
             v.extend(q.installer.as_deref().map(|p| self.path(p)));
@@ -999,6 +1096,7 @@ mod tests {
             memory_mib: 8192,
             disk: "disk.qcow2".into(),
             disk_format: ImageFormat::Qcow2,
+            additional_disks: vec![],
             stop_timeout_secs: 90,
             extra_args: vec!["-boot".into(), "menu=on".into()],
             graphics: Graphics::ReimsVgpu,
@@ -1036,6 +1134,8 @@ mod tests {
     fn config_round_trips_through_toml() {
         let mut c = x86_64_config();
         let text = toml::to_string_pretty(&c).unwrap();
+        // Older vm.toml files omit additional_disks and keep their original disk behavior.
+        assert!(!text.contains("additional_disks"), "{text}");
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
         // A VM on reims-vgpu saves as it did before the choice existed.
         assert!(!text.contains("graphics"), "{text}");
@@ -1043,6 +1143,124 @@ mod tests {
         let text = toml::to_string_pretty(&c).unwrap();
         assert!(text.contains("graphics = \"vmware-svga\""), "{text}");
         assert_eq!(toml::from_str::<VmConfig>(&text).unwrap(), c);
+    }
+
+    #[test]
+    fn additional_disks_round_trip_and_validate_paths_order_and_profile() {
+        let mut c = x86_64_config();
+        c.additional_disks = vec![
+            AdditionalDisk {
+                path: "media.qcow2".into(),
+                format: ImageFormat::Qcow2,
+                controller: DiskController::Ahci,
+                order: 0,
+            },
+            AdditionalDisk {
+                path: "/data/archive.img".into(),
+                format: ImageFormat::Raw,
+                controller: DiskController::Nvme,
+                order: 1,
+            },
+        ];
+        c.check().unwrap();
+        let encoded = toml::to_string_pretty(&c).unwrap();
+        assert!(encoded.contains("[[additional_disks]]"), "{encoded}");
+        assert_eq!(toml::from_str::<VmConfig>(&encoded).unwrap(), c);
+        assert!(
+            toml::from_str::<VmConfig>(
+                &encoded.replace("controller = \"nvme\"", "controller = \"scsi\"")
+            )
+            .is_err()
+        );
+        assert!(
+            toml::from_str::<VmConfig>(&encoded.replace("format = \"raw\"", "format = \"vhdx\""))
+                .is_err()
+        );
+
+        let mut invalid = c.clone();
+        invalid.additional_disks[1].order = 0;
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("contiguous")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks[1].path = "media.qcow2".into();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("reuses a path")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks[0].path = invalid.disk.clone();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("reuses a path")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks[1].path = "../outside.img".into();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot contain")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks[1].path = "data/./outside.img".into();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot contain")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks[1].path = "".into();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("cannot be empty")
+        );
+        let mut invalid = c.clone();
+        invalid.additional_disks = (0..16)
+            .map(|order| AdditionalDisk {
+                path: format!("disk-{order}.img").into(),
+                format: ImageFormat::Raw,
+                controller: DiskController::Nvme,
+                order,
+            })
+            .collect();
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("at most 15")
+        );
+        let mut invalid = c;
+        invalid.profile = Profile::VmappleArm64;
+        invalid.q35 = None;
+        invalid.vmapple = Some(Vmapple {
+            aux: "aux.img".into(),
+            ecid: 1,
+        });
+        assert!(
+            invalid
+                .check()
+                .unwrap_err()
+                .to_string()
+                .contains("only on Q35")
+        );
     }
 
     /// A VM whose settings name no controller has its disk on SATA, and one on SATA saves

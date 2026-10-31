@@ -33,6 +33,12 @@ pub enum Cmd {
         #[arg(long)]
         json: bool,
     },
+    /// Report structured runtime and settings-schema capabilities
+    Capabilities {
+        /// Machine-readable JSON output, for management clients
+        #[arg(long)]
+        json: bool,
+    },
     /// Create a VM
     #[command(after_help = create_examples())]
     Create(Box<CreateArgs>),
@@ -380,6 +386,7 @@ pub fn main(cli: Cli) -> Result<i32> {
     };
     match cmd {
         Cmd::List { json } => list(json)?,
+        Cmd::Capabilities { json } => capabilities(json)?,
         Cmd::Create(a) => create_cmd(*a, host)?,
         Cmd::Delete {
             name,
@@ -518,6 +525,40 @@ pub fn main(cli: Cli) -> Result<i32> {
     }
     let _ = bool_arg;
     Ok(0)
+}
+
+#[derive(serde::Serialize)]
+struct CapabilityDocument {
+    version: String,
+    schema_version: u32,
+    schema_features: Vec<&'static str>,
+}
+
+fn capability_document() -> CapabilityDocument {
+    CapabilityDocument {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        schema_version: 1,
+        schema_features: vec!["additional_disks"],
+    }
+}
+
+fn capabilities(json: bool) -> Result<()> {
+    let document = capability_document();
+    if json {
+        println!("{}", capability_json()?);
+    } else {
+        println!(
+            "reims-ctl {} (schema v{}): {}",
+            document.version,
+            document.schema_version,
+            document.schema_features.join(", ")
+        );
+    }
+    Ok(())
+}
+
+fn capability_json() -> Result<String> {
+    Ok(serde_json::to_string_pretty(&capability_document())?)
 }
 
 pub fn script_comment(vm: &Vm) -> String {
@@ -1319,6 +1360,23 @@ fn doctor(host: Host) -> Result<i32> {
 mod tests {
     use super::*;
     use crate::testenv::Env;
+
+    #[test]
+    fn capabilities_json_is_versioned_and_names_supported_schema_features() {
+        let cli = Cli::try_parse_from(["reims-ctl", "capabilities", "--json"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Cmd::Capabilities { json: true })
+        ));
+        let document: serde_json::Value =
+            serde_json::from_str(&capability_json().unwrap()).unwrap();
+        assert_eq!(document["version"], env!("CARGO_PKG_VERSION"));
+        assert_eq!(document["schema_version"], 1);
+        assert_eq!(
+            document["schema_features"],
+            serde_json::json!(["additional_disks"])
+        );
+    }
 
     /// `name`, registered with `dir`, its settings `config`.
     fn register(name: &str, dir: &Path, config: &str) {

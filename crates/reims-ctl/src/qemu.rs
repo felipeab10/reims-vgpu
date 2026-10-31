@@ -255,6 +255,36 @@ fn q35(vm: &Vm, ctx: &Ctx, a: &mut Vec<String>) -> Result<()> {
             &format!("ide-hd,bus=sata.{},drive=disk,rotation_rate=1", q.disk_port),
         ]),
     }
+    for disk in &c.additional_disks {
+        let id = format!("extra_disk_{}", disk.order);
+        let slot = 0x0c + disk.order;
+        let path = optp(&vm.path(&disk.path));
+        push(&[
+            "-drive",
+            &format!(
+                "id={id},if=none,format={},file={path}",
+                disk.format.as_str()
+            ),
+        ]);
+        match disk.controller {
+            crate::vm::DiskController::Ahci => {
+                let sata = format!("extra_sata_{}", disk.order);
+                push(&[
+                    "-device",
+                    &format!("ich9-ahci,id={sata},bus=pcie.0,addr=0x{slot:x}"),
+                    "-device",
+                    &format!("ide-hd,bus={sata}.0,drive={id},rotation_rate=1"),
+                ]);
+            }
+            crate::vm::DiskController::Nvme => push(&[
+                "-device",
+                &format!(
+                    "nvme,drive={id},serial=reims-disk-{},bus=pcie.0,addr=0x{slot:x}",
+                    disk.order
+                ),
+            ]),
+        }
+    }
     // The installer, on port 4, past OpenCore's, or on 5 past an AHCI disk on 4.
     if let Some(p) = q.installer.as_deref().map(|p| vm.path(p)) {
         let port = if q.disk_controller == DiskController::Ahci && q.disk_port == 4 {
@@ -533,6 +563,7 @@ mod tests {
                 memory_mib: 12288,
                 disk: "disk.qcow2".into(),
                 disk_format: ImageFormat::Qcow2,
+                additional_disks: vec![],
                 stop_timeout_secs: 90,
                 extra_args: vec![],
                 graphics: Graphics::ReimsVgpu,
@@ -654,6 +685,55 @@ mod tests {
         assert!(!a.iter().any(|x| x.contains("installer")), "no installer");
         assert!(inv.unset.contains(&"REIMS_VGPU_WINDOW".to_string()));
         assert!(!inv.unset.contains(&"REIMS_VGPU_LOG".to_string()));
+    }
+
+    #[test]
+    fn additional_disks_are_projected_in_order_to_dedicated_controllers() {
+        let mut vm = q35_vm();
+        vm.config.additional_disks = vec![
+            AdditionalDisk {
+                path: "data,one.qcow2".into(),
+                format: ImageFormat::Qcow2,
+                controller: DiskController::Ahci,
+                order: 0,
+            },
+            AdditionalDisk {
+                path: "/images/archive.img".into(),
+                format: ImageFormat::Raw,
+                controller: DiskController::Nvme,
+                order: 1,
+            },
+        ];
+        let args = invocation(&vm, &ctx(linux())).unwrap().args;
+        for pair in [
+            &[
+                "-drive",
+                "id=extra_disk_0,if=none,format=qcow2,file=/vms/t/data,,one.qcow2",
+            ][..],
+            &[
+                "-device",
+                "ich9-ahci,id=extra_sata_0,bus=pcie.0,addr=0xc",
+                "-device",
+                "ide-hd,bus=extra_sata_0.0,drive=extra_disk_0,rotation_rate=1",
+            ],
+            &[
+                "-drive",
+                "id=extra_disk_1,if=none,format=raw,file=/images/archive.img",
+                "-device",
+                "nvme,drive=extra_disk_1,serial=reims-disk-1,bus=pcie.0,addr=0xd",
+            ],
+        ] {
+            assert!(has(&args, pair), "missing {pair:?} in {args:?}");
+        }
+        let first = args
+            .iter()
+            .position(|a| a == "id=extra_disk_0,if=none,format=qcow2,file=/vms/t/data,,one.qcow2")
+            .unwrap();
+        let second = args
+            .iter()
+            .position(|a| a == "id=extra_disk_1,if=none,format=raw,file=/images/archive.img")
+            .unwrap();
+        assert!(first < second, "extra disk order changed: {args:?}");
     }
 
     /// With logs off the library still logs its warnings and device resets, which

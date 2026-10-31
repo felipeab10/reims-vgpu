@@ -118,6 +118,17 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
             need(&vm.path(&q.opencore), "the OpenCore image")?;
             need(&vm.path(&q.firmware_code), "the firmware")?;
             need(&vm.path(&q.firmware_vars), "the firmware variables")?;
+            for disk in &c.additional_disks {
+                let path = vm.path(&disk.path);
+                need(&path, &format!("additional disk {}", disk.order))?;
+                if !path.is_file() {
+                    bail!(
+                        "additional disk {} is not a regular image file: {}",
+                        disk.order,
+                        path.display()
+                    );
+                }
+            }
             if let Some(i) = q.installer.as_ref().map(|i| vm.path(i))
                 && !i.exists()
             {
@@ -127,6 +138,26 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                     i.display(),
                     c.name
                 );
+            }
+            let mut images = std::collections::BTreeSet::new();
+            let reserved_images = std::iter::once(vm.disk())
+                .chain([
+                    vm.path(&q.opencore),
+                    vm.path(&q.firmware_code),
+                    vm.path(&q.firmware_vars),
+                ])
+                .chain(q.installer.iter().map(|p| vm.path(p)));
+            for path in
+                reserved_images.chain(c.additional_disks.iter().map(|disk| vm.path(&disk.path)))
+            {
+                let resolved = std::fs::canonicalize(&path)
+                    .with_context(|| format!("resolve disk image {}", path.display()))?;
+                if !images.insert(resolved) {
+                    bail!(
+                        "disk images must name different files; {} aliases another image",
+                        path.display()
+                    );
+                }
             }
         }
         Profile::VmappleArm64 => {
@@ -471,18 +502,34 @@ pub fn now_stamp(fmt: &str) -> String {
     }
 }
 
-/// Another VM that runs on `vm`'s disk, which both use in place. QEMU on Linux would refuse the
+/// Another VM that runs on any writable image `vm` uses in place. QEMU on Linux would refuse the
 /// second's start on its lock of the image; on macOS QEMU locks no image, and both would write
 /// the disk.
 fn running_on_disk(vm: &Vm) -> Option<String> {
     let real = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-    let disk = real(&vm.disk());
+    let disks = std::iter::once(vm.disk())
+        .chain(vm.config.additional_disks.iter().map(|d| vm.path(&d.path)))
+        .map(|p| real(&p))
+        .collect::<std::collections::BTreeSet<_>>();
     let reg = crate::vm::Registry::load().ok()?;
     reg.vms
         .iter()
         .filter(|e| e.name != vm.name())
         .filter_map(|e| Vm::load(&e.dir).ok())
-        .find(|other| real(&other.disk()) == disk && pid(other).is_some())
+        .find(|other| {
+            if pid(other).is_none() {
+                return false;
+            }
+            std::iter::once(other.disk())
+                .chain(
+                    other
+                        .config
+                        .additional_disks
+                        .iter()
+                        .map(|d| other.path(&d.path)),
+                )
+                .any(|p| disks.contains(&real(&p)))
+        })
         .map(|other| other.name().to_string())
 }
 
@@ -539,9 +586,8 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
     }
     if let Some(other) = running_on_disk(vm) {
         bail!(
-            "{other} is running on {}'s disk, {}: stop it first. Two VMs on one disk corrupt it",
-            vm.name(),
-            crate::paths::tilde(&vm.disk())
+            "{other} is running on a disk {} also uses: stop it first. Two VMs on one disk corrupt it",
+            vm.name()
         );
     }
     preflight(vm, host)?;
@@ -790,25 +836,36 @@ mod tests {
     #[test]
     fn a_vm_does_not_start_on_a_disk_another_runs_on() {
         let env = crate::testenv::Env::new("start-shared");
-        let disk = env.root.join("disk.img");
-        std::fs::write(&disk, "").unwrap();
+        let shared = env.root.join("shared.img");
+        std::fs::write(&shared, "").unwrap();
         let mut reg = crate::vm::Registry::default();
         let mut vms = Vec::new();
         for name in ["a", "b"] {
             let dir = env.root.join(name);
             std::fs::create_dir_all(&dir).unwrap();
+            let system_disk = env.root.join(format!("{name}-system.img"));
+            std::fs::write(&system_disk, "").unwrap();
             let config = format!(
                 r#"
                 name = "{name}"
-                profile = "vmapple-arm64"
+                profile = "q35-x86_64"
                 cpus = 2
                 memory_mib = 4096
                 disk = "{}"
-                [vmapple]
-                aux = "aux.img"
-                ecid = 1
+
+                [[additional_disks]]
+                path = "{}"
+                format = "raw"
+                controller = "nvme"
+                order = 0
+
+                [q35]
+                opencore = "opencore.qcow2"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
                 "#,
-                disk.display()
+                system_disk.display(),
+                shared.display()
             );
             std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
             reg.add(name, &dir).unwrap();
@@ -826,7 +883,7 @@ mod tests {
         let _ = qemu.kill();
         let _ = qemu.wait();
         let e = format!("{:#}", r.unwrap_err());
-        assert!(e.starts_with("a is running on b's disk"), "{e}");
+        assert!(e.starts_with("a is running on a disk b also uses"), "{e}");
     }
 
     /// A start leaves the pid file and the QMP socket where they are, a running QEMU's among
