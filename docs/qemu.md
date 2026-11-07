@@ -111,6 +111,7 @@ merge into staging of 2026-06-19), and upstream master is merged into it
 | the IOSurface device over PCI for x86-64 guests that run Apple's arm64 GPU driver: `apple-gfx-iosurface-pci` (106b:eeef, ours), whose presence is the only switch: `apple-gfx-pci` isolates a task, and offers argument buffers, only while the guest's mapper has a descriptor table, and has no option for either; and a reset of the IOSurface device's registers ("The IOSurface device over PCI", below) | `bd95509aa3` |
 | the VideoToolbox device's transport for macOS guests' AppleVideoToolboxParavirtualization: `apple-videotoolbox-pci` (106b:1a03, Apple's IDs; subsystem 106b:1a03 and class 0x120000 ours), modern virtio, two queues, on the library's video device (`rvg_video_device_*`), its IOSurfaces resolved through the process's latest IOSurface device, with no properties: the library picks what it decodes and encodes with, on the GPU its GPU device runs on; the guest-to-host queue holds 1024 descriptors, where Apple's hold 256, so that an x86-64 guest's largest message fits; a readable part over 16 MiB is answered -12904 before it is copied; each of its elements answered on a worker thread of the device's, in the guest's order, each status before the messages sent while it was answered ("The VideoToolbox device", below) | `4895365e5b` |
 | the M2 scaler device's transport for macOS guests' AppleM2ScalerParavirtDriver: `apple-m2scaler-pci` (106b:1a0b, subsystem 106b:1a0b and class 0x1200, Apple's), modern virtio, one queue, on the library's scaler device (`rvg_scaler_device_*`), the guest's memory reached through the device's DMA address space, with no properties, as the VideoToolbox device; realized on every host, it refuses the guest's features where the host has no GPU for it; a readable part over 64 KiB is a needs-reset before it is copied; each element answered on a worker thread of the device's, in the guest's order ("The M2 scaler device", below) | `4895365e5b` |
+| the reims-graphics device's transport, for the library's own guest driver: `reims-graphics-pci` (1234:5247, class 0x0380), on the library's graphics device (`rvg_graphics_device_*`); BAR 0 its registers with MSI-X from 0x800, the doorbell an ioeventfd, BAR 2 the library's region as RAM, its allocations dirty-logged for the scanout; built for every target where the library is found (`CONFIG_REIMS_GRAPHICS`), x86-64 under TCG on a Mac among them ("The reims-graphics device", below) | `77ee6c6b` |
 | `vmapple`'s AES engine refuses to realize in a QEMU built with no crypto library, which has no AES: QEMU stops at start with an error that names what the build lacks, where a macOS guest would hang as it mounted its root volume ("A QEMU without a crypto library", below) | `c7a4f0700f` |
 
 The branch's other commits are earlier ways of building `apple-gfx`
@@ -300,6 +301,167 @@ hides its VM.
 Realized paused on q35 under KVM, the device is 106b:1a0b, class
 0x120000, subsystem 106b:1a0b, with BAR 1 (4 KiB, MSI-X) and BAR 4
 (16 KiB, 64-bit prefetchable) (**measured**).
+
+## The reims-graphics device
+
+`reims-graphics-pci` is the device of the library's own guest driver for
+x86-64 macOS guests (`docs/graphics-kext/design.md`): its own PCI ID,
+1234:5247, class 0x0380, which Apple's paravirtualized graphics kext never
+matches. Its host side is the library's graphics device
+(`rvg_graphics_device_*`, docs/api.md); `hw/display/reims-graphics-pci.c`
+is its transport:
+- **BAR 0**, 4 KiB: the library's 32-bit registers below 0x800, the MSI-X
+  table at 0x800 and its PBA at 0xc00, one vector. The vCPU calls the
+  library itself, with no BQL: an access waits at most for the command the
+  control thread is taking. A write of 0, the control ring's id, to
+  DOORBELL (0x20) is taken by an ioeventfd (an eventfd on Linux, a pipe on
+  a Mac), whose file the library's control thread polls. Every other
+  register write goes to the library through
+  `rvg_graphics_device_mmio_write_taking`: a write of a command queue's ring
+  may answer the queue's next command buffer on the vCPU, posting its
+  `CB_SUBMITTED` and raising the interrupt inside the call, and wakes the
+  queue's thread, which takes the buffer either way.
+- **BAR 2**, 64-bit and prefetchable: the library's region
+  (`rvg_graphics_device_region`), 1 GiB of private anonymous memory of
+  QEMU's process, as two RAM regions over the one mapping: the control
+  rings, below `RVG_GRAPHICS_ALLOCATIONS_OFFSET` (0x400000), and the guest's
+  allocations from there. Only the allocations are dirty-logged
+  (`DIRTY_MEMORY_VGA`), where the guest's scanout lies; the library asks at
+  each refresh whether the guest wrote the scanout (`scanout_written`),
+  which takes the BQL to snapshot and clear that log.
+- **The guest's RAM**: where every range of it is a shared file in pages of
+  the host's size (the memfd of `reims-ctl`'s VMs), the library gets the
+  RAM's map and the files behind it, and the GPU uses an IOSurface's own
+  pages in place. The graphics device takes no dirty source: resolving the
+  pages behind each IOSurface's import cost its thread about 5 ms a command
+  buffer on a discrete GPU, more than the whole copies it saved.
+- An interrupt the library raises, on a thread of its own, is written to
+  the vector's irqfd where KVM's in-kernel irqchip injects MSI-X through one
+  and MSI-X is enabled, and KVM injects it on the raising thread; elsewhere
+  (HVF, TCG) a BH sends it under the BQL. Neither waits for a lock.
+- Under `-display none` the library opens a window for the display, unless
+  `REIMS_VGPU_WINDOW` is `0`, as `apple-gfx` does. The window keeps the size
+  the person gives it, and the display offers the guest that size in pixels
+  at the host screen's rate. Its input is queued for a BH and reaches the
+  guest's tablet and keyboard through the device's console. Closing the
+  window powers the VM off.
+- **The console** shows what the display shows, with a window or without
+  one: at each of its updates (a display change listener's refresh, or a
+  screendump) a thread of the device's pool reads it back from the library
+  (`rvg_graphics_device_read_display`), the scanout or the IOSurface the
+  guest presents, through the display's colour, at the display's mode, and
+  a BH copies it into the console's surface and says the update is done. So
+  QMP's `screendump` saves the guest's frame. One read runs at a time; an
+  update that comes while one is under way is done with it. The read waits
+  for its draw on the GPU, never under the BQL, and the guest sees nothing
+  of it.
+- It has no default option ROM: `romfile=` names one.
+- **The machine:** macOS places every 64-bit prefetchable BAR below 4 GiB,
+  where a 1 GiB BAR needs the window to start at or below 0x4000_0000. So a
+  q35 machine with the device keeps at most 1 GiB of the guest's RAM below
+  4 GiB (`-machine q35,...,max-ram-below-4g=1G`): with q35's default of
+  2 GiB there, BAR 2 gets no address and the kext finds no region
+  (docs/graphics-kext/design.md, the region; `REGION_SIZE` in
+  `crates/reims-graphics/src/device.rs`). `reims-ctl`'s VMs do not have the
+  device, so a host that adds it adds the option too. Where it does not, the
+  device's realize warns, naming the option: on a PC machine (one with the
+  `max-ram-below-4g` property) with RAM at 1 GiB.
+
+`CONFIG_REIMS_GRAPHICS` is set for every target when the library is found,
+not only the HVF and KVM targets `MAC_PVG` is limited to. A Mac builds it
+into `qemu-system-x86_64` with
+`make qemu QEMU_CONFIGURE='--target-list=aarch64-softmmu,x86_64-softmmu'`
+and `make -C build/qemu qemu-system-x86_64`.
+
+**Measured** on the M3 Max, under TCG on q35, paused (`-S`), when the region
+was 256 MiB:
+- headless (`REIMS_VGPU_WINDOW=0`), QMP's `query-pci` shows 1234:5247,
+  class 0x0380, BAR 0 4 KiB of 32-bit memory and BAR 2 256 MiB of 64-bit
+  prefetchable memory; `system_reset` and `quit` exit 0;
+- under the qtest accelerator, with the BARs programmed by hand, MAGIC reads
+  0x58464752, VERSION 1 and the region size 0x10000000; a GET_DISPLAYS
+  written into the submission ring and rung through DOORBELL's ioeventfd is
+  answered with DISPLAYS, one display of one mode, 1920 x 1080 at 60000
+  mHz; STATUS 0 empties the completion ring;
+- under `-display none`, the window opens and the library imports the
+  region for it with no refusal.
+
+### Measuring WindowServer's composites
+
+dtrace in an x86-64 guest adds to what it measures, so WindowServer's
+composite time (`CompositorMetal::CompositeLayersToDestination`, CLTD) is
+read with that function's own entry and return probes and no others, and
+QEMU's CPU time is read with no dtrace in the guest. A script that also
+probes what CLTD calls splits its time up, but its total is no longer
+CLTD's. On-CPU samples of a guest thread key their state on `tid`: a
+`profile` probe does not see a thread's `self->` variables.
+
+**Measured** on the RTX 5080 Laptop GPU host with a macOS 26.6.1 x86-64
+guest, under KVM:
+- each pid or objc probe that fires costs the guest about 10 µs. A script
+  of about 50 of them a composite adds 0.4 to 0.5 ms to CLTD, with Apple's
+  own driver as much as with ours;
+- `profile-997` on the guest's eight vCPUs adds about 30% of a host core to
+  QEMU's CPU time.
+
+On the host, QEMU is never traced with a per-task perf recorder: `perf record
+-p` or `-t`, or tracepoint or uprobe events its new threads inherit. Each
+thread carries the events, so **measured** on the same host, a thread's exit
+took 0.12 to 12 s and at least 0.13 s of CPU in `perf_event_exit_task`, and
+as the host's bursts of graphics threads exited, those exits filled 22 to 23
+of its 24 CPUs, starved the vCPUs and froze the guest for 1.3 to 10 s: frames
+of up to 9.5 s. A host trace records system-wide (`perf record -a`), filtered
+by pid, and measures only after perf's first sample, since attaching its
+uprobes made present gaps of 378 and 521 ms.
+
+### fbt probes in the guest's kexts
+
+`dtrace -l -P fbt -m com.steelbrain.ReimsGraphics` lists no probes. The
+guest's kernel decides that, not the kext's build. **Read** from xnu's
+public source (its main branch, `bsd/dev/dtrace` and
+`libkern/c++/OSKext.cpp`, not checked against macOS 26's):
+- While SIP restricts dtrace (`CSR_ALLOW_UNRESTRICTED_DTRACE` not allowed),
+  the kernel makes no fbt probe in any module
+  (`dtrace_fbt_probes_restricted`). The lane's guests run with SIP on, so
+  fbt needs an image whose `csr-active-config` allows dtrace.
+- OpenCore injects our kext into the Boot kernel collection
+  ([docs/graphics-kext/design.md](graphics-kext/design.md), item 13). For a
+  Boot-collection kext, the kernel defers fbt's probes to the dtrace command,
+  which sends the symbols it finds for the kext's UUID
+  (`dtrace_module_loaded`). It makes them from the kext's own symbol table
+  at its load only where the kext's `Info.plist` sets
+  `OSBundleForceDTraceInit`, which `OSKext::registerWithDTrace` ignores for a
+  Boot-collection kext unless the guest boots with `keepsyms=1`. From that
+  table fbt takes only global functions.
+
+**Inferred**, not measured: the dtrace command finds Apple's Boot-collection
+kexts in the collection on the guest's disk, but OpenCore injects ours only
+into the copy in memory, and no file on the guest's disk has its UUID.
+
+**Measured** on the kext as `make -C guest/kext` builds it: its symbol table
+keeps every function (398 symbols in `__text`, 324 of them global), it has an
+`LC_UUID`, and 384 of the 392 functions `otool -tv` lists (314 of the 319
+global ones) start with `push %rbp; mov %rsp,%rbp`, the prologue fbt patches
+on x86-64. `keepsyms=1` alone, which the lane's trace images of 11-01 had in
+their boot-args beside `csr-active-config` 0x7f, does not change where the
+probes' symbols come from (above).
+
+So an image for tracing our kext sets three things: a `csr-active-config`
+that allows dtrace, `keepsyms=1`, and `OSBundleForceDTraceInit` (true) in the
+`Info.plist` of the ReimsGraphics.kext that OpenCore injects. `make -C
+guest/kext DTRACE=1 BUILD=build/dtrace` builds that kext; a plain `make`
+leaves the key out. Without `keepsyms=1` the kernel ignores the key for a
+Boot-collection kext, logging `Ignoring OSBundleForceDTraceInit for Boot KC
+Kext com.steelbrain.ReimsGraphics` (**read** from xnu-12377.1.9 and
+xnu-12377.121.6, macOS 26's sources; macOS 11's, xnu-7195, panics there
+instead). With SIP on, dtrace makes no fbt probe whatever the kext sets
+(`dtrace_fbt_probes_restricted`). Whether the three give our global
+functions their probes is not yet measured. To check, as root in the guest
+on such an image:
+- `dtrace -l -P fbt -m com.steelbrain.ReimsGraphics | wc -l` prints more
+  than 0: about 314 entry probes, and their return probes;
+- `log show --last boot --predicate 'eventMessage CONTAINS
+  "OSBundleForceDTraceInit"'` prints no line.
 
 ## apple-gfx on reims-vgpu
 
@@ -1069,6 +1231,38 @@ Without the key, the aborts also fault the GPU. **Measured** with macOS
 
 reims-ctl counts these faults' lines in QEMU's log, and from the third tells
 the user to set the key from Recovery.
+
+### x86-64 macOS guests: WebGPU render bundles
+
+**Measured** with a macOS 26 guest on an RTX 5080 Laptop GPU host: opening
+Safari's WebGPU renderBundles sample ended QEMU. The host read the records
+of a render pipeline's two functions, could not copy either function's IR
+("the function's IR is not in task memory", which did not yet say why),
+handed Metal both as nil, and Metal ended the process at a render
+descriptor with no vertex function. In the 9.5 s before it the guest sent
+no exec (67), and the host committed no command buffer in the last 4.5 s;
+the guest sent 1,700 to 2,900 info indirects (69) and 1,000 to 2,000
+DiscardResources (63) a second, and the host's trace ends 0.14 ms after the
+last info indirect.
+
+**Read**, from the guest's Metal driver and kext:
+- A render pipeline holds its vertex and fragment functions' IR buffers.
+  Every command stream that names the pipeline adds those buffers to its
+  resource list: a render encoder's setRenderPipelineState, and an info
+  encoder's queries of the pipeline.
+- The kext commits a listed buffer's pages to the task's page table as it
+  prepares the stream's resource list.
+
+So why the copy failed is not settled: IR whose pages the guest had not yet
+committed, or a range past the task's end. The host now logs which. IR over
+a hole raises the function lookup's failure ("function N not made: its IR
+... is not mapped: a hole in the page table"), so the exec or info faults
+where Metal would end the process, as for an empty entry (section 6.18 of
+docs/testing.md, `mutgap_svc_function_over_hole`). Nothing is cached, so a
+lookup once the guest has mapped the IR makes the function. IR past the
+task's end is still nil to Metal, as Apple's framework answers it
+(`compute_death_function_data_out_of_range`, measured). Whether the sample
+draws with this is not yet measured.
 
 ### x86-64 macOS guests: thumbnail extensions
 

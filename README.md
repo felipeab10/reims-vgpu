@@ -223,7 +223,7 @@ set. [docs/api.md](docs/api.md) section 2 lists every setting and variable,
 
 | Pathway | Host | Guest | QEMU machine and device | Platform | Run with |
 |---|---|---|---|---|---|
-| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `apple-gfx-pci` (`106b:eeee`) with its option ROM | **Vulkan** through metal2vulkan | `reims-ctl` |
+| **x86-64 macOS / Linux Vulkan** | x86-64 Linux (KVM) | x86-64 macOS | `q35` through OpenCore, PCI `reims-graphics-pci` with its option ROM and reims-vgpu's own macOS drivers (reims-ctl's default), or `apple-gfx-pci` (`106b:eeee`) | **Vulkan** through metal2vulkan | `reims-ctl` |
 | **arm64 macOS / macOS Metal** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Metal** | `reims-ctl`, or `make vm` |
 | **arm64 macOS / macOS Vulkan** | Apple silicon Mac (HVF) | arm64 macOS | `vmapple`, MMIO `apple-gfx-mmio` | **Vulkan** through metal2vulkan, on MoltenVK | `reims-ctl`, installed with `GPU_ARM=vulkan scripts/install-ctl.sh` |
 
@@ -274,8 +274,8 @@ the following.
 
 - An Apple silicon Mac. Every Rust binary is arm64 (`aarch64-apple-darwin`): rustc's arm64e target
   has no pointer authentication, and its binaries crash before `main` (`rust-toolchain.toml`).
-- The toolchain `rust-toolchain.toml` pins: stable 1.98.1 with rustfmt and clippy. rustup installs
-  it on first use.
+- The toolchain `rust-toolchain.toml` pins: nightly-2026-11-03 with rustfmt and clippy, for rustc's
+  parallel front end (`-Zthreads`, in `.cargo/config.toml`). rustup installs it on first use.
 - `cargo-nextest`, which runs the tests in `cargo xtask check`
   (`cargo install --locked cargo-nextest`).
 - cbindgen 0.29.4, for `cargo xtask header` (`cargo install --locked cbindgen --version 0.29.4`).

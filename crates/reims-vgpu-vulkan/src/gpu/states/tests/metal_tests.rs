@@ -1487,3 +1487,204 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
         assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
     }
 }
+
+/// RenderBox's custom effect is Metal's: the fragment function that calls `custom_fn` links the
+/// function made under that specialized name and reads, at every pixel, the bits Metal's reads;
+/// with the function made under its own name or another, the pipeline is refused on both. (What
+/// each function answers as its name is Metal's too: the Metal platform's
+/// `a_specialized_name_resolves_a_kernel_s_call`.)
+#[test]
+fn a_function_linked_under_a_specialized_name_is_metals() {
+    use reims_vgpu_metal::MetalPlatform;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
+    let (p, d) = (crate::platform::tests::platform(), dev());
+    let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
+    let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+    let metal_library = |bytes| md.new_library(bytes).unwrap().unwrap().unwrap();
+    let (metal_caller, metal_callee) = (metal_library(LINKED_CALLER), metal_library(LINKED_CALLEE));
+    for specialized in [Some("custom_fn"), None, Some("other_fn")] {
+        let ours = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
+        let metals = gradient::<MetalPlatform>(&metal_callee, specialized).unwrap();
+        assert_eq!(ours.name(), specialized.unwrap_or("linked_gradient"));
+        let want = custom_effect(&mp, &md, &metal_caller, &metals);
+        assert_eq!(
+            want.is_some(),
+            specialized == Some("custom_fn"),
+            "{specialized:?}"
+        );
+        let drawn = catch_death(|| custom_effect(&p, &d, &caller, &ours));
+        assert_eq!(drawn, Ok(want), "{specialized:?}");
+    }
+}
+
+/// A pipeline creator's answer in [`linked_answers`]: made, or the `NSError`'s code, or where the
+/// creator dies.
+type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>;
+
+/// What the compute and render creators answer for `linked_caller.metal`'s functions with
+/// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
+/// carries, each case named: the function made by name, then its copy compiled to a binary.
+///
+/// The copy is made after every case of the function made by name: while a copy of a library's
+/// function compiled to a binary lives, Metal's `newFunctionWithName:` for it, and its
+/// `newFunctionWithDescriptor:` for that copy, answer one object, of options 1, even from another
+/// library made of the same bytes, and the copy turns the function made before it into that
+/// object (measured on the M3 Max, macOS 27.0.1). A case after the copy would link the binary
+/// where it names the function made by name.
+fn linked_answers<P: reims_vgpu_core::platform::Platform>(
+    d: &P::Device,
+) -> Vec<(&'static str, LinkedAnswer)> {
+    let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
+    let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+    let named = |l: &P::Library, name| l.new_function(OnFault::Return, name).unwrap().unwrap();
+    let (kernel, vertex, fragment) = (
+        named(&caller, "linked_kernel"),
+        named(&caller, "linked_vertex"),
+        named(&caller, "linked_fragment"),
+    );
+    let add_one = named(&callee, "linked_add_one");
+    let one = |f: &P::Function| vec![f.clone_ref()];
+    let group = || vec![("g".to_owned(), one(&add_one))];
+    let answer = |made: Result<
+        Result<Option<()>, NsErrorText>,
+        reims_vgpu_core::raise::death::DeathSite,
+    >| {
+        made.map(|made| match made {
+            Ok(state) => {
+                assert!(state.is_some());
+                Ok(())
+            }
+            Err(e) => Err(e.code),
+        })
+    };
+    let compute = |functions, binary_functions, groups, private_functions| {
+        answer(catch_death(|| {
+            d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                label: None,
+                function: &kernel,
+                threadgroup_size_is_multiple_of_execution_width: false,
+                max_total_threads_per_threadgroup: 0,
+                max_call_stack_depth: 1,
+                support_indirect_command_buffers: false,
+                stage_input: None,
+                linked: LinkedFunctionsDesc {
+                    functions,
+                    binary_functions,
+                    groups,
+                    private_functions,
+                },
+            })
+            .map(|state| state.map(drop))
+        }))
+    };
+    let render = |vertex_linked, fragment_linked| {
+        answer(catch_death(|| {
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: None,
+                vertex: &vertex,
+                fragment: Some(&fragment),
+                vertex_descriptor: None,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked,
+                fragment_linked,
+            })
+            .map(|state| state.map(drop))
+        }))
+    };
+    let functions = |f: &P::Function| LinkedFunctionsDesc {
+        functions: one(f),
+        ..LinkedFunctionsDesc::default()
+    };
+    let mut answers = vec![
+        ("none", compute(vec![], vec![], vec![], vec![])),
+        ("functions", compute(one(&add_one), vec![], vec![], vec![])),
+        ("private", compute(vec![], vec![], vec![], one(&add_one))),
+        ("group", compute(vec![], vec![], group(), vec![])),
+        (
+            "group, private",
+            compute(vec![], vec![], group(), one(&add_one)),
+        ),
+        (
+            "unbinary alone",
+            compute(vec![], one(&add_one), vec![], vec![]),
+        ),
+        (
+            "unbinary in both",
+            compute(one(&add_one), one(&add_one), vec![], vec![]),
+        ),
+        (
+            "render none",
+            render(
+                LinkedFunctionsDesc::default(),
+                LinkedFunctionsDesc::default(),
+            ),
+        ),
+        (
+            "render vertex",
+            render(functions(&add_one), LinkedFunctionsDesc::default()),
+        ),
+        (
+            "render fragment",
+            render(LinkedFunctionsDesc::default(), functions(&add_one)),
+        ),
+    ];
+    let binary = callee
+        .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
+        .unwrap()
+        .unwrap();
+    answers.extend([
+        (
+            "binary alone",
+            compute(vec![], one(&binary), vec![], vec![]),
+        ),
+        (
+            "binary in functions",
+            compute(one(&binary), vec![], vec![], vec![]),
+        ),
+        (
+            "binary in both",
+            compute(one(&binary), one(&binary), vec![], vec![]),
+        ),
+    ]);
+    answers
+}
+
+/// A call through a visible-function reference that nothing the stage links resolves is
+/// refused with Metal's `NSError` code (3, "unresolved visible function reference"), at the
+/// compute and the render creators, and made where Metal makes it, each answer Metal's
+/// ([`linked_answers`]): made by `functions`, private functions, or a group with the function in
+/// private functions, whether the function was made compiled to a binary or not; code 3 with
+/// none, a group alone, or `binaryFunctions` alone holding it, as a direct call resolves by no
+/// binary function; made with the function in both `functions` and `binaryFunctions` where it
+/// was made compiled to a binary, and code 2 where it was not
+#[test]
+fn unresolved_visible_calls_are_metals() {
+    use reims_vgpu_metal::MetalPlatform;
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let metals = linked_answers::<MetalPlatform>(&md);
+    let ours = linked_answers::<VulkanPlatform>(&dev());
+    assert_eq!(ours.len(), metals.len());
+    for ((case, ours), (_, metals)) in ours.into_iter().zip(metals) {
+        assert_eq!(ours, metals, "{case}");
+    }
+}

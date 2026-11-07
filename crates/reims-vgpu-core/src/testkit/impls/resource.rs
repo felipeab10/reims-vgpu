@@ -11,6 +11,7 @@ use super::{Backing, new_buffer, new_texture};
 use crate::host::HostPtr;
 use crate::platform::resource::*;
 use crate::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use crate::platform::values::SurfacePlane;
 use crate::platform::{Handle, HostRange, Platform};
 use crate::raise::{OnFault, RaiseResult};
 use crate::testkit::script::Policy;
@@ -181,6 +182,31 @@ impl Buffer<FakePlatform> for Fk<kind::Buffer> {
                 Arg::obj(descriptor),
                 Arg::U64(offset),
                 Arg::U64(bytes_per_row),
+            ],
+            |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
+        )
+    }
+
+    /// Logged with the plane's index, offset and rows, whether the surface has planes, and its
+    /// facts (`Arg::val` of the `Option`); a texture over the buffer, as `new_texture`'s.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &<FakePlatform as Platform>::TextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Texture>> {
+        let desc = descriptor.desc();
+        let parent = self.erase();
+        self.make(
+            Policy::On(on),
+            "newTextureWithDescriptor:iosurface:plane:",
+            vec![
+                Arg::obj(descriptor),
+                Arg::U64(plane.plane),
+                Arg::U64(plane.offset),
+                Arg::U64(plane.bytes_per_row),
+                Arg::Bool(plane.planar),
+                Arg::val(&plane.facts),
             ],
             |w| Some(new_texture(w, desc, None, 0, Some(parent), false)),
         )
@@ -642,6 +668,26 @@ impl RenderPipeline for Fk<kind::RenderPipeline> {
         1024
     }
 
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.object_threads)
+    }
+
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.mesh_threads)
+    }
+
+    fn object_thread_execution_width(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.object_width)
+    }
+
+    fn mesh_thread_execution_width(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.mesh_width)
+    }
+
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        self.with_model(|m: &PipelineModel| m.mesh.grid)
+    }
+
     fn resource_index(&self) -> u64 {
         self.resource_index_value()
     }
@@ -680,6 +726,54 @@ impl Library<FakePlatform> for Fk<kind::Library> {
             |w| Some(w.new_obj::<kind::Function>(Model::Names(vec![name]))),
         )
     }
+
+    fn new_function_with_constants(
+        &self,
+        on: OnFault,
+        function_name: &str,
+        constants: &[crate::platform::resource::FunctionConstant],
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Function>> {
+        let name = function_name.to_owned();
+        let mut args = vec![Arg::Str(function_name.to_owned())];
+        for c in constants {
+            args.push(Arg::U64(u64::from(c.index)));
+            args.push(Arg::U64(u64::from(c.data_type)));
+            args.push(Arg::Bytes(c.value.to_vec()));
+        }
+        self.make(
+            Policy::On(on),
+            "newFunctionWithName:constantValues:error:",
+            args,
+            |w| Some(w.new_obj::<kind::Function>(Model::Names(vec![name]))),
+        )
+    }
+
+    fn new_function_with_options(
+        &self,
+        on: OnFault,
+        function_name: &str,
+        constants: &[crate::platform::resource::FunctionConstant],
+        options: u64,
+        specialized_name: Option<&str>,
+    ) -> RaiseResult<Option<<FakePlatform as Platform>::Function>> {
+        let name = specialized_name.unwrap_or(function_name).to_owned();
+        let mut args = vec![
+            Arg::Str(function_name.to_owned()),
+            Arg::U64(options),
+            Arg::Str(specialized_name.unwrap_or_default().to_owned()),
+        ];
+        for c in constants {
+            args.push(Arg::U64(u64::from(c.index)));
+            args.push(Arg::U64(u64::from(c.data_type)));
+            args.push(Arg::Bytes(c.value.to_vec()));
+        }
+        self.make(
+            Policy::On(on),
+            "newFunctionWithDescriptor:error:",
+            args,
+            |w| Some(w.new_obj::<kind::Function>(Model::Names(vec![name]))),
+        )
+    }
 }
 
 impl Fk<kind::Texture> {
@@ -714,6 +808,24 @@ pub struct PipelineModel {
     pub common: ResourceCommon,
     /// A compute pipeline's `staticThreadgroupMemoryLength`.
     pub static_threadgroup_memory_length: u64,
+    /// A mesh render pipeline's answers, in the order of [`MeshLimits`]'s fields (all 0 for any
+    /// other pipeline).
+    pub mesh: MeshLimits,
+}
+
+/// What a fake mesh render pipeline answers for its stages' limits.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct MeshLimits {
+    /// `maxTotalThreadsPerObjectThreadgroup`.
+    pub object_threads: u64,
+    /// `maxTotalThreadsPerMeshThreadgroup`.
+    pub mesh_threads: u64,
+    /// `objectThreadExecutionWidth`.
+    pub object_width: u64,
+    /// `meshThreadExecutionWidth`.
+    pub mesh_width: u64,
+    /// `maxTotalThreadgroupsPerMeshGrid`.
+    pub grid: u64,
 }
 
 impl Fk<kind::ComputePipeline> {

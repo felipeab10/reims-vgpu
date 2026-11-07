@@ -122,6 +122,29 @@ pub enum RenderCmd<'a, P: Platform> {
         indirect_buffer: &'a P::Buffer,
         indirect_buffer_offset: u64,
     },
+    /// `drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// The graphics lane's only.
+    DrawMeshThreadgroups {
+        threadgroups_per_grid: MtlSize,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
+    /// `drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// nil: `indirect_buffer` — never nil: the graphics lane's decoder raises on a nil indirect
+    /// buffer first.
+    DrawMeshThreadgroupsIndirect {
+        indirect_buffer: &'a P::Buffer,
+        indirect_buffer_offset: u64,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
+    /// `drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:`
+    /// The graphics lane's only.
+    DrawMeshThreads {
+        threads_per_grid: MtlSize,
+        threads_per_object_threadgroup: MtlSize,
+        threads_per_mesh_threadgroup: MtlSize,
+    },
     /// `drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:`
     /// nil: `indirect_buffer` — never nil: the decoder raises on a nil indirect buffer first.
     /// nil: `patch_index_buffer` is nil when the command's reference is 0 (no lookup is made).
@@ -247,6 +270,8 @@ pub enum RenderCmd<'a, P: Platform> {
     },
     /// `setDepthStoreAction:`
     SetDepthStoreAction { store_action: u64 },
+    /// `setDepthStoreActionOptions:`
+    SetDepthStoreActionOptions { store_action_options: u64 },
     /// `setFragmentBuffer:offset:atIndex:`
     SetFragmentBuffer {
         buffer: Option<&'a P::Buffer>,
@@ -294,6 +319,73 @@ pub enum RenderCmd<'a, P: Platform> {
     SetFrontFacingWinding { front_facing_winding: u64 },
     /// `setLineWidth:` (SPI)
     SetLineWidth { line_width: f32 },
+    /// `setMeshBufferOffset:atIndex:` (the graphics lane's only, as every mesh and object
+    /// stage command)
+    SetMeshBufferOffset { offset: u64, index: u64 },
+    /// `setMeshBuffers:offsets:withRange:`
+    /// `buffers`: its length is `range.length`.
+    /// `offsets`: its length is `range.length`.
+    SetMeshBuffers {
+        buffers: &'a [Option<&'a P::Buffer>],
+        offsets: &'a [u64],
+        range: NsRange,
+    },
+    /// `setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:`
+    /// `samplers`: its length is `range.length`.
+    /// `lod_min_clamps`: its length is `range.length`. `lod_max_clamps`: its length is
+    /// `range.length`.
+    SetMeshSamplerStatesLodClamps {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        lod_min_clamps: &'a [f32],
+        lod_max_clamps: &'a [f32],
+        range: NsRange,
+    },
+    /// `setMeshSamplerStates:withRange:`
+    /// `samplers`: its length is `range.length`.
+    SetMeshSamplerStates {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        range: NsRange,
+    },
+    /// `setMeshTextures:withRange:`
+    /// `textures`: its length is `range.length`.
+    SetMeshTextures {
+        textures: &'a [Option<&'a P::Texture>],
+        range: NsRange,
+    },
+    /// `setObjectBufferOffset:atIndex:`
+    SetObjectBufferOffset { offset: u64, index: u64 },
+    /// `setObjectBuffers:offsets:withRange:`
+    /// `buffers`: its length is `range.length`.
+    /// `offsets`: its length is `range.length`.
+    SetObjectBuffers {
+        buffers: &'a [Option<&'a P::Buffer>],
+        offsets: &'a [u64],
+        range: NsRange,
+    },
+    /// `setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:`
+    /// `samplers`: its length is `range.length`.
+    /// `lod_min_clamps`: its length is `range.length`. `lod_max_clamps`: its length is
+    /// `range.length`.
+    SetObjectSamplerStatesLodClamps {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        lod_min_clamps: &'a [f32],
+        lod_max_clamps: &'a [f32],
+        range: NsRange,
+    },
+    /// `setObjectSamplerStates:withRange:`
+    /// `samplers`: its length is `range.length`.
+    SetObjectSamplerStates {
+        samplers: &'a [Option<&'a P::SamplerState>],
+        range: NsRange,
+    },
+    /// `setObjectTextures:withRange:`
+    /// `textures`: its length is `range.length`.
+    SetObjectTextures {
+        textures: &'a [Option<&'a P::Texture>],
+        range: NsRange,
+    },
+    /// `setObjectThreadgroupMemoryLength:atIndex:`
+    SetObjectThreadgroupMemoryLength { length: u64, index: u64 },
     /// `setPointSize:` (SPI)
     SetPointSize { point_size: f32 },
     /// `setPrimitiveRestartEnabled:index:` (SPI)
@@ -497,6 +589,15 @@ impl<P: Platform> RenderCmd<'_, P> {
             Self::DrawIndexedPrimitivesIndirect { .. } => {
                 "drawIndexedPrimitives:indexType:indexBuffer:indexBufferOffset:indirectBuffer:indirectBufferOffset:"
             }
+            Self::DrawMeshThreadgroups { .. } => {
+                "drawMeshThreadgroups:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
+            Self::DrawMeshThreadgroupsIndirect { .. } => {
+                "drawMeshThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
+            Self::DrawMeshThreads { .. } => {
+                "drawMeshThreads:threadsPerObjectThreadgroup:threadsPerMeshThreadgroup:"
+            }
             Self::DrawPatchesIndirect { .. } => {
                 "drawPatches:patchIndexBuffer:patchIndexBufferOffset:indirectBuffer:indirectBufferOffset:"
             }
@@ -537,6 +638,7 @@ impl<P: Platform> RenderCmd<'_, P> {
             }
             Self::SetDepthStencilState { .. } => "setDepthStencilState:",
             Self::SetDepthStoreAction { .. } => "setDepthStoreAction:",
+            Self::SetDepthStoreActionOptions { .. } => "setDepthStoreActionOptions:",
             Self::SetFragmentBuffer { .. } => "setFragmentBuffer:offset:atIndex:",
             Self::SetFragmentBufferOffset { .. } => "setFragmentBufferOffset:atIndex:",
             Self::SetFragmentBuffers { .. } => "setFragmentBuffers:offsets:withRange:",
@@ -548,6 +650,23 @@ impl<P: Platform> RenderCmd<'_, P> {
             Self::SetFragmentTextures { .. } => "setFragmentTextures:withRange:",
             Self::SetFrontFacingWinding { .. } => "setFrontFacingWinding:",
             Self::SetLineWidth { .. } => "setLineWidth:",
+            Self::SetMeshBufferOffset { .. } => "setMeshBufferOffset:atIndex:",
+            Self::SetMeshBuffers { .. } => "setMeshBuffers:offsets:withRange:",
+            Self::SetMeshSamplerStatesLodClamps { .. } => {
+                "setMeshSamplerStates:lodMinClamps:lodMaxClamps:withRange:"
+            }
+            Self::SetMeshSamplerStates { .. } => "setMeshSamplerStates:withRange:",
+            Self::SetMeshTextures { .. } => "setMeshTextures:withRange:",
+            Self::SetObjectBufferOffset { .. } => "setObjectBufferOffset:atIndex:",
+            Self::SetObjectBuffers { .. } => "setObjectBuffers:offsets:withRange:",
+            Self::SetObjectSamplerStatesLodClamps { .. } => {
+                "setObjectSamplerStates:lodMinClamps:lodMaxClamps:withRange:"
+            }
+            Self::SetObjectSamplerStates { .. } => "setObjectSamplerStates:withRange:",
+            Self::SetObjectTextures { .. } => "setObjectTextures:withRange:",
+            Self::SetObjectThreadgroupMemoryLength { .. } => {
+                "setObjectThreadgroupMemoryLength:atIndex:"
+            }
             Self::SetPointSize { .. } => "setPointSize:",
             Self::SetPrimitiveRestartEnabled { .. } => "setPrimitiveRestartEnabled:index:",
             Self::SetProvokingVertexMode { .. } => "setProvokingVertexMode:",
@@ -605,12 +724,85 @@ impl<P: Platform> RenderCmd<'_, P> {
         }
     }
 }
+
+/// One draw of [`RenderEncoder::encode_draws`]: [`RenderCmd::SetVertexBuffer`] of `buffer`,
+/// `offset` and `index`, then [`RenderCmd::DrawPrimitives`] of `primitive_type`, `vertex_start`
+/// and `vertex_count`.
+#[derive(Debug)]
+#[allow(missing_docs)] // the fields are the two commands' arguments
+pub struct VertexDraw<'a, P: Platform> {
+    pub buffer: Option<&'a P::Buffer>,
+    pub offset: u64,
+    pub index: u64,
+    pub primitive_type: u64,
+    pub vertex_start: u64,
+    pub vertex_count: u64,
+}
+
+impl<P: Platform> Clone for VertexDraw<'_, P> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+
+impl<P: Platform> Copy for VertexDraw<'_, P> {}
+
+impl<'a, P: Platform> VertexDraw<'a, P> {
+    /// Its `setVertexBuffer:offset:atIndex:`.
+    pub fn vertex_buffer(&self) -> RenderCmd<'a, P> {
+        RenderCmd::SetVertexBuffer {
+            buffer: self.buffer,
+            offset: self.offset,
+            index: self.index,
+        }
+    }
+
+    /// Its `drawPrimitives:vertexStart:vertexCount:`.
+    pub fn primitives(&self) -> RenderCmd<'a, P> {
+        RenderCmd::DrawPrimitives {
+            primitive_type: self.primitive_type,
+            vertex_start: self.vertex_start,
+            vertex_count: self.vertex_count,
+        }
+    }
+}
+
+/// [`RenderEncoder::encode_draws`] as each platform's but the one that takes them its own way
+/// sends them: each draw's two commands through [`RenderEncoder::encode`], in order, up to the
+/// first that raises.
+pub fn encode_each<P: Platform, E: RenderEncoder<P> + ?Sized>(
+    enc: &E,
+    on: OnFault,
+    draws: &[VertexDraw<'_, P>],
+) -> RaiseResult<()> {
+    for draw in draws {
+        enc.encode(on, draw.vertex_buffer())?;
+        enc.encode(on, draw.primitives())?;
+    }
+    Ok(())
+}
+
 /// The render encoder `-renderCommandEncoderWithDescriptor:` answers (`CommandBuffer`).
 pub trait RenderEncoder<P: Platform>: Handle {
     /// Sends one [`RenderCmd`]. `on` says what a raise in a command reached both under a
     /// handler and with none (the display's frame commands and `EndEncoding`) does; the other
     /// commands are reached one way only.
     fn encode(&self, on: OnFault, cmd: RenderCmd<'_, P>) -> RaiseResult<()>;
+    /// Sends each of `draws`, one after another, as [`encode_each`] does: each command does what
+    /// it does alone, in its order, and the first that raises ends them. A platform may take
+    /// them its own way, where that is all it does.
+    fn encode_draws(&self, on: OnFault, draws: &[VertexDraw<'_, P>]) -> RaiseResult<()> {
+        encode_each(self, on, draws)
+    }
+    /// Runs `run`, a run of [`Self::encode`]s this thread sends the encoder one after another,
+    /// with nothing else sent it between them. Each command does what it does alone, in its
+    /// order; a platform may hold the encoder for the run, so that each command takes less.
+    fn encoding<T>(&self, run: impl FnOnce() -> T) -> T
+    where
+        Self: Sized,
+    {
+        run()
+    }
     /// sel: tileHeight
     /// Declared on MTLRenderCommandEncoder (protocol).
     /// A zero-argument getter: a raise dies at the send (4.2 item 3).

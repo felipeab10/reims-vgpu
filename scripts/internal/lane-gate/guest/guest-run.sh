@@ -1,0 +1,324 @@
+#!/bin/bash
+# The lane gate's guest side (scripts/internal/lane-gate.sh): run in the guest over SSH, as the
+# autologin user, from the directory the gate copied it into with its tools:
+#   GATE_PASS=<the user's password> bash guest-run.sh DIR [PHASE...]
+# DIR holds sweep, bench, present_probe and decode_md5 (x86_64 builds of guest/bundle/tools),
+# webgl.html, webgl-serve.pl, h264.list and hevc.list (the decode sets: their streams, in corpus/
+# beside each one's reference .md5, with the timed passes after a stream whose rate is measured),
+# h264-odd.list and hevc-odd.list (odd sizes and crops, in corpus/odd/), and, where the tree has
+# them, oracle_icb and its oracle_icb.metallib (guest/bundle/tools/oracle).
+#
+# It prints what it finds as lines the gate's report reads ("GATE item NAME PASS|FAIL|SKIP
+# detail", "GATE metric NAME VALUE"), each phase between "GATE phase NAME start" and "... end",
+# and the tools' own result lines ("sweep: ...", "bench: ...", "present_probe: ...",
+# "decode_md5: ...") as they come. The phases run in the order given (default: info idle bench
+# present sweep decode webgl final), over one run or several: what a later phase reads stays in
+# DIR. The gate's correctness boot runs info sweep decode icb webgl present final, its bench boot
+# info webgl present idle bench, then benchretry where the host asks, then decodefps final.
+# benchretry runs the cases in GATE_RETRY again (run_benchretry). decode checks every
+# stream's MD5s, decodefps also times the streams the lists time (decode_md5 -l), and present
+# runs present_probe for GATE_PRESENT_S seconds (default 10) each way. Each tool runs under an
+# alarm, so a hang ends as a FAIL line.
+# sudo (for launchctl asuser, which runs the on-screen tools in the logged-in user's window
+# server session) takes GATE_PASS.
+set -u
+D=${1:?usage: guest-run.sh DIR [PHASE...]}
+shift
+cd "$D" || exit 2
+PHASES=${*:-info idle bench present sweep decode webgl final}
+# The seconds the guest waits before its idle phase opens (the phase loop, below).
+IDLE_SETTLE_S=2
+: "${GATE_PASS:?GATE_PASS must hold the password of the user}"
+ME=$(id -un) UIDN=$(id -u)
+
+item() { echo "GATE item $*"; }
+metric() { echo "GATE metric $1 $2"; }
+phase() { echo "GATE phase $1 $2 $(date +%s)"; }
+# CMD under an alarm of SECONDS: a hang is killed and shows as exit 142.
+limit() { perl -e 'alarm shift @ARGV; exec @ARGV or exit 127' "$@"; }
+S() { echo "$GATE_PASS" | sudo -S -p '' "$@"; }
+# CMD in the logged-in user's GUI session, as that user.
+gui() { S launchctl asuser "$UIDN" sudo -u "$ME" "$@"; }
+reports() { ls /Library/Logs/DiagnosticReports "$HOME/Library/Logs/DiagnosticReports" 2>/dev/null | grep -E '\.(ips|panic)$' | sort -u; }
+wspid() { pgrep -x WindowServer | head -1; }
+
+run_info() {
+	reports > "$D/reports-before.txt"
+	# The crash reports written since the guest booted, during boot and login: reports-before.txt,
+	# taken once the desktop is up, already holds them, so "GATE crashes" never shows them. Listed
+	# for the report (an INFO item), not judged.
+	local bt f boot_new=
+	bt=$(sysctl -n kern.boottime | sed 's/.* sec = \([0-9]*\),.*/\1/')
+	for f in /Library/Logs/DiagnosticReports/* "$HOME"/Library/Logs/DiagnosticReports/*; do
+		case $f in *.ips|*.panic) ;; *) continue ;; esac
+		[[ -f $f ]] && (( $(stat -f %m "$f") >= bt )) && boot_new+="${f##*/} "
+	done
+	echo "GATE info boot-crashes ${boot_new:-none}"
+	wspid > "$D/ws-pid.txt"
+	echo "GATE info os $(sw_vers -productVersion) $(sw_vers -buildVersion)"
+	local csr; csr=$(csrutil status 2>&1)
+	case $csr in
+	*"enabled."*) item sip PASS "$csr" ;;
+	*) item sip FAIL "$csr" ;;
+	esac
+	local kexts; kexts=$(kmutil showloaded 2>/dev/null | grep -o -E 'com\.steelbrain\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
+	case $kexts in
+	*com.steelbrain.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
+	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
+	esac
+	# The loader's log says whether every site of ReimsGraphics resolved: guest/loader's
+	# ReimsGraphicsLoader keeps it in LoaderLog, the older AppleParavirtGPULoader in ApvLoadLog.
+	local ld bind
+	ld=$({ ioreg -l -w0 -c ReimsGraphicsLoader; ioreg -l -w0 -c AppleParavirtGPULoader; } 2>/dev/null |
+		grep -o -E 'ReimsGraphics:[^"]{0,160}')
+	bind=$(echo "$ld" | grep -o -E 'ReimsGraphics: all [0-9]+ sites resolved.{0,40}' | head -1)
+	if [ -n "$bind" ]; then item loader-bind PASS "$bind"; else
+		item loader-bind FAIL "$(echo "$ld" | head -2 | tr '\n' ' ')"
+	fi
+	local b=/Library/GPUBundles/reims-graphics.bundle
+	if codesign -v --strict "$b" 2>/dev/null; then
+		item bundle PASS "$(shasum "$b/Contents/MacOS/reims-graphics" | cut -c1-16) $(codesign -dvvv "$b" 2>&1 | grep -E '^CDHash=' | head -1)"
+		echo "GATE info bundle-sha $(shasum "$b/Contents/MacOS/reims-graphics" | cut -d' ' -f1)"
+	else
+		item bundle FAIL "$(ls -la /Library/GPUBundles 2>&1 | tr '\n' ' ')"
+	fi
+	local dev; dev=$(limit 30 ./bench -l 2>&1 | grep -v '^[0-9-]* [0-9:.]* .*RGFX' | head -5 | tr '\n' ' ')
+	case $dev in
+	*Apple\ Paravirtual*) item metal-device FAIL "$dev" ;;
+	*bench:\ device*) item metal-device PASS "$dev" ;;
+	*) item metal-device FAIL "no Metal device: $dev" ;;
+	esac
+	local desk; desk="$(wspid) $(pgrep -x Dock | head -1) $(pgrep -x Finder | head -1)"
+	set -- $desk
+	if [ $# -eq 3 ]; then item desktop PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop FAIL "WindowServer/Dock/Finder: $desk"; fi
+	run_memory
+	# The wire's features the host offered and the kext took (where the kext states them).
+	local feat; feat=$(ioreg -l -w0 2>/dev/null | grep -o -E '"RgfxFeatures(Offered|Taken)" = [0-9]+' | sort -u | tr -d '"' | tr '\n' ' ')
+	case $feat in
+	*Offered*Taken* | *Taken*Offered*)
+		local off tak; off=$(echo "$feat" | sed -n 's/.*RgfxFeaturesOffered = \([0-9]*\).*/\1/p'); tak=$(echo "$feat" | sed -n 's/.*RgfxFeaturesTaken = \([0-9]*\).*/\1/p')
+		if [ $(( tak & ~off )) -eq 0 ]; then item features PASS "$feat"; else item features FAIL "the kext took features the host did not offer: $feat"; fi ;;
+	"") echo "GATE info features none stated" ;;
+	*) item features FAIL "$feat" ;;
+	esac
+	# The codecs our accelerator offers AppleGVA: HEVC where it carries IOGVAHEVCDecode.
+	local gva; gva=$(ioreg -l -w0 -r -c RgfxAccelerator 2>/dev/null | grep -o -E '"IOGVA[A-Za-z0-9]*"' | tr -d '"' | sort -u | tr '\n' ' ')
+	case " $gva" in
+	*" IOGVAHEVCDecode "*) echo "GATE info video-offer hevc=1 keys=${gva% }" ;;
+	*) echo "GATE info video-offer hevc=0 keys=${gva% }" ;;
+	esac
+	echo "GATE info uptime $(uptime | tr -s ' ')"
+}
+
+# The GPU's memory as the guest's frameworks state it: system_profiler's "VRAM" (the kext's
+# VRAM,totalMB) and the Metal device's recommendedMaxWorkingSetSize, hasUnifiedMemory and
+# dedicatedMemorySize. A Mac's GPU states VRAM as its working set, and dedicatedMemorySize as
+# the working set where it has memory of its own, else 0 (guest/kext/src/RgfxMemorySize.hpp).
+run_memory() {
+	local vram mem ws uni ded gb
+	vram=$(system_profiler SPDisplaysDataType 2>/dev/null | grep -m1 -E '^ *VRAM' | sed 's/^ *//')
+	mem=$(limit 30 osascript -l JavaScript -e 'ObjC.import("Metal"); var d = $.MTLCreateSystemDefaultDevice();
+		[d.recommendedMaxWorkingSetSize, d.hasUnifiedMemory ? 1 : 0,
+		 d.respondsToSelector("dedicatedMemorySize") ? d.dedicatedMemorySize : -1].join(" ")' 2>/dev/null)
+	echo "GATE info memory vram=\"$vram\" metal=\"$mem\""
+	set -- $mem
+	ws=${1:-0} uni=${2:-} ded=${3:--1}
+	gb=$(echo "$vram" | sed -n 's/.*: *\([0-9][0-9]*\) GB.*/\1/p')
+	if [ -z "$vram" ] || [ "$ws" = 0 ] || [ "$ded" = -1 ]; then
+		item memory FAIL "VRAM \"$vram\", Metal \"$mem\" (working set, unified, dedicatedMemorySize)"
+	elif [ "$uni" = 1 ] && [ "$ded" != 0 ]; then
+		item memory FAIL "unified memory with dedicatedMemorySize $ded"
+	elif [ "$uni" = 0 ] && [ "$ded" != "$ws" ]; then
+		item memory FAIL "dedicatedMemorySize $ded is not the working set $ws"
+	elif [ -n "$gb" ] && [ "$(perl -e 'printf "%.0f", $ARGV[0] / 2**30' "$ws")" != "$gb" ]; then
+		item memory FAIL "VRAM $gb GB is not the working set $ws"
+	else
+		item memory PASS "$vram; recommendedMaxWorkingSetSize $ws, hasUnifiedMemory $uni, dedicatedMemorySize $ded"
+	fi
+}
+
+run_idle() { sleep 10; }
+
+run_bench() {
+	# The lines pass as they come, the GPU-bound cases' repetitions among them (-v), so the host can
+	# read the GPU's core clock beside each (lane-gate/reps.py).
+	limit 300 ./bench -m 3 -v 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
+	echo "rc bench ${PIPESTATUS[0]}"
+	gui perl -e 'alarm shift @ARGV; exec @ARGV' 60 "$D/bench" -t 10 onscreen 2>&1 | grep --line-buffered -E '^bench: |^# start'
+}
+
+# present_probe full-screen, then in a 1280 x 800 window, each its own sub-phase, so the host's
+# display updates can be counted in each.
+# The cases the host found no repetition of at the GPU's high clock in the bench phase
+# (GATE_RETRY, from msi-boot.sh): each again for 20 s, of which the host keeps the repetitions at
+# the high clock, while GATE_RETRY_S seconds (default 300) leave time for one more. msi-boot.sh
+# runs this phase between bench and the phases after it.
+run_benchretry() {
+	local c end=$(( $(date +%s) + ${GATE_RETRY_S:-300} ))
+	for c in ${GATE_RETRY:-}; do
+		if [ $(( $(date +%s) + 30 )) -gt "$end" ]; then
+			echo "GATE benchretry out of time at $c"
+			break
+		fi
+		limit 60 ./bench -m 20 -v "$c" 2>&1 | grep --line-buffered -E '^bench: |^# start|^# rep '
+	done
+}
+
+# oracle_icb's cases that check what CPU- and GPU-encoded indirect command buffers draw and
+# dispatch (each result line, "^ differs" under one that is not what Metal draws), and its timing
+# (CPU encodes of 1024 and 16384 commands): each line as "oracle_icb: CASE | LINE", then the case's
+# exit status. Each case runs in a child of its own, which says how it died.
+run_icb() {
+	[ -x ./oracle_icb ] || { item icb SKIP "the tree has no oracle_icb"; return; }
+	local dev c
+	dev=$(limit 30 ./bench -l 2>/dev/null | sed -n 's/^bench: device "\([^"]*\)".*/\1/p' | head -1)
+	[ -n "$dev" ] || { item icb FAIL "no Metal device to run oracle_icb on"; return; }
+	for c in render compute ranges reset gpu timing; do
+		limit 180 ./oracle_icb "$dev" "$c" 2>&1 | sed "s/^/oracle_icb: $c | /"
+		echo "oracle_icb: $c rc ${PIPESTATUS[0]}"
+	done
+}
+
+run_present() {
+	phase present.fullscreen start
+	gui perl -e 'alarm shift @ARGV; exec @ARGV' 40 "$D/present_probe" -t "${GATE_PRESENT_S:-10}" 2>&1 | grep '^present_probe:' | sed 's/^present_probe:/present_probe: fullscreen/'
+	phase present.fullscreen end
+	phase present.windowed start
+	gui perl -e 'alarm shift @ARGV; exec @ARGV' 40 "$D/present_probe" -t "${GATE_PRESENT_S:-10}" -w 1280x800 2>&1 | grep '^present_probe:' | sed 's/^present_probe:/present_probe: windowed/'
+	phase present.windowed end
+}
+
+# A new crash report's name and summary (ips-summary.js), among the reports not in BEFORE. The
+# system writes a report a few seconds after the process died: up to 10 s are waited for one.
+crash_since() {
+	local r f n
+	for n in 1 2 3 4 5 6 7 8 9 10; do
+		for r in $(reports | comm -13 "$1" -); do
+			for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
+				[ -f "$f" ] && { echo "$r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 600)"; return; }
+			done
+		done
+		sleep 1
+	done
+	echo "no crash report within 10 s"
+}
+
+# The sweep, all its cases in one process. Where that process dies in a case, each case it did not
+# reach runs in a process of its own, in the order of the last full sweep (sweep-cases.txt, which
+# the gate keeps): a crash fails its own case, with its crash report's frames, and no other.
+run_sweep() {
+	reports > "$D/reports-sweep.txt"
+	limit 420 ./sweep 2>&1 | grep '^sweep: ' | tee "$D/sweep.out"
+	local rc=${PIPESTATUS[0]}
+	echo "rc sweep $rc"
+	if grep -q -E '^sweep: [0-9]+ OK, ' "$D/sweep.out"; then
+		echo "GATE sweep-order $(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/sweep.out" | grep -v -x -E 'device|[0-9]+' | tr '\n' ' ')"
+	elif [ -s sweep-cases.txt ]; then
+		local c r done_
+		done_=$(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/sweep.out")
+		for c in $(cat sweep-cases.txt); do
+			echo "$done_" | grep -q -x -F "$c" && continue
+			reports > "$D/reports-case.txt"
+			limit 120 ./sweep "$c" 2>&1 | grep "^sweep: $c " > "$D/case.out"
+			r=${PIPESTATUS[0]}
+			if [ -s "$D/case.out" ]; then
+				cat "$D/case.out"
+			else
+				echo "sweep: $c FAIL crashed (rc $r): $(crash_since "$D/reports-case.txt")"
+			fi
+			done_="$done_
+$(sed -n 's/^sweep: \([^ ]*\) .*/\1/p' "$D/case.out")"
+		done
+		echo "GATE sweep-resumed after rc $rc"
+	fi
+	# The bundle writes no file of its own: no /tmp/rgfx-*.log after every Metal process the sweep ran.
+	local logs; logs=$(ls /tmp/rgfx-*.log 2>/dev/null | tr '\n' ' ')
+	if [ -z "$logs" ]; then item no-tmp-files PASS "no /tmp/rgfx-*.log after the sweep"; else item no-tmp-files FAIL "$logs"; fi
+}
+
+# decode: every stream of both sets, MD5s only; decodefps: the timed streams, MD5s and timed passes.
+# The sets h264 and hevc are corpus/'s streams, h264-odd and hevc-odd corpus/odd/'s (odd sizes and
+# crops); a stream's items are decode.SET.NAME.
+# The streams decode-repeat.txt names ("SET STREAM N" a line, from the gate) checked N times more,
+# each run's line named STREAM.r2, STREAM.r3, ...: a stream whose frames differ only sometimes.
+run_repeats() {
+	local set s n dir i
+	[ -f "$D/decode-repeat.txt" ] || return 0
+	while read -r set s n; do
+		case $set in ''|'#'*) continue ;; esac
+		case $set in *-odd) dir=corpus/odd ;; *) dir=corpus ;; esac
+		i=1
+		while [ "$i" -le "${n:-0}" ]; do
+			i=$((i + 1))
+			limit 90 ./decode_md5 -l 0 "$dir/$s" 2>&1 | grep '^decode_md5: ' |
+				sed "s/^decode_md5: \([^ ]*\) /decode_md5: $set \1.r$i /"
+		done
+	done < "$D/decode-repeat.txt"
+}
+
+run_decode() {
+	local set s loops dir
+	for set in h264 hevc h264-odd hevc-odd; do
+		[ -f "$set.list" ] || { item "decode-$set" SKIP "no $set.list"; continue; }
+		case $set in *-odd) dir=corpus/odd ;; *) dir=corpus ;; esac
+		while read -r s loops; do
+			case $s in ''|'#'*) continue ;; esac
+			if [ -n "${TIMED:-}" ]; then [ -n "$loops" ] || continue; else loops=0; fi
+			limit 90 ./decode_md5 -l "$loops" "$dir/$s" 2>&1 | grep '^decode_md5: ' | sed "s/^decode_md5: /decode_md5: $set /"
+		done < "$set.list"
+	done
+	run_repeats
+}
+run_decodefps() { TIMED=1 run_decode; }
+
+run_webgl() {
+	local port=8765 res="$D/webgl-result.json"
+	rm -f "$res"
+	perl "$D/webgl-serve.pl" "$port" "$D" "$res" 60 &
+	local srv=$!
+	sleep 1
+	gui open -a Safari "http://127.0.0.1:$port/webgl.html"
+	wait "$srv"
+	if [ -s "$res" ]; then
+		echo "GATE webgl $(cat "$res")"
+	else
+		echo 'GATE webgl {"ok": false, "error": "no result from the page in 60 s"}'
+	fi
+	gui killall Safari > /dev/null 2>&1
+	sleep 2
+}
+
+run_final() {
+	local before now new
+	before=$(cat "$D/ws-pid.txt" 2>/dev/null) now=$(wspid)
+	if [ -n "$now" ] && [ "$now" = "$before" ]; then item windowserver PASS "pid $now throughout"; else item windowserver FAIL "pid $before at start, ${now:-none} now"; fi
+	local desk; desk="$(wspid) $(pgrep -x Dock | head -1) $(pgrep -x Finder | head -1)"
+	set -- $desk
+	if [ $# -eq 3 ]; then item desktop-end PASS "WindowServer $1, Dock $2, Finder $3"; else item desktop-end FAIL "WindowServer/Dock/Finder: $desk"; fi
+	new=$(reports | comm -13 "$D/reports-before.txt" - | tr '\n' ' ')
+	echo "GATE crashes ${new:-none}"
+	# Each new report's exception and faulting thread's top frames (ips-summary.js).
+	local r f
+	for r in $new; do
+		for f in "/Library/Logs/DiagnosticReports/$r" "$HOME/Library/Logs/DiagnosticReports/$r"; do
+			[ -f "$f" ] || continue
+			echo "GATE crash $r: $(limit 20 osascript -l JavaScript "$D/ips-summary.js" "$f" 2>&1 | head -c 1500)"
+			break
+		done
+	done
+	# The gate's --final-cmd: a command of the run's, its output kept in this log.
+	if [ -n "${GATE_FINAL_CMD_B64:-}" ]; then
+		printf '%s' "$GATE_FINAL_CMD_B64" | base64 -d > "$D/final-cmd.sh" 2>/dev/null ||
+			printf '%s' "$GATE_FINAL_CMD_B64" | base64 -D > "$D/final-cmd.sh"
+		limit 120 bash "$D/final-cmd.sh" 2>&1 | sed 's/^/GATE final-cmd: /'
+	fi
+}
+
+for p in $PHASES; do
+	# The idle phase opens once the phase before it has settled: an app that ended (present_probe's
+	# teardown) takes 77-145% of a CPU for about a second after, which the idle window would count.
+	[ "$p" = idle ] && sleep "$IDLE_SETTLE_S"
+	phase "$p" start
+	"run_$p"
+	phase "$p" end
+done

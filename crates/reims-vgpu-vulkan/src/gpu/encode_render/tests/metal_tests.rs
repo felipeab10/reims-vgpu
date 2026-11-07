@@ -1326,6 +1326,80 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
     }
 }
 
+/// `setLineWidth:` reaches the runtime's encoder, which draws Metal's widths: lines and line
+/// strips over the flat vertices at widths 1, 3, 2.5 and 0 draw as the Metal platform draws them,
+/// where the runtime draws the width exactly (its band of triangles, or device lines it takes as
+/// exact), at 0 the few pixels Metal lights on the segments (3 of the list's, 5 of the strip's
+/// here, the M3 Max). A device's own lines that differ from Metal's say so (`device-wide-lines`),
+/// relayed by default, and are not compared. A width of 3 lights more pixels than a width of 1.
+/// The first vertex is white: [`vertex_colours`]' first is the clear's black, which would hide
+/// the line it provokes
+#[test]
+fn lines_draw_at_metals_widths() {
+    let (p, d) = (platform(), dev());
+    let metal = MetalPlatform::system_default_device()
+        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
+    let kind = rt::Degradation::DeviceWideLines;
+    /// The flat state's draw of `primitive_type` over the first 8 flat vertices at `line_width`,
+    /// the first white.
+    fn lines<P: Platform>(
+        p: &P,
+        d: &P::Device,
+        line_width: f32,
+        primitive_type: u64,
+    ) -> Vec<[u8; 4]> {
+        let state = fixture_state::<P>(d, FLAT.0, FLAT.1);
+        let (pos, _) = flat_vertices::<P>(d, 16);
+        let mut colours = vertex_colours();
+        colours[..4].copy_from_slice(&[1.0; 4]);
+        let length = u64::try_from(colours.len() * 4).unwrap();
+        let colours = buffer::<P>(d, length, 0, &bytes(&colours));
+        pass_pixels(
+            p,
+            d,
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&pos),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&colours),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetLineWidth { line_width },
+                RenderCmd::DrawPrimitivesInstances {
+                    primitive_type,
+                    vertex_start: 0,
+                    vertex_count: 8,
+                    instance_count: 1,
+                },
+            ],
+        )
+    }
+    let lit = |px: &[[u8; 4]]| px.iter().filter(|&&t| t != [0, 0, 0, 0xff]).count();
+    for primitive_type in [1, 2] {
+        let mut lit_at = Vec::new();
+        for w in [1.0, 3.0, 2.5, 0.0] {
+            let before = super::relayed_kind(kind);
+            let ours = crate::answer::relaxed(|| lines(&p, &d, w, primitive_type));
+            let exact = super::relayed_kind(kind) == before;
+            lit_at.push(lit(&ours));
+            if let Some((mp, md)) = &metal
+                && exact
+            {
+                let theirs = lines(mp, md, w, primitive_type);
+                assert!(ours == theirs, "{primitive_type} at {w}");
+            }
+        }
+        assert!(lit_at[1] > lit_at[0], "{primitive_type}: {lit_at:?}");
+    }
+}
+
 /// At `setProvokingVertexMode:` 1, a state whose fragment function reads `[[barycentric_coord]]`
 /// and no flat input draws what Metal draws: a list's weights in mode 0's order and a strip's odd
 /// triangles' moved, over their vertices, over indices, restarting, from indirect arguments, and
@@ -2404,6 +2478,10 @@ fn texture_writes_round_as_metals_at_the_modes_they_decode() {
 /// `RGB10A8_2P_XR10_sRGB` under source and destination factor one, whose blend the runtime
 /// computes in the `_sRGB` form as in the linear one, which Metal's lanes measured equal
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::raise::death::DeathKind;
@@ -2728,14 +2806,12 @@ fn blended_state<P: Platform>(
 /// (`InvalidDescriptor(ColorAttachment)`), which the creator answers
 /// ([`crate::gpu::states::pipeline_error`]), where this platform died at the runtime's refusal
 /// of an extended-range one. A function that writes a second output (`xr_dual_half_fragment`) is
-/// made as on Metal, but compiled with fast math into an extended-range form or twin, which dies
-/// at the creator, naming the runtime's refusal (`ExtendedRangeBlend(DualSource)`, and
-/// `ExtendedRangeBlend(SrgbForm)` into `BGRA10_XR_sRGB`), where Metal makes it. And a state of a `half4` output into `RGBA8Uint`, unblended, whose output the
+/// made as on Metal, compiled with fast math or without, into every one of those formats. And a
+/// state of a `half4` output into `RGBA8Uint`, unblended, whose output the
 /// runtime refuses for its type class (`InvalidDescriptor(ColorAttachment)` too), is answered as
 /// Metal answers it
 #[test]
 fn second_source_blends_without_a_second_output_are_refused_as_metals() {
-    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -2766,16 +2842,8 @@ fn second_source_blends_without_a_second_output_are_refused_as_metals() {
         let ours =
             catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        let refused = library == ROUNDING
-            && fragment == "xr_dual_half_fragment"
-            && XR_LINEAR.into_iter().chain(XR_SRGB).any(|f| f == format);
         match ours {
-            Ok(ours) if !refused && ours == theirs => {}
-            Err(site)
-                if refused
-                    && theirs.is_ok()
-                    && site.file == STATE
-                    && line.contains("ExtendedRangeBlend(") => {}
+            Ok(ours) if ours == theirs => {}
             Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
             Err(site) => differ.push(format!(
                 "{what}: died at {}: {line}; Metal {theirs:?}",
@@ -3132,6 +3200,10 @@ fn xr_within(
 /// one is made and stores Metal's values, bit for bit, and none announces the stored codes,
 /// as the runtime holds the attachment's `half` values through the pass
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn float4_extended_range_blends_are_metals_here() {
     let linear = (&XR_LINEAR[..], &XR_BLENDS[..]);
     let srgb = (&XR_SRGB[..], &XR_SRGB_BLENDS[..]);
@@ -3182,6 +3254,10 @@ fn float4_extended_range_blends_are_metals_here() {
 /// add; 5, 4, add), and in `RGB10A8_2P_XR10` and `BGRA10_XR` (8, 9, add; 8, 9, add). The
 /// function's unblended draw is Metal's, bit for bit
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn float4_extended_range_blends_die_naming_their_source() {
     use reims_vgpu_core::raise::death::DeathKind;
 
@@ -3239,6 +3315,10 @@ const XR_CONSTANT_DIFFERENCES: [[u32; 6]; 2] = [[11, 12, 1, 1, 1, 0], [12, 11, 2
 /// without fast math too, is
 /// [`extended_range_masked_blends_and_two_output_states_are_metals`]'s
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn extended_range_blends_drawn_without_fast_math_alone_are_metals() {
     use reims_vgpu_core::raise::death::DeathKind;
 
@@ -3355,6 +3435,10 @@ const XR_DUAL_BLENDS: [[u32; 6]; 6] = [
 /// blend under a mask of one colour channel into `BGRA10_XR`
 /// (`ExtendedRangeBlend(OneColorChannel)`)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn extended_range_masked_blends_and_two_output_states_are_metals() {
     use reims_vgpu_core::raise::death::DeathKind;
 
@@ -3497,18 +3581,26 @@ const HALF4_FAST_GAP: [XrGap; 13] = [
 ];
 
 /// A `half4` output (`xr_half_fragment`, each lane a value a `half` holds, computed from the
-/// pixel), compiled with fast math ([`ROUNDING`]), blended into an attachment of each linear
-/// extended-range format under each of [`XR_BLENDS`], across passes ([`xr_across`]) and in the
-/// first draw's pass ([`xr_within`]): Metal's side draws each, and this platform's blended draw
-/// dies at its selector naming `extended-range-blend-source` ([`crate::answer::DIES`]), which
-/// the runtime announces for such an output; [`HALF4_FAST_GAP`]'s 13 configurations
-/// are where its blends missed Metal's. Each unblended draw stores Metal's values, bit for bit,
-/// and none announces `extended-range-blends-stored-codes`
+/// pixel), compiled with fast math ([`ROUNDING`]), drawn into an attachment of each linear
+/// extended-range format unblended and blended under each of [`XR_BLENDS`], across passes
+/// ([`xr_across`]) and in the first draw's pass ([`xr_within`]): Metal's side draws each, and
+/// every draw of this platform's, the blended and the unblended alike, dies at its selector
+/// naming `device-pack-conversion` ([`crate::answer::DIES`]). The runtime holds such an
+/// attachment in its codes, which the fragment function converts by the device's arithmetic
+/// (a read multiplies a code by the `f32` nearest `1 / 510`, a write rounds its value's `f32`
+/// product by 510, where Metal answers the correctly rounded quotient and encodes by the exact
+/// product), and the translation of every function that converts such a texel records
+/// `DevicePackConversion` on every device, MoltenVK among them, which a device on Metal does not
+/// relay (the runtime's `lower/arith/extended_range.rs`; measured on the M3 Max under macOS
+/// 27.0.1, MoltenVK 1.4.2, at the runtime's 57b3b26ba0: all 138 draws). That is the line a
+/// blended draw dies with, where at the runtime's earlier commits it named the render state's
+/// `extended-range-blend-source`, which the runtime announces for such an output; a draw that
+/// did not die is held to [`HALF4_FAST_GAP`], where those blends missed Metal's
 #[test]
 fn half4_extended_range_blends_announce_their_source() {
     let drawn = ("fast math", ROUNDING, "xr_half_fragment");
     let shape = (&XR_LINEAR[..], &XR_BLENDS[..]);
-    let named = "(metal2vulkan-degrade-extended-range-blend-source)";
+    let named = "(metal2vulkan-degrade-device-pack-conversion)";
     let at = "\"drawPrimitives:vertexStart:vertexCount:\"";
     let expect = XrExpect::Announced(Some(&HALF4_FAST_GAP));
     let sides = xr_sides();
@@ -3518,8 +3610,8 @@ fn half4_extended_range_blends_announce_their_source() {
         .partition(|what| what.contains(named) && what.contains(at));
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
     if sides.1.is_some() {
-        let blended = 2 * XR_LINEAR.len() * XR_BLENDS.len();
-        assert_eq!(died.len(), blended, "the blended draws that die: {died:#?}");
+        let draws = 2 * XR_LINEAR.len() * (1 + XR_BLENDS.len());
+        assert_eq!(died.len(), draws, "the draws that die: {died:#?}");
     }
 }
 
@@ -3533,6 +3625,10 @@ fn half4_extended_range_blends_announce_their_source() {
 /// one is made and stores Metal's values, bit for bit, and none announces the stored codes,
 /// as the runtime holds the attachment's `half` values through the pass
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn half4_extended_range_blends_are_metals_without_fast_math() {
     let drawn = ("fast math off", ROUNDING_SAFE, "xr_half_fragment");
     let source = rt::Degradation::ExtendedRangeBlendSource;
@@ -3689,6 +3785,10 @@ fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> 
 /// factors, though a blend of one and one is among those it measured Metal's
 /// ([`HALF4_FAST_GAP`] lists none such)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn a_blend_onto_a_clear_between_codes_is_metals() {
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
@@ -3833,6 +3933,10 @@ fn mode_2_render_states_are_decided_once_made() {
 /// `RG16Float` and `RGBA16Float`, unblended and blended by one and zero, of a `float4` and of
 /// a `half4` output, and of a write mask of red and green alone, and of none
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn mode_2_half_float_attachments_stored_as_written_round_as_metals() {
     use crate::gpu::serialized::NEAREST_EVEN;
 
@@ -3994,6 +4098,10 @@ impl Channels {
 /// `float4` output (`sweep_fragment`) under the same state, which the runtime notes nothing of,
 /// draws and stores Metal's bytes in every case
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn half_outputs_store_within_the_bound_or_die_named() {
     use reims_vgpu_core::platform::resource::Library as _;
     use reims_vgpu_core::rt::Hold;
@@ -4326,6 +4434,10 @@ fn half_outputs_store_within_the_bound_or_die_named() {
 /// in a pass that loads one and stores it, which Metal makes, dies at the draw, naming the
 /// attachment (`bfloat_loaded`: the tiles the runtime's pass leaves are not Metal's)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn bfloat_draws_store_metals_codes() {
     use reims_vgpu_core::raise::death::DeathKind;
 
@@ -5034,17 +5146,28 @@ fn drawn_specials() -> [Vec<[f32; 4]>; 2] {
 /// A multisampled float colour attachment whose samples draws wrote as NaN (quiet, negative
 /// and of a payload), as either infinity, past the largest half or as plain values, two
 /// values in some pixels' samples, resolves as Metal's, byte for byte ([`drawn_resolved`]):
-/// `R16Float`, `RG16Float`, `RGBA16Float` and `RG11B10Float`, which MoltenVK averages by Metal's
-/// own resolve, announcing nothing (another device resolves them by the runtime's rules of
-/// Metal's resolve), and `R32Float`, which the runtime resolves by its own rule, at 2 and 4
-/// samples, resolved by
+/// `R16Float`, `RG16Float` and `RGBA16Float`, which MoltenVK averages by Metal's own resolve,
+/// announcing nothing (another device resolves them by the runtime's rules of Metal's resolve),
+/// and `R32Float`, which the runtime resolves by its own rule, at 2 and 4 samples, resolved by
 /// the drawing pass (`MultisampleResolve`, `StoreAndMultisampleResolve`) and by a later pass
-/// that loads the samples. Each case whose bytes are not Metal's is named, with the texels off
+/// that loads the samples. Each case whose bytes are not Metal's is named, with the texels off.
+/// `RG11B10Float`'s cases die at the blit that copies the resolve texture into a buffer,
+/// naming `device-nan-encoding`: Metal keeps that 64 by 64 render target, of the descriptor's
+/// default options, losslessly compressed, and its blit through the compression makes a NaN
+/// field the quiet NaN, where the
+/// device's copy keeps the texels' bytes, which the runtime announces at the blit and which
+/// dies on every device ([`crate::answer::DIES`]; the runtime's `compressed_blit.rs`; measured
+/// on the M3 Max under macOS 27.0.1, MoltenVK 1.4.2, at the runtime's 57b3b26ba0). Their
+/// resolved bytes are not compared
 #[test]
 fn drawn_nan_and_infinite_samples_resolve_as_metals() {
     /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
     const RESOLVE: u64 = 2;
     const STORE_AND_RESOLVE: u64 = 3;
+    /// The blit [`drawn_resolved`] reads the resolve texture back with.
+    const TO_BUFFER: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
+                             toBuffer:destinationOffset:destinationBytesPerRow:\
+                             destinationBytesPerImage:";
     let Some(md) = MetalPlatform::system_default_device() else {
         return;
     };
@@ -5055,6 +5178,14 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
         for store in [RESOLVE, STORE_AND_RESOLVE, STORE] {
             for (format, bytes) in [(25, 2), (65, 4), (115, 8), (55, 4), (92, 4)] {
                 let case = (format, bytes, samples);
+                if format == 92 {
+                    let ours = || drawn_resolved(&p, &d, case, store, &drawn_specials());
+                    let line = died_at(TO_BUFFER, ours);
+                    if !line.contains("(metal2vulkan-degrade-device-nan-encoding)") {
+                        differ.push(format!("{format} {samples}x store {store}: {line}"));
+                    }
+                    continue;
+                }
                 let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
                 let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
                 let texel = usize::try_from(bytes).unwrap();
@@ -5116,6 +5247,10 @@ fn extended_codes(format: u64, bytes: &[u8]) -> Vec<(u32, u32, bool)> {
 /// within one), the bounds the runtime measured on the M3 Max (macOS 27.0.1), every padding bit
 /// Metal's
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn drawn_extended_range_samples_resolve_as_metals() {
     /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
     const RESOLVE: u64 = 2;
@@ -5956,6 +6091,10 @@ fn resolving_pass<P: Platform>(
 /// resolve's writes (the samples `MultisampleResolve` leaves there:
 /// `samples_resolved_into_the_twin_are_metals`)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-rounded-resolve, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
     let metal = MetalPlatform::system_default_device()
@@ -6238,6 +6377,10 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
 /// resolve of its own, whose texels are Metal's
 /// (`resolves_into_other_formats_are_metals_or_die_named`)
 #[test]
+#[cfg_attr(
+    target_os = "macos",
+    ignore = "MoltenVK: the runtime records device-rounded-resolve, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
+)]
 fn samples_resolved_into_the_twin_are_metals() {
     let (p, d) = (platform(), dev());
     let Some(md) = MetalPlatform::system_default_device() else {
@@ -6792,9 +6935,18 @@ fn late_resolves_beside_a_dropped_one_follow_late_store_actions() {
 }
 
 /// A resolve into the attachment's sRGB twin, or across the 8-bit four-channel family's
-/// channel orders, is the runtime's to resolve or refuse ([`runtime_resolves`]): the pass of a
-/// 4-sample `R8Unorm`, `R8Unorm_sRGB`, `RG8Unorm` or `RG8Unorm_sRGB` attachment resolving into
-/// its twin is made and completes. Other pairs are not
+/// channel orders, is the runtime's to resolve or refuse ([`runtime_resolves`]). The pass of a
+/// 4-sample `R8Unorm_sRGB` or `RG8Unorm_sRGB` attachment resolving into its UNORM twin is made
+/// and completes: the runtime's resolve after the pass averages the samples' codes by the unorm
+/// rule. That of an `R8Unorm` or `RG8Unorm` attachment resolving into its sRGB twin, on a
+/// device that renders the twin, dies as it ends, at `endEncoding`, naming
+/// `device-rounded-resolve`: the runtime's resolve decodes the samples and encodes their average
+/// by the device's own sRGB conversions, where Metal's resolve takes its 12-bit tables, and the
+/// runtime announces that on every device, MoltenVK among them, which a device on Metal does not
+/// relay (the runtime's `color_resolve.rs`; measured on the M3 Max under macOS 27.0.1, MoltenVK
+/// 1.4.2, at the runtime's 57b3b26ba0). On a device that lacks the twin the runtime takes those
+/// tables and announces nothing, so the pass is made and completes (read from the runtime's
+/// code). Other pairs are not
 #[test]
 fn resolves_into_twins_are_the_runtimes() {
     use PixelFormat as P;
@@ -6826,11 +6978,29 @@ fn resolves_into_twins_are_the_runtimes() {
     for (a, b) in others {
         assert!(!runtime_resolves(a, b), "{a:?} {b:?}");
     }
+    use metal2vulkan::device::FormatUsage;
+    use metal2vulkan::vk::Format;
+
     let (p, d) = (platform(), dev());
-    for (from, into) in [(10, 11), (11, 10), (30, 31), (31, 30)] {
+    let profile = d.raw.compile_device().profile();
+    // Each pair, with the sRGB twin a UNORM attachment resolves into.
+    let pairs = [
+        (10, 11, Some(Format::R8_SRGB)),
+        (11, 10, None),
+        (30, 31, Some(Format::R8G8_SRGB)),
+        (31, 30, None),
+    ];
+    for (from, into, srgb) in pairs {
         let target = texture(&p, &d, into, READ | TARGET, (16, 16), None);
         let (cb, e) = resolving_pass(&p, &d, (from, RESOLVE), &target, (0, 0));
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        let end = || e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        if srgb.is_some_and(|twin| profile.supports_format(twin, FormatUsage::ColorAttachment)) {
+            let line = died_at("endEncoding", end);
+            let named = "(metal2vulkan-degrade-device-rounded-resolve)";
+            assert!(line.contains(named), "{from} into {into}: {line}");
+            continue;
+        }
+        end();
         cb.commit(OnFault::Die).unwrap();
         cb.wait_until_completed(OnFault::Die).unwrap();
         assert!(cb.error().is_none(), "{from} into {into}: {:?}", cb.error());
@@ -9789,4 +9959,322 @@ fn type_9_faults_revoke_queues_as_metals() {
         assert_eq!(theirs[draws.len()..], metals, "{draws:?}: {theirs:#?}");
         assert_eq!(after_type_9s(&p, &d, draws), theirs, "{draws:?}");
     }
+}
+
+/// A step of a visibility case's pass: `setVisibilityResultMode:offset:` of a mode at an offset,
+/// a draw of `render_depth`'s triangle over the whole target at a depth (0.25 passes the depth
+/// test of a pass with depth, 0.75 fails it), or a scissor rectangle over the target's left
+/// columns.
+#[derive(Clone, Copy, Debug)]
+enum Vis {
+    Mode(u64, u64),
+    Draw(f32),
+    Scissor(u64),
+}
+
+/// A pass of a visibility case: its samples, whether it has a `Depth32Float` attachment
+/// (cleared to 0.5, tested `Less`, unwritten), its `visibilityResultType`, and its steps.
+#[derive(Clone, Copy, Debug)]
+struct VisPass<'a> {
+    samples: u64,
+    depth: bool,
+    result_type: u64,
+    steps: &'a [Vis],
+}
+
+/// The side of a visibility case's target.
+const VIS_SIDE: u64 = 16;
+
+/// The 64-bit words of a visibility result buffer holding `init` after `passes` drew over it in
+/// one command buffer, each pass over its own `VIS_SIDE` square BGRA8 target, cleared.
+fn visibility_results<P: Platform>(
+    p: &P,
+    d: &P::Device,
+    init: &[u64],
+    passes: &[VisPass<'_>],
+) -> Vec<u64> {
+    use reims_vgpu_core::platform::values::{DepthStencilDesc, PassSet};
+
+    let words: Vec<u8> = init.iter().flat_map(|w| w.to_ne_bytes()).collect();
+    let length = u64::try_from(words.len()).unwrap();
+    let results = buffer::<P>(d, length, 0, &words);
+    let tested = d
+        .new_depth_stencil_state(&DepthStencilDesc {
+            depth_compare_function: Some(1), // Less
+            depth_write_enabled: Some(false),
+            front: None,
+            back: None,
+        })
+        .unwrap()
+        .unwrap();
+    let q = d.new_command_queue().unwrap();
+    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+    let (mut kept_buffers, mut kept_textures) = (Vec::new(), Vec::new());
+    for pass in passes {
+        let mut entries = Vec::new();
+        let count = format!("04 04 {:02x}000000", pass.samples);
+        if pass.samples > 1 {
+            entries.push(count.as_str());
+        }
+        if pass.depth {
+            entries.push("09 04 fc000000"); // Depth32Float
+        }
+        let state = blob_state::<P>(d, ("render_depth", "render_color"), &entries);
+        let attachment = |format: u64| {
+            let desc = p.texture_descriptor(&TextureDesc {
+                texture_type: if pass.samples > 1 { 4 } else { 2 },
+                pixel_format: format,
+                width: VIS_SIDE,
+                height: VIS_SIDE,
+                sample_count: pass.samples,
+                usage: TARGET,
+                resource_options: Some(0x20), // Private
+                ..TextureDesc::default()
+            });
+            d.new_texture(OnFault::Die, &desc).unwrap().unwrap()
+        };
+        let colour = attachment(BGRA8);
+        let rp = p.render_pass_descriptor();
+        rp.set_color_attachment(
+            OnFault::Die,
+            0,
+            &ColorAttachmentSet {
+                texture: Some(Some(&colour)),
+                load_action: Some(CLEAR),
+                store_action: Some(0), // DontCare
+                ..ColorAttachmentSet::default()
+            },
+        )
+        .unwrap();
+        let depth = pass.depth.then(|| attachment(252));
+        if let Some(depth) = &depth {
+            rp.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+                texture: Some(Some(depth)),
+                load_action: Some(CLEAR),
+                store_action: Some(0),
+                clear_depth: Some(0.5),
+                ..Default::default()
+            });
+        }
+        rp.set_pass(&PassSet {
+            visibility_result_buffer: Some(Some(&results)),
+            visibility_result_type: Some(pass.result_type),
+            ..PassSet::default()
+        });
+        let e = cb.render_encoder(OnFault::Die, &rp).unwrap().unwrap();
+        e.encode(
+            OnFault::Die,
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+        )
+        .unwrap();
+        if pass.depth {
+            e.encode(
+                OnFault::Die,
+                RenderCmd::SetDepthStencilState {
+                    depth_stencil_state: Some(&tested),
+                },
+            )
+            .unwrap();
+        }
+        for step in pass.steps {
+            match *step {
+                Vis::Mode(mode, offset) => e
+                    .encode(
+                        OnFault::Die,
+                        RenderCmd::SetVisibilityResultMode { mode, offset },
+                    )
+                    .unwrap(),
+                Vis::Scissor(width) => e
+                    .encode(
+                        OnFault::Die,
+                        RenderCmd::SetScissorRect {
+                            rect: MtlScissorRect {
+                                x: 0,
+                                y: 0,
+                                width,
+                                height: VIS_SIDE,
+                            },
+                        },
+                    )
+                    .unwrap(),
+                Vis::Draw(z) => {
+                    let params = [z, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0];
+                    let params = buffer::<P>(d, 32, 0, &bytes(&params));
+                    e.encode(
+                        OnFault::Die,
+                        RenderCmd::SetVertexBuffer {
+                            buffer: Some(&params),
+                            offset: 0,
+                            index: 0,
+                        },
+                    )
+                    .unwrap();
+                    e.encode(
+                        OnFault::Die,
+                        RenderCmd::DrawPrimitives {
+                            primitive_type: 3,
+                            vertex_start: 0,
+                            vertex_count: 3,
+                        },
+                    )
+                    .unwrap();
+                    kept_buffers.push(params);
+                }
+            }
+        }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        kept_textures.push(colour);
+        kept_textures.extend(depth);
+    }
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert!(cb.error().is_none(), "{passes:?}: {:?}", cb.error());
+    let n = init.len();
+    // SAFETY: a Shared buffer of `n` words, which no command uses any more.
+    let words = unsafe { std::slice::from_raw_parts(results.contents().as_ptr::<u64>(), n) };
+    words.to_vec()
+}
+
+/// A visibility result buffer's words, each Metal's own fill until a pass writes it.
+const VIS_FILL: u64 = 0xeeee_eeee_eeee_eeee;
+
+/// A case of [`visibility_results_are_metals`]: its name, its passes, the buffer's words before
+/// them and the words Metal leaves.
+type VisCase<'a> = (&'static str, Vec<VisPass<'a>>, [u64; 4], [u64; 4]);
+
+/// A pass's visibility results are Metal's: a `Counting` result is the samples that passed the
+/// depth test (every sample of the target, at 1 and 4 samples, the scissor's alone, none where
+/// the depth test fails, two draws' together at one offset), a `Boolean` one 1 where any did and
+/// 0 where none did; an offset set with no draw after it gets 0, one left set at the encoder's
+/// end gets its draws', one never set keeps its bytes, and a later pass in the command buffer
+/// rewrites only its own offsets; `Disabled` writes nothing. A pass of type `Accumulate` resets
+/// its results as the AMD Radeon Pro 5300M and the Intel UHD 630 do under macOS 26.7.1, where
+/// Metal's docs promise accumulation and the M3 Max accumulates: the runtime does not build it.
+/// Left out, as the Macs differ: a draw after `Disabled` at an offset once a mode was set, which
+/// the M3 Max writes 0 at and the x86-64 Macs, and the runtime, leave.
+#[test]
+fn visibility_results_are_metals() {
+    use Vis::{Draw, Mode, Scissor};
+    let Some(md) = MetalPlatform::system_default_device() else {
+        return;
+    };
+    let mp = MetalPlatform::new(Box::new(NoLauncher));
+    let (p, d) = (platform(), dev());
+    let (all, quad) = (VIS_SIDE * VIS_SIDE, VIS_SIDE * VIS_SIDE * 4);
+    let one = |steps| VisPass {
+        samples: 1,
+        depth: false,
+        result_type: 0,
+        steps,
+    };
+    let fill = [VIS_FILL; 4];
+    let modes: &[Vis] = &[Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25), Mode(0, 0)];
+    let unclosed: &[Vis] = &[Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let undrawn: &[Vis] = &[Mode(2, 0), Mode(1, 8)];
+    let scissored: &[Vis] = &[Scissor(4), Mode(2, 0), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let twice: &[Vis] = &[Mode(2, 0), Draw(0.25), Draw(0.25), Mode(1, 8), Draw(0.25)];
+    let depth_tested: &[Vis] = &[
+        Mode(2, 0),
+        Draw(0.75),
+        Mode(1, 8),
+        Draw(0.75),
+        Mode(2, 16),
+        Draw(0.25),
+        Mode(1, 24),
+        Draw(0.25),
+    ];
+    let disabled: &[Vis] = &[Mode(0, 8), Draw(0.25)];
+    let later: &[Vis] = &[Mode(2, 16), Draw(0.25)];
+    let accumulating: &[Vis] = &[
+        Mode(2, 0),
+        Draw(0.25),
+        Mode(1, 8),
+        Draw(0.25),
+        Mode(1, 16),
+        Mode(2, 24),
+    ];
+    let cases: Vec<VisCase<'_>> = vec![
+        (
+            "modes",
+            vec![one(modes)],
+            fill,
+            [all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "unclosed",
+            vec![one(unclosed)],
+            fill,
+            [all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "undrawn",
+            vec![one(undrawn)],
+            fill,
+            [0, 0, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "scissored",
+            vec![one(scissored)],
+            fill,
+            [all / 4, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "twice",
+            vec![one(twice)],
+            fill,
+            [2 * all, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "multisampled",
+            vec![VisPass {
+                samples: 4,
+                ..one(unclosed)
+            }],
+            fill,
+            [quad, 1, VIS_FILL, VIS_FILL],
+        ),
+        (
+            "depth tested",
+            vec![VisPass {
+                depth: true,
+                ..one(depth_tested)
+            }],
+            fill,
+            [0, 0, all, 1],
+        ),
+        (
+            "multisampled, depth tested",
+            vec![VisPass {
+                samples: 4,
+                depth: true,
+                ..one(depth_tested)
+            }],
+            fill,
+            [0, 0, quad, 1],
+        ),
+        ("disabled", vec![one(disabled)], fill, fill),
+        (
+            "two passes",
+            vec![one(modes), one(later)],
+            fill,
+            [all, 1, all, VIS_FILL],
+        ),
+    ];
+    for (name, passes, init, want) in &cases {
+        let ours = visibility_results(&p, &d, init, passes);
+        let theirs = visibility_results(&mp, &md, init, passes);
+        assert_eq!(theirs, want, "{name} on Metal");
+        assert_eq!(ours, theirs, "{name}");
+    }
+    let start = [100, 5, 7, 9];
+    let accumulated = [VisPass {
+        result_type: 1,
+        ..one(accumulating)
+    }];
+    let reset = [one(accumulating)];
+    let ours = visibility_results(&p, &d, &start, &accumulated);
+    assert_eq!(ours, [all, 1, 0, 0]);
+    assert_eq!(ours, visibility_results(&mp, &md, &start, &reset));
 }

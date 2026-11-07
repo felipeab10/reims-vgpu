@@ -27,19 +27,25 @@
 use std::ffi::c_void;
 
 use block2::RcBlock;
+use objc2::rc::Retained;
+use objc2::runtime::ProtocolObject;
+use objc2_foundation::{NSArray, NSDictionary, NSString};
 use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::types::MtlSamplePosition;
+use reims_vgpu_core::platform::types::{MtlSamplePosition, MtlSize};
 use reims_vgpu_core::platform::values::{
-    AttachmentState, BufferDeallocator, BufferDesc, ColorAttachmentSet, ComputePassDesc,
-    DepthAttachmentSet, DepthStencilDesc, HeapDesc, IcbDesc, OptionSet, PassSet,
-    RenderPipelineDesc, SamplerDesc, StencilAttachmentSet, StencilDesc, TextureDesc,
+    AttachmentState, BufferDeallocator, BufferDesc, ColorAttachmentDesc, ColorAttachmentSet,
+    ComputePassDesc, DepthAttachmentSet, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, IcbDesc, LinkedFunctionsDesc,
+    OptionSet, PassSet, RenderPipelineDesc, SamplerDesc, StageInputDesc, StencilAttachmentSet,
+    StencilDesc, TextureDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::gpu::array;
+use crate::gpu::resource::MetalFunction;
 use crate::msg::encode::ToMtl;
 use crate::msg::{self, Policy};
 use crate::platform::{MetalPlatform, Obj};
@@ -277,6 +283,9 @@ impl reims_vgpu_core::platform::descriptor::ComputePipelineDescriptor<MetalPlatf
 
 /// `MTLTileRenderPipelineDescriptor *`.
 pub type MetalTileRenderPipelineDescriptor = Obj<MTLTileRenderPipelineDescriptor>;
+
+/// `MTLMeshRenderPipelineDescriptor *`.
+pub type MetalMeshRenderPipelineDescriptor = Obj<MTLMeshRenderPipelineDescriptor>;
 
 impl reims_vgpu_core::platform::descriptor::TileRenderPipelineDescriptor<MetalPlatform>
     for MetalTileRenderPipelineDescriptor
@@ -710,6 +719,482 @@ fn blend_over(a: &MTLRenderPipelineColorAttachmentDescriptor) {
     });
 }
 
+/// The highest index of a vertex or stage-input descriptor's layout and attribute arrays: Metal
+/// raises past it, and the graphics lane refuses a larger one before it reaches here.
+const LAST_BUFFER_INDEX: u64 = 30;
+
+/// Applies the whole render pipeline value `desc` to the fresh descriptor `d`, in the value's
+/// order ([`FullRenderPipelineDesc`]). Each raw value goes to Metal unvalidated; Metal checks it.
+pub fn apply_full_render_pipeline(
+    desc: &FullRenderPipelineDesc<'_, MetalPlatform>,
+    d: &MetalRenderPipelineDescriptor,
+) {
+    let o = d.get();
+    if let Some(label) = desc.label {
+        let label = msg::new_string(label);
+        msg::get("setLabel:", || o.setLabel(Some(&label)));
+    }
+    let function = desc.vertex.get();
+    msg::get("setVertexFunction:", || o.setVertexFunction(Some(function)));
+    if let Some(function) = desc.fragment {
+        let function = function.get();
+        msg::get("setFragmentFunction:", || {
+            o.setFragmentFunction(Some(function))
+        });
+    }
+    if let Some(v) = &desc.vertex_descriptor {
+        let vd = Obj::from_retained(msg::get(
+            "vertexDescriptor",
+            MTLVertexDescriptor::vertexDescriptor,
+        ));
+        apply_vertex_descriptor(v, vd.get());
+        msg::get("setVertexDescriptor:", || {
+            o.setVertexDescriptor(Some(vd.get()))
+        });
+    }
+    if let Some(array) = part("colorAttachments", || o.colorAttachments()) {
+        for (index, c) in &desc.colors {
+            if let Some(a) = msg::get("objectAtIndexedSubscript:", || {
+                array.get().objectAtIndexedSubscript_or_nil(*index)
+            })
+            .map(Obj::from_retained)
+            {
+                apply_pipeline_color_attachment(c, a.get());
+            }
+        }
+    }
+    msg::get("setDepthAttachmentPixelFormat:", || {
+        o.setDepthAttachmentPixelFormat(MTLPixelFormat(desc.depth_pixel_format.to_usize()));
+    });
+    msg::get("setStencilAttachmentPixelFormat:", || {
+        o.setStencilAttachmentPixelFormat(MTLPixelFormat(desc.stencil_pixel_format.to_usize()));
+    });
+    msg::get("setRasterSampleCount:", || {
+        o.setRasterSampleCount(desc.raster_sample_count.to_usize());
+    });
+    msg::get("setAlphaToCoverageEnabled:", || {
+        o.setAlphaToCoverageEnabled(desc.alpha_to_coverage);
+    });
+    msg::get("setAlphaToOneEnabled:", || {
+        o.setAlphaToOneEnabled(desc.alpha_to_one)
+    });
+    msg::get("setRasterizationEnabled:", || {
+        o.setRasterizationEnabled(desc.rasterization_enabled);
+    });
+    // SAFETY: raw guest values go to Metal unvalidated; Metal checks them itself.
+    msg::get("setInputPrimitiveTopology:", || unsafe {
+        o.setInputPrimitiveTopology(MTLPrimitiveTopologyClass(
+            desc.input_primitive_topology.to_usize(),
+        ));
+    });
+    // SAFETY: as above.
+    msg::get("setMaxVertexAmplificationCount:", || unsafe {
+        o.setMaxVertexAmplificationCount(desc.max_vertex_amplification_count.to_usize());
+    });
+    msg::get("setSupportIndirectCommandBuffers:", || {
+        o.setSupportIndirectCommandBuffers(desc.support_indirect_command_buffers);
+    });
+    if let Some(linked) = linked_functions(&desc.vertex_linked) {
+        msg::get("setVertexLinkedFunctions:", || {
+            o.setVertexLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.fragment_linked) {
+        msg::get("setFragmentLinkedFunctions:", || {
+            o.setFragmentLinkedFunctions(Some(&linked))
+        });
+    }
+}
+
+/// Applies the whole mesh render pipeline value `desc` to the fresh descriptor `d`, in the
+/// value's order ([`FullMeshRenderPipelineDesc`]). A maximum, payload length or required size of
+/// 0 is left as Metal's descriptor has it; every other raw value goes to Metal unvalidated, and
+/// Metal checks it.
+pub fn apply_full_mesh_render_pipeline(
+    desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>,
+    d: &MetalMeshRenderPipelineDescriptor,
+) {
+    let o = d.get();
+    if let Some(label) = desc.label {
+        let label = msg::new_string(label);
+        msg::get("setLabel:", || o.setLabel(Some(&label)));
+    }
+    if let Some(function) = desc.object {
+        let function = function.get();
+        // SAFETY: a live function of this device.
+        msg::get("setObjectFunction:", || unsafe {
+            o.setObjectFunction(Some(function));
+        });
+    }
+    let function = desc.mesh.get();
+    // SAFETY: as above.
+    msg::get("setMeshFunction:", || unsafe {
+        o.setMeshFunction(Some(function))
+    });
+    if let Some(function) = desc.fragment {
+        let function = function.get();
+        // SAFETY: as above.
+        msg::get("setFragmentFunction:", || unsafe {
+            o.setFragmentFunction(Some(function));
+        });
+    }
+    if let Some(array) = part("colorAttachments", || o.colorAttachments()) {
+        for (index, c) in &desc.colors {
+            if let Some(a) = msg::get("objectAtIndexedSubscript:", || {
+                array.get().objectAtIndexedSubscript_or_nil(*index)
+            })
+            .map(Obj::from_retained)
+            {
+                apply_pipeline_color_attachment(c, a.get());
+            }
+        }
+    }
+    msg::get("setDepthAttachmentPixelFormat:", || {
+        o.setDepthAttachmentPixelFormat(MTLPixelFormat(desc.depth_pixel_format.to_usize()));
+    });
+    msg::get("setStencilAttachmentPixelFormat:", || {
+        o.setStencilAttachmentPixelFormat(MTLPixelFormat(desc.stencil_pixel_format.to_usize()));
+    });
+    // SAFETY: raw guest values go to Metal unvalidated; Metal checks them itself.
+    msg::get("setRasterSampleCount:", || unsafe {
+        o.setRasterSampleCount(desc.raster_sample_count.to_usize());
+    });
+    msg::get("setAlphaToCoverageEnabled:", || {
+        o.setAlphaToCoverageEnabled(desc.alpha_to_coverage);
+    });
+    msg::get("setAlphaToOneEnabled:", || {
+        o.setAlphaToOneEnabled(desc.alpha_to_one)
+    });
+    msg::get("setRasterizationEnabled:", || {
+        o.setRasterizationEnabled(desc.rasterization_enabled);
+    });
+    if desc.max_total_threads_per_object_threadgroup != 0 {
+        msg::get("setMaxTotalThreadsPerObjectThreadgroup:", || {
+            o.setMaxTotalThreadsPerObjectThreadgroup(
+                desc.max_total_threads_per_object_threadgroup.to_usize(),
+            );
+        });
+    }
+    if desc.max_total_threads_per_mesh_threadgroup != 0 {
+        msg::get("setMaxTotalThreadsPerMeshThreadgroup:", || {
+            o.setMaxTotalThreadsPerMeshThreadgroup(
+                desc.max_total_threads_per_mesh_threadgroup.to_usize(),
+            );
+        });
+    }
+    if desc.max_total_threadgroups_per_mesh_grid != 0 {
+        msg::get("setMaxTotalThreadgroupsPerMeshGrid:", || {
+            o.setMaxTotalThreadgroupsPerMeshGrid(
+                desc.max_total_threadgroups_per_mesh_grid.to_usize(),
+            );
+        });
+    }
+    msg::get(
+        "setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth:",
+        || {
+            o.setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+                desc.object_threadgroup_size_is_multiple_of_execution_width,
+            );
+        },
+    );
+    msg::get(
+        "setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth:",
+        || {
+            o.setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth(
+                desc.mesh_threadgroup_size_is_multiple_of_execution_width,
+            );
+        },
+    );
+    if desc.payload_memory_length != 0 {
+        msg::get("setPayloadMemoryLength:", || {
+            o.setPayloadMemoryLength(desc.payload_memory_length.to_usize());
+        });
+    }
+    // SAFETY: as above.
+    msg::get("setMaxVertexAmplificationCount:", || unsafe {
+        o.setMaxVertexAmplificationCount(desc.max_vertex_amplification_count.to_usize());
+    });
+    if desc.required_threads_per_object_threadgroup != MtlSize::new(0, 0, 0) {
+        msg::get("setRequiredThreadsPerObjectThreadgroup:", || {
+            o.setRequiredThreadsPerObjectThreadgroup(
+                desc.required_threads_per_object_threadgroup.mtl(),
+            );
+        });
+    }
+    if desc.required_threads_per_mesh_threadgroup != MtlSize::new(0, 0, 0) {
+        msg::get("setRequiredThreadsPerMeshThreadgroup:", || {
+            o.setRequiredThreadsPerMeshThreadgroup(
+                desc.required_threads_per_mesh_threadgroup.mtl(),
+            );
+        });
+    }
+    msg::get("setSupportIndirectCommandBuffers:", || {
+        o.setSupportIndirectCommandBuffers(desc.support_indirect_command_buffers);
+    });
+    if let Some(linked) = linked_functions(&desc.object_linked) {
+        msg::get("setObjectLinkedFunctions:", || {
+            o.setObjectLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.mesh_linked) {
+        msg::get("setMeshLinkedFunctions:", || {
+            o.setMeshLinkedFunctions(Some(&linked))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.fragment_linked) {
+        msg::get("setFragmentLinkedFunctions:", || {
+            o.setFragmentLinkedFunctions(Some(&linked))
+        });
+    }
+}
+
+/// `l` as Metal's `MTLLinkedFunctions`, each list set where it holds a function, in the
+/// properties' order (functions, binary functions, groups, private functions); `None` where it
+/// links nothing, which leaves the stage's as Metal's descriptor has them.
+fn linked_functions(
+    l: &LinkedFunctionsDesc<MetalPlatform>,
+) -> Option<Retained<MTLLinkedFunctions>> {
+    if l.is_empty() {
+        return None;
+    }
+    let array = |fs: &[MetalFunction]| {
+        let fs: Vec<&ProtocolObject<dyn MTLFunction>> = fs.iter().map(|f| f.get()).collect();
+        msg::value("arrayWithObjects:count:", || NSArray::from_slice(&fs))
+    };
+    let o = msg::get("linkedFunctions", MTLLinkedFunctions::linkedFunctions);
+    if !l.functions.is_empty() {
+        let functions = array(&l.functions);
+        msg::get("setFunctions:", || o.setFunctions(Some(&functions)));
+    }
+    if !l.binary_functions.is_empty() {
+        let functions = array(&l.binary_functions);
+        msg::get("setBinaryFunctions:", || {
+            o.setBinaryFunctions(Some(&functions))
+        });
+    }
+    if !l.groups.is_empty() {
+        let names: Vec<Retained<NSString>> = l
+            .groups
+            .iter()
+            .map(|(name, _)| msg::new_string(name))
+            .collect();
+        let lists: Vec<_> = l.groups.iter().map(|(_, fs)| array(fs)).collect();
+        let keys: Vec<&NSString> = names.iter().map(|n| &**n).collect();
+        let values: Vec<&NSArray<ProtocolObject<dyn MTLFunction>>> =
+            lists.iter().map(|a| &**a).collect();
+        let groups = msg::value("dictionaryWithObjects:forKeys:count:", || {
+            NSDictionary::from_slices(&keys, &values)
+        });
+        msg::get("setGroups:", || o.setGroups(Some(&groups)));
+    }
+    if !l.private_functions.is_empty() {
+        let functions = array(&l.private_functions);
+        msg::get("setPrivateFunctions:", || {
+            o.setPrivateFunctions(Some(&functions))
+        });
+    }
+    Some(o)
+}
+
+/// One colour attachment's every property, in `MTLRenderPipelineColorAttachmentDescriptor`'s
+/// order.
+fn apply_pipeline_color_attachment(
+    c: &ColorAttachmentDesc,
+    a: &MTLRenderPipelineColorAttachmentDescriptor,
+) {
+    msg::get("setPixelFormat:", || {
+        a.setPixelFormat(MTLPixelFormat(c.pixel_format.to_usize()))
+    });
+    msg::get("setBlendingEnabled:", || {
+        a.setBlendingEnabled(c.blending_enabled)
+    });
+    msg::get("setSourceRGBBlendFactor:", || {
+        a.setSourceRGBBlendFactor(MTLBlendFactor(c.source_rgb_blend_factor.to_usize()));
+    });
+    msg::get("setDestinationRGBBlendFactor:", || {
+        a.setDestinationRGBBlendFactor(MTLBlendFactor(c.destination_rgb_blend_factor.to_usize()));
+    });
+    msg::get("setRgbBlendOperation:", || {
+        a.setRgbBlendOperation(MTLBlendOperation(c.rgb_blend_operation.to_usize()));
+    });
+    msg::get("setSourceAlphaBlendFactor:", || {
+        a.setSourceAlphaBlendFactor(MTLBlendFactor(c.source_alpha_blend_factor.to_usize()));
+    });
+    msg::get("setDestinationAlphaBlendFactor:", || {
+        a.setDestinationAlphaBlendFactor(MTLBlendFactor(
+            c.destination_alpha_blend_factor.to_usize(),
+        ));
+    });
+    msg::get("setAlphaBlendOperation:", || {
+        a.setAlphaBlendOperation(MTLBlendOperation(c.alpha_blend_operation.to_usize()));
+    });
+    msg::get("setWriteMask:", || {
+        a.setWriteMask(MTLColorWriteMask(c.write_mask.to_usize()))
+    });
+}
+
+/// A vertex descriptor's layouts, then its attributes, onto `vd`.
+fn apply_vertex_descriptor(v: &VertexDesc, vd: &MTLVertexDescriptor) {
+    let layouts = Obj::from_retained(msg::get("layouts", || vd.layouts()));
+    for l in v
+        .layouts
+        .iter()
+        .filter(|l| l.buffer_index <= LAST_BUFFER_INDEX)
+    {
+        // SAFETY: the index is within the array (`LAST_BUFFER_INDEX`); raw guest values go to
+        // Metal unvalidated, and Metal checks them itself.
+        let layout = Obj::from_retained(msg::get("objectAtIndexedSubscript:", || unsafe {
+            layouts
+                .get()
+                .objectAtIndexedSubscript(l.buffer_index.to_usize())
+        }));
+        let layout = layout.get();
+        // SAFETY: as above.
+        msg::get("setStride:", || unsafe {
+            layout.setStride(l.stride.to_usize())
+        });
+        msg::get("setStepFunction:", || {
+            layout.setStepFunction(MTLVertexStepFunction(l.step_function.to_usize()));
+        });
+        // SAFETY: as above.
+        msg::get("setStepRate:", || unsafe {
+            layout.setStepRate(l.step_rate.to_usize())
+        });
+    }
+    let attributes = Obj::from_retained(msg::get("attributes", || vd.attributes()));
+    for a in v
+        .attributes
+        .iter()
+        .filter(|a| a.attribute_index <= LAST_BUFFER_INDEX)
+    {
+        // SAFETY: as above.
+        let attribute = Obj::from_retained(msg::get("objectAtIndexedSubscript:", || unsafe {
+            attributes
+                .get()
+                .objectAtIndexedSubscript(a.attribute_index.to_usize())
+        }));
+        let attribute = attribute.get();
+        msg::get("setFormat:", || {
+            attribute.setFormat(MTLVertexFormat(a.format.to_usize()))
+        });
+        // SAFETY: as above.
+        msg::get("setOffset:", || unsafe {
+            attribute.setOffset(a.offset.to_usize())
+        });
+        // SAFETY: as above.
+        msg::get("setBufferIndex:", || unsafe {
+            attribute.setBufferIndex(a.buffer_index.to_usize());
+        });
+    }
+}
+
+/// Applies the whole compute pipeline value `desc` to the fresh descriptor `d`, in the value's
+/// order ([`FullComputePipelineDesc`]). Each raw value goes to Metal unvalidated; Metal checks it.
+pub fn apply_full_compute_pipeline(
+    desc: &FullComputePipelineDesc<'_, MetalPlatform>,
+    d: &MetalComputePipelineDescriptor,
+) {
+    let o = d.get();
+    if let Some(label) = desc.label {
+        let label = msg::new_string(label);
+        msg::get("setLabel:", || o.setLabel(Some(&label)));
+    }
+    let function = desc.function.get();
+    msg::get("setComputeFunction:", || {
+        o.setComputeFunction(Some(function))
+    });
+    // SAFETY: a plain flag.
+    msg::get(
+        "setThreadGroupSizeIsMultipleOfThreadExecutionWidth:",
+        || unsafe {
+            o.setThreadGroupSizeIsMultipleOfThreadExecutionWidth(
+                desc.threadgroup_size_is_multiple_of_execution_width,
+            );
+        },
+    );
+    if desc.max_total_threads_per_threadgroup != 0 {
+        msg::get("setMaxTotalThreadsPerThreadgroup:", || {
+            o.setMaxTotalThreadsPerThreadgroup(desc.max_total_threads_per_threadgroup.to_usize());
+        });
+    }
+    msg::get("setMaxCallStackDepth:", || {
+        o.setMaxCallStackDepth(desc.max_call_stack_depth.to_usize());
+    });
+    msg::get("setSupportIndirectCommandBuffers:", || {
+        o.setSupportIndirectCommandBuffers(desc.support_indirect_command_buffers);
+    });
+    if let Some(s) = &desc.stage_input {
+        let sd = Obj::from_retained(msg::get(
+            "stageInputOutputDescriptor",
+            MTLStageInputOutputDescriptor::stageInputOutputDescriptor,
+        ));
+        apply_stage_input(s, sd.get());
+        msg::get("setStageInputDescriptor:", || {
+            o.setStageInputDescriptor(Some(sd.get()))
+        });
+    }
+    if let Some(linked) = linked_functions(&desc.linked) {
+        msg::get("setLinkedFunctions:", || {
+            o.setLinkedFunctions(Some(&linked))
+        });
+    }
+}
+
+/// A stage-input descriptor's layouts, attributes, then index type and index buffer, onto `sd`.
+fn apply_stage_input(s: &StageInputDesc, sd: &MTLStageInputOutputDescriptor) {
+    let layouts = Obj::from_retained(msg::get("layouts", || sd.layouts()));
+    for l in s
+        .layouts
+        .iter()
+        .filter(|l| l.buffer_index <= LAST_BUFFER_INDEX)
+    {
+        // SAFETY: the index is within the array (`LAST_BUFFER_INDEX`); raw guest values go to
+        // Metal unvalidated, and Metal checks them itself.
+        let layout = Obj::from_retained(msg::get("objectAtIndexedSubscript:", || unsafe {
+            layouts
+                .get()
+                .objectAtIndexedSubscript(l.buffer_index.to_usize())
+        }));
+        let layout = layout.get();
+        msg::get("setStride:", || layout.setStride(l.stride.to_usize()));
+        msg::get("setStepFunction:", || {
+            layout.setStepFunction(MTLStepFunction(l.step_function.to_usize()));
+        });
+        msg::get("setStepRate:", || {
+            layout.setStepRate(l.step_rate.to_usize())
+        });
+    }
+    let attributes = Obj::from_retained(msg::get("attributes", || sd.attributes()));
+    for a in s
+        .attributes
+        .iter()
+        .filter(|a| a.attribute_index <= LAST_BUFFER_INDEX)
+    {
+        // SAFETY: as above.
+        let attribute = Obj::from_retained(msg::get("objectAtIndexedSubscript:", || unsafe {
+            attributes
+                .get()
+                .objectAtIndexedSubscript(a.attribute_index.to_usize())
+        }));
+        let attribute = attribute.get();
+        msg::get("setFormat:", || {
+            attribute.setFormat(MTLAttributeFormat(a.format.to_usize()))
+        });
+        msg::get("setOffset:", || attribute.setOffset(a.offset.to_usize()));
+        // SAFETY: as above.
+        msg::get("setBufferIndex:", || unsafe {
+            attribute.setBufferIndex(a.buffer_index.to_usize());
+        });
+    }
+    msg::get("setIndexType:", || {
+        sd.setIndexType(MTLIndexType(s.index_type.to_usize()))
+    });
+    // SAFETY: as above.
+    msg::get("setIndexBufferIndex:", || unsafe {
+        sd.setIndexBufferIndex(s.index_buffer_index.to_usize());
+    });
+}
+
 /// `setResourceIndex:` then `setForceResourceIndex:` on a render pipeline descriptor.
 fn pipeline_resource_index(o: &MTLRenderPipelineDescriptor, index: u64, force: bool) {
     msg::get("setResourceIndex:", || {
@@ -805,9 +1290,11 @@ pub fn apply_texture(desc: &TextureDesc, d: &MetalTextureDescriptor) {
 }
 
 /// Makes a render pass descriptor hold `set`, each property sent when set. Order: visibility
-/// result buffer, render target array length, width and height, default raster and colour
-/// sample counts, rasterization rate map, imageblock sample length, threadgroup memory length,
-/// tile width and height.
+/// result buffer and type, render target array length, width and height, default raster and
+/// colour sample counts, rasterization rate map, imageblock sample length, threadgroup memory
+/// length, tile width and height. The type's setter is macOS 26's: only a type other than
+/// `Reset`, every descriptor's own, is sent, and only where the descriptor answers the setter,
+/// so a host before macOS 26 resets each pass's results, as it does whatever the type.
 fn apply_pass(set: &PassSet<'_, MetalPlatform>, d: &MetalRenderPassDescriptor) {
     let o = d.get();
     if let Some(buffer) = set.visibility_result_buffer {
@@ -815,6 +1302,17 @@ fn apply_pass(set: &PassSet<'_, MetalPlatform>, d: &MetalRenderPassDescriptor) {
         msg::get("setVisibilityResultBuffer:", || {
             o.setVisibilityResultBuffer(buffer)
         });
+    }
+    if let Some(t) = set.visibility_result_type.filter(|&t| t != 0)
+        && msg::get("respondsToSelector:", || {
+            objc2_foundation::NSObjectProtocol::respondsToSelector(
+                o,
+                objc2::sel!(setVisibilityResultType:),
+            )
+        })
+    {
+        let t = MTLVisibilityResultType(isize::try_from(t).unwrap_or(isize::MAX));
+        msg::get("setVisibilityResultType:", || o.setVisibilityResultType(t));
     }
     if let Some(v) = set.render_target_array_length {
         let n = v.to_usize();
@@ -949,7 +1447,9 @@ macro_rules! apply_attachment {
 
 apply_attachment!(
     /// A colour attachment's set; its own: the clear colour.
-    apply_color_attachment(ColorAttachmentSet, MetalRenderPassColorAttachment) |set, o| {
+    apply_color_attachment(ColorAttachmentSet, MetalRenderPassColorAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_color {
             let v = v.mtl();
             msg::get("setClearColor:", || o.setClearColor(v));
@@ -959,30 +1459,30 @@ apply_attachment!(
 
 apply_attachment!(
     /// The depth attachment's set; its own: the clear depth, then the resolve filter.
-    apply_depth_attachment(DepthAttachmentSet, MetalRenderPassDepthAttachment) |set, o| {
+    apply_depth_attachment(DepthAttachmentSet, MetalRenderPassDepthAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_depth {
             msg::get("setClearDepth:", || o.setClearDepth(v));
         }
         if let Some(v) = set.depth_resolve_filter {
             let v = MTLMultisampleDepthResolveFilter(v.to_usize());
-            msg::get("setDepthResolveFilter:", || {
-                o.setDepthResolveFilter(v)
-            });
+            msg::get("setDepthResolveFilter:", || o.setDepthResolveFilter(v));
         }
     }
 );
 
 apply_attachment!(
     /// The stencil attachment's set; its own: the clear stencil, then the resolve filter.
-    apply_stencil_attachment(StencilAttachmentSet, MetalRenderPassStencilAttachment) |set, o| {
+    apply_stencil_attachment(StencilAttachmentSet, MetalRenderPassStencilAttachment)
+        | set,
+    o | {
         if let Some(v) = set.clear_stencil {
             msg::get("setClearStencil:", || o.setClearStencil(v));
         }
         if let Some(v) = set.stencil_resolve_filter {
             let v = MTLMultisampleStencilResolveFilter(v.to_usize());
-            msg::get("setStencilResolveFilter:", || {
-                o.setStencilResolveFilter(v)
-            });
+            msg::get("setStencilResolveFilter:", || o.setStencilResolveFilter(v));
         }
     }
 );
@@ -1006,7 +1506,7 @@ mod tests {
     use reims_vgpu_core::platform::device::GpuDevice as _;
     use reims_vgpu_core::platform::resource::Buffer as _;
     use reims_vgpu_core::platform::types::{ClearColor, Swizzle};
-    use reims_vgpu_core::platform::{HostRange, Platform as _};
+    use reims_vgpu_core::platform::{Handle as _, HostRange, Platform as _};
     use reims_vgpu_core::sync::Mutex;
 
     use super::*;
@@ -1329,6 +1829,193 @@ mod tests {
         );
     }
 
+    /// The whole render value reaches the descriptor: every colour attachment it sets with its
+    /// blend state and write mask, the vertex descriptor's layouts and attributes, the depth and
+    /// stencil formats, the sample count, the flags, the topology, the amplification count and
+    /// each stage's linked functions in their lists; with no fragment function the descriptor's
+    /// is nil
+    #[test]
+    fn a_whole_render_value_reaches_the_descriptor() {
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let k = kit();
+        let x: MetalRenderPipelineDescriptor =
+            Obj::from_retained(MTLRenderPipelineDescriptor::new());
+        let blended = ColorAttachmentDesc {
+            pixel_format: 115,
+            blending_enabled: true,
+            source_rgb_blend_factor: 4,
+            destination_rgb_blend_factor: 5,
+            rgb_blend_operation: 1,
+            source_alpha_blend_factor: 2,
+            destination_alpha_blend_factor: 7,
+            alpha_blend_operation: 3,
+            write_mask: 0x9,
+        };
+        apply_full_render_pipeline(
+            &FullRenderPipelineDesc {
+                label: Some("whole"),
+                vertex: &k.function,
+                fragment: None,
+                vertex_descriptor: Some(VertexDesc {
+                    layouts: vec![BufferLayoutDesc {
+                        buffer_index: 3,
+                        stride: 16,
+                        step_function: 2,
+                        step_rate: 4,
+                    }],
+                    attributes: vec![AttributeDesc {
+                        attribute_index: 5,
+                        format: 31,
+                        offset: 4,
+                        buffer_index: 3,
+                    }],
+                }),
+                colors: vec![(2, blended)],
+                depth_pixel_format: 252,
+                stencil_pixel_format: 253,
+                raster_sample_count: 4,
+                alpha_to_coverage: true,
+                alpha_to_one: true,
+                rasterization_enabled: false,
+                input_primitive_topology: 3,
+                max_vertex_amplification_count: 2,
+                support_indirect_command_buffers: true,
+                vertex_linked: LinkedFunctionsDesc {
+                    functions: vec![k.function.clone_ref()],
+                    groups: vec![(
+                        "g".to_owned(),
+                        vec![k.function.clone_ref(), k.function.clone_ref()],
+                    )],
+                    ..LinkedFunctionsDesc::default()
+                },
+                fragment_linked: LinkedFunctionsDesc {
+                    private_functions: vec![k.function.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
+            },
+            &x,
+        );
+        let o = x.get();
+        assert!(o.fragmentFunction().is_none());
+        let (v, f) = (o.vertexLinkedFunctions(), o.fragmentLinkedFunctions());
+        let count = |a: Option<Retained<NSArray<ProtocolObject<dyn MTLFunction>>>>| {
+            a.map_or(0, |a| a.count())
+        };
+        assert_eq!(count(v.functions()), 1);
+        assert_eq!(count(v.privateFunctions()), 0);
+        let groups = v.groups().unwrap();
+        assert_eq!(groups.count(), 1);
+        assert_eq!(count(groups.objectForKey(&NSString::from_str("g"))), 2);
+        assert_eq!(count(f.privateFunctions()), 1);
+        assert_eq!(count(f.functions()), 0);
+        // SAFETY: index 2 of the colour attachments.
+        let c = unsafe { o.colorAttachments().objectAtIndexedSubscript(2) };
+        assert_eq!(c.pixelFormat(), MTLPixelFormat(115));
+        assert!(c.isBlendingEnabled());
+        assert_eq!(c.sourceRGBBlendFactor(), MTLBlendFactor(4));
+        assert_eq!(c.destinationRGBBlendFactor(), MTLBlendFactor(5));
+        assert_eq!(c.rgbBlendOperation(), MTLBlendOperation(1));
+        assert_eq!(c.sourceAlphaBlendFactor(), MTLBlendFactor(2));
+        assert_eq!(c.destinationAlphaBlendFactor(), MTLBlendFactor(7));
+        assert_eq!(c.alphaBlendOperation(), MTLBlendOperation(3));
+        assert_eq!(c.writeMask(), MTLColorWriteMask(9));
+        let vd = o.vertexDescriptor().unwrap();
+        // SAFETY: indices within the arrays.
+        let (l, a) = unsafe {
+            (
+                vd.layouts().objectAtIndexedSubscript(3),
+                vd.attributes().objectAtIndexedSubscript(5),
+            )
+        };
+        assert_eq!(
+            (l.stride(), l.stepFunction(), l.stepRate()),
+            (16, MTLVertexStepFunction(2), 4)
+        );
+        assert_eq!(
+            (a.format(), a.offset(), a.bufferIndex()),
+            (MTLVertexFormat(31), 4, 3)
+        );
+        assert_eq!(o.depthAttachmentPixelFormat(), MTLPixelFormat(252));
+        assert_eq!(o.stencilAttachmentPixelFormat(), MTLPixelFormat(253));
+        assert_eq!(o.rasterSampleCount(), 4);
+        assert!(o.isAlphaToCoverageEnabled() && o.isAlphaToOneEnabled());
+        assert!(!o.isRasterizationEnabled());
+        assert_eq!(o.inputPrimitiveTopology(), MTLPrimitiveTopologyClass(3));
+        assert_eq!(o.maxVertexAmplificationCount(), 2);
+        assert!(o.supportIndirectCommandBuffers());
+    }
+
+    /// The whole compute value reaches the descriptor: the threadgroup-size multiple, the maximum
+    /// threads per threadgroup, the maximum call stack depth, indirect command buffer support, the
+    /// stage-input descriptor's layouts, attributes, index type and index buffer, and the linked
+    /// functions in their lists
+    #[test]
+    fn a_whole_compute_value_reaches_the_descriptor() {
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let k = kit();
+        let x: MetalComputePipelineDescriptor =
+            Obj::from_retained(MTLComputePipelineDescriptor::new());
+        apply_full_compute_pipeline(
+            &FullComputePipelineDesc {
+                label: Some("whole"),
+                function: &k.function,
+                threadgroup_size_is_multiple_of_execution_width: true,
+                max_total_threads_per_threadgroup: 128,
+                max_call_stack_depth: 3,
+                support_indirect_command_buffers: true,
+                stage_input: Some(StageInputDesc {
+                    layouts: vec![BufferLayoutDesc {
+                        buffer_index: 1,
+                        stride: 4,
+                        step_function: 5,
+                        step_rate: 1,
+                    }],
+                    attributes: vec![AttributeDesc {
+                        attribute_index: 0,
+                        format: 36,
+                        offset: 0,
+                        buffer_index: 1,
+                    }],
+                    index_type: 1,
+                    index_buffer_index: 2,
+                }),
+                linked: LinkedFunctionsDesc {
+                    binary_functions: vec![k.function.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
+            },
+            &x,
+        );
+        let o = x.get();
+        assert!(o.threadGroupSizeIsMultipleOfThreadExecutionWidth());
+        assert_eq!(o.maxTotalThreadsPerThreadgroup(), 128);
+        assert_eq!(o.maxCallStackDepth(), 3);
+        assert!(o.supportIndirectCommandBuffers());
+        let sd = o.stageInputDescriptor().unwrap();
+        // SAFETY: indices within the arrays.
+        let (l, a) = unsafe {
+            (
+                sd.layouts().objectAtIndexedSubscript(1),
+                sd.attributes().objectAtIndexedSubscript(0),
+            )
+        };
+        assert_eq!(
+            (l.stride(), l.stepFunction(), l.stepRate()),
+            (4, MTLStepFunction(5), 1)
+        );
+        assert_eq!(
+            (a.format(), a.offset(), a.bufferIndex()),
+            (MTLAttributeFormat(36), 0, 1)
+        );
+        assert_eq!(
+            (sd.indexType(), sd.indexBufferIndex()),
+            (MTLIndexType(1), 2)
+        );
+        let linked = o.linkedFunctions().unwrap();
+        assert_eq!(linked.binaryFunctions().map(|a| a.count()), Some(1));
+        assert!(linked.functions().is_none_or(|a| a.count() == 0));
+    }
+
     /// setContents: and setDeallocator: (SPI) on the private buffer descriptor: the buffer Metal
     /// makes uses the caller's memory, and Metal calls the deallocator once, with the contents
     /// and length, when the buffer is released
@@ -1568,6 +2255,7 @@ mod tests {
         let d: MetalRenderPassDescriptor = Obj::from_retained(MTLRenderPassDescriptor::new());
         d.set_pass(&PassSet {
             visibility_result_buffer: Some(Some(&k.buffer)),
+            visibility_result_type: Some(1),
             render_target_array_length: Some(2),
             render_target_width: Some(64),
             render_target_height: Some(32),
@@ -1581,6 +2269,7 @@ mod tests {
         });
         let o = obj(&d);
         for (sel, v) in [
+            ("visibilityResultType", 1),
             ("renderTargetArrayLength", 2),
             ("renderTargetWidth", 64),
             ("renderTargetHeight", 32),

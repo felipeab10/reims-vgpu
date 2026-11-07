@@ -126,8 +126,8 @@ use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::answer::{
-    Inexact, Policy, decide, get, hang, inexact, metal_aborts, plain, refused, send,
-    unrepresentable, unstopped_at,
+    Inexact, Policy, created_or_decided, decide, get, hang, inexact, metal_aborts, plain, plain_at,
+    refused, send, unrepresentable, unstopped_at,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -286,7 +286,7 @@ pub struct IcbObject {
     /// ([`OverrunShape::of`]).
     pub(crate) overrun_shape: Option<OverrunShape>,
     /// How many committed command buffers that have not ended execute it as their commit read
-    /// its records ([`crate::gpu::command::executions::reads`]).
+    /// its records (the `reads` of [`crate::gpu::command::executions`]).
     pub(crate) readers: Arc<AtomicUsize>,
 }
 
@@ -692,6 +692,27 @@ impl IcbObject {
         });
     }
 
+    /// Commands `range` were reset on the CPU at once: each as [`rewritten`](Self::rewritten)
+    /// leaves one, in one pass over what the sides hold, not one per command.
+    fn rewritten_range(&self, range: Range<u64>) {
+        let n = plain(|| self.raw.size());
+        plain(|| {
+            let mut sides = self.sides.lock();
+            sides
+                .corrupted
+                .retain(|&at| !range.contains(&u64::from(at)));
+            sides.copied_lengths.retain(|&place| {
+                !(range.contains(&(place / LENGTHS_A_COMMAND))
+                    && matches!(place % LENGTHS_A_COMMAND, 36 | 37))
+            });
+            if !self.inherits.pipeline && !range.is_empty() {
+                let words =
+                    Tail::pipeline(n, range.start).start..Tail::pipeline(n, range.end).start;
+                sides.tail.clear(words);
+            }
+        });
+    }
+
     /// A setter of command `index` wrote the words `words` gives of a buffer of its size, as
     /// Metal's does and the runtime's does not ([`Tail`]).
     fn words_set(&self, index: u32, words: fn(u64, u64) -> Range<u64>) {
@@ -983,7 +1004,8 @@ fn descriptor(desc: &IcbDesc) -> rt::IndirectCommandBufferDescriptor {
 /// Metal's numbers (the module docs), placed at the descriptor's resource index when its low 32
 /// bits are nonzero. Metal answers no nil here. A placement past Metal's table of IDs dies, as
 /// Metal ends its process there; so does every refusal of the runtime's, as Metal crashes at
-/// memory it cannot back. A buffer whose own ID is 2^23 or more, which plain allocation hands out
+/// memory it cannot back, but a gap of the runtime's or the device's, which by default answers
+/// nil ([`crate::answer::relay_gap`]), as core models a nil buffer. A buffer whose own ID is 2^23 or more, which plain allocation hands out
 /// past a reservation that large, the runtime makes as Metal does, at every ID below 2^31
 /// (`RECORDS_ID_LIMIT`) and any count of commands. The runtime makes what Metal makes of
 /// the descriptors its validation stops (no command types, render and compute types together,
@@ -1017,11 +1039,15 @@ pub(crate) fn new_indirect_command_buffer(
             &format!("an indirect command buffer placed at ID {id}"),
         );
     }
-    let raw = send(sel, Policy::Dies, || {
+    let made = plain_at(sel, || {
         device
             .raw
             .new_indirect_command_buffer(&d, max_count, options)
-    })?;
+    });
+    let raw = match made {
+        Ok(raw) => raw,
+        Err(e) => return created_or_decided(sel, Policy::Dies, e),
+    };
     drop(held);
     Ok(Some(Obj::new(IcbObject {
         raw,
@@ -1073,6 +1099,18 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
             index: command_index.low_u32(),
             raw,
         })))
+    }
+
+    /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
+    /// size as Metal's validation does (a death: core passes one inside it); then the commands'
+    /// sides as a CPU reset leaves them ([`IcbObject::rewritten_range`]).
+    fn reset_with_range(&self, location: u64, length: u64) -> RaiseResult<()> {
+        let range = location..location.saturating_add(length);
+        send("resetWithRange:", Policy::Dies, || {
+            self.raw.reset_with_range(range.clone())
+        })?;
+        self.rewritten_range(range);
+        Ok(())
     }
 
     /// Metal's `resourceIndex` of an indirect command buffer is its `gpuResourceID` (measured,
@@ -2092,6 +2130,168 @@ mod tests {
         .unwrap();
         c.encode(IcbComputeCmd::Reset).unwrap();
         assert_eq!(c.pipeline_state_unique_identifier(), 0);
+    }
+
+    /// Executes command 0 of `icb`, `resident` made resident for reading and writing, in a
+    /// command buffer of its own, which completes with no error.
+    fn execute_first(
+        d: &VulkanDevice,
+        icb: &VulkanIcb,
+        resident: &[Option<ResourceRef<'_, VulkanPlatform>>],
+    ) {
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: resident,
+                usage: 3,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
+    }
+
+    /// Command 0 of a buffer of `size` dispatches `add_one` of `input` into `out`.
+    fn add_into(
+        d: &VulkanDevice,
+        size: u64,
+        out: &VulkanBuffer,
+        input: &VulkanBuffer,
+    ) -> (VulkanIcb, VulkanComputePipeline) {
+        let pipeline = icb_pipeline(d);
+        let desc = IcbDesc {
+            command_types: 0x40,
+            max_kernel_buffer_bind_count: 2,
+            ..IcbDesc::default()
+        };
+        let icb = make::<VulkanPlatform>(d, &desc, size);
+        let c = icb.compute_command(0).unwrap().unwrap();
+        for cmd in [
+            IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: Some(&pipeline),
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(out),
+                offset: 0,
+                index: 0,
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(input),
+                offset: 0,
+                index: 1,
+            },
+            IcbComputeCmd::ConcurrentDispatchThreads {
+                threads_per_grid: MtlSize::new(4, 1, 1),
+                threads_per_threadgroup: MtlSize::new(4, 1, 1),
+            },
+        ] {
+            c.encode(cmd).unwrap();
+        }
+        (icb, pipeline)
+    }
+
+    /// A CPU reset of a range, one call however many commands it spans, leaves each command of it
+    /// fresh, as a command's reset leaves one: of 2^20 commands, command 0 dispatches nothing
+    /// after it, and its getters read a fresh command's
+    #[test]
+    fn a_cpu_reset_of_a_range_leaves_its_commands_fresh() {
+        let d = dev();
+        let input = holding(&d, &[10, 20, 30, 40]);
+        let out = holding(&d, &[0; 4]);
+        let (icb, _pipeline) = add_into(&d, 1 << 20, &out, &input);
+        let resident = [
+            Some(ResourceRef::Buffer(&input)),
+            Some(ResourceRef::Buffer(&out)),
+            Some(ResourceRef::Icb(&icb)),
+        ];
+        execute_first(&d, &icb, &resident);
+        assert_eq!(words(&out), [11, 21, 31, 41]);
+        icb.reset_with_range(0, 1 << 20).unwrap();
+        let reset = icb.compute_command(0).unwrap().unwrap();
+        assert_eq!(
+            (
+                reset.command_type(),
+                reset.pipeline_state_unique_identifier(),
+                reset.has_barrier()
+            ),
+            (0, 0, false)
+        );
+        let out_again = holding(&d, &[0; 4]);
+        let resident = [
+            Some(ResourceRef::Buffer(&input)),
+            Some(ResourceRef::Buffer(&out_again)),
+            Some(ResourceRef::Icb(&icb)),
+        ];
+        execute_first(&d, &icb, &resident);
+        assert_eq!(words(&out_again), [0; 4]);
+    }
+
+    /// The words `add_one` writes into its output from an input released before the execution,
+    /// command 0 of a buffer made resident with `icb_usage`, the output for reading and writing,
+    /// in a command buffer that completes with no error.
+    fn released_input_read(icb_usage: u64) -> Vec<u32> {
+        let d = dev();
+        let out = holding(&d, &[0; 4]);
+        let input = holding(&d, &[10, 20, 30, 40]);
+        let (icb, _pipeline) = add_into(&d, 1, &out, &input);
+        drop(input);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        let buffers = [Some(ResourceRef::Buffer(&out))];
+        let icbs = [Some(ResourceRef::Icb(&icb))];
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: &buffers,
+                usage: 3,
+            },
+            ComputeCmd::UseResources {
+                resources: &icbs,
+                usage: icb_usage,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: &icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!((cb.status().0, cb.error()), (COMPLETED, None));
+        words(&out)
+    }
+
+    /// A command naming a buffer released before its execution runs with no error, reading zero
+    /// there: the runtime resolves the address the command holds to no live buffer, as it
+    /// resolves a pointer to none, so the slot reads zero and drops writes. Metal's answer
+    /// varies (oracle_icb `freed`, an AMD 5300M and an Intel 630 on macOS 26.7.1, an M3 Max on
+    /// macOS 27.0.1): each reads a small released buffer's last bytes; the AMD and the M3 read
+    /// zero from a released buffer of 1 to 64 MiB, where the Intel reads other bytes; the AMD
+    /// draws nothing through a released vertex or fragment buffer; none fails the command buffer
+    #[test]
+    fn a_command_naming_a_released_buffer_reads_zero() {
+        assert_eq!(released_input_read(1), [1; 4]);
+    }
+
+    /// The same, in a buffer an encoder made resident for writing, which the runtime executes
+    /// from its records on the host. Ignored until the runtime runs the command there:
+    /// metal2vulkan c8a0481cf8 on MoltenVK runs nothing, the output keeping [0; 4], with no
+    /// error, where the buffer made resident for reading alone runs it reading zero
+    #[test]
+    #[ignore = "metal2vulkan's host replay runs no command naming a released buffer (handed to it 11-03)"]
+    fn a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing() {
+        assert_eq!(released_input_read(3), [1; 4]);
     }
 
     /// The tests' kernels that encode indirect commands, which `build.rs` compiled from

@@ -10,12 +10,14 @@
 //! texture on the surface through its resource ID alone keeps that image's memory and not the
 //! buffer, so it holds no reference of the surface.
 
+use std::collections::BTreeMap;
 use std::ptr::NonNull;
 use std::sync::{Arc, Weak};
 
 use metal2vulkan::metal::{PixelFormat, PrimitiveTopologyClass, TextureType, TextureUsage};
 use metal2vulkan::pipeline::{
-    ComputePipelineDescriptor, RenderPipelineDescriptor, TileRenderPipelineDescriptor,
+    ComputePipelineDescriptor, MeshPipelineDescriptor, RenderPipelineDescriptor,
+    TileRenderPipelineDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
@@ -25,17 +27,18 @@ use reims_vgpu_core::platform::resource::{
     SamplerState, Texture,
 };
 use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange, Swizzle};
+use reims_vgpu_core::platform::values::{SurfaceMatrix, SurfacePlane};
 use reims_vgpu_core::platform::{Handle, HostRange};
 use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Nil, Policy, create, get, hearing, metal_aborts, plain, plain_at, refused, send,
+    Nil, Policy, create, get, hearing, metal_aborts, plain, plain_at, refused, relay_gap, send,
     unrepresentable,
 };
 use crate::gpu;
 use crate::gpu::backing::{Backing, REPLACE};
-use crate::gpu::desc::{Maker, VulkanTextureDescriptor, format_refused};
+use crate::gpu::desc::{Maker, VulkanTextureDescriptor, created_format_refused};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::metal_space::Hold;
 use crate::gpu::writes::{Reflected, Reflection};
@@ -171,6 +174,20 @@ fn texel_bytes(
     };
     let span = (pitch.saturating_mul(slices - 1)).saturating_add(image);
     start.min(length)..offset.saturating_add(span).min(length)
+}
+
+/// The runtime's matrix of a surface's `kIOSurfaceYCbCrMatrix` value, as
+/// `rt::SurfaceYCbCrMatrix::from_attachment` reads the value's string.
+fn ycbcr_matrix(matrix: SurfaceMatrix) -> rt::SurfaceYCbCrMatrix {
+    match matrix {
+        SurfaceMatrix::Itu601 => rt::SurfaceYCbCrMatrix::Itu601,
+        SurfaceMatrix::Itu709 => rt::SurfaceYCbCrMatrix::Itu709,
+        SurfaceMatrix::Itu2020 => rt::SurfaceYCbCrMatrix::Itu2020,
+        SurfaceMatrix::Smpte240M1995 => rt::SurfaceYCbCrMatrix::Smpte240M,
+        SurfaceMatrix::DciP3 => rt::SurfaceYCbCrMatrix::DciP3,
+        SurfaceMatrix::P3D65 => rt::SurfaceYCbCrMatrix::P3D65,
+        SurfaceMatrix::Other => rt::SurfaceYCbCrMatrix::Other,
+    }
 }
 
 impl BufferObject {
@@ -723,26 +740,59 @@ pub type VulkanHeap = Obj<HeapObject>;
 /// `id<MTLSamplerState>`.
 pub type VulkanSamplerState = Obj<rt::SamplerState>;
 
-/// The sampler states with a live handle: the one object each runtime state is.
-static SAMPLERS: Mutex<Vec<Weak<rt::SamplerState>>> = Mutex::new(Vec::new());
+/// The sampler states' handles, by their runtime state's resource ID: the one object each runtime
+/// state is. A live runtime state's ID is its own on its device, so an ID names one live state of
+/// a device; its list holds the handles of other devices' states, and of states gone.
+struct SamplerHandles {
+    by_id: BTreeMap<u64, Vec<Weak<rt::SamplerState>>>,
+    /// The handles listed, gone ones among them.
+    listed: usize,
+    /// Where the next sweep of the gone ones is due: twice the handles live at the last.
+    sweep_at: usize,
+}
+
+/// The handles of [`SamplerHandles`].
+static SAMPLERS: Mutex<SamplerHandles> = Mutex::new(SamplerHandles {
+    by_id: BTreeMap::new(),
+    listed: 0,
+    sweep_at: SAMPLER_SWEEP_FLOOR,
+});
+
+/// The fewest handles listed before a sweep.
+const SAMPLER_SWEEP_FLOOR: usize = 256;
 
 /// The handle of `raw`: the object a live handle to the same runtime state already is, or a new
 /// one. The runtime answers one state for equal requests while it lives, as Metal answers one
 /// object (one identity) on this host, so the handles of equal requests are one object too. The
 /// ID it takes is in the runtime's sampler ID pool, which Metal's sampler mempool follows
-/// ([`crate::gpu::metal_space`]'s `Samplers`).
+/// ([`crate::gpu::metal_space`]'s `Samplers`). The handle is found by that ID, so a create costs
+/// the same however many samplers live (it read every live handle before: 11 us a create with
+/// 1000 alive, measured on the msi RTX 5080).
 pub(crate) fn sampler_state(raw: rt::SamplerState) -> VulkanSamplerState {
-    let mut live = SAMPLERS.lock();
-    live.retain(|weak| weak.strong_count() > 0);
-    if let Some(held) = live
+    let id = plain(|| rt::SamplerState::gpu_resource_id(&raw)).0;
+    let mut table = SAMPLERS.lock();
+    let handles = table.by_id.entry(id).or_default();
+    if let Some(held) = handles
         .iter()
         .filter_map(Obj::upgrade)
         .find(|held| **held == raw)
     {
         return held;
     }
+    let before = handles.len();
+    handles.retain(|weak| weak.strong_count() > 0);
     let made = Obj::new(raw);
-    live.push(made.downgrade());
+    handles.push(made.downgrade());
+    let after = handles.len();
+    table.listed = table.listed + after - before;
+    if table.listed >= table.sweep_at {
+        table.by_id.retain(|_, listed| {
+            listed.retain(|weak| weak.strong_count() > 0);
+            !listed.is_empty()
+        });
+        table.listed = table.by_id.values().map(Vec::len).sum();
+        table.sweep_at = (2 * table.listed).max(SAMPLER_SWEEP_FLOOR);
+    }
     made
 }
 
@@ -876,6 +926,54 @@ pub enum RenderDescriptor {
     Render(Box<RenderPipelineDescriptor>),
     /// A tile pipeline's.
     Tile(Box<TileRenderPipelineDescriptor>),
+    /// A mesh render pipeline's, with what the state answers of the guest's values the runtime's
+    /// descriptor does not hold.
+    Mesh(Box<MeshDescriptor>),
+}
+
+/// A mesh render pipeline state's descriptor: the runtime's, and the state's own answers.
+#[derive(Debug, Clone)]
+pub struct MeshDescriptor {
+    /// The runtime's descriptor the state was made of.
+    pub descriptor: MeshPipelineDescriptor,
+    /// What the state answers, and holds its draws to, of the guest's descriptor
+    /// ([`MeshAnswers`]).
+    pub answers: MeshAnswers,
+}
+
+/// What a mesh render pipeline state answers of its stages' limits, and what its draws are held
+/// to, from the guest's descriptor values the runtime's `MeshPipelineDescriptor` does not hold
+/// (`crate::gpu::states::mesh_answers` decides each).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshAnswers {
+    /// Whether the state has an object function: its draws' threads per object threadgroup are
+    /// held to the object stage's limits only then, as Metal ignores them without one.
+    pub object: bool,
+    /// `maxTotalThreadsPerObjectThreadgroup`: 0 without an object function.
+    pub object_threads: u64,
+    /// `maxTotalThreadsPerMeshThreadgroup`.
+    pub mesh_threads: u64,
+    /// `objectThreadExecutionWidth`: 0 without an object function.
+    pub object_width: u64,
+    /// `meshThreadExecutionWidth`.
+    pub mesh_width: u64,
+    /// `maxTotalThreadgroupsPerMeshGrid`.
+    pub grid: u64,
+    /// The object and mesh stages' maxima the guest's descriptor set (0 for one it left), and
+    /// their required threadgroup sizes (`None` for none): a draw of a threadgroup past a
+    /// maximum set, or of another size than a required one, dies
+    /// (`crate::gpu::encode_render`'s `threads_held`).
+    pub held: [MeshStageHeld; 2],
+}
+
+/// What one stage of a mesh render pipeline state holds its draws' threadgroups to
+/// ([`MeshAnswers::held`]): the object stage's first, then the mesh stage's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MeshStageHeld {
+    /// The descriptor's maximum threads per threadgroup; 0 where it set none.
+    pub max: u64,
+    /// The descriptor's required threadgroup size; `None` where it set none.
+    pub required: Option<MtlSize>,
 }
 
 /// `id<MTLRenderPipelineState>`.
@@ -888,8 +986,8 @@ pub(crate) fn render_pipeline(raw: rt::RenderPipelineState) -> VulkanRenderPipel
     render_pipeline_of(raw, PrimitiveTopologyClass::Unspecified, None)
 }
 
-/// [`render_pipeline`] of `descriptor`, where one made it, whose `inputPrimitiveTopology` is
-/// `input_primitive_topology`.
+/// The handle of a state a creator made, with the runtime's identifier of it, and `descriptor`,
+/// where one made it, whose `inputPrimitiveTopology` is `input_primitive_topology`.
 pub(crate) fn render_pipeline_of(
     raw: rt::RenderPipelineState,
     input_primitive_topology: PrimitiveTopologyClass,
@@ -903,6 +1001,16 @@ pub(crate) fn render_pipeline_of(
         reflection: Reflection::new(descriptor.map(Reflected::Render)),
         drawn: std::sync::OnceLock::new(),
     })
+}
+
+impl RenderPipelineObject {
+    /// What a mesh render pipeline state answers ([`MeshAnswers`]); `None` for any other state.
+    pub(crate) fn mesh_answers(&self) -> Option<&MeshAnswers> {
+        match self.reflection.descriptor() {
+            Some(Reflected::Render(RenderDescriptor::Mesh(m))) => Some(&m.answers),
+            _ => None,
+        }
+    }
 }
 
 /// A runtime shared texture handle.
@@ -1035,7 +1143,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
             (self
                 .raw
                 .new_linear_texture(&desc, offset, bytes_per_row, bytes_per_image))
-            .map_err(|e| format_refused(sel, "a texture of", format, e))
+            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
         })?
         else {
             return Ok(None);
@@ -1068,7 +1176,7 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let format = fields.raw_pixel_format();
         let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
             buffer_texture_type(sel, self.raw.new_texture(&desc, offset, bytes_per_row))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", format, e))
         })?
         else {
             return Ok(None);
@@ -1076,6 +1184,81 @@ impl Buffer<VulkanPlatform> for VulkanBuffer {
         let bytes = texel_bytes(&desc, (offset, bytes_per_row), plain(|| self.raw.length()));
         let under = Under::Buffer(self.clone_ref(), bytes);
         Ok(Some(self.device.texture_in(raw, under, answered)))
+    }
+
+    /// A texture of the buffer's bytes as Metal's IOSurface creator makes one over the plane of
+    /// a surface the buffer stands for (`Buffer::new_texture_with_iosurface_plane`), at the
+    /// plane's offset with rows its bytes per row apart: of the descriptor's options, a sampler
+    /// ID of the device taken, as Metal's device takes one, and as the device's
+    /// `new_texture_on_surface` makes one over an `IOSurfaceRef`, minus its reads of the surface,
+    /// which the facts give ([`crate::gpu::device::surface_plane_descriptor`],
+    /// [`crate::gpu::device::texture_over_plane`]). A two-plane YCbCr format the runtime reads
+    /// and a two-plane XR10 one read the facts of a surface of two planes or more
+    /// ([`crate::gpu::device::plane_facts_taken`]): its OSType, which says its range, its size,
+    /// its plane 1 at the facts' offset in the buffer with their rows, and its YCbCr matrix,
+    /// which the XR10 formats do not read; what the runtime refuses of them dies here, naming the
+    /// refusal. A plane past 0 of a surface without planes dies, where Metal asserts, and a plane
+    /// past a planar surface's last is nil, as Metal's. Without facts the buffer stands for no
+    /// surface: the texture is the buffer's own creator's ([`Buffer::new_texture`]), which is
+    /// nil for a two-plane format. The texture may change the bytes of its plane and, of a
+    /// two-plane format over plane 0, of plane 1.
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &VulkanTextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<VulkanTexture>> {
+        use crate::gpu::device::{PlaneFacts, plane_facts_taken};
+        let Some(facts) = plane.facts else {
+            return self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row);
+        };
+        let sel = "newTextureWithDescriptor:iosurface:plane:";
+        let fields = descriptor.fields();
+        let device = &self.device.raw;
+        let Some(mut desc) = crate::gpu::device::surface_plane_descriptor(device, sel, &fields)?
+        else {
+            return Ok(None);
+        };
+        let usage = match self.gpu_read_only() {
+            true => read_only_usage(&mut desc),
+            false => 0,
+        };
+        // As over an `IOSurfaceRef` (`textures_over_planes_a_surface_lacks_are_metals`).
+        if plane.plane != 0 && facts.plane_count == 0 {
+            let what = format!("plane {} of a surface without planes", plane.plane);
+            metal_aborts(sel, &what);
+        }
+        if facts.plane_count != 0 && plane.plane >= facts.plane_count {
+            return Ok(None);
+        }
+        let taken = plane_facts_taken(desc.pixel_format).filter(|_| facts.plane_count >= 2);
+        let ycbcr = taken.map(|kind| {
+            let size = [facts.width, facts.height];
+            let (chroma, rows) = (facts.chroma_offset, facts.chroma_bytes_per_row);
+            let read = rt::IoSurfaceYCbCr::new(facts.pixel_format, plane.plane, size, chroma, rows);
+            match (kind, facts.ycbcr_matrix) {
+                (PlaneFacts::YCbCr, Some(matrix)) => read.with_matrix(ycbcr_matrix(matrix)),
+                _ => read,
+            }
+        });
+        let at = rt::IoSurfacePlane::new(plane.offset, plane.bytes_per_row, plane.planar);
+        let at = match ycbcr {
+            Some(ycbcr) => at.with_ycbcr(ycbcr),
+            None => at,
+        };
+        let raw = crate::gpu::device::texture_over_plane(sel, &fields, &self.raw, &desc, at)?;
+        let Some(raw) = raw else {
+            return Ok(None);
+        };
+        let length = plain(|| self.raw.length());
+        let mut bytes = texel_bytes(&desc, (plane.offset, plane.bytes_per_row), length);
+        if ycbcr.is_some() && plane.plane == 0 {
+            let rows = facts.chroma_bytes_per_row.saturating_mul(facts.height);
+            let end = facts.chroma_offset.saturating_add(rows).min(length);
+            bytes = bytes.start.min(facts.chroma_offset.min(length))..bytes.end.max(end);
+        }
+        let under = Under::Buffer(self.clone_ref(), bytes);
+        Ok(Some(self.device.texture_in(raw, under, usage)))
     }
 
     /// A detached no-copy buffer over an alias of the ranges, which total its length, from now
@@ -1212,10 +1395,13 @@ impl VulkanTexture {
                 let e = match padded {
                     true => {
                         let what = format!("a view in pixel format {format} of a texture of");
-                        format_refused(sel, &what, u64::from(source.as_raw()), e)
+                        created_format_refused(sel, &what, u64::from(source.as_raw()), e)
                     }
-                    false => format_refused(sel, "a view of", format, e),
+                    false => created_format_refused(sel, "a view of", format, e),
                 };
+                if relay_gap(sel, &e, None) {
+                    return Ok(None);
+                }
                 refused(sel, &e)
             }
         };
@@ -1445,10 +1631,11 @@ impl Texture<VulkanPlatform> for VulkanTexture {
     /// The runtime reads `pixel_bytes` in place, through their pointer ([`guest_bytes`]), each
     /// byte once. Refused as Metal's validation refuses a region outside the level, rows that do
     /// not cover it, or a Private texture. One of a texture over memory the runtime imports
-    /// through a writable twin of read-only pages, but a surface's ([`Self::gpu_read_only()`]),
-    /// dies: the runtime writes through the twin, which reaches the pages, where Metal's CPU
-    /// writes through their read-only mapping ([`crate::gpu::writes::kept_write`]). A surface's
-    /// reads a copy of them first ([`host_bytes`]), which it writes row by row.
+    /// through a writable twin of read-only pages, but a surface's
+    /// ([`TextureObject::gpu_read_only()`]), dies: the runtime writes through the twin, which
+    /// reaches the pages, where Metal's CPU writes through their read-only mapping
+    /// ([`crate::gpu::writes::kept_write`]). A surface's reads a copy of them first
+    /// ([`host_bytes`]), which it writes row by row.
     fn replace_region(
         &self,
         region: MtlRegion,
@@ -1772,7 +1959,7 @@ impl Heap<VulkanPlatform> for VulkanHeap {
                 let made = self.raw.new_texture_at_offset(&desc, offset);
                 placed(
                     sel,
-                    made.map_err(|e| format_refused(sel, "a texture of", format, e)),
+                    made.map_err(|e| created_format_refused(sel, "a texture of", format, e)),
                 )
             })
         });
@@ -2000,6 +2187,32 @@ impl RenderPipeline for VulkanRenderPipeline {
         u64::from(plain(|| self.raw.max_total_threads_per_threadgroup()))
     }
 
+    /// A mesh render pipeline state's answer, which its creation decided
+    /// (`crate::gpu::states::mesh_answers`); 0 for any other state, as Metal's answers.
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        self.mesh_answers().map_or(0, |m| m.object_threads)
+    }
+
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        self.mesh_answers().map_or(0, |m| m.mesh_threads)
+    }
+
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
+    fn object_thread_execution_width(&self) -> u64 {
+        self.mesh_answers().map_or(0, |m| m.object_width)
+    }
+
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
+    fn mesh_thread_execution_width(&self) -> u64 {
+        self.mesh_answers().map_or(0, |m| m.mesh_width)
+    }
+
+    /// As [`Self::max_total_threads_per_object_threadgroup`].
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        self.mesh_answers().map_or(0, |m| m.grid)
+    }
+
     fn resource_index(&self) -> u64 {
         plain(|| self.raw.resource_index())
     }
@@ -2053,6 +2266,115 @@ impl Library<VulkanPlatform> for VulkanLibrary {
         )
         .map(|made| made.map(Obj::new))
     }
+
+    /// The runtime's `newFunctionWithName:constantValues:error:`: each constant by its index.
+    /// A constant whose type the runtime does not know, or no function constant takes, answers
+    /// nil, as a refused specialisation.
+    fn new_function_with_constants(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+    ) -> RaiseResult<Option<VulkanFunction>> {
+        let sel = "newFunctionWithName:constantValues:error:";
+        let Some(values) = constant_values(function_name, constants) else {
+            return Ok(None);
+        };
+        crate::gpu::timing::creation(
+            sel,
+            "",
+            || {
+                create(sel, Policy::Dies, Nil::MissingFunction, || {
+                    self.raw
+                        .new_function_with_name_constant_values(function_name, &values)
+                })
+            },
+            || format!("{function_name:?} with {} constants", constants.len()),
+            |made| match made {
+                Ok(Some(_)) => "found".to_owned(),
+                Ok(None) => "nil".to_owned(),
+                Err(_) => "raised".to_owned(),
+            },
+        )
+        .map(|made| made.map(Obj::new))
+    }
+
+    /// The runtime's `newFunctionWithDescriptor:error:`: the descriptor's constant values nil
+    /// where there are none, and each constant by its index where there are; its specialized
+    /// name where it has one, which the function answers as its name and links under, as
+    /// Metal's does. A constant the runtime cannot carry answers nil, as a refused
+    /// specialisation; options the runtime does not know die, as its other creators' unknown
+    /// raw values do.
+    fn new_function_with_options(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        options: u64,
+        specialized_name: Option<&str>,
+    ) -> RaiseResult<Option<VulkanFunction>> {
+        let sel = "newFunctionWithDescriptor:error:";
+        let mut descriptor = rt::FunctionDescriptor::new(function_name);
+        if let Some(specialized) = specialized_name {
+            descriptor = descriptor.with_specialized_name(specialized);
+        }
+        if !constants.is_empty() {
+            let Some(values) = constant_values(function_name, constants) else {
+                return Ok(None);
+            };
+            descriptor.constant_values = Some(values);
+        }
+        descriptor.options = gpu::metal_value(sel, "function options", options);
+        crate::gpu::timing::creation(
+            sel,
+            "",
+            || {
+                create(sel, Policy::Dies, Nil::MissingFunction, || {
+                    self.raw.new_function_with_descriptor(&descriptor)
+                })
+            },
+            || {
+                format!(
+                    "{function_name:?} with {} constants, options {options:#x}, specialized \
+                     name {specialized_name:?}",
+                    constants.len()
+                )
+            },
+            |made| match made {
+                Ok(Some(_)) => "found".to_owned(),
+                Ok(None) => "nil".to_owned(),
+                Err(_) => "raised".to_owned(),
+            },
+        )
+        .map(|made| made.map(Obj::new))
+    }
+}
+
+/// The runtime's constant values of `constants`, each by its index: `None`, logged, where one is
+/// of a type the runtime does not know or no function constant takes.
+fn constant_values(
+    function_name: &str,
+    constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+) -> Option<metal2vulkan::library::FunctionConstantValues> {
+    let mut values = metal2vulkan::library::FunctionConstantValues::defaults();
+    for c in constants {
+        let (Ok(ty), Some(bytes)) = (
+            metal2vulkan::metal::DataType::try_from(c.data_type),
+            c.bytes(),
+        ) else {
+            log::warn!(
+                "function {function_name:?}: constant {} of MTLDataType {} cannot be carried",
+                c.index,
+                c.data_type
+            );
+            return None;
+        };
+        values = values.with_index(
+            c.index,
+            metal2vulkan::library::FunctionConstantValue::new(ty, bytes.to_vec()),
+        );
+    }
+    Some(values)
 }
 
 #[cfg(test)]
@@ -3269,6 +3591,71 @@ pub(crate) mod tests {
         );
     }
 
+    /// A BC1 or BC7 texture over a surface's rows, through the buffer that stands for the
+    /// surface, is made, as the x86 Macs make it (docs/graphics-kext/dgpu-oracle.md, Q20), and
+    /// reads back row j of its blocks from the plane's row j, as theirs read: over a surface
+    /// without planes, and over plane 1 of a surface with planes, at an offset and rows that are
+    /// multiples of 16 bytes. metal2vulkan makes these since its stack 34; the guest's bundle
+    /// sends them
+    #[test]
+    fn bc_textures_over_a_surface_s_rows_are_made() {
+        use reims_vgpu_core::platform::values::SurfaceFacts;
+        let p = platform();
+        let (rows, pitch) = (64u64, 256u64);
+        let b = shared(2 * rows * pitch);
+        let bytes: Vec<u8> = (0..2 * rows * pitch).map(|i| (i * 7 % 251) as u8).collect();
+        // SAFETY: the buffer's Shared bytes, which nothing else touches yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), b.contents().as_ptr(), bytes.len())
+        };
+        for (format, block) in [(130, 8), (152, 16)] {
+            let desc = p.texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 64,
+                height: 32,
+                usage: 1,
+                ..TextureDesc::default()
+            });
+            for planar in [false, true] {
+                let offset = if planar { rows * pitch } else { 0 };
+                let facts = SurfaceFacts {
+                    pixel_format: u32::from_be_bytes(if planar { *b"420v" } else { *b"BGRA" }),
+                    plane_count: if planar { 2 } else { 0 },
+                    width: 64,
+                    height: rows,
+                    chroma_offset: offset,
+                    chroma_bytes_per_row: if planar { pitch } else { 0 },
+                    ycbcr_matrix: None,
+                };
+                let plane = SurfacePlane {
+                    plane: u64::from(planar),
+                    offset,
+                    bytes_per_row: pitch,
+                    planar,
+                    facts: Some(facts),
+                };
+                let what = format!("format {format}, planar {planar}");
+                let t = b
+                    .new_texture_over_surface_plane(OnFault::Return, &desc, plane)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{what}: nil"));
+                assert_eq!((t.pixel_format(), t.width(), t.height()), (format, 64, 32));
+                // 16 blocks a row, 8 rows of them.
+                let row = 16 * block;
+                let mut read = vec![0u8; (row * 8).to_usize()];
+                let region = rt::Region::new_3d(0, 0, 0, 64, 32, 1);
+                t.raw.get_bytes(&mut read, row, 0, region, 0, 0).unwrap();
+                let expected: Vec<u8> = (0..8)
+                    .flat_map(|j| {
+                        let at = (offset + j * pitch).to_usize();
+                        bytes[at..at + row.to_usize()].to_vec()
+                    })
+                    .collect();
+                assert_eq!(read, expected, "{what}");
+            }
+        }
+    }
+
     /// A texture on a surface writes the surface's memory, and holds one reference of the
     /// surface while it lives; its views share that reference. One over plane 1 of the surface,
     /// which has no planes, dies where it is made
@@ -3659,6 +4046,28 @@ pub(crate) mod tests {
         assert_eq!(desc.pixel_format(), 501);
         let site = catch_death(|| dev().new_texture(OnFault::Return, &desc)).unwrap_err();
         assert_eq!(site.file, "newTextureWithDescriptor:");
+    }
+
+    /// By default the same texture is nil, relayed as a gap at its creator and counted, where
+    /// Metal makes it: the guest's creation fails, and the process goes on
+    #[test]
+    fn a_texture_gap_is_nil_by_default() {
+        use crate::answer::{Inexact, inexact_counts, relaxed};
+        let counted = || {
+            (inexact_counts().into_iter())
+                .find(|&(k, _)| k == Inexact::RefusedCreate)
+                .map_or(0, |(_, n)| n)
+        };
+        let desc = bgra(8, 8, 0);
+        desc.set_pixel_format(501);
+        let before = counted();
+        let made = relaxed(|| dev().new_texture(OnFault::Return, &desc));
+        assert!(
+            matches!(made, Ok(None)),
+            "{:?}",
+            made.as_ref().map(Option::is_some)
+        );
+        assert_eq!(counted(), before + 1);
     }
 
     /// A 64 by 16 `BGRA8Unorm` render target's descriptor, Shared, of `rotation`, `framebufferOnly`

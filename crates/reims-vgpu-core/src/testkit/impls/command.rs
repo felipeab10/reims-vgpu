@@ -5,7 +5,7 @@
 //! and `device` are free and read the model.
 
 use super::super::calllog::Arg;
-use super::super::objects::{CommandBufferModel, Fk, Model, kind};
+use super::super::objects::{CommandBufferModel, Fk, Model, completion_read, kind};
 use super::super::platform::FakePlatform;
 use super::fatal;
 use crate::platform::command::*;
@@ -32,14 +32,70 @@ impl CommandQueue<FakePlatform> for Fk<kind::CommandQueue> {
 }
 
 impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
+    /// As Metal's platforms do: the read of the buffer and `block` run in the refusal scope the
+    /// handler was added in, where it was added in one (`run_completed`), so a read that dies
+    /// ([`World::complete_dying_read`]) hands `block` the buffer refused there.
+    ///
+    /// [`World::complete_dying_read`]: super::super::objects::World::complete_dying_read
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
         self.act(
             Policy::On(on),
             "addCompletedHandler:",
             vec![Arg::Block(true)],
         )?;
+        let carried = crate::raise::refusals::carry();
+        let block: CompletedHandler = Box::new(move |info| {
+            run_completed(carried, || completion_read(info), block);
+        });
         if let Model::CommandBuffer(m) = &mut self.state().model {
             m.handlers.push(block);
+        }
+        Ok(())
+    }
+
+    /// Run at commit, on the committing thread, before the buffer can complete
+    /// ([`commit_obj`](super::super::objects::commit_obj)).
+    fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addScheduledHandler:",
+            vec![Arg::Block(true)],
+        )?;
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.scheduled.push(block);
+        }
+        Ok(())
+    }
+
+    /// Run at commit, on the committing thread, before its scheduled handlers, as the fake takes
+    /// a buffer's work as it is committed ([`commit_obj`](super::super::objects::commit_obj)).
+    fn add_submission_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addSubmissionHandler",
+            vec![Arg::Block(true)],
+        )?;
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.submission.push(block);
+        }
+        Ok(())
+    }
+
+    /// Run where the buffer completes, before its completed handlers, the read and `block` in
+    /// the refusal scope it was added in, as a completed handler's are
+    /// ([`complete_obj`](super::super::objects::complete_obj)).
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        self.act(
+            Policy::On(on),
+            "addCompletionSeenHandler",
+            vec![Arg::Block(true)],
+        )?;
+        let carried = crate::raise::refusals::carry();
+        let block: CompletedHandler = Box::new(move |info| {
+            run_completed(carried, || completion_read(info), block);
+        });
+        if let Model::CommandBuffer(m) = &mut self.state().model {
+            m.seen.push(block);
         }
         Ok(())
     }
@@ -53,9 +109,14 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
         })
     }
 
+    /// Its submission handlers, and those of the buffers the world takes at this commit
+    /// ([`World::release_submissions_at_next_commit`]), run inside the call, marked so
+    /// ([`crate::platform::command::committing`]), as the Vulkan platform's runtime runs them.
+    ///
+    /// [`World::release_submissions_at_next_commit`]: crate::testkit::objects::World::release_submissions_at_next_commit
     fn commit(&self, on: OnFault) -> RaiseResult<()> {
         self.act(Policy::On(on), "commit", vec![])?;
-        super::super::objects::commit_obj(self.obj());
+        crate::platform::command::committing(|| super::super::objects::commit_obj(self.obj()));
         Ok(())
     }
 
@@ -70,6 +131,26 @@ impl CommandBuffer<FakePlatform> for Fk<kind::CommandBuffer> {
 
     fn device(&self) -> Option<<FakePlatform as Platform>::Device> {
         self.device_handle()
+    }
+
+    /// `None`, logging nothing, until the world splits command buffers
+    /// ([`World::split_command_buffers`]); then logged, the buffer committed as at `commit`, and a
+    /// new command buffer answered.
+    ///
+    /// [`World::split_command_buffers`]: super::super::objects::World::split_command_buffers
+    fn split(&self, on: OnFault) -> RaiseResult<Option<<FakePlatform as Platform>::CommandBuffer>> {
+        if !self.world().splits() {
+            return Ok(None);
+        }
+        let next = self.make(Policy::On(on), "split", vec![], |w| {
+            Some(w.new_obj::<kind::CommandBuffer>(Model::CommandBuffer(
+                CommandBufferModel::default(),
+            )))
+        })?;
+        if next.is_some() {
+            super::super::objects::commit_obj(self.obj());
+        }
+        Ok(next)
     }
 
     fn encode_signal(

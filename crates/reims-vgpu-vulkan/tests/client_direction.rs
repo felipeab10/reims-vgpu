@@ -20,7 +20,11 @@
 //! surface's own, and Metal's write ends the process with a bus error, where this crate's platform
 //! dies at the call.
 
-#![cfg(target_os = "macos")] // Compares with Metal, which is macOS's.
+#![cfg(target_os = "macos")]
+// Compares with Metal, which is macOS's.
+// The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
+// `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -1162,6 +1166,7 @@ fn small_blits_dropped<P: Platform>(p: &P, d: &P::Device, past_the_level: bool) 
 }
 
 #[test]
+#[ignore = "opt-in: it faults the GPU on purpose, a GPU recovery that fails every process's in-flight work"]
 fn metal_drops_small_blits_into_the_texture() {
     let p = MetalPlatform::new(Box::new(NoLauncher));
     small_blits_dropped(&p, &MetalPlatform::system_default_device().unwrap(), true);

@@ -30,11 +30,12 @@ use objc2::{Message, msg_send};
 use objc2_foundation::{NSArray, NSError, NSRange, NSString};
 use objc2_io_surface::IOSurfaceRef;
 use objc2_metal::{
-    MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer, MTLCompileOptions,
-    MTLComputeCommandEncoder, MTLComputePipelineDescriptor, MTLComputePipelineState,
-    MTLDepthStencilState, MTLDevice, MTLEvent, MTLFunction, MTLHeap, MTLIndirectCommandBuffer,
-    MTLIndirectCommandBufferDescriptor, MTLIndirectComputeCommand, MTLIndirectRenderCommand,
-    MTLLibrary, MTLOrigin, MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMap,
+    MTLArgumentEncoder, MTLBlitCommandEncoder, MTLBuffer, MTLClearColor, MTLCommandBuffer,
+    MTLCompileOptions, MTLComputeCommandEncoder, MTLComputePipelineDescriptor,
+    MTLComputePipelineState, MTLDepthStencilState, MTLDevice, MTLEvent, MTLFunction, MTLHeap,
+    MTLIndirectCommandBuffer, MTLIndirectCommandBufferDescriptor, MTLIndirectComputeCommand,
+    MTLIndirectRenderCommand, MTLLibrary, MTLMeshRenderPipelineDescriptor, MTLOrigin,
+    MTLRasterizationRateLayerDescriptor, MTLRasterizationRateMap,
     MTLRasterizationRateMapDescriptor, MTLRegion, MTLRenderCommandEncoder,
     MTLRenderPassColorAttachmentDescriptor, MTLRenderPassColorAttachmentDescriptorArray,
     MTLRenderPassDescriptor, MTLRenderPipelineColorAttachmentDescriptor,
@@ -71,9 +72,18 @@ pub unsafe trait DeviceSpi: Message {
     fn deviceLinearTextureAlignmentBytes(&self) -> u64 {
         unsafe { msg_send![self, deviceLinearTextureAlignmentBytes] }
     }
+    fn doubleFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, doubleFPConfig] }
+    }
+    fn featureProfile(&self) -> u64 {
+        unsafe { msg_send![self, featureProfile] }
+    }
     /// `unsigned int`, as the runtime answers (`I@:`).
     fn gpuCoreCount(&self) -> u32 {
         unsafe { msg_send![self, gpuCoreCount] }
+    }
+    fn halfFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, halfFPConfig] }
     }
     fn iosurfaceReadOnlyTextureAlignmentBytes(&self) -> u64 {
         unsafe { msg_send![self, iosurfaceReadOnlyTextureAlignmentBytes] }
@@ -162,6 +172,9 @@ pub unsafe trait DeviceSpi: Message {
     fn maxViewportCount(&self) -> u64 {
         unsafe { msg_send![self, maxViewportCount] }
     }
+    fn singleFPConfig(&self) -> u64 {
+        unsafe { msg_send![self, singleFPConfig] }
+    }
     fn supportsBufferWithAddressRanges(&self) -> bool {
         unsafe { msg_send![self, supportsBufferWithAddressRanges] }
     }
@@ -200,6 +213,11 @@ pub unsafe trait DeviceSpi: Message {
     }
     fn supportsNonSquareTileShaders(&self) -> bool {
         unsafe { msg_send![self, supportsNonSquareTileShaders] }
+    }
+    /// The macOS 26 SDK's getter, which objc2-metal does not declare: sent only where the device
+    /// responds to it.
+    fn supportsPlacementSparse(&self) -> bool {
+        unsafe { msg_send![self, supportsPlacementSparse] }
     }
     fn supportsPrimitiveType(&self, primitive_type: u64) -> bool {
         unsafe { msg_send![self, supportsPrimitiveType: primitive_type] }
@@ -386,6 +404,21 @@ pub unsafe trait DeviceSpi: Message {
             msg_send![self, newRenderPipelineStateWithDescriptor: descriptor, options: options, reflection: reflection, error: error]
         }
     }
+    /// Reflection is nil.
+    ///
+    /// # Safety
+    /// `error` is a writable out-parameter.
+    unsafe fn newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+        &self,
+        descriptor: &MTLMeshRenderPipelineDescriptor,
+        options: u64,
+        error: *mut *mut NSError,
+    ) -> Option<Retained<ProtocolObject<dyn MTLRenderPipelineState>>> {
+        let reflection: *mut *mut AnyObject = std::ptr::null_mut();
+        unsafe {
+            msg_send![self, newRenderPipelineStateWithMeshDescriptor: descriptor, options: options, reflection: reflection, error: error]
+        }
+    }
     /// A nil descriptor is sent as it is; reflection is nil.
     ///
     /// # Safety
@@ -436,6 +469,31 @@ pub unsafe trait LibrarySpi: Message {
 
 // SAFETY: an `id<MTLLibrary>`.
 unsafe impl LibrarySpi for ProtocolObject<dyn MTLLibrary> {}
+
+/// `-[MTLFunction newArgumentEncoderWithBufferIndex:reflection:]` with a nil result carried
+/// (objc2-metal's is nonnull).
+///
+/// # Safety
+/// The implementor is an `id<MTLFunction>`.
+pub unsafe trait FunctionSpi: Message {
+    /// The encoder of the argument buffer the function takes at `buffer_index`, or nil, and the
+    /// argument Metal reflects for it in `reflection` (an autoreleased object, or nil). The
+    /// selector is deprecated for `newArgumentEncoderWithBufferBinding:` of a pipeline's binding;
+    /// it is the one that reflects the argument buffer of a function alone.
+    #[allow(deprecated)]
+    fn newArgumentEncoderWithBufferIndex_reflection_or_nil(
+        &self,
+        buffer_index: u64,
+        reflection: &mut Option<Retained<objc2_metal::MTLArgument>>,
+    ) -> Option<Retained<ProtocolObject<dyn MTLArgumentEncoder>>> {
+        unsafe {
+            msg_send![self, newArgumentEncoderWithBufferIndex: buffer_index, reflection: reflection]
+        }
+    }
+}
+
+// SAFETY: an `id<MTLFunction>`.
+unsafe impl FunctionSpi for ProtocolObject<dyn MTLFunction> {}
 
 /// The attachment arrays' `objectAtIndexedSubscript:` with a nil result carried (objc2-metal's
 /// is nonnull). It raises past the end.

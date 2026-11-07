@@ -197,6 +197,25 @@ pub struct MetalPlatform {
     launcher: Box<dyn TaskLauncher<MetalPlatform>>,
 }
 
+/// `[[MTLResourceAddressRangeArray alloc] initWithRanges:count:]` (`Platform`'s
+/// `new_address_range_array`), for the device's heap over host memory too.
+pub(crate) fn address_range_array(
+    ranges: &[ResourceAddressRange],
+) -> RaiseResult<MetalAddressRangeArray> {
+    let sel = "initWithRanges:count:";
+    let this = msg::value("alloc", MTLResourceAddressRangeArray::alloc);
+    // `Enc` is transparent: the pointer is to `ranges.len()` ranges.
+    let (ptr, count) = (
+        ranges.as_ptr().cast::<Enc<ResourceAddressRange>>(),
+        ranges.len().to_u64(),
+    );
+    // SAFETY: the pointer is valid for `count` ranges during the call.
+    let array = msg::send(sel, Policy::Caught, || unsafe {
+        MTLResourceAddressRangeArray::initWithRanges_count(this, ptr, count)
+    })?;
+    Ok(array.map_or_else(|| msg::nil_result(sel), Obj::from_retained))
+}
+
 impl fmt::Debug for MetalPlatform {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("MetalPlatform").finish_non_exhaustive()
@@ -332,18 +351,7 @@ impl Platform for MetalPlatform {
         &self,
         ranges: &[ResourceAddressRange],
     ) -> RaiseResult<MetalAddressRangeArray> {
-        let sel = "initWithRanges:count:";
-        let this = msg::value("alloc", MTLResourceAddressRangeArray::alloc);
-        // `Enc` is transparent: the pointer is to `ranges.len()` ranges.
-        let (ptr, count) = (
-            ranges.as_ptr().cast::<Enc<ResourceAddressRange>>(),
-            ranges.len().to_u64(),
-        );
-        // SAFETY: the pointer is valid for `count` ranges during the call.
-        let array = msg::send(sel, Policy::Caught, || unsafe {
-            MTLResourceAddressRangeArray::initWithRanges_count(this, ptr, count)
-        })?;
-        Ok(array.map_or_else(|| msg::nil_result(sel), Obj::from_retained))
+        address_range_array(ranges)
     }
 
     // Made descriptors and devices, from values, sent natively.
@@ -361,7 +369,7 @@ impl Platform for MetalPlatform {
     /// The device of `MTLCopyAllDevices()` whose `registryID` is `registry_id` (+1), or `None`.
     /// In one process it is the instance the host's own device is.
     fn open_device(&self, registry_id: u64) -> Option<MetalDevice> {
-        let all = msg::fatal_send("MTLCopyAllDevices()", || objc2_metal::MTLCopyAllDevices());
+        let all = msg::fatal_send("MTLCopyAllDevices()", objc2_metal::MTLCopyAllDevices);
         let count = msg::value("count", || all.count());
         (0..count)
             .map(|i| msg::value("objectAtIndex:", || all.objectAtIndex(i)))

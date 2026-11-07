@@ -1201,6 +1201,12 @@ impl Predication {
             device: device.clone_ref(),
         })
     }
+
+    /// Whether a unit of compute encoders is open: one began since its last end, and a compute
+    /// encoder after it would go on in it.
+    pub(crate) fn in_unit(&self) -> bool {
+        self.unit.lock().first_type.is_some()
+    }
 }
 
 /// The state of a command buffer's current unit, and of its open compute encoder.
@@ -1584,7 +1590,8 @@ impl Unit {
         let Some(cb) = Obj::upgrade(&enc.command_buffer) else {
             return;
         };
-        let mut raw = enc.raw.lock();
+        let held = enc.raw.lock();
+        let mut raw = held.borrow_mut();
         let Some(old) = raw.take() else {
             return;
         };
@@ -3306,7 +3313,15 @@ mod tests {
             let c = shared(64);
             let cb = command_buffer();
             let e = compute(&cb);
-            encode_all(&e, [set(&inc), bind(&[Some(&c)], &[0]), start_while(&c, 0, 1, 1000), one()]);
+            encode_all(
+                &e,
+                [
+                    set(&inc),
+                    bind(&[Some(&c)], &[0]),
+                    start_while(&c, 0, 1, 1000),
+                    one(),
+                ],
+            );
             e.encode_end_while().unwrap();
             e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
             cb.commit(OnFault::Return).unwrap();

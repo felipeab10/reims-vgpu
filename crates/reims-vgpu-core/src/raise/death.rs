@@ -3,6 +3,9 @@
 //! `reims-vgpu: fatal: <what died>`, then `abort()`. Nothing unwinds and no `Drop` runs, so the
 //! process ends at the guest op that caused it and nothing after it reaches the host or the
 //! guest. Where the process dies is the contract; the message and the signal are diagnostics.
+//! The two exceptions unwind instead: a death in an isolated task's own code ends the task
+//! (`tasks::isolation::life`), and one inside a refusal scope refuses the op it met
+//! ([`crate::raise::refusals`]), which only the graphics lane opens.
 //!
 //! [`DeathId`] names what died: an area's reason (its `Display` a dotted id), a raise nothing may
 //! catch, a platform call, or a host call that raised. [`DeathSite`] and [`DeathKind`] are the
@@ -107,6 +110,9 @@ pub enum DeathId {
     GuestDisplay(crate::display::guest_display::DeathKind),
     /// The device's display ports'.
     Displays(crate::device::displays::DeathKind),
+    /// A panic in a refusal scope, which the scope refuses as a death there
+    /// ([`crate::raise::refusals`], "Panics"): no death site raises it.
+    Panic,
     /// A test's own death at a site it names (the testkit's fakes and the tests of the death
     /// machinery).
     #[cfg(any(test, feature = "testkit"))]
@@ -199,6 +205,12 @@ impl DeathId {
                 file: k.id(),
                 line: 0,
             },
+            // A panic outside every scope ends the process in the panic hook's `abort()` (6.5).
+            DeathId::Panic => DeathSite {
+                kind: DeathKind::Abort,
+                file: "panic",
+                line: 0,
+            },
         }
     }
 }
@@ -231,6 +243,7 @@ impl fmt::Display for DeathId {
             DeathId::Manager(k) => k.fmt(f),
             DeathId::GuestDisplay(k) => write!(f, "{k}"),
             DeathId::Displays(k) => write!(f, "{k}"),
+            DeathId::Panic => f.write_str("a panic"),
         }
     }
 }
@@ -249,8 +262,16 @@ pub fn fatal_with_detail(id: impl Into<DeathId>, detail: &str) -> ! {
 pub(crate) fn die(id: DeathId, detail: Option<&str>) -> ! {
     // A death in an isolated task's own code ends that task, not the process.
     crate::tasks::isolation::life::trap(id, detail);
+    // A death inside a refusal scope (the graphics lane's ops) refuses the op instead.
+    crate::raise::refusals::trap(id, detail);
     #[cfg(any(test, feature = "testkit"))]
     if crate::testkit::capture::capture_enabled() {
+        // A captured death unwinds quietly, before its line below is written: the line goes to
+        // stderr first, so a test that dies where it should not shows what it died of.
+        let _ = std::io::Write::write_all(
+            &mut std::io::stderr(),
+            format!("{}\n", message(&id, detail)).as_bytes(),
+        );
         crate::testkit::capture::capture(id.site())
     }
     let mut line = message(&id, detail);

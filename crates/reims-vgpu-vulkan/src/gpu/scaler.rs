@@ -1,7 +1,7 @@
 //! The scaler device's kernels on the Vulkan platform: the metal crate's `scaler.metal`, which
 //! `build.rs` compiled with fast math off into `$OUT_DIR/scaler.metallib`, made on the runtime's
 //! system default device, the one the library's GPU device draws on (the loader's pin included,
-//! [`crate::host_gpus`]). reims-vgpu's scaler backend works out each dispatch's kernel,
+//! `crate::host_gpus` on Linux). reims-vgpu's scaler backend works out each dispatch's kernel,
 //! parameters and taps from a transform's plan; this makes the buffers it binds, encodes its
 //! dispatches in one command buffer of a queue of its own, in order, each after the one before (a
 //! serial encoder, which the runtime orders with the barriers their buffers need), and says when
@@ -28,10 +28,10 @@ use reims_vgpu_core::num::ToU64;
 use crate::platform::device_options;
 
 /// The kernel's metallib, which `build.rs` compiled from the metal crate's `scaler.metal`.
-const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.metallib"));
+pub(crate) const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/scaler.metallib"));
 
 /// The kernels' names in it, as [`Kernel`] orders them.
-const KERNELS: [&str; 6] = [
+pub(crate) const KERNELS: [&str; 6] = [
     "scaler_lines",
     "scaler_transform",
     "scaler_across",
@@ -181,6 +181,8 @@ impl ScalerGpu {
             pipeline(KERNELS[4])?,
             pipeline(KERNELS[5])?,
         ];
+        // Shared: the scaler's work is a guest app's video work, which shares a GPU queue as an
+        // app's own queues do.
         let new_queue = || {
             device
                 .new_command_queue()

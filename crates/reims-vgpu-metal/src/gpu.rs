@@ -1,13 +1,14 @@
 //! Metal's GPU objects: the device's queries and creators ([`device`]), resources and state
-//! objects ([`resource`]), rasterization rate maps ([`rate_map`]), the descriptors ([`desc`]),
-//! the encoders, the indirect command buffers, the command queue and buffer, the events, and our
-//! own shaders ([`shaders`]).
+//! objects ([`resource`](mod@resource)), rasterization rate maps ([`rate_map`]), the descriptors
+//! ([`desc`]), the encoders, the indirect command buffers, the command queue and buffer, the
+//! events, and our own shaders ([`shaders`]).
 //!
 //! Every Metal method core asks for is one typed call (objc2-metal's, or `spi`'s declaration),
 //! run through the message layer ([`crate::msg`]), named by its selector. The encoder families
 //! (`BlitCmd`, `ComputeCmd`, `RenderCmd`, `IcbRenderCmd`, `IcbComputeCmd`) are each one
 //! exhaustive `match` in their trait's `encode`, one call per variant.
 
+mod argument;
 pub mod command;
 pub mod desc;
 pub mod device;

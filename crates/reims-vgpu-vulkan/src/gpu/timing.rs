@@ -44,7 +44,7 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
+use metal2vulkan::pipeline::{MeshPipelineDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 
@@ -103,6 +103,23 @@ pub fn render_stages(d: &RenderPipelineDescriptor) -> String {
         Some(fragment) => format!("vertex {}, fragment {}", stage(&d.vertex), stage(fragment)),
         None => format!("vertex {}, no fragment function", stage(&d.vertex)),
     }
+}
+
+/// A mesh render descriptor's stages as a line names them.
+pub fn mesh_stages(d: &MeshPipelineDescriptor) -> String {
+    let object = d
+        .object
+        .as_ref()
+        .map_or("no object function".to_owned(), |o| {
+            format!("object {}", stage(o))
+        });
+    let fragment = d
+        .fragment
+        .as_ref()
+        .map_or("no fragment function".to_owned(), |f| {
+            format!("fragment {}", stage(f))
+        });
+    format!("{object}, mesh {}, {fragment}", stage(&d.mesh))
 }
 
 /// A made state as a line names it, by its `uniqueIdentifier`.
@@ -167,10 +184,19 @@ pub const DISPATCH_LATER: &str =
 /// Runs the encoder command `sel`'s runtime call `call`, and when the lines are on and it takes
 /// [`SLOW_CALL`] or more, writes its wall time on the encoding thread, naming the
 /// `uniqueIdentifier` of the pipeline state the encoder set last, if any (0 is none).
+#[inline]
 pub fn encoder_call<T>(sel: &str, pipeline: &AtomicU64, call: impl FnOnce() -> T) -> T {
     if !on() {
         return call();
     }
+    timed_encoder_call(sel, pipeline, call)
+}
+
+/// [`encoder_call`] with the lines on: out of line, as they are a diagnostic most runs leave
+/// off.
+#[cold]
+#[inline(never)]
+fn timed_encoder_call<T>(sel: &str, pipeline: &AtomicU64, call: impl FnOnce() -> T) -> T {
     let start = now();
     let out = call();
     let elapsed = elapsed_since(start);

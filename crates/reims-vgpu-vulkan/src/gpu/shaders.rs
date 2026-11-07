@@ -80,13 +80,17 @@ mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The display's and the blits' five entry points.
-    const FUNCTIONS: [&str; 5] = [
+    /// The display's and the blits' nine entry points.
+    const FUNCTIONS: [&str; 9] = [
         "BlitInRGB_2P_XR10_A8",
         "BlitOutRGB_2P_XR10_A8",
         "displayPresentVertex",
         "displayPresentFragment",
         "displayPresentFragmentWithGammaTableAndColorMatrix",
+        "displayPipeColorFragment",
+        "displayPipeColorScanoutFragment",
+        "displayPipeLutFragment",
+        "displayPipeLutScanoutFragment",
     ];
 
     fn function(lib: &VulkanLibrary, name: &str) -> rt::Function {
@@ -95,17 +99,17 @@ mod tests {
             .unwrap_or_else(|e| panic!("no function {name}: {e}"))
     }
 
-    /// The metallib loads as a library of the device holding the five functions
+    /// The metallib loads as a library of the device holding the nine functions
     #[test]
-    fn the_metallib_loads_with_the_five_functions() {
+    fn the_metallib_loads_with_the_nine_functions() {
         let d = dev();
         let lib = library(&d).unwrap().unwrap();
         assert_eq!(lib.device.id(), d.id());
         let mut names = lib.raw.function_names();
         names.sort();
-        let mut five = FUNCTIONS.map(str::to_owned);
-        five.sort();
-        assert_eq!(names, five);
+        let mut nine = FUNCTIONS.map(str::to_owned);
+        nine.sort();
+        assert_eq!(names, nine);
     }
 
     /// The metallibs the repository holds for a build without Apple's tools (`metallibs/`,
@@ -149,9 +153,10 @@ mod tests {
         assert_eq!(a.id(), b.id());
     }
 
-    /// Both present pipelines are made as `display/pipeline.rs` makes them: the vertex function,
-    /// one of the two fragment functions, colour 0 a frame target's format, blending off, no
-    /// vertex descriptor; for each format a frame target takes
+    /// The present pipelines are made as `display/pipeline.rs` makes them, and the display
+    /// colour's as `reims-vgpu`'s `graphics/sink.rs` does: the vertex function, one of the six
+    /// fragment functions, colour 0 a frame target's format, blending off, no vertex descriptor;
+    /// for each format a frame target takes
     #[test]
     fn both_present_pipelines_are_made() {
         let d = dev();
@@ -160,6 +165,10 @@ mod tests {
         for fragment in [
             "displayPresentFragment",
             "displayPresentFragmentWithGammaTableAndColorMatrix",
+            "displayPipeColorFragment",
+            "displayPipeColorScanoutFragment",
+            "displayPipeLutFragment",
+            "displayPipeLutScanoutFragment",
         ] {
             let fragment = function(&lib, fragment);
             for format in [
