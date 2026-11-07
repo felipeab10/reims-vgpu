@@ -127,6 +127,7 @@ fn runtime_classes() -> Vec<(&'static str, &'static AnyClass)> {
         .unwrap();
     m.push(("MTLLibrary", class_of(&*lib)));
     let func = |n: &str| lib.newFunctionWithName(&NSString::from_str(n)).unwrap();
+    m.push(("MTLFunction", class_of(&*func("k"))));
     let cd = MTLComputePipelineDescriptor::new();
     cd.setComputeFunction(Some(&func("k")));
     cd.setSupportIndirectCommandBuffers(true);
@@ -346,7 +347,10 @@ MTLRasterizationRateLayerDescriptor initWithSampleCount: @@:{?=QQQ}
 MTLResourceAddressRangeArray initWithRanges:count: @@:^{MTLAddressRange=QQ}Q
 MTLDevice allowLibrariesFromOtherPlatforms v@:
 MTLDevice deviceLinearTextureAlignmentBytes Q@:
+MTLDevice doubleFPConfig Q@:
+MTLDevice featureProfile Q@:
 MTLDevice gpuCoreCount I@:
+MTLDevice halfFPConfig Q@:
 MTLDevice iosurfaceReadOnlyTextureAlignmentBytes Q@:
 MTLDevice iosurfaceTextureAlignmentBytes Q@:
 MTLDevice isFramebufferReadSupported B@:
@@ -394,6 +398,7 @@ MTLDevice newSharedTextureWithHandle:withResourceIndex: @@:@Q
 MTLDevice newTextureWithDescriptor:iosurface:plane: @@:@^{__IOSurface=}Q
 MTLDevice newTileRenderPipelineDescriptorWithSerializedData:deserializationContext: @@:@@
 MTLDevice reserveResourceIndicesForResourceType:indices:indexCount: v@:Q^QQ
+MTLDevice singleFPConfig Q@:
 MTLDevice supportsBufferWithAddressRanges B@:
 MTLDevice supportsBufferWithIOSurface B@:
 MTLDevice supportsCommandBufferJump B@:
@@ -407,6 +412,7 @@ MTLDevice supportsImageBlocks B@:
 MTLDevice supportsMemoryOrderAtomics B@:
 MTLDevice supportsNativeHardwareFP16 B@:
 MTLDevice supportsNonSquareTileShaders B@:
+MTLDevice supportsPlacementSparse B@:
 MTLDevice supportsPrimitiveType: B@:Q
 MTLDevice supportsProgrammableSamplePositions B@:
 MTLDevice supportsResourceDetachBacking B@:
@@ -486,6 +492,7 @@ MTLRenderPipelineState uniqueIdentifier Q@:
 MTLTexture uniqueIdentifier Q@:
 MTLHeap gpuAddress Q@:
 MTLLibrary functionNames @@:
+MTLFunction newArgumentEncoderWithBufferIndex:reflection: @@:Q^@
 MTLSharedEvent newSharedEventHandle @@:
 MTLRasterizationRateMap mutability Q@:
 MTLRasterizationRateMap resetUsingDescriptor: v@:@
@@ -682,7 +689,7 @@ fn every_spi_declaration_matches_the_runtime() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
-    assert_eq!(rows.len(), 252);
+    assert_eq!(rows.len(), 258);
 }
 
 /// The render-encoder SPI the host's AGX render encoder does not implement stays unimplemented

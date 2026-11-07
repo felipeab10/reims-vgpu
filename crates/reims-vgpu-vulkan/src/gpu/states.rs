@@ -1,6 +1,6 @@
 //! The render family's state objects, made from core's values and the translator's descriptors:
-//! sampler states, depth-stencil states and render pipeline states (`GpuDevice`'s creators of
-//! them call here).
+//! sampler states, depth-stencil states, render pipeline states and mesh render pipeline states
+//! (`GpuDevice`'s creators of them call here).
 //!
 //! - **A value's raw properties** become the runtime's types in the value's order, each named by
 //!   its setter: a raw value no Metal enumerator is dies at that setter
@@ -24,22 +24,27 @@
 //!   more with constexpr samplers, whose order Metal itself does not decide, and a function a
 //!   table can hold whose samplers the runtime cannot read, among them. One linked function
 //!   alone, of `functions` or `privateFunctions`, called or not, is numbered as Metal numbers it.
-//!   No guest form here links a function. This platform's libraries, functions and states hold the
-//!   runtime's exactly as long as the guest's handles to them live, so its sampler IDs are Metal's
-//!   (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
+//!   The paravirtualized device's guest forms link none; the graphics wire's pipelines link the
+//!   functions the guest lists (`reims-vgpu`'s decoder). This platform's libraries, functions and
+//!   states hold the runtime's exactly as long as the guest's handles to them live, so its sampler
+//!   IDs are Metal's (`tests::sampler_ids_follow_pipeline_holders_as_metals`).
 //! - **A pipeline's refusals** that Metal answers with an `NSError` are one here
 //!   ([`pipeline_error`]): what the compile finds wrong with the functions or the descriptor, a
 //!   vertex function writing a point size under a line or triangle topology, a function Metal's
-//!   compiler itself refuses on this device, an import no dynamic library supplies, and a state
-//!   that supports indirect command buffers whose functions use a direct texture or sampler
-//!   argument. The rest die at the selector: an ID past Metal's limit, which ends Metal's process,
-//!   a gap of the runtime (an unspecialized function constant among them, which Metal aborts for;
-//!   and a function's SIMD-group operations in a stage the runtime does not take them in, a vertex
-//!   function's on MoltenVK, which Metal makes and for which device info's key 33 answers no,
-//!   [`crate::gpu::caps`]), and its other refusals, as Metal raises at none. Such a death's line
-//!   also names the descriptor's formats (`formats`: its colour attachments' with their write
-//!   masks, its depth and stencil, its vertex attributes'), which the runtime's error does not
-//!   carry. A binary archive miss cannot happen: core's descriptors list no archive.
+//!   compiler itself refuses on this device, an import no dynamic library supplies, a call through
+//!   a visible-function reference no linked function resolves, and a state that supports indirect
+//!   command buffers whose functions use a direct texture or sampler argument. A gap of the
+//!   runtime's or the device's, where Metal makes the state (a function's SIMD-group operations
+//!   in a stage the runtime does not take them in, a vertex function's on MoltenVK, which Metal
+//!   makes and for which device info's key 33 answers no, [`crate::gpu::caps`]; a colour
+//!   attachment of a format the runtime has and does not render to there), is the runtime's
+//!   refusal as the `NSError` by default, relayed, and dies in strict mode
+//!   ([`crate::answer::relay_gap`]). The rest die at the selector: an ID past Metal's limit,
+//!   which ends Metal's process, an unspecialized function constant, which Metal aborts for, and
+//!   the runtime's other refusals, as Metal raises at none. Such a death's line, and a relayed
+//!   gap's, also names the descriptor's formats (`formats`: its colour attachments' with their
+//!   write masks, its depth and stencil, its vertex attributes'), which the runtime's error does
+//!   not carry. A binary archive miss cannot happen: core's descriptors list no archive.
 //!
 //!   Measured on the M3 Max (macOS 26.7, one case per process, plain and under `MTL_DEBUG_LAYER`):
 //!   the compute creators (both selectors), the render creator and the tile creator answer nil and
@@ -48,7 +53,13 @@
 //!   and for a fragment function's read of a program-scope `thread_index_in_quadgroup` (a read of
 //!   `thread_index_in_simdgroup` or `threads_per_simdgroup` there is made); and of code 2
 //!   ("Undefined symbols:") for a function whose import the library at its install name lacks, or
-//!   whose install name names no file. The functions that draw without a setter, and those whose
+//!   whose install name names no file. The compute and render creators answer nil and an
+//!   `NSError` of code 3 for a stage whose call through a visible-function reference no function
+//!   its descriptor links under that name resolves ("unresolved visible function reference:
+//!   linked_add_one", "Reason: visible function not loaded", macOS 27.0.1, plain and under
+//!   `MTL_DEBUG_LAYER`): none linked, one linked to the other stage, one in a group alone, or one
+//!   in `binaryFunctions` not made compiled to a binary, or made so, with no list but
+//!   `binaryFunctions` holding it. The functions that draw without a setter, and those whose
 //!   library exports the import, are made. The runtime refuses a fragment function's read of a
 //!   program-scope `thread_index_in_simdgroup` as a gap of its own (`Lowering(StageIo)`), which
 //!   dies where Metal makes the pipeline. The compute and render creators answer nil and an
@@ -127,7 +138,9 @@
 //!   state of any descriptor these take (measured: a sampler of `maxAnisotropy` 0 or 17, of a
 //!   minimum LOD clamp past the maximum, or of border colour 3, and a depth-stencil state of the
 //!   default descriptor, each made, no exception raised), and so does the runtime of each of
-//!   those.
+//!   those. A gap of the runtime's or the device's (a sampler address mode or comparison the
+//!   device does not take) answers nil by default, relayed, and dies in strict mode
+//!   ([`crate::answer::relay_gap`]).
 //! - **Labels** are diagnostics: a pipeline state takes its descriptor's or its value's
 //!   (`PipelineOptions::label`), which no answer to the guest reads and the runtime compiles
 //!   nothing of.
@@ -139,27 +152,33 @@ use metal2vulkan::bind::SamplerDescriptor;
 use metal2vulkan::metal::PrimitiveTopologyClass;
 use metal2vulkan::metal::state::{DepthStencilDescriptor, StencilDescriptor};
 use metal2vulkan::pipeline::{
-    ColorAttachmentDescriptor, ComputePipelineDescriptor, RenderPipelineDescriptor, StageSource,
-    TileRenderPipelineDescriptor,
+    ColorAttachmentDescriptor, ComputePipelineDescriptor, LinkedFunctions, MeshPipelineDescriptor,
+    RenderPipelineDescriptor, StageInputAttributeDescriptor, StageInputDescriptor,
+    StageInputLayoutDescriptor, StageSource, TileRenderPipelineDescriptor,
+    VertexAttributeDescriptor, VertexBufferLayoutDescriptor, VertexDescriptor,
 };
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::NsErrorText;
+use reims_vgpu_core::platform::types::{MtlSize, NsErrorText};
 use reims_vgpu_core::platform::values::{
-    DepthStencilDesc, RenderPipelineDesc, SamplerDesc, StencilDesc,
+    ColorAttachmentDesc, DepthStencilDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
+    FullRenderPipelineDesc, LinkedFunctionsDesc, RenderPipelineDesc, SamplerDesc, StageInputDesc,
+    StencilDesc, VertexDesc,
 };
 use reims_vgpu_core::raise::RaiseResult;
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Policy, decide, decide_describing, error_text, get_describing, plain, plain_at, unrepresentable,
+    Nil, Policy, create, decide_describing, error_text, get_describing, plain, plain_at, relay_gap,
+    unrepresentable,
 };
 use crate::gpu::desc::{VulkanRenderPipelineDescriptor, VulkanTileRenderPipelineDescriptor};
 use crate::gpu::device::{VulkanDevice, nil_pipeline_descriptor};
 use crate::gpu::metal_value;
 use crate::gpu::resource::{
-    RenderDescriptor, RenderPipelineObject, VulkanDepthStencilState, VulkanRenderPipeline,
-    VulkanSamplerState, render_pipeline_of, sampler_state,
+    MeshAnswers, MeshDescriptor, MeshStageHeld, RenderDescriptor, RenderPipelineObject,
+    VulkanDepthStencilState, VulkanFunction, VulkanRenderPipeline, VulkanSamplerState,
+    render_pipeline_of, sampler_state,
 };
 use crate::gpu::serialized;
 use crate::gpu::timing;
@@ -313,21 +332,20 @@ fn sampler_descriptor(d: &SamplerDesc) -> (SamplerDescriptor, rt::SamplerStateOp
 }
 
 /// `newSamplerStateWithDescriptor:`: a refusal dies at the selector, as Metal makes a state of
-/// any descriptor, and its process ends at an ID past its limit.
+/// any descriptor, and its process ends at an ID past its limit; but a gap of the runtime's or
+/// the device's, which by default answers nil ([`crate::answer::relay_gap`]).
 pub(crate) fn new_sampler_state(
     device: &VulkanDevice,
     desc: &SamplerDesc,
 ) -> RaiseResult<Option<VulkanSamplerState>> {
     let sel = "newSamplerStateWithDescriptor:";
     let (descriptor, options) = sampler_descriptor(desc);
-    match plain_at(sel, || {
+    let made = create(sel, Policy::Dies, Nil::Never, || {
         device
             .raw
             .new_sampler_state_with_options(&descriptor, options)
-    }) {
-        Ok(raw) => Ok(Some(sampler_state(raw))),
-        Err(e) => decide(sel, Policy::Dies, e),
-    }
+    })?;
+    Ok(made.map(sampler_state))
 }
 
 /// A face's stencil of `s`, every property set in field order.
@@ -359,7 +377,8 @@ fn stencil(s: &StencilDesc) -> StencilDescriptor {
 }
 
 /// `newDepthStencilStateWithDescriptor:`: Metal makes a state of any descriptor, and so does the
-/// runtime; a refusal dies at the selector.
+/// runtime; a refusal dies at the selector, but a gap of the runtime's or the device's, which by
+/// default answers nil ([`crate::answer::relay_gap`]).
 pub(crate) fn new_depth_stencil_state(
     device: &VulkanDevice,
     desc: &DepthStencilDesc,
@@ -378,10 +397,10 @@ pub(crate) fn new_depth_stencil_state(
     if let Some(back) = &desc.back {
         d.back_face_stencil = stencil(back);
     }
-    match plain_at(sel, || device.raw.new_depth_stencil_state(&d)) {
-        Ok(raw) => Ok(Some(Obj::new(raw))),
-        Err(e) => decide(sel, Policy::Dies, e),
-    }
+    let made = create(sel, Policy::Dies, Nil::Never, || {
+        device.raw.new_depth_stencil_state(&d)
+    })?;
+    Ok(made.map(Obj::new))
 }
 
 /// The `NSError` a pipeline creator answers for the runtime's refusal `e` of a pipeline, where
@@ -398,7 +417,10 @@ pub(crate) fn new_depth_stencil_state(
 ///   function writes no second output ("Fragment shader does not write to render target
 ///   color(0), index(1) that is required for blending"), and a `half4` output into an
 ///   `RGBA8Uint` attachment (`encode_render`'s
-///   `second_source_blends_without_a_second_output_are_refused_as_metals`).
+///   `second_source_blends_without_a_second_output_are_refused_as_metals`); and a call through a
+///   visible-function reference no function the stage links resolves (`NeedsInput` of
+///   `LinkedFunction`), measured ("unresolved visible function reference":
+///   `tests::metal_tests::unresolved_visible_calls_are_metals`).
 /// - Code 2 ([`UNDEFINED_SYMBOLS`]): a function whose import no linked dynamic library exports,
 ///   or whose install name loaded no library (`NeedsInput` of `DynamicSymbol` or
 ///   `DynamicLibrary`).
@@ -424,6 +446,9 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
         {
             METAL_REFUSES
         }
+        rt::Error::Compile(Compile::NeedsInput(RuntimeInput::LinkedFunction { .. })) => {
+            METAL_REFUSES
+        }
         rt::Error::Compile(Compile::NeedsInput(
             RuntimeInput::DynamicSymbol { .. } | RuntimeInput::DynamicLibrary { .. },
         )) => UNDEFINED_SYMBOLS,
@@ -439,8 +464,9 @@ pub(crate) fn pipeline_error(e: &rt::Error) -> Option<NsErrorText> {
 /// The `NSError` code of Metal's pipeline creators for a function its compiler refuses on the
 /// device ("Encountered unlowered function call to air.set_cull_mode_render_command", to
 /// `air.get_thread_index_in_quadgroup.i32`), at the compute, render and tile creators (measured:
-/// the module docs), and of the render creator for a colour attachment the fragment function's
-/// outputs do not fit ([`pipeline_error`]).
+/// the module docs), of the render creator for a colour attachment the fragment function's
+/// outputs do not fit, and of the compute and render creators for a call through a
+/// visible-function reference nothing linked resolves ([`pipeline_error`]).
 const METAL_REFUSES: i64 = 3;
 
 /// The `NSError` code of Metal's pipeline creators for a function whose import no library it
@@ -504,6 +530,480 @@ pub(crate) fn new_render_pipeline_state(
     )
 }
 
+/// `newRenderPipelineStateWithDescriptor:error:` of the whole value `desc`, the graphics lane's:
+/// every field the value carries is the runtime descriptor's own. A raw value the runtime has no
+/// enumerator of dies at the send ([`metal_value`]); so does the compile's refusal where Metal
+/// answers no `NSError` ([`made`]). The lane calls it inside its refusal scope.
+pub(crate) fn new_render_pipeline_state_full(
+    device: &VulkanDevice,
+    desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    let sel = "newRenderPipelineStateWithDescriptor:error:";
+    let mut d = RenderPipelineDescriptor::new(StageSource::Function(
+        desc.vertex
+            .function_descriptor()
+            .with_linked(linked_functions(&desc.vertex_linked)),
+    ));
+    d.fragment = desc.fragment.map(|f| {
+        StageSource::Function(
+            f.function_descriptor()
+                .with_linked(linked_functions(&desc.fragment_linked)),
+        )
+    });
+    d.vertex_descriptor = desc
+        .vertex_descriptor
+        .as_ref()
+        .map(|v| vertex_descriptor(sel, v));
+    for (index, c) in &desc.colors {
+        let slot = usize::try_from(*index)
+            .ok()
+            .and_then(|i| d.color_attachments.get_mut(i))
+            .unwrap_or_else(|| unrepresentable(sel, &format!("colour attachment {index}")));
+        *slot = full_color_attachment(sel, c);
+    }
+    d.depth_format = optional_format(sel, desc.depth_pixel_format);
+    d.stencil_format = optional_format(sel, desc.stencil_pixel_format);
+    d.raster_sample_count = count(sel, "raster sample count", desc.raster_sample_count);
+    d.alpha_to_coverage = desc.alpha_to_coverage;
+    d.alpha_to_one = desc.alpha_to_one;
+    d.rasterization_enabled = desc.rasterization_enabled;
+    d.input_primitive_topology = metal_value(
+        sel,
+        "primitive topology class",
+        desc.input_primitive_topology,
+    );
+    d.max_vertex_amplification_count = count(
+        sel,
+        "maximum vertex amplification count",
+        desc.max_vertex_amplification_count,
+    );
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    let mut options = rt::PipelineOptions::default();
+    options.label = desc.label.map(str::to_owned);
+    timing::creation(
+        sel,
+        timing::RENDER_LATER,
+        || {
+            let state = plain_at(sel, || device.raw.new_render_pipeline_state(&d, &options));
+            let class = d.input_primitive_topology;
+            match made(
+                sel,
+                (class, RenderDescriptor::Render(Box::new(d.clone()))),
+                state,
+            ) {
+                Ok(answer) => answer,
+                Err(raise) => raise.fatal(),
+            }
+        },
+        || timing::render_stages(&d),
+        |made| timing::answer(made, |s| timing::state(s.unique_identifier())),
+    )
+}
+
+/// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` of the whole value `desc`,
+/// the graphics lane's, with no options and no reflection: its object, mesh and fragment
+/// functions, each with the functions its stage links, its colour attachments, its depth and
+/// stencil formats, its raster sample count, alpha-to-coverage, alpha-to-one, rasterization and
+/// indirect command buffer support are the runtime descriptor's own, and its label the options'.
+/// What the runtime's descriptor does not hold is the state's own ([`mesh_answers`]): the
+/// stages' maxima, the grid's maximum and the required threadgroup sizes, which its getters
+/// answer and its draws are held to. The execution-width promises are the guest's promise to
+/// Metal's compiler, which changes nothing a draw that keeps them draws: they are not carried.
+/// The payload length is not carried either: the runtime sizes the payload by the object and
+/// mesh functions' own payload types, the larger of the two, which is what Metal reads and
+/// writes of a function that reaches its payload through its type. A length past 16384 bytes is
+/// Metal's `NSError` ([`payload_refused`]). The maximum vertex amplification count is not
+/// carried: the runtime draws a mesh pipeline's draws at one amplification, which a descriptor
+/// of any maximum draws, and refuses a draw under a count past 1, which dies there. A raw value
+/// the runtime has no enumerator of dies at the send ([`metal_value`]); so does the compile's
+/// refusal where Metal answers no `NSError` ([`made`]): among them, on a device with
+/// `VK_EXT_mesh_shader` but without `taskShader`, an object function
+/// (`Unsupported{MeshShading}`). A device without `VK_EXT_mesh_shader` (MoltenVK among them)
+/// makes the state, its object and mesh functions run as compute work the runtime draws the
+/// records of (`emulated-mesh-draws`). The lane calls it inside its refusal scope.
+pub(crate) fn new_mesh_render_pipeline_state_full(
+    device: &VulkanDevice,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+    let sel = "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
+    if let Some(refusal) = wrong_mesh_stage(sel, desc) {
+        return Err(refusal);
+    }
+    if desc.payload_memory_length > METAL_PAYLOAD_BYTES {
+        return Err(payload_refused(desc.payload_memory_length));
+    }
+    let stage = |f: &VulkanFunction, linked| {
+        StageSource::Function(
+            f.function_descriptor()
+                .with_linked(linked_functions(linked)),
+        )
+    };
+    let mut d = MeshPipelineDescriptor::new(stage(desc.mesh, &desc.mesh_linked));
+    d.object = desc.object.map(|f| stage(f, &desc.object_linked));
+    d.fragment = desc.fragment.map(|f| stage(f, &desc.fragment_linked));
+    for (index, c) in &desc.colors {
+        let slot = usize::try_from(*index)
+            .ok()
+            .and_then(|i| d.color_attachments.get_mut(i))
+            .unwrap_or_else(|| unrepresentable(sel, &format!("colour attachment {index}")));
+        *slot = full_color_attachment(sel, c);
+    }
+    d.depth_format = optional_format(sel, desc.depth_pixel_format);
+    d.stencil_format = optional_format(sel, desc.stencil_pixel_format);
+    d.raster_sample_count = count(sel, "raster sample count", desc.raster_sample_count);
+    d.alpha_to_coverage = desc.alpha_to_coverage;
+    d.alpha_to_one = desc.alpha_to_one;
+    d.rasterization_enabled = desc.rasterization_enabled;
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    let answers = mesh_answers(device, desc);
+    let mut options = rt::PipelineOptions::default();
+    options.label = desc.label.map(str::to_owned);
+    timing::creation(
+        sel,
+        timing::RENDER_LATER,
+        || {
+            let state = plain_at(sel, || {
+                device.raw.new_mesh_render_pipeline_state(&d, &options)
+            });
+            let descriptor = RenderDescriptor::Mesh(Box::new(MeshDescriptor {
+                descriptor: d.clone(),
+                answers,
+            }));
+            let class = PrimitiveTopologyClass::Unspecified;
+            match made(sel, (class, descriptor), state) {
+                Ok(answer) => answer,
+                Err(raise) => raise.fatal(),
+            }
+        },
+        || timing::mesh_stages(&d),
+        |made| timing::answer(made, |s| timing::state(s.unique_identifier())),
+    )
+}
+
+/// The refusal of a mesh render pipeline whose stage function is of another stage's type, as the
+/// Metal platform refuses it before Metal sees the descriptor (`reims-vgpu-metal`'s
+/// `wrong_mesh_stage`): Metal on the M3 Max (macOS 27.0.1) ends the process with SIGSEGV at a
+/// vertex function as the mesh function, a mesh function as the fragment function and a fragment
+/// function as the object function, and refuses an object function as the mesh function and a
+/// mesh function as the object function (measured by the graphics lane's `oracle_mesh`). A
+/// guest's input never ends the host, so each is refused in the compiler's domain: code 2 for a
+/// vertex function as the mesh function, code 1 for the rest, the mesh function's type asked
+/// first, then the object function's, then the fragment function's, so both platforms answer
+/// one descriptor alike. A function whose type the runtime does not answer
+/// ([`rt::Function::function_type`]'s refusal) is left to the runtime's creation.
+fn wrong_mesh_stage(
+    sel: &'static str,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> Option<NsErrorText> {
+    use metal2vulkan::metal::FunctionType;
+    let stage = |f: &VulkanFunction| plain_at(sel, || f.function_type()).ok();
+    let refusal = |code: i64, description: &str| NsErrorText {
+        domain: "CompilerError".to_owned(),
+        code,
+        description: description.to_owned(),
+    };
+    let mesh = stage(desc.mesh);
+    if mesh == Some(FunctionType::Vertex) {
+        return Some(refusal(
+            2,
+            "RasterizationEnabled is false but the vertex shader's return type is not void",
+        ));
+    }
+    if mesh.is_some_and(|t| t != FunctionType::Mesh) {
+        return Some(refusal(
+            1,
+            "meshFunction functionType is not MTLFunctionTypeMesh.",
+        ));
+    }
+    let not = |f: Option<&VulkanFunction>, wanted| f.and_then(stage).is_some_and(|t| t != wanted);
+    if not(desc.object, FunctionType::Object) {
+        return Some(refusal(
+            1,
+            "objectFunction functionType is not MTLFunctionTypeObject.",
+        ));
+    }
+    if not(desc.fragment, FunctionType::Fragment) {
+        return Some(refusal(
+            1,
+            "fragmentFunction functionType is not MTLFunctionTypeFragment.",
+        ));
+    }
+    None
+}
+
+/// The most bytes of payload Metal makes a mesh render pipeline state of
+/// (`payloadMemoryLength`): past it the M3 Max (macOS 27.0.1), the AMD 5300M and the Intel 630
+/// (macOS 26.7.1) answer nil and an `NSError`, of 16385 bytes (`oracle_mesh make`'s
+/// `payload-big`), and make one of 256.
+const METAL_PAYLOAD_BYTES: u64 = 16384;
+
+/// The `NSError` of a mesh render pipeline whose payload length, `length`, is past
+/// [`METAL_PAYLOAD_BYTES`]: the M3 Max's code ([`METAL_REFUSES`]) and text, in the runtime's
+/// domain, as the compile's refusals are ([`pipeline_error`]). The AMD and the Intel 630 answer
+/// code 2 and text of their own; core reads only the description.
+fn payload_refused(length: u64) -> NsErrorText {
+    NsErrorText {
+        domain: crate::answer::RUNTIME_DOMAIN.to_owned(),
+        code: METAL_REFUSES,
+        description: format!(
+            "Object shader payload size ({length}) exceeds the maximum payload size allowed \
+             ({METAL_PAYLOAD_BYTES})"
+        ),
+    }
+}
+
+/// Metal's most threads of an object or mesh threadgroup: what
+/// `maxTotalThreadsPerObjectThreadgroup` and `maxTotalThreadsPerMeshThreadgroup` answer for a
+/// descriptor that sets no maximum, on the M3 Max, the AMD 5300M and the Intel 630
+/// (`oracle_mesh make`'s `object`). A threadgroup past
+/// it draws nothing on plain Metal, and the runtime's (`render/mesh.rs`).
+const METAL_THREADGROUP_THREADS: u64 = 1024;
+
+/// What `maxTotalThreadgroupsPerMeshGrid` answers on the M3 Max (macOS 27.0.1) for a descriptor
+/// that sets no maximum, or sets this (`oracle_mesh make`'s `plain` and `grid-big`): one past the
+/// mesh grid an object function may launch there, and on the runtime's devices, which launch none
+/// past `metal2vulkan::bind::METAL_MESH_GRID_TOTAL` threadgroups (Metal's, measured on the M3 Max).
+const METAL_MESH_GRID: u64 = 1 << 20;
+
+/// The most threads this device runs an object (`object`) or a mesh threadgroup of: Metal's
+/// ([`METAL_THREADGROUP_THREADS`]), within the device's own limit for the stage, which the runtime
+/// refuses a draw past (`Unsupported{MeshShading}` naming it): `maxTaskWorkGroupInvocations` or
+/// `maxMeshWorkGroupInvocations` where the device runs the stages natively (`VK_EXT_mesh_shader`
+/// and `meshShader` enabled), else `maxComputeWorkGroupInvocations`, as the runtime runs both
+/// stages as compute work there (`lower::mesh::emulates`, read).
+pub(crate) fn stage_threads(device: &VulkanDevice, object: bool) -> u64 {
+    use metal2vulkan::device::{VkExtension, VkFeature};
+    let profile = device.raw.compile_device().profile();
+    let (enabled, limits) = (profile.enabled(), profile.limits());
+    let native = enabled.extensions.contains(&VkExtension::ExtMeshShader)
+        && enabled.features.contains(&VkFeature::MeshShader);
+    let limit = match (native, object) {
+        (true, true) => limits.mesh.max_task_work_group_invocations,
+        (true, false) => limits.mesh.max_mesh_work_group_invocations,
+        (false, _) => limits.max_compute_work_group_invocations,
+    };
+    u64::from(limit).min(METAL_THREADGROUP_THREADS)
+}
+
+/// What a mesh render pipeline state of `desc` answers on `device`, and holds its draws to
+/// ([`MeshAnswers`]), of the values the runtime's descriptor does not hold. The answers describe
+/// the device, so they are this device's, where Metal's three measured GPUs differ (`oracle_mesh
+/// make`: the M3 Max on macOS 27.0.1, the AMD 5300M and the Intel 630 on macOS 26.7.1):
+/// - `maxTotalThreadsPerObjectThreadgroup` and `maxTotalThreadsPerMeshThreadgroup`: the
+///   descriptor's maximum where it sets one, else Metal's 1024, within the most this device runs
+///   a threadgroup of the stage with ([`stage_threads`]); the object stage's 0 without an object
+///   function. The M3 and the AMD answer 1024 for a stage whose maximum is not set and the
+///   descriptor's where it is (64, 32 and 100 measured), and the AMD 0 for the object stage
+///   without an object function, where the M3 answers 3; the Intel 630 answers 1024 whatever is
+///   set, and 0 without an object function. A maximum past 1024 is made, as the Intel 630 makes
+///   it, answering 1024, where the M3 and the AMD answer nil and an `NSError`: they differ, and
+///   a draw within the state's answer draws as Metal's either way.
+/// - `objectThreadExecutionWidth` and `meshThreadExecutionWidth`: 32, the width of the
+///   simdgroups the runtime gives object and mesh functions, as it gives a kernel
+///   (`metal_properties().thread_execution_width`), which all three answer; the object stage's 0
+///   without an object function, as the AMD and the Intel 630 answer (the M3 answers 32).
+/// - `maxTotalThreadgroupsPerMeshGrid`: the descriptor's maximum where it sets one, else
+///   [`METAL_MESH_GRID`], as the M3 answers (8 where it set 8); the AMD and the Intel 630 answer
+///   `NSUIntegerMax` whatever is set. The runtime holds no maximum of the descriptor's: an object
+///   function's grid past it, which Metal's answer is unmeasured for, launches as one within it.
+///
+/// The descriptor's maxima and required sizes are also what its draws are held to
+/// ([`MeshAnswers::held`]).
+fn mesh_answers(
+    device: &VulkanDevice,
+    desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+) -> MeshAnswers {
+    let object = desc.object.is_some();
+    let threads = |max: u64, of_object| {
+        let limit = stage_threads(device, of_object);
+        if max == 0 { limit } else { max.min(limit) }
+    };
+    let width = u64::from(plain(|| {
+        device
+            .raw
+            .compile_device()
+            .metal_properties()
+            .thread_execution_width
+    }));
+    let required = |s: MtlSize| (s != MtlSize::new(0, 0, 0)).then_some(s);
+    MeshAnswers {
+        object,
+        object_threads: match object {
+            true => threads(desc.max_total_threads_per_object_threadgroup, true),
+            false => 0,
+        },
+        mesh_threads: threads(desc.max_total_threads_per_mesh_threadgroup, false),
+        object_width: if object { width } else { 0 },
+        mesh_width: width,
+        grid: match desc.max_total_threadgroups_per_mesh_grid {
+            0 => METAL_MESH_GRID,
+            max => max,
+        },
+        held: [
+            MeshStageHeld {
+                max: desc.max_total_threads_per_object_threadgroup,
+                required: required(desc.required_threads_per_object_threadgroup),
+            },
+            MeshStageHeld {
+                max: desc.max_total_threads_per_mesh_threadgroup,
+                required: required(desc.required_threads_per_mesh_threadgroup),
+            },
+        ],
+    }
+}
+
+/// The runtime's linked functions of a whole value's: each function as a stage links it, with its
+/// constant values, under its specialized name where it was made with one, and precompiled where
+/// it was made compiled to a binary.
+fn linked_functions(l: &LinkedFunctionsDesc<VulkanPlatform>) -> LinkedFunctions {
+    let list = |fs: &[VulkanFunction]| fs.iter().map(|f| f.linked_function()).collect();
+    let mut out = LinkedFunctions::new();
+    out.functions = list(&l.functions);
+    out.binary_functions = list(&l.binary_functions);
+    out.groups = l
+        .groups
+        .iter()
+        .map(|(name, fs)| (name.clone(), list(fs)))
+        .collect();
+    out.private_functions = list(&l.private_functions);
+    out
+}
+
+/// The runtime's colour attachment of a whole value's: none for `MTLPixelFormatInvalid`.
+fn full_color_attachment(
+    sel: &'static str,
+    c: &ColorAttachmentDesc,
+) -> Option<ColorAttachmentDescriptor> {
+    let mut a = color_attachment(c.pixel_format)?;
+    a.blending_enabled = c.blending_enabled;
+    a.source_rgb_blend_factor = metal_value(sel, "blend factor", c.source_rgb_blend_factor);
+    a.destination_rgb_blend_factor =
+        metal_value(sel, "blend factor", c.destination_rgb_blend_factor);
+    a.rgb_blend_operation = metal_value(sel, "blend operation", c.rgb_blend_operation);
+    a.source_alpha_blend_factor = metal_value(sel, "blend factor", c.source_alpha_blend_factor);
+    a.destination_alpha_blend_factor =
+        metal_value(sel, "blend factor", c.destination_alpha_blend_factor);
+    a.alpha_blend_operation = metal_value(sel, "blend operation", c.alpha_blend_operation);
+    a.write_mask = metal_value(sel, "colour write mask", c.write_mask);
+    Some(a)
+}
+
+/// A depth or stencil attachment's format: none for `MTLPixelFormatInvalid`.
+fn optional_format(sel: &'static str, raw: u64) -> Option<metal2vulkan::metal::PixelFormat> {
+    (raw != 0).then(|| crate::gpu::pixel_format(sel, raw))
+}
+
+/// A count the runtime holds as a `u32`.
+fn count(sel: &'static str, what: &str, raw: u64) -> u32 {
+    u32::try_from(raw).unwrap_or_else(|_| unrepresentable(sel, &format!("{what} {raw}")))
+}
+
+/// `MTLBufferLayoutStrideDynamic` (`NSUIntegerMax`), a layout's stride the runtime holds as
+/// `None`.
+const DYNAMIC_STRIDE: u64 = u64::MAX;
+
+/// A layout's stride: `None` for `MTLBufferLayoutStrideDynamic`.
+fn layout_stride(sel: &'static str, raw: u64) -> Option<u32> {
+    (raw != DYNAMIC_STRIDE).then(|| count(sel, "buffer layout stride", raw))
+}
+
+/// The runtime's vertex descriptor of a whole value's: each layout and attribute at its index,
+/// and a layout, as Metal's array holds one, for each buffer an attribute reads that the value
+/// sets none of.
+fn vertex_descriptor(sel: &'static str, v: &VertexDesc) -> VertexDescriptor {
+    let mut out = VertexDescriptor::new();
+    for l in &v.layouts {
+        let mut layout = VertexBufferLayoutDescriptor::new(layout_stride(sel, l.stride));
+        layout.step_function = metal_value(sel, "vertex step function", l.step_function);
+        layout.step_rate = count(sel, "vertex step rate", l.step_rate);
+        out.layouts
+            .insert(count(sel, "vertex buffer index", l.buffer_index), layout);
+    }
+    for a in &v.attributes {
+        let attribute = VertexAttributeDescriptor::new(
+            metal_value(sel, "vertex format", a.format),
+            count(sel, "vertex attribute offset", a.offset),
+            count(sel, "vertex buffer index", a.buffer_index),
+        );
+        out.attributes.insert(
+            count(sel, "vertex attribute index", a.attribute_index),
+            attribute,
+        );
+    }
+    for buffer in out.attributes.values().map(|a| a.buffer_index) {
+        out.layouts
+            .entry(buffer)
+            .or_insert_with(|| VertexBufferLayoutDescriptor::new(Some(0)));
+    }
+    out
+}
+
+/// The runtime's stage-input descriptor of a whole value's, as [`vertex_descriptor`] makes a
+/// vertex descriptor's, with its index type and index buffer.
+pub(crate) fn stage_input_descriptor(
+    sel: &'static str,
+    s: &StageInputDesc,
+) -> StageInputDescriptor {
+    let mut out = StageInputDescriptor::new();
+    for l in &s.layouts {
+        let mut layout = StageInputLayoutDescriptor::new(layout_stride(sel, l.stride));
+        layout.step_function = metal_value(sel, "step function", l.step_function);
+        layout.step_rate = count(sel, "step rate", l.step_rate);
+        out.layouts.insert(
+            count(sel, "stage-input buffer index", l.buffer_index),
+            layout,
+        );
+    }
+    for a in &s.attributes {
+        let attribute = StageInputAttributeDescriptor::new(
+            metal_value(sel, "attribute format", a.format),
+            count(sel, "stage-input attribute offset", a.offset),
+            count(sel, "stage-input buffer index", a.buffer_index),
+        );
+        out.attributes.insert(
+            count(sel, "stage-input attribute index", a.attribute_index),
+            attribute,
+        );
+    }
+    for buffer in out.attributes.values().map(|a| a.buffer_index) {
+        out.layouts
+            .entry(buffer)
+            .or_insert_with(|| StageInputLayoutDescriptor::new(Some(0)));
+    }
+    out.index_type = metal_value(sel, "index type", s.index_type);
+    out.index_buffer_index = count(sel, "index buffer index", s.index_buffer_index);
+    out
+}
+
+/// The runtime's compute descriptor of a whole value's, the graphics lane's.
+pub(crate) fn full_compute_descriptor(
+    sel: &'static str,
+    desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
+) -> ComputePipelineDescriptor {
+    let mut d = ComputePipelineDescriptor::new(StageSource::Function(
+        desc.function
+            .function_descriptor()
+            .with_linked(linked_functions(&desc.linked)),
+    ));
+    d.threadgroup_size_is_multiple_of_execution_width =
+        desc.threadgroup_size_is_multiple_of_execution_width;
+    d.max_total_threads_per_threadgroup =
+        (desc.max_total_threads_per_threadgroup != 0).then(|| {
+            count(
+                sel,
+                "maximum threads per threadgroup",
+                desc.max_total_threads_per_threadgroup,
+            )
+        });
+    d.max_call_stack_depth = count(sel, "maximum call stack depth", desc.max_call_stack_depth);
+    d.support_indirect_command_buffers = desc.support_indirect_command_buffers;
+    d.stage_input = desc
+        .stage_input
+        .as_ref()
+        .map(|s| stage_input_descriptor(sel, s));
+    d
+}
+
 /// The runtime's options of Metal's raw `MTLPipelineOption`, the state placed at `placement` and
 /// labelled `label`.
 fn pipeline_options(
@@ -518,11 +1018,13 @@ fn pipeline_options(
 }
 
 /// A pipeline creator's answer to core: the state, of the descriptor's input primitive topology
-/// `class`, the `NSError` ([`pipeline_error`]), or a death at the selector for the rest: an ID past
-/// Metal's limit, a gap of the runtime (an unspecialized function constant among them, which
-/// Metal aborts for), an answer it cannot prove ([`unproven`]: a state that supports indirect
-/// command buffers whose functions' use of a direct texture or sampler argument the compile layer
-/// refused to decide among them), and its other refusals, as Metal raises at none.
+/// `class`, the `NSError` ([`pipeline_error`]), the runtime's refusal as the `NSError` for a gap
+/// of its own or the device's, relayed by default ([`crate::answer::relay_gap`]), or a death at
+/// the selector for the rest: an ID past Metal's limit, an unspecialized function constant, which
+/// Metal aborts for, a gap in strict mode, an answer it cannot prove ([`unproven`]: a state that
+/// supports indirect command buffers whose functions' use of a direct texture or sampler argument
+/// the compile layer refused to decide among them), and its other refusals, as Metal raises at
+/// none.
 fn made(
     sel: &'static str,
     (class, descriptor): (PrimitiveTopologyClass, RenderDescriptor),
@@ -552,6 +1054,7 @@ fn made(
                 rt::Error::Unproven(unproven) => {
                     self::unproven(sel, unproven, &e, &formats(&descriptor))
                 }
+                _ if relay_gap(sel, &e, Some(&formats(&descriptor))) => Ok(Err(error_text(&e))),
                 _ => decide_describing(sel, Policy::Dies, e, Some(&formats(&descriptor))),
             },
         },
@@ -593,6 +1096,7 @@ pub(crate) fn formats(d: &RenderDescriptor) -> String {
     match d {
         RenderDescriptor::Render(d) => render_formats(d),
         RenderDescriptor::Tile(d) => tile_formats(d),
+        RenderDescriptor::Mesh(m) => mesh_formats(&m.descriptor),
     }
 }
 
@@ -611,29 +1115,10 @@ fn listed(items: Vec<String>, none: &str) -> String {
     format!("the descriptor's formats: {items}")
 }
 
-/// A render descriptor's formats, by index: each colour attachment's pixel format, its blend
-/// state ([`blend_state`]) and write mask, the depth and stencil formats, and its vertex
-/// descriptor's attribute formats.
+/// A render descriptor's formats, by index: its attachments' ([`attachment_formats`]), then its
+/// vertex descriptor's attribute formats.
 pub(crate) fn render_formats(d: &RenderPipelineDescriptor) -> String {
-    let format = |f: metal2vulkan::metal::PixelFormat| named(f.as_raw(), f.name());
-    let mut items: Vec<String> = (d.color_attachments.iter().enumerate())
-        .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
-        .map(|(i, c)| {
-            let (format, mask) = (format(c.pixel_format), c.write_mask.as_raw());
-            let blend = blend_state(c);
-            format!("colour {i} {format} {blend} write mask {mask:#x}")
-        })
-        .collect();
-    if items.is_empty() {
-        items.push("no colour attachments".to_owned());
-    }
-    items.push(
-        d.depth_format
-            .map_or("no depth".to_owned(), |f| format!("depth {}", format(f))),
-    );
-    items.push(d.stencil_format.map_or("no stencil".to_owned(), |f| {
-        format!("stencil {}", format(f))
-    }));
+    let mut items = attachment_formats(&d.color_attachments, d.depth_format, d.stencil_format);
     match &d.vertex_descriptor {
         None => items.push("no vertex descriptor".to_owned()),
         Some(v) if v.attributes.is_empty() => items.push("no vertex attributes".to_owned()),
@@ -645,6 +1130,40 @@ pub(crate) fn render_formats(d: &RenderPipelineDescriptor) -> String {
         })),
     }
     listed(items, "")
+}
+
+/// A mesh render descriptor's formats, by index: its attachments' ([`attachment_formats`]).
+pub(crate) fn mesh_formats(d: &MeshPipelineDescriptor) -> String {
+    listed(
+        attachment_formats(&d.color_attachments, d.depth_format, d.stencil_format),
+        "",
+    )
+}
+
+/// A drawing descriptor's attachments' formats, by index: each colour attachment's pixel
+/// format, its blend state ([`blend_state`]) and write mask, then the depth and stencil formats.
+fn attachment_formats(
+    colors: &[Option<ColorAttachmentDescriptor>],
+    depth: Option<metal2vulkan::metal::PixelFormat>,
+    stencil: Option<metal2vulkan::metal::PixelFormat>,
+) -> Vec<String> {
+    let format = |f: metal2vulkan::metal::PixelFormat| named(f.as_raw(), f.name());
+    let mut items: Vec<String> = (colors.iter().enumerate())
+        .filter_map(|(i, c)| c.as_ref().map(|c| (i, c)))
+        .map(|(i, c)| {
+            let (format, mask) = (format(c.pixel_format), c.write_mask.as_raw());
+            let blend = blend_state(c);
+            format!("colour {i} {format} {blend} write mask {mask:#x}")
+        })
+        .collect();
+    if items.is_empty() {
+        items.push("no colour attachments".to_owned());
+    }
+    items.push(depth.map_or("no depth".to_owned(), |f| format!("depth {}", format(f))));
+    items.push(stencil.map_or("no stencil".to_owned(), |f| {
+        format!("stencil {}", format(f))
+    }));
+    items
 }
 
 /// A colour attachment's blend state as a death's line names it: whether it blends, then its rgb
@@ -845,6 +1364,543 @@ mod tests {
              address modes s unset t unset r unset, border colour unset, normalized coordinates \
              unset, lod min unset max unset average unset, max anisotropy unset, compare function \
              unset, reduction mode unset, supportArgumentBuffers unset, resource index unset"
+        );
+    }
+
+    /// The suite's vertex function fed through a vertex descriptor (attribute 0 a `float2`,
+    /// attribute 1 a normalized `uchar4`, buffer 0) and the fragment function that returns the
+    /// colour it outputs.
+    fn vertex_descriptor_functions() -> (VulkanFunction, VulkanFunction) {
+        use crate::gpu::serialized::tests::fixture_function;
+        (
+            fixture_function(include_bytes!(
+                "../../../../tests/suite/fixtures/shaders/render_vdesc.metallib"
+            )),
+            fixture_function(include_bytes!(
+                "../../../../tests/suite/fixtures/shaders/render_color.metallib"
+            )),
+        )
+    }
+
+    /// The whole render value of `vertex` and `fragment`: colour 0 BGRA8Unorm, no vertex
+    /// descriptor, Metal's defaults elsewhere.
+    fn full_render<'a>(
+        vertex: &'a VulkanFunction,
+        fragment: Option<&'a VulkanFunction>,
+    ) -> FullRenderPipelineDesc<'a, VulkanPlatform> {
+        FullRenderPipelineDesc {
+            label: Some("whole"),
+            vertex,
+            fragment,
+            vertex_descriptor: None,
+            colors: vec![(
+                0,
+                ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..ColorAttachmentDesc::default()
+                },
+            )],
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: true,
+            input_primitive_topology: 0,
+            max_vertex_amplification_count: 1,
+            support_indirect_command_buffers: false,
+            vertex_linked: LinkedFunctionsDesc::default(),
+            fragment_linked: LinkedFunctionsDesc::default(),
+        }
+    }
+
+    /// A vertex function that reads `[[stage_in]]` attributes makes a pipeline with the vertex
+    /// descriptor the whole value carries, and with none is the compile's `NSError` for the
+    /// attribute it lacks
+    #[test]
+    fn a_whole_render_value_carries_its_vertex_descriptor() {
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let (v, f) = vertex_descriptor_functions();
+        let d = dev();
+        let mut desc = full_render(&v, Some(&f));
+        let e = d.new_render_pipeline_state_full(&desc).unwrap_err();
+        assert!(
+            e.description.contains("VertexAttribute { attribute: 0 }"),
+            "{e:?}"
+        );
+        desc.vertex_descriptor = Some(VertexDesc {
+            layouts: vec![BufferLayoutDesc {
+                buffer_index: 0,
+                stride: 12,
+                step_function: 1,
+                step_rate: 1,
+            }],
+            attributes: vec![
+                AttributeDesc {
+                    attribute_index: 0,
+                    format: 29,
+                    offset: 0,
+                    buffer_index: 0,
+                },
+                AttributeDesc {
+                    attribute_index: 1,
+                    format: 9,
+                    offset: 8,
+                    buffer_index: 0,
+                },
+            ],
+        });
+        let made = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
+        assert_ne!(made.unique_identifier(), 0);
+    }
+
+    /// The runtime's descriptor of a whole render value holds every field it carries, each raw
+    /// value the runtime's own: the colour attachments with their blend state and write masks,
+    /// the depth and stencil formats, the sample count, the flags, the topology and the
+    /// amplification count; a raw value the runtime has no enumerator of dies at the send
+    #[test]
+    fn a_whole_render_value_is_the_runtime_s_descriptor() {
+        use metal2vulkan::metal::{
+            BlendFactor, BlendOperation, ColorWriteMask, PrimitiveTopologyClass,
+        };
+        let (v, f) = vertex_descriptor_functions();
+        let sel = "newRenderPipelineStateWithDescriptor:error:";
+        let c = ColorAttachmentDesc {
+            pixel_format: 115,
+            blending_enabled: true,
+            source_rgb_blend_factor: 4,
+            destination_rgb_blend_factor: 5,
+            rgb_blend_operation: 1,
+            source_alpha_blend_factor: 2,
+            destination_alpha_blend_factor: 7,
+            alpha_blend_operation: 3,
+            write_mask: 0x9,
+        };
+        let a = full_color_attachment(sel, &c).unwrap();
+        assert_eq!(a.pixel_format, PixelFormat::RGBA16Float);
+        assert!(a.blending_enabled);
+        assert_eq!(
+            (
+                a.source_rgb_blend_factor,
+                a.destination_rgb_blend_factor,
+                a.source_alpha_blend_factor,
+                a.destination_alpha_blend_factor
+            ),
+            (
+                BlendFactor::try_from(4).unwrap(),
+                BlendFactor::try_from(5).unwrap(),
+                BlendFactor::try_from(2).unwrap(),
+                BlendFactor::try_from(7).unwrap()
+            )
+        );
+        assert_eq!(
+            (a.rgb_blend_operation, a.alpha_blend_operation),
+            (
+                BlendOperation::try_from(1).unwrap(),
+                BlendOperation::try_from(3).unwrap()
+            )
+        );
+        assert_eq!(a.write_mask, ColorWriteMask::try_from(9).unwrap());
+        assert_eq!(
+            full_color_attachment(sel, &ColorAttachmentDesc::default()),
+            None,
+            "no format, no attachment"
+        );
+        let site = catch_death(|| {
+            full_color_attachment(
+                sel,
+                &ColorAttachmentDesc {
+                    source_rgb_blend_factor: 99,
+                    ..c
+                },
+            )
+        })
+        .unwrap_err();
+        assert_eq!(site.file, sel);
+        assert_eq!(optional_format(sel, 0), None);
+        assert_eq!(optional_format(sel, 252), Some(PixelFormat::Depth32Float));
+        let mut desc = full_render(&v, Some(&f));
+        desc.input_primitive_topology = 99;
+        let site = catch_death(|| d_new(&desc)).unwrap_err();
+        assert_eq!(site.file, sel, "no topology class 99");
+        assert_eq!(
+            metal_value::<PrimitiveTopologyClass>(sel, "primitive topology class", 3),
+            PrimitiveTopologyClass::Triangle
+        );
+    }
+
+    /// [`GpuDevice::new_render_pipeline_state_full`] on the default device.
+    fn d_new(
+        desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        dev().new_render_pipeline_state_full(desc)
+    }
+
+    /// A kernel that reads `[[stage_in]]` attributes makes a compute pipeline with the
+    /// stage-input descriptor the whole value carries, and dies at the send with none; the
+    /// value's other fields are the runtime descriptor's own
+    #[test]
+    fn a_whole_compute_value_carries_its_stage_input() {
+        use crate::gpu::serialized::tests::{STAGEIN, fixture_function};
+        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        use reims_vgpu_core::platform::values::{AttributeDesc, BufferLayoutDesc};
+        let f = fixture_function(STAGEIN);
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let mut desc = FullComputePipelineDesc {
+            label: Some("stage in"),
+            function: &f,
+            threadgroup_size_is_multiple_of_execution_width: true,
+            max_total_threads_per_threadgroup: 128,
+            max_call_stack_depth: 3,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+            linked: LinkedFunctionsDesc::default(),
+        };
+        let site = catch_death(|| dev().new_compute_pipeline_state_full(&desc)).unwrap_err();
+        assert_eq!(site.file, sel);
+        desc.stage_input = Some(StageInputDesc {
+            layouts: vec![BufferLayoutDesc {
+                buffer_index: 1,
+                stride: 4,
+                step_function: 5,
+                step_rate: 1,
+            }],
+            attributes: vec![AttributeDesc {
+                attribute_index: 0,
+                format: 36,
+                offset: 0,
+                buffer_index: 1,
+            }],
+            index_type: 1,
+            index_buffer_index: 0,
+        });
+        let d = full_compute_descriptor(sel, &desc);
+        assert!(d.threadgroup_size_is_multiple_of_execution_width);
+        assert_eq!(d.max_total_threads_per_threadgroup, Some(128));
+        assert_eq!(d.max_call_stack_depth, 3);
+        let s = d.stage_input.as_ref().unwrap();
+        assert_eq!(s.layouts[&1].stride, Some(4));
+        assert_eq!(s.attributes[&0].buffer_index, 1);
+        let made = dev()
+            .new_compute_pipeline_state_full(&desc)
+            .unwrap()
+            .unwrap();
+        assert_eq!(made.max_total_threads_per_threadgroup(), 128);
+    }
+
+    /// `linked_caller.metal`'s kernel, vertex and fragment functions, and `linked_callee.metal`'s
+    /// `linked_add_one`, which they call, made by name and, with `COMPILE_TO_BINARY`, by
+    /// descriptor.
+    fn linked_functions_of_fixtures() -> [VulkanFunction; 5] {
+        use crate::gpu::resource::VulkanLibrary;
+        let d = dev();
+        let library = |bytes: &[u8]| d.new_library(bytes).unwrap().unwrap().unwrap();
+        let caller = library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linked_caller.metallib"
+        )));
+        let callee = library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/linked_callee.metallib"
+        )));
+        let named =
+            |l: &VulkanLibrary, name: &str| l.new_function(OnFault::Return, name).unwrap().unwrap();
+        let binary = callee
+            .new_function_with_options(OnFault::Return, "linked_add_one", &[], 1, None)
+            .unwrap()
+            .unwrap();
+        [
+            named(&caller, "linked_kernel"),
+            named(&caller, "linked_vertex"),
+            named(&caller, "linked_fragment"),
+            named(&callee, "linked_add_one"),
+            binary,
+        ]
+    }
+
+    /// A kernel that calls a visible function its library does not define is made with the
+    /// function linked by functions, private functions, or a group with it in private functions,
+    /// and is refused with Metal's code with none, with a group alone, and with binary functions
+    /// alone holding it, made compiled to a binary or not, as a direct call resolves by no binary
+    /// function (`metal_tests::unresolved_visible_calls_are_metals`). The value carries a binary
+    /// function as one made compiled to a binary
+    #[test]
+    fn a_whole_compute_value_carries_its_linked_functions() {
+        let [kernel, _, _, add_one, binary] = linked_functions_of_fixtures();
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let desc = |linked| FullComputePipelineDesc {
+            label: None,
+            function: &kernel,
+            threadgroup_size_is_multiple_of_execution_width: false,
+            max_total_threads_per_threadgroup: 0,
+            max_call_stack_depth: 1,
+            support_indirect_command_buffers: false,
+            stage_input: None,
+            linked,
+        };
+        let one = |f: &VulkanFunction| vec![f.clone_ref()];
+        let linked = |functions, binary_functions, groups, private_functions| LinkedFunctionsDesc {
+            functions,
+            binary_functions,
+            groups,
+            private_functions,
+        };
+        let made = |l: LinkedFunctionsDesc<VulkanPlatform>| {
+            catch_death(|| dev().new_compute_pipeline_state_full(&desc(l)))
+        };
+        for l in [
+            linked(one(&add_one), vec![], vec![], vec![]),
+            linked(vec![], vec![], vec![], one(&add_one)),
+            linked(
+                vec![],
+                vec![],
+                vec![("g".to_owned(), one(&add_one))],
+                one(&add_one),
+            ),
+        ] {
+            let shown = format!("{l:?}");
+            let state = made(l);
+            assert!(matches!(state, Ok(Ok(Some(_)))), "{shown}: {state:?}");
+        }
+        let d = full_compute_descriptor(
+            sel,
+            &desc(linked(one(&add_one), one(&binary), vec![], vec![])),
+        );
+        let StageSource::Function(f) = &d.kernel else {
+            panic!("{:?}", d.kernel);
+        };
+        assert_eq!(f.linked.functions.len(), 1);
+        assert!(!f.linked.functions[0].precompiled);
+        assert!(f.linked.binary_functions[0].precompiled);
+        for refused in [
+            LinkedFunctionsDesc::default(),
+            linked(
+                vec![],
+                vec![],
+                vec![("g".to_owned(), one(&add_one))],
+                vec![],
+            ),
+            linked(vec![], one(&binary), vec![], vec![]),
+            linked(vec![], one(&add_one), vec![], vec![]),
+        ] {
+            let shown = format!("{refused:?}");
+            let state = made(refused);
+            assert!(
+                matches!(&state, Ok(Err(e)) if e.code == METAL_REFUSES),
+                "{shown}: {state:?}"
+            );
+        }
+    }
+
+    /// `linked_caller.metal`'s and `linked_callee.metal`'s metallibs, compiled by build.rs.
+    pub(super) const LINKED_CALLER: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/linked_caller.metallib"));
+    pub(super) const LINKED_CALLEE: &[u8] =
+        include_bytes!(concat!(env!("OUT_DIR"), "/linked_callee.metallib"));
+
+    /// The float constant of `index` whose value is `v`.
+    fn float_constant(index: u32, v: f32) -> reims_vgpu_core::platform::resource::FunctionConstant {
+        let mut value = [0; reims_vgpu_core::platform::resource::FunctionConstant::MAX_BYTES];
+        value[..4].copy_from_slice(&v.to_le_bytes());
+        reims_vgpu_core::platform::resource::FunctionConstant {
+            index,
+            data_type: 3,
+            value,
+        }
+    }
+
+    /// `linked_callee.metal`'s `linked_gradient` of `callee` with `linked_gradient_scale` 0.5,
+    /// made by descriptor under `specialized` where given: the function RenderBox links under
+    /// `custom_fn`. `None` where the library makes none.
+    pub(super) fn gradient<P: reims_vgpu_core::platform::Platform>(
+        callee: &P::Library,
+        specialized: Option<&str>,
+    ) -> Option<P::Function> {
+        callee
+            .new_function_with_options(
+                OnFault::Return,
+                "linked_gradient",
+                &[float_constant(1, 0.5)],
+                0,
+                specialized,
+            )
+            .unwrap()
+    }
+
+    /// What `linked_caller.metal`'s `linked_effect_fragment` of `caller`, with
+    /// `linked_effect_alpha` 0.75 and `linked` linked to its stage (RenderBox's custom effect),
+    /// writes for each pixel of a 4x4 target on `p`'s device `d`, by its bits: `None` where the
+    /// pipeline is refused.
+    pub(super) fn custom_effect<P: reims_vgpu_core::platform::Platform>(
+        p: &P,
+        d: &P::Device,
+        caller: &P::Library,
+        linked: &P::Function,
+    ) -> Option<Vec<[u32; 4]>> {
+        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
+        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+        let _pool = reims_vgpu_core::rt::Pool::here();
+        let vertex = caller
+            .new_function(OnFault::Die, "linked_effect_vertex")
+            .unwrap()
+            .unwrap();
+        let fragment = caller
+            .new_function_with_options(
+                OnFault::Return,
+                "linked_effect_fragment",
+                &[float_constant(0, 0.75)],
+                0,
+                None,
+            )
+            .unwrap()
+            .unwrap();
+        let state = d
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                label: Some("custom effect"),
+                vertex: &vertex,
+                fragment: Some(&fragment),
+                vertex_descriptor: None,
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: 80,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                depth_pixel_format: 0,
+                stencil_pixel_format: 0,
+                raster_sample_count: 1,
+                alpha_to_coverage: false,
+                alpha_to_one: false,
+                rasterization_enabled: true,
+                input_primitive_topology: 0,
+                max_vertex_amplification_count: 1,
+                support_indirect_command_buffers: false,
+                vertex_linked: LinkedFunctionsDesc::default(),
+                fragment_linked: LinkedFunctionsDesc {
+                    functions: vec![linked.clone_ref()],
+                    ..LinkedFunctionsDesc::default()
+                },
+            })
+            .ok()??;
+        let out = d
+            .new_buffer_of_length(OnFault::Die, 16 * 16, 0)
+            .unwrap()
+            .unwrap();
+        let target = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: 2,
+                    pixel_format: 80,
+                    width: 4,
+                    height: 4,
+                    usage: 4,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap();
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        let buffers = [Some(&out)];
+        for cmd in [
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&state),
+            },
+            RenderCmd::SetFragmentBuffers {
+                buffers: &buffers,
+                offsets: &[0],
+                range: NsRange::new(0, 1),
+            },
+            RenderCmd::DrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            },
+            RenderCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Die, cmd).unwrap();
+        }
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert!(cb.error().is_none(), "{:?}", cb.error());
+        // SAFETY: a Shared buffer of 16 float4s, read after the command buffer completed.
+        let floats = unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<f32>(), 64) };
+        Some(
+            floats
+                .chunks(4)
+                .map(|c| [0, 1, 2, 3].map(|i| c[i].to_bits()))
+                .collect(),
+        )
+    }
+
+    /// RenderBox's custom effect: a function made with a specialized name answers it as its
+    /// name, and a fragment function that calls a visible function of that name links it, its
+    /// own constants and the linked function's each read; each pixel reads the linked
+    /// `linked_gradient` at its centre with `linked_gradient_scale` 0.5, and alpha
+    /// `linked_effect_alpha` 0.75. The same function made under its own name, or under another,
+    /// leaves the call unresolved, and the pipeline refused
+    #[test]
+    fn a_function_with_a_specialized_name_links_under_it() {
+        use crate::gpu::resource::VulkanLibrary;
+        let (p, d) = (crate::platform::tests::platform(), dev());
+        let library = |bytes| -> VulkanLibrary { d.new_library(bytes).unwrap().unwrap().unwrap() };
+        let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
+        let custom = gradient::<VulkanPlatform>(&callee, Some("custom_fn")).unwrap();
+        assert_eq!(custom.name(), "custom_fn");
+        let drawn = custom_effect(&p, &d, &caller, &custom).expect("the pipeline was refused");
+        let want: Vec<[u32; 4]> = (0u8..16)
+            .map(|i| {
+                let (x, y) = (f32::from(i % 4) + 0.5, f32::from(i / 4) + 0.5);
+                [x * 0.5, y * 0.25, 0.5, 0.75].map(f32::to_bits)
+            })
+            .collect();
+        assert_eq!(drawn, want);
+        for specialized in [None, Some("other_fn")] {
+            let linked = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
+            let name = specialized.unwrap_or("linked_gradient");
+            assert_eq!(linked.name(), name);
+            let refused = catch_death(|| custom_effect(&p, &d, &caller, &linked));
+            assert!(matches!(refused, Ok(None)), "{name}: {refused:?}");
+        }
+    }
+
+    /// A vertex function that calls a visible function its library does not define is made with
+    /// the function linked to the vertex stage, and refused with Metal's code with it linked to
+    /// the fragment stage
+    #[test]
+    fn a_whole_render_value_carries_its_stages_linked_functions() {
+        let [_, vertex, fragment, add_one, _] = linked_functions_of_fixtures();
+        let made = |vertex_linked, fragment_linked| {
+            let mut desc = full_render(&vertex, Some(&fragment));
+            desc.vertex_linked = vertex_linked;
+            desc.fragment_linked = fragment_linked;
+            catch_death(|| dev().new_render_pipeline_state_full(&desc))
+        };
+        let functions = |f: &VulkanFunction| LinkedFunctionsDesc {
+            functions: vec![f.clone_ref()],
+            ..LinkedFunctionsDesc::default()
+        };
+        let state = made(functions(&add_one), LinkedFunctionsDesc::default());
+        assert!(matches!(state, Ok(Ok(Some(_)))), "{state:?}");
+        let state = made(LinkedFunctionsDesc::default(), functions(&add_one));
+        assert!(
+            matches!(&state, Ok(Err(e)) if e.code == METAL_REFUSES),
+            "{state:?}"
         );
     }
 
@@ -1065,6 +2121,28 @@ mod tests {
             .unwrap();
         assert_ne!(nearest.id(), a.id());
         assert_ne!(nearest.gpu_resource_id(), a.gpu_resource_id());
+    }
+
+    /// Among many live samplers, and past a sweep of the handles of ones gone, each equal request
+    /// still answers the one object while it lives
+    #[test]
+    fn equal_sampler_requests_are_one_object_among_many() {
+        let d = dev();
+        let desc = |i: u16| SamplerDesc {
+            lod_max_clamp: Some(1000.0 - f32::from(i)),
+            ..SamplerDesc::default()
+        };
+        let held: Vec<_> = (0..200)
+            .map(|i| d.new_sampler_state(&desc(i)).unwrap().unwrap())
+            .collect();
+        for i in 200..400 {
+            drop(d.new_sampler_state(&desc(i)).unwrap().unwrap());
+        }
+        for (i, h) in (0..).zip(&held) {
+            let again = d.new_sampler_state(&desc(i)).unwrap().unwrap();
+            assert_eq!(again.id(), h.id(), "{i}");
+            assert_eq!(again.gpu_resource_id(), h.gpu_resource_id(), "{i}");
+        }
     }
 
     /// A value's resource index places the sampler at that ID, and its resource index is its ID

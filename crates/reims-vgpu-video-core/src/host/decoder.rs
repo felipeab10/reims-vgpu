@@ -16,6 +16,8 @@
 //! copy runs on a thread of its own, and the session's thread decodes the
 //! next `dfrm` meanwhile, if the guest has sent it; what the guest sees
 //! stays as it was (ours).
+//!
+//! [`ReplyClerk`]: super::reply_clerk::ReplyClerk
 
 mod avc_record;
 mod frame_times;
@@ -646,7 +648,7 @@ impl Worker {
     fn take_up_frame(&self) {
         let _ = self
             .frames_queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 queued.checked_sub(1)
             });
     }
@@ -1967,6 +1969,7 @@ impl ZeroCopy {
         parts.device += clock.elapsed_since(writing);
         match written {
             Ok(DeviceWrite::Written) => {
+                held.surface.device_wrote();
                 parts.written += 1;
                 Some(Ok(()))
             }
@@ -1980,6 +1983,12 @@ impl ZeroCopy {
                     "frame {} cannot be written into the guest's buffer: {error}",
                     frame.frame_id()
                 );
+                // A device that missed its deadline may still write the buffer: told of
+                // once it is done (`GuestHold`).
+                let wrote = Arc::clone(held);
+                target
+                    .hold()
+                    .report_late_write(Box::new(move || wrote.surface.device_wrote()));
                 Some(Err(error.status()))
             }
         }

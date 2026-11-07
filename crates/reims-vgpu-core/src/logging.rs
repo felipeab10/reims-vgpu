@@ -13,7 +13,8 @@
 //! `REIMS_VGPU_LOG` is a level (`off`, `error`, `warn`, `info`, `debug` or `trace`), optionally
 //! followed by `,target=level` pairs: `warn,reims_vgpu_core::fifo=debug` ([`Filter::parse`]).
 //! When it is set, its filter decides which lines are written, to the hook too; when it isn't,
-//! the hook's own level does.
+//! the hook's own level does. A diagnostic whose own work costs the work it watches runs only
+//! where the variable names its target itself ([`names`]), not under a lone level.
 //!
 //! Which lines are written, and whether a line's arguments are evaluated, are diagnostics: a line
 //! evaluates its arguments only when a logger takes it, so no argument has an effect. A value a
@@ -22,6 +23,7 @@
 
 use std::fmt::Write as _;
 use std::io::Write as _;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use log::{Level, LevelFilter, Log, Metadata, Record};
@@ -97,6 +99,26 @@ impl Filter {
             .map(|(_, level)| *level)
             .fold(self.rest, Ord::max)
     }
+
+    /// Whether a pair names `target` itself, up to `level` or finer: a lone level does not, nor
+    /// does a pair of a target above it (`reims_vgpu` for `reims_vgpu::work`) or below it. The
+    /// last pair of `target` decides, as in [`Self::level`].
+    pub fn names(&self, target: &str, level: Level) -> bool {
+        (self.targets.iter().rev())
+            .find(|(named, _)| named == target)
+            .is_some_and(|(_, up_to)| level <= *up_to)
+    }
+}
+
+/// Whether `REIMS_VGPU_LOG` names `target` itself, up to `level` or finer ([`Filter::names`]).
+/// False where the variable is not set: a hook's level is a lone level. For a diagnostic whose
+/// own work costs the work it watches, which runs only where its target is asked for by name,
+/// not under a lone level such as a bug report's `debug`. Whether its lines are then written is
+/// still the logger's to say (`log::log_enabled!`).
+pub fn names(target: &str, level: Level) -> bool {
+    LOGGER
+        .env()
+        .is_some_and(|filter| filter.names(target, level))
 }
 
 /// Whether the filter's `prefix` covers `target`: it is `target`, or `target`'s path above a `::`.
@@ -116,6 +138,24 @@ struct Logger {
     /// `REIMS_VGPU_LOG`'s filter, read on first use; `None` if it is not set.
     env: OnceLock<Option<Filter>>,
     hook: Mutex<Option<HookEntry>>,
+    /// The hook's level ([`hook_code`]), written under `hook`'s lock as the hook is set or
+    /// cleared ([`Self::keep`]): what [`Log::enabled`] and `log`'s filter read, so neither takes
+    /// the lock for a line that is not written. Every encoder call of the Vulkan platform asks
+    /// whether its debug line is on, from as many walk threads as run at once.
+    hook_level: AtomicUsize,
+}
+
+/// A hook's level as [`Logger::hook_level`] keeps it: 0 for no hook, else the level's place in
+/// [`LevelFilter::iter`] plus one.
+fn hook_code(level: Option<LevelFilter>) -> usize {
+    level
+        .and_then(|level| LevelFilter::iter().position(|l| l == level))
+        .map_or(0, |at| at + 1)
+}
+
+/// The hook's level [`hook_code`] gave `code`.
+fn hook_level_of(code: usize) -> Option<LevelFilter> {
+    LevelFilter::iter().nth(code.checked_sub(1)?)
 }
 
 impl Logger {
@@ -123,7 +163,21 @@ impl Logger {
         Logger {
             env: OnceLock::new(),
             hook: Mutex::new(None),
+            hook_level: AtomicUsize::new(0),
         }
+    }
+
+    /// Puts `entry` in the hook's `slot`, which the caller holds locked, and its level where
+    /// [`Self::hook_level`] reads it.
+    fn keep(&self, slot: &mut Option<HookEntry>, entry: Option<HookEntry>) {
+        let code = hook_code(entry.as_ref().map(|(level, _)| *level));
+        self.hook_level.store(code, Ordering::Release);
+        *slot = entry;
+    }
+
+    /// The hook's level, `None` without a hook, read without its lock.
+    fn hook_level(&self) -> Option<LevelFilter> {
+        hook_level_of(self.hook_level.load(Ordering::Acquire))
     }
 
     fn env(&self) -> Option<&Filter> {
@@ -154,11 +208,15 @@ impl Logger {
 
 impl Log for Logger {
     fn enabled(&self, metadata: &Metadata<'_>) -> bool {
-        let hook = self.hook.lock().as_ref().map(|(level, _)| *level);
-        metadata.level() <= self.level(metadata.target(), hook)
+        metadata.level() <= self.level(metadata.target(), self.hook_level())
     }
 
     fn log(&self, record: &Record<'_>) {
+        // A line not written takes no lock; one written is filtered again by the hook it goes
+        // to, as a hook set or cleared meanwhile may change its level.
+        if !self.enabled(record.metadata()) {
+            return;
+        }
         // The hook is called without the lock: it may write lines of its own, or be replaced.
         let hook = self.hook.lock().clone();
         if record.level() > self.level(record.target(), hook.as_ref().map(|(level, _)| *level)) {
@@ -220,7 +278,7 @@ pub fn set_hook(level: LevelFilter, hook: Hook) -> bool {
         return false;
     }
     let mut slot = LOGGER.hook.lock();
-    *slot = Some((level, Arc::from(hook)));
+    LOGGER.keep(&mut slot, Some((level, Arc::from(hook))));
     refresh_max_level(Some(level));
     true
 }
@@ -229,7 +287,7 @@ pub fn set_hook(level: LevelFilter, hook: Hook) -> bool {
 /// A line being written on another thread may still reach the old hook.
 pub fn clear_hook() {
     let mut slot = LOGGER.hook.lock();
-    *slot = None;
+    LOGGER.keep(&mut slot, None);
     refresh_max_level(None);
 }
 
@@ -255,6 +313,7 @@ mod tests {
         Logger {
             env: OnceLock::from(env.map(Filter::parse)),
             hook: Mutex::new(None),
+            hook_level: AtomicUsize::new(0),
         }
     }
 
@@ -306,6 +365,60 @@ mod tests {
         assert_eq!(f.max(), LevelFilter::Debug);
     }
 
+    /// A filter names a target only by a pair of the target itself, the last one deciding: not
+    /// by a lone level, nor by a pair of a target above or below it
+    #[test]
+    fn a_filter_names_a_target_only_by_its_own_pair() {
+        const WORK: &str = "reims_vgpu::work";
+        let names = |spec: &str| Filter::parse(spec).names(WORK, Level::Debug);
+        assert_eq!(Filter::parse("debug").level(WORK), LevelFilter::Debug);
+        assert!(
+            !names("debug"),
+            "a lone level, which writes the target's lines"
+        );
+        assert!(!names("trace"));
+        assert!(names("info,reims_vgpu::work=debug"));
+        assert!(names("reims_vgpu::work=trace"));
+        assert!(
+            !names("reims_vgpu::work=info"),
+            "named, but not up to debug"
+        );
+        assert!(!names("reims_vgpu=debug"), "a target above it");
+        assert!(!names("reims_vgpu::work::lines=debug"), "a target below it");
+        assert!(!names("reims_vgpu::works=debug"));
+        assert!(!names("reims_vgpu::work=debug,reims_vgpu::work=warn"));
+        assert!(names("reims_vgpu::work=warn,reims_vgpu::work=debug"));
+    }
+
+    /// The process names a target only where the variable's own pair does: not without the
+    /// variable, nor under a lone level or a pair above it, a hook at any level aside
+    #[test]
+    fn the_process_names_a_target_only_by_the_variables_pair() {
+        if std::env::var_os(CHILD).is_some() {
+            let named = names("reims_vgpu::work", Level::Debug);
+            let (_, hook) = recording_hook();
+            assert!(set_hook(LevelFilter::Trace, hook));
+            assert_eq!(names("reims_vgpu::work", Level::Debug), named);
+            println!("named {named}");
+            return;
+        }
+        for (env, named) in [
+            (None, false),
+            (Some("debug"), false),
+            (Some("trace"), false),
+            (Some("reims_vgpu=debug"), false),
+            (Some("info,reims_vgpu::work=debug"), true),
+        ] {
+            let out = child(
+                "logging::tests::the_process_names_a_target_only_by_the_variables_pair",
+                env,
+            );
+            assert!(out.status.success(), "{env:?}: {out:?}");
+            let said = String::from_utf8_lossy(&out.stdout);
+            assert!(said.contains(&format!("named {named}")), "{env:?}: {said}");
+        }
+    }
+
     /// A stderr line names the library, the level and the target
     #[test]
     fn stderr_lines_name_level_and_target() {
@@ -328,7 +441,10 @@ mod tests {
     fn a_hook_takes_the_lines_its_filter_passes() {
         let l = logger(None);
         let (seen, hook) = recording_hook();
-        *l.hook.lock() = Some((LevelFilter::Info, Arc::from(hook)));
+        l.keep(
+            &mut l.hook.lock(),
+            Some((LevelFilter::Info, Arc::from(hook))),
+        );
         assert!(enabled(&l, Level::Info, "reims_vgpu::fifo"));
         assert!(!enabled(&l, Level::Debug, "reims_vgpu::fifo"));
         write(&l, Level::Warn, "reims_vgpu::fifo", "kept");
@@ -344,7 +460,10 @@ mod tests {
 
         let l = logger(Some("error,reims_vgpu::tasks=debug"));
         let (seen, hook) = recording_hook();
-        *l.hook.lock() = Some((LevelFilter::Trace, Arc::from(hook)));
+        l.keep(
+            &mut l.hook.lock(),
+            Some((LevelFilter::Trace, Arc::from(hook))),
+        );
         assert_eq!(l.max_level(Some(LevelFilter::Trace)), LevelFilter::Debug);
         write(&l, Level::Warn, "reims_vgpu::fifo", "dropped");
         write(&l, Level::Debug, "reims_vgpu::tasks", "kept");
@@ -356,6 +475,48 @@ mod tests {
                 "kept".to_owned()
             )]
         );
+    }
+
+    /// A line not written takes no lock: `enabled`, and `log` of a line the filter drops, return
+    /// while another thread holds the hook's lock, under the hook's level and under the
+    /// variable's filter alike. Every encoder call of the Vulkan platform asks `enabled` for its
+    /// debug line, from every walk thread at once.
+    #[test]
+    fn a_line_not_written_takes_no_lock() {
+        for env in [None, Some("info,reims_graphics=trace")] {
+            let l = logger(env);
+            let (seen, hook) = recording_hook();
+            l.keep(
+                &mut l.hook.lock(),
+                Some((LevelFilter::Info, Arc::from(hook))),
+            );
+            let held = l.hook.lock();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::scope(|s| {
+                s.spawn(|| {
+                    let asked = enabled(&l, Level::Debug, "reims_vgpu_vulkan::gpu::timing");
+                    write(
+                        &l,
+                        Level::Debug,
+                        "reims_vgpu_vulkan::gpu::timing",
+                        "dropped",
+                    );
+                    let _ = tx.send(asked);
+                });
+                let answer = rx.recv_timeout(std::time::Duration::from_secs(10));
+                // Let go before the asserts, so a thread that waited for the lock can end.
+                drop(held);
+                assert_eq!(
+                    answer,
+                    Ok(false),
+                    "{env:?}: the filtered line waited for the lock"
+                );
+            });
+            assert!(seen.lock().is_empty(), "{env:?}");
+            // A line the filter passes still reaches the hook.
+            write(&l, Level::Info, "reims_graphics", "kept");
+            assert_eq!(seen.lock().len(), 1, "{env:?}");
+        }
     }
 
     /// The marker that makes a test the child of `the_process_logger_*`.

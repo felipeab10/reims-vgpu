@@ -17,6 +17,9 @@
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
+/// The dirty log's kept resolutions of an import's ranges, Linux's alone but measured anywhere.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) mod resolutions;
 mod surface;
 mod wsi;
 
@@ -49,14 +52,17 @@ pub(crate) use host_os::views_through_dma_bufs;
 pub use host_os::{DeviceLend, LendRefusal, LentDmaBuf, attachment, lend_to_devices};
 pub(crate) use host_os::{
     Drawables, ImportView, TWINS_READ_ONLY, allocate_aliasable, allocate_zeros, dma_buf_refusal,
-    host_memory, import_view, plane_shape, shown_at, surface_memory_hold,
+    host_memory, host_memory_vouched, import_view, plane_shape, shown_at, surface_memory_hold,
 };
 pub use host_os::{
-    GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_gpu_core_count,
-    default_registry_id, install_process_services, lease_guest_memory,
+    GuestMemoryLease, OsClock, OsSurface, OsSurfaces, OsThreads, OsVm, default_driver_sizes,
+    default_gpu_core_count, default_registry_id, install_process_services, lease_guest_memory,
 };
 #[cfg(test)]
 pub(crate) use host_os::{PAGE, mapped, writable};
+/// The guest's RAM a device copies by runs of it, on Linux (`os/linux/host_ram.rs`).
+#[cfg(target_os = "linux")]
+pub(crate) use host_os::{copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over};
 #[cfg(all(test, target_os = "macos"))]
 pub(crate) use macos::MATRIX_KEY;
 pub use surface::{PlaneLayout, lend_surface_bytes, lend_surface_bytes_for_reading, plane_layout};

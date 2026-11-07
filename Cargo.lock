@@ -569,18 +569,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
+name = "reims-graphics"
+version = "0.1.0"
+dependencies = [
+ "libc",
+ "log",
+ "parking_lot",
+ "zerocopy",
+]
+
+[[package]]
 name = "reims-vgpu"
 version = "0.1.0"
 dependencies = [
  "ash",
  "libc",
  "log",
+ "metal2vulkan-runtime",
  "objc2",
  "objc2-core-foundation",
  "objc2-foundation",
  "objc2-io-surface",
  "objc2-metal",
  "objc2-quartz-core",
+ "parking_lot",
+ "reims-graphics",
  "reims-vgpu-core",
  "reims-vgpu-metal",
  "reims-vgpu-video-conformance",
@@ -588,8 +601,11 @@ dependencies = [
  "reims-vgpu-video-nvidia",
  "reims-vgpu-video-vaapi",
  "reims-vgpu-video-videotoolbox",
+ "reims-vgpu-video-vulkan",
  "reims-vgpu-vulkan",
  "reims-vgpu-window",
+ "sha2 0.10.9",
+ "zerocopy",
 ]
 
 [[package]]
@@ -601,6 +617,7 @@ dependencies = [
  "objc2",
  "objc2-foundation",
  "parking_lot",
+ "reims-graphics",
  "reims-vgpu",
  "reims-vgpu-core",
  "tikv-jemallocator",
@@ -637,6 +654,7 @@ name = "reims-vgpu-video-codec"
 version = "0.1.0"
 dependencies = [
  "libc",
+ "memchr",
  "reims-vgpu-video-core",
 ]
 
@@ -685,6 +703,17 @@ dependencies = [
 name = "reims-vgpu-video-videotoolbox"
 version = "0.1.0"
 dependencies = [
+ "log",
+ "reims-vgpu-video-codec",
+ "reims-vgpu-video-conformance",
+ "reims-vgpu-video-core",
+]
+
+[[package]]
+name = "reims-vgpu-video-vulkan"
+version = "0.1.0"
+dependencies = [
+ "ash",
  "log",
  "reims-vgpu-video-codec",
  "reims-vgpu-video-conformance",

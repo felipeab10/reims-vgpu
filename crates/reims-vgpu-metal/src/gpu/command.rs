@@ -8,7 +8,7 @@ use objc2::runtime::ProtocolObject;
 use objc2_metal::{MTLCommandBuffer, MTLCommandQueue};
 use reims_vgpu_core::num::ToU64;
 use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo};
+use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
 use reims_vgpu_core::platform::event::EventRef;
 use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
 use reims_vgpu_core::platform::values::ComputePassDesc;
@@ -41,13 +41,17 @@ impl reims_vgpu_core::platform::command::CommandQueue<MetalPlatform> for MetalCo
     }
 }
 
-/// What a completed handler learns of `cb`: its `status` and `error`, read when the handler runs.
+/// What a completed handler learns of `cb`: its `status`, `error` and GPU times, read when the
+/// handler runs.
 fn completed_info(cb: &ProtocolObject<dyn MTLCommandBuffer>) -> CompletedInfo {
     let status = msg::get("status", || cb.status());
     let error = msg::get("error", || cb.error());
+    let start = msg::get("GPUStartTime", || cb.GPUStartTime());
+    let end = msg::get("GPUEndTime", || cb.GPUEndTime());
     CompletedInfo {
         status: CommandBufferStatus(status.0.to_u64()),
         error: error.as_deref().map(error_text),
+        gpu_times_ns: CompletedInfo::gpu_times(start, end),
     }
 }
 
@@ -56,8 +60,12 @@ pub type MetalCommandBuffer = Obj<ProtocolObject<dyn MTLCommandBuffer>>;
 
 impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalCommandBuffer {
     /// The block reads the buffer's `status` and `error` when Metal calls it, on Metal's completion
-    /// thread, and runs `block` once with them; `block` is dropped there, when it returns.
+    /// thread, and runs `block` once with them; `block` is dropped there, when it returns. Added
+    /// inside a refusal scope (the graphics lane's), the read and `block` run in one there too
+    /// (`run_completed`): a death in the read fails the command buffer to `block`, and the process
+    /// goes on.
     fn add_completed_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        let carried = reims_vgpu_core::raise::refusals::carry();
         let once = Mutex::new(Some(block));
         let handler = RcBlock::new(move |cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
             // A foreign callout: marked ours, so a panic here aborts before it unwinds into Metal.
@@ -67,13 +75,44 @@ impl reims_vgpu_core::platform::command::CommandBuffer<MetalPlatform> for MetalC
                 return;
             };
             // SAFETY: Metal passes the live command buffer the handler was added to.
-            block(completed_info(unsafe { cb.as_ref() }));
+            let cb = unsafe { cb.as_ref() };
+            reims_vgpu_core::platform::command::run_completed(
+                carried,
+                || completed_info(cb),
+                block,
+            );
         });
         let handler = RcBlock::as_ptr(&handler);
         // SAFETY: a live block; Metal copies it.
         msg::send("addCompletedHandler:", Policy::On(on), || unsafe {
             self.addCompletedHandler(handler)
         })
+    }
+    /// The block runs `block` once when Metal calls it, on Metal's thread, as the buffer is
+    /// scheduled; `block` is dropped there, when it returns.
+    fn add_scheduled_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        let once = Mutex::new(Some(block));
+        let handler = RcBlock::new(move |_cb: NonNull<ProtocolObject<dyn MTLCommandBuffer>>| {
+            // A foreign callout: marked ours, so a panic here aborts before it unwinds into Metal.
+            let _env = reims_vgpu_core::rt::BlockEnv::foreign();
+            // Metal calls a scheduled handler once; a second call would find nothing to run.
+            if let Some(block) = once.lock().take() {
+                block();
+            }
+        });
+        let handler = RcBlock::as_ptr(&handler);
+        // SAFETY: a live block; Metal copies it.
+        msg::send("addScheduledHandler:", Policy::On(on), || unsafe {
+            self.addScheduledHandler(handler)
+        })
+    }
+    /// Metal tells of no submission before scheduling: a scheduled handler.
+    fn add_submission_handler(&self, on: OnFault, block: ScheduledHandler) -> RaiseResult<()> {
+        self.add_scheduled_handler(on, block)
+    }
+    /// Metal tells of a completion only on its completed handlers' thread: a completed handler.
+    fn add_completion_seen_handler(&self, on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
+        self.add_completed_handler(on, block)
     }
     /// `blitCommandEncoder`: a `+0` encoder, retained.
     fn blit_encoder(

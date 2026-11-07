@@ -1,5 +1,13 @@
 //! Functions (object type 6, command 15): the record names where the function's IR sits in the
 //! task's memory; Metal makes a library of it, and the library's one function is the object.
+//!
+//! IR the task cannot copy refuses the function, except IR over a hole in the task's page table,
+//! which raises the function lookup's failure: a guest commits a buffer's pages to the task's
+//! page table as it prepares a command buffer that lists the buffer, so a hole is IR the guest
+//! has not mapped. A nil function would reach Metal, which ends the process at a nil vertex or
+//! compute function; the raise faults the exec instead, as an empty entry's lookup does
+//! (`resolver`), and caches nothing, so a lookup once the guest has mapped the IR makes the
+//! function (docs/qemu.md, "x86-64 macOS guests: WebGPU render bundles").
 
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
@@ -12,10 +20,10 @@ use crate::platform::device::GpuDevice;
 use crate::platform::resource::Library;
 use crate::raise::RaiseResult;
 use crate::raise::{OnFault, Raise};
-use crate::resources::manager::DeathKind;
 use crate::resources::manager::cache::nil_object;
 use crate::resources::manager::icb::ManagerOps;
 use crate::resources::manager::records::OperationHeader;
+use crate::resources::manager::{DeathKind, ObjectKind, RaiseKind};
 use crate::rt::Hold;
 
 /// The command type that makes a function from IR.
@@ -70,10 +78,12 @@ fn new_function_with_ir<P: Platform, M: ManagerOps<P>>(
     Ok(Ok(library.new_function(OnFault::Return, name)?))
 }
 
-/// A function from `entry` and its record.
+/// The function `reference` names, from `entry` and its record. IR over a hole in the task's
+/// page table raises the function lookup's failure; IR the task cannot otherwise copy refuses it.
 pub(crate) fn create<P: Platform, M: ManagerOps<P>>(
     hold: Hold<'_>,
     m: &M,
+    reference: u32,
     entry: &ObjectEntry,
     mut cursor: Cursor,
 ) -> RaiseResult<Result<P::Function, String>> {
@@ -94,8 +104,23 @@ pub(crate) fn create<P: Platform, M: ManagerOps<P>>(
             .map_err(|e| format!("command header not readable: {e}"))
     );
     // The IR is copied before the command type is checked
-    let Some(data) = m.get_data(hold, function.offset, u64::from(function.length)) else {
-        return Ok(Err("the function's IR is not in task memory".to_owned()));
+    let (offset, length) = (function.offset, function.length);
+    let data = match m.get_data(hold, offset, u64::from(length)) {
+        Ok(data) => data,
+        Err(missing) if missing.hole => {
+            log::warn!(
+                "function {reference} not made: its IR, {length:#x} bytes at task offset \
+                 {offset:#x}, is not mapped: {missing}"
+            );
+            let kind = ObjectKind::Function;
+            return Err(Raise::new(RaiseKind::Lookup(kind)).with_detail(kind.failure()));
+        }
+        Err(missing) => {
+            return Ok(Err(format!(
+                "the function's IR, {length:#x} bytes at task offset {offset:#x}, is not in \
+                 task memory: {missing}"
+            )));
+        }
     };
     if header.command_type != NEW_FUNCTION_WITH_IR {
         let ct = header.command_type;
@@ -112,7 +137,9 @@ pub(crate) fn create<P: Platform, M: ManagerOps<P>>(
 mod tests {
     use super::*;
     use crate::platform::types::NsErrorText;
+    use crate::raise::RaiseId;
     use crate::resources::manager::icb::testing::*;
+    use crate::resources::manager::lookup::NoData;
     use crate::testkit::calllog::Arg;
     use crate::testkit::capture::catch_death;
     use crate::testkit::{FakePlatform, Fk, Step, kind};
@@ -124,7 +151,7 @@ mod tests {
     }
 
     fn make(o: &FakeOps, ty: u32, data: &[u8]) -> Result<Fk<kind::Function>, String> {
-        create::<FakePlatform, _>(Hold::NONE, o, &entry(ty), cursor(data)).unwrap()
+        create::<FakePlatform, _>(Hold::NONE, o, 3, &entry(ty), cursor(data)).unwrap()
     }
 
     fn error(description: &str) -> Step {
@@ -166,11 +193,47 @@ mod tests {
         fn the_data_is_copied_before_the_command_type_is_checked() {
             let mut o = FakeOps::new();
             let e = make(&o, 6, &record(0x40, 4, 3)).unwrap_err();
-            assert_eq!(e, "the function's IR is not in task memory");
+            assert_eq!(
+                e,
+                "the function's IR, 0x4 bytes at task offset 0x40, is not in task memory: no data"
+            );
             assert_eq!(o.calls(), vec!["get_data(0x40, 0x4)"]);
             o.data = Some(vec![1, 2, 3, 4]);
             let e = make(&o, 6, &record(0x40, 4, 3)).unwrap_err();
             assert_eq!(e, "unknown command type 3");
+            assert!(o.log().is_empty());
+        }
+
+        #[test]
+        fn ir_over_a_hole_raises_the_function_lookup_s_failure() {
+            let mut o = FakeOps::new();
+            o.no_data = NoData {
+                hole: true,
+                why: "a hole in the page table".to_owned(),
+            };
+            let (r, lines) = logged(|| {
+                create::<FakePlatform, _>(
+                    Hold::NONE,
+                    &o,
+                    3,
+                    &entry(6),
+                    cursor(&record(0x40, 4, 15)),
+                )
+            });
+            let raised = r.err().unwrap();
+            assert_eq!(
+                raised.id(),
+                RaiseId::Manager(RaiseKind::Lookup(ObjectKind::Function))
+            );
+            assert_eq!(raised.detail(), Some("function lookup failed"));
+            assert_eq!(
+                lines,
+                vec![
+                    "function 3 not made: its IR, 0x4 bytes at task offset 0x40, is not mapped: a \
+                     hole in the page table"
+                ]
+            );
+            assert_eq!(o.calls(), vec!["get_data(0x40, 0x4)"]);
             assert!(o.log().is_empty());
         }
 

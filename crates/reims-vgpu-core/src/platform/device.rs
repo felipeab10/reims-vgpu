@@ -15,13 +15,15 @@
 
 use std::sync::Arc;
 
-use super::caps::DeviceCaps;
+use super::caps::{DeviceCaps, IdentityCaps};
 use super::host_range::HostRange;
 use super::types::{
-    NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    ArgumentLayout, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use super::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
+    RenderPipelineDesc, SamplerDesc,
 };
 use super::{Handle, Platform};
 use crate::raise::{OnFault, RaiseResult};
@@ -46,6 +48,20 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// Side effect only; sent once per device, where no handler is live: a raise inside it dies
     /// at the send.
     fn allow_foreign_libraries(&self);
+    /// sel: newArgumentEncoderWithArguments: — the layout of the encoder Metal makes of
+    /// `arguments`, in their order: its `encodedLength`, its `alignment` and where each argument
+    /// lands. Nothing is kept. `None` where Metal makes no encoder (nil, or a raise a handler
+    /// catches: no arguments, a data type no argument has).
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>>;
+    /// sel: -[MTLFunction newArgumentEncoderWithBufferIndex:] — the layout of the encoder Metal
+    /// makes of the argument buffer `function` takes at `buffer_index`, its nested argument
+    /// buffers' layouts with it (`newArgumentEncoderForBufferAtIndex:`). Nothing is kept. `None`
+    /// where Metal makes none (no argument buffer at the index).
+    fn function_argument_layout(
+        &self,
+        function: &P::Function,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>>;
     /// sel: heapTextureSizeAndAlignWithDescriptor:
     /// The result reaches the guest (opcode 64, info 451/469).
     fn heap_texture_size_and_align(&self, desc: &P::TextureDescriptor)
@@ -80,6 +96,26 @@ pub trait GpuDevice<P: Platform>: Handle {
     /// sel: newCommandQueue
     /// Never nil-checked. No path reaches it under a handler: a raise inside it dies at the send.
     fn new_command_queue(&self) -> Option<P::CommandQueue>;
+    /// No Metal counterpart: a queue as [`new_command_queue`](GpuDevice::new_command_queue)'s,
+    /// which shares the GPU queue it submits to with no other command queue for its life, where
+    /// the platform would otherwise share one between command queues: the queues on a present's
+    /// path are made so, lest another queue's long command buffer hold theirs back: WindowServer's
+    /// in the graphics lane (`RGFX_QUEUE_UNSHARED`), so that no other process's work queues on
+    /// the GPU ahead of its frames, and the host's own on that path (the device's blit and exec
+    /// queues, the process's frame queue, a graphics display's scanout draw and the IOSurface
+    /// device caches' transfer queue). A platform that shares no GPU queue between command queues
+    /// answers `new_command_queue`'s queue. Never nil-checked; a raise inside it dies at the
+    /// call, as one inside `newCommandQueue` does.
+    fn new_command_queue_unshared(&self) -> Option<P::CommandQueue>;
+    /// No Metal counterpart: whether the device copies between its buffers and the guest's RAM
+    /// by the RAM's host addresses ([`BlitEncoder::copy_from_guest_ram`],
+    /// [`BlitEncoder::copy_to_guest_ram`]), so a copy of guest pages needs no view of them.
+    /// False where the platform has no such copy; where true, a copy may still be refused, and
+    /// the caller copies another way.
+    ///
+    /// [`BlitEncoder::copy_from_guest_ram`]: super::blit::BlitEncoder::copy_from_guest_ram
+    /// [`BlitEncoder::copy_to_guest_ram`]: super::blit::BlitEncoder::copy_to_guest_ram
+    fn copies_guest_ram(&self) -> bool;
     /// sel: newComputePipelineDescriptorWithSerializedData:deserializationContext: SPI
     /// `data` becomes a `dispatch_data_t` with core's destructor; `context` runs synchronously
     /// during the call. aborts: a malformed or truncated blob, inside Metal's deserializer.
@@ -206,12 +242,35 @@ pub trait GpuDevice<P: Platform>: Handle {
     // Capabilities and creators from values.
     /// The device's capabilities: read in full on the first call for this device, then shared.
     fn caps(&self) -> Arc<DeviceCaps>;
+    /// The device's identity and the capability answers beyond [`caps`](GpuDevice::caps): every
+    /// family and feature set of the SDK, and the identity and capability getters. Read on each
+    /// call; only the graphics lane asks it, once per device.
+    fn identity_caps(&self) -> IdentityCaps;
+    /// The bytes of the GPU's own memory the process may hold, as the platform answers at the
+    /// call: Metal's `recommendedMaxWorkingSetSize`; on the Vulkan platform the budget of the
+    /// device-local heaps (`VK_EXT_memory_budget`) where the device has the extension, else their
+    /// size. The graphics lane's deferred surfaces take a quarter of it, read once at its device's
+    /// start.
+    fn own_memory_budget(&self) -> u64;
     /// sel: newBufferWithDescriptor: SPI — from a private `MTLBufferDescriptor` made from
     /// `desc`.
     fn new_buffer(&self, desc: BufferDesc<'_>) -> RaiseResult<Option<P::Buffer>>;
     /// sel: newHeapWithDescriptor: — from a heap descriptor made from `desc`, and that
     /// descriptor's `resourceOptions` read after the creation.
     fn new_heap(&self, desc: &HeapDesc<'_, P>) -> RaiseResult<HeapMade<P>>;
+    /// sel: newHeapWithDescriptor: over `bytes` in place — a Shared heap of `desc`, whose
+    /// `address_ranges` the platform ignores, with `bytes` as its memory, zero-copy, as Metal
+    /// makes one over one address range (`setAddressRanges:` SPI): a resource placed at an offset
+    /// lies in `bytes` from that offset, and the CPU's and the GPU's writes there are each
+    /// other's. Unlike a heap over address ranges it never detaches. `bytes` starts on a page and
+    /// covers the heap's size rounded up to Metal's 16 KiB page, and its constructor's contract
+    /// keeps it mapped for as long as the heap lives. Nil where the platform makes no heap over
+    /// it, as for `new_heap`.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, P>,
+    ) -> RaiseResult<HeapMade<P>>;
     /// sel: newSamplerStateWithDescriptor: — from a sampler descriptor made from `desc`.
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<P::SamplerState>>;
     /// sel: newDepthStencilStateWithDescriptor: — from a depth-stencil descriptor made from
@@ -235,4 +294,28 @@ pub trait GpuDevice<P: Platform>: Handle {
         &self,
         desc: &RenderPipelineDesc<'_, P>,
     ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+    /// sel: newRenderPipelineStateWithDescriptor:error: — from a render pipeline descriptor made
+    /// from the whole value `desc`, the graphics lane's. A raise inside it, and a refusal Metal
+    /// answers with no `NSError`, die at the send: the lane calls it inside its refusal scope.
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, P>,
+    ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+    /// sel: newRenderPipelineStateWithMeshDescriptor:options:reflection:error: — from a mesh
+    /// render pipeline descriptor made from the whole value `desc`, the graphics lane's, with no
+    /// options and a nil reflection. A raise inside it, and a refusal Metal answers with no
+    /// `NSError`, die at the send: the lane calls it inside its refusal scope. A platform whose
+    /// device makes no mesh pipeline answers the `NSError` Metal would.
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        desc: &FullMeshRenderPipelineDesc<'_, P>,
+    ) -> Result<Option<P::RenderPipeline>, NsErrorText>;
+    /// sel: newComputePipelineStateWithDescriptor:options:reflection:error: — from a compute
+    /// pipeline descriptor made from the whole value `desc`, the graphics lane's, with no options
+    /// and a nil reflection. A raise inside it, and a refusal Metal answers with no `NSError`, die
+    /// at the send: the lane calls it inside its refusal scope.
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, P>,
+    ) -> Result<Option<P::ComputePipeline>, NsErrorText>;
 }

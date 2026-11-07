@@ -242,12 +242,36 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
     DEVICE.get_or_init(|| device)
 }
 
+/// The device extensions every device enables where it has them, for the video-decode queue's
+/// decodes ([`device_options`]): Vulkan Video's H.264 decode, and `VK_KHR_synchronization2`, whose
+/// commands the decodes record and submit with, core only from Vulkan 1.3, above the runtime's
+/// instance.
+pub const VIDEO_DECODE_EXTENSIONS: [&std::ffi::CStr; 4] = [
+    c"VK_KHR_video_queue",
+    c"VK_KHR_video_decode_queue",
+    c"VK_KHR_video_decode_h264",
+    c"VK_KHR_synchronization2",
+];
+
+/// The device extension of Vulkan Video's H.265 decode, which every device enables where it has
+/// it ([`device_options`]), beside [`VIDEO_DECODE_EXTENSIONS`]: the video-decode queue's decodes
+/// take HEVC where the device has it and the queue's family decodes it, and H.264 without it.
+pub const VIDEO_DECODE_H265_EXTENSION: &std::ffi::CStr = c"VK_KHR_video_decode_h265";
+
+/// The device extension that keeps the video-decode queue's images in one layout, which every
+/// device enables where it has it ([`device_options`]), beside [`VIDEO_DECODE_EXTENSIONS`], with
+/// its `unifiedImageLayoutsVideo` feature where the device has that: its decodes then keep their
+/// pictures in `VK_IMAGE_LAYOUT_GENERAL`, and run beside the copies out of earlier pictures.
+pub const VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION: &std::ffi::CStr = c"VK_KHR_unified_image_layouts";
+
 /// The options every device is made with: the runtime's defaults, whose loader search finds
 /// Homebrew's (`vulkan-loader`, beside its `molten-vk`), with the window system's extensions where
 /// a display's window presents through Vulkan (on Linux, [`crate::os::add_window_extensions`]), the
 /// shader cache in
 /// `~/.cache/reims-vgpu-vulkan` ([`SHADER_CACHE`]; the runtime's default directory when `HOME` is
-/// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], a command buffer's
+/// not set), which every process shares, holding [`SHADER_CACHE_CAPACITY`], each pipeline state's
+/// record kept in the file beside it for later processes' warm passes ([`crate::records`]; none
+/// in the unit tests), a command buffer's
 /// GPU times answered from the host's clock (`gpu_times_from_host`), the runtime's device policy,
 /// its fast native forms but its exact completion and heap textures and those `REIMS_VGPU_EXACT`
 /// names ([`exact_policy`]), and in a strict process ([`crate::answer::strict_process`]) its
@@ -257,24 +281,45 @@ pub(crate) fn answering_device(sel: &'static str) -> &'static rt::Device {
 /// runtime announces sent to the answer layer ([`crate::answer::notice`]), where those that reach
 /// what the guest sees are counted, and die in strict mode ([`crate::answer::strict`]), with the
 /// kinds announced at every occurrence ([`announced_each`]), its other messages there too but
-/// those below the least severity the log takes ([`crate::answer::least_severity`]). One set,
-/// so the runtime keeps one device per physical device across `open_device` and every other open.
+/// those below the least severity the log takes ([`crate::answer::least_severity`]), and a
+/// video-decode queue of the caller's, with the extensions its decodes use where the device has
+/// them ([`VIDEO_DECODE_EXTENSIONS`], [`VIDEO_DECODE_H265_EXTENSION`],
+/// [`VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION`]), and one queue of the
+/// runtime's own families reserved for the caller. One set, so the runtime keeps one device per
+/// physical device across `open_device` and every other open.
+///
+/// **The video-decode queue** is the reims-graphics device's hardware video's (reims-vgpu's
+/// `platform::vulkan::graphics_video`), which alone submits to it. A device without a
+/// video-decode family is made all the same, with no such queue, and so is one without the
+/// extensions.
+///
+/// **The reserved queue** is that video's too: it copies decoded pictures out into the
+/// runtime's buffers there, an IOSurface's device cache among them, waiting for each decode on
+/// the GPU, since no runtime work ever runs on it. The runtime takes it off the end of its
+/// round robin, past the queues presenting keeps: on a device whose graphics family has no
+/// queue to spare (MoltenVK's, lavapipe's, a Radeon's single graphics queue) it reserves none,
+/// says so once at info level, and the copies go on a runtime command queue's `VkQueue`
+/// instead. The options are one set for every device, so a device without a video-decode
+/// family that has one to spare reserves it all the same, unused: measured on an RTX 5080
+/// Laptop GPU, whose graphics family has 16 queues, the round robin goes from 14 to 13.
 ///
 /// **GPU times from the host.** No command buffer writes GPU timestamps: its `GPUStartTime` is the
 /// host time its submission ended (`kernelEndTime`, or its queue's latest GPU end before it,
 /// where later, so a queue's command buffers do not overlap) and its `GPUEndTime` the host time
 /// the runtime saw it complete. On MoltenVK 1.4.1 the runtime answers so whatever the option, as
-/// its timestamps wait for every queue's (the runtime's `TimestampsWaitForEveryQueue`). Only this
-/// platform's debug lines read them ([`crate::gpu::timing`]): core's traits answer no command
-/// buffer's GPU times, so neither the guest nor the host sees them. The timestamps cost latency:
+/// its timestamps wait for every queue's (the runtime's `TimestampsWaitForEveryQueue`). A
+/// completed handler learns them (core's `CompletedInfo::gpu_times_ns`), and the graphics lane
+/// posts them to its guest, whose bundle answers the run's length from them; this platform's
+/// debug lines read them too ([`crate::gpu::timing`]). The apple-gfx lane's host sees none. The
+/// timestamps cost latency:
 /// measured on the M3 Max (a release build, under a load average of 34), a command buffer of one
 /// blit fill completed a median of 283 to 309 us after its commit, against 356 to 399 us with
 /// them (`timing`'s `gpu_times_from_host_latency`).
 /// The kinds the runtime announces at every occurrence (`DeviceOptions::announce_each`): those a
 /// call here hears ([`crate::answer::HEARD`]) and those that die by default
 /// ([`crate::answer::DIES_BY_DEFAULT`]), `CopiedHostPages`, which the device's probe of its imports
-/// may meet unheard as it is made ([`crate::answer::unheard`]), and every other kind of
-/// [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
+/// may meet unheard as it is made ([`crate::answer`]'s `unheard`, on Linux), and every other kind
+/// of [`crate::answer::DIES`] where `every_dies`, in strict and census mode, which die at or record
 /// each occurrence. Elsewhere the
 /// runtime announces such a kind once per device, its first occurrence, the only one the default
 /// writes: asked for each, a pipeline variant's notices reach the sink again at every draw's bind,
@@ -316,9 +361,23 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
         }
         if let Some(home) = std::env::var_os("HOME") {
             options.shader_cache =
-                rt::ShaderCacheOptions::in_directory(PathBuf::from(home).join(SHADER_CACHE));
+                rt::ShaderCacheOptions::in_directory(PathBuf::from(&home).join(SHADER_CACHE));
+            #[cfg(not(test))]
+            {
+                options.pipeline_records =
+                    crate::records::hook(crate::records::path_in(home.as_ref()));
+            }
         }
         options.shader_cache.capacity = SHADER_CACHE_CAPACITY;
+        options.extra_queues = vec![ash::vk::QueueFlags::VIDEO_DECODE_KHR];
+        options.reserved_queues = 1;
+        options.optional_device_extensions = (VIDEO_DECODE_EXTENSIONS.iter())
+            .chain([
+                &VIDEO_DECODE_H265_EXTENSION,
+                &VIDEO_DECODE_UNIFIED_LAYOUTS_EXTENSION,
+            ])
+            .map(|&name| name.to_owned())
+            .collect();
         options
     });
     &OPTIONS
@@ -333,19 +392,32 @@ pub(crate) fn device_options() -> &'static rt::DeviceOptions {
 /// (`host_page_textures`, `HostPageTexturePolicy::Shadow`), and, on a device without
 /// `shaderFloat16`, each `half` addition, subtraction and product of a fast-math chain rounded
 /// where it is computed, where the default rounds the chain where a value leaves it
-/// (`half_chains`, `HalfChainPolicy::EachOperation`), and a command buffer that waits for each
+/// (`half_chains`, `HalfChainPolicy::EachOperation`), a command buffer that waits for each
 /// pipeline the driver is still making until it is made, where the default waits 4.5 s from its
 /// commit and then drops the draws and dispatches whose pipeline is not made (`pipeline_waits`,
-/// `PipelineWaitPolicy::Exact`). [`EXACT_ALL`] names every one. The
+/// `PipelineWaitPolicy::Exact`), and, on a device with `tessellationShader`, a line `setLineWidth:`
+/// widens drawn as Metal's parallelogram, two triangles over each segment, where the default draws
+/// the device's own line at the width wherever it draws it, which can differ from Metal's
+/// (`wide_lines`, `WideLinePolicy::Exact`), and a blit into or out of a `BGRA10_XR` texture Metal
+/// keeps compressed rewritten to Metal's encoding (each 16-bit word's low 6 bits clear, alpha's
+/// code within 384 to 894) and a fill's texel encoded so, where the default keeps the bytes the
+/// device's copy moves (`extended_range_blits`, `ExtendedRangeBlitPolicy::Canonical`), and every
+/// command queue on the `VkQueue` it took at its creation, where the default lets command queues
+/// share `VkQueue`s on a device whose own check finds its GPU idle at each switch between queues,
+/// so a command buffer can wait on the GPU behind another queue's (`queue_sharing`,
+/// `QueueSharingPolicy::PerQueue`). [`EXACT_ALL`] names every one. The
 /// policy's `completion` and `heap_compression` are no names of these: every device takes their
 /// exact forms ([`exact_policy`]). The rest of Metal's values the runtime answers with the
 /// device's own arithmetic, sampling and conversions, each difference a precision note it
 /// records, with no exact form to name.
-pub const EXACT_FORMS: [&str; 4] = [
+pub const EXACT_FORMS: [&str; 7] = [
     "batch_order",
     "host_page_textures",
     "half_chains",
     "pipeline_waits",
+    "wide_lines",
+    "extended_range_blits",
+    "queue_sharing",
 ];
 
 /// The name `REIMS_VGPU_EXACT` takes for the runtime's `DevicePolicy::exact_answers()`: every
@@ -374,13 +446,16 @@ pub const EXACT_ALL: &str = "all";
 /// list, names takes the runtime's exact form too, and [`EXACT_ALL`] every such form:
 /// `batch_order`'s barriers between batches, `host_page_textures`' copies of each sampled texture
 /// over the guest's pages at each command buffer's first use, and `half_chains`' rounding at
-/// each `half` operation on a device without `shaderFloat16`, and `pipeline_waits`' wait for
-/// every pipeline until it is made. A name of neither changes nothing,
+/// each `half` operation on a device without `shaderFloat16`, `pipeline_waits`' wait for every
+/// pipeline until it is made, `wide_lines`' band variant of each pipeline that draws a line
+/// the device's own lines would draw otherwise than Metal, and `extended_range_blits`' rewrite of
+/// each extended-range blit to Metal's encoding. A name of neither changes nothing,
 /// and a line on stderr says so.
 fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
     use metal2vulkan::device::{
-        BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy, HeapCompressionPolicy,
-        HostPageTexturePolicy, PipelineWaitPolicy,
+        BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy, HalfChainPolicy,
+        HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy, QueueSharingPolicy,
+        WideLinePolicy,
     };
     let mut policy = DevicePolicy::default();
     policy.completion = CompletionPolicy::Exact;
@@ -392,6 +467,11 @@ fn exact_policy(exact: Option<&str>) -> metal2vulkan::device::DevicePolicy {
             "host_page_textures" => policy.host_page_textures = HostPageTexturePolicy::Shadow,
             "half_chains" => policy.half_chains = HalfChainPolicy::EachOperation,
             "pipeline_waits" => policy.pipeline_waits = PipelineWaitPolicy::Exact,
+            "wide_lines" => policy.wide_lines = WideLinePolicy::Exact,
+            "extended_range_blits" => {
+                policy.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
+            }
+            "queue_sharing" => policy.queue_sharing = QueueSharingPolicy::PerQueue,
             other => {
                 let line = format!(
                     "reims-vgpu: REIMS_VGPU_EXACT names {other:?}, none of {EXACT_ALL}, {}: \
@@ -693,8 +773,9 @@ pub(crate) mod tests {
     #[test]
     fn reims_vgpu_exact_names_the_policys_exact_forms() {
         use metal2vulkan::device::{
-            BatchOrderPolicy, CompletionPolicy, DevicePolicy, HalfChainPolicy,
-            HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
+            BatchOrderPolicy, CompletionPolicy, DevicePolicy, ExtendedRangeBlitPolicy,
+            HalfChainPolicy, HeapCompressionPolicy, HostPageTexturePolicy, PipelineWaitPolicy,
+            QueueSharingPolicy, WideLinePolicy,
         };
         let runtimes = DevicePolicy::default();
         assert_eq!(runtimes.completion, CompletionPolicy::Grouped);
@@ -706,6 +787,9 @@ pub(crate) mod tests {
         assert_eq!(fast.host_page_textures, HostPageTexturePolicy::InPlace);
         assert_eq!(fast.half_chains, HalfChainPolicy::AtExits);
         assert_eq!(fast.pipeline_waits, PipelineWaitPolicy::Bounded);
+        assert_eq!(fast.wide_lines, WideLinePolicy::Device);
+        assert_eq!(fast.extended_range_blits, ExtendedRangeBlitPolicy::Kept);
+        assert_eq!(fast.queue_sharing, QueueSharingPolicy::Adaptive);
         for unchanged in [
             None,
             Some(""),
@@ -720,7 +804,7 @@ pub(crate) mod tests {
         }
         let one = |name| exact_policy(Some(name));
         type Set = fn(&mut DevicePolicy);
-        let alone: [(&str, Set); 4] = [
+        let alone: [(&str, Set); 7] = [
             ("batch_order", |p| p.batch_order = BatchOrderPolicy::Exact),
             ("host_page_textures", |p| {
                 p.host_page_textures = HostPageTexturePolicy::Shadow;
@@ -730,6 +814,13 @@ pub(crate) mod tests {
             }),
             ("pipeline_waits", |p| {
                 p.pipeline_waits = PipelineWaitPolicy::Exact;
+            }),
+            ("wide_lines", |p| p.wide_lines = WideLinePolicy::Exact),
+            ("extended_range_blits", |p| {
+                p.extended_range_blits = ExtendedRangeBlitPolicy::Canonical;
+            }),
+            ("queue_sharing", |p| {
+                p.queue_sharing = QueueSharingPolicy::PerQueue;
             }),
         ];
         assert_eq!(alone.map(|(name, _)| name), EXACT_FORMS);
@@ -741,7 +832,8 @@ pub(crate) mod tests {
             assert_eq!(one(name), want, "{name}");
             set(&mut every);
         }
-        let named = " half_chains,pipeline_waits,host_page_textures , batch_order";
+        let named = " half_chains,wide_lines,pipeline_waits,host_page_textures , batch_order,\
+                     queue_sharing,extended_range_blits";
         assert_eq!(exact_policy(Some(named)), every);
         assert_eq!(exact_policy(Some(&EXACT_FORMS.join(","))), every);
         assert_eq!(one(EXACT_ALL), fast.exact_answers());

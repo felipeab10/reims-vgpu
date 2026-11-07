@@ -20,6 +20,21 @@
 //! nothing: the host re-protects only watched granules. A watch's range is resolved once, as it
 //! begins; `changed` answers within the live watches only.
 //!
+//! **Resolved once.** The pages behind an import's bytes stay the same while the runtime holds it
+//! (the memory it is given stays mapped, with the same backing, for the import's life), so the
+//! guest runs behind a range of it are resolved once and kept (the latest
+//! [`KEPT`](crate::os::resolutions::KEPT) ranges an import, [`Resolutions`]), and a range inside
+//! a kept one is cut from it. The runtime reports the writes of each
+//! command buffer's in-place writers at its commit, at each of its batches' completion turns and
+//! at its completion, each over the same ranges; resolving a 3840x2400 surface over scattered
+//! 4 KiB guest pages each time (about 9,000 pieces of the backing table, under its lock) took
+//! 57% of QEMU's CPU time in a stock-lane present loop on the RTX 5080 Laptop GPU, and held each
+//! such commit about 7 ms and each completion as long again (**measured** 2026-11-05, round
+//! 20261105-092958, perf at 499 Hz). The guest's RAM handed whole ([`ImportDirty::of_ram`]),
+//! whose offsets are host addresses, is asked once for each run of it a written surface's pages
+//! are, a range each, so its ranges are kept whole: each is resolved at its first ask and read
+//! with no lock (`crate::os::resolutions`' module docs, "Wholes").
+//!
 //! **Writers.** The runtime's named writes ([`DirtyLog::wrote_as`]) and questions
 //! ([`DirtyLog::changed_except`]) go to the log, so a shadow's own copy back or merge never comes
 //! back to it as a change, while the guest's and any other writer's do.
@@ -47,6 +62,7 @@ use reims_vgpu_core::sync::Mutex;
 
 use super::{LinuxClock, files};
 use crate::os::GuestRamFile;
+use crate::os::resolutions::{Resolutions, Segments};
 
 /// One range of a device's RAM, registered by its lease.
 #[derive(Debug)]
@@ -199,6 +215,19 @@ struct Shared {
     /// The host address of the import's pointer, as the backing table knows it.
     at: u64,
     watches: Mutex<Vec<Watched>>,
+    /// The ranges resolved so far, with their segments (module docs, "Resolved once").
+    resolved: Resolutions,
+}
+
+impl Shared {
+    fn new(log: Arc<DirtyLog>, at: u64, resolved: Resolutions) -> Shared {
+        Shared {
+            log,
+            at,
+            watches: Mutex::new(Vec::new()),
+            resolved,
+        }
+    }
 }
 
 /// The runtime's questions about one import (module docs), over its device's log.
@@ -231,31 +260,33 @@ impl ImportDirty {
         let first = resolved(at, 1).into_iter().next()?;
         let (log, _) = first.ram?;
         Some(ImportDirty {
-            shared: Arc::new(Shared {
-                log,
-                at,
-                watches: Mutex::new(Vec::new()),
-            }),
+            shared: Arc::new(Shared::new(log, at, Resolutions::default())),
         })
     }
 
-    /// The answers for the whole of a guest's RAM, its offsets host addresses (the runtime's
-    /// `HostRam::with_dirty_pages`, whose log's pointer is 0), where host address `first`, a byte
-    /// of the RAM, lies in the RAM of a device with a dirty log; `None` otherwise.
-    pub(crate) fn of_ram(first: u64) -> Option<ImportDirty> {
+    /// The answers for the whole of a guest's RAM, `ranges` of it, each a host address and a
+    /// length, its offsets host addresses (the runtime's `HostRam::with_dirty_pages`, whose log's
+    /// pointer is 0), where the first range's first byte lies in the RAM of a device with a dirty
+    /// log; `None` otherwise. The ranges are kept whole (module docs, "Resolved once").
+    pub(crate) fn of_ram(ranges: &[(u64, u64)]) -> Option<ImportDirty> {
+        let &(first, _) = ranges.first()?;
         let first = resolved(first, 1).into_iter().next()?;
         let (log, _) = first.ram?;
+        let wholes = (ranges.iter()).map(|&(at, length)| at..at.saturating_add(length));
         Some(ImportDirty {
-            shared: Arc::new(Shared {
-                log,
-                at: 0,
-                watches: Mutex::new(Vec::new()),
-            }),
+            shared: Arc::new(Shared::new(log, 0, Resolutions::with_wholes(wholes))),
         })
     }
 
-    /// The import's bytes `range` as segments of the import, in this log's RAM or none.
-    fn segments(&self, range: &Range<u64>) -> Vec<Segment> {
+    /// The import's bytes `range` as segments of the import, in this log's RAM or none: cut from
+    /// a whole or a range resolved before that holds it, or resolved now and kept (module docs,
+    /// "Resolved once").
+    fn segments(&self, range: &Range<u64>) -> Segments<'_> {
+        (self.shared.resolved).segments(range, |range| self.resolve(range))
+    }
+
+    /// The import's bytes `range` as segments, from the backing table.
+    fn resolve(&self, range: &Range<u64>) -> Vec<Segment> {
         let length = range.end.saturating_sub(range.start);
         let pieces = resolved(self.shared.at.saturating_add(range.start), length);
         if pieces.is_empty() {
@@ -306,12 +337,11 @@ impl ImportDirty {
             }
         }
     }
+}
 
-    /// The guest runs of this log behind the import's bytes `range`.
-    fn runs(&self, range: &Range<u64>) -> impl Iterator<Item = Range<u64>> {
-        (self.segments(range).into_iter())
-            .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
-    }
+/// The guest physical runs of `segments`, leaving out what is not the guest's RAM.
+fn guest_runs(segments: impl Iterator<Item = Segment>) -> impl Iterator<Item = Range<u64>> {
+    segments.filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
 }
 
 /// The runtime's questions, in offsets from the import's pointer (module docs).
@@ -319,10 +349,8 @@ impl rt::DirtyPages for ImportDirty {
     type Watch = ImportWatch;
 
     fn watch(&self, range: Range<u64>) -> ImportWatch {
-        let segments: Arc<[Segment]> = self.segments(&range).into();
-        let runs: Vec<Range<u64>> = (segments.iter())
-            .filter_map(|s| s.guest.map(|g| g..g.saturating_add(s.length)))
-            .collect();
+        let segments = self.segments(&range).shared();
+        let runs: Vec<Range<u64>> = guest_runs(segments.iter().copied()).collect();
         self.shared.log.watch(&runs);
         let id = NEXT_ID.fetch_add(1, Ordering::Relaxed);
         self.shared.watches.lock().push(Watched { id, segments });
@@ -346,18 +374,14 @@ impl rt::DirtyPages for ImportDirty {
     }
 
     fn wrote(&self, range: Range<u64>) {
-        for run in self.runs(&range) {
-            self.shared.log.wrote(run);
-        }
+        (self.shared.log).wrote_runs(guest_runs(self.segments(&range).iter()));
     }
 
     fn wrote_as(&self, range: Range<u64>, writer: NonZeroU64) {
         if !writers() {
             return rt::DirtyPages::wrote(self, range);
         }
-        for run in self.runs(&range) {
-            self.shared.log.wrote_as(run, writer);
-        }
+        (self.shared.log).wrote_runs_as(guest_runs(self.segments(&range).iter()), writer);
     }
 
     fn changed_except(&self, since: rt::DirtyStamp, writer: NonZeroU64, out: &mut Vec<Range<u64>>) {

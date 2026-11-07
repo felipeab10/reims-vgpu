@@ -113,6 +113,25 @@ pub fn default_gpu_core_count() -> Option<u64> {
     *COUNT.get_or_init(|| count)
 }
 
+/// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig` of the system default
+/// `MTLDevice`, asked of Metal once: the answers of the GPU's own driver for the device
+/// [`default_registry_id`] names, which no Vulkan query reports. `None` for each where Metal has
+/// no device, or its device does not respond to it.
+pub fn default_driver_sizes() -> [Option<u64>; 4] {
+    static SIZES: std::sync::OnceLock<[Option<u64>; 4]> = std::sync::OnceLock::new();
+    *SIZES.get_or_init(|| {
+        MetalPlatform::system_default_device().map_or([None; 4], |d| {
+            let z = d.identity_caps().sizes;
+            [
+                z.feature_profile,
+                z.half_fp_config,
+                z.single_fp_config,
+                z.double_fp_config,
+            ]
+        })
+    })
+}
+
 /// What a device holds of the guest's RAM while it lives: nothing, as Mach makes a view of any
 /// memory by remapping its addresses (`mach_vm_remap`), with no file behind it.
 #[derive(Debug)]
@@ -161,6 +180,12 @@ impl ImportView {
         false
     }
 
+    /// Whether the runtime is told the import's pages are writable: never on macOS, where it
+    /// asks the kernel nothing of them either way.
+    pub(crate) fn vouched(&self) -> bool {
+        false
+    }
+
     /// The runtime's deallocator of the import, and what keeps the import's memory mapped beside
     /// the bytes themselves: `inner`, as it is, and nothing, as the runtime imports the bytes.
     pub(crate) fn release(
@@ -186,6 +211,21 @@ pub(crate) fn import_view(at: std::ptr::NonNull<u8>, _length: u64) -> ImportView
 pub(crate) unsafe fn host_memory(at: std::ptr::NonNull<u8>, _logged: bool) -> rt::HostMemory {
     // SAFETY: the caller's.
     unsafe { rt::HostMemory::new(at) }
+}
+
+/// [`host_memory`]: on macOS the runtime asks nothing of the pages' permissions, so a vouch
+/// changes nothing.
+///
+/// # Safety
+///
+/// [`host_memory`]'s.
+pub(crate) unsafe fn host_memory_vouched(
+    at: std::ptr::NonNull<u8>,
+    logged: bool,
+    _vouched: bool,
+) -> rt::HostMemory {
+    // SAFETY: the caller's.
+    unsafe { host_memory(at, logged) }
 }
 
 /// Why this thread's last dma-buf source made none: never, on macOS, where imports carry none.
@@ -505,9 +545,9 @@ fn alive(id: u32) -> bool {
 
 /// `IOSurfaceCreate` and `[[IOSurface alloc] initWithProperties:]`: the metal crate's. A surface
 /// made over the guest's pages, or at an offset into its allocation, is recorded with them
-/// ([`surface_memory`], [`surface_offset`]), and with whether the GPU's writes through it reach
-/// them ([`gpu_read_only`]); every lookup of it answers the record too. Each surface made here
-/// drops the record of a surface gone that had its ID.
+/// ([`crate::os::surface_memory`], [`crate::os::surface_offset`]), and with whether the GPU's
+/// writes through it reach them ([`crate::os::gpu_read_only`]); every lookup of it answers the
+/// record too. Each surface made here drops the record of a surface gone that had its ID.
 #[derive(Debug, Default)]
 pub struct VulkanSurfaces(MetalSurfaces);
 

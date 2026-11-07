@@ -23,22 +23,27 @@ use std::sync::{Arc, LazyLock};
 use block2::{Block, RcBlock};
 use dispatch2::{DispatchData, DispatchRetained, dispatch_block_t};
 use objc2::rc::Retained;
-use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject};
+use objc2::runtime::{AnyObject, NSObjectProtocol, ProtocolObject, Sel};
 use objc2::{AnyThread as _, Message, sel};
 use objc2_foundation::{NSData, NSError};
 use objc2_metal::{MTLDevice, MTLGPUFamily, MTLPixelFormat, MTLResourceOptions};
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::HostRange;
 use reims_vgpu_core::platform::caps::{
-    DeviceCaps, FAMILIES, Flags, HEAP_QUERY_OPTIONS, LINEAR_ALIGNMENT_FORMAT, Limits,
-    SAMPLE_COUNTS, WRITE_ROUNDING_MODES,
+    COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
+    HEAP_QUERY_OPTIONS, IdentityCaps, IdentityFlags, IdentitySizes, LARGEST_COUNT_ASKED,
+    LINEAR_ALIGNMENT_FORMAT, Limits, SAMPLE_COUNTS, SDK_FAMILIES, SDK_PIXEL_FORMATS,
+    SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS, TEXTURE_BUFFER_FORMATS, WRITE_ROUNDING_MODES,
 };
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::types::{
-    MtlSize, NsErrorText, PixelFormatInfo, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
+    ArgumentLayout, MtlSize, NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign,
+    TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, RenderPipelineDesc, SamplerDesc,
+    ArgumentDesc, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc,
+    RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::raise::death::DeathKind;
 use reims_vgpu_core::raise::{Kept, keep_forever};
@@ -208,6 +213,57 @@ pub(super) fn create_or_die<T: Message>(
     unsafe { made_or_error(made, error) }
 }
 
+/// The refusal of a mesh render pipeline whose stage function is of another stage's type, made
+/// before Metal sees the descriptor: Metal on the M3 Max ends the process with SIGSEGV inside
+/// `newRenderPipelineStateWithMeshDescriptor:options:reflection:error:` at a vertex function as the
+/// mesh function, a mesh function as the fragment function and a fragment function as the object
+/// function, and refuses an object function as the mesh function and a mesh function as the object
+/// function (measured: `guest/bundle/tools/oracle/oracle_mesh`, macOS 27.0.1). A guest's input
+/// never ends the host, so each is refused, in the domain, code and words the guest's bundle
+/// answers it with before it sends the create (the x86 Macs' compiler's domain and codes:
+/// `RgfxRenderPipelineState.mm`, `wrongStageError`).
+fn wrong_mesh_stage(desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>) -> Option<NsErrorText> {
+    use objc2_metal::{MTLFunction as _, MTLFunctionType};
+    let stage = |f: &MetalFunction| msg::get("functionType", || f.get().functionType());
+    let refusal = |code: i64, description: &str| NsErrorText {
+        domain: "CompilerError".to_owned(),
+        code,
+        description: description.to_owned(),
+    };
+    let mesh = stage(desc.mesh);
+    if mesh == MTLFunctionType::Vertex {
+        return Some(refusal(
+            2,
+            "RasterizationEnabled is false but the vertex shader's return type is not void",
+        ));
+    }
+    if mesh != MTLFunctionType::Mesh {
+        return Some(refusal(
+            1,
+            "meshFunction functionType is not MTLFunctionTypeMesh.",
+        ));
+    }
+    if desc
+        .object
+        .is_some_and(|f| stage(f) != MTLFunctionType::Object)
+    {
+        return Some(refusal(
+            1,
+            "objectFunction functionType is not MTLFunctionTypeObject.",
+        ));
+    }
+    if desc
+        .fragment
+        .is_some_and(|f| stage(f) != MTLFunctionType::Fragment)
+    {
+        return Some(refusal(
+            1,
+            "fragmentFunction functionType is not MTLFunctionTypeFragment.",
+        ));
+    }
+    None
+}
+
 /// A creator's answer: the object it made, else the `NSError` it wrote, else nil.
 ///
 /// # Safety
@@ -288,6 +344,20 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         msg::get("allowLibrariesFromOtherPlatforms", || {
             d.allowLibrariesFromOtherPlatforms()
         });
+    }
+
+    /// Read off the encoder Metal makes ([`super::argument`]).
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
+        super::argument::of_descriptors(self.get(), arguments)
+    }
+
+    /// Read off the encoder Metal makes, and its reflection ([`super::argument`]).
+    fn function_argument_layout(
+        &self,
+        function: &MetalFunction,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>> {
+        super::argument::of_function(function, buffer_index)
     }
 
     fn heap_texture_size_and_align(
@@ -380,6 +450,18 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
     fn new_command_queue(&self) -> Option<MetalCommandQueue> {
         let d = self.get();
         created(msg::get("newCommandQueue", || d.newCommandQueue()))
+    }
+
+    /// `newCommandQueue`'s queue: Metal has no call that keeps a queue from sharing the GPU's
+    /// queues, so the platform makes the queue any create makes.
+    fn new_command_queue_unshared(&self) -> Option<MetalCommandQueue> {
+        self.new_command_queue()
+    }
+
+    /// No: a Mac's GPU shares the CPU's memory, so the host keeps no device caches to copy
+    /// guest pages into, and Metal has no copy by host addresses.
+    fn copies_guest_ram(&self) -> bool {
+        false
     }
 
     fn deserialize_compute_pipeline_descriptor(
@@ -693,6 +775,18 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         CAPS.lock().entry(id).or_insert(read).clone()
     }
 
+    /// Every getter's answer, Metal's own (`read_identity_caps`).
+    fn identity_caps(&self) -> IdentityCaps {
+        read_identity_caps(self)
+    }
+
+    fn own_memory_budget(&self) -> u64 {
+        let d = self.get();
+        msg::get("recommendedMaxWorkingSetSize", || {
+            d.recommendedMaxWorkingSetSize()
+        })
+    }
+
     // Each creator from a value makes the descriptor with its class's `new`, makes it hold the
     // value (`desc`'s `apply_*`), then sends the descriptor's creator.
 
@@ -710,6 +804,26 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         Ok(HeapMade {
             heap,
             descriptor_resource_options: desc::heap_descriptor_resource_options(&d),
+        })
+    }
+
+    /// A heap over one address range, `bytes`, which Metal makes over the range's pages in place.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, MetalPlatform>,
+    ) -> RaiseResult<HeapMade<MetalPlatform>> {
+        let range = ResourceAddressRange {
+            address: bytes.ptr().addr().to_u64(),
+            length: bytes.len(),
+        };
+        let ranges = crate::platform::address_range_array(&[range])?;
+        self.new_heap(&HeapDesc {
+            size: desc.size,
+            heap_type: desc.heap_type,
+            options: desc.options.clone(),
+            address_ranges: Some(&ranges),
+            pinned_gpu_address: desc.pinned_gpu_address,
         })
     }
 
@@ -747,6 +861,57 @@ impl GpuDevice<MetalPlatform> for MetalDevice {
         let d = crate::platform::class_new(objc2_metal::MTLRenderPipelineDescriptor::new);
         desc::apply_render_pipeline(desc, &d);
         render_pipeline_state_with_descriptor(self, &d)
+    }
+
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalRenderPipeline>, NsErrorText> {
+        let d = crate::platform::class_new(objc2_metal::MTLRenderPipelineDescriptor::new);
+        desc::apply_full_render_pipeline(desc, &d);
+        render_pipeline_state_with_descriptor(self, &d)
+    }
+
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        desc: &FullMeshRenderPipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalRenderPipeline>, NsErrorText> {
+        if let Some(refusal) = wrong_mesh_stage(desc) {
+            return Err(refusal);
+        }
+        let d = crate::platform::class_new(objc2_metal::MTLMeshRenderPipelineDescriptor::new);
+        desc::apply_full_mesh_render_pipeline(desc, &d);
+        let (device, descriptor) = (self.get(), d.get());
+        // SAFETY: `create_or_die`'s out-parameter.
+        create_or_die(
+            "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:",
+            |error| unsafe {
+                DeviceSpi::newRenderPipelineStateWithMeshDescriptor_options_reflection_error(
+                    device, descriptor, 0, error,
+                )
+            },
+        )
+    }
+
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, MetalPlatform>,
+    ) -> Result<Option<MetalComputePipeline>, NsErrorText> {
+        let d = crate::platform::class_new(objc2_metal::MTLComputePipelineDescriptor::new);
+        desc::apply_full_compute_pipeline(desc, &d);
+        let (device, descriptor) = (self.get(), d.get());
+        // SAFETY: `create_or_die`'s out-parameter.
+        create_or_die(
+            "newComputePipelineStateWithDescriptor:options:reflection:error:",
+            |error| unsafe {
+                DeviceSpi::newComputePipelineStateWithDescriptor_options_reflection_error(
+                    device,
+                    Some(descriptor),
+                    0,
+                    error,
+                )
+            },
+        )
     }
 }
 
@@ -856,6 +1021,11 @@ fn gpu_core_count(d: &ProtocolObject<dyn MTLDevice>) -> Option<u64> {
     }
     let n = msg::get("gpuCoreCount", || d.gpuCoreCount());
     Some(u64::from(n))
+}
+
+/// Whether the device responds to `sel`, an `MTLDeviceSPI` getter sent only where it does.
+fn responds(d: &ProtocolObject<dyn MTLDevice>, sel: Sel) -> bool {
+    msg::get("respondsToSelector:", || d.respondsToSelector(sel))
 }
 
 /// `heapBufferSizeAndAlignWithLength:options:`.
@@ -988,6 +1158,163 @@ fn read_caps(device: &MetalDevice, page_size: u64) -> DeviceCaps {
         }),
         heap_buffer_page_private: heap_buffer_size_and_align(d, page_size, HEAP_QUERY_OPTIONS),
         min_linear_alignment_bgra8: minimum_linear_alignment(d, LINEAR_ALIGNMENT_FORMAT),
+    }
+}
+
+/// The largest count in `1..=LARGEST_COUNT_ASKED` that `accepts` takes, counting up from 1 until
+/// it refuses one; 0 where it refuses 1.
+fn largest(accepts: impl Fn(u64) -> bool) -> u64 {
+    (1..=LARGEST_COUNT_ASKED)
+        .take_while(|&count| accepts(count))
+        .last()
+        .unwrap_or(0)
+}
+
+/// The answers of `format` [`FormatAnswers`] holds: its texture buffers' alignment where Metal
+/// answers it ([`TEXTURE_BUFFER_FORMATS`]; it asserts on every other format), and its 2D sparse
+/// tiles.
+fn format_answers(d: &ProtocolObject<dyn MTLDevice>, format: u64) -> FormatAnswers {
+    let pf = MTLPixelFormat(format.to_usize());
+    let texture_buffer_alignment = TEXTURE_BUFFER_FORMATS.contains(&format).then(|| {
+        msg::get("minimumTextureBufferAlignmentForPixelFormat:", || {
+            d.minimumTextureBufferAlignmentForPixelFormat(pf)
+        })
+        .to_u64()
+    });
+    let mut tiles = [[0; 3]; 9];
+    let pairs = SPARSE_SAMPLE_COUNTS
+        .iter()
+        .flat_map(|&samples| SPARSE_PAGE_SIZES.iter().map(move |&page| (samples, page)));
+    for (tile, (samples, page)) in tiles.iter_mut().zip(pairs) {
+        // `NSInteger` is `i64` on arm64: lossless.
+        let page = objc2_metal::MTLSparsePageSize(page as isize);
+        let samples = samples.to_usize();
+        // SAFETY: any format, count and page; Metal answers a tile for each of the SDK's.
+        let size = msg::get(
+            "sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:",
+            || unsafe {
+                d.sparseTileSizeWithTextureType_pixelFormat_sampleCount_sparsePageSize(
+                    objc2_metal::MTLTextureType::Type2D,
+                    pf,
+                    samples,
+                    page,
+                )
+            },
+        );
+        *tile = [size.width, size.height, size.depth].map(ToU64::to_u64);
+    }
+    FormatAnswers {
+        format,
+        texture_buffer_alignment,
+        sparse_tiles: Some(tiles),
+    }
+}
+
+/// Every identity and capability answer of `device` [`IdentityCaps`] holds, each Metal's getter
+/// or query, sent once. Metal answers each of them, so none is `None`, but for the
+/// `MTLDeviceSPI` getters a device may not respond to.
+#[allow(deprecated)] // `supportsFeatureSet:`, `location` and the peer getters, deprecated in the SDK
+fn read_identity_caps(device: &MetalDevice) -> IdentityCaps {
+    let d = device.get();
+    /// A `Fatal` getter of the device: one call, whose selector is the getter's name.
+    macro_rules! get {
+        ($getter:ident) => {
+            msg::get(stringify!($getter), || d.$getter())
+        };
+    }
+    let arch = msg::get("architecture", || d.architecture());
+    let architecture_name = msg::get("name", || arch.name());
+    // `supportsPlacementSparse` is the macOS 26 SDK's; a device of an older OS lacks it.
+    let placement_sparse = msg::get("respondsToSelector:", || {
+        d.respondsToSelector(sel!(supportsPlacementSparse))
+    })
+    .then(|| msg::get("supportsPlacementSparse", || d.supportsPlacementSparse()));
+    IdentityCaps {
+        families: SDK_FAMILIES.map(|family| {
+            // `NSInteger` is `i64` on arm64: lossless.
+            let family = MTLGPUFamily(family as isize);
+            Some(msg::get("supportsFamily:", || d.supportsFamily(family)))
+        }),
+        feature_sets: FEATURE_SETS.map(|set| {
+            let set = objc2_metal::MTLFeatureSet(set.to_usize());
+            Some(msg::get("supportsFeatureSet:", || {
+                d.supportsFeatureSet(set)
+            }))
+        }),
+        counter_sampling: COUNTER_SAMPLING_POINTS.map(|point| {
+            let point = objc2_metal::MTLCounterSamplingPoint(point.to_usize());
+            Some(msg::get("supportsCounterSampling:", || {
+                d.supportsCounterSampling(point)
+            }))
+        }),
+        architecture_name: Some(msg::string_text(&architecture_name)),
+        formats: SDK_PIXEL_FORMATS
+            .iter()
+            .map(|&format| format_answers(d, format))
+            .collect(),
+        sizes: IdentitySizes {
+            recommended_max_working_set_size: Some(get!(recommendedMaxWorkingSetSize)),
+            location: Some(get!(location).0.to_u64()),
+            location_number: Some(get!(locationNumber).to_u64()),
+            max_transfer_rate: Some(get!(maxTransferRate)),
+            peer_group_id: Some(get!(peerGroupID)),
+            peer_index: Some(u64::from(get!(peerIndex))),
+            peer_count: Some(u64::from(get!(peerCount))),
+            max_buffer_length: Some(get!(maxBufferLength).to_u64()),
+            max_argument_buffer_sampler_count: Some(get!(maxArgumentBufferSamplerCount).to_u64()),
+            argument_buffers_support: Some(get!(argumentBuffersSupport).0.to_u64()),
+            read_write_texture_support: Some(get!(readWriteTextureSupport).0.to_u64()),
+            sparse_tile_size_in_bytes: Some(get!(sparseTileSizeInBytes).to_u64()),
+            maximum_concurrent_compilation_task_count: Some(
+                get!(maximumConcurrentCompilationTaskCount).to_u64(),
+            ),
+            largest_vertex_amplification_count: Some(largest(|count| {
+                let count = count.to_usize();
+                msg::get("supportsVertexAmplificationCount:", || {
+                    d.supportsVertexAmplificationCount(count)
+                })
+            })),
+            largest_rasterization_rate_map_layer_count: Some(largest(|count| {
+                let count = count.to_usize();
+                // SAFETY: a count is any `NSUInteger`; Metal answers no for one it does not take.
+                msg::get("supportsRasterizationRateMapWithLayerCount:", || unsafe {
+                    d.supportsRasterizationRateMapWithLayerCount(count)
+                })
+            })),
+            // `Q@:` getters, `None` where the device does not respond to one, and then only
+            // `respondsToSelector:` is sent.
+            feature_profile: responds(d, sel!(featureProfile))
+                .then(|| msg::get("featureProfile", || d.featureProfile())),
+            half_fp_config: responds(d, sel!(halfFPConfig))
+                .then(|| msg::get("halfFPConfig", || d.halfFPConfig())),
+            single_fp_config: responds(d, sel!(singleFPConfig))
+                .then(|| msg::get("singleFPConfig", || d.singleFPConfig())),
+            double_fp_config: responds(d, sel!(doubleFPConfig))
+                .then(|| msg::get("doubleFPConfig", || d.doubleFPConfig())),
+        },
+        flags: IdentityFlags {
+            is_low_power: Some(get!(isLowPower)),
+            is_headless: Some(get!(isHeadless)),
+            is_removable: Some(get!(isRemovable)),
+            has_unified_memory: Some(get!(hasUnifiedMemory)),
+            supports_32bit_float_filtering: Some(get!(supports32BitFloatFiltering)),
+            supports_32bit_msaa: Some(get!(supports32BitMSAA)),
+            supports_query_texture_lod: Some(get!(supportsQueryTextureLOD)),
+            supports_bc_texture_compression: Some(get!(supportsBCTextureCompression)),
+            supports_pull_model_interpolation: Some(get!(supportsPullModelInterpolation)),
+            are_barycentric_coords_supported: Some(get!(areBarycentricCoordsSupported)),
+            supports_shader_barycentric_coordinates: Some(get!(
+                supportsShaderBarycentricCoordinates
+            )),
+            supports_dynamic_libraries: Some(get!(supportsDynamicLibraries)),
+            supports_render_dynamic_libraries: Some(get!(supportsRenderDynamicLibraries)),
+            supports_raytracing: Some(get!(supportsRaytracing)),
+            supports_function_pointers: Some(get!(supportsFunctionPointers)),
+            supports_function_pointers_from_render: Some(get!(supportsFunctionPointersFromRender)),
+            supports_raytracing_from_render: Some(get!(supportsRaytracingFromRender)),
+            supports_primitive_motion_blur: Some(get!(supportsPrimitiveMotionBlur)),
+            supports_placement_sparse: placement_sparse,
+        },
     }
 }
 
@@ -1242,6 +1569,75 @@ pub(crate) mod tests {
         unsafe { std::alloc::dealloc(mem, layout) };
     }
 
+    /// A heap over host memory is Metal's over the one address range in place: a buffer placed at
+    /// an offset is the bytes there, at the heap's address plus the offset, and the CPU's writes
+    /// and the GPU's fill of the buffer land in them
+    #[test]
+    fn a_heap_over_host_memory_lies_in_its_bytes() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::resource::{Buffer, Heap};
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::OptionSet;
+        let d = dev();
+        let layout = std::alloc::Layout::from_size_align(0x2_0000, 0x4000).unwrap();
+        // SAFETY: a non-zero layout; the memory is kept for the process.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        let at = |offset: usize| {
+            // SAFETY: inside the allocation.
+            unsafe { mem.add(offset) }
+        };
+        // SAFETY: the memory is kept for the process.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(mem), 0x1_4000) };
+        let desc = HeapDesc {
+            size: 0x1_0001,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0)],
+            address_ranges: None,
+            pinned_gpu_address: None,
+        };
+        let heap = d
+            .new_heap_over_host_memory(bytes, &desc)
+            .unwrap()
+            .heap
+            .unwrap();
+        let buffer = heap
+            .new_buffer_of_length(0x1000, 0, 0x4000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.contents().addr(), at(0x4000).addr());
+        assert_eq!(buffer.gpu_address(), heap.gpu_address() + 0x4000);
+        // SAFETY: the buffer's bytes are the allocation's, which nothing else touches.
+        unsafe { at(0x4000).write_bytes(0xa1, 0x800) };
+        let queue = d.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for command in [
+            BlitCmd::FillBuffer {
+                buffer: &buffer,
+                range: NsRange::new(0x800, 0x800),
+                value: 0x5c,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, command).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
+        // SAFETY: as above, the command buffer done.
+        unsafe {
+            assert_eq!(at(0x47ff).read(), 0xa1, "the CPU's bytes stay");
+            assert_eq!(
+                at(0x4800).read(),
+                0x5c,
+                "the GPU's fill lands in the heap's bytes"
+            );
+            assert_eq!(at(0x4fff).read(), 0x5c);
+            assert_eq!(at(0x5000).read(), 0, "past the buffer");
+        }
+    }
+
     /// Metal runs a no-copy buffer's deallocator on the thread that lets the buffer go, which
     /// need not be the library's: the deallocator runs marked as ours there (a panic in it aborts
     /// before it unwinds into Metal), and the thread's own mark comes back after it
@@ -1474,6 +1870,57 @@ pub(crate) mod tests {
         assert!(a.heap_buffer_page_private.is_ok());
     }
 
+    /// The identity is Metal's: every family and feature set answered, Apple5 to Apple10 as the
+    /// caps answer them, and the getters the device's own
+    #[test]
+    fn identity_caps_are_metals() {
+        let d = dev();
+        let caps = d.caps();
+        let identity = d.identity_caps();
+        assert!(identity.families.iter().all(Option::is_some));
+        assert!(identity.feature_sets.iter().all(Option::is_some));
+        // SDK_FAMILIES[4..10] are Apple5 to Apple10, core's FAMILIES[..6].
+        for (k, answer) in caps.families.iter().take(6).enumerate() {
+            assert_eq!(identity.families[4 + k], answer.clone().ok());
+        }
+        assert_eq!(
+            identity.flags.has_unified_memory,
+            Some(d.get().hasUnifiedMemory())
+        );
+        assert_eq!(
+            identity.sizes.max_buffer_length,
+            Some(d.get().maxBufferLength().to_u64())
+        );
+        assert_eq!(
+            identity.architecture_name,
+            Some(d.get().architecture().name().to_string())
+        );
+        // The budget of the GPU's own memory is the working set Metal recommends.
+        assert_eq!(
+            Some(d.own_memory_budget()),
+            identity.sizes.recommended_max_working_set_size
+        );
+        // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB.
+        let bgra8 = identity.formats.iter().find(|f| f.format == 80).unwrap();
+        assert_eq!(bgra8.texture_buffer_alignment, Some(16));
+        assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
+        // BC1_RGBA (130), which Metal asserts on, is not asked.
+        let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
+        assert_eq!(bc1.texture_buffer_alignment, None);
+        // The driver's feature profile and FP configs, as the device answers them.
+        assert_eq!(
+            identity.sizes.feature_profile,
+            Some(d.get().featureProfile())
+        );
+        assert!(identity.sizes.feature_profile.is_some_and(|p| p >= 8));
+        assert_eq!(identity.sizes.half_fp_config, Some(d.get().halfFPConfig()));
+        assert_eq!(
+            identity.sizes.single_fp_config,
+            Some(d.get().singleFPConfig())
+        );
+        assert_eq!(identity.sizes.double_fp_config, Some(0));
+    }
+
     /// Garbage is the NSError; a compiled metallib (the suite's one-kernel fixture) is a library
     #[test]
     fn new_library() {
@@ -1489,6 +1936,151 @@ pub(crate) mod tests {
         let bytes = include_bytes!("../../../../tests/suite/fixtures/shaders/kernel.metallib");
         let lib = d.new_library(bytes).unwrap().unwrap().unwrap();
         assert_eq!(lib.get().functionNames().count(), 1);
+    }
+
+    /// A mesh render pipeline's functions: an object function and the mesh function it feeds, a
+    /// mesh function alone, a fragment function, and a vertex function.
+    const MESH_SOURCE: &str = "#include <metal_stdlib>
+using namespace metal;
+struct V { float4 p [[position]]; };
+using M = metal::mesh<V, void, 3, 1, topology::triangle>;
+struct P { uint n; };
+static void tri(M m, uint t) {
+  if (t == 0) { m.set_primitive_count(1); m.set_index(0, 0); m.set_index(1, 1); m.set_index(2, 2); }
+  if (t < 3) { V v; v.p = float4(float(t) - 1.0, float(t & 1), 0, 1); m.set_vertex(t, v); }
+}
+[[object]] void omain(object_data P &p [[payload]], mesh_grid_properties g,
+                      uint t [[thread_index_in_threadgroup]]) {
+  if (t == 0) { p.n = 1; g.set_threadgroups_per_grid(uint3(1, 1, 1)); }
+}
+[[mesh]] void mpay(M m, const object_data P &p [[payload]], uint t [[thread_index_in_threadgroup]]) {
+  tri(m, t);
+}
+[[mesh]] void mmain(M m, uint t [[thread_index_in_threadgroup]]) { tri(m, t); }
+fragment float4 fmain() { return float4(1, 0, 0, 1); }
+vertex float4 vmain(uint v [[vertex_id]]) { return float4(0, 0, 0, 1); }
+";
+
+    /// A mesh render pipeline of `mesh` (with `object` and `fragment` where given) into one
+    /// BGRA8Unorm target, every other field Metal's.
+    fn mesh_desc<'a>(
+        object: Option<&'a MetalFunction>,
+        mesh: &'a MetalFunction,
+        fragment: Option<&'a MetalFunction>,
+    ) -> FullMeshRenderPipelineDesc<'a, MetalPlatform> {
+        FullMeshRenderPipelineDesc {
+            label: None,
+            object,
+            mesh,
+            fragment,
+            colors: vec![(
+                0,
+                reims_vgpu_core::platform::values::ColorAttachmentDesc {
+                    pixel_format: 80,
+                    ..Default::default()
+                },
+            )],
+            depth_pixel_format: 0,
+            stencil_pixel_format: 0,
+            raster_sample_count: 1,
+            alpha_to_coverage: false,
+            alpha_to_one: false,
+            rasterization_enabled: fragment.is_some(),
+            max_total_threads_per_object_threadgroup: 0,
+            max_total_threads_per_mesh_threadgroup: 0,
+            max_total_threadgroups_per_mesh_grid: 0,
+            object_threadgroup_size_is_multiple_of_execution_width: false,
+            mesh_threadgroup_size_is_multiple_of_execution_width: false,
+            payload_memory_length: if object.is_some() { 16 } else { 0 },
+            max_vertex_amplification_count: 1,
+            required_threads_per_object_threadgroup: MtlSize::default(),
+            required_threads_per_mesh_threadgroup: MtlSize::default(),
+            support_indirect_command_buffers: false,
+            object_linked: Default::default(),
+            mesh_linked: Default::default(),
+            fragment_linked: Default::default(),
+        }
+    }
+
+    /// newRenderPipelineStateWithMeshDescriptor:options:reflection:error: makes a mesh render
+    /// pipeline, whose state answers its stages' limits as Metal's does; one whose stage
+    /// function is of another stage's type is refused before Metal sees it, in the x86 Macs'
+    /// domain and codes (Metal on the M3 Max ends the process at a vertex function as the mesh
+    /// function, a mesh function as the fragment function and a fragment function as the object
+    /// function: oracle_mesh, macOS 27.0.1)
+    #[test]
+    fn mesh_render_pipelines() {
+        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        let d = dev();
+        let library = Obj::from_retained(
+            objc2_metal::MTLDevice::newLibraryWithSource_options_error(
+                d.get(),
+                &NSString::from_str(MESH_SOURCE),
+                None,
+            )
+            .expect("the mesh functions compile"),
+        );
+        let f = |name: &str| function(&library, name);
+        let (omain, mpay, mmain, fmain, vmain) =
+            (f("omain"), f("mpay"), f("mmain"), f("fmain"), f("vmain"));
+
+        let state = d
+            .new_mesh_render_pipeline_state_full(&mesh_desc(Some(&omain), &mpay, Some(&fmain)))
+            .unwrap()
+            .expect("a mesh pipeline with an object stage");
+        assert_eq!(state.max_total_threads_per_threadgroup(), 0);
+        assert_eq!(state.max_total_threads_per_object_threadgroup(), 1024);
+        assert_eq!(state.max_total_threads_per_mesh_threadgroup(), 1024);
+        assert!(state.mesh_thread_execution_width() > 0);
+        assert!(state.object_thread_execution_width() > 0);
+        assert!(state.max_total_threadgroups_per_mesh_grid() > 0);
+        assert!(
+            d.new_mesh_render_pipeline_state_full(&mesh_desc(None, &mmain, None))
+                .unwrap()
+                .is_some(),
+            "a mesh pipeline that does not rasterize"
+        );
+
+        let refused = |object, mesh, fragment| {
+            d.new_mesh_render_pipeline_state_full(&mesh_desc(object, mesh, fragment))
+                .err()
+                .map(|e| (e.domain, e.code, e.description))
+        };
+        let words = |code: i64, description: &str| {
+            Some(("CompilerError".to_owned(), code, description.to_owned()))
+        };
+        assert_eq!(
+            refused(None, &vmain, Some(&fmain)),
+            words(
+                2,
+                "RasterizationEnabled is false but the vertex shader's return type is not void"
+            )
+        );
+        assert_eq!(
+            refused(None, &omain, Some(&fmain)),
+            words(1, "meshFunction functionType is not MTLFunctionTypeMesh.")
+        );
+        assert_eq!(
+            refused(Some(&fmain), &mpay, Some(&fmain)),
+            words(
+                1,
+                "objectFunction functionType is not MTLFunctionTypeObject."
+            )
+        );
+        assert_eq!(
+            refused(Some(&mmain), &mpay, Some(&fmain)),
+            words(
+                1,
+                "objectFunction functionType is not MTLFunctionTypeObject."
+            )
+        );
+        assert_eq!(
+            refused(None, &mmain, Some(&mpay)),
+            words(
+                1,
+                "fragmentFunction functionType is not MTLFunctionTypeFragment."
+            )
+        );
     }
 
     /// newComputePipelineStateWithFunction:error: and

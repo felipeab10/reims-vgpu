@@ -29,15 +29,16 @@ use std::sync::{Arc, OnceLock, Weak};
 use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
 use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::caps::DeviceCaps;
+use reims_vgpu_core::platform::caps::{DeviceCaps, IdentityCaps};
 use reims_vgpu_core::platform::device::{FunctionResolver, GpuDevice, NoCopyDeallocator};
 use reims_vgpu_core::platform::os::vm::HostVm;
 use reims_vgpu_core::platform::types::{
-    NsErrorText, PixelFormatInfo, ResourceAddressRange, SizeAndAlign, TextureLevelInfo,
-    TextureLevelQuery,
+    ArgumentKind, ArgumentLayout, ArgumentMember, NsErrorText, PixelFormatInfo,
+    ResourceAddressRange, SizeAndAlign, TextureLevelInfo, TextureLevelQuery,
 };
 use reims_vgpu_core::platform::values::{
-    BufferDeallocator, BufferDesc, DepthStencilDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
+    ArgumentDesc, BufferDeallocator, BufferDesc, DepthStencilDesc, FullComputePipelineDesc,
+    FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc, HeapMade, IcbDesc, OptionSet,
     RenderPipelineDesc, SamplerDesc,
 };
 use reims_vgpu_core::platform::{Handle, HostRange};
@@ -46,8 +47,8 @@ use reims_vgpu_core::rt::{BlockEnv, Hold};
 use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
-    Nil, Policy, RUNTIME_DOMAIN, create, decide, get, get_describing, hearing, metal_aborts, plain,
-    plain_at, send, unrepresentable,
+    Nil, Policy, RUNTIME_DOMAIN, create, created_or_decided, decide, error_text, get,
+    get_describing, hearing, metal_aborts, plain, plain_at, relay_gap, send, unrepresentable,
 };
 use crate::gpu::backing::{self, Backing, HEAP_GRANULE};
 use crate::gpu::caps;
@@ -55,11 +56,11 @@ use crate::gpu::command::{QueueObject, VulkanCommandQueue};
 use crate::gpu::desc::{
     Maker, PipelineDescriptorObject, TextureFields, VulkanComputePipelineDescriptor,
     VulkanRenderPipelineDescriptor, VulkanTextureDescriptor, VulkanTileRenderPipelineDescriptor,
-    format_refused,
+    created_format_refused, format_refused,
 };
 use crate::gpu::event::{VulkanEvent, VulkanSharedEvent, VulkanSharedEventHandle};
 use crate::gpu::icb::VulkanIcb;
-use crate::gpu::metal_space::{self, Placing, SurfacePlace, TextureKind};
+use crate::gpu::metal_space::{self, PinRefused, Placing, SurfacePlace, TextureKind};
 use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 use crate::gpu::resource::{
     BufferObject, ComputePipelineObject, HeapObject, LibraryObject, TextureObject, Under,
@@ -71,6 +72,48 @@ use crate::gpu::serialized;
 use crate::gpu::timing;
 use crate::os::{OsSurface, OsVm};
 use crate::platform::{Obj, VulkanPlatform};
+
+/// Core's layout of the runtime's `layout`, nested layouts with it.
+fn layout_of(layout: &metal2vulkan::bind::ArgumentBufferLayout) -> ArgumentLayout {
+    ArgumentLayout {
+        encoded_length: layout.encoded_length,
+        alignment: layout.alignment,
+        members: layout
+            .members
+            .iter()
+            .map(|m| ArgumentMember {
+                id: m.id,
+                count: m.count,
+                ids_per_element: m.ids_per_element,
+                offset: m.offset,
+                stride: m.stride,
+                size: m.size,
+                kind: argument_kind(m.ty),
+                layout: m.layout.as_deref().map(|l| Box::new(layout_of(l))),
+            })
+            .collect(),
+    }
+}
+
+/// Core's kind of the runtime's argument type.
+fn argument_kind(ty: metal2vulkan::bind::ArgumentType) -> ArgumentKind {
+    use metal2vulkan::bind::ArgumentType as T;
+    match ty {
+        T::Buffer => ArgumentKind::Buffer,
+        T::Texture => ArgumentKind::Texture,
+        T::Sampler => ArgumentKind::Sampler,
+        T::Constant => ArgumentKind::Constant,
+        T::IndirectCommandBuffer => ArgumentKind::IndirectCommandBuffer,
+        T::ComputePipelineState => ArgumentKind::ComputePipelineState,
+        T::RenderPipelineState => ArgumentKind::RenderPipelineState,
+        T::VisibleFunctionTable => ArgumentKind::VisibleFunctionTable,
+        T::IntersectionFunctionTable => ArgumentKind::IntersectionFunctionTable,
+        T::AccelerationStructure => ArgumentKind::AccelerationStructure,
+        T::DepthStencilState => ArgumentKind::DepthStencilState,
+        T::Struct => ArgumentKind::Struct,
+        _ => ArgumentKind::Constant,
+    }
+}
 
 /// `newTextureWithDescriptor:iosurface:plane:`'s debug line ([the module docs](self)): the
 /// selector; the descriptor's pixel format, raw and by Metal's name; the plane asked for; the
@@ -151,6 +194,26 @@ pub struct DeviceObject {
     pub registry_id: u64,
     /// Its capabilities, once read.
     caps: OnceLock<Arc<DeviceCaps>>,
+    /// Its keeping awake while the guest draws ([`crate::awake`]).
+    pub(crate) awake: crate::awake::Awake,
+}
+
+/// How many uncompleted command buffers a queue of `newCommandQueue` holds at most, as Metal's
+/// and the runtime's `new_command_queue`'s.
+const METAL_MAX_COMMAND_BUFFER_COUNT: usize = 64;
+
+/// The runtime's queue of at most `count` uncompleted command buffers for a command queue the
+/// graphics lane's kext asks unshared (`RGFX_QUEUE_UNSHARED`, WindowServer's queues): the
+/// runtime's `new_command_queue_unshared`, whose `VkQueue` no other command queue shares where the
+/// runtime shares `VkQueue`s, so no other process's long command buffer queues its frames on the
+/// GPU. On a device that shares none it is the queue every create makes. Its refusals are the
+/// runtime's: a `count` of 0 (`Invalid`, `MaxCommandBufferCount`) and a lost device
+/// (`DeviceLost`).
+pub(crate) fn unshared_queue(
+    raw: &rt::Device,
+    count: usize,
+) -> Result<rt::CommandQueue, rt::Error> {
+    raw.new_command_queue_unshared(count)
 }
 
 /// The registry ID this platform answers for `raw`: for the runtime's system default device,
@@ -181,18 +244,22 @@ fn invalid_library_file() -> NsErrorText {
 }
 
 /// The runtime's refusal `e` of the pipeline creator `sel`: the `NSError` where Metal answers one
-/// ([`super::states::pipeline_error`]), else a death at the send, whose line names `descriptor`'s
-/// formats ([`super::states::compute_formats`]). An unspecialized function constant is a death,
-/// as Metal aborts for one.
+/// ([`super::states::pipeline_error`]), the runtime's refusal as the `NSError` for a gap of its
+/// own or the device's, relayed by default ([`relay_gap`]), else a death at the send, whose line
+/// names `descriptor`'s formats ([`super::states::compute_formats`]). An unspecialized function
+/// constant is a death, as Metal aborts for one.
 fn compile_error(
     sel: &'static str,
     e: rt::Error,
     descriptor: Option<&ComputePipelineDescriptor>,
 ) -> NsErrorText {
     super::states::pipeline_error(&e).unwrap_or_else(|| {
-        // Decided as a getter's refusal: none of them returns.
         let formats = descriptor.map(super::states::compute_formats);
-        get_describing(sel, formats.as_deref(), || Err(e))
+        match relay_gap(sel, &e, formats.as_deref()) {
+            true => error_text(&e),
+            // Decided as a getter's refusal: none of them returns.
+            false => get_describing(sel, formats.as_deref(), || Err(e)),
+        }
     })
 }
 
@@ -242,7 +309,10 @@ pub(crate) fn first_adopted() -> Option<rt::Device> {
 /// The handle of `raw`, a device the runtime made: the object of the same device made before, or
 /// a new one, kept. The process's first device's sampler ID pool is the one Metal's sampler mempool
 /// follows ([`metal_space::count_sampler_ids`]). A new device's class joins the process's
-/// placement of degradations ([`crate::answer::native::device_made`]).
+/// placement of degradations ([`crate::answer::native::device_made`]), and its warm pass runs
+/// over the pipeline records earlier processes kept ([`crate::records`]), in the background. Its
+/// work counts go to the log where its filter names their target ([`crate::work_log`]), and its
+/// GPU is kept awake while the guest draws ([`crate::awake`]).
 pub fn adopt(raw: rt::Device) -> VulkanDevice {
     let id = registry_id(&raw);
     let mut devices = DEVICES.lock();
@@ -253,7 +323,13 @@ pub fn adopt(raw: rt::Device) -> VulkanDevice {
     crate::answer::native::device_made(raw.properties());
     #[cfg(target_os = "linux")]
     crate::os::learn_view_imports(&raw);
+    #[cfg(not(test))]
+    if let Some(home) = std::env::var_os("HOME") {
+        crate::records::warm(&raw, crate::records::path_in(home.as_ref()));
+    }
+    crate::work_log::start(&raw);
     let made = Obj::new(DeviceObject {
+        awake: crate::awake::Awake::start(&raw),
         raw,
         registry_id: id,
         caps: OnceLock::new(),
@@ -326,26 +402,78 @@ fn keep_unrun<D, T>(made: &RaiseResult<Option<T>>, slot: Option<Slot<D>>) {
 /// own address, and the keep-alive, which the runtime drops once it freed its import: it holds
 /// the twin, and an unmap hold on the bytes' pages, so that core's unmap of its mapping of them
 /// through the platform's VM, which its deallocator may make, waits for the free
-/// ([`crate::remap::UnmapHold`]); and whether the import is a writable twin of read-only pages,
-/// whose GPU writes reach them where Metal drops them ([`Backing::writes_kept`]).
+/// ([`crate::remap::UnmapHold`]); whether the import is a writable twin of read-only pages,
+/// whose GPU writes reach them where Metal drops them ([`Backing::writes_kept`]); and whether
+/// the runtime may be told the pages are writable ([`crate::os::ImportView::vouched`]).
 fn no_copy_release(
     start: NonNull<u8>,
     length: u64,
     run: Option<rt::Deallocator>,
     site: backing::ImportSite,
-) -> (NonNull<u8>, Option<rt::Deallocator>, rt::KeepAlive, bool) {
+) -> NoCopyImport {
     let view = crate::os::import_view(start, length);
     let imported = view.at();
     let kept = view.writes_kept();
+    let vouched = view.vouched();
     let (run, twin) = view.release(start, run);
     let hold = crate::remap::UnmapHold::new(start, length);
     let traced = backing::ImportTrace::new(site, start, length, imported);
-    (
-        imported,
+    NoCopyImport {
+        at: imported,
         run,
-        backing::keep_alive((twin, hold, traced)),
+        keep: backing::keep_alive((twin, hold, traced)),
         kept,
-    )
+        vouched,
+    }
+}
+
+/// What [`no_copy_release`] gives the runtime for a no-copy object.
+struct NoCopyImport {
+    /// The first byte the runtime imports.
+    at: NonNull<u8>,
+    /// The runtime's deallocator.
+    run: Option<rt::Deallocator>,
+    /// What keeps the import's pages mapped until the runtime freed it.
+    keep: rt::KeepAlive,
+    /// The import is a writable twin of read-only pages.
+    kept: bool,
+    /// The runtime may be told the pages are writable.
+    vouched: bool,
+}
+
+/// [`create`] of a buffer, its nil answer logged with its reason, once ([`no_buffer`]): `pinned`
+/// where Metal's space refused the guest's pin ([`Placing::pin_refused`]), the span the pin needs
+/// and the held byte it meets or the granule it is off; else the runtime's refusal (no memory,
+/// an import that failed). The guest learns only that the buffer is nil, and its later uses of it
+/// fail far from the cause.
+fn create_buffer<T>(
+    sel: &'static str,
+    nil: Nil,
+    pinned: Option<&PinRefused>,
+    call: impl FnOnce() -> Result<T, rt::Error>,
+) -> RaiseResult<Option<T>> {
+    let mut refused = None;
+    let made = create(sel, Policy::Dies, nil, || {
+        call().inspect_err(|e| refused = Some(e.to_string()))
+    });
+    if matches!(made, Ok(None)) {
+        match (pinned, refused) {
+            (Some(pinned), _) => {
+                no_buffer(
+                    sel,
+                    &format_args!("Metal's space refused the pin: {pinned:x?}"),
+                );
+            }
+            (None, Some(refused)) => no_buffer(sel, &refused),
+            (None, None) => {}
+        }
+    }
+    made
+}
+
+/// Logs that `sel` answered nil, its buffer refused for `why`.
+fn no_buffer(sel: &'static str, why: &dyn std::fmt::Display) {
+    log::warn!(target: "reims_vgpu_vulkan::gpu", "{sel} answered nil: {why}");
 }
 
 /// What Metal answers where the runtime refuses a buffer or heap made at `placing`'s address:
@@ -696,7 +824,7 @@ impl VulkanDevice {
             Some(other) => descriptor.with_range_of(other),
             None => descriptor,
         };
-        create(sel, Policy::Dies, nil, || {
+        create_buffer(sel, nil, None, || {
             self.raw
                 .new_buffer_with_descriptor(with_token(descriptor, token))
         })
@@ -734,6 +862,68 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     /// built for (`newLibraryWithData:error:` checks no platform).
     fn allow_foreign_libraries(&self) {
         plain(|| ());
+    }
+
+    /// The runtime's encoder's layout (`ArgumentEncoder::layout`), Metal's rules for descriptors
+    /// as the runtime measured them. A descriptor of a data type, access or texture type the
+    /// runtime has no enumerator of answers nil, as one of a type no argument has; what the
+    /// runtime refuses as Metal raises (no arguments, a misplaced constant block alignment) is the
+    /// caller's to catch.
+    fn argument_layout(&self, arguments: &[ArgumentDesc]) -> RaiseResult<Option<ArgumentLayout>> {
+        let sel = "newArgumentEncoderWithArguments:";
+        let mut descriptors = Vec::with_capacity(arguments.len());
+        for a in arguments {
+            let (
+                Some(data_type),
+                Some(access),
+                Some(texture_type),
+                Ok(index),
+                Ok(array_length),
+                Ok(alignment),
+            ) = (
+                u32::try_from(a.data_type)
+                    .ok()
+                    .and_then(|raw| metal2vulkan::metal::DataType::try_from(raw).ok()),
+                u32::try_from(a.access)
+                    .ok()
+                    .and_then(|raw| metal2vulkan::metal::BindingAccess::try_from(raw).ok()),
+                crate::gpu::runtime_texture_type(a.texture_type),
+                u32::try_from(a.index),
+                u32::try_from(a.array_length),
+                u32::try_from(a.constant_block_alignment),
+            )
+            else {
+                return Ok(None);
+            };
+            let mut d = metal2vulkan::bind::ArgumentDescriptor::new(data_type, index);
+            d.array_length = array_length;
+            d.access = access;
+            d.texture_type = texture_type;
+            d.constant_block_alignment = alignment;
+            descriptors.push(d);
+        }
+        let encoder = create(sel, Policy::Caught, Nil::Never, || {
+            self.raw.new_argument_encoder_with_arguments(&descriptors)
+        })?;
+        Ok(encoder.map(|e| layout_of(e.layout())))
+    }
+
+    /// The runtime's encoder of the function's argument buffer, laid out as its AIR lays it out,
+    /// nested argument buffers with it. No argument buffer at the index is the caller's to catch,
+    /// as Metal raises.
+    fn function_argument_layout(
+        &self,
+        function: &VulkanFunction,
+        buffer_index: u64,
+    ) -> RaiseResult<Option<ArgumentLayout>> {
+        let sel = "newArgumentEncoderWithBufferIndex:";
+        let Ok(index) = u32::try_from(buffer_index) else {
+            return Ok(None);
+        };
+        let encoder = create(sel, Policy::Caught, Nil::Never, || {
+            function.new_argument_encoder_with_buffer_index(index)
+        })?;
+        Ok(encoder.map(|e| layout_of(e.layout())))
     }
 
     /// The runtime's answer, Metal's but for a depth or stencil texture with
@@ -828,35 +1018,40 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let token = placing.token();
         // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
         // and what keeps them mapped until the runtime freed its import.
-        let (imported, run, keep, kept) =
-            no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
-        let made = create(
-            sel,
-            Policy::Dies,
-            placed_nil(&placing, Nil::BufferLength),
-            || {
-                // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
-                // runs, or for the buffer's life with none, and an unmap of core's through the
-                // platform's VM waits for the keep-alive; a twin of them stays until it goes.
-                let memory = unsafe { crate::os::host_memory(imported, bytes.logged()) };
-                let contents = rt::BufferContents::NoCopy {
-                    memory,
-                    deallocator: run,
-                    keep_alive: Some(keep),
-                };
-                let descriptor = rt::BufferDescriptor::new(bytes.len(), options, contents)
-                    .with_placement(placement);
-                match self
-                    .raw
-                    .new_buffer_with_descriptor(with_token(descriptor, token))
-                {
-                    Ok(raw) => Ok(Some(raw)),
-                    // Pages Metal makes no buffer over: nil.
-                    Err(_) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => Ok(None),
-                    Err(e) => Err(e),
+        let NoCopyImport {
+            at: imported,
+            run,
+            keep,
+            kept,
+            vouched,
+        } = no_copy_release(start, bytes.len(), run, backing::ImportSite::NoCopyBytes);
+        let made = create_buffer(sel, placed_nil(&placing, Nil::BufferLength), None, || {
+            // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the deallocator
+            // runs, or for the buffer's life with none, and an unmap of core's through the
+            // platform's VM waits for the keep-alive; a twin of them stays until it goes; and a
+            // vouch is the table's record of the pages as they are mapped now.
+            let memory =
+                unsafe { crate::os::host_memory_vouched(imported, bytes.logged(), vouched) };
+            let contents = rt::BufferContents::NoCopy {
+                memory,
+                deallocator: run,
+                keep_alive: Some(keep),
+            };
+            let descriptor =
+                rt::BufferDescriptor::new(bytes.len(), options, contents).with_placement(placement);
+            match self
+                .raw
+                .new_buffer_with_descriptor(with_token(descriptor, token))
+            {
+                Ok(raw) => Ok(Some(raw)),
+                // Pages Metal makes no buffer over: nil.
+                Err(e) if !OsVm::new().readable(bytes.ptr(), bytes.len()) => {
+                    no_buffer(sel, &format_args!("pages it cannot read: {e}"));
+                    Ok(None)
                 }
-            },
-        )
+                Err(e) => Err(e),
+            }
+        })
         .map(Option::flatten);
         keep_unrun(&made, slot);
         made.map(|b| {
@@ -940,10 +1135,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor = rt::BufferDescriptor::new(length, options, rt::BufferContents::Zero)
             .with_placement(placement);
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create(
+        let made = create_buffer(
             sel,
-            Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
+            placing.pin_refused(),
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
@@ -956,6 +1151,30 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let raw = get("newCommandQueue", || self.raw.new_command_queue());
         metal_space::first_use(metal_space::FirstUse::Queue);
         Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
+    }
+
+    /// A queue of at most 64 uncompleted command buffers, as `newCommandQueue`'s, made by
+    /// [`unshared_queue`]; a refusal dies at the call, as `newCommandQueue`'s does. A first use
+    /// of Metal's device, as `newCommandQueue`'s.
+    fn new_command_queue_unshared(&self) -> Option<VulkanCommandQueue> {
+        let raw = get("newCommandQueue", || {
+            unshared_queue(&self.raw, METAL_MAX_COMMAND_BUFFER_COUNT)
+        });
+        metal_space::first_use(metal_space::FirstUse::Queue);
+        Some(Obj::new(QueueObject::new(raw, self.clone_ref())))
+    }
+
+    /// On Linux, where the device uses the guest's RAM whole and the runtime copies by its runs
+    /// (`os/linux/host_ram.rs`); never on macOS, whose devices are handed no RAM.
+    fn copies_guest_ram(&self) -> bool {
+        #[cfg(target_os = "linux")]
+        {
+            crate::os::copies_guest_ram(&self.raw)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            false
+        }
     }
 
     /// Decoded as Metal's deserializer decodes it ([`serialized::compute`]): nil for an empty blob;
@@ -1068,7 +1287,8 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     }
 
     /// A metallib only, as Metal and the runtime take: other bytes, raw AIR and a bitcode wrapper
-    /// among them, are Metal's `NSError` (testing.md section 6.18).
+    /// among them, are Metal's `NSError` (testing.md section 6.18). A gap of the runtime's or the
+    /// device's is its refusal as the `NSError`, relayed by default ([`relay_gap`]).
     fn new_library(&self, data: &[u8]) -> RaiseResult<Result<Option<VulkanLibrary>, NsErrorText>> {
         let sel = "newLibraryWithData:error:";
         let made = timing::creation(
@@ -1081,6 +1301,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                         Err(rt::Error::Compile(metal2vulkan::error::Error::InvalidInput(_))) => {
                             Ok(Err(invalid_library_file()))
                         }
+                        Err(e) if relay_gap(sel, &e, None) => Ok(Err(error_text(&e))),
                         Err(e) => Err(e),
                     }
                 })
@@ -1219,7 +1440,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let raw = fields.raw_pixel_format();
         let made = create(sel, Policy::Dies, Nil::StorageMode, || {
             (self.raw.new_shared_texture_with_range_token(&desc, token))
-                .map_err(|e| format_refused(sel, "a texture of", raw, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", raw, e))
         })?;
         if made.is_some() && storage != PRIVATE {
             unrepresentable(
@@ -1252,10 +1473,14 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let sel = "newSharedTextureWithHandle:withResourceIndex:";
         let handle = handle.unwrap_or_else(|| unrepresentable(sel, "a nil handle"));
         let placement = rt::IdPlacement::At(rt::ResourceId(resource_index));
-        let raw = send(sel, Policy::Dies, || {
+        let made = plain_at(sel, || {
             self.raw
                 .new_shared_texture_with_handle(&handle.raw, placement)
-        })?;
+        });
+        let raw = match made {
+            Ok(raw) => raw,
+            Err(e) => return created_or_decided(sel, Policy::Dies, e),
+        };
         let usage = handle.private_usage;
         Ok(Some(self.texture_of(
             raw,
@@ -1318,7 +1543,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let token: rt::RangeToken = Box::new(Arc::clone(&space));
         let made = create(sel, Policy::Dies, Nil::Memory, || {
             (self.raw.new_texture_with_range_token(&desc, token))
-                .map_err(|e| format_refused(sel, "a texture of", raw, e))
+                .map_err(|e| created_format_refused(sel, "a texture of", raw, e))
         })?;
         if made.is_some() {
             fields.made_unprotected(sel);
@@ -1360,19 +1585,9 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                 plane
             }
         );
-        // A format of `no_texture` is nil, once Metal's validation passes, before the plane and
-        // the surface are looked at: the runtime's heap size query validates its descriptor as
-        // the runtime's creators do (over a surface's plane too), and answers 0 bytes for it.
-        if fields.no_texture_format.is_some()
-            && let Some(pf) = fields.formatless()
-        {
-            let desc = crate::gpu::no_texture::descriptor(sel, &fields, pf);
-            send(sel, Policy::Dies, || {
-                self.raw.heap_texture_size_and_align(&desc)
-            })?;
+        let Some(mut desc) = surface_plane_descriptor(&self.raw, sel, &fields)? else {
             return Ok(None);
-        }
-        let mut desc = fields.descriptor(sel, Maker::Surface);
+        };
         let usage = match crate::os::gpu_read_only(surface) {
             true => crate::gpu::resource::read_only_usage(&mut desc),
             false => 0,
@@ -1387,12 +1602,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let Some(mut at) = crate::os::plane(surface, plane) else {
             return Ok(None);
         };
-        let facts = if crate::gpu::ycbcr::runtime_makes(desc.pixel_format) {
-            crate::os::ycbcr_facts(surface, plane)
-        } else if two_plane_xr10(desc.pixel_format) {
-            crate::os::plane_facts(surface, plane)
-        } else {
-            None
+        let facts = match plane_facts_taken(desc.pixel_format) {
+            Some(PlaneFacts::YCbCr) => crate::os::ycbcr_facts(surface, plane),
+            Some(PlaneFacts::Planes) => crate::os::plane_facts(surface, plane),
+            None => None,
         };
         if let Some(facts) = facts {
             at = at.with_ycbcr(facts);
@@ -1410,12 +1623,7 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let Some(buffer) = self.buffer_over_surface(sel, &surface, token)? else {
             return Ok(None);
         };
-        let format = fields.raw_pixel_format();
-        let Some(raw) = create(sel, Policy::Dies, Nil::Never, || {
-            (buffer.new_texture_with_iosurface_plane(&desc, plane))
-                .map_err(|e| format_refused(sel, "a texture of", format, e))
-        })?
-        else {
+        let Some(raw) = texture_over_plane(sel, &fields, &buffer, &desc, plane)? else {
             return Ok(None);
         };
         let gpu_read_only = crate::gpu::resource::writes_never_reach(Some(&surface), None);
@@ -1498,6 +1706,15 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         )
     }
 
+    /// Read on each call ([`crate::gpu::identity`]).
+    fn identity_caps(&self) -> IdentityCaps {
+        crate::gpu::identity::read(&self.raw, &self.caps())
+    }
+
+    fn own_memory_budget(&self) -> u64 {
+        crate::gpu::identity::device_local_budget(&self.raw)
+    }
+
     /// The runtime's buffer descriptor of the value: zero bytes, a copy of the contents, or,
     /// with `no_copy`, the contents themselves with the deallocator, at the pinned address when
     /// there is one. Nil as `newBufferWithLength:options:` is, for a pinned address the space
@@ -1553,7 +1770,13 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     })
                 });
                 own = Some(backing::Own::new(start, held));
-                let (imported, run, keep, twinned) = no_copy_release(
+                let NoCopyImport {
+                    at: imported,
+                    run,
+                    keep,
+                    kept: twinned,
+                    vouched,
+                } = no_copy_release(
                     start,
                     bytes.len(),
                     run,
@@ -1564,8 +1787,11 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
                     // SAFETY: `HostRange::new`'s contract keeps the bytes mapped until the
                     // deallocator runs, or for the buffer's life with none, and an unmap of
                     // core's through the platform's VM waits for the keep-alive; a twin of them
-                    // stays until it goes.
-                    memory: unsafe { crate::os::host_memory(imported, bytes.logged()) },
+                    // stays until it goes; and a vouch is the table's record of the pages as they
+                    // are mapped now.
+                    memory: unsafe {
+                        crate::os::host_memory_vouched(imported, bytes.logged(), vouched)
+                    },
                     deallocator: run,
                     keep_alive: Some(keep),
                 }
@@ -1576,10 +1802,10 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         let descriptor =
             rt::BufferDescriptor::new(desc.length, options, contents).with_placement(placement);
         let descriptor = with_token(in_slot(descriptor, &pool), placing.token());
-        let made = create(
+        let made = create_buffer(
             sel,
-            Policy::Dies,
             placed_nil(&placing, Nil::BufferLength),
+            placing.pin_refused(),
             || self.raw.new_buffer_with_descriptor(descriptor),
         );
         metal_space::let_go(pool);
@@ -1749,6 +1975,97 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
         })
     }
 
+    /// A heap whose memory is `bytes`, imported in place as a no-copy buffer's is
+    /// ([`no_copy_release`]), at the address Metal's space gives it or the value's pin: its
+    /// resources lie in `bytes` from their offsets, so the guest's writes there and the GPU's are
+    /// each other's, and it never detaches ([`Backing::fixed`]). Nil for a size of 0, for bytes
+    /// short of the size rounded up to the runtime's granule, and as [`Self::new_heap`] answers
+    /// for its address; storage other than `Shared` dies, as there. A type the runtime lacks
+    /// dies at `setType:`.
+    fn new_heap_over_host_memory(
+        &self,
+        bytes: HostRange<'_>,
+        desc: &HeapDesc<'_, VulkanPlatform>,
+    ) -> RaiseResult<HeapMade<VulkanPlatform>> {
+        let sel = "newHeapWithDescriptor:";
+        let heap_type = u64::try_from(desc.heap_type)
+            .ok()
+            .and_then(|raw| rt::HeapType::from_raw(raw).ok())
+            .unwrap_or_else(|| {
+                unrepresentable("setType:", &format!("heap type {}", desc.heap_type))
+            });
+        let held = descriptor_options(HEAP_DESCRIPTOR_OPTIONS, &desc.options);
+        let options = crate::gpu::resource_options(sel, held);
+        let covered = desc.size.checked_next_multiple_of(backing::HEAP_GRANULE);
+        if desc.size == 0 || covered.is_none_or(|need| bytes.len() < need) {
+            return Ok(HeapMade {
+                heap: None,
+                descriptor_resource_options: held,
+            });
+        }
+        let (placement, mut placing) =
+            metal_space::placing(desc.size, metal_space::Bytes::Heap, desc.pinned_gpu_address);
+        let token = placing.token();
+        let nil = placed_nil(&placing, Nil::Heap);
+        let descriptor =
+            rt::HeapDescriptor::new(heap_type, desc.size, options).with_placement(placement);
+        let start = pointer(sel, bytes.ptr());
+        // The bytes, or a writable twin of them where the runtime cannot import them as mapped,
+        // and what keeps them mapped until the runtime freed its import.
+        let NoCopyImport {
+            at: imported,
+            keep,
+            kept,
+            vouched,
+            ..
+        } = no_copy_release(start, bytes.len(), None, backing::ImportSite::Heap);
+        let heap = create(sel, Policy::Dies, nil, || {
+            // SAFETY: `HostRange::new`'s contract keeps the bytes mapped for the heap's life, and
+            // an unmap of core's through the platform's VM waits for the keep-alive; they cover
+            // the heap's size rounded up to the runtime's granule (checked above) and start on a
+            // page, the runtime's import unit on this host; and a vouch is the table's record of
+            // the pages as they are mapped now.
+            let made = unsafe {
+                let memory = crate::os::host_memory_vouched(imported, bytes.logged(), vouched);
+                match token {
+                    Some(token) => self.raw.new_heap_with_bytes_no_copy_and_range_token(
+                        memory,
+                        &descriptor,
+                        None,
+                        Some(keep),
+                        token,
+                    ),
+                    None => {
+                        self.raw
+                            .new_heap_with_bytes_no_copy(memory, &descriptor, None, Some(keep))
+                    }
+                }
+            };
+            match made {
+                Err(rt::Error::Invalid(rt::Invalid {
+                    problem: rt::Problem::StorageMode,
+                    ..
+                })) => metal_aborts(sel, &format!("a heap of resource options {held:#x}")),
+                made => made,
+            }
+        })?;
+        Ok(HeapMade {
+            heap: heap.map(|raw| {
+                let backing = Backing::fixed();
+                backing.imported(kept);
+                Obj::new(HeapObject {
+                    raw,
+                    device: self.clone_ref(),
+                    descriptor_size: desc.size,
+                    backing,
+                    placed: Mutex::default(),
+                    space: placing.made(),
+                })
+            }),
+            descriptor_resource_options: held,
+        })
+    }
+
     /// One object for equal requests while it lives, placed at the value's resource index
     /// ([`super::states`]).
     fn new_sampler_state(&self, desc: &SamplerDesc) -> RaiseResult<Option<VulkanSamplerState>> {
@@ -1779,6 +2096,112 @@ impl GpuDevice<VulkanPlatform> for VulkanDevice {
     ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
         super::states::new_render_pipeline_state(self, desc)
     }
+
+    /// The graphics lane's whole descriptor ([`super::states::new_render_pipeline_state_full`]).
+    fn new_render_pipeline_state_full(
+        &self,
+        desc: &FullRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        super::states::new_render_pipeline_state_full(self, desc)
+    }
+
+    /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it
+    /// finds wrong, and a payload past Metal's, are the `NSError`; every other refusal dies at
+    /// the send ([`super::states::new_mesh_render_pipeline_state_full`]).
+    fn new_mesh_render_pipeline_state_full(
+        &self,
+        desc: &FullMeshRenderPipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanRenderPipeline>, NsErrorText> {
+        super::states::new_mesh_render_pipeline_state_full(self, desc)
+    }
+
+    /// The graphics lane's whole descriptor: the compile's refusal of a function or descriptor it
+    /// finds wrong is the `NSError`, every other refusal dies at the send ([`compile_error()`]).
+    fn new_compute_pipeline_state_full(
+        &self,
+        desc: &FullComputePipelineDesc<'_, VulkanPlatform>,
+    ) -> Result<Option<VulkanComputePipeline>, NsErrorText> {
+        let sel = "newComputePipelineStateWithDescriptor:options:reflection:error:";
+        let d = super::states::full_compute_descriptor(sel, desc);
+        let mut options = rt::PipelineOptions::default();
+        options.label = desc.label.map(str::to_owned);
+        timing::creation(
+            sel,
+            timing::DISPATCH_LATER,
+            || match plain_at(sel, || self.raw.new_compute_pipeline_state(&d, &options)) {
+                Ok(state) => Ok(Some(Obj::new(ComputePipelineObject::of(state, d.clone())))),
+                Err(e) => Err(compile_error(sel, e, Some(&d))),
+            },
+            || format!("kernel {}", timing::stage(&d.kernel)),
+            |made| timing::answer(made, |s| timing::state(s.unique_identifier)),
+        )
+    }
+}
+
+/// The runtime's descriptor of a texture of `fields` over a surface's plane, made by `sel` on
+/// `device`: Metal's `newTextureWithDescriptor:iosurface:plane:` over the surface, or over a
+/// buffer that stands for it ([`crate::gpu::resource`]'s `new_texture_over_surface_plane`).
+/// `None` for a format of [`crate::gpu::no_texture`], nil once Metal's validation passes, before
+/// the plane and the surface are looked at: the runtime's heap size query validates its
+/// descriptor as the runtime's creators do (over a surface's plane too), and answers 0 bytes for
+/// it. Any other format, the two-plane ones among them, is the runtime's to make
+/// ([`Maker::Surface`]).
+pub(crate) fn surface_plane_descriptor(
+    device: &rt::Device,
+    sel: &'static str,
+    fields: &TextureFields,
+) -> RaiseResult<Option<rt::TextureDescriptor>> {
+    if fields.no_texture_format.is_some()
+        && let Some(pf) = fields.formatless()
+    {
+        let desc = crate::gpu::no_texture::descriptor(sel, fields, pf);
+        send(sel, Policy::Dies, || {
+            device.heap_texture_size_and_align(&desc)
+        })?;
+        return Ok(None);
+    }
+    Ok(Some(fields.descriptor(sel, Maker::Surface)))
+}
+
+/// What a texture over a surface's plane reads of the surface besides the plane
+/// ([`plane_facts_taken`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PlaneFacts {
+    /// The surface's YCbCr facts: its OSType, its size, its plane 1, and its YCbCr matrix.
+    YCbCr,
+    /// Its OSType, its size and its plane 1 alone.
+    Planes,
+}
+
+/// The facts of its surface a texture of `pf` over a plane of it takes: the YCbCr facts for a
+/// two-plane YCbCr format the runtime reads ([`crate::gpu::ycbcr::runtime_makes`]), the planes'
+/// for a two-plane XR10 format ([`two_plane_xr10`]), which Metal reads alike ('b3a8'), and none
+/// for any other.
+pub(crate) fn plane_facts_taken(pf: metal2vulkan::metal::PixelFormat) -> Option<PlaneFacts> {
+    if crate::gpu::ycbcr::runtime_makes(pf) {
+        Some(PlaneFacts::YCbCr)
+    } else if two_plane_xr10(pf) {
+        Some(PlaneFacts::Planes)
+    } else {
+        None
+    }
+}
+
+/// The runtime's texture of `desc` (of `fields`) over `plane` of `buffer`, which stands for the
+/// surface (`Buffer::new_texture_with_iosurface_plane`), made by `sel`: what the runtime refuses
+/// dies here, naming the refusal, and its nil is nil.
+pub(crate) fn texture_over_plane(
+    sel: &'static str,
+    fields: &TextureFields,
+    buffer: &rt::Buffer,
+    desc: &rt::TextureDescriptor,
+    plane: rt::IoSurfacePlane,
+) -> RaiseResult<Option<rt::Texture>> {
+    let format = fields.raw_pixel_format();
+    create(sel, Policy::Dies, Nil::Never, || {
+        (buffer.new_texture_with_iosurface_plane(desc, plane))
+            .map_err(|e| created_format_refused(sel, "a texture of", format, e))
+    })
 }
 
 /// Whether `pf` is a two-plane XR10 format: `RGB10A8_2P_XR10` (550) or its sRGB twin (551),
@@ -1812,6 +2235,75 @@ pub(crate) mod tests {
     /// The system default device (MoltenVK on the suite's host).
     pub(crate) fn dev() -> VulkanDevice {
         DEVICE.clone_ref()
+    }
+
+    /// Descriptors and a function's argument buffer are laid out as the Metal platform's own
+    /// encoder lays them out (`reims-vgpu-metal`'s `gpu::argument` tests, measured on the M3 Max,
+    /// with the same descriptors and the same probe kernel): the runtime's layout, Metal's
+    /// rules, reaches the guest unchanged
+    #[test]
+    fn argument_layouts_are_metals() {
+        use reims_vgpu_core::platform::resource::Library as _;
+        use reims_vgpu_core::platform::types::ArgumentKind as K;
+        let d = dev();
+        let arg = |data_type: u64, index: u64, array_length: u64| ArgumentDesc {
+            data_type,
+            index,
+            array_length,
+            texture_type: 2,
+            ..ArgumentDesc::default()
+        };
+        let layout = d
+            .argument_layout(&[arg(58, 0, 0), arg(60, 1, 4), arg(6, 5, 0), arg(3, 6, 0)])
+            .unwrap()
+            .unwrap();
+        let got: Vec<_> = layout
+            .members
+            .iter()
+            .map(|m| (m.id, m.count, m.offset, m.stride, m.size, m.kind))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 1, 0, 8, 8, K::Texture),
+                (1, 4, 8, 8, 8, K::Buffer),
+                (5, 1, 48, 16, 16, K::Constant),
+                (6, 1, 64, 4, 4, K::Constant),
+            ]
+        );
+        assert_eq!((layout.encoded_length, layout.alignment), (80, 16));
+
+        const PROBE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/argument_probe.metallib"));
+        let library = d.new_library(PROBE).unwrap().unwrap().unwrap();
+        let function = library
+            .new_function(OnFault::Die, "reims_vgpu_argument_probe")
+            .unwrap()
+            .unwrap();
+        let layout = d.function_argument_layout(&function, 0).unwrap().unwrap();
+        let got: Vec<_> = layout
+            .members
+            .iter()
+            .map(|m| (m.id, m.offset, m.kind, m.layout.is_some()))
+            .collect();
+        assert_eq!(
+            got,
+            [
+                (0, 0, K::Texture, false),
+                (1, 8, K::Buffer, true),
+                (2, 16, K::Sampler, false),
+                (3, 32, K::Constant, false),
+                (4, 48, K::Buffer, false),
+            ]
+        );
+        assert_eq!((layout.encoded_length, layout.alignment), (64, 16));
+        let inner = layout.members[1].layout.as_ref().unwrap();
+        let got: Vec<_> = inner
+            .members
+            .iter()
+            .map(|m| (m.id, m.offset, m.kind))
+            .collect();
+        assert_eq!(got, [(0, 0, K::Texture), (1, 8, K::Sampler)]);
+        assert_eq!(inner.encoded_length, 16);
     }
 
     /// The crate's directory, which cargo and nextest give a test process: read at run time, so
@@ -1848,7 +2340,126 @@ pub(crate) mod tests {
             registry_id: registry_id(&raw),
             raw,
             caps: OnceLock::new(),
+            awake: Default::default(),
         })
+    }
+
+    /// A buffer pinned where another's span lies is nil, and the line it logs names the runtime's
+    /// refusal: the held range the pin met.
+    #[test]
+    fn a_pinned_buffer_the_runtime_refuses_logs_why() {
+        use reims_vgpu_core::platform::resource::Buffer;
+        use reims_vgpu_core::platform::values::OptionSet;
+        use reims_vgpu_core::testkit::logs;
+        let d = dev();
+        let pin = metal_space::END / 4 + 0x100_0000;
+        let pinned = || BufferDesc {
+            length: 0x1000,
+            options: vec![OptionSet::StorageMode(0)],
+            pinned_gpu_address: Some(pin),
+            contents: None,
+            no_copy: false,
+            deallocator: None,
+        };
+        let first = d.new_buffer(pinned()).unwrap().unwrap();
+        assert_eq!(first.gpu_address(), pin);
+        let logs = logs::capture();
+        assert!(d.new_buffer(pinned()).unwrap().is_none());
+        let lines = logs.take();
+        assert_eq!(lines.len(), 1, "{lines:?}");
+        let (level, target, line) = &lines[0];
+        assert_eq!(
+            (*level, target.as_str()),
+            (log::Level::Warn, "reims_vgpu_vulkan::gpu")
+        );
+        assert!(
+            line.starts_with(
+                "newBufferWithDescriptor: answered nil: Metal's space refused the pin: Held {"
+            ) && line.contains(&format!("held: {pin:x}")),
+            "{line}"
+        );
+    }
+
+    /// A Shared heap over host memory lies in it, in place: a buffer placed at an offset is the
+    /// bytes there, at the heap's pin plus the offset, and the CPU's writes through either and
+    /// the GPU's fill of the buffer land in them. Bytes short of the heap's size rounded up to
+    /// the runtime's granule make none.
+    #[test]
+    fn a_heap_over_host_memory_lies_in_its_bytes() {
+        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        use reims_vgpu_core::platform::resource::{Buffer, Heap};
+        use reims_vgpu_core::platform::types::NsRange;
+        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        let d = dev();
+        // Private anonymous memory, as the graphics device's region is, kept for the process.
+        let layout = std::alloc::Layout::from_size_align(0x2_0000, 0x4000).unwrap();
+        // SAFETY: a layout of non-zero size.
+        let mem = unsafe { std::alloc::alloc_zeroed(layout) };
+        assert!(!mem.is_null());
+        let at = |offset: usize| {
+            // SAFETY: inside the allocation, which the process keeps.
+            unsafe { mem.add(offset) }
+        };
+        let over = |length: u64| {
+            // SAFETY: the allocation stays for the process.
+            unsafe { HostRange::new(HostPtr::from_ptr(mem), length) }
+        };
+        let pin = metal_space::END / 4;
+        let desc = HeapDesc {
+            size: 0x1_0001,
+            heap_type: 1,
+            options: vec![OptionSet::StorageMode(0)],
+            address_ranges: None,
+            pinned_gpu_address: Some(pin),
+        };
+        let short = d.new_heap_over_host_memory(over(0x1_0000), &desc).unwrap();
+        assert!(short.heap.is_none(), "short of the granule");
+        let heap = d
+            .new_heap_over_host_memory(over(0x1_4000), &desc)
+            .unwrap()
+            .heap
+            .unwrap();
+        assert_eq!(heap.gpu_address(), pin);
+        let buffer = heap
+            .new_buffer_of_length(0x1000, 0, 0x4000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(buffer.contents().addr(), at(0x4000).addr());
+        assert_eq!(buffer.gpu_address(), pin + 0x4000);
+        // SAFETY: the buffer's bytes are the allocation's, which nothing else touches.
+        unsafe {
+            at(0x4000).write_bytes(0xa1, 0x800);
+            assert_eq!(buffer.contents().as_ptr::<u8>().read(), 0xa1);
+        }
+        let queue = d.new_command_queue().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for command in [
+            BlitCmd::FillBuffer {
+                buffer: &buffer,
+                range: NsRange::new(0x800, 0x800),
+                value: 0x5c,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, command).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
+        // SAFETY: as above, the command buffer done.
+        unsafe {
+            assert_eq!(at(0x4000).read(), 0xa1, "the CPU's bytes stay");
+            assert_eq!(at(0x47ff).read(), 0xa1);
+            assert_eq!(
+                at(0x4800).read(),
+                0x5c,
+                "the GPU's fill lands in the heap's bytes"
+            );
+            assert_eq!(at(0x4fff).read(), 0x5c);
+            assert_eq!(at(0x5000).read(), 0, "past the buffer");
+        }
     }
 
     /// A sparse heap takes its range where the model of Metal's space places it: unpinned or at a
@@ -1885,6 +2496,42 @@ pub(crate) mod tests {
         );
         let line = crate::answer::LAST_LINE.lock().clone().unwrap();
         assert!(line.contains(&format!("{refused:#x}")), "{line}");
+    }
+
+    /// A no-copy buffer over pages the table shows mapped writable is imported with the runtime
+    /// told so, which asks the kernel nothing of them (its count of the mappings it asked about
+    /// stays); once one of the pages is protected read-only, the next buffer over them imports
+    /// a twin with no vouch, and the runtime asks again
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_buffer_is_vouched_for_while_its_pages_are_writable() {
+        use reims_vgpu_core::platform::os::vm::{HostVm as _, VmProt};
+
+        const PAGE: u64 = 0x1000;
+        let d = dev();
+        let vm = crate::os::OsVm::new();
+        let at = crate::os::allocate_aliasable(2 * PAGE).unwrap();
+        let queried = || d.raw.work_counts().host_mappings_queried;
+        let buffer = || {
+            // SAFETY: the pages stay mapped until the deallocation below, after the buffer's drop.
+            let bytes = unsafe { HostRange::new(at, 2 * PAGE) };
+            d.new_buffer_over_host_memory(OnFault::Return, bytes, 0, None)
+                .unwrap()
+                .unwrap()
+        };
+        let before = queried();
+        let vouched = buffer();
+        assert_eq!(queried(), before, "vouched for: nothing asked");
+        drop(vouched);
+        let second = HostPtr::from_addr(at.addr() + 0x1000);
+        assert!(vm.protect_max(second, PAGE, VmProt::READ).is_ok());
+        let checked = buffer();
+        assert!(
+            queried() > before,
+            "a twin, not vouched for: the runtime asked"
+        );
+        drop(checked);
+        assert!(vm.deallocate(at, 2 * PAGE).is_success());
     }
 
     /// A no-copy buffer over a mapping of core's, released while a command buffer that reads it
@@ -2463,6 +3110,31 @@ pub(crate) mod tests {
         );
     }
 
+    /// A compute pipeline the runtime refuses for a gap of its own or of the device's is, by
+    /// default, nil and the runtime's refusal as the `NSError`, relayed; in strict mode it dies
+    /// at its selector as before. The creators' decision, without a device
+    #[test]
+    fn a_compute_pipeline_gap_is_its_nserror_by_default() {
+        use metal2vulkan::error::{Feature, Unsupported};
+        let sel = "newComputePipelineStateWithFunction:error:";
+        let e = rt::Error::Unsupported(Unsupported::not_implemented(Feature::SubgroupOperations));
+        let before = crate::answer::inexact_counts();
+        let error = crate::answer::relaxed(|| compile_error(sel, e.clone(), None));
+        assert_eq!(error, error_text(&e));
+        assert_eq!(error.domain, RUNTIME_DOMAIN);
+        let counted = |counts: Vec<(crate::answer::Inexact, u64)>| {
+            (counts.into_iter())
+                .find(|&(k, _)| k == crate::answer::Inexact::RefusedCreate)
+                .map_or(0, |(_, n)| n)
+        };
+        assert_eq!(
+            counted(crate::answer::inexact_counts()),
+            counted(before) + 1
+        );
+        let site = catch_death(|| compile_error(sel, e.clone(), None)).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+    }
+
     /// A multisample texture of the padded 10-bit formats (576 to 579), which the runtime stops
     /// as Metal's validation does (`Invalid`, `TextureProblem::TypeForFormat`), dies at its
     /// creator, where Metal aborts in the descriptor's validation: measured on this host (macOS
@@ -2557,6 +3229,24 @@ pub(crate) mod tests {
         assert_ne!(id, without.0);
         assert_ne!(address, without.1);
         drop((own, held));
+    }
+
+    /// A Core Image kernel library (`ci_kernel.metallib`, its header's file type 1) is made, as
+    /// Metal makes it, and the device goes on to make others
+    #[test]
+    fn a_core_image_kernel_library_is_made() {
+        const CI_KERNEL: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/ci_kernel.metallib"));
+        assert_eq!(CI_KERNEL[10], 1, "the header's file type");
+        assert!(dev().new_library(CI_KERNEL).unwrap().unwrap().is_some());
+        assert!(
+            dev()
+                .new_library(include_bytes!(
+                    "../../../../tests/suite/fixtures/shaders/kernel.metallib"
+                ))
+                .unwrap()
+                .unwrap()
+                .is_some()
+        );
     }
 
     /// Every compute pipeline creation takes a new nonzero identifier, even of one function twice,
@@ -2894,6 +3584,25 @@ pub(crate) mod tests {
         assert_eq!(opened.signaled_value(), 7);
         let site = catch_death(|| d.open_shared_event(None)).unwrap_err();
         assert_eq!(site.file, "newSharedEventWithHandle:");
+    }
+
+    /// An unshared queue runs a command buffer as `newCommandQueue`'s does, and its maker passes
+    /// the runtime's refusals on as they are: a count of 0 is the runtime's `Invalid`
+    /// (`MaxCommandBufferCount`), where the platform asks for Metal's 64.
+    #[test]
+    fn an_unshared_queue_runs_and_its_refusals_are_the_runtimes() {
+        use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
+        let d = dev();
+        match unshared_queue(&d.raw, 0) {
+            Err(rt::Error::Invalid(i)) => assert_eq!(i.problem, rt::Problem::MaxCommandBufferCount),
+            Err(e) => panic!("refused otherwise: {e}"),
+            Ok(_) => panic!("a count of 0 made a queue"),
+        }
+        let queue = d.new_command_queue_unshared().unwrap();
+        let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        assert_eq!(cb.status().0, 4, "completed");
     }
 
     #[cfg(target_os = "macos")]

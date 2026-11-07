@@ -30,11 +30,14 @@ pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
 pub use threads::LinuxThreads;
 pub use vm::LinuxVm;
 
+pub(crate) use host_ram::{
+    copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
+};
 #[cfg(test)]
 pub(crate) use import::views_through_dma_bufs;
 pub(crate) use import::{
-    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, import_view,
-    learn_view_imports, shown_at,
+    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched,
+    import_view, learn_view_imports, shown_at,
 };
 pub(crate) use surface::{
     base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
@@ -134,4 +137,10 @@ pub fn default_registry_id() -> Option<u64> {
 /// is no Metal here to ask.
 pub fn default_gpu_core_count() -> Option<u64> {
     None
+}
+
+/// The feature profile and FP configs Metal answers for the device [`default_registry_id`]
+/// names: none, as there is no Metal here to ask.
+pub fn default_driver_sizes() -> [Option<u64>; 4] {
+    [None; 4]
 }

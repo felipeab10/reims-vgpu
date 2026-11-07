@@ -116,11 +116,13 @@ Run the checks a change can reach, and no others. Measured on the M3 Max,
 `cargo xtask check` takes about 3 min, 180 s after a core edit, of which
 the workspace's tests are 138 s of GPU time and core's x86-64 tests under
 Rosetta 8 s; `make test`, the full suite, takes 5 min of GPU time.
-`.config/nextest.toml` runs the test that faults a Mac's GPU on purpose,
-and the one that holds the most of its memory, first and alone, so the
-check's tests no longer fail as each other's victims
-([docs/lessons.md](docs/lessons.md)). A GPU test can still fail beside GPU
-work or heavy load elsewhere on the host, and passes run again alone.
+The test that faults a Mac's GPU on purpose and the one that holds the
+most of its memory are opt-in (`#[ignore]`): they fail the work of every
+process on the Mac, the desktop's included, so they run only for a change
+to what they test (`--run-ignored only`), and then first and alone
+(`.config/nextest.toml`, [docs/lessons.md](docs/lessons.md)). A GPU test
+can still fail beside GPU work or heavy load elsewhere on the host, and
+passes run again alone.
 
 | the change touches | check it with |
 |---|---|
@@ -131,7 +133,8 @@ work or heavy load elsewhere on the host, and passes run again alone.
 | the video crates (`crates/reims-vgpu-video-*`), or their glue in `reims-vgpu` and the C API | `cargo xtask check` on a Mac; the Linux tests on a VA-API host and on an NVIDIA host; and, where a backend changes, the conformance suite on that backend's hardware ("The video crates' checks", below) |
 | `xtask/` | `cargo test -p xtask`, rustfmt and clippy on it |
 | `crates/reims-ctl` | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it (`cargo xtask check` does not reach it); a change to the QEMU command it builds, or to `scripts/install-ctl.sh`, also needs an install and a VM boot on each host it touches |
-| `firmware/` | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes |
+| `guest/` (kext, bundle, rgfxgate, loader) | `make -C guest test` on a Mac; a change to a source the set is built from also needs `make -C guest prebuilt KDK=<KDK Extensions dir>`, committing `guest/prebuilt` with it (`make -C guest prebuilt-check` fails otherwise) |
+| `firmware/` | build it (`make -C firmware`); a change not meant to alter what the guest's firmware sees keeps the ROM's bytes; a change to what `ReimsGraphics.rom` is built from (its sources, the Makefile, `crates/reims-graphics/include/reims_graphics_wire.h`) also runs `make -C firmware prebuilt` on a Mac, committing the ROM and record it writes |
 | `vendor/qemu` | build it (`make qemu`) and realize the devices paused (`-S`); a change to `hw/display/apple-gfx*.c`, or to what QEMU calls, also needs a VM boot ([docs/lessons.md](docs/lessons.md), [docs/qemu.md](docs/qemu.md)) |
 | docs and comments | nothing |
 
@@ -225,18 +228,23 @@ The suite's inputs:
     `git worktree add`. It clones the main checkout's `tests/suite`, 257 of
     the tree's 278 MiB, and git writes only the files that differ from
     START.
-- **Each worktree has its own `CARGO_TARGET_DIR`** under `~/.cache`: cargo
-  can run another tree's `xtask` from a shared one
-  ([docs/lessons.md](docs/lessons.md)). Caches never go under `/tmp`.
+- **Each worktree builds in its own `target/`**, cargo's default, with no
+  `CARGO_TARGET_DIR`; the worktree itself lives under `~/.cache`. A target
+  shared between trees runs another tree's `xtask`
+  ([docs/lessons.md](docs/lessons.md)), and kache seeds a worktree's
+  incremental state only from targets inside their worktrees
+  ([docs/development.md](docs/development.md)). Caches never go under
+  `/tmp`.
   - Build there in the environment of `scripts/internal/dev-env.sh`, sourced
     from the worktree's root before each cargo command
-    (`. scripts/internal/dev-env.sh && cargo ...`): `CARGO_INCREMENTAL=0`,
-    as the check builds, and, where `kache` is installed, rustc and build
-    scripts through kache, a compiler cache local to the host. A new
-    worktree's first build then compiles only what no tree on the host built
-    before (measured: `cargo xtask check`'s tests built in a second worktree
-    in 1.5 s on a Ryzen 7 7840HS and 9.5 s on the M3 Max, after a first had
-    built them).
+    (`. scripts/internal/dev-env.sh && cargo ...`): incremental, as the
+    check builds, and, where `kache` (2.0.0 or later) is installed, rustc
+    and build scripts through kache, a compiler cache local to the host,
+    which keeps an edited unit's incremental state and seeds a new
+    worktree's from another's. A new worktree's first build then compiles
+    only what no tree on the host built before (measured: `cargo xtask
+    check`'s tests built in a second worktree in 1.5 s on a Ryzen 7 7840HS
+    and 9.5 s on the M3 Max, after a first had built them).
   - Start the target directory empty. Never build through kache in a target
     copied from a build without it: every workspace crate misses
     ([docs/lessons.md](docs/lessons.md)).
@@ -271,6 +279,33 @@ The suite's inputs:
   large spends of time or money, the project's direction and rules, and
   anything irreversible or outward-facing. A question for the owner never
   blocks the rest of the work.
+
+## Landing work
+
+- When the merge pipeline is idle and any finished lane waits, start a run
+  with every finished lane at once; lanes still running form the next batch.
+  Add no lane once a batch's checks start. The moment its last check passes,
+  merge it into its target, or report it ready where the owner holds that
+  branch's merges.
+- When a batch fails, take the failing lane out and run the rest as the next
+  batch; the lane rejoins once fixed.
+- Log each lane's finish and merge times in the checklist file. If a finished
+  lane waits more than one pipeline run for its own run to start, fix the
+  pipeline before starting more lanes.
+- Report progress as merged commit hashes and each finished lane's wait. A
+  plan is not progress.
+- Never let an agent block on a command that returns only when a queued job
+  starts: submit and poll, or time out near the expected wait. Every 15
+  minutes, check each agent and remote job, and act on any with no new
+  output.
+- On a first-in-first-out queue without backfill, submit a whole-machine job
+  only when that machine has nothing running or queued; otherwise it holds
+  the head of the queue while the machine drains. Submit short jobs before
+  long ones.
+- Shared test machines serve the merge pipeline first: queue measurements
+  only while no pipeline job waits, since queue wait grows steeply as a
+  machine nears full use. Run a harness on its shortest case before a long
+  run, and stop a series at a harness fault until it is fixed.
 
 ## Rules for changing code
 
@@ -316,15 +351,31 @@ The suite's inputs:
   merges**, not before each commit (Checking a change).
 - **Stage explicit paths, and never commit build output.** Before each
   commit, `git diff --cached --name-only | grep -E
-  '(^|/)target[^/]*/|\.(bin|o|obj|rlib|rmeta|dylib|a|efi|rom)$'` must print
-  nothing.
-  - **The one exception is metallibs** compiled from this repository's own
-    `.metal` sources, which only Apple's compiler makes: the Vulkan
-    platform's, in `crates/reims-vgpu-vulkan/metallibs`, which a build off a
-    Mac copies, and the suite's inputs, in `tests/suite/fixtures/shaders`.
-    Each is committed with the source it is compiled from. The Vulkan
+  '(^|/)target[^/]*/|\.(bin|o|obj|rlib|rmeta|dylib|a|efi|rom)$' | grep -vxF
+  firmware/prebuilt/ReimsGraphics.rom` must print nothing.
+  - **The exceptions are the outputs below**, each committed with the
+    sources it is built from.
+  - **Metallibs** compiled from this repository's own `.metal` sources,
+    which only Apple's compiler makes: the Vulkan platform's, in
+    `crates/reims-vgpu-vulkan/metallibs`, which a build off a Mac copies, and
+    the suite's inputs, in `tests/suite/fixtures/shaders`. The Vulkan
     platform's are rewritten by `cargo xtask metallibs` on a Mac, and a
     stale one fails the Mac's `cargo xtask check` and the Linux build.
+  - **The reims-graphics device's option ROM**,
+    `firmware/prebuilt/ReimsGraphics.rom`, which reims-ctl embeds and names
+    as the device's `romfile`. `make -C firmware prebuilt` rewrites it on a
+    Mac with its record, `firmware/prebuilt/ReimsGraphics.toml`, and a stale
+    one fails `cargo xtask check` and reims-ctl's `cargo test`
+    (`make -C firmware prebuilt-check`).
+  - **The guest's OpenCore kext set for that device**, in `guest/prebuilt`:
+    `set.toml`, `sources.toml`, and for each of `ReimsGraphicsLoader`,
+    `RgfxIOGraphicsFamilyBridge`, `RgfxAppleGraphicsDeviceControlBridge`,
+    `ReimsGraphics` and `RgfxGate`, `<name>.kext/Contents/Info.plist` and
+    `<name>.kext/Contents/MacOS/<name>`. reims-ctl embeds the bundles
+    `set.toml` lists and adds them to the OpenCore image of an x86-64 VM on
+    reims-vgpu. `make -C guest prebuilt` rewrites them from `guest/` on a Mac
+    with a KDK, with the record of their sources, `sources.toml`, and a stale
+    set fails `make -C guest prebuilt-check`, which `cargo xtask check` runs.
 - **Never commit Apple binaries.** The build needs none: the option ROM is
   built from `firmware/`. The committed metallibs hold only our shaders and
   constant samplers, with no Apple code linked in. Nothing taken from a

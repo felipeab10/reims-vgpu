@@ -52,7 +52,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "check",
-        about: "testkit, header --check, rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
+        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
         run: cmd_check,
     },
 ];
@@ -116,9 +116,8 @@ fn cmd_testkit(_args: &[String]) -> Res<bool> {
     Ok(show("testkit", &lint::testkit_manifests(&lib, &manifests)))
 }
 
-/// Runs one of the check's cargo steps, without incremental compilation (`CARGO_INCREMENTAL=0`).
-/// A check builds each configuration once in its tree, so incremental caches would only take
-/// disk, and their stale state can fail a sound build (docs/lessons.md).
+/// Runs one of the check's cargo steps, in the environment the check started in: incremental, as
+/// cargo's dev and test profiles are, so a check run again after a fix rebuilds only what changed.
 fn cargo(args: &[&str]) -> Res<bool> {
     cargo_with(args, &[])
 }
@@ -129,15 +128,26 @@ fn cargo_with(args: &[&str], env: &[(&str, &std::path::Path)]) -> Res<bool> {
         .iter()
         .map(|(k, v)| format!("{k}={} ", v.display()))
         .collect();
-    println!("$ CARGO_INCREMENTAL=0 {shown}cargo {}", args.join(" "));
+    println!("$ {shown}cargo {}", args.join(" "));
     let status =
         std::process::Command::new(std::env::var("CARGO").unwrap_or_else(|_| "cargo".into()))
             .args(args)
-            .env("CARGO_INCREMENTAL", "0")
             .envs(env.iter().copied())
             .current_dir(repo_root())
             .status()
             .map_err(|e| format!("cargo: {e}"))?;
+    Ok(status.success())
+}
+
+/// Runs `make` with `args` from the repository's root: one of the check's steps that are not
+/// cargo's.
+fn make(args: &[&str]) -> Res<bool> {
+    println!("$ make {}", args.join(" "));
+    let status = std::process::Command::new("make")
+        .args(args)
+        .current_dir(repo_root())
+        .status()
+        .map_err(|e| format!("make: {e}"))?;
     Ok(status.success())
 }
 
@@ -193,6 +203,12 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     let mut ok = true;
     ok &= cmd_testkit(&[])?;
     ok &= header::cmd_header(&["--check".to_owned()])?;
+    // The option ROM and the guest's kexts reims-ctl carries are built from the tree's sources:
+    // a change to what they are built from (the wire header among them) without them built
+    // again fails here, though the library's checks reach neither (firmware/prebuilt.sh,
+    // guest/tools/prebuilt.py).
+    ok &= make(&["-C", "firmware", "prebuilt-check"])?;
+    ok &= make(&["-C", "guest", "prebuilt-check"])?;
     if !flag(args, "--no-cargo") {
         let features = if cfg!(target_os = "linux") {
             LINUX_FEATURES

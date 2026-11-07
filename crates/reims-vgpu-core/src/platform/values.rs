@@ -31,6 +31,24 @@ pub enum OptionSet {
     HazardTrackingMode(u64),
 }
 
+/// One `MTLArgumentDescriptor` of `newArgumentEncoderWithArguments:`, as a value: each field is
+/// its Metal raw value, sent with its setter in field order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct ArgumentDesc {
+    /// `setDataType:` (`MTLDataType`).
+    pub data_type: u64,
+    /// `setIndex:`.
+    pub index: u64,
+    /// `setArrayLength:`.
+    pub array_length: u64,
+    /// `setAccess:` (`MTLBindingAccess`).
+    pub access: u64,
+    /// `setTextureType:` (`MTLTextureType`).
+    pub texture_type: u64,
+    /// `setConstantBlockAlignment:`.
+    pub constant_block_alignment: u64,
+}
+
 /// The block Metal calls once, with the contents and the length, when a buffer made from a
 /// [`BufferDesc`] is released.
 pub type BufferDeallocator = Box<dyn FnOnce(HostPtr, u64) + Send>;
@@ -244,6 +262,372 @@ impl<P: Platform> fmt::Debug for RenderPipelineDesc<'_, P> {
     }
 }
 
+/// One colour attachment of a [`FullRenderPipelineDesc`]
+/// (`MTLRenderPipelineColorAttachmentDescriptor`), each enum its Metal raw value: `MTLPixelFormat`,
+/// `MTLBlendFactor`, `MTLBlendOperation` and `MTLColorWriteMask`. [`Default`] is Metal's
+/// attachment: no format, blending off, `one` over `zero` by `add`, every channel written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct ColorAttachmentDesc {
+    pub pixel_format: u64,
+    pub blending_enabled: bool,
+    pub source_rgb_blend_factor: u64,
+    pub destination_rgb_blend_factor: u64,
+    pub rgb_blend_operation: u64,
+    pub source_alpha_blend_factor: u64,
+    pub destination_alpha_blend_factor: u64,
+    pub alpha_blend_operation: u64,
+    pub write_mask: u64,
+}
+
+impl Default for ColorAttachmentDesc {
+    fn default() -> Self {
+        ColorAttachmentDesc {
+            pixel_format: 0,
+            blending_enabled: false,
+            source_rgb_blend_factor: 1,
+            destination_rgb_blend_factor: 0,
+            rgb_blend_operation: 0,
+            source_alpha_blend_factor: 1,
+            destination_alpha_blend_factor: 0,
+            alpha_blend_operation: 0,
+            write_mask: 0xf,
+        }
+    }
+}
+
+/// One buffer layout of a vertex descriptor (`MTLVertexBufferLayoutDescriptor`) or a stage-input
+/// descriptor (`MTLBufferLayoutDescriptor`), at index `buffer_index` of its array: the stride
+/// (`MTLBufferLayoutStrideDynamic` as Metal's raw value), the step function (`MTLVertexStepFunction`
+/// or `MTLStepFunction`) and the step rate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct BufferLayoutDesc {
+    pub buffer_index: u64,
+    pub stride: u64,
+    pub step_function: u64,
+    pub step_rate: u64,
+}
+
+/// One attribute of a vertex descriptor (`MTLVertexAttributeDescriptor`) or a stage-input
+/// descriptor (`MTLAttributeDescriptor`), at index `attribute_index` of its array: the format
+/// (`MTLVertexFormat` or `MTLAttributeFormat`), the byte offset and the buffer it reads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct AttributeDesc {
+    pub attribute_index: u64,
+    pub format: u64,
+    pub offset: u64,
+    pub buffer_index: u64,
+}
+
+/// `MTLVertexDescriptor`: the layouts and attributes set, the rest as Metal makes them.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+pub struct VertexDesc {
+    /// The layouts set, each at its index.
+    pub layouts: Vec<BufferLayoutDesc>,
+    /// The attributes set, each at its index.
+    pub attributes: Vec<AttributeDesc>,
+}
+
+/// `MTLStageInputOutputDescriptor`: the layouts and attributes set, and the index buffer's type
+/// (`MTLIndexType`) and index.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Default)]
+#[allow(missing_docs)] // each field is its setter's argument, named after it
+pub struct StageInputDesc {
+    pub layouts: Vec<BufferLayoutDesc>,
+    pub attributes: Vec<AttributeDesc>,
+    pub index_type: u64,
+    pub index_buffer_index: u64,
+}
+
+/// `MTLLinkedFunctions`, as a value: the functions a pipeline stage links, each made as the guest
+/// made it. Order: functions, binary functions, groups, then private functions. [`Default`] links
+/// none, which leaves the stage's linked functions as Metal's descriptor has them.
+pub struct LinkedFunctionsDesc<P: Platform> {
+    /// `setFunctions:`.
+    pub functions: Vec<P::Function>,
+    /// `setBinaryFunctions:`.
+    pub binary_functions: Vec<P::Function>,
+    /// `setGroups:`: each call-site group's name and its functions, in name order.
+    pub groups: Vec<(String, Vec<P::Function>)>,
+    /// `setPrivateFunctions:`.
+    pub private_functions: Vec<P::Function>,
+}
+
+impl<P: Platform> LinkedFunctionsDesc<P> {
+    /// Whether no function is linked.
+    pub fn is_empty(&self) -> bool {
+        self.functions.is_empty()
+            && self.binary_functions.is_empty()
+            && self.groups.is_empty()
+            && self.private_functions.is_empty()
+    }
+}
+
+impl<P: Platform> Default for LinkedFunctionsDesc<P> {
+    fn default() -> Self {
+        LinkedFunctionsDesc {
+            functions: Vec::new(),
+            binary_functions: Vec::new(),
+            groups: Vec::new(),
+            private_functions: Vec::new(),
+        }
+    }
+}
+
+impl<P: Platform> fmt::Debug for LinkedFunctionsDesc<P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let ids = |fs: &[P::Function]| fs.iter().map(Handle::id).collect::<Vec<_>>();
+        let groups: Vec<_> = self
+            .groups
+            .iter()
+            .map(|(name, fs)| (name.as_str(), ids(fs)))
+            .collect();
+        f.debug_struct("LinkedFunctionsDesc")
+            .field("functions", &ids(&self.functions))
+            .field("binary_functions", &ids(&self.binary_functions))
+            .field("groups", &groups)
+            .field("private_functions", &ids(&self.private_functions))
+            .finish()
+    }
+}
+
+/// A whole `MTLRenderPipelineDescriptor`, as a value: what the graphics lane carries of a guest's
+/// descriptor. The display's own pipelines take [`RenderPipelineDesc`]. Each enum is its Metal raw
+/// value. Order: label, the vertex and fragment functions, the vertex descriptor, the colour
+/// attachments at their indices, the depth and stencil formats, the raster sample count,
+/// alpha-to-coverage, alpha-to-one, rasterization, the input primitive topology, the maximum
+/// vertex amplification count, indirect command buffer support, then the vertex and fragment
+/// stages' linked functions where they link any.
+pub struct FullRenderPipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setVertexFunction:`.
+    pub vertex: &'a P::Function,
+    /// `setFragmentFunction:`; `None` leaves it nil (a pipeline that does not rasterize).
+    pub fragment: Option<&'a P::Function>,
+    /// `setVertexDescriptor:`; `None` leaves it nil.
+    pub vertex_descriptor: Option<VertexDesc>,
+    /// The colour attachments set, each at its index (0 to 7).
+    pub colors: Vec<(u64, ColorAttachmentDesc)>,
+    /// `setDepthAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u64,
+    /// `setStencilAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u64,
+    /// `setRasterSampleCount:`.
+    pub raster_sample_count: u64,
+    /// `setAlphaToCoverageEnabled:`.
+    pub alpha_to_coverage: bool,
+    /// `setAlphaToOneEnabled:`.
+    pub alpha_to_one: bool,
+    /// `setRasterizationEnabled:`.
+    pub rasterization_enabled: bool,
+    /// `setInputPrimitiveTopology:` (`MTLPrimitiveTopologyClass`).
+    pub input_primitive_topology: u64,
+    /// `setMaxVertexAmplificationCount:`.
+    pub max_vertex_amplification_count: u64,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+    /// `setVertexLinkedFunctions:`, where the stage links any.
+    pub vertex_linked: LinkedFunctionsDesc<P>,
+    /// `setFragmentLinkedFunctions:`, where the stage links any.
+    pub fragment_linked: LinkedFunctionsDesc<P>,
+}
+
+impl<P: Platform> fmt::Debug for FullRenderPipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullRenderPipelineDesc")
+            .field("label", &self.label)
+            .field("vertex", &self.vertex.id())
+            .field("fragment", &self.fragment.map(|f| f.id()))
+            .field("vertex_descriptor", &self.vertex_descriptor)
+            .field("colors", &self.colors)
+            .field("depth_pixel_format", &self.depth_pixel_format)
+            .field("stencil_pixel_format", &self.stencil_pixel_format)
+            .field("raster_sample_count", &self.raster_sample_count)
+            .field("alpha_to_coverage", &self.alpha_to_coverage)
+            .field("alpha_to_one", &self.alpha_to_one)
+            .field("rasterization_enabled", &self.rasterization_enabled)
+            .field("input_primitive_topology", &self.input_primitive_topology)
+            .field(
+                "max_vertex_amplification_count",
+                &self.max_vertex_amplification_count,
+            )
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .field("vertex_linked", &self.vertex_linked)
+            .field("fragment_linked", &self.fragment_linked)
+            .finish()
+    }
+}
+
+/// A whole `MTLMeshRenderPipelineDescriptor`, as a value: what the graphics lane carries of a
+/// guest's descriptor. Each enum is its Metal raw value. Order: label, the object, mesh and
+/// fragment functions, the colour attachments at their indices, the depth and stencil formats,
+/// the raster sample count, alpha-to-coverage, alpha-to-one, rasterization, the stages'
+/// maxima and their execution-width promises, the payload length, the maximum vertex
+/// amplification count, the required threadgroup sizes, indirect command buffer support, then
+/// the object, mesh and fragment stages' linked functions where they link any.
+pub struct FullMeshRenderPipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setObjectFunction:`; `None` leaves it nil (a pipeline with no object stage).
+    pub object: Option<&'a P::Function>,
+    /// `setMeshFunction:`.
+    pub mesh: &'a P::Function,
+    /// `setFragmentFunction:`; `None` leaves it nil (a pipeline that does not rasterize).
+    pub fragment: Option<&'a P::Function>,
+    /// The colour attachments set, each at its index (0 to 7).
+    pub colors: Vec<(u64, ColorAttachmentDesc)>,
+    /// `setDepthAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub depth_pixel_format: u64,
+    /// `setStencilAttachmentPixelFormat:` (`MTLPixelFormat`; 0 for none).
+    pub stencil_pixel_format: u64,
+    /// `setRasterSampleCount:`.
+    pub raster_sample_count: u64,
+    /// `setAlphaToCoverageEnabled:`.
+    pub alpha_to_coverage: bool,
+    /// `setAlphaToOneEnabled:`.
+    pub alpha_to_one: bool,
+    /// `setRasterizationEnabled:`.
+    pub rasterization_enabled: bool,
+    /// `setMaxTotalThreadsPerObjectThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_object_threadgroup: u64,
+    /// `setMaxTotalThreadsPerMeshThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_mesh_threadgroup: u64,
+    /// `setMaxTotalThreadgroupsPerMeshGrid:`, when set (0 leaves Metal's).
+    pub max_total_threadgroups_per_mesh_grid: u64,
+    /// `setObjectThreadgroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub object_threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setMeshThreadgroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub mesh_threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setPayloadMemoryLength:`, when set (0 leaves Metal's).
+    pub payload_memory_length: u64,
+    /// `setMaxVertexAmplificationCount:`.
+    pub max_vertex_amplification_count: u64,
+    /// `setRequiredThreadsPerObjectThreadgroup:`, when set (a size of zeros leaves Metal's).
+    pub required_threads_per_object_threadgroup: MtlSize,
+    /// `setRequiredThreadsPerMeshThreadgroup:`, when set (a size of zeros leaves Metal's).
+    pub required_threads_per_mesh_threadgroup: MtlSize,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+    /// `setObjectLinkedFunctions:`, where the stage links any.
+    pub object_linked: LinkedFunctionsDesc<P>,
+    /// `setMeshLinkedFunctions:`, where the stage links any.
+    pub mesh_linked: LinkedFunctionsDesc<P>,
+    /// `setFragmentLinkedFunctions:`, where the stage links any.
+    pub fragment_linked: LinkedFunctionsDesc<P>,
+}
+
+impl<P: Platform> fmt::Debug for FullMeshRenderPipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullMeshRenderPipelineDesc")
+            .field("label", &self.label)
+            .field("object", &self.object.map(|f| f.id()))
+            .field("mesh", &self.mesh.id())
+            .field("fragment", &self.fragment.map(|f| f.id()))
+            .field("colors", &self.colors)
+            .field("depth_pixel_format", &self.depth_pixel_format)
+            .field("stencil_pixel_format", &self.stencil_pixel_format)
+            .field("raster_sample_count", &self.raster_sample_count)
+            .field("alpha_to_coverage", &self.alpha_to_coverage)
+            .field("alpha_to_one", &self.alpha_to_one)
+            .field("rasterization_enabled", &self.rasterization_enabled)
+            .field(
+                "max_total_threads_per_object_threadgroup",
+                &self.max_total_threads_per_object_threadgroup,
+            )
+            .field(
+                "max_total_threads_per_mesh_threadgroup",
+                &self.max_total_threads_per_mesh_threadgroup,
+            )
+            .field(
+                "max_total_threadgroups_per_mesh_grid",
+                &self.max_total_threadgroups_per_mesh_grid,
+            )
+            .field(
+                "object_threadgroup_size_is_multiple_of_execution_width",
+                &self.object_threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field(
+                "mesh_threadgroup_size_is_multiple_of_execution_width",
+                &self.mesh_threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field("payload_memory_length", &self.payload_memory_length)
+            .field(
+                "max_vertex_amplification_count",
+                &self.max_vertex_amplification_count,
+            )
+            .field(
+                "required_threads_per_object_threadgroup",
+                &self.required_threads_per_object_threadgroup,
+            )
+            .field(
+                "required_threads_per_mesh_threadgroup",
+                &self.required_threads_per_mesh_threadgroup,
+            )
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .field("object_linked", &self.object_linked)
+            .field("mesh_linked", &self.mesh_linked)
+            .field("fragment_linked", &self.fragment_linked)
+            .finish()
+    }
+}
+
+/// A whole `MTLComputePipelineDescriptor`, as a value: what the graphics lane carries of a guest's
+/// descriptor. Order: label, the compute function, whether the threadgroup size is a multiple of
+/// the execution width, the maximum threads per threadgroup where set, the maximum call stack
+/// depth, indirect command buffer support, the stage-input descriptor where set, then the linked
+/// functions where it links any.
+pub struct FullComputePipelineDesc<'a, P: Platform> {
+    /// `setLabel:`, when set.
+    pub label: Option<&'a str>,
+    /// `setComputeFunction:`.
+    pub function: &'a P::Function,
+    /// `setThreadGroupSizeIsMultipleOfThreadExecutionWidth:`.
+    pub threadgroup_size_is_multiple_of_execution_width: bool,
+    /// `setMaxTotalThreadsPerThreadgroup:`, when set (0 leaves Metal's).
+    pub max_total_threads_per_threadgroup: u64,
+    /// `setMaxCallStackDepth:`.
+    pub max_call_stack_depth: u64,
+    /// `setSupportIndirectCommandBuffers:`.
+    pub support_indirect_command_buffers: bool,
+    /// `setStageInputDescriptor:`, when set.
+    pub stage_input: Option<StageInputDesc>,
+    /// `setLinkedFunctions:`, where the kernel links any.
+    pub linked: LinkedFunctionsDesc<P>,
+}
+
+impl<P: Platform> fmt::Debug for FullComputePipelineDesc<'_, P> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("FullComputePipelineDesc")
+            .field("label", &self.label)
+            .field("function", &self.function.id())
+            .field(
+                "threadgroup_size_is_multiple_of_execution_width",
+                &self.threadgroup_size_is_multiple_of_execution_width,
+            )
+            .field(
+                "max_total_threads_per_threadgroup",
+                &self.max_total_threads_per_threadgroup,
+            )
+            .field("max_call_stack_depth", &self.max_call_stack_depth)
+            .field(
+                "support_indirect_command_buffers",
+                &self.support_indirect_command_buffers,
+            )
+            .field("stage_input", &self.stage_input)
+            .field("linked", &self.linked)
+            .finish()
+    }
+}
+
 /// `MTLTextureDescriptor`, as a value, from which the platform makes the descriptor.
 ///
 /// The first nine fields are always sent; [`Default`] gives Metal's own defaults for them. The
@@ -314,6 +698,75 @@ impl Default for TextureDesc {
     }
 }
 
+/// Where plane `plane` of an IOSurface lies in a buffer that stands for the surface, its first
+/// byte the surface's base address, and what a texture over it reads of the surface besides
+/// ([`crate::platform::resource::Buffer::new_texture_over_surface_plane`], Metal's
+/// `newTextureWithDescriptor:iosurface:plane:` over such a buffer, which reads these from the
+/// `IOSurfaceRef`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfacePlane {
+    /// The plane the texture is asked of (`newTextureWithDescriptor:iosurface:plane:`'s
+    /// `plane`): 0 for a surface without planes.
+    pub plane: u64,
+    /// The plane's first byte in the buffer: `IOSurfaceGetBaseAddressOfPlane` less
+    /// `IOSurfaceGetBaseAddress`, 0 for a surface without planes.
+    pub offset: u64,
+    /// The plane's bytes from one row's start to the next's in the buffer:
+    /// `IOSurfaceGetBytesPerRowOfPlane`, or `IOSurfaceGetBytesPerRow` for a surface without
+    /// planes.
+    pub bytes_per_row: u64,
+    /// Whether the surface has planes: `IOSurfaceGetPlaneCount` above 0.
+    pub planar: bool,
+    /// The surface's facts where the caller has them, `None` where it has none: a platform then
+    /// makes the texture as over a buffer alone.
+    pub facts: Option<SurfaceFacts>,
+}
+
+/// The facts of an IOSurface a texture over one of its planes reads besides the plane, as the
+/// surface held them when the texture was made: a two-plane YCbCr texture over plane 0 reads
+/// plane 1's chroma, converted by the surface's range (its OSType) and matrix, and a two-plane
+/// XR10 texture plane 1's alpha bytes. Plane 1 lies in the buffer that stands for the surface
+/// ([`SurfacePlane`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SurfaceFacts {
+    /// `IOSurfaceGetPixelFormat`: the surface's OSType, its four characters big-endian (`'x420'`
+    /// is `0x7834_3230`).
+    pub pixel_format: u32,
+    /// `IOSurfaceGetPlaneCount`: 0 for a surface without planes.
+    pub plane_count: u64,
+    /// `IOSurfaceGetWidth`: its plane 0's width.
+    pub width: u64,
+    /// `IOSurfaceGetHeight`: its plane 0's height.
+    pub height: u64,
+    /// Plane 1's first byte in the buffer; 0 for a surface of fewer than two planes.
+    pub chroma_offset: u64,
+    /// `IOSurfaceGetBytesPerRowOfPlane(surface, 1)`, as the buffer lays plane 1's rows out; 0 for
+    /// a surface of fewer than two planes.
+    pub chroma_bytes_per_row: u64,
+    /// The surface's `kIOSurfaceYCbCrMatrix` value; `None` without one.
+    pub ycbcr_matrix: Option<SurfaceMatrix>,
+}
+
+/// An IOSurface's `kIOSurfaceYCbCrMatrix` value: one of the strings CoreVideo names
+/// (`kCVImageBufferYCbCrMatrix_*`), or any other value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum SurfaceMatrix {
+    /// `ITU_R_601_4`.
+    Itu601,
+    /// `ITU_R_709_2`.
+    Itu709,
+    /// `ITU_R_2020`.
+    Itu2020,
+    /// `SMPTE_240M_1995`.
+    Smpte240M1995,
+    /// `DCI_P3`.
+    DciP3,
+    /// `P3_D65`.
+    P3D65,
+    /// Any other value: a string of another text, or a value that is no string.
+    Other,
+}
+
 /// `MTLRasterizationRateMapDescriptor`, as a value, from which the platform makes the descriptor;
 /// its layers are set on the made descriptor. Order: screen size, mutability, min factor.
 #[derive(Debug, Clone, Copy, PartialEq, Default)]
@@ -357,12 +810,15 @@ macro_rules! set_struct_impls {
 }
 
 /// The render pass descriptor's own properties, each sent when set (`Some(None)` sends nil).
-/// Order: visibility result buffer, render target array length, width and height, default raster
-/// and colour sample counts, rasterization rate map, imageblock sample length, threadgroup memory
-/// length, tile width and height.
+/// Order: visibility result buffer and type, render target array length, width and height,
+/// default raster and colour sample counts, rasterization rate map, imageblock sample length,
+/// threadgroup memory length, tile width and height.
 #[allow(missing_docs)] // each field is its setter's argument, named after it
 pub struct PassSet<'a, P: Platform> {
     pub visibility_result_buffer: Option<Option<&'a P::Buffer>>,
+    /// `setVisibilityResultType:` (macOS 26): `MTLVisibilityResultType`, 0 `Reset`, 1
+    /// `Accumulate`.
+    pub visibility_result_type: Option<u64>,
     pub render_target_array_length: Option<u64>,
     pub render_target_width: Option<u64>,
     pub render_target_height: Option<u64>,
@@ -377,7 +833,7 @@ pub struct PassSet<'a, P: Platform> {
 }
 
 set_struct_impls!(PassSet { visibility_result_buffer, rasterization_rate_map } {
-    render_target_array_length, render_target_width, render_target_height,
+    visibility_result_type, render_target_array_length, render_target_width, render_target_height,
     default_raster_sample_count, default_color_sample_count, imageblock_sample_length,
     threadgroup_memory_length, tile_width, tile_height
 });

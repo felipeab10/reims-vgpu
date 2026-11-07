@@ -32,12 +32,21 @@
 #[cfg(all(target_os = "linux", not(feature = "vulkan")))]
 compile_error!("on Linux the library is the Vulkan platform's: build it with the `vulkan` feature");
 
+/// The unit tests' allocator, which counts a thread's allocations where a test asks.
+#[cfg(test)]
+mod counted;
+#[cfg(test)]
+#[global_allocator]
+static ALLOCATOR: counted::Counted = counted::Counted;
+
 mod device;
+mod device_writes;
 pub mod dirty;
 mod display;
 mod entry;
 mod error;
 mod frame;
+mod graphics;
 mod iosurface;
 pub mod platform;
 mod retained;
@@ -55,6 +64,10 @@ pub use display::{
 };
 pub use error::{Error, ResumeError};
 pub use frame::{Frame, FrameTarget, MAX_FRAME_TARGET_SIZE, PixelFormat, Region};
+pub use graphics::{
+    GraphicsCallbacks, GraphicsConfig, GraphicsDevice, GraphicsRaiseFn, GraphicsVideo,
+    GraphicsVideoSession, ScanoutWrittenFn, VideoDecode, VideoPlane,
+};
 pub use iosurface::{IoSurfaceDevice, IoSurfaceDeviceConfig};
 pub use platform::ApiPlatform;
 pub use reims_vgpu_core::host::{

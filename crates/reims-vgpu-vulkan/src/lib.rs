@@ -25,12 +25,15 @@
 
 pub mod answer;
 pub mod api;
+pub(crate) mod awake;
 pub mod gpu;
 #[cfg(target_os = "linux")]
 pub mod host_gpus;
 pub mod os;
 pub mod platform;
+pub(crate) mod records;
 pub mod remap;
 pub mod swapchain;
+pub(crate) mod work_log;
 
 pub use platform::{Obj, VulkanPlatform};

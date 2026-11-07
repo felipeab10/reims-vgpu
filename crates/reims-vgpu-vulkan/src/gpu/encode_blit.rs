@@ -109,6 +109,7 @@
 //! - **`synchronizeResource:` of nil** does nothing, which Metal takes
 //!   (`blit_texture_maintenance`) and the runtime has no form for.
 
+use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
@@ -118,7 +119,7 @@ use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
 use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{
     Policy, decide, metal_aborts, plain, send, send_describing, unrepresentable, unstopped_at,
@@ -126,15 +127,18 @@ use crate::answer::{
 use crate::gpu::command::{CommandBufferObject, Failing, Progress, VulkanCommandBuffer};
 use crate::gpu::fill;
 use crate::gpu::metal_space::{self, FirstUse};
-use crate::gpu::resource::VulkanTexture;
+use crate::gpu::resource::{VulkanBuffer, VulkanTexture};
 use crate::gpu::{origin, range, size};
 use crate::platform::{Obj, VulkanPlatform};
 
 /// An open runtime encoder: `None` once `endEncoding` consumed it.
 #[derive(Debug)]
 pub struct EncoderObject<E> {
-    /// The runtime's encoder, until it ends.
-    pub raw: Mutex<Option<E>>,
+    /// The runtime's encoder, until it ends. Only the thread that encodes into it takes it,
+    /// once a command ([`Self::with`]), or once for a run of commands ([`Self::running`]),
+    /// inside which each command's take is the same thread's again, which no atomic operation
+    /// takes. A command's call holds it borrowed, and makes no command of its own encoder.
+    pub raw: ReentrantMutex<RefCell<Option<E>>>,
     /// Its command buffer's count of open encoders, which counts it until it ends or goes.
     open: Arc<AtomicUsize>,
     /// Its command buffer, held weakly: once it goes, nothing encoded here runs.
@@ -176,7 +180,7 @@ impl<E> EncoderObject<E> {
         open.fetch_add(1, Ordering::SeqCst);
         let (at, aborts) = command_buffer.made_encoder(true);
         EncoderObject {
-            raw: Mutex::new(Some(raw)),
+            raw: ReentrantMutex::new(RefCell::new(Some(raw))),
             open: Arc::clone(open),
             command_buffer: command_buffer.downgrade(),
             encodes_icbs: AtomicBool::new(false),
@@ -218,11 +222,20 @@ impl<E> EncoderObject<E> {
     /// Runs `call` on the open encoder, for `sel`: a command after `endEncoding` dies. A slow
     /// call is a debug line ([`crate::gpu::timing::encoder_call`]).
     pub fn with<T>(&self, sel: &'static str, call: impl FnOnce(&mut E) -> T) -> T {
-        let mut raw = self.raw.lock();
+        let held = self.raw.lock();
+        let mut raw = held.borrow_mut();
         let e = raw
             .as_mut()
             .unwrap_or_else(|| unrepresentable(sel, "a command after endEncoding"));
         crate::gpu::timing::encoder_call(sel, &self.pipeline, || call(e))
+    }
+
+    /// Runs `run`, a run of commands this thread encodes one after another, holding the encoder
+    /// for it: each command's take inside it is this thread's again ([`Self::raw`]). It encodes
+    /// nothing itself, and its commands run as each would alone, in their order.
+    pub fn running<T>(&self, run: impl FnOnce() -> T) -> T {
+        let _held = self.raw.lock();
+        run()
     }
 
     /// Encodes nothing for `sel`, a command Metal encodes nothing for; after `endEncoding` it
@@ -237,6 +250,7 @@ impl<E> EncoderObject<E> {
         let e = self
             .raw
             .lock()
+            .borrow_mut()
             .take()
             .unwrap_or_else(|| unrepresentable(sel, "a second endEncoding"));
         self.open.fetch_sub(1, Ordering::SeqCst);
@@ -261,7 +275,7 @@ impl<E> EncoderObject<E> {
 impl<E> Drop for EncoderObject<E> {
     /// An encoder that goes without `endEncoding` is open no more: the runtime abandons it.
     fn drop(&mut self) {
-        if self.raw.get_mut().is_some() {
+        if self.raw.get_mut().get_mut().is_some() {
             self.open.fetch_sub(1, Ordering::SeqCst);
         }
     }
@@ -272,6 +286,15 @@ impl<E> Drop for EncoderObject<E> {
 /// The runtime's encoder is boxed: its handle is about 1.2 KiB, which each move between its making
 /// and its end would copy.
 pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
+
+/// What the encoder's lines name [`BlitEncoder::copy_from_guest_ram`] by: no selector of Metal's
+/// does.
+#[cfg(target_os = "linux")]
+const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
+
+/// What they name [`BlitEncoder::copy_to_guest_ram`] by.
+#[cfg(target_os = "linux")]
+const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
 /// or stencil of a combined texture, or a PVRTC texture's blocks row by row. The runtime copies
@@ -616,6 +639,69 @@ fn buffer_copy_shape(
 }
 
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
+    /// On Linux, through the RAM the destination's device uses that holds every run
+    /// (`os/linux/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
+    /// as a blit's copy is. False, with nothing encoded, where no such RAM holds them or the
+    /// runtime refuses the copy; never on macOS.
+    fn copy_from_guest_ram(
+        &self,
+        _on: OnFault,
+        runs: &[std::ops::Range<u64>],
+        destination: &VulkanBuffer,
+        destination_offset: u64,
+    ) -> RaiseResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = &destination.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(GUEST_RAM_TO_BUFFER, |e| {
+                crate::os::copy_from_host_ram(e, &ram, runs, &destination.raw, destination_offset)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (runs, destination, destination_offset);
+            Ok(false)
+        }
+    }
+
+    /// As [`Self::copy_from_guest_ram`], the other way, through the RAM the source's device uses.
+    fn copy_to_guest_ram(
+        &self,
+        _on: OnFault,
+        source: &VulkanBuffer,
+        source_offset: u64,
+        runs: &[std::ops::Range<u64>],
+    ) -> RaiseResult<bool> {
+        #[cfg(target_os = "linux")]
+        {
+            let device = &source.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
+                crate::os::copy_to_host_ram(e, &source.raw, source_offset, &ram, runs)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (source, source_offset, runs);
+            Ok(false)
+        }
+    }
+
     /// Each command but `endEncoding` is a first use of Metal's device
     /// ([`FirstUse::BlitCommand`]: measured for fills and copies, taken alike for the rest), and
     /// a reset or copy of an indirect command buffer is work for Metal's tiler
@@ -1101,7 +1187,10 @@ mod tests {
             blit.encode(OnFault::Return, BlitCmd::EndEncoding)
         });
         assert!(stopped.is_none());
-        assert!(blit.raw.lock().is_some(), "the blit encoder was taken");
+        assert!(
+            blit.raw.lock().borrow().is_some(),
+            "the blit encoder was taken"
+        );
         let cb = buffer();
         let compute = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
         let life = TaskLife::new();
@@ -1111,7 +1200,7 @@ mod tests {
         });
         assert!(stopped.is_none());
         assert!(
-            compute.raw.lock().is_some(),
+            compute.raw.lock().borrow().is_some(),
             "the compute encoder was taken"
         );
     }

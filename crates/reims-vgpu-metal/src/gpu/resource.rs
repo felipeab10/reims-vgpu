@@ -13,6 +13,7 @@ use objc2_metal::*;
 use reims_vgpu_core::host::HostPtr;
 use reims_vgpu_core::num::{ToU64, ToUsize};
 use reims_vgpu_core::platform::types::*;
+use reims_vgpu_core::platform::values::SurfacePlane;
 use reims_vgpu_core::platform::{HostRange, Platform};
 use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
@@ -172,6 +173,23 @@ impl reims_vgpu_core::platform::resource::Buffer<MetalPlatform> for MetalBuffer 
             || b.newTextureWithDescriptor_offset_bytesPerRow(descriptor, offset, bytes_per_row),
         )
         .map(created)
+    }
+
+    /// Metal's `newTextureWithDescriptor:offset:bytesPerRow:` at the plane's offset and rows:
+    /// Metal makes a texture over a surface's plane only over an `IOSurfaceRef`, and no public
+    /// call makes one over a buffer's bytes. A format Metal makes no texture of over a buffer (a
+    /// two-plane YCbCr or XR10 one among them) is that creator's nil, whatever the facts; any
+    /// other is made as over the buffer, the facts unread. A BC1 or BC7 texture is that
+    /// creator's nil, which Metal's IOSurface creator answers over the surface itself (measured
+    /// on the M3 Max under macOS 27 with no validation layer, over a surface without planes:
+    /// `bc_textures_over_a_surface_s_plane_are_metals`; with planes too, dgpu-oracle.md Q20).
+    fn new_texture_over_surface_plane(
+        &self,
+        on: OnFault,
+        descriptor: &<MetalPlatform as Platform>::TextureDescriptor,
+        plane: SurfacePlane,
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Texture>> {
+        self.new_texture(on, descriptor, plane.offset, plane.bytes_per_row)
     }
 
     fn replace_backing(
@@ -587,6 +605,87 @@ impl reims_vgpu_core::platform::resource::Library<MetalPlatform> for MetalLibrar
         })
         .map(created)
     }
+
+    /// Metal's `newFunctionWithName:constantValues:error:`, each constant set by its index. A
+    /// constant of a type no function constant takes, or an `NSError`, answers nil.
+    fn new_function_with_constants(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
+        let (l, name) = (self.get(), msg::new_string(function_name));
+        let Some(values) = constant_values(constants) else {
+            return Ok(None);
+        };
+        msg::send(
+            "newFunctionWithName:constantValues:error:",
+            Policy::Caught,
+            || {
+                l.newFunctionWithName_constantValues_error(&name, &values)
+                    .ok()
+            },
+        )
+        .map(created)
+    }
+
+    /// Metal's `newFunctionWithDescriptor:error:` over a descriptor of the name, the options, the
+    /// specialized name where given and, where there are any, the constants, each set by its
+    /// index. A constant of a type no function constant takes, or an `NSError`, answers nil.
+    fn new_function_with_options(
+        &self,
+        _on: OnFault,
+        function_name: &str,
+        constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+        options: u64,
+        specialized_name: Option<&str>,
+    ) -> RaiseResult<Option<<MetalPlatform as Platform>::Function>> {
+        let (l, name) = (self.get(), msg::new_string(function_name));
+        let d = msg::get(
+            "functionDescriptor",
+            MTLFunctionDescriptor::functionDescriptor,
+        );
+        msg::get("setName:", || d.setName(Some(&name)));
+        if !constants.is_empty() {
+            let Some(values) = constant_values(constants) else {
+                return Ok(None);
+            };
+            msg::get("setConstantValues:", || d.setConstantValues(Some(&values)));
+        }
+        msg::get("setOptions:", || {
+            d.setOptions(MTLFunctionOptions(options.to_usize()))
+        });
+        if let Some(specialized) = specialized_name {
+            let specialized = msg::new_string(specialized);
+            msg::get("setSpecializedName:", || {
+                d.setSpecializedName(Some(&specialized))
+            });
+        }
+        msg::send("newFunctionWithDescriptor:error:", Policy::Caught, || {
+            l.newFunctionWithDescriptor_error(&d).ok()
+        })
+        .map(created)
+    }
+}
+
+/// `MTLFunctionConstantValues` of `constants`, each set by its index: `None` where one is of a
+/// type no function constant takes.
+fn constant_values(
+    constants: &[reims_vgpu_core::platform::resource::FunctionConstant],
+) -> Option<objc2::rc::Retained<MTLFunctionConstantValues>> {
+    let values = msg::get("new", MTLFunctionConstantValues::new);
+    for c in constants {
+        let bytes = c.bytes()?;
+        // SAFETY: `bytes` holds as many bytes as `data_type` names; Metal copies them.
+        msg::get("setConstantValue:type:atIndex:", || unsafe {
+            values.setConstantValue_type_atIndex(
+                NonNull::new(bytes.as_ptr().cast_mut().cast()).unwrap_or(NonNull::dangling()),
+                MTLDataType(c.data_type.to_usize()),
+                c.index.to_usize(),
+            );
+        });
+    }
+    Some(values)
 }
 
 /// `id<MTLFunction>`.
@@ -681,6 +780,43 @@ impl reims_vgpu_core::platform::resource::RenderPipeline for MetalRenderPipeline
         let p = self.get();
         msg::get("maxTotalThreadsPerThreadgroup", || {
             p.maxTotalThreadsPerThreadgroup()
+        })
+        .to_u64()
+    }
+
+    fn max_total_threads_per_object_threadgroup(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadsPerObjectThreadgroup", || {
+            p.maxTotalThreadsPerObjectThreadgroup()
+        })
+        .to_u64()
+    }
+
+    fn max_total_threads_per_mesh_threadgroup(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadsPerMeshThreadgroup", || {
+            p.maxTotalThreadsPerMeshThreadgroup()
+        })
+        .to_u64()
+    }
+
+    fn object_thread_execution_width(&self) -> u64 {
+        let p = self.get();
+        msg::get("objectThreadExecutionWidth", || {
+            p.objectThreadExecutionWidth()
+        })
+        .to_u64()
+    }
+
+    fn mesh_thread_execution_width(&self) -> u64 {
+        let p = self.get();
+        msg::get("meshThreadExecutionWidth", || p.meshThreadExecutionWidth()).to_u64()
+    }
+
+    fn max_total_threadgroups_per_mesh_grid(&self) -> u64 {
+        let p = self.get();
+        msg::get("maxTotalThreadgroupsPerMeshGrid", || {
+            p.maxTotalThreadgroupsPerMeshGrid()
         })
         .to_u64()
     }
@@ -1432,6 +1568,64 @@ mod tests {
         assert!(k.texture.iosurface().is_none());
     }
 
+    /// A BC1 or BC7 texture over a surface's plane, through the buffer that stands for the
+    /// surface, is nil, over a surface without planes and over a plane of one with planes: the
+    /// buffer's creator answers nil, and does not end the process, as Metal's IOSurface creator
+    /// answers nil over the surface itself, measured here over a surface without planes
+    #[test]
+    fn bc_textures_over_a_surface_s_plane_are_metals() {
+        use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, SurfaceSpec};
+        use reims_vgpu_core::platform::values::{SurfaceFacts, TextureDesc};
+
+        use crate::os::iosurface::MetalSurfaces;
+
+        let d = dev();
+        let spec = SurfaceSpec {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            alloc_size: 256 * 64,
+            width: 64,
+            height: 64,
+            bytes_per_element: 4,
+            bytes_per_row: 256,
+            element_width: 1,
+            element_height: 1,
+            ..SurfaceSpec::default()
+        };
+        let surface = MetalSurfaces::new().create(&spec).unwrap();
+        let stand_in = buffer(&d, 256 * 64);
+        let facts = |plane_count| SurfaceFacts {
+            pixel_format: u32::from_be_bytes(*b"BGRA"),
+            plane_count,
+            width: 64,
+            height: 64,
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ycbcr_matrix: None,
+        };
+        for format in [130, 152] {
+            let desc = crate::gpu::desc::texture_descriptor(&TextureDesc {
+                pixel_format: format,
+                width: 64,
+                height: 32,
+                usage: 1,
+                ..TextureDesc::default()
+            });
+            let theirs = d.new_texture_on_surface(&desc, Some(&surface), 0).unwrap();
+            assert!(theirs.is_none(), "Metal's IOSurface creator: {format}");
+            for (plane, planar) in [(0, false), (1, true)] {
+                let at = SurfacePlane {
+                    plane,
+                    offset: plane * 256 * 32,
+                    bytes_per_row: 256,
+                    planar,
+                    facts: Some(facts(if planar { 2 } else { 0 })),
+                };
+                let ours = stand_in.new_texture_over_surface_plane(OnFault::Return, &desc, at);
+                assert!(ours.unwrap().is_none(), "{format} over plane {plane}");
+            }
+        }
+    }
+
     /// replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage: copies the bytes into
     /// the region, which getBytes reads back
     #[test]
@@ -1514,6 +1708,79 @@ mod tests {
         }
         assert!(lib.new_function(OnFault::Return, "nope").unwrap().is_none());
         assert!(lib.new_function(OnFault::Return, "k").unwrap().is_some());
+    }
+
+    /// A function made with options is Metal's function of the descriptor's name and options,
+    /// and a name the library does not hold is nil
+    #[test]
+    fn a_function_made_with_options_answers_them() {
+        let k = kit();
+        let lib = library(&k.device);
+        let f = lib
+            .new_function_with_options(OnFault::Return, "k", &[], 1, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(f.get().options(), MTLFunctionOptions::CompileToBinary);
+        assert_eq!(f.get().name().to_string(), "k");
+        assert!(
+            lib.new_function_with_options(OnFault::Return, "nope", &[], 1, None)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    /// A function made with a specialized name answers that name, and a kernel that calls a
+    /// visible function of that name links it as a private function; the same function made
+    /// under its own name leaves the call unresolved, and the pipeline refused
+    #[test]
+    fn a_specialized_name_resolves_a_kernel_s_call() {
+        use objc2_foundation::NSString;
+        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_core::platform::values::{FullComputePipelineDesc, LinkedFunctionsDesc};
+        let k = kit();
+        let source = |src: &str| -> MetalLibrary {
+            Obj::from_retained(
+                k.device
+                    .get()
+                    .newLibraryWithSource_options_error(&NSString::from_str(src), None)
+                    .unwrap(),
+            )
+        };
+        let caller = source(
+            "[[visible]] int custom_fn(int x);\n\
+             kernel void caller(device int *o [[buffer(0)]]) { o[0] = custom_fn(o[0]); }",
+        );
+        let callee = source("[[visible]] int impl_fn(int x) { return x + 1; }");
+        let kernel = function(&caller, "caller");
+        let pipeline = |linked: MetalFunction| {
+            k.device
+                .new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                    label: None,
+                    function: &kernel,
+                    threadgroup_size_is_multiple_of_execution_width: false,
+                    max_total_threads_per_threadgroup: 0,
+                    max_call_stack_depth: 1,
+                    support_indirect_command_buffers: false,
+                    stage_input: None,
+                    linked: LinkedFunctionsDesc {
+                        private_functions: vec![linked],
+                        ..LinkedFunctionsDesc::default()
+                    },
+                })
+        };
+        let specialized = callee
+            .new_function_with_options(OnFault::Return, "impl_fn", &[], 0, Some("custom_fn"))
+            .unwrap()
+            .unwrap();
+        assert_eq!(specialized.get().name().to_string(), "custom_fn");
+        assert!(matches!(pipeline(specialized), Ok(Some(_))));
+        let plain = callee
+            .new_function_with_options(OnFault::Return, "impl_fn", &[], 0, None)
+            .unwrap()
+            .unwrap();
+        assert_eq!(plain.get().name().to_string(), "impl_fn");
+        let refused = pipeline(plain);
+        assert!(refused.is_err(), "{refused:?}");
     }
 
     /// The pipeline getters agree with objc2-metal's

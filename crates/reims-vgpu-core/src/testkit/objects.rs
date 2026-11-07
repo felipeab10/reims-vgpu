@@ -30,7 +30,7 @@
 use std::any::{Any, TypeId};
 use std::borrow::BorrowMut;
 use std::marker::PhantomData;
-use std::sync::atomic::{AtomicI64, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::{Arc, Weak};
 
 use crate::sync::{Condvar, Mutex, MutexGuard};
@@ -43,12 +43,13 @@ use super::impls::device::DeviceModel;
 use super::impls::icb::{IcbCommandModel, IcbModel};
 use super::impls::rate_map::{RateMapDescriptorModel, RateMapModel};
 use super::impls::resource::PipelineModel;
-use super::script::{Script, Step};
+use super::script::{HeldCall, Script, Step};
 use super::vm::FakeVm;
 use crate::host::HostPtr;
 use crate::num;
-use crate::platform::command::{CompletedHandler, CompletedInfo};
+use crate::platform::command::{CompletedHandler, CompletedInfo, ScheduledHandler};
 use crate::platform::device::NoCopyDeallocator;
+use crate::platform::event::Notification;
 use crate::platform::os::{Clock, Deadline};
 use crate::platform::types::{
     CommandBufferStatus, MtlSize, NsErrorText, ResourceAddressRange, Swizzle,
@@ -128,7 +129,7 @@ pub mod kind {
 
 /// A resource-index space: the reservation type the platform is given. Textures, samplers and
 /// ICBs are the product's reservation types 0, 1 and 5; the other spaces are the fake's own.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Space(pub u64);
 
 impl Space {
@@ -354,10 +355,24 @@ pub struct CommandBufferModel {
     pub error: Option<NsErrorText>,
     /// The completed handlers, in the order added.
     pub handlers: Vec<CompletedHandler>,
+    /// The completion-seen handlers, in the order added: run before the completed handlers.
+    pub seen: Vec<CompletedHandler>,
+    /// The scheduled handlers, in the order added: run at commit, on the committing thread.
+    pub scheduled: Vec<ScheduledHandler>,
+    /// The submission handlers, in the order added: run at commit, on the committing thread,
+    /// before the scheduled handlers.
+    pub submission: Vec<ScheduledHandler>,
     /// `encodeSignalEvent:value:`s, applied at completion.
     pub signal_on_complete: Vec<(AnyHandle, u64)>,
     /// `encodeSignalEventScheduled:value:`s, applied at commit.
     pub signal_on_schedule: Vec<(AnyHandle, u64)>,
+    /// The detail of the death the platform's read of the buffer dies with as each completed
+    /// handler runs ([`World::complete_dying_read`]); `None` for a read that finds what the model
+    /// holds.
+    pub read_dies: Option<String>,
+    /// `GPUStartTime` and `GPUEndTime` in nanoseconds, which its completed handlers learn
+    /// ([`World::set_gpu_times`]); `None`, the default, for none.
+    pub gpu_times_ns: Option<(u64, u64)>,
 }
 
 impl std::fmt::Debug for CommandBufferModel {
@@ -366,6 +381,9 @@ impl std::fmt::Debug for CommandBufferModel {
             .field("status", &self.status)
             .field("error", &self.error)
             .field("handlers", &self.handlers.len())
+            .field("seen", &self.seen.len())
+            .field("scheduled", &self.scheduled.len())
+            .field("submission", &self.submission.len())
             .finish_non_exhaustive()
     }
 }
@@ -704,12 +722,25 @@ impl<K: Kind> Handle for Fk<K> {
 }
 
 impl<K: Kind> Drop for Fk<K> {
+    /// A release: logged where `K` logs its retains, then the death [`World::die_at_release`]
+    /// set for the object and the hold [`World::hold_at_release`] set for it, where the thread
+    /// is not unwinding already.
     fn drop(&mut self) {
         if K::LOG_RETAIN {
             self.obj()
                 .world
                 .log
                 .push(self.id(), K::CLASS, "CFRelease", vec![]);
+        }
+        if !std::thread::panicking() && self.obj().world.take_release_death(self.id()) {
+            crate::raise::Raise::platform("release")
+                .with_detail("the platform died letting go of the object")
+                .fatal();
+        }
+        if !std::thread::panicking()
+            && let Some(held) = self.obj().world.take_release_hold(self.id())
+        {
+            held.hold();
         }
     }
 }
@@ -808,6 +839,15 @@ impl<K: Kind> Fk<K> {
         s.children.push((key, index, h));
     }
 
+    /// Every child, its key and index with it, in the order they were made.
+    pub fn children(&self) -> Vec<(&'static str, u64, AnyHandle)> {
+        self.state()
+            .children
+            .iter()
+            .map(|(k, i, h)| (*k, *i, h.clone_ref()))
+            .collect()
+    }
+
     /// The child `key[index]`, if set or made.
     pub fn get_child(&self, key: &'static str, index: u64) -> Option<AnyHandle> {
         self.state()
@@ -830,7 +870,8 @@ impl<K: Kind> Fk<K> {
 #[derive(Debug, Default)]
 struct Indices {
     used: Vec<(Space, u64)>,
-    reserved: Vec<(Space, u64)>,
+    // A set: a reservation may hold thousands (the graphics device's texture ids).
+    reserved: std::collections::HashSet<(Space, u64)>,
 }
 
 /// A resource index held by a live object; freed when the object dies.
@@ -886,6 +927,26 @@ pub struct World {
     library_functions: Mutex<Vec<String>>,
     /// What [`World::on_new`] runs on the next object of a kind, in the order added.
     on_new: Mutex<Vec<(TypeId, Box<dyn Any + Send>)>>,
+    /// The objects whose next release dies ([`World::die_at_release`]).
+    release_dies: Mutex<Vec<ObjId>>,
+    /// The objects whose next release holds its thread ([`World::hold_at_release`]).
+    release_holds: Mutex<Vec<(ObjId, HeldCall)>>,
+    /// Committed command buffers whose work the platform has not taken, in commit order, while
+    /// submissions are held ([`World::hold_submissions`]); `None` while they are not.
+    held_submissions: Mutex<Option<Vec<Arc<FakeObj>>>>,
+    /// Whether the next commit, on whichever thread, first takes the held work
+    /// ([`World::release_submissions_at_next_commit`]).
+    release_at_commit: AtomicBool,
+    /// The shared events' notifications not yet due, each with its event (the root of a shared
+    /// copy) and value ([`notify_event`]), in the order asked for.
+    notifications: Mutex<Vec<(ObjId, u64, Notification)>>,
+    /// Whether a command buffer's `split` commits it as a part and answers the next
+    /// ([`World::split_command_buffers`]).
+    splits: AtomicBool,
+    /// What the devices' [`GpuDevice::copies_guest_ram`] answers ([`World::copy_guest_ram`]).
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    guest_ram_copies: AtomicBool,
 }
 
 /// A test's model setters for the next object of kind `K` ([`World::on_new`]).
@@ -917,7 +978,45 @@ impl World {
             auto_complete: Mutex::new(None),
             library_functions: Mutex::new(Vec::new()),
             on_new: Mutex::new(Vec::new()),
+            release_dies: Mutex::new(Vec::new()),
+            release_holds: Mutex::new(Vec::new()),
+            held_submissions: Mutex::new(None),
+            release_at_commit: AtomicBool::new(false),
+            notifications: Mutex::new(Vec::new()),
+            splits: AtomicBool::new(false),
+            guest_ram_copies: AtomicBool::new(false),
         })
+    }
+
+    /// From now on a command buffer's `split` commits it as a part of the command buffer, as a
+    /// commit does, and answers a new command buffer that goes on from it, as a platform that
+    /// splits command buffers does (`CommandBuffer::split`); until then it answers `None`, the
+    /// default, as Metal's does, and logs nothing.
+    pub fn split_command_buffers(&self) {
+        self.splits.store(true, Ordering::SeqCst);
+    }
+
+    /// Whether a command buffer's `split` splits it ([`World::split_command_buffers`]).
+    pub fn splits(&self) -> bool {
+        self.splits.load(Ordering::SeqCst)
+    }
+
+    /// Has the devices copy the guest's RAM by its runs ([`GpuDevice::copies_guest_ram`]), or
+    /// not, as a device of the Vulkan platform handed the guest's RAM whole does; not at first.
+    /// The copies answer as scripted ([`GUEST_RAM_TO_BUFFER`], [`BUFFER_TO_GUEST_RAM`]).
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    /// [`GUEST_RAM_TO_BUFFER`]: super::impls::blit::GUEST_RAM_TO_BUFFER
+    /// [`BUFFER_TO_GUEST_RAM`]: super::impls::blit::BUFFER_TO_GUEST_RAM
+    pub fn copy_guest_ram(&self, on: bool) {
+        self.guest_ram_copies.store(on, Ordering::SeqCst);
+    }
+
+    /// What the devices' [`GpuDevice::copies_guest_ram`] answers.
+    ///
+    /// [`GpuDevice::copies_guest_ram`]: crate::platform::device::GpuDevice::copies_guest_ram
+    pub fn copies_guest_ram(&self) -> bool {
+        self.guest_ram_copies.load(Ordering::SeqCst)
     }
 
     fn arc(&self) -> Arc<World> {
@@ -975,6 +1074,40 @@ impl World {
         self.on_new.lock().push((TypeId::of::<K>(), Box::new(set)));
     }
 
+    /// Makes the next release of a handle of object `id` die at `release`, as a platform that
+    /// dies letting go of an object does (the Vulkan platform's release of a no-copy buffer whose
+    /// deallocator the runtime delays): in a refusal scope it is refused, outside every scope it
+    /// ends the process.
+    pub fn die_at_release(&self, id: ObjId) {
+        self.release_dies.lock().push(id);
+    }
+
+    /// Whether this release of object `id` dies ([`World::die_at_release`]): once.
+    fn take_release_death(&self, id: ObjId) -> bool {
+        let mut dies = self.release_dies.lock();
+        match dies.iter().position(|d| *d == id) {
+            Some(i) => {
+                dies.remove(i);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Holds the next release of a handle of object `id` on its thread until the test lets
+    /// `held` go, as a platform holds the thread that lets an object go where its driver takes
+    /// long to free the object's memory or an import of the guest's pages.
+    pub fn hold_at_release(&self, id: ObjId, held: HeldCall) {
+        self.release_holds.lock().push((id, held));
+    }
+
+    /// The hold this release of object `id` waits in ([`World::hold_at_release`]): once.
+    fn take_release_hold(&self, id: ObjId) -> Option<HeldCall> {
+        let mut holds = self.release_holds.lock();
+        let at = holds.iter().position(|(held, _)| *held == id)?;
+        Some(holds.remove(at).1)
+    }
+
     /// A live object by identity (a retained, erased handle).
     pub fn find(&self, id: ObjId) -> Option<AnyHandle> {
         self.registry
@@ -1018,11 +1151,8 @@ impl World {
             Some(i) => i,
             None => {
                 let mut i = 1u64;
-                while g
-                    .used
-                    .iter()
-                    .chain(g.reserved.iter())
-                    .any(|&(s, x)| s == space && x == i)
+                while g.reserved.contains(&(space, i))
+                    || g.used.iter().any(|&(s, x)| s == space && x == i)
                 {
                     i = i.wrapping_add(1);
                 }
@@ -1042,7 +1172,7 @@ impl World {
     pub fn reserve_indices(&self, space: Space, indices: &[u64]) {
         let mut g = self.indices.lock();
         for &i in indices {
-            g.reserved.push((space, i));
+            g.reserved.insert((space, i));
         }
     }
 
@@ -1067,6 +1197,54 @@ impl World {
     /// The auto-complete mode.
     pub fn auto_complete(&self) -> Option<CompleteOn> {
         *self.auto_complete.lock()
+    }
+
+    /// From now until [`World::release_submissions`], a committed command buffer's work is not
+    /// taken at its commit: it stays `Committed`, its submission handlers, scheduled signals and
+    /// scheduled handlers wait, as a platform holds a buffer whose wait is not yet satisfied (the
+    /// Vulkan platform's wait for a shared event's value). Its completion is listed as at any
+    /// commit.
+    pub fn hold_submissions(&self) {
+        let mut held = self.held_submissions.lock();
+        if held.is_none() {
+            *held = Some(Vec::new());
+        }
+    }
+
+    /// Takes the work of every command buffer held since [`World::hold_submissions`], in commit
+    /// order, as a commit takes it, and takes each later buffer's at its commit again; how many
+    /// there were. One completed meanwhile ([`World::complete`]) was failed before the platform
+    /// took it, and runs no submission handler.
+    pub fn release_submissions(&self) -> usize {
+        let held = self.held_submissions.lock().take().unwrap_or_default();
+        for cb in &held {
+            let completed = matches!(&cb.state.lock().model, Model::CommandBuffer(m)
+                if m.status.raw() >= CommandBufferStatus::COMPLETED.raw());
+            if !completed {
+                submit_obj(cb);
+            }
+        }
+        held.len()
+    }
+
+    /// The next command buffer committed, on whichever thread, first takes the work held since
+    /// [`World::hold_submissions`], inside its commit and on its thread, as
+    /// [`World::release_submissions`] does, then its own: as the Vulkan platform's runtime
+    /// submits, inside a commit, the ready batches committed before it, and runs their submission
+    /// handlers there.
+    pub fn release_submissions_at_next_commit(&self) {
+        self.release_at_commit.store(true, Ordering::Release);
+    }
+
+    /// Whether `cb`, just committed, is held ([`World::hold_submissions`]), listed if so.
+    fn holds_submission(&self, cb: &Arc<FakeObj>) -> bool {
+        match self.held_submissions.lock().as_mut() {
+            Some(held) => {
+                held.push(Arc::clone(cb));
+                true
+            }
+            None => false,
+        }
     }
 
     /// The names `functionNames` returns and the fake's libraries list.
@@ -1129,6 +1307,35 @@ impl World {
         true
     }
 
+    /// Completes the committed command buffer `id` with status Error, as [`World::complete`]
+    /// does, where the platform's read of it, as each completed handler runs, dies with `detail`
+    /// (a failure the platform has no answer of Metal's for, which the Vulkan platform dies at on
+    /// the runtime's thread): a handler added in a refusal scope (the graphics lane's) is handed
+    /// the buffer refused ([`CompletedInfo::refused`]), and one added outside every scope dies
+    /// with it. `false` if no such live buffer.
+    pub fn complete_dying_read(&self, id: ObjId, detail: &str, on: CompleteOn) -> bool {
+        let Some(h) = self.find(id) else {
+            return false;
+        };
+        if let Model::CommandBuffer(m) = &mut h.obj().state.lock().model {
+            m.read_dies = Some(detail.to_owned());
+        }
+        complete_obj(h.obj(), CommandBufferStatus::ERROR, None, on);
+        true
+    }
+
+    /// Sets the GPU times the command buffer `id`'s completed handlers learn when it completes
+    /// ([`CompletedInfo::gpu_times_ns`]). `false` if no such live buffer.
+    pub fn set_gpu_times(&self, id: ObjId, start_ns: u64, end_ns: u64) -> bool {
+        let Some(h) = self.find(id) else {
+            return false;
+        };
+        if let Model::CommandBuffer(m) = &mut h.obj().state.lock().model {
+            m.gpu_times_ns = Some((start_ns, end_ns));
+        }
+        true
+    }
+
     /// Completes every committed buffer successfully, in commit order.
     pub fn complete_all(&self, on: CompleteOn) -> usize {
         let ids = self.committed();
@@ -1139,7 +1346,8 @@ impl World {
     }
 }
 
-/// Sets an event's value (following a shared copy to its root) and wakes its waiters.
+/// Sets an event's value (following a shared copy to its root), wakes its waiters, then runs the
+/// notifications it reached, on this thread, in the order they were asked for ([`notify_event`]).
 pub fn signal_event(ev: &Arc<FakeObj>, v: u64) {
     let root = match &ev.state.lock().model {
         Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
@@ -1150,6 +1358,40 @@ pub fn signal_event(ev: &Arc<FakeObj>, v: u64) {
         *value = v;
     }
     target.cv.notify_all();
+    run_due(target);
+}
+
+/// Runs `block` once the event `ev` (following a shared copy to its root) reaches `v`: at once, on
+/// this thread, where it has, else on the thread whose signal or set raises it there
+/// ([`signal_event`]). One never reached stays with the world.
+pub fn notify_event(ev: &Arc<FakeObj>, v: u64, block: Notification) {
+    let root = match &ev.state.lock().model {
+        Model::Event { root: Some(r), .. } => Some(r.obj().clone()),
+        _ => None,
+    };
+    let target = root.as_ref().unwrap_or(ev);
+    target
+        .world
+        .notifications
+        .lock()
+        .push((target.id, v, block));
+    run_due(target);
+}
+
+/// Runs the notifications of the root event `target` whose value it reached, with no lock held.
+fn run_due(target: &Arc<FakeObj>) {
+    let value = event_value(target);
+    let due: Vec<(ObjId, u64, Notification)> = {
+        let mut pending = target.world.notifications.lock();
+        let (due, kept) = std::mem::take(&mut *pending)
+            .into_iter()
+            .partition(|&(id, at, _)| id == target.id && at <= value);
+        *pending = kept;
+        due
+    };
+    for (_, _, block) in due {
+        block();
+    }
 }
 
 /// An event's value (following a shared copy to its root).
@@ -1194,6 +1436,37 @@ pub fn wait_event(ev: &Arc<FakeObj>, v: u64, ms: u64) -> bool {
     }
 }
 
+thread_local! {
+    /// The detail of the death the platform's read of the command buffer whose completed handlers
+    /// this thread runs dies with ([`World::complete_dying_read`]).
+    static READ_DIES: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Runs `f`, the completed handlers of a command buffer whose read dies with `detail` where it is
+/// `Some` ([`completion_read`]).
+fn with_read_death<R>(detail: Option<String>, f: impl FnOnce() -> R) -> R {
+    struct Restore(Option<String>);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            READ_DIES.with(|d| *d.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(READ_DIES.with(|d| d.replace(detail)));
+    f()
+}
+
+/// The platform's read of a command buffer as its completed handler runs: `info`, what the model
+/// holds, or the death [`World::complete_dying_read`] set for it, at `commit`, the selector the
+/// Vulkan platform dies at for a failure it reads there.
+pub(crate) fn completion_read(info: CompletedInfo) -> CompletedInfo {
+    if let Some(detail) = READ_DIES.with(|d| d.borrow().clone()) {
+        crate::raise::Raise::platform("commit")
+            .with_detail(detail)
+            .fatal();
+    }
+    info
+}
+
 /// [`World::complete`]'s body.
 pub fn complete_obj(
     cb: &Arc<FakeObj>,
@@ -1201,16 +1474,20 @@ pub fn complete_obj(
     error: Option<NsErrorText>,
     on: CompleteOn,
 ) {
-    let (handlers, signals) = {
+    let (handlers, signals, read_dies, gpu_times_ns) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
         };
         m.status = status;
         m.error = error.clone();
+        let mut handlers = std::mem::take(&mut m.seen);
+        handlers.append(&mut m.handlers);
         (
-            std::mem::take(&mut m.handlers),
+            handlers,
             std::mem::take(&mut m.signal_on_complete),
+            m.read_dies.take(),
+            m.gpu_times_ns,
         )
     };
     for (ev, v) in &signals {
@@ -1218,12 +1495,18 @@ pub fn complete_obj(
     }
     cb.cv.notify_all();
     cb.world.note_completed(cb);
-    let info = CompletedInfo { status, error };
+    let info = CompletedInfo {
+        status,
+        error,
+        gpu_times_ns,
+    };
     let run = move || {
         super::calllog::as_completion_thread(|| {
-            for h in handlers {
-                h(info.clone());
-            }
+            with_read_death(read_dies, || {
+                for h in handlers {
+                    h(info.clone());
+                }
+            })
         })
     };
     match on {
@@ -1245,25 +1528,57 @@ pub fn complete_obj(
     }
 }
 
-/// `commit`'s model: Scheduled at once, the scheduled signals applied, the buffer listed for
-/// completion (or completed at once under auto-complete).
+/// `commit`'s model: its submission handlers run, then Scheduled at once, the scheduled signals
+/// applied, the buffer listed for completion (or completed at once under auto-complete). While
+/// submissions are held ([`World::hold_submissions`]) it is only listed for completion, and the
+/// rest waits for [`World::release_submissions`].
 pub fn commit_obj(cb: &Arc<FakeObj>) {
-    let signals = {
+    if cb.world.release_at_commit.swap(false, Ordering::AcqRel) {
+        cb.world.release_submissions();
+    }
+    if cb.world.holds_submission(cb) {
+        cb.world.note_committed(cb);
+        return;
+    }
+    submit_obj(cb);
+    cb.world.note_committed(cb);
+    if let Some(on) = cb.world.auto_complete() {
+        complete_obj(cb, CommandBufferStatus::COMPLETED, None, on);
+    }
+}
+
+/// The platform takes a committed buffer's work: its submission handlers run, then Scheduled, the
+/// scheduled signals applied and its scheduled handlers run.
+fn submit_obj(cb: &Arc<FakeObj>) {
+    // Its submission handlers, before it reads `Scheduled`.
+    let submission = {
+        let mut s = cb.state.lock();
+        let Model::CommandBuffer(m) = &mut s.model else {
+            return;
+        };
+        std::mem::take(&mut m.submission)
+    };
+    for h in submission {
+        h();
+    }
+    let (signals, scheduled) = {
         let mut s = cb.state.lock();
         let Model::CommandBuffer(m) = &mut s.model else {
             return;
         };
         m.status = CommandBufferStatus::SCHEDULED;
-        std::mem::take(&mut m.signal_on_schedule)
+        (
+            std::mem::take(&mut m.signal_on_schedule),
+            std::mem::take(&mut m.scheduled),
+        )
     };
     for (ev, v) in &signals {
         signal_event(ev.obj(), *v);
     }
-    cb.cv.notify_all();
-    cb.world.note_committed(cb);
-    if let Some(on) = cb.world.auto_complete() {
-        complete_obj(cb, CommandBufferStatus::COMPLETED, None, on);
+    for h in scheduled {
+        h();
     }
+    cb.cv.notify_all();
 }
 
 /// Blocks (on the virtual clock's untimed wait) until the buffer's status reaches `at_least`.

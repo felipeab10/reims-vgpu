@@ -128,6 +128,10 @@
 // A frame committed twice, or waited on before its commit.
 #define RVG_ERR_FRAME_STATE 16
 
+// The host refused the memory, a pipe or a thread the call needs: the graphics device's region
+// or its threads (rvg_graphics_device_create).
+#define RVG_ERR_HOST_RESOURCES 17
+
 // No lines.
 #define RVG_LOG_OFF 0
 
@@ -272,6 +276,43 @@
 // The scaler device's virtqueues: one, the guest's requests, each answered in place.
 #define RVG_SCALER_QUEUE_COUNT 1
 
+// The PCI vendor ID of the graphics device: a placeholder until its own is picked.
+#define RVG_GRAPHICS_PCI_VENDOR_ID 4660
+
+// The PCI device ID of the graphics device: a placeholder, as the vendor ID is.
+#define RVG_GRAPHICS_PCI_DEVICE_ID 21063
+
+// The PCI class of the graphics device: a display controller of class "other".
+#define RVG_GRAPHICS_PCI_CLASS 896
+
+// The BAR of the graphics device's registers: 32-bit MMIO accesses, which the host sends to
+// rvg_graphics_device_mmio_read and rvg_graphics_device_mmio_write, below the MSI-X table.
+#define RVG_GRAPHICS_PCI_BAR_REGISTERS 0
+
+// The size of BAR 0.
+#define RVG_GRAPHICS_REGISTERS_SIZE 4096
+
+// Where in BAR 0 the MSI-X table starts, the PBA after it: the host's, not the library's.
+#define RVG_GRAPHICS_MSIX_OFFSET 2048
+
+// The graphics device's MSI-X vectors.
+#define RVG_GRAPHICS_MSIX_VECTORS 1
+
+// The BAR of the graphics device's region (rvg_graphics_device_region): 64-bit and
+// prefetchable, over the region's memory, which the guest maps write-back.
+#define RVG_GRAPHICS_PCI_BAR_REGION 2
+
+// The register the guest writes a ring's id to as its doorbell: the host's `ioeventfd` for it
+// matches the value RVG_GRAPHICS_DOORBELL_CONTROL, 4 bytes wide.
+#define RVG_GRAPHICS_REG_DOORBELL 32
+
+// The control ring's id, which the guest writes to RVG_GRAPHICS_REG_DOORBELL.
+#define RVG_GRAPHICS_DOORBELL_CONTROL 0
+
+// Where the guest's allocations start in the region, the scanout among them: below it are the
+// control rings, which the host's dirty log need not cover.
+#define RVG_GRAPHICS_ALLOCATIONS_OFFSET 4194304
+
 // The device: one paravirtualized GPU and its display ports.
 typedef struct RvgDevice RvgDevice;
 
@@ -284,6 +325,9 @@ typedef struct RvgFrame RvgFrame;
 
 // A 2D texture the library draws frames into and reads pixels back from.
 typedef struct RvgFrameTarget RvgFrameTarget;
+
+// The graphics device.
+typedef struct RvgGraphicsDevice RvgGraphicsDevice;
 
 // The IOSurface device: vmapple's second MMIO region.
 typedef struct RvgIOSurfaceDevice RvgIOSurfaceDevice;
@@ -923,6 +967,82 @@ typedef struct {
 // `RVG_SCALER_*` outcomes.
 typedef uint32_t RvgScalerOutcome;
 
+// `raise_interrupt(ctx, vector)`: raise the device's MSI-X vector `vector` (0).
+//
+// Thread: the one that posts the event it raises for: the device's control thread
+// (`reims-vgpu.graphics-control`), one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`),
+// which carry out a guest process's control messages, its presents and a block's pages and
+// downloads, each on its lane, its refresh thread
+// (`reims-vgpu.graphics-refresh`), a command queue's service thread
+// (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads, which walk and commit its
+// command buffers (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
+// (`reims-vgpu.graphics-compile-<n>`), a thread that makes IOSurfaces' and pages blocks' views
+// (`reims-vgpu.graphics-surfaces-<i>`), a thread that makes indirect command buffers
+// (`reims-vgpu.icb-create-<i>`), a thread that lets go of a closed process's objects and answers
+// its close (`reims-vgpu.graphics-closes-<i>`), or the platform's thread that runs a command
+// buffer's scheduled or completed handler; or the host's own, inside
+// rvg_graphics_device_mmio_write_taking.
+// Never inside another call of the host's into the library. The library may hold locks of its
+// own around it (docs/api.md section 5 names them), but none that a function it may call waits
+// for, directly or through a thread of the library's, so it may call them at once. It may wait
+// for a lock the host holds while it calls the device (QEMU's BQL), but not for one the host
+// holds while it calls rvg_graphics_device_mmio_write_taking. May call: rvg_status_message and
+// the rvg_graphics_device_* functions, except the release of its own device. Without it the
+// guest gets no interrupt.
+typedef void (*RvgGraphicsRaiseFn)(void *ctx, uint32_t vector);
+
+// `scanout_written(ctx, offset, length)`: whether the guest wrote any of the `length` bytes at
+// `offset` in the region since the last call, which starts the next span: the host's dirty log
+// of the guest's writes to that range, taken and cleared (QEMU: memory_region_set_log on the
+// region, and memory_region_snapshot_and_clear_dirty). The range lies at or past
+// RVG_GRAPHICS_ALLOCATIONS_OFFSET. The display shows the scanout again only where it answers
+// true.
+//
+// Thread: the device's refresh thread (`reims-vgpu.graphics-refresh`), at each refresh of the
+// display, never inside a call of the host's into the library, and with no lock of the
+// library's held: it may wait for a lock the host holds while it calls the device (QEMU's BQL).
+// May call: as raise_interrupt. Without it, every refresh shows the scanout again.
+typedef bool (*RvgGraphicsScanoutWrittenFn)(void *ctx, uint64_t offset, uint64_t length);
+
+// The graphics device's callbacks.
+typedef struct {
+  // sizeof(RvgGraphicsCallbacks) as the host was compiled.
+  uint32_t struct_size;
+  void *ctx;
+  // Runs once when the device's threads have ended, after their last callback: possibly on
+  // one of them, after rvg_graphics_device_release has returned.
+  RvgDestroyFn destroy;
+  RvgGraphicsRaiseFn raise_interrupt;
+  RvgGraphicsScanoutWrittenFn scanout_written;
+} RvgGraphicsCallbacks;
+
+// The graphics device's config.
+typedef struct {
+  // sizeof(RvgGraphicsDeviceConfig) as the host was compiled.
+  uint32_t struct_size;
+  // NULL is a table with every callback absent.
+  const RvgGraphicsCallbacks *callbacks;
+  // NULL is no window: the display offers 1920 x 1080 at 60 Hz and shows nothing. Otherwise
+  // the library opens a window for the display, as for a display's (RvgDisplayConfig.window),
+  // with its input as the window's callbacks; its flags are ignored, and it opens sized for
+  // its mode (1920 x 1080 where it has none). The window keeps its size: the display offers
+  // the guest one mode, the window's size in pixels at the refresh rate of the host screen it
+  // opens on, and tells the guest when the person resizes it. The guest's scanout is blitted
+  // out of the region into the window's drawables on the GPU, at the screen's rate, where
+  // scanout_written says the guest wrote it.
+  const RvgWindowConfig *window;
+  // The guest's RAM, or NULL. With it, where the host's page is the guest's 4 KiB, the GPU uses
+  // an IOSurface's own pages in place, through views of them made as a device's memory map
+  // makes its views (RvgDeviceConfig.memory_map); without it each surface's GPU view is a copy
+  // of its pages in the region. The map's pages stay the guest's RAM while the device lives:
+  // a host that discards guest RAM (a balloon, virtio-mem, hot-unplug) passes NULL.
+  const RvgMemoryMap *memory_map;
+  // With `memory_map`: the files behind its ranges, checked and duplicated as
+  // RvgDeviceConfig.memory_files are, with the same refusals; NULL for none. Files without a
+  // map are refused (RVG_ERR_INVALID_ARGUMENT).
+  const RvgMemoryRangeFile *memory_files;
+} RvgGraphicsDeviceConfig;
+
 // Write the request, which the call rewrote in place, into the element's writable part, with a
 // used length of the request's.
 #define RVG_SCALER_REPLY 0
@@ -1387,6 +1507,119 @@ RvgScalerOutcome rvg_scaler_device_process(RvgScalerDevice *device,
 // # Safety
 // `device` is a live scaler device handle.
 void rvg_scaler_device_reset(RvgScalerDevice *device);
+
+// A new graphics device, its region mapped and zeroed, its threads started, with a window for
+// its display where the config gives one. Its config and window config are read, with their
+// tables, before either table is the library's: a struct_size refusal runs no destroy, and a
+// later refusal runs both, the window's first. Refusals: RVG_ERR_INVALID_ARGUMENT,
+// RVG_ERR_UNSUPPORTED, RVG_ERR_HOST_RESOURCES (the host refused the region's memory, a pipe or
+// a thread). Calls back: never, but a refusal's destroys.
+//
+// # Safety
+// `config` is NULL or a live config; `device` is NULL or writable.
+RvgStatus rvg_graphics_device_create(const RvgGraphicsDeviceConfig *config,
+                                     RvgGraphicsDevice **device);
+
+// Drops the host's reference; the last one closes the window, waiting for nothing, and ends the
+// device's threads without waiting for them: the callbacks' destroy runs once both have ended,
+// possibly after this returns, and the region stays mapped until then and until the window's
+// GPU work has let it go. The host unmaps BAR 2 from the guest first. Calls back: never.
+//
+// # Safety
+// `device` is NULL or a live graphics device handle, not used again.
+void rvg_graphics_device_release(RvgGraphicsDevice *device);
+
+// The device's region: its first byte, page-aligned, and, through `size` where it is not NULL,
+// its size, a power of two. The host maps it into the guest as BAR 2, once; it is private
+// anonymous memory of the host's process, zeroed, mapped while the device lives
+// (rvg_graphics_device_release). Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle; `size` is NULL or writable.
+void *rvg_graphics_device_region(const RvgGraphicsDevice *device, uint64_t *size);
+
+// A 32-bit read of BAR 0 at `offset`, below RVG_GRAPHICS_MSIX_OFFSET; offsets with no register
+// read 0. On any thread, the vCPU's included. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+uint32_t rvg_graphics_device_mmio_read(RvgGraphicsDevice *device, uint64_t offset);
+
+// A 32-bit write of BAR 0 at `offset`, below RVG_GRAPHICS_MSIX_OFFSET: STATUS, and DOORBELL
+// where the host's ioeventfd did not take the write; other offsets are ignored. A write of 0 to
+// STATUS resets the device, and waits for the command the device is taking, which waits for
+// nothing of the host's. On any thread, the vCPU's included. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+void rvg_graphics_device_mmio_write(RvgGraphicsDevice *device, uint64_t offset, uint32_t value);
+
+// rvg_graphics_device_mmio_write, but a write to RVG_GRAPHICS_REG_DOORBELL of a command queue's
+// ring (any value but RVG_GRAPHICS_DOORBELL_CONTROL) may answer the queue's next command buffer
+// on the calling thread, ahead of the queue's own thread, posting the event that says it is
+// submitted there: raise_interrupt is then called on the calling thread, inside this call, after
+// that event is published. The host's raise_interrupt must therefore not wait for a lock the host
+// holds while it calls this. A buffer is answered only where nothing need be waited for (each
+// lock the answer needs is tried, and the queue's thread holds none of the queue's messages), and
+// the answer allocates nothing; the queue's thread then takes the buffer, as it takes any, and
+// the write wakes it, as rvg_graphics_device_mmio_write does. A write of
+// RVG_GRAPHICS_DOORBELL_CONTROL may likewise take the control ring's next message on the calling
+// thread and answer it there, raising the interrupt inside the call, where it is a surface
+// download whose pages hold the surface's GPU copy already and the control thread sleeps with
+// every earlier message carried out (each lock tried, nothing allocated); else the control
+// thread takes it. What the guest sees is the same either way but for when the event comes. It
+// waits for nothing rvg_graphics_device_mmio_write does not. On any thread, the vCPU's included.
+// Calls back: raise_interrupt, as above.
+//
+// # Safety
+// `device` is a live graphics device handle.
+void rvg_graphics_device_mmio_write_taking(RvgGraphicsDevice *device,
+                                           uint64_t offset,
+                                           uint32_t value);
+
+// Hands the device the host's doorbell for the control ring: `fd`, readable once the guest
+// writes RVG_GRAPHICS_DOORBELL_CONTROL to RVG_GRAPHICS_REG_DOORBELL (QEMU: the read side of
+// the EventNotifier of memory_region_add_eventfd, an eventfd, or a pipe where the host has
+// none). The device takes a copy of it, and reads what it holds when it wakes; the host may
+// close its own. RVG_ERR_INVALID_ARGUMENT where `fd` is not open or the device has one already.
+// Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+RvgStatus rvg_graphics_device_set_doorbell(RvgGraphicsDevice *device, int32_t fd);
+
+// The guest's bus reset: as a write of 0 to STATUS, the device is as one just made. It takes no
+// command until the guest writes 1, its rings are as new, the display keeps its scanout but has
+// no cursor image or VBLANK, and the device drops every object the guest's processes made, on
+// its control thread before it takes the guest's next command. Waits for the command the device
+// is taking, and for a take of a queue's ring or a post onto one under way. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle.
+void rvg_graphics_device_reset(RvgGraphicsDevice *device);
+
+// What the device's display shows now, read back into `dst`: the guest's scanout, or the
+// IOSurface its display pipe presents, through the display's colour, drawn as the device's
+// window draws it into a drawable of the display's mode, the size the guest is told (the
+// window's size in pixels, or 1920 x 1080 with no window); black where the guest shows nothing.
+// `*height` rows of `*width * 4` bytes each, BGRA8: B, G, R and A in memory, pixman's
+// x8r8g8b8 on a little-endian host. `width` and `height` (each NULL or writable) get the mode's
+// size whatever the result, so a call with a NULL `dst` asks the size. RVG_ERR_INVALID_ARGUMENT,
+// with nothing written to `dst`, where it is NULL or `dst_length` is below the mode's
+// `width * height * 4` bytes; RVG_ERR_METAL where the platform refuses the draw or its
+// texture; RVG_ERR_GPU where the draw ended with an error. Waits on the calling thread for the draw on the GPU, and for no lock
+// the device's callbacks may wait on, so the host may hold its own (QEMU's BQL) but need not:
+// QEMU calls it on a thread of its pool. The guest sees nothing of it: no present is answered,
+// and the mode is only asked. One read runs at a time. On any thread. Calls back: never.
+//
+// # Safety
+// `device` is a live graphics device handle; `dst` is NULL or holds `dst_length` writable bytes;
+// `width` and `height` are each NULL or writable.
+RvgStatus rvg_graphics_device_read_display(RvgGraphicsDevice *device,
+                                           uint8_t *dst,
+                                           size_t dst_length,
+                                           uint32_t *width,
+                                           uint32_t *height);
 
 #ifdef __cplusplus
 }  // extern "C"

@@ -128,6 +128,181 @@ pub struct DeviceCaps {
     pub min_linear_alignment_bgra8: RaiseResult<u64>,
 }
 
+/// Every `MTLGPUFamily` of the macOS 27 SDK, in its order: Apple1 to Apple11, Mac1 and Mac2,
+/// Common1 to Common3, MacCatalyst1 and MacCatalyst2, Metal3 and Metal4. [`IdentityCaps`]
+/// answers `supportsFamily:` of each.
+pub const SDK_FAMILIES: [i64; 20] = [
+    1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 2001, 2002, 3001, 3002, 3003,
+    4001, 4002, 5001, 5002,
+];
+
+/// Every `MTLFeatureSet` of the SDK, in its order: iOS 0 to 16, macOS 10000 to 10005, tvOS 30000
+/// to 30005. [`IdentityCaps`] answers `supportsFeatureSet:` of each.
+pub const FEATURE_SETS: [u64; 29] = [
+    0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 10000, 10001, 10002, 10003, 10004,
+    10005, 30000, 30001, 30002, 30003, 30004, 30005,
+];
+
+/// The family of [`SDK_FAMILIES`] an `MTLFeatureSet` of [`FEATURE_SETS`] goes with: a device answers
+/// the set where it answers the family, as Metal answers on the M3 Max (macOS 27, measured). The iOS
+/// sets go with the Apple family of their number, macOS' 1_v1 to v4 with Mac1 and 2_v1 with Mac2;
+/// `None` for the sets no family brings (macOS_ReadWriteTextureTier2 and the tvOS sets), which the
+/// M3 Max answers no.
+pub const fn feature_set_family(set: u64) -> Option<i64> {
+    match set {
+        // iOS_GPUFamily1_v1 to v5.
+        0 | 2 | 5 | 8 | 12 => Some(1001),
+        // iOS_GPUFamily2_v1 to v5.
+        1 | 3 | 6 | 9 | 13 => Some(1002),
+        // iOS_GPUFamily3_v1 to v4.
+        4 | 7 | 10 | 14 => Some(1003),
+        // iOS_GPUFamily4_v1 and v2.
+        11 | 15 => Some(1004),
+        // iOS_GPUFamily5_v1.
+        16 => Some(1005),
+        // macOS_GPUFamily1_v1 to v4.
+        10000 | 10001 | 10003 | 10004 => Some(2001),
+        // macOS_GPUFamily2_v1.
+        10005 => Some(2002),
+        _ => None,
+    }
+}
+
+/// The `MTLCounterSamplingPoint`s [`IdentityCaps`] answers `supportsCounterSampling:` of, in order:
+/// at stage, draw, dispatch, tile and blit boundaries.
+pub const COUNTER_SAMPLING_POINTS: [u64; 5] = [0, 1, 2, 3, 4];
+
+/// The largest count `supportsVertexAmplificationCount:` and
+/// `supportsRasterizationRateMapWithLayerCount:` are asked about: each answer of
+/// [`IdentitySizes`] is the largest count up to it the query takes.
+pub const LARGEST_COUNT_ASKED: u64 = 16;
+
+/// Every `MTLPixelFormat` of the macOS 27 SDK but Invalid, in its order. [`IdentityCaps`] answers
+/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of each.
+pub const SDK_PIXEL_FORMATS: [u64; 151] = [
+    1, 10, 11, 12, 13, 14, 20, 22, 23, 24, 25, 30, 31, 32, 33, 34, 40, 41, 42, 43, 45, 46, 47, 48,
+    53, 54, 55, 60, 62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90, 91, 92, 93, 94, 95, 96, 97, 98,
+    99, 103, 104, 105, 110, 112, 113, 114, 115, 120, 121, 122, 123, 124, 125, 130, 131, 132, 133,
+    134, 135, 140, 141, 142, 143, 150, 151, 152, 153, 160, 161, 162, 163, 164, 165, 166, 167, 170,
+    172, 174, 176, 178, 179, 180, 181, 182, 183, 186, 187, 188, 189, 190, 192, 193, 194, 195, 196,
+    197, 198, 199, 200, 204, 205, 206, 207, 208, 210, 211, 212, 213, 214, 215, 216, 217, 218, 222,
+    223, 224, 225, 226, 228, 229, 230, 231, 232, 233, 234, 235, 236, 240, 241, 250, 252, 253, 255,
+    260, 261, 262, 263, 552, 553, 554, 555,
+];
+
+/// The formats of [`SDK_PIXEL_FORMATS`] Metal answers `minimumTextureBufferAlignmentForPixelFormat:`
+/// of, as it does `minimumLinearTextureAlignmentForPixelFormat:`: the uncompressed colour
+/// formats that are neither packed nor YUV (measured on an Apple M3 Max, macOS 27.2: 16 for each,
+/// and a failed assertion, which ends the process, for every other format of the SDK, so no
+/// other is asked).
+pub const TEXTURE_BUFFER_FORMATS: [u64; 56] = [
+    1, 10, 11, 12, 13, 14, 20, 22, 23, 24, 25, 30, 31, 32, 33, 34, 40, 41, 42, 43, 53, 54, 55, 60,
+    62, 63, 64, 65, 70, 71, 72, 73, 74, 80, 81, 90, 91, 92, 93, 94, 103, 104, 105, 110, 112, 113,
+    114, 115, 123, 124, 125, 263, 552, 553, 554, 555,
+];
+
+/// The sample counts [`FormatAnswers::sparse_tiles`] answers, in order.
+pub const SPARSE_SAMPLE_COUNTS: [u64; 3] = [1, 2, 4];
+
+/// The `MTLSparsePageSize`s [`FormatAnswers::sparse_tiles`] answers, in order: 16, 64 and 256
+/// KiB. The query without a page size answers the first's.
+pub const SPARSE_PAGE_SIZES: [i64; 3] = [101, 102, 103];
+
+/// One pixel format's answers in [`IdentityCaps`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct FormatAnswers {
+    /// The raw `MTLPixelFormat`.
+    pub format: u64,
+    /// `minimumTextureBufferAlignmentForPixelFormat:`; `None` for a format Metal does not answer
+    /// (it asserts) or where the platform has no answer.
+    pub texture_buffer_alignment: Option<u64>,
+    /// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of a 2D texture,
+    /// width, height and depth, at each of [`SPARSE_SAMPLE_COUNTS`] (major) and each of
+    /// [`SPARSE_PAGE_SIZES`]: the same for every texture type (measured on the M3 Max); `None`
+    /// where the platform has no answer.
+    pub sparse_tiles: Option<[[u64; 3]; 9]>,
+}
+
+caps_struct! {
+    /// The device's identity and size answers [`IdentityCaps`] holds, one field per selector:
+    /// `None` where the platform has no answer of its own. The last four are `MTLDeviceSPI`'s
+    /// `featureProfile`, `halfFPConfig`, `singleFPConfig` and `doubleFPConfig`, which SkyLight
+    /// asks (measured on the M3 Max, macOS 27: 10, 0xe, 0x54 and 0).
+    IdentitySizes: Option<u64>;
+    recommended_max_working_set_size,
+    location,
+    location_number,
+    max_transfer_rate,
+    peer_group_id,
+    peer_index,
+    peer_count,
+    max_buffer_length,
+    max_argument_buffer_sampler_count,
+    argument_buffers_support,
+    read_write_texture_support,
+    sparse_tile_size_in_bytes,
+    maximum_concurrent_compilation_task_count,
+    largest_vertex_amplification_count,
+    largest_rasterization_rate_map_layer_count,
+    feature_profile,
+    half_fp_config,
+    single_fp_config,
+    double_fp_config,
+}
+
+caps_struct! {
+    /// The device's `BOOL` identity and capability answers [`IdentityCaps`] holds, one field per
+    /// selector: `None` where the platform has no answer of its own.
+    IdentityFlags: Option<bool>;
+    is_low_power,
+    is_headless,
+    is_removable,
+    has_unified_memory,
+    supports_32bit_float_filtering,
+    supports_32bit_msaa,
+    supports_query_texture_lod,
+    supports_bc_texture_compression,
+    supports_pull_model_interpolation,
+    are_barycentric_coords_supported,
+    supports_shader_barycentric_coordinates,
+    supports_dynamic_libraries,
+    supports_render_dynamic_libraries,
+    supports_raytracing,
+    supports_function_pointers,
+    supports_function_pointers_from_render,
+    supports_raytracing_from_render,
+    supports_primitive_motion_blur,
+    supports_placement_sparse,
+}
+
+/// The device's answers a guest's own `MTLDevice` gives beyond [`DeviceCaps`]: `supportsFamily:`
+/// of every family of the SDK, `supportsFeatureSet:` of every feature set, and the identity and
+/// capability getters. Only the graphics lane asks it ([`GpuDevice::identity_caps`]), once per
+/// device; core's guest ABI never reads it.
+///
+/// Each answer is the platform's own: Metal's getter on the Metal platform, the runtime's answer
+/// on the Vulkan platform. `None` is a query the platform has no answer of, which the asker must
+/// not read as support.
+///
+/// [`GpuDevice::identity_caps`]: super::device::GpuDevice::identity_caps
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IdentityCaps {
+    /// `supportsFamily:` of each of [`SDK_FAMILIES`].
+    pub families: [Option<bool>; 20],
+    /// `supportsFeatureSet:` of each of [`FEATURE_SETS`].
+    pub feature_sets: [Option<bool>; 29],
+    /// `supportsCounterSampling:` of each of [`COUNTER_SAMPLING_POINTS`].
+    pub counter_sampling: [Option<bool>; 5],
+    /// `architecture.name`.
+    pub architecture_name: Option<String>,
+    /// The answers of each of [`SDK_PIXEL_FORMATS`], in its order.
+    pub formats: Vec<FormatAnswers>,
+    /// The integer answers.
+    pub sizes: IdentitySizes,
+    /// The `BOOL` answers.
+    pub flags: IdentityFlags,
+}
+
 /// `r` again: its value, or its raise thrown here, as `on` says.
 fn again<T: Clone>(on: OnFault, r: &RaiseResult<T>) -> RaiseResult<T> {
     match r {
