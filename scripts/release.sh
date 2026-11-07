@@ -302,6 +302,8 @@ fi
 MISSING=()
 [[ -f "${QEMU_BIN}" ]] || MISSING+=("QEMU (${QEMU_BIN})")
 [[ -n "${ROM_BIN}" && -f "${ROM_BIN}" ]] || MISSING+=("a ROM do vGPU (ReimsVgpu.rom)")
+GRAPHICS_ROM_BIN="firmware/prebuilt/ReimsGraphics.rom"
+[[ -f "${GRAPHICS_ROM_BIN}" ]] || MISSING+=("a ROM do ReimsGraphics (firmware/prebuilt/ReimsGraphics.rom)")
 [[ -n "${CTL_BIN}" && -f "${CTL_BIN}" ]] || MISSING+=("o motor reims-ctl (target/release/reims-ctl)")
 [[ -d "vendor/qemu/pc-bios" ]] || MISSING+=("vendor/qemu/pc-bios/")
 
@@ -418,6 +420,7 @@ mkdir -p "${DIST_TMP}/vendor/qemu/build/bin"
 mkdir -p "${DIST_TMP}/vendor/qemu/build/share/qemu"
 mkdir -p "${DIST_TMP}/vm/ovmf"
 mkdir -p "${DIST_TMP}/bin"
+mkdir -p "${DIST_TMP}/firmware/prebuilt"
 
 cp -a "${QEMU_BIN}" "${DIST_TMP}/vendor/qemu/build/bin/qemu-system-x86_64"
 
@@ -433,6 +436,7 @@ if [[ "${ROM_DEST_NAME}" != "ReimsVgpu.rom" ]]; then
     say "${YELLOW}  Aviso: a ROM encontrada é ${ROM_DEST_NAME}; ela será publicada como ReimsVgpu.rom, que é o nome que o binário procura.${NC}"
 fi
 cp -a "${ROM_BIN}" "${DIST_TMP}/vendor/qemu/build/share/qemu/ReimsVgpu.rom"
+cp -a "${GRAPHICS_ROM_BIN}" "${DIST_TMP}/firmware/prebuilt/ReimsGraphics.rom"
 
 # pc-bios: as ROMs padrão do QEMU (pxe, vgabios, edk2), ao lado da do vGPU.
 if [[ -d "vendor/qemu/pc-bios" ]]; then
@@ -452,7 +456,7 @@ fi
 [[ -f vm/boot-x86.sh ]] && cp -a vm/boot-x86.sh "${DIST_TMP}/vm/"
 
 tar -czf "${OUT_TAR}" -C "${DIST_TMP}" .
-sha256sum "${OUT_TAR}" > "${OUT_TAR}.sha256"
+sha256sum "${ASSET}" > "${OUT_TAR}.sha256"
 
 say "  ✓ ${ASSET} ($(du -h "${OUT_TAR}" | cut -f1))"
 say "  ✓ ${ASSET}.sha256"
@@ -466,6 +470,7 @@ TAR_LIST="$(tar -tzf "${OUT_TAR}")" || die "não consegui listar o tarball gerad
 for esperado in \
     'vendor/qemu/build/bin/qemu-system-x86_64' \
     'vendor/qemu/build/share/qemu/ReimsVgpu.rom' \
+    'firmware/prebuilt/ReimsGraphics.rom' \
     'vendor/qemu/build/share/qemu/' \
     'bin/reims-ctl'
 do
