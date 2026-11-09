@@ -131,7 +131,16 @@ fi
 # ------------------------------------------------------------------------------
 # 1. Última tag e próxima versão
 # ------------------------------------------------------------------------------
-LAST_TAG="$(git tag -l 'v[0-9]*' --sort=-v:refname | head -n1 || true)"
+# A última release é a tag de MAIOR precedência entre as que NÃO são pré-release.
+# `--sort=-v:refname` sozinho põe `v1.6.0-test.1` acima de `v1.6.0` (semver: o
+# pré-release tem precedência MENOR, então `-v:` o ordena por último e o `head -n1`
+# o escolhe como se fosse a mais nova). Foi assim que o script passou a sugerir v1.7.0
+# tendo `v1.6.0` publicado. `grep -v` remove pré-release (sufixo após `-`) antes de ordenar.
+LAST_TAG="$(git tag -l 'v[0-9]*' | grep -v -- '-[^-]*$' | sort -rV | head -n1 || true)"
+if [[ -z "${LAST_TAG}" ]]; then
+    # Só há pré-releases (ou nenhuma tag): aí sim vale a maior delas.
+    LAST_TAG="$(git tag -l 'v[0-9]*' | sort -rV | head -n1 || true)"
+fi
 if [[ -z "${LAST_TAG}" ]]; then
     LAST_TAG="v0.0.0"
     say "${YELLOW}Nenhuma tag encontrada; partindo de ${LAST_TAG}.${NC}"
