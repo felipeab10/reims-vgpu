@@ -3980,6 +3980,39 @@ mod tests {
         );
     }
 
+    /// The same death inside a refusal scope (the graphics lane's op) is the op's refusal, never
+    /// the process's and never silence: `refusing` answers `Err` with the death's id and the line
+    /// the process would have died with, and the thread goes on to the next op. This is the path
+    /// the device's nil-function creator leans on (`gpu::device`,
+    /// `new_compute_pipeline_state_for_function`): a `None` function the runtime has no form for
+    /// refuses the task that named it, and the host lives
+    #[test]
+    fn an_unrepresentable_in_a_scope_refuses_the_op_and_the_process_lives() {
+        use crate::core::raise::refusals::{is_refusing, refusing};
+        let sel = "newComputePipelineStateWithFunction:error:";
+        let refusal = refusing(|| unrepresentable(sel, "a nil function")).unwrap_err();
+        assert_eq!(
+            refusal.id,
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call: sel
+            }
+        );
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("the Vulkan runtime cannot hold a nil function")
+        );
+        // Not silence: the refusal carries the call and the line, as the process's death would
+        assert_eq!(
+            refusal.to_string(),
+            "platform call newComputePipelineStateWithFunction:error:: \
+             the Vulkan runtime cannot hold a nil function"
+        );
+        // The scope is left, and the thread runs the next op: nothing ended
+        assert!(!is_refusing());
+        assert_eq!(refusing(|| 7).unwrap(), 7);
+    }
+
     /// A runtime error as an NSError carries the runtime's text
     #[test]
     fn error_text_is_the_runtimes() {

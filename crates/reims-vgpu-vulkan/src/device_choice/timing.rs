@@ -99,6 +99,7 @@ fn run(id: u64, clock: &crate::os::OsClock) -> Result<Duration, rt::Error> {
             rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
         texture.usage = usage;
         texture.resource_options = rt::ResourceOptions::private();
+        texture.placement = rt::IdPlacement::Outside;
         device.new_texture(&texture)
     };
     let work = Work {
@@ -228,6 +229,7 @@ fn host_textures(
         rt::TextureDescriptor::texture_2d(PixelFormat::BGRA8Unorm, WIDTH, HEIGHT, false);
     texture.usage = TextureUsage::SHADER_READ | TextureUsage::RENDER_TARGET;
     texture.resource_options = rt::ResourceOptions::shared();
+    texture.placement = rt::IdPlacement::Outside;
     let sampled = buffer.new_texture(&texture, 0, WIDTH * 4)?;
     let written = buffer.new_texture(&texture, plane, WIDTH * 4)?;
     Ok(Some((sampled, written, buffer)))

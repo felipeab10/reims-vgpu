@@ -317,12 +317,42 @@ pub fn window_device(raw: rt::Device) -> VulkanDevice {
 /// Reserves the guest's texture resource IDs on `raw` where the process declared them
 /// (`crate::platform::present_guest_texture_ids`), the device's first call, before the library's
 /// own work on it makes a command queue or a texture ([`adopt`]): the IDs it reserved, or `None`
-/// where none were declared or the runtime refused them, which is logged at error.
+/// where none were declared, the runtime refused them, or the reservation was withheld late, which
+/// is logged at error.
 fn reserve_guest_texture_ids(raw: &rt::Device) -> Option<std::ops::RangeInclusive<u64>> {
     let ids = crate::platform::guest_texture_ids()?;
     let reserved: Vec<rt::ResourceId> = ids.clone().map(rt::ResourceId).collect();
     match raw.reserve_resource_ids(rt::ResourceIdKind::Texture, &reserved) {
-        Ok(()) => Some(ids),
+        Ok(()) => {
+            // `Ok` is no proof the reservation was taken: a pool that started before it ignores
+            // the reservation, answering `Ok` and saying so only of the first such call. A plain
+            // texture of nothing says which happened where the runtime's counts do not: an ID of
+            // the guest's means plain allocation hands those out, and the guest's textures made
+            // at their own IDs would share them.
+            let mut descriptor = rt::TextureDescriptor::texture_2d(
+                metal2vulkan::metal::PixelFormat::BGRA8Unorm,
+                1,
+                1,
+                false,
+            );
+            descriptor.usage = metal2vulkan::metal::TextureUsage::SHADER_READ;
+            let withheld = match raw.new_texture(&descriptor) {
+                Ok(probe) => ids.contains(&probe.gpu_resource_id().0),
+                // A probe the runtime refuses says nothing of the reservation: the error below
+                // is the reservation's alone.
+                Err(_) => false,
+            };
+            if !withheld {
+                return Some(ids);
+            }
+            log::error!(
+                "the guest's texture resource ids {} to {} are not reserved as the device is \
+                 made (reservation withheld late): its textures may share ids with the host's",
+                ids.start(),
+                ids.end()
+            );
+            None
+        }
         Err(error) => {
             log::error!(
                 "the guest's texture resource ids {} to {} are not reserved as the device is \
