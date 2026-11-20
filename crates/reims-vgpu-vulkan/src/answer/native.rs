@@ -87,9 +87,11 @@ pub struct NativeRelay {
 /// `NativeHalfQuantize` (maths); `DeviceSampling`, `DeviceTexelConversion` and
 /// `DecodedTexelPrecision` (sampling); `DeviceRoundedResolve` (the device's rounding of a resolve's
 /// average); `DevicePackConversion` (its conversions of packed normalized values),
-/// `DeviceVertexConversion` (its vertex input's conversion of a normalized attribute) and
-/// `DeviceAlphaCoverage` (its alpha to coverage). A device that runs on Metal (MoltenVK) is an
-/// Apple GPU, where each still dies.
+/// `DeviceVertexConversion` (its vertex input's conversion of a normalized attribute),
+/// `DeviceAlphaCoverage` (its alpha to coverage), `NativeLogicOperation` (its logic operation on
+/// a 10-bit or signed normalized attachment's own codes) and `NativeFloat8` (its own 8-bit float,
+/// which a tensor's 8-bit float element widens through). A device that runs on Metal (MoltenVK) is
+/// an Apple GPU, where each still dies.
 ///
 /// These die here, as on MoltenVK, as no class covers them: blending, storage, tessellation,
 /// depth, layout, the band's rasterization, a pass's tile store and when a command buffer is seen
@@ -127,7 +129,7 @@ pub struct NativeRelay {
 /// - `AttachmentReadInPlace`, a draw's access to an attachment's memory inside its render pass
 ///   instance other than as an attachment, where the runtime serves no copy or snapshot: its
 ///   exact form, the copy or snapshot a sampled slot's binding reads, the hardware allows.
-pub const NATIVE_RELAYED: [NativeRelay; 38] = [
+pub const NATIVE_RELAYED: [NativeRelay; 40] = [
     NativeRelay {
         kind: rt::Degradation::DeviceInterpolation,
         ground: "a fragment function's interpolated input, on every device but MoltenVK, where \
@@ -451,6 +453,31 @@ pub const NATIVE_RELAYED: [NativeRelay; 38] = [
                  one sample of Metal's on lavapipe, unmeasured elsewhere (the runtime's record). \
                  The runtime gives the device's answer with the note, as for its maths and \
                  sampling, with no exact form to take",
+    },
+    NativeRelay {
+        kind: rt::Degradation::NativeLogicOperation,
+        ground: "class (e): a render pipeline's private logic operation drawn by the device's \
+                 `logicOp` into an `RGB10A2Unorm`, `BGR10A2Unorm` or signed normalized \
+                 attachment, which operates on the channels' stored codes themselves, where Metal \
+                 operates on a 10-bit or 2-bit code widened to 16 bits and narrows the result, \
+                 and reads and stores a signed channel's lowest code as the code above it, so a \
+                 channel may store another code (lavapipe's xor: green 938 where Metal's rule \
+                 gives 937, and 0x60 over a signed 0x80 where Metal's gives 0x61; the runtime's \
+                 record, with no bound, as the result follows the codes' bits). Every other \
+                 format's logic operation is Metal's. The runtime gives the device's operation \
+                 off Apple's GPUs, as for its maths and sampling, and draws it in the fragment \
+                 function on MoltenVK, which has no `logicOp`",
+    },
+    NativeRelay {
+        kind: rt::Degradation::NativeFloat8,
+        ground: "class (e): a tensor's 8-bit float element widened through the device's own \
+                 8-bit float (`shaderFloat8`, OCP's encodings), the only form where the device \
+                 has one: an e4m3 0x7F or 0xFF reads as a NaN where Metal reads 480 and -480 \
+                 (measured on the M3 Max), and an e5m2 NaN's bits are the device's where Metal \
+                 reads 0x7FC00000; every other code reads Metal's value (the runtime's record, \
+                 with no bound, as a NaN in a sum makes the sum a NaN). A device without \
+                 `shaderFloat8` decodes the fields with integers, as Metal reads them, and \
+                 announces nothing",
     },
 ];
 

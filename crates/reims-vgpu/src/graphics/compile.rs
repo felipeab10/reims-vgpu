@@ -1,7 +1,7 @@
 //! Pipeline compiles off ring 0's threads: the [`CompilePool`] that runs them and the
 //! [`Pending`] pipelines a command buffer waits for.
 //!
-//! A pipeline create on ring 0 is prepared on its context's lane (`reims-graphics`' device, on one
+//! A pipeline create on ring 0 is prepared on its context's lane (`reims-vgpu-graphics`' device, on one
 //! of ring 0's threads, `reims-vgpu.graphics-ring0-*`), which then goes on with the context's later
 //! messages, and is compiled on one of the pool's threads, `reims-vgpu.graphics-compile-*`; its
 //! reply goes on ring 0's completion ring when the compile ends, keyed to the create by its seqno.
@@ -12,13 +12,18 @@
 //! creates delays no other's. The pool's threads serve the processes (contexts) in turns: the
 //! next compile is of the context that owns the scanout where it has one waiting (the context of
 //! the surface the display last presented, WindowServer's), else of the context with the fewest
-//! compiles running, the one longest without a turn among equals; each context's own compiles go
-//! in the order it handed them over. So a context's single create waits for at most the first
-//! running compile to end, whatever another context has queued, and the scanout owner's waits
+//! compiles running, the one longest without a turn among equals: a context goes to the back of
+//! the turns as a compile of it is taken and again as one ends, so a context whose compiles all
+//! ended before a thread took the next goes behind one that waited through them. Each context's
+//! own compiles go in the order it handed them over. So a context's single create waits for at
+//! most the first running compile to end, whatever another context has queued, and the scanout
+//! owner's waits
 //! behind no other context's. Library makes go before every pipeline compile: a pipeline that
 //! names a library another context is still making waits for it on its thread, and that library
 //! has then always been taken by a thread already. Each compile's wait and run time is logged at
-//! debug (`reims_vgpu::graphics::compile`).
+//! debug (`reims_vgpu::graphics::compile`), and, in the profiling trace
+//! ([`reims_vgpu_vulkan::core::trace`]), its hand-over, start and end as `cmphand`, `cmpstart`
+//! and `cmpend` events, each with the object's id.
 //!
 //! **Order.** From its dispatch until it is stored, the pipeline is pending. A command buffer
 //! that names a pending pipeline (`SET_RENDER_PIPELINE_STATE`, `SET_COMPUTE_PIPELINE_STATE`: the
@@ -28,29 +33,38 @@
 //! asks the pending set under the lock of the table the pipeline goes in, and the destroy cancels
 //! it before it removes from that table. A table's lock is taken before the pending set's wherever
 //! both are held, and a waiter holds only the pending set's.
+//!
+//! **At the exit.** Each compile a thread runs is a making of the exit gate's
+//! ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for those in progress, and a
+//! thread that takes its next compile once the exit began parks for good without running it, so
+//! no compile of the pool's is inside the driver's compiler as the driver's destructors run.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_graphics::icb::{
+use reims_vgpu_graphics::icb::{
     RGFX_ICB_OP_COMPUTE_PIPELINE, RGFX_ICB_OP_RENDER_PIPELINE, RGFX_ICB_SLOT_PIPELINE,
     RgfxIcbObject, RgfxIcbRecord, slot_bytes,
 };
-use reims_graphics::ops::compute::{
+use reims_vgpu_graphics::ops::compute::{
     RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
 };
-use reims_graphics::ops::render::{
+use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RgfxOpSetRenderPipelineState,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_BODY_OFFSET, RgfxCommandBuffer, RgfxOpHeader,
 };
-use reims_graphics::region::Region;
-use reims_graphics::wire::{RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite};
-use reims_vgpu_core::platform::os::clock::MonoTime;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
+    RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIcbSlotRun, RgfxIcbSlots, RgfxIcbWrite,
+};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::trace;
+use reims_vgpu_vulkan::exit_gate;
 use zerocopy::FromBytes;
 
 /// The most compile threads a device runs.
@@ -137,7 +151,7 @@ struct PoolState {
     /// Each context's waiting compiles.
     queues: HashMap<u32, ContextQueue>,
     /// The contexts with compiles waiting, in the order they take turns: a context goes to the
-    /// back as a compile of it is taken.
+    /// back as a compile of it is taken and as one ends.
     turns: VecDeque<u32>,
     /// The compiles each context has running.
     running: HashMap<u32, usize>,
@@ -145,6 +159,11 @@ struct PoolState {
     favoured: Option<u32>,
     /// The pool is gone (or stopped): the threads end once nothing waits.
     closed: bool,
+    /// The context of each compile taken, in the order taken (tests only): a thread runs a
+    /// compile only after it has taken it, and one put off between the two runs its compile
+    /// after a later take's.
+    #[cfg(test)]
+    taken: Vec<u32>,
 }
 
 impl PoolState {
@@ -181,16 +200,24 @@ impl PoolState {
             self.turns.push_back(context);
         }
         *self.running.entry(context).or_default() += 1;
+        #[cfg(test)]
+        self.taken.push(context);
         Some(queued)
     }
 
-    /// A compile of `context` ended.
+    /// A compile of `context` ended: the context goes to the back of the turns, behind those
+    /// that waited while it ran.
     fn ended(&mut self, context: u32) {
         if let Some(n) = self.running.get_mut(&context) {
             *n -= 1;
             if *n == 0 {
                 self.running.remove(&context);
             }
+        }
+        if let Some(at) = self.turns.iter().position(|&c| c == context)
+            && let Some(c) = self.turns.remove(at)
+        {
+            self.turns.push_back(c);
         }
     }
 }
@@ -228,8 +255,11 @@ impl CompilePool {
         (self.shared.now)()
     }
 
-    /// A pool of `threads` threads, those the host starts.
+    /// A pool of `threads` threads, those the host starts, with the exit gate's hook registered
+    /// first, the device's driver loaded: the process's exit waits for a compile in progress,
+    /// and no thread starts one once it began (the module doc, "At the exit").
     fn with_threads(threads: usize, now: Now) -> CompilePool {
+        exit_gate::arm();
         let shared = Arc::new(Shared {
             state: Mutex::new(PoolState::default()),
             waiting: Condvar::new(),
@@ -248,6 +278,11 @@ impl CompilePool {
                     while let Some(queued) = next_compile(&shared) {
                         #[cfg(test)]
                         gate.pass();
+                        // A making of the exit gate's: the exit waits for it, and one taken
+                        // after the exit began parks the thread, its compile not run.
+                        let Some(_making) = exit_gate::making() else {
+                            exit_gate::stay()
+                        };
                         run(&shared, queued);
                     }
                 });
@@ -298,6 +333,7 @@ impl CompilePool {
             state.turns.push_back(context);
         }
         drop(state);
+        trace::event("cmphand", &[of.obj_id]);
         self.shared.waiting.notify_one();
         Ok(())
     }
@@ -326,6 +362,12 @@ impl CompilePool {
     #[cfg(test)]
     pub(crate) fn favoured(&self) -> Option<u32> {
         self.shared.state.lock().favoured
+    }
+
+    /// The context of each compile the threads took, in the order taken (tests only).
+    #[cfg(test)]
+    fn taken(&self) -> Vec<u32> {
+        self.shared.state.lock().taken.clone()
     }
 
     /// Shuts the gate: the threads hold before their next compile (tests only).
@@ -384,7 +426,9 @@ fn run(shared: &Shared, queued: Queued) {
         ahead,
     } = queued;
     let started = (shared.now)();
+    trace::event("cmpstart", &[of.obj_id]);
     job();
+    trace::event("cmpend", &[of.obj_id]);
     let ended = (shared.now)();
     let ms = |d: Duration| d.as_secs_f64() * 1e3;
     log::debug!(
@@ -515,6 +559,24 @@ impl Pending {
 }
 
 impl Pending {
+    /// Waits until none of the pipelines `named` is pending.
+    pub(crate) fn wait_for_ids(&self, named: &[u64]) {
+        let mut ids = self.ids.lock();
+        while named.iter().any(|id| ids.contains_key(id)) {
+            self.done.wait(&mut ids);
+        }
+    }
+
+    /// Waits until no pipeline of those `named` answers is pending, where any is: `named` is
+    /// asked only then, as it reads the guest's slots (an `ICB_SLOTS_IN_PAGES`'s, which the
+    /// decoder finds in their pages blocks).
+    pub(crate) fn wait_for_named(&self, named: impl FnOnce() -> Vec<u64>) {
+        if self.ids.lock().is_empty() {
+            return;
+        }
+        self.wait_for_ids(&named());
+    }
+
     /// Waits until no pipeline the `ICB_WRITE` `message`'s records set is pending.
     pub(crate) fn wait_for_icb_write(&self, message: &[u8]) {
         let mut ids = self.ids.lock();
@@ -724,20 +786,73 @@ mod tests {
 
     /// Waits until `n` compiles have started.
     fn started(starts: &Starts, n: usize) -> Vec<String> {
-        for _ in 0..5000 {
-            let now = starts.lock().clone();
-            if now.len() >= n {
-                return now;
-            }
-            std::thread::sleep(Duration::from_millis(1));
+        let mut now = Vec::new();
+        let came = crate::graphics::tests::eventually(|| {
+            now = starts.lock().clone();
+            now.len() >= n
+        });
+        assert!(came, "{n} compiles did not start");
+        now
+    }
+
+    /// Waits until `pool`'s threads have taken `n` compiles; the contexts of those taken, in
+    /// order.
+    fn took(pool: &CompilePool, n: usize) -> Vec<u32> {
+        let mut now = Vec::new();
+        let came = crate::graphics::tests::eventually(|| {
+            now = pool.taken();
+            now.len() >= n
+        });
+        assert!(came, "the threads did not take {n} compiles");
+        now
+    }
+
+    /// The process's exit waits for a compile in progress, and the pool starts no compile once
+    /// it began: a child exits 300 ms before its one thread's first compile ends, with a second
+    /// queued behind it, which never runs (the module doc, "At the exit"). The second's thread
+    /// parks, so the exit's status is the child's own
+    #[test]
+    fn an_exit_mid_compile_waits_for_it_and_starts_no_other() {
+        const TEST: &str =
+            "graphics::compile::tests::an_exit_mid_compile_waits_for_it_and_starts_no_other";
+        let say = |line: &str| {
+            use std::io::Write as _;
+            let _ = writeln!(std::io::stderr(), "{line}");
+        };
+        if std::env::var("RVG_EXIT_CHILD").as_deref() == Ok(TEST) {
+            let pool = pool(1);
+            let (began, at_begin) = mpsc::channel();
+            let first: CompileJob = Box::new(move || {
+                began.send(()).unwrap();
+                std::thread::sleep(Duration::from_millis(300));
+                say("the first compile ended");
+            });
+            let second: CompileJob = Box::new(move || say("the second compile ran"));
+            let of = |n| CompileOf::new(CompileKind::Pipeline, obj(1, n));
+            assert!(pool.submit(of(1), first).is_ok());
+            assert!(pool.submit(of(2), second).is_ok());
+            at_begin.recv().unwrap();
+            crate::graphics::tests::host_exit(7);
         }
-        panic!("{n} compiles did not start");
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+            .env("RVG_EXIT_CHILD", TEST)
+            .output()
+            .unwrap();
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(7), "{out:?}");
+        assert!(stderr.contains("the first compile ended"), "{stderr}");
+        assert!(!stderr.contains("the second compile ran"), "{stderr}");
     }
 
     /// One context's backlog holds no other context's create: with four threads busy on context
-    /// 1's twenty compiles, context 2's single create starts as the first of them ends and so
-    /// finishes one compile time after that, where in the order compiles were handed over it
-    /// would wait for five
+    /// 1's twenty compiles, context 2's single create is the fifth compile taken, as the first of
+    /// the four ends, though all four end before a thread takes the next, where in the order
+    /// compiles were handed over it would be taken after the twenty. The order is read as the
+    /// pool took the compiles: a thread put off between its take and its compile's start lets a
+    /// compile taken after its own start first. The order alone is checked, not when the create
+    /// finished: one compile time after the release on an idle host, it took more than three
+    /// under a loaded host's test run (0.46 s, with four sleeping threads)
     #[test]
     fn a_context_s_create_waits_behind_no_other_context_s_backlog() {
         const TAKES: Duration = Duration::from_millis(100);
@@ -754,36 +869,73 @@ mod tests {
                 TAKES,
             );
         }
-        let (finished, finish) = mpsc::channel::<Instant>();
+        let (finished, finish) = mpsc::channel::<()>();
         let create: CompileJob = {
             let starts = Arc::clone(&starts);
             Box::new(move || {
                 starts.lock().push("2".to_owned());
                 std::thread::sleep(TAKES);
-                let _ = finished.send(Instant::now());
+                let _ = finished.send(());
             })
         };
         assert!(
             pool.submit(CompileOf::new(CompileKind::Pipeline, obj(2, 1)), create)
                 .is_ok()
         );
-        let released = Instant::now();
         pool.release();
-        let done = finish
+        finish
             .recv_timeout(Duration::from_secs(10))
             .expect("context 2's create never ran");
-        let order = starts.lock().clone();
-        let at = order.iter().position(|n| n == "2");
+        let taken = pool.taken();
+        let at = taken.iter().position(|&context| context == 2);
         assert!(
             at.is_some_and(|at| at <= 4),
-            "context 2's create started late: {order:?}"
+            "context 2's create was taken late: {taken:?}, started in {:?}",
+            starts.lock().clone()
         );
-        // Handed over last, it would finish after six compile times; it waits for one.
-        let took = done.saturating_duration_since(released);
-        assert!(
-            took < 3 * TAKES,
-            "context 2's create finished {took:?} after the release, more than a compile's wait"
+    }
+
+    /// A context's compile ending puts the context behind one that waited through it: with one
+    /// thread, context 2's create handed over while context 1's compile runs is taken as that
+    /// compile ends, before context 1's next, though neither then has a compile running and
+    /// context 1 joined the turns first
+    #[test]
+    fn a_context_that_waited_through_another_s_compile_goes_next() {
+        let pool = pool(1);
+        let starts = Starts::default();
+        pool.hold();
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            1,
+            "1.0",
+            Duration::ZERO,
         );
+        // The thread takes 1.0 and holds at the gate; then 1 hands over two more, 2 its create.
+        assert_eq!(took(&pool, 1), [1], "the thread took no compile");
+        for name in ["1.1", "1.2"] {
+            compile(
+                &pool,
+                &starts,
+                CompileKind::Pipeline,
+                1,
+                name,
+                Duration::ZERO,
+            );
+        }
+        compile(
+            &pool,
+            &starts,
+            CompileKind::Pipeline,
+            2,
+            "2",
+            Duration::ZERO,
+        );
+        pool.release();
+        let order = started(&starts, 4);
+        assert_eq!(pool.taken(), [1, 2, 1, 1], "started in {order:?}");
+        assert_eq!(order, ["1.0", "2", "1.1", "1.2"]);
     }
 
     /// The scanout owner's compile goes before every other context's waiting, and so before one
@@ -803,7 +955,7 @@ mod tests {
                 .is_ok()
         );
         // The one thread holds the blocker; then three contexts' compiles wait.
-        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(took(&pool, 1), [9], "the thread took no blocker");
         for i in 0..3 {
             compile(
                 &pool,
@@ -855,7 +1007,7 @@ mod tests {
             pool.submit(CompileOf::new(CompileKind::Pipeline, obj(9, 1)), blocker)
                 .is_ok()
         );
-        std::thread::sleep(Duration::from_millis(20));
+        assert_eq!(took(&pool, 1), [9], "the thread took no blocker");
         compile(
             &pool,
             &starts,

@@ -5,7 +5,14 @@
 
 #include "RgfxRegion.hpp"
 
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
+#include <os/log.h>
+
 #include <cstring>
+
+#include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 RgfxRegion::RgfxRegion(volatile uint8_t *base, uint64_t size)
     : m_base(base), m_size(size), m_floor(RGFX_ALLOCATIONS_OFFSET), m_cursor(RGFX_ALLOCATIONS_OFFSET)
@@ -40,6 +47,12 @@ void RgfxRegion::setBlockSource(AllocFn alloc, ReleaseFn release, void *context)
 	m_alloc = alloc;
 	m_release = release;
 	m_sourceContext = context;
+}
+
+void RgfxRegion::setWriteCombinedSource(WriteCombinedAllocFn alloc)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_writeCombinedAlloc = alloc;
 }
 
 void RgfxRegion::setReclaim(ReclaimFn reclaim, void *context)
@@ -92,14 +105,16 @@ void RgfxRegion::setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignmen
 
 RgfxRegion::SurfaceBlock RgfxRegion::acquireSurfacePages(const void *base, uint64_t length,
                                                          uint64_t size, uint32_t surfaceId,
-                                                         bool cacheable, PagesAnswer *answer)
+                                                         bool cacheable,
+                                                         const RgfxSurfacePagesLayout *layout,
+                                                         PagesAnswer *answer)
 {
 	SurfaceBlock out = {};
 	uint64_t offset = 0, serial = 0;
 	bool fresh = false, cached = false;
 	auto ask = [&] {
-		return m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable, &offset,
-		                      &serial, &fresh, &cached);
+		return m_pagesAcquire(m_pagesContext, base, length, size, surfaceId, cacheable, layout,
+		                      &offset, &serial, &fresh, &cached);
 	};
 	*answer = m_pagesAcquire == nullptr ? kPagesUnsupported : ask();
 	if (*answer == kPagesNoRoom && reclaimed()) {
@@ -144,6 +159,18 @@ void RgfxRegion::retireSurfaceWrites(uint64_t queue, uint64_t seqno)
 	}
 }
 
+void RgfxRegion::setSurfaceSeedsSource(SurfaceSeedsFn seeds, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_seeds = seeds;
+	m_seedsContext = context;
+}
+
+bool RgfxRegion::surfaceSeeds(uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed)
+{
+	return m_seeds != nullptr && m_seeds(m_seedsContext, surfaceId, lockSeed, unlockSeed);
+}
+
 void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
 {
 	std::lock_guard<std::mutex> guard(m_lock);
@@ -151,21 +178,144 @@ void RgfxRegion::setPagesBlockSource(PagesBlockFn acquire, void *context)
 	m_pagesBlockContext = context;
 }
 
-RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable)
+void RgfxRegion::setChunkedPagesSource(ChunkedPagesFn make, void *context)
+{
+	std::lock_guard<std::mutex> guard(m_lock);
+	m_chunkedPages = make;
+	m_chunkedPagesContext = context;
+}
+
+RgfxRegion::Block RgfxRegion::acquireChunkedPages(uint64_t length)
 {
 	Block out = {};
+	uint8_t *bytes = nullptr;
 	uint64_t offset = 0, size = 0;
-	if (m_pagesBlock == nullptr ||
-	    !m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
+	if (m_chunkedPages == nullptr ||
+	    !m_chunkedPages(m_chunkedPagesContext, length, &bytes, &offset, &size))
 		return out; // ok == false
 	if (offset < m_floor || offset > m_size || size > m_size - offset) {
 		release(offset);
 		return out;
 	}
 	out.offset = offset;
+	out.ptr = bytes;
 	out.size = size;
 	out.ok = true;
 	return out;
+}
+
+bool rgfxPagesIdentity(const void *address, uint64_t length, std::vector<uint64_t> *identity)
+{
+	identity->clear();
+	mach_vm_address_t at = reinterpret_cast<uintptr_t>(address);
+	const mach_vm_address_t end = at + length;
+	if (length == 0 || end < at)
+		return false;
+	natural_t depth = 0;
+	while (at < end) {
+		mach_vm_address_t base = at;
+		mach_vm_size_t size = 0;
+		vm_region_submap_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_V2_COUNT_64;
+		if (mach_vm_region_recurse(mach_task_self(), &base, &size, &depth,
+		                           reinterpret_cast<vm_region_recurse_info_t>(&info),
+		                           &count) != KERN_SUCCESS)
+			return false;
+		// The region found is the one holding `at`, or the next one past a hole.
+		if (base > at)
+			return false;
+		if (info.is_submap) {
+			depth++;
+			continue;
+		}
+		if (count < VM_REGION_SUBMAP_INFO_V2_COUNT_64 || info.object_id_full == 0)
+			return false;
+		const mach_vm_address_t stop = base + size < end ? base + size : end;
+		identity->push_back(info.object_id_full);
+		identity->push_back(info.offset + (at - base));
+		identity->push_back(stop - at);
+		at = stop;
+		depth = 0;
+	}
+	return true;
+}
+
+RgfxRegion::Block RgfxRegion::acquirePages(const void *address, uint64_t length, bool writable,
+                                           uint32_t join)
+{
+	Block out = {};
+	if (m_pagesBlock == nullptr)
+		return out; // ok == false
+	const PagesRange range = {reinterpret_cast<uintptr_t>(address), length, writable, join};
+	if (join != kPagesOwn) {
+		std::vector<uint64_t> now;
+		const bool known = rgfxPagesIdentity(address, length, &now);
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		auto it = m_joinablePages.find(range);
+		if (it != m_joinablePages.end()) {
+			JoinedPages &joined = m_joinedPages.at(it->second);
+			if (known && now == joined.identity) {
+				joined.joinable++;
+				joined.held++;
+				out.offset = it->second;
+				out.size = joined.size;
+				out.ok = true;
+				return out;
+			}
+			// Other memory at the bytes now: the block is joinable no longer, and stays held
+			// by the objects over it until their releases.
+			static char site;
+			if (rgfxLogFirst(&site))
+				os_log_info(rgfxLog(),
+				            "RGFX: a no-copy buffer over %llu bytes takes a pages block of its own: "
+				            "a live one over the same address and length lies over the memory the "
+				            "process mapped there before",
+				            (unsigned long long)length);
+			os_log_debug(rgfxLog(),
+			             "RGFX: no join of the pages block at 0x%llx for %llu bytes at %p: the "
+			             "memory there is other memory now",
+			             (unsigned long long)it->second, (unsigned long long)length, address);
+			joined.joinable = 0;
+			m_joinablePages.erase(it);
+			m_rejoinsRefused++;
+		}
+	}
+	uint64_t offset = 0, size = 0;
+	if (!m_pagesBlock(m_pagesBlockContext, address, length, writable, &offset, &size))
+		return out; // ok == false
+	if (offset < m_floor || offset > m_size || size > m_size - offset) {
+		release(offset);
+		return out;
+	}
+	// Joinable where the memory can be told, as it is now its pages are wired; a block the kext
+	// gave for the same bytes on another thread meanwhile stays the one joined, and this one is
+	// its own.
+	std::vector<uint64_t> identity;
+	if (join != kPagesOwn && rgfxPagesIdentity(address, length, &identity)) {
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		if (m_joinablePages.emplace(range, offset).second)
+			m_joinedPages[offset] = JoinedPages{range, size, 1, 1, std::move(identity)};
+	}
+	out.offset = offset;
+	out.size = size;
+	out.ok = true;
+	return out;
+}
+
+uint64_t RgfxRegion::pagesRejoinsRefused() const
+{
+	std::lock_guard<std::mutex> guard(m_pagesLock);
+	return m_rejoinsRefused;
+}
+
+void RgfxRegion::leavePages(uint64_t offset)
+{
+	std::lock_guard<std::mutex> guard(m_pagesLock);
+	auto it = m_joinedPages.find(offset);
+	if (it == m_joinedPages.end() || it->second.joinable == 0)
+		return;
+	if (--it->second.joinable == 0)
+		m_joinablePages.erase(it->second.range);
 }
 
 void RgfxRegion::releaseSurface(uint64_t offset)
@@ -177,12 +327,28 @@ void RgfxRegion::releaseSurface(uint64_t offset)
 
 void RgfxRegion::release(uint64_t offset)
 {
+	{
+		std::lock_guard<std::mutex> guard(m_pagesLock);
+		auto it = m_joinedPages.find(offset);
+		if (it != m_joinedPages.end()) {
+			if (--it->second.held != 0)
+				return;
+			if (it->second.joinable != 0)
+				m_joinablePages.erase(it->second.range);
+			m_joinedPages.erase(it);
+		}
+	}
 	if (m_release != nullptr) {
 		m_release(m_sourceContext, offset);
 	}
 }
 
 RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
+{
+	return allocate(size, align, UINT64_MAX);
+}
+
+RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align, uint64_t writeCombinedFrom)
 {
 	Block out = {};
 	if (!isPowerOfTwo(align)) {
@@ -191,8 +357,13 @@ RgfxRegion::Block RgfxRegion::allocate(uint64_t size, uint64_t align)
 
 	if (m_alloc != nullptr) {
 		uint64_t offset = 0;
-		const bool placed = m_alloc(m_sourceContext, size, align, &offset) ||
-		                    (reclaimed() && m_alloc(m_sourceContext, size, align, &offset));
+		const bool combined = m_writeCombinedAlloc != nullptr && writeCombinedFrom < size;
+		auto ask = [&] {
+			return combined ? m_writeCombinedAlloc(m_sourceContext, size, align,
+			                                       writeCombinedFrom, &offset)
+			                : m_alloc(m_sourceContext, size, align, &offset);
+		};
+		const bool placed = ask() || (reclaimed() && ask());
 		if (!placed || offset < m_floor || offset > m_size || size > m_size - offset) {
 			return out; // no room; ok == false
 		}
@@ -233,7 +404,15 @@ RgfxRegion::RingPair RgfxRegion::allocateRingPair(uint32_t submit_data_size,
 		return out; // ok == false
 	}
 
-	Block submit = allocate(RGFX_RING_HEADER_SIZE + submit_data_size, kRingAlign);
+	// Where the kext maps part of a block write-combined, the submission ring's data takes it,
+	// from its block's second page, and the ring's header, which the host writes too and the
+	// writer reads, ends the first page, write-back (WRITE-COMBINED PARTS).
+	const bool combined = writeCombines();
+	const uint64_t head = combined ? kDefaultBlockAlign - RGFX_RING_HEADER_SIZE : 0;
+	Block submit = combined
+	                   ? allocate(kDefaultBlockAlign + submit_data_size, kDefaultBlockAlign,
+	                              kDefaultBlockAlign)
+	                   : allocate(RGFX_RING_HEADER_SIZE + submit_data_size, kRingAlign);
 	if (!submit.ok) {
 		return out;
 	}
@@ -241,20 +420,23 @@ RgfxRegion::RingPair RgfxRegion::allocateRingPair(uint32_t submit_data_size,
 	if (complete_data_size != 0) {
 		complete = allocate(RGFX_RING_HEADER_SIZE + complete_data_size, kRingAlign);
 		if (!complete.ok) {
+			release(submit.offset);
 			return out;
 		}
 	}
 
 	// Zero each ring's header + byte ring so a fresh RgfxRingWriter (producer 0,
 	// consumer 0, consumer_idle 0, armed 0) starts clean over BAR memory whose
-	// contents are otherwise undefined. The region is plain write-back memory.
-	std::memset(const_cast<uint8_t *>(submit.ptr), 0, submit.size);
+	// contents are otherwise undefined.
+	std::memset(const_cast<uint8_t *>(submit.ptr + head), 0, submit.size - head);
 	if (complete_data_size != 0) {
 		std::memset(const_cast<uint8_t *>(complete.ptr), 0, complete.size);
 	}
 
-	out.submit_offset = submit.offset;
+	out.submit_offset = submit.offset + head;
 	out.complete_offset = complete_data_size != 0 ? complete.offset : 0;
+	out.submit_block = submit.offset;
+	out.complete_block = out.complete_offset;
 	out.ok = true;
 	return out;
 }

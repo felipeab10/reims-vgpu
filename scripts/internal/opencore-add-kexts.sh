@@ -1,10 +1,12 @@
 #!/bin/bash
 # A copy of a VM's OpenCore image with kexts added: each bundle in
 # EFI/OC/Kexts, with a Kernel > Add entry made as reims-util makes its own
-# (from the image's first entry: x86_64, its executable and Info.plist, and the
-# Darwin bounds of the loader bridge's set, macOS 26.4 to 26.x). For iterating
-# on the guest display kext (guest/kext) and the loader that binds it, without
-# installing anything inside the guest.
+# (from the image's first entry where it has one: x86_64, its executable and
+# Info.plist), but with no Darwin bounds, where guest/prebuilt's set has them:
+# the kexts load on whatever release the VM runs, as work on a release the set
+# leaves out needs. For iterating on the guest kexts (guest/kext,
+# guest/rgfxgate) and the Graft that binds them, without installing anything
+# inside the guest.
 #
 #   scripts/internal/opencore-add-kexts.sh SRC OUT KEXT...
 #
@@ -34,7 +36,11 @@ for k in "$@"; do
 done
 
 tmp=$(mktemp -d "${TMPDIR:-/tmp}/opencore-add-kexts.XXXXXX")
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 qemu-img convert -O raw "$src" "$tmp/disk.raw"
 
 # The ESP: the GPT's first partition, in 512-byte sectors as reims-util
@@ -75,9 +81,9 @@ config_path, staged = sys.argv[1], sys.argv[2]
 with open(config_path, "rb") as f:
     config = plistlib.load(f)
 add = config["Kernel"]["Add"]
-if not add:
-    sys.exit("opencore-add-kexts: the image's Kernel > Add is empty: no entry to take keys from")
-template = add[0]
+# Every key OpenCore reads is set below; the first entry, where there is one,
+# carries any other key over.
+template = add[0] if add else {}
 
 kexts = []
 for path in sys.argv[3:]:
@@ -109,8 +115,8 @@ for name, info in ordered:
         "Comment": f"{name[:-5] if name.endswith('.kext') else name}, added for development",
         "Enabled": True,
         "ExecutablePath": f"Contents/MacOS/{executable}" if executable else "",
-        "MaxKernel": "25.99.99",
-        "MinKernel": "25.4.0",
+        "MaxKernel": "",
+        "MinKernel": "",
         "PlistPath": "Contents/Info.plist",
     })
     at = next((i for i, e in enumerate(add) if e.get("BundlePath") == name), None)
@@ -141,4 +147,5 @@ case $out in
 esac
 qemu-img convert -O "$format" "$tmp/disk.raw" "$tmp/out"
 mv "$tmp/out" "$out"
+ended=1
 echo "opencore-add-kexts: wrote $out ($format)"

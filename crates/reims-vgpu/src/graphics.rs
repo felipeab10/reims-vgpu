@@ -1,25 +1,44 @@
-//! [`GraphicsDevice`]: the reims-graphics device (PCI 1234:5247), `reims-graphics`'s host side
+//! [`GraphicsDevice`]: the reims-graphics device (PCI 1234:5247), `reims-vgpu-graphics`'s host side
 //! with its display shown in a window of the library's, made from a [`GraphicsConfig`].
 //!
 //! The device's region (BAR 2) is made here and shared: the device takes the guest's commands
 //! from its rings, and the window's sink imports the region's pages under the scanout as a
-//! no-copy buffer on the platform (Metal on macOS, the Vulkan platform's runtime with the
-//! `vulkan` feature) and blits the scanout out of it into each drawable, on the GPU, with no copy
-//! on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until the
-//! GPU has let the buffer go, after the device and the window.
+//! no-copy buffer on the Vulkan platform and blits the scanout out of it into each drawable, on
+//! the GPU, with no copy on the CPU (`sink`). The buffer's deallocator holds the region, so it stays mapped until
+//! the GPU has let the buffer go, after the device and the window.
 //!
-//! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its
-//! size (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's
-//! mode, else 1920 × 1080, and the display then offers the guest one mode, the window's size in
-//! pixels as its render thread last drew into it, at the refresh rate of the host screen it
-//! opened on; when that size changes (the person resized the window) the device tells the
-//! guest (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then whenever
-//! the host's dirty log says the guest wrote it, at the screen's rate; the window draws it at
-//! the screen's pace. The guest's cursor image is the host's cursor over the image, shown while
-//! the guest shows its cursor; the guest's cursor position moves nothing, since the host's
-//! pointer moves the guest's (the window never draws the cursor into the image itself).
+//! **The window** ([`WindowScreen`]) is a display window of `reims-vgpu-window` that keeps its size
+//! (`WindowConfig::keeps_its_size`): the guest follows it. It opens sized for the config's mode,
+//! else 1920 × 1080, and the display then offers the guest one mode, the window's size in pixels as
+//! its render thread last drew into it, its width rounded down to a multiple of 16 and its height
+//! to even, so each row of a guest surface of the mode's width starts and ends on a 64-byte line of
+//! the GPU's memory (`geometry::offered_mode`; a window of other pixels shows the guest's mode
+//! unscaled, beside up to 15 columns and a row of black), at the refresh rate of the host screen
+//! it opened on; when that size changes (the person resized the window) the device tells the guest
+//! (`DISPLAY_CHANGED`). The guest's scanout shows in the window at once and then again at each of
+//! the display's refreshes, at the screen's rate, while no presented surface shows in its place;
+//! the window draws it at the screen's pace. While a surface shows, a refresh draws nothing: the
+//! guest's presents draw it ([`Presented`]). The guest's cursor image is the host's cursor over
+//! the image, shown while the guest shows its cursor, at the host's pointer, which moves the
+//! guest's. The window takes each place the guest puts its cursor's hot spot (`MOVE_CURSOR`):
+//! where the guest moves its cursor with no pointer event of the window's just before (a mouse
+//! passed through to the guest with QEMU's `usb-host`, or a warp of the guest's own), the window
+//! draws the guest's cursor into its image there itself, and the host's cursor is invisible over
+//! the image (`reims_vgpu_window::handle`'s module doc; `sink`, "The guest's cursor").
 //!
 //! **Without a window** the display offers 1920 × 1080 at 60 Hz and shows nothing.
+//!
+//! **Several displays** ([`GraphicsConfig::display_count`], docs/graphics-kext/design.md,
+//! "Multiple displays"): each display has what display 0 has, its own window (display `i`'s on the
+//! window crate's port `i`, titled and placed as that port's), or none where display 0 has none,
+//! its own presented surface, colour, host's reads and host cursor, and its mode sized to its
+//! scanout room (`reims-vgpu-graphics`' `display::offered_in_room`). The presents of all of them
+//! share one queue, each display's in its own order ([`PresentQueue`]). A device of one display
+//! is what a device was before the count.
+//!
+//! **The host is told the guest's cursor**, with a window or without one, where it takes it
+//! ([`GraphicsCallbacks`]' `cursor_*`, [`HostCursor`]): its image, whether it shows and where the
+//! guest put its hot spot, on the display thread. QEMU's console draws it for QEMU's own displays.
 //!
 //! **The host reads what the display shows** ([`GraphicsDevice::read_display`], `read`): the
 //! window's draw, into a texture of the display's mode, read back once it has finished, with a
@@ -28,132 +47,214 @@
 //! Every public method runs as an entry ([`crate::entry`]).
 
 use std::borrow::Cow;
+use std::collections::HashMap;
 use std::marker::PhantomData;
-use std::os::fd::RawFd;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
 use parking_lot::lock_api::ArcRwLockReadGuard;
 use parking_lot::{RawRwLock, RwLock};
-use reims_graphics::ops::RgfxCommandBuffer;
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_graphics::ops::RgfxCommandBuffer;
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_ARGUMENT_LAYOUT, RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_COMMAND_BUFFER,
-    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE,
-    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION,
-    RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY,
-    RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT,
-    RGFX_CMD_SHARED_EVENT_NAME, RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT,
-    RGFX_DEVICE_INFO_OFFSET, RGFX_EVT_ICB_STATE, RGFX_EVT_SAMPLER_STATE, RGFX_FEATURE_CB_SUBMITTED,
-    RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR, RGFX_FEATURE_HEAP_OVER_PAGES,
-    RGFX_FEATURE_HOST_TIME, RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
+    RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
+    RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE, RGFX_CMD_HEAP_OVER_PAGES,
+    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS,
+    RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LIBRARY_LOOKUP, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_PIPELINE_ANSWERS, RGFX_CMD_RATE_MAP_CREATE,
+    RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RENDER_PIPELINE_CREATE,
+    RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_IMPORT, RGFX_CMD_SHARED_EVENT_NAME,
+    RGFX_CMD_SHARED_EVENT_UNNAME, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_DEVICE_INFO_OFFSET,
+    RGFX_DISPLAYS_MAX, RGFX_EVT_FUNCTION_POINTER_STATE, RGFX_EVT_ICB_STATE,
+    RGFX_EVT_RATE_MAP_ANSWER, RGFX_EVT_RATE_MAP_STATE, RGFX_EVT_SAMPLER_STATE,
+    RGFX_FEATURE_CB_SUBMITTED, RGFX_FEATURE_COMMIT_ORDER, RGFX_FEATURE_DISPLAY_COLOR,
+    RGFX_FEATURE_DISPLAY_POWER, RGFX_FEATURE_DISPLAY_SCALE, RGFX_FEATURE_DOORBELL_ASKS,
+    RGFX_FEATURE_DOORBELL_PAGES, RGFX_FEATURE_DYNAMIC_LIBRARIES, RGFX_FEATURE_FUNCTION_POINTERS,
+    RGFX_FEATURE_GUEST_TIMES, RGFX_FEATURE_HEAP_OVER_PAGES, RGFX_FEATURE_HOST_TIME,
+    RGFX_FEATURE_ICB_SLOTS, RGFX_FEATURE_ICB_SLOTS_IN_PAGES, RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS,
     RGFX_FEATURE_MANAGED_AT_OFFSET, RGFX_FEATURE_MANAGED_BUFFER_SLABS,
-    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_PAGES_BUFFERS,
-    RGFX_FEATURE_SHARED_EVENT_NAMES, RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM,
-    RGFX_FEATURE_SURFACE_CACHE, RGFX_FEATURE_SURFACE_DEFERRED, RGFX_FEATURE_SURFACE_ORDER,
-    RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK,
-    RGFX_RESOURCE_ID_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_FEATURE_MANAGED_TEXTURE_SLABS, RGFX_FEATURE_MESH_PIPELINES, RGFX_FEATURE_OPENCL_MODE,
+    RGFX_FEATURE_PAGES_16K, RGFX_FEATURE_PAGES_BUFFERS, RGFX_FEATURE_PIPELINE_ANSWERS,
+    RGFX_FEATURE_PIPELINE_KEYS, RGFX_FEATURE_PRIVATE_RENDER_STATE, RGFX_FEATURE_RATE_MAPS,
+    RGFX_FEATURE_READ_ONLY_PAGES, RGFX_FEATURE_SCHEDULED_ASK, RGFX_FEATURE_SHARED_EVENT_NAMES,
+    RGFX_FEATURE_SMALL_ID_CHUNKS, RGFX_FEATURE_SUBMIT_ROOM, RGFX_FEATURE_SURFACE_CACHE,
+    RGFX_FEATURE_SURFACE_CACHE_REFUSED, RGFX_FEATURE_SURFACE_DEFERRED,
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK, RGFX_FEATURE_SURFACE_DEFERRED_CARRY,
+    RGFX_FEATURE_SURFACE_ORDER, RGFX_FEATURE_SURFACE_PAGES, RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA,
+    RGFX_FEATURE_UNSHARED_QUEUES, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_CHUNKS,
+    RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
     RGFX_VIDEO_CAPS_CODECS, RGFX_VIDEO_CAPS_OFFSET, RGFX_VIDEO_CAPS_OUTPUT_CACHED,
     RGFX_VIDEO_CAPS_VERSION, RgfxBlockGrant, RgfxBlockRelease, RgfxBufferOverPages, RgfxCbComplete,
     RgfxCbScheduled, RgfxCbSubmitted, RgfxColorEntry, RgfxDisplayColor, RgfxEventSignalled,
-    RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader, RgfxPageRun, RgfxSamplerState,
-    RgfxSharedEventName, RgfxSurfacePages, RgfxVideoCaps,
+    RgfxFunctionPointerState, RgfxHeapOverPages, RgfxIcbState, RgfxLibraryLookup, RgfxMsgHeader,
+    RgfxPageRun, RgfxPipelineAnswersQuery, RgfxRateMapAnswer, RgfxRateMapState, RgfxSamplerState,
+    RgfxScheduledAsk, RgfxSharedEventName, RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxVideoCaps,
 };
-use reims_graphics::{
-    CompleteAnswer, CompletionPoster, CursorImage, Host, Mode, PresentAnswer, QueueClaim, Scanout,
-    Screen,
+use reims_vgpu_graphics::{
+    CompleteAnswer, CompletionPoster, CursorImage, DoorbellAt, Host, Mode, PresentAnswer,
+    QueueClaim, RawDoorbell, RingDegradation, Scanout, Screen,
 };
-use reims_vgpu_core::memory::map::MemoryMap as CoreMemoryMap;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::clock::Clock as _;
-use reims_vgpu_core::platform::resource::Texture;
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_window::{FrameSink, Window, WindowConfig};
+use reims_vgpu_vulkan::core::host::HostQueue;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+use reims_vgpu_vulkan::core::num::ToU64;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::os::clock::Clock as _;
+use reims_vgpu_vulkan::core::platform::resource::Texture;
+use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_window::{FrameSink, Window, WindowConfig, geometry};
 use zerocopy::{FromBytes, IntoBytes};
 
 use crate::DefaultPlatform;
-use crate::device::{GuestMemoryLease, MemoryMap};
-use crate::display::no_catch;
+use crate::cursor::{
+    CursorGlyph, CursorGlyphAtFn, CursorGlyphFn, CursorMoveAtFn, CursorMoveFn, CursorShowAtFn,
+    CursorShowFn,
+};
 use crate::entry;
+use crate::entry::no_catch;
 use crate::error::Error;
+use crate::graphics::answers::PipelineAnswers;
 use crate::graphics::color::{ColorChange, ColorStaging, DisplayColor};
 use crate::graphics::compile::{CompileKind, CompileOf, CompilePool, Pending};
 use crate::graphics::completion::cb_failed;
 use crate::graphics::decode::shares::ListenSink;
-use crate::graphics::decode::worker::{Unsettled, Worker};
+use crate::graphics::decode::worker::{Job, Settle, Unsettled, Worker};
 use crate::graphics::decode::{
-    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, LibraryJob,
+    Begun, CompletionSink, DecodeError, Decoders, DrainAnswer, GraphicsDecoder, Joined, LibraryJob,
     LibraryStart, MadeLibrary, PipelineJob, PipelineReply, ReflectionSink, ScheduledSink,
-    SignalSink, Sinks, SubmittedSink, SurfacePresent, compile_refusing, complete, make_library,
-    refused_reply, refusing,
+    SignalSink, Sinks, SubmittedSink, SurfacePresent, Then, compile_refusing, complete,
+    make_library, refused_reply, refusing,
 };
 use crate::graphics::device_info::device_info;
 use crate::graphics::present::{Drawing, PresentAnswers, PresentQueue};
 use crate::graphics::read::DisplayRead;
-use crate::platform::ApiPlatform;
+use crate::memory::{GuestMemoryLease, MemoryMap};
+use crate::platform::{ApiPlatform, api_state};
 use crate::window::WindowLink;
 
+mod answers;
 mod color;
 mod compile;
 mod completion;
 mod decode;
 mod device_info;
-#[cfg(test)]
-mod display_cost;
-#[cfg(target_os = "macos")]
-mod metal;
+mod mirror;
+#[cfg(target_os = "linux")]
+mod nvidia;
 mod present;
 mod read;
 mod sink;
-#[cfg(feature = "vulkan")]
+#[cfg(target_os = "linux")]
+mod vaapi;
+mod video_choice;
+mod video_host;
 mod vulkan;
 
-#[cfg(feature = "vulkan")]
-pub(crate) use vulkan::graphics_video as vulkan_graphics_video;
+pub(crate) use video_choice::graphics_video as vulkan_graphics_video;
 
-pub use decode::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+pub use decode::{GraphicsVideo, GraphicsVideoSession, PlanePages, VideoDecode, VideoPlane};
 
 /// Raises MSI-X vector `vector`: the device's interrupt.
 pub type GraphicsRaiseFn = Arc<dyn Fn(u32) + Send + Sync>;
-/// Whether the guest wrote any of the `length` bytes at `offset` in the region since the last
-/// ask: the host's dirty log over the scanout, taken and cleared.
-pub type ScanoutWrittenFn = Arc<dyn Fn(u64, u64) -> bool + Send + Sync>;
 
-/// A graphics device's callbacks. `scanout_written` is called on the device's refresh thread
-/// (`reims-vgpu.graphics-refresh`), and `raise_interrupt` on the thread that posts the event it
-/// raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
+/// `(route, ring_id, bell)`: with `Some(bell)`, routes a command queue's plain doorbell, a
+/// `DOORBELL` write of `ring_id`, into the file `bell` (an eventfd the queue's thread sleeps on)
+/// where the host takes such a write with no thread of its running it (QEMU: a KVM
+/// `ioeventfd`), as route number `route`, and answers whether it took it; with `None`, drops
+/// route `route` (of `ring_id`), whose queue ended, and its answer is not read: once the call
+/// returns no write reaches `bell`, as the ring may be a later queue's. A route of a `ring_id`
+/// another route holds replaces that one. The host takes a copy of `bell` and may take the
+/// route after the call; until then, and where it refuses it, the writes come through
+/// [`GraphicsDevice::mmio_write_taking`]. The device offers `RGFX_FEATURE_DOORBELL_ASKS` only
+/// where the host gives this function, on Linux, and routes only where the guest's driver took
+/// it, at most `reims_vgpu_graphics::device::MAX_DOORBELL_ROUTES` at once, and drops none at its
+/// end: those it holds then are the host's to drop. Called with no lock held that a function of
+/// the device's waits for: on one of ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) or the
+/// control thread (`reims-vgpu.graphics-control`) as a queue is made, destroyed or its process
+/// closed, where
+/// it may wait for a lock the host holds while it calls the device (QEMU's BQL); and with
+/// `None` also on the host's own inside a `STATUS` 0 write or [`GraphicsDevice::reset`], where
+/// it must not wait for a lock the host holds around that call.
+pub type GraphicsRouteDoorbellFn = Arc<dyn Fn(u64, u32, Option<RawDoorbell>) -> bool + Send + Sync>;
+
+/// `(route, page, ring_id, bell)`: [`GraphicsRouteDoorbellFn`], for a write of `ring_id` at the
+/// first byte of doorbell page `page` in BAR 4 (`page * RGFX_DOORBELL_PAGE_SIZE`) in place of
+/// `DOORBELL`: the route of a queue whose context has that page, which only a host that maps BAR 4
+/// ([`GraphicsConfig::doorbell_pages`]) is asked for. Until it takes the route, and where it
+/// refuses it, the writes come through [`GraphicsDevice::doorbell_write`]. A route of a `ring_id`
+/// at `page` another route holds replaces that one. Called as [`GraphicsRouteDoorbellFn`] is.
+pub type GraphicsRouteDoorbellPageFn =
+    Arc<dyn Fn(u64, u32, u32, Option<RawDoorbell>) -> bool + Send + Sync>;
+
+/// Whether the device offers `DOORBELL_ASKS`, on which it routes its queues' plain doorbells to
+/// the host ([`GraphicsCallbacks::route_doorbell`]): where the host gives the route function, on
+/// Linux, whose eventfds the queues' threads sleep on and KVM's `ioeventfd` writes. A host on
+/// macOS (QEMU under HVF or TCG, with no `ioeventfd` of the kernel's), and one with no route
+/// function, is not offered it: its guest rings every doorbell as before the bit, every write
+/// runs through [`GraphicsDevice::mmio_write_taking`], and nothing changes for the guest.
+fn offers_doorbell_asks(callbacks: &GraphicsCallbacks) -> bool {
+    cfg!(target_os = "linux") && callbacks.route_doorbell.is_some()
+}
+
+/// A graphics device's callbacks. `raise_interrupt` is called on the thread that posts the event
+/// it raises for: the device's control thread (`reims-vgpu.graphics-control`), one of ring 0's
 /// threads (`reims-vgpu.graphics-ring0-<i>`), which carry out a guest process's control messages,
-/// its presents and a block's pages and downloads, each on its lane, its refresh thread, a command
-/// queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
+/// its presents and a block's pages and downloads, each on its lane, a display's refresh thread, a
+/// command queue's service thread (`reims-vgpu.graphics-queue-<id>`) or one of its lane's threads
 /// (`reims-vgpu.graphics-lane-<id>`), a pipeline compile's thread
 /// (`reims-vgpu.graphics-compile-<n>`), the surface worker (`reims-vgpu.graphics-surfaces-<i>`),
 /// the indirect command buffers' worker (`reims-vgpu.icb-create-<i>`), the worker that lets go of
 /// a closed process's objects and answers its close (`reims-vgpu.graphics-closes-<i>`), or the
 /// platform's thread that runs a command buffer's scheduled or completed handler; or the host's
 /// own, inside [`GraphicsDevice::mmio_write_taking`].
-/// Each is called never inside another call of the host's into the device, and with no lock held
+/// It is called never inside another call of the host's into the device, and with no lock held
 /// that a function of the device's waits for, directly or through a thread of the library's, so
-/// they may call it at once. `scanout_written` runs with no lock of the library's held.
-/// `raise_interrupt` may run under these: a command queue's claim on its next message, on the
-/// queue's service thread and inside `mmio_write_taking`; there, at a command buffer's
+/// it may call it at once. It may run under these: a command queue's claim on its next message,
+/// on the queue's service thread and inside `mmio_write_taking`; there, at a command buffer's
 /// `CB_SUBMITTED` answered on the calling thread, the decoder's contexts' lock, the buffer's
 /// context's table read, its queue's answer slot and the reset gate read; the device caches'
 /// lock, with the download's answer slot, at a `SURFACE_DOWNLOAD` answered at once; a command
 /// buffer's `CB_SUBMITTED` latch, wherever that is posted; and the presents' queue, at a present
 /// answered at once with no window. No function of the device takes any of them, and
 /// `mmio_write_taking` only tries the claim and the decoder's locks.
+///
+/// The cursor's three run on the process's display thread (`reims-vgpu.display`, the
+/// `platform` module's), one at a time with every display callback of the process, in the order
+/// the device took the guest's cursor commands and resets (`HostCursor`): never inside a call of
+/// the host's, and the device never waits for them. The guest sees nothing of whether the host
+/// takes them. They are display 0's; the `_at` three are those of displays 1 and up, which name
+/// the display, called as they are, in order with them.
 #[derive(Clone, Default)]
 pub struct GraphicsCallbacks {
     /// Raises the device's interrupt. Without it the guest gets no interrupt.
     pub raise_interrupt: Option<GraphicsRaiseFn>,
-    /// The host's dirty log over the scanout, on the refresh thread. Without it the guest's
-    /// scanout is taken as written at every refresh.
-    pub scanout_written: Option<ScanoutWrittenFn>,
+    /// The guest set its cursor's image: its pixels as straight-alpha RGBA, which the guest
+    /// gave premultiplied BGRA (`reims-vgpu-graphics`' `display`), and its hot spot.
+    pub cursor_glyph: Option<CursorGlyphFn>,
+    /// Whether the cursor shows changed, hidden until the first call: 1 once the guest has an
+    /// image while it shows its cursor, 0 once it has none or hides it.
+    pub cursor_show: Option<CursorShowFn>,
+    /// The guest moved its cursor: [`GraphicsDevice::cursor_position`] reads where.
+    pub cursor_move: Option<CursorMoveFn>,
+    /// `cursor_glyph` of display 1 and up, `(display, glyph)`.
+    pub cursor_glyph_at: Option<CursorGlyphAtFn>,
+    /// `cursor_show` of display 1 and up, `(display, show)`.
+    pub cursor_show_at: Option<CursorShowAtFn>,
+    /// `cursor_move` of display 1 and up, `(display)`: [`GraphicsDevice::cursor_position_at`]
+    /// reads where.
+    pub cursor_move_at: Option<CursorMoveAtFn>,
+    /// Routes a command queue's plain doorbell into its bell, or drops the route. Without it every
+    /// doorbell write comes through [`GraphicsDevice::mmio_write_taking`].
+    pub route_doorbell: Option<GraphicsRouteDoorbellFn>,
+    /// Routes the plain doorbell of a command queue whose context has a doorbell page into its
+    /// bell, at the page, or drops the route. Without it such a queue is not routed, and its
+    /// writes come through [`GraphicsDevice::doorbell_write`].
+    pub route_doorbell_page: Option<GraphicsRouteDoorbellPageFn>,
 }
 
 /// A graphics device's config.
@@ -162,58 +263,152 @@ pub struct GraphicsConfig {
     /// Its callbacks.
     pub callbacks: GraphicsCallbacks,
     /// The display's window: its input callbacks and the mode it opens sized for; `None` is no
-    /// window. The window keeps its size whatever this says (the module doc).
+    /// window. The window keeps its size whatever this says (the module doc). Display 0's on a
+    /// device of several displays.
     pub window: Option<WindowConfig>,
+    /// How many displays the device has: 0 and 1 are one display, as a config made before the
+    /// field has; 2 to `RGFX_DISPLAYS_MAX` (4) make a device of that many, which offers the
+    /// guest `RGFX_FEATURE_MULTI_DISPLAY`. Any other count is [`Error::InvalidArgument`].
+    pub display_count: u32,
+    /// The windows of displays 1 to `display_count - 1`, given exactly where
+    /// [`Self::window`] is: `display_count - 1` of them with it, none without it; otherwise
+    /// [`Error::InvalidArgument`].
+    pub display_windows: Vec<WindowConfig>,
     /// The guest's RAM, with the files behind it, through which the GPU uses an IOSurface's own
-    /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB);
-    /// `None` keeps each surface's GPU view a copy of its pages in the region. The pages stay the
-    /// guest's RAM while the device lives: a host that discards guest RAM (a balloon, hot-unplug)
-    /// gives none.
+    /// pages in place (`RGFX_FEATURE_SURFACE_PAGES`, where the host's page is the guest's 4 KiB, or
+    /// 16 KiB for a guest that takes `RGFX_FEATURE_PAGES_16K`); `None` keeps each surface's GPU
+    /// view a copy of its pages in the region. On a GPU that shares the CPU's memory the device
+    /// answers `recommendedMaxWorkingSetSize` from the RAM the map holds (`device_info`'s
+    /// `lane_working_set`). The pages stay the guest's RAM while the device lives: a host that
+    /// discards guest RAM (a balloon, hot-unplug) gives none.
     pub memory_map: Option<MemoryMap>,
+    /// The guest's architecture, which the device's answer of `isFramebufferReadSupported` follows
+    /// (`device_info`'s `lane_flags`), and the class of Mac whose answers the platform's devices
+    /// give where a Mac's GPU decides them ([`GuestArch::mac_class`]).
+    pub guest_arch: GuestArch,
+    /// The host maps BAR 4, the doorbell pages (`RGFX_PCI_BAR_DOORBELLS`, 32-bit and not
+    /// prefetchable, `RGFX_DOORBELLS_SIZE` bytes), and hands each of its writes to
+    /// [`GraphicsDevice::doorbell_write`], reading 0 for every read: the device then offers
+    /// `RGFX_FEATURE_DOORBELL_PAGES`, on which the kext maps each process's own page, which it
+    /// rings its queues' doorbells on with no call into the kext.
+    pub doorbell_pages: bool,
+}
+
+/// The architecture of the macOS guest a graphics device serves ([`GraphicsConfig::guest_arch`]).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum GuestArch {
+    /// An x86-64 guest, whose frameworks were written against Intel and AMD Macs' GPUs.
+    #[default]
+    X86_64,
+    /// An arm64 guest, whose frameworks were written against Apple silicon's GPUs.
+    Arm64,
+}
+
+impl GuestArch {
+    /// The class of Mac this guest's frameworks were written against, which the Vulkan platform's
+    /// devices present to the runtime ([`ApiPlatform::present_guest`],
+    /// `reims_vgpu_vulkan::platform::present_mac_class`), whatever GPU the host has: a Mac with an
+    /// Intel or AMD GPU for an x86-64 guest, as every x86-64 Mac's GPU is (the x86 oracles, an AMD
+    /// Radeon Pro 5300M and an Intel UHD 630, read zero in a new `Private` texture), and an Apple
+    /// silicon Mac for an arm64 guest, as every arm64 Mac's GPU is Apple's (an Apple M3 Max reads
+    /// Metal's fixed pattern there). The runtime gives that Mac's answers where a Mac's GPU decides
+    /// them: a new `Private` texture's contents, a blit's encodings through a compressed texture, a
+    /// `half` NaN clear's sign, and a `Clear` load's reach past the render area of a pass without
+    /// a draw call.
+    pub fn mac_class(self) -> metal2vulkan_runtime::MacClass {
+        match self {
+            GuestArch::X86_64 => metal2vulkan_runtime::MacClass::IntelOrAmd,
+            GuestArch::Arm64 => metal2vulkan_runtime::MacClass::AppleSilicon,
+        }
+    }
 }
 
 /// The bytes of the host GPU's memory deferred blocks' device caches may hold, which
 /// `DEFERRED_BUDGET_LO` and `_HI` read, of a device offering `features` on a GPU whose own memory's
 /// budget is `own_memory` ([`GpuDevice::own_memory_budget`]): a quarter of it, as the wire gives
-/// it (`RGFX_REG_DEFERRED_BUDGET_LO`); 0 without `SURFACE_DEFERRED`.
+/// it (`RGFX_REG_DEFERRED_BUDGET_LO`), whether the GPU shares the CPU's memory or not; 0 without
+/// `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`.
 fn deferred_budget(features: u64, own_memory: u64) -> u64 {
-    if features & u64::from(RGFX_FEATURE_SURFACE_DEFERRED) == 0 {
+    let deferring =
+        u64::from(RGFX_FEATURE_SURFACE_DEFERRED) | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK);
+    if features & deferring == 0 {
         return 0;
     }
     own_memory / 4
 }
 
-/// The mode a display offers before its window has a size, and without a window.
+/// The mode a display offers before its window has a size, and without a window: no screen
+/// shows it, so it has no scale.
 const FALLBACK_MODE: Mode = Mode {
     width: 1920,
     height: 1080,
     refresh_mhz: 60_000,
+    scale_120ths: 0,
 };
+
+/// The displays `config` makes ([`GraphicsConfig::display_count`]): 0 and 1 are one;
+/// [`Error::InvalidArgument`] for a count past `RGFX_DISPLAYS_MAX`, or display windows that are
+/// not one for each display from 1 where display 0 has a window, and none where it has none.
+fn display_count(config: &GraphicsConfig) -> Result<usize, Error> {
+    let count = config.display_count.max(1);
+    if count > RGFX_DISPLAYS_MAX {
+        return Err(Error::InvalidArgument);
+    }
+    let count = count as usize;
+    let windows = if config.window.is_some() {
+        count - 1
+    } else {
+        0
+    };
+    if config.display_windows.len() != windows {
+        return Err(Error::InvalidArgument);
+    }
+    Ok(count)
+}
 
 /// The reims-graphics device.
 pub struct GraphicsDevice<P: ApiPlatform = DefaultPlatform> {
-    /// The window, which closes when the link drops: before the device.
-    window: Option<WindowLink>,
+    /// The displays' windows, display `i`'s at index `i`, none without them, which close when
+    /// their links drop: before the device.
+    windows: Vec<WindowLink>,
     /// The device.
-    device: reims_graphics::Device,
+    device: reims_vgpu_graphics::Device,
+    /// Each display's guest cursor as the host is told it, display `i`'s at index `i`.
+    cursors: Vec<Arc<HostCursor>>,
     /// The stage-3 decoder and the device handle it drives, shared with the device's [`Host`],
     /// which feeds it the control ring's stage-3 messages; held here for the tests' look at it.
     #[cfg(any(test, feature = "testkit"))]
     control: Arc<GraphicsControl<P>>,
-    /// What the window shows, where there is one: the tests draw it.
+    /// What display 0's window shows, where there is one: the tests draw it.
     #[cfg(test)]
     shown: Option<Arc<Shown>>,
-    /// The host's reads of what the display shows ([`GraphicsDevice::read_display`]).
-    read: DisplayRead<P>,
+    /// The host's reads of what each display shows ([`GraphicsDevice::read_display_at`]),
+    /// display `i`'s at index `i`.
+    reads: Vec<DisplayRead<P>>,
+    /// The stage-3 decoder's state while it lives: once the device ended, what holds the GPU
+    /// device until its threads, its objects and their GPU work let go ([`ENDING`]).
+    ending: Weak<GraphicsControl<P>>,
     /// The platform the decoder runs on.
     platform: PhantomData<fn() -> P>,
 }
+
+/// How many graphics devices live in the process, of every platform: made and not dropped
+/// ([`GraphicsDevice::let_go_of_gpu`]).
+static LIVE: AtomicUsize = AtomicUsize::new(0);
+
+/// The decoder states of the graphics devices that ended, while one lives
+/// ([`GraphicsDevice::let_go_of_gpu`]'s warning).
+static ENDING: Mutex<Vec<Weak<dyn std::any::Any + Send + Sync>>> = Mutex::new(Vec::new());
+
+/// How long the C API's release of the process's last graphics device waits for the device's
+/// threads, objects and GPU work to let go of the GPU device ([`GraphicsDevice::let_go_of_gpu`]).
+pub const LET_GO_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
 
 impl<P: ApiPlatform> std::fmt::Debug for GraphicsDevice<P> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GraphicsDevice")
             .field("device", &self.device)
-            .field("window", &self.window.is_some())
+            .field("windows", &self.windows.len())
             .finish()
     }
 }
@@ -227,16 +422,28 @@ impl GraphicsDevice<DefaultPlatform> {
 
 impl<P: ApiPlatform> GraphicsDevice<P> {
     /// A device whose window draws on `platform`. [`Error::HostResources`] where the host
-    /// refuses the region's memory, a pipe or a thread.
+    /// refuses the region's memory, a pipe or a thread, or has no GPU device the platform can use
+    /// (none, or one its driver refused).
     pub fn with_platform(platform: Arc<P>, config: GraphicsConfig) -> Result<Self, Error> {
         entry::run(|_| {
-            let size =
-                usize::try_from(reims_graphics::REGION_SIZE).map_err(|_| Error::HostResources)?;
-            let region = Arc::new(Region::new(size).ok_or(Error::HostResources)?);
+            let count = display_count(&config)?;
+            let size = usize::try_from(reims_vgpu_graphics::REGION_SIZE)
+                .map_err(|_| Error::HostResources)?;
+            let region = platform
+                .graphics_region(size)
+                .or_else(|| Region::new(size))
+                .ok_or(Error::HostResources)?;
+            let region = Arc::new(region);
             // The device the decoder drives, and its caps blob, which the guest bundle reads
-            // before it makes any queue. A host with no GPU device cannot run the lane.
+            // before it makes any queue. A host with no GPU device cannot run the lane. The
+            // platform learns the guest's architecture first, so the device gives the answers of
+            // the Macs the guest's frameworks were written against (`GuestArch::mac_class`).
+            // It learns the guest's texture ids too, which a platform whose device makes queues
+            // or textures of its own as it is made reserves there first.
+            platform.present_guest(config.guest_arch);
+            platform.present_guest_texture_ids(guest_texture_ids());
             let gpu_device = platform.metal_device(None).ok_or(Error::HostResources)?;
-            // Before anything else makes a queue or a texture on it.
+            // Before anything else of this device makes a queue or a texture on it.
             reserve_guest_texture_ids(platform.as_ref(), &gpu_device);
             let clock = Arc::clone(&platform);
             let pool = CompilePool::new(Box::new(move || clock.clock().now_mono()));
@@ -246,39 +453,74 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
             // answers `hasUnifiedMemory` alike, from the blob.
             let unified_memory = identity.flags.has_unified_memory.unwrap_or(false);
             let meshes = device_info::makes_mesh_pipelines(&identity);
-            let mut info = device_info(&gpu_device.caps(), identity, pool.threads().to_u64());
+            // The guest's RAM, as much of it as the host maps: the working set a GPU that shares
+            // the CPU's memory answers follows it (`device_info`'s `lane_working_set`).
+            let guest_ram = (config.memory_map.as_ref())
+                .map(|map| map.ranges().iter().map(|r| r.physical_length).sum::<u64>())
+                .filter(|&bytes| bytes > 0);
+            let mut info = device_info(
+                &gpu_device.caps(),
+                identity,
+                pool.threads().to_u64(),
+                config.guest_arch,
+                guest_ram,
+            );
             let mut decoder = GraphicsDecoder::new(Arc::clone(&platform), Arc::clone(&region));
             decoder.set_unified_memory(unified_memory);
             // The platform's lease on the guest's RAM, held by the views of the surfaces' pages
             // made through the map, so it outlives the last of them.
             if let Some(map) = &config.memory_map {
-                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map, None));
+                let lease: GuestMemoryLease = Arc::from(platform.guest_memory(map));
                 let memory = CoreMemoryMap::new(Arc::clone(&platform), &map.to_core())
                     .ok_or(Error::InvalidArgument)?;
                 decoder.set_guest_memory(memory, lease);
             }
             // A GPU of its own memory keeps IOSurfaces' device caches where the kext asks, and
-            // places its `Managed` buffers' CPU copies in the guest's heaps. Every host answers a
-            // command buffer's ask for its submission, orders command buffers of different queues
+            // places its `Managed` buffers' CPU copies in the guest's heaps; a GPU that shares the
+            // CPU's memory keeps them only for the surfaces whose pages its textures cannot use
+            // in place, which it answers the kext surface by surface (`SURFACE_CACHE_REFUSED`,
+            // `decode::surface_pages`). Every host answers a
+            // command buffer's ask for its submission, and a waiting thread's for its scheduling
+            // (`SCHEDULED_ASK`), orders command buffers of different queues
             // over the IOSurfaces they share where the guest names the order, commits a process's
             // command buffers across its queues in the order it names, makes a queue the
             // kext asks unshared (WindowServer's) on the platform's unshared queue, and tells a
             // guest producer waiting for room on a submission ring that the device took from it
-            // (the device carries SUBMIT_ROOM out). Both platforms make indirect command buffers,
-            // so every host decodes their messages, slots included. Every host reads a `Managed`
-            // texture's or buffer's CPU copy where its Shared buffer's contents lie, so the guest
-            // may lay the copies in its slabs. Every host takes the texture resource ids' grants
-            // in small chunks (`RESOURCE_ID_SMALL_CHUNK`). Every host lets the guest read the
-            // clock its VBLANKs are stamped on (the device answers HOST_TIME).
-            // A host that maps the guest's pages maps a process's own pages too, for its no-copy
-            // buffers (`BUFFER_OVER_PAGES`) and the heaps of its buffers' slabs
-            // (`HEAP_OVER_PAGES`). Every host carries the display pipe's colour out
-            // (`DISPLAY_COLOR`), its window drawing through it, and names the shared events one
-            // process hands another (`SHARED_EVENT_NAMES`). A host whose GPU answers Metal3
-            // makes mesh render pipelines and draws them (`MESH_PIPELINES`).
+            // (the device carries SUBMIT_ROOM out). The platform makes indirect command buffers on
+            // every host, so every host decodes their messages, slots included. Every host reads a
+            // `Managed` texture's or buffer's CPU copy where its Shared buffer's contents lie, so
+            // the guest may lay the copies in its slabs. Every host takes the texture resource ids'
+            // grants in small chunks (`RESOURCE_ID_SMALL_CHUNK`). Every host lets the guest read
+            // the clock its VBLANKs are stamped on (the device answers HOST_TIME). A host that maps
+            // the guest's pages maps a process's own pages too, for its no-copy buffers
+            // (`BUFFER_OVER_PAGES`), the heaps of its buffers' slabs (`HEAP_OVER_PAGES`) and its
+            // indirect command buffers' slots (`ICB_SLOTS_IN_PAGES`), and the pages it maps
+            // read-only, which it keeps every object over from writing (`READ_ONLY_PAGES`). Every
+            // host carries the display pipe's colour out (`DISPLAY_COLOR`), its window drawing
+            // through it, names the shared events one process hands another
+            // (`SHARED_EVENT_NAMES`), and tells the guest its window's screen's scale
+            // (`DISPLAY_SCALE`). A host whose GPU answers Metal3 makes mesh render pipelines
+            // and draws them (`MESH_PIPELINES`). A host whose device makes compute pipelines of
+            // OpenCL mode links an OpenCL kernel's function the bundle names so (`OPENCL_MODE`). A
+            // host whose device takes the private render state Apple's OpenGL renderer sets makes
+            // the guest's render pipelines with it (`PRIVATE_RENDER_STATE`). Every host carries a
+            // texture's `didModifyData` to its platform (`TEXTURE_DID_MODIFY_DATA`), shows black
+            // while the guest's display sleeps (`DISPLAY_POWER`), and makes the guest's
+            // rasterization rate maps on its platform (`RATE_MAPS`), of the layer counts the device
+            // info answers, and its compute pipeline states' function handles and visible function
+            // tables (`FUNCTION_POINTERS`). A host that routes queues' doorbells takes the doorbell
+            // of a buffer that asks for its `CB_SUBMITTED` apart from the rest (`DOORBELL_ASKS`;
+            // [`offers_doorbell_asks`]), so it may take the rest where it runs nothing of the
+            // device's. Every host takes the guest's stamps of its command buffers
+            // (`GUEST_TIMES`), a diagnostic of the time before it takes each. A host that maps
+            // BAR 4 has each process ring its queues on a doorbell page of its own
+            // (`DOORBELL_PAGES`). Every host hands the kext the answers it kept of keyed
+            // pipeline creates from earlier runs (`PIPELINE_ANSWERS`, `answers`).
             let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES)
                 | u64::from(RGFX_FEATURE_PAGES_BUFFERS)
-                | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES);
+                | u64::from(RGFX_FEATURE_HEAP_OVER_PAGES)
+                | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+                | RGFX_FEATURE_READ_ONLY_PAGES;
             let features = u64::from(RGFX_FEATURE_CB_SUBMITTED)
                 | u64::from(RGFX_FEATURE_SURFACE_ORDER)
                 | u64::from(RGFX_FEATURE_COMMIT_ORDER)
@@ -292,6 +534,36 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 | u64::from(RGFX_FEATURE_SMALL_ID_CHUNKS)
                 | u64::from(RGFX_FEATURE_DISPLAY_COLOR)
                 | u64::from(RGFX_FEATURE_SHARED_EVENT_NAMES)
+                | RGFX_FEATURE_SCHEDULED_ASK
+                | RGFX_FEATURE_DISPLAY_SCALE
+                | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+                | RGFX_FEATURE_DISPLAY_POWER
+                | RGFX_FEATURE_RATE_MAPS
+                | RGFX_FEATURE_FUNCTION_POINTERS
+                | RGFX_FEATURE_DYNAMIC_LIBRARIES
+                | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_PIPELINE_ANSWERS
+                | RGFX_FEATURE_GUEST_TIMES
+                | if offers_doorbell_asks(&config.callbacks) {
+                    RGFX_FEATURE_DOORBELL_ASKS
+                } else {
+                    0
+                }
+                | if config.doorbell_pages {
+                    RGFX_FEATURE_DOORBELL_PAGES
+                } else {
+                    0
+                }
+                | if gpu_device.makes_opencl_mode_pipelines() {
+                    u64::from(RGFX_FEATURE_OPENCL_MODE)
+                } else {
+                    0
+                }
+                | if gpu_device.takes_private_render_state() {
+                    u64::from(RGFX_FEATURE_PRIVATE_RENDER_STATE)
+                } else {
+                    0
+                }
                 | if meshes {
                     u64::from(RGFX_FEATURE_MESH_PIPELINES)
                 } else {
@@ -301,49 +573,87 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     0
                 } else {
                     u64::from(RGFX_FEATURE_MANAGED_AT_OFFSET)
-                }
-                | match (decoder.surface_pages_available(), unified_memory) {
-                    (false, _) => 0,
-                    (true, true) => in_place,
-                    // A host that keeps caches keeps fresh surfaces in them alone where the kext
-                    // defers their pages.
-                    (true, false) => {
-                        in_place
-                            | u64::from(RGFX_FEATURE_SURFACE_CACHE)
-                            | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
-                    }
                 };
-            let deferred_budget = deferred_budget(features, gpu_device.own_memory_budget());
+            let pages_features = match (decoder.surface_pages_available(), unified_memory) {
+                (false, _) => 0,
+                // A host whose GPU shares the CPU's memory keeps a device cache only of the
+                // surfaces whose pages its textures cannot use in place, where the kext asks,
+                // and keeps a fresh one of those in its cache alone where the kext defers it,
+                // asking, the few pages a process wrote of it without a lock carried in.
+                (true, true) => {
+                    in_place
+                        | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED)
+                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK)
+                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+                }
+                // A host that keeps caches keeps fresh surfaces in them alone where the kext
+                // defers their pages, the few a process wrote without a lock carried in.
+                (true, false) => {
+                    in_place
+                        | u64::from(RGFX_FEATURE_SURFACE_CACHE)
+                        | u64::from(RGFX_FEATURE_SURFACE_DEFERRED)
+                        | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+                }
+            };
+            // A host of 16 KiB pages offers the guest RAM's features only to a guest that takes
+            // `PAGES_16K`, whose runs are whole 16 KiB pages: the device reads them in
+            // `FEATURES_LO` and `_HI` once it is taken, and every other guest reads the features
+            // without them, as from a host with no guest RAM
+            // (`device::Host::features_with_16k_pages`).
+            let (features, features_16k) =
+                if pages_features != 0 && decoder.surface_pages_need_16k() {
+                    (features | RGFX_FEATURE_PAGES_16K, pages_features)
+                } else {
+                    (features | pages_features, 0)
+                };
+            // The decoder carries out each feature the device may offer; the device's registers
+            // read the budget only where it offers the deferred blocks.
+            let offerable = features | features_16k;
+            let deferred_budget = deferred_budget(offerable, gpu_device.own_memory_budget());
             decoder.set_deferred_budget(deferred_budget);
-            // The processes read the features from the device info, as no register is theirs.
+            if offerable & u64::from(RGFX_FEATURE_SURFACE_DEFERRED_ASK) != 0 {
+                decoder.set_deferred_asks();
+            }
+            if offerable & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0 {
+                decoder.set_deferred_carries();
+            }
+            // The processes read the features from the device info, as no register is theirs:
+            // those every guest reads, written before any takes `PAGES_16K`.
             info.features_lo = u8::try_from(features & 0xff).unwrap_or_default();
+            // A host that offers the surfaces' pages has the guest align their rows as its GPU's
+            // linear images take them in place, on any GPU: a texture over a surface lies over its
+            // pages, or over a device cache in the pages' layout, and the GPU's own linear image
+            // holds it there only at the GPU's pitch (on RADV exactly `round_up(row, 256)`). One
+            // that offers its pages only once a guest takes `PAGES_16K` leaves the guest's rows as
+            // they were, as the device info is written before it does.
+            if decoder.surface_pages_available() && features_16k == 0 {
+                info.linear_row_alignment =
+                    u32::try_from(gpu_device.linear_row_alignment()).unwrap_or_default();
+            }
             region.write(RGFX_DEVICE_INFO_OFFSET, info.as_bytes());
             // The host's hardware video, whose codecs the video caps after the device info list
             // for the guest's video driver.
-            if let Some(video) = platform.graphics_video(&gpu_device) {
-                // Pictures land in device caches only where the kext makes them.
-                let cached = features & u64::from(RGFX_FEATURE_SURFACE_CACHE) != 0
-                    && video.lands_in_device_caches();
-                let mut caps = RgfxVideoCaps {
-                    version: RGFX_VIDEO_CAPS_VERSION,
-                    flags: if cached {
-                        RGFX_VIDEO_CAPS_OUTPUT_CACHED
-                    } else {
-                        0
-                    },
-                    ..RgfxVideoCaps::default()
-                };
-                for (slot, codec) in caps.codecs.iter_mut().zip(video.caps()) {
-                    *slot = codec;
-                    caps.codec_count += 1;
-                }
+            let video_runtime = crate::video::runtime::PlatformRuntime::of(&platform);
+            if let Some(video) = platform.graphics_video(&gpu_device, video_runtime) {
+                let caps = video_caps(features, &*video);
+                let cached = caps.flags & RGFX_VIDEO_CAPS_OUTPUT_CACHED != 0;
                 debug_assert!(caps.codec_count as usize <= RGFX_VIDEO_CAPS_CODECS);
                 region.write(RGFX_VIDEO_CAPS_OFFSET, caps.as_bytes());
+                if cached && video.imports_device_caches() {
+                    decoder.set_exportable_caches();
+                } else if cached && video.decodes_into_device_caches() {
+                    decoder.set_dma_buf_caches();
+                }
                 decoder.set_video(video);
             }
-            let clock = Arc::clone(&platform);
-            let presented = Arc::new(Presented::new(Box::new(move || clock.clock().now_mono())));
-            let presents = Arc::new(PresentQueue::new(Arc::clone(&presented)));
+            // Each display's presented surface, display `i`'s at index `i`.
+            let presented: Vec<Arc<Presented<P>>> = (0..count)
+                .map(|_| {
+                    let clock = Arc::clone(&platform);
+                    Arc::new(Presented::new(Box::new(move || clock.clock().now_mono())))
+                })
+                .collect();
+            let presents = Arc::new(PresentQueue::new(presented.clone()));
             // A present that waits for its surface's fill is shown as the fill finishes.
             let waiting = Arc::downgrade(&presents);
             decoder.on_fill_done(Arc::new(move || {
@@ -351,14 +661,17 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                     presents.filled();
                 }
             }));
+            let answers = PipelineAnswers::open(gpu_device.pipeline_answers_identity().as_deref());
             let control = Arc::new(GraphicsControl {
                 decoders: decoder.decoders(),
                 device: gpu_device,
                 presents,
+                queue_sinks: RwLock::default(),
                 presented,
-                color: Mutex::default(),
+                colors: (0..count).map(|_| Mutex::default()).collect(),
                 pool,
                 pending: Pending::default(),
+                answers,
                 region: Arc::clone(&region),
                 icb_worker: Worker::new("reims-vgpu.icb-create"),
                 icbs: Arc::default(),
@@ -366,51 +679,85 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
                 reset_gate: Arc::default(),
                 inline_walk_max: AtomicUsize::new(INLINE_WALK_MAX),
             });
+            let cursors: Vec<Arc<HostCursor>> = (0..count)
+                .map(|display| {
+                    let (glyph, show, moved) = display_cursor(&config.callbacks, display);
+                    Arc::new(HostCursor::new(&platform, glyph, show, moved))
+                })
+                .collect();
             let host = Box::new(CallbackHost {
                 callbacks: config.callbacks,
                 features,
+                features_16k,
                 deferred_budget,
                 control: Arc::clone(&control),
             });
-            let (window, screen, shown): (Option<WindowLink>, Arc<dyn Screen>, Arc<Shown>) =
-                match config.window {
+            // Display 0's window, then those of displays 1 and up, or none.
+            let window_configs: Vec<Option<WindowConfig>> = match config.window {
+                Some(first) => std::iter::once(first)
+                    .chain(config.display_windows)
+                    .map(Some)
+                    .collect(),
+                None => (0..count).map(|_| None).collect(),
+            };
+            let displays = u32::try_from(count).unwrap_or(u32::MAX);
+            let mut windows = Vec::new();
+            let mut screens: Vec<Box<dyn Screen>> = Vec::with_capacity(count);
+            let mut reads = Vec::with_capacity(count);
+            let mut first_shown = None;
+            for (display, window_config) in window_configs.into_iter().enumerate() {
+                let (screen, shown): (Arc<dyn Screen>, Arc<Shown>) = match window_config {
                     Some(window_config) => {
                         let (link, screen) = WindowScreen::open(
                             &platform,
                             &region,
-                            &control.presented,
+                            &control.presented[display],
                             window_config,
+                            display.to_u64(),
                         );
+                        windows.push(link);
                         let shown = Arc::clone(&screen.shown);
-                        (Some(link), Arc::new(screen), shown)
+                        (Arc::new(screen), shown)
                     }
                     None => {
                         let shown = Arc::new(Shown::default());
                         let screen = HeadlessScreen {
                             shown: Arc::clone(&shown),
                         };
-                        (None, Arc::new(screen), shown)
+                        (Arc::new(screen), shown)
                     }
                 };
-            let read = DisplayRead::new(
-                &platform,
-                &region,
-                &shown,
-                &control.presented,
-                Arc::clone(&screen),
-            );
+                reads.push(DisplayRead::new(
+                    &platform,
+                    &region,
+                    &shown,
+                    &control.presented[display],
+                    Arc::clone(&screen),
+                    displays,
+                ));
+                first_shown.get_or_insert(shown);
+                screens.push(Box::new(SharedScreen {
+                    screen,
+                    cursor: Arc::clone(&cursors[display]),
+                }));
+            }
             #[cfg(test)]
-            let shown = window.is_some().then_some(shown);
-            let device = reims_graphics::Device::new(region, host, Box::new(SharedScreen(screen)))
+            let shown = first_shown.filter(|_| !windows.is_empty());
+            #[cfg(not(test))]
+            drop(first_shown);
+            let device = reims_vgpu_graphics::Device::with_screens(region, host, screens)
                 .ok_or(Error::HostResources)?;
+            LIVE.fetch_add(1, Ordering::SeqCst);
             Ok(GraphicsDevice {
-                window,
+                windows,
                 device,
+                cursors,
+                ending: Arc::downgrade(&control),
                 #[cfg(any(test, feature = "testkit"))]
                 control,
                 #[cfg(test)]
                 shown,
-                read,
+                reads,
                 platform: PhantomData,
             })
         })
@@ -454,6 +801,22 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         self.device.queue_count()
     }
 
+    /// By queue id, where the completion sink its command buffers are begun with lies
+    /// (`GraphicsControl::queue_sinks`): the tests check a queue's buffers share one.
+    #[cfg(test)]
+    pub(crate) fn queue_completion_sinks(&self) -> Vec<(u64, usize)> {
+        let sinks = self.control.queue_sinks.read();
+        let at = |sinks: &Sinks| {
+            sinks
+                .completion
+                .as_ref()
+                .map(|c| Arc::as_ptr(c).cast::<()>())
+        };
+        (sinks.iter())
+            .map(|(&queue, (_, s))| (queue, at(s).map_or(0, |p| p as usize)))
+            .collect()
+    }
+
     /// The region's size: BAR 2's, a power of two.
     pub fn region_size(&self) -> u64 {
         self.device.region_size()
@@ -469,7 +832,24 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
     /// on the GPU, and for no lock a callback of the device's may wait on; the guest sees
     /// nothing of it.
     pub fn read_display(&self, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
-        entry::run(|_| self.read.read(dst))
+        self.read_display_at(0, dst)
+    }
+
+    /// [`Self::read_display`] of display `display`, at its own mode, the one the guest is told
+    /// (sized to its scanout room on a device of several displays); display 0's is
+    /// `read_display`. [`Error::InvalidArgument`], with nothing written and a size of (0, 0),
+    /// for a display at or past the device's count.
+    pub fn read_display_at(&self, display: u32, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
+        entry::run(|_| match self.reads.get(display as usize) {
+            Some(read) => read.read(dst),
+            None => ((0, 0), Err(Error::InvalidArgument)),
+        })
+    }
+
+    /// How many displays the device has: 1 to `RGFX_DISPLAYS_MAX`
+    /// ([`GraphicsConfig::display_count`]).
+    pub fn display_count(&self) -> u32 {
+        u32::try_from(self.reads.len()).unwrap_or(u32::MAX)
     }
 
     /// A 32-bit read of BAR 0 at `offset`.
@@ -485,7 +865,7 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
 
     /// [`Self::mmio_write`], but a `DOORBELL` write of a command queue's ring may answer the
     /// queue's next command buffer on the calling thread, posting its `CB_SUBMITTED` there and
-    /// calling `raise_interrupt` inside this call (`reims-graphics`'s `Device::mmio_write_taking`),
+    /// calling `raise_interrupt` inside this call (`reims-vgpu-graphics`'s `Device::mmio_write_taking`),
     /// allocating nothing; the queue's thread then takes it as it takes any. A write of ring 0's
     /// may take and answer the control ring's next message there, where it is a
     /// `SURFACE_DOWNLOAD` whose pages hold the surface's device cache already
@@ -495,29 +875,108 @@ impl<P: ApiPlatform> GraphicsDevice<P> {
         entry::run(|_| self.device.mmio_write_taking(offset, value));
     }
 
-    /// Takes a copy of `fd`, the host's `ioeventfd` for `DOORBELL` with ring 0. False where `fd`
-    /// is not open or the device has one already.
-    pub fn set_doorbell(&self, fd: RawFd) -> bool {
-        entry::run(|_| self.device.set_doorbell(fd))
+    /// A 32-bit write of BAR 4, the doorbell pages, at `offset`, where the host maps it
+    /// ([`GraphicsConfig::doorbell_pages`]) and no route took it: a write of a ring's id at a
+    /// page's first byte is that `DOORBELL` write through [`Self::mmio_write_taking`] for a ring of
+    /// the context the page is bound to, and may answer its next command buffer and call
+    /// `raise_interrupt` inside this call; every other is dropped and counted
+    /// (`reims-vgpu-graphics`'s `Device::doorbell_write`). It waits for no lock but the queues'
+    /// table.
+    pub fn doorbell_write(&self, offset: u64, value: u32) {
+        entry::run(|_| self.device.doorbell_write(offset, value));
+    }
+
+    /// Takes a copy of `doorbell`, the host's `ioeventfd` for `DOORBELL` with ring 0: a file on
+    /// Linux and macOS, an event on Windows ([`RawDoorbell`]). False where `doorbell` is not open
+    /// or the device has one already.
+    pub fn set_doorbell(&self, doorbell: RawDoorbell) -> bool {
+        entry::run(|_| self.device.set_doorbell(doorbell))
     }
 
     /// The host's reset of the device (the guest's bus reset).
     pub fn reset(&self) {
         entry::run(|_| self.device.reset());
     }
-}
 
-impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
-    /// The window closes, then the device ends; neither waits (`reims-graphics`'s `device`).
-    fn drop(&mut self) {
+    /// Where the guest last put its cursor's hot spot, in the display's pixels, each axis kept
+    /// to 0 to 65535: (0, 0) before it moved it and after a reset. The host reads it at its
+    /// `cursor_move` ([`GraphicsCallbacks`]).
+    pub fn cursor_position(&self) -> (u16, u16) {
+        self.cursor_position_at(0)
+    }
+
+    /// [`Self::cursor_position`] of display `display`, in its pixels, which the host reads at its
+    /// `cursor_move_at` ([`GraphicsCallbacks`]); display 0's is `cursor_position`. (0, 0) for a
+    /// display at or past the device's count.
+    pub fn cursor_position_at(&self, display: u32) -> (u16, u16) {
         entry::run(|_| {
-            drop(self.window.take());
-        });
+            (self.cursors.get(display as usize)).map_or((0, 0), |cursor| cursor.position())
+        })
     }
 }
 
+impl<P: ApiPlatform> Drop for GraphicsDevice<P> {
+    /// The windows close, display 0's first, then the device ends; neither waits
+    /// (`reims-vgpu-graphics`'s `device`). The device no longer counts among those alive
+    /// ([`GraphicsDevice::let_go_of_gpu`]).
+    fn drop(&mut self) {
+        entry::run(|_| {
+            drop(std::mem::take(&mut self.windows));
+        });
+        let ending: Weak<dyn std::any::Any + Send + Sync> = self.ending.clone();
+        let mut ended = ENDING.lock();
+        ended.retain(|state| state.strong_count() > 0);
+        ended.push(ending);
+        drop(ended);
+        LIVE.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+impl<P: ApiPlatform> GraphicsDevice<P> {
+    /// Where no graphics device lives in the process, lets go of the GPU devices the platform
+    /// keeps for it ([`ApiPlatform::let_go_of_devices`]): what the C API's release of the last
+    /// one does, with [`LET_GO_BOUND`], so that no runtime device is live as the process exits
+    /// (on NVIDIA's driver an exit with one live can end in `SIGSEGV` inside the driver's exit
+    /// handler, `reims_vgpu_vulkan::let_go`). It waits, at most `bound`, for the ended devices'
+    /// threads, their objects and their GPU work to let go of the GPU devices; a device callback
+    /// still running holds them up, one blocked on a lock the caller holds until the bound. Past
+    /// the bound it lets go of nothing, says what still held them in a warning, and answers it as
+    /// `Err`. `Ok(false)` where a graphics device lives, letting go of nothing; `Ok(true)` once
+    /// let go of. A device made after it runs on a new GPU device of the platform's.
+    pub fn let_go_of_gpu(bound: std::time::Duration) -> Result<bool, String> {
+        if LIVE.load(Ordering::SeqCst) != 0 {
+            return Ok(false);
+        }
+        entry::run(|_| {
+            let let_go = P::process().let_go_of_devices(bound);
+            let_go.map(|()| true).map_err(|held| held_up(bound, &held))
+        })
+    }
+}
+
+/// The warning of a let-go that waited out its `bound` ([`GraphicsDevice::let_go_of_gpu`]), `held`
+/// the platform's account of the devices still held: it names the ended graphics devices whose
+/// decoder still lives, too. Logged, and answered.
+fn held_up(bound: std::time::Duration, held: &str) -> String {
+    let ending = (ENDING.lock().iter())
+        .filter(|state| state.strong_count() > 0)
+        .count();
+    let decoders = match ending {
+        0 => String::new(),
+        n => format!(
+            "the decoder of {n} ended graphics devices still lives (its threads, a callback \
+             among them, its objects or their GPU work), and "
+        ),
+    };
+    let line = format!(
+        "the GPU device stays for the process: after {bound:?}, {decoders}{held} still held it"
+    );
+    log::warn!("{line}");
+    line
+}
+
 /// The stage-3 decoder and the device handle it drives, shared by the device's [`Host`], which
-/// feeds it ring 0's object lifecycle on each context's lane (`reims-graphics`' device) and the
+/// feeds it ring 0's object lifecycle on each context's lane (`reims-vgpu-graphics`' device) and the
 /// command queues' own rings' messages on their service threads. Each message is carried out on a
 /// decoder of its own over the shared state ([`Decoders::sender`]), whose locks are each held for a
 /// short section (`decode`'s module doc): no thread holds one across a command buffer's walk, so a
@@ -529,17 +988,27 @@ struct GraphicsControl<P: ApiPlatform> {
     decoders: Decoders<P>,
     /// The GPU device it drives.
     device: P::Device,
-    /// The surface the display pipe shows, shared with the window's sink.
-    presented: Arc<Presented<P>>,
+    /// The surface each display's pipe shows, shared with its window's sink, display `i`'s at
+    /// index `i`.
+    presented: Vec<Arc<Presented<P>>>,
     /// The presents waiting for the command buffers that write their surfaces.
     presents: Arc<PresentQueue<P>>,
-    /// The display colour's `DISPLAY_COLOR` parts staged since the last present, which the next
-    /// one takes (`color`): on the presents' lane, in ring order with the presents.
-    color: Mutex<ColorStaging>,
+    /// By queue id: the sinks a command queue's buffers are begun with, and the poster they were
+    /// made for ([`Self::queue_sinks`]). An entry goes with its queue's destroy, its context's
+    /// close or the device's reset.
+    queue_sinks: RwLock<HashMap<u64, (CompletionPoster, Sinks)>>,
+    /// Each display colour's `DISPLAY_COLOR` parts staged since the display's last present, which
+    /// its next one takes (`color`): on the presents' lane, in ring order with the presents.
+    /// Display `i`'s at index `i`.
+    colors: Vec<Mutex<ColorStaging>>,
     /// The threads ring 0's pipeline and library creates compile on (`compile`, `make`).
     pool: CompilePool,
     /// The pipelines being compiled, which a command buffer naming one waits for.
     pending: Pending,
+    /// The answers it gave keyed pipeline creates, kept from one run of the host to the next
+    /// (`answers`): learnt as each compile ends ([`Self::compile`]), handed to the kext on
+    /// `PIPELINE_ANSWERS` ([`Self::pipeline_answers`]).
+    answers: PipelineAnswers,
     /// The device's region, where an `ICB_SLOTS` names the slots whose pipelines it waits for.
     region: Arc<Region>,
     /// The thread ring 0's `ICB_CREATE`s are made on, in the order their lanes hand them over, off
@@ -550,9 +1019,9 @@ struct GraphicsControl<P: ApiPlatform> {
     /// The indirect command buffers whose create was handed to [`Self::icb_worker`] and is not
     /// yet answered, by object id.
     icbs: Arc<Unsettled>,
-    /// The no-copy buffers whose `BUFFER_OVER_PAGES` was handed to the surface worker and is not
-    /// yet made ([`Self::start_buffer_over_pages`]): by their context ([`pages_context`]), and by
-    /// their pages block's offset.
+    /// The no-copy buffers and heaps whose `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` was handed to
+    /// the surface worker and is not yet made ([`Self::start_over_pages`]): by their context
+    /// ([`pages_context`]), and by their pages block's offset.
     pages_buffers: Arc<Unsettled>,
     /// What the device's reset waits for ([`Self::reset`]): held shared by each message carried
     /// out off ring 0's threads, a queue's command buffer, create or destroy, from before it
@@ -618,15 +1087,23 @@ pub(crate) enum Shows<P: Platform> {
 
 /// The IOSurface the display pipe shows in place of the scanout (`PRESENT_SURFACE`): the texture
 /// the decoder made over it, which the window's sink draws into the next drawable (`sink`), and
-/// the presents' answers, given at the first refresh of the device's display after that draw has
-/// finished ([`PresentAnswers`]). The window draws a present when it is made, and again where the
+/// the presents' answers, given at the first refresh of the device's display after their show,
+/// once no draw of the window still running may read the surface of a present before them
+/// ([`PresentAnswers`]). The window draws a present when it is made, and again where the
 /// window needs a frame (a new layout, the cursor): each present is the guest's own, and none is
 /// batched or repeated by the GPU's work. The texture's block is held until the next present, the
 /// device's reset or the device's end, and each draw of it until it has finished
-/// ([`DisplayHold`]).
+/// ([`DisplayHold`]); the texture itself is let go of at the device's refresh after the next
+/// present, or at its reset (`retired`).
 pub(crate) struct Presented<P: Platform> {
     /// The texture shown; `None` shows the scanout.
     pub(crate) texture: Mutex<Option<ShownTexture<P>>>,
+    /// The textures the display showed before, by their surface's id, let go of at the device's
+    /// next refresh ([`Self::refreshed`]) or its reset: a present is shown on the platform's
+    /// thread that runs its writer's completion handlers, which waits for nothing, and the release
+    /// of a texture's last hold is the platform's work, which may wait (a driver that frees an
+    /// import of the guest's pages).
+    retired: Mutex<Vec<(u32, P::Texture)>>,
     /// The holds made and not yet gone, for a release to find those of its block.
     holds: Mutex<Vec<Weak<DisplayHold>>>,
     /// The surface's IOSurface ID, 0 for none.
@@ -649,7 +1126,7 @@ pub(crate) struct Presented<P: Platform> {
 impl<P: Platform> Default for Presented<P> {
     fn default() -> Self {
         Presented::new(Box::new(
-            reims_vgpu_core::platform::os::clock::MonoTime::default,
+            reims_vgpu_vulkan::core::platform::os::clock::MonoTime::default,
         ))
     }
 }
@@ -660,6 +1137,7 @@ impl<P: Platform> Presented<P> {
     fn new(now: compile::Now) -> Self {
         Presented {
             texture: Mutex::new(None),
+            retired: Mutex::default(),
             holds: Mutex::default(),
             surface_id: AtomicU32::new(0),
             window: OnceLock::new(),
@@ -763,28 +1241,49 @@ impl<P: Platform> Presented<P> {
     }
 
     /// The display shows `texture` (the surface `id`'s), or the scanout for `None`: the hold of
-    /// the texture shown before, for [`Self::show`]'s caller.
+    /// the texture shown before, for [`Self::show`]'s caller. That texture is retired, let go of
+    /// at the next refresh (`retired`).
     fn swap(&self, id: u32, texture: Option<ShownTexture<P>>) -> Option<Arc<DisplayHold>> {
         let previous = self.surface_id.swap(id, Ordering::AcqRel);
-        if previous != id {
+        // A guest that draws into a few IOSurfaces in turn (WindowServer's three) changes the
+        // surface shown at every present, so each change is a debug line of its own target, which
+        // a run that counts the display's flips names (`reims_vgpu::graphics::shown=debug`); only
+        // a change between the scanout and a surface is an info line too.
+        if previous != id && (previous == 0 || id == 0) {
             log::info!(
                 target: "reims_vgpu::graphics",
                 "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
             );
-        }
-        // The texture shown before may be the last hold of a closed context's: let go of in a
-        // refusal scope, so a release the platform dies at is refused, logged, and the present
-        // goes on.
-        let shown = std::mem::replace(&mut *self.texture.lock(), texture);
-        let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
-        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
-            log::warn!(
-                target: "reims_vgpu::graphics",
-                "the texture of IOSurface {previous} was let go of, and its release was refused: \
-                 {refusal}"
+        } else if previous != id {
+            log::debug!(
+                target: "reims_vgpu::graphics::shown",
+                "the display shows IOSurface {id} (was {previous}; 0 is the scanout)"
             );
         }
+        let shown = std::mem::replace(&mut *self.texture.lock(), texture);
+        let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
+        if let Some(shown) = shown {
+            self.retired.lock().push((previous, shown));
+        }
         hold
+    }
+
+    /// Lets go of the textures the display showed before (`retired`), each in a refusal scope:
+    /// one may be the last hold of a closed context's, so a release the platform dies at is
+    /// refused, logged, and the display goes on. `at` names the event, for the log line.
+    fn let_go_of_retired(&self, at: &str) {
+        let retired = std::mem::take(&mut *self.retired.lock());
+        for (id, texture) in retired {
+            if let Err(refusal) =
+                reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(texture))
+            {
+                log::warn!(
+                    target: "reims_vgpu::graphics", kind:% = refusal;
+                    "the texture of IOSurface {id} was let go of at {at}, and its release was \
+                     refused: {refusal}"
+                );
+            }
+        }
     }
 
     /// The display's colour, and the count of its changes, which names it.
@@ -794,7 +1293,8 @@ impl<P: Platform> Presented<P> {
     }
 
     /// The device's reset: the display shows the scanout, which the reset keeps, in place of any
-    /// surface, whose texture is let go of in a refusal scope, with every colour stage off; the
+    /// surface, whose texture is let go of in a refusal scope, as are those retired before it
+    /// (`retired`), with every colour stage off; the
     /// answers still owed are given as they come, and dropped, as each is of a present taken
     /// before the reset. The scanout is the guest's own pixels, still in the region, but the
     /// colour is what the transactions of a display pipe the reset ended set: kept, a reset in the
@@ -805,12 +1305,15 @@ impl<P: Platform> Presented<P> {
             let mut color = self.color.lock();
             *color = (color.0.wrapping_add(1), Arc::default());
         }
+        self.let_go_of_retired("the device's reset");
         let previous = self.surface_id.swap(0, Ordering::AcqRel);
         let shown = self.texture.lock().take();
         let (shown, hold) = shown.map(|s| (s.texture, s.hold)).unzip();
-        if let Err(refusal) = reims_vgpu_core::raise::refusals::refusing(move || drop(shown)) {
+        if let Err(refusal) =
+            reims_vgpu_vulkan::core::raise::refusals::refusing(move || drop(shown))
+        {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the texture of IOSurface {previous} was let go of at the device's reset, and its \
                  release was refused: {refusal}"
             );
@@ -821,8 +1324,8 @@ impl<P: Platform> Presented<P> {
         }
     }
 
-    /// The window draws the latest present: the presents shown so far, answered once the draw has
-    /// finished, or once it is dropped undone ([`DrawnPresents`]).
+    /// The window draws the latest present: the presents shown after it are answered once the
+    /// draw has finished, or once it is dropped undone ([`DrawnPresents`]).
     pub(crate) fn drawn(self: &Arc<Self>) -> DrawnPresents<P> {
         DrawnPresents {
             presented: Arc::clone(self),
@@ -831,15 +1334,22 @@ impl<P: Platform> Presented<P> {
         }
     }
 
+    /// Whether the display shows a presented surface's texture in place of the scanout.
+    fn shows_surface(&self) -> bool {
+        self.texture.lock().is_some()
+    }
+
     /// The texture shown, and the hold of its block, for a window draw of it; `None` for the
     /// scanout.
     pub(crate) fn shown(&self) -> Option<(P::Texture, Arc<DisplayHold>)> {
         (self.texture.lock().as_ref()).map(|s| (Handle::clone_ref(&s.texture), Arc::clone(&s.hold)))
     }
 
-    /// A refresh of the device's display: the presents it now shows are answered.
+    /// A refresh of the device's display, on its refresh thread: the presents it now shows are
+    /// answered, then the textures it showed before them are let go of (`retired`).
     fn refreshed(&self) {
         self.answers.refreshed();
+        self.let_go_of_retired("a refresh");
     }
 
     /// The sink draws a surface of pixel format `surface` into a drawable of `drawable`: logged
@@ -869,14 +1379,14 @@ impl<P: Platform> Presented<P> {
     }
 }
 
-/// The presents a window's draw shows: answered at the refresh after the draw has finished on the
-/// GPU ([`DrawnPresents::after`]), or after the draw is dropped before its commit, once every
-/// present shown before them is ([`PresentAnswers::refreshed`]); and the hold of the block of the
-/// surface it draws, let go of then too.
+/// What a window's draw holds of the presents until it has finished on the GPU
+/// ([`DrawnPresents::after`]), or is dropped before its commit: the answers of the presents shown
+/// after the latest one when it began, whose surface it may read ([`PresentAnswers::drawn`]),
+/// and the hold of the block of the surface it draws, let go of then too.
 pub(crate) struct DrawnPresents<P: Platform> {
     /// Where they are answered.
     presented: Arc<Presented<P>>,
-    /// The presents the draw took.
+    /// The presents the draw took, and the answers it holds.
     drawing: Drawing,
     /// The hold of the block of the surface the draw reads, where it reads one.
     hold: Option<Arc<DisplayHold>>,
@@ -888,9 +1398,9 @@ impl<P: Platform> DrawnPresents<P> {
         self.hold = Some(hold);
     }
 
-    /// The presents are answered, and the surface's block let go of, after `command_buffer`, the
+    /// The answers it holds, and the surface's block, are let go of after `command_buffer`, the
     /// draw, has finished: its completed handler holds them. Called before its commit; where the
-    /// handler is refused, or the buffer is never committed, they are answered as if it had
+    /// handler is refused, or the buffer is never committed, they are let go of as if it had
     /// finished.
     pub(crate) fn after(self, command_buffer: &P::CommandBuffer) {
         if self.drawing.is_empty() && self.hold.is_none() {
@@ -936,7 +1446,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// committed has finished: the kext then gives the context's blocks, texture resource ids and
     /// GPU addresses out again.
     fn close_context(&self, context: u32, answer: CompleteAnswer) {
-        // After its no-copy buffers being made, so none lands in the table its close empties.
+        // Its groups of views being formed make nothing (`decode::surface_pages`, "Group
+        // dma-bufs"); then after its no-copy buffers being made, so none lands in the table its
+        // close empties.
+        self.decoder().drop_groups(context);
         self.pages_buffers.wait(pages_context(context));
         entry::run(|_| {
             let decoder = self.decoder();
@@ -945,6 +1458,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             let (dropped, closed) = decoder.close_tables(&self.device, context);
             self.pool.context_closed(context);
             self.presents.context_gone(context);
+            self.queue_sinks
+                .write()
+                .retain(|&queue, _| decode::context_of(queue) != context);
             let drain = decoder.drain_context(
                 context,
                 true,
@@ -981,16 +1497,24 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     self.pool.context_closed(context);
                 }
                 self.presents.reset();
-                self.color.lock().reset();
+                self.queue_sinks.write().clear();
+                for color in &self.colors {
+                    color.lock().reset();
+                }
                 self.decoders.reset_done();
                 (contexts, dropped)
             };
-            self.presented.reset();
+            for presented in &self.presented {
+                presented.reset();
+            }
             log::info!(
                 target: "reims_vgpu::graphics",
                 "the device was reset: {dropped} objects of {} contexts dropped",
                 contexts.len()
             );
+            // What the boot before the reset degraded, and the lines it repeated
+            // (docs/conventions.md).
+            reims_vgpu_vulkan::answer::write_counts();
         });
     }
 
@@ -1015,11 +1539,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             answer.answer(RGFX_STATUS_REFUSED);
             return;
         }
-        let answer = self.presented.after_shown(
-            release.offset,
-            release.size,
-            Box::new(move || answer.answer(RGFX_STATUS_OK)),
-        );
+        // Once no display shows or draws a surface over the block.
+        let answer: DrainAnswer = Box::new(move || answer.answer(RGFX_STATUS_OK));
+        let answer = (self.presented.iter()).fold(answer, |answer, presented| {
+            presented.after_shown(release.offset, release.size, answer)
+        });
         let answer = decoder.after_unshares(release.offset, answer);
         let drain = decoder.drain_context(release.context, false, answer);
         // No buffer lies over the block's surface view any more: it goes with the block, and its
@@ -1036,7 +1560,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 Box::new(move || drop(held)),
                 Box::new(move |raise| {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "the block at {offset:#x}: the platform raised at its device cache's \
                          write back ({raise:?})"
                     );
@@ -1067,6 +1591,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         pages: RgfxSurfacePages,
         runs: Vec<RgfxPageRun>,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
         // After the no-copy buffers being made over the block it describes again, which see it as
@@ -1079,7 +1604,8 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let job = move |settle| {
             let status = {
                 let _carried = me.reset_gate.read_recursive();
-                (me.decoder()).carry_out_surface_pages(&me.device, &pages, &runs, flags, &settle)
+                (me.decoder())
+                    .carry_out_surface_pages(&me.device, &pages, &runs, flags, layout, &settle)
             };
             // Nothing is owed where the device was reset since.
             if let Some(status) = status {
@@ -1167,13 +1693,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     ) {
         let message: &[u8] = &bytes;
         let r#type = RgfxMsgHeader::read_from_prefix(message).map_or(0, |(h, _)| h.r#type);
-        if r#type == RGFX_CMD_BUFFER_OVER_PAGES && self.start_buffer_over_pages(poster, message) {
+        if (r#type == RGFX_CMD_BUFFER_OVER_PAGES || r#type == RGFX_CMD_HEAP_OVER_PAGES)
+            && self.start_over_pages(poster, message)
+        {
             return;
         }
         // A message of a context whose no-copy buffer is being made on the surface worker, which
         // it may name, is carried out after it.
-        self.pages_buffers
-            .wait(pages_context(sender_context(poster, message)));
+        self.wait_for_pages_buffers(poster, message);
         match r#type {
             RGFX_CMD_RENDER_PIPELINE_CREATE
             | RGFX_CMD_MESH_RENDER_PIPELINE_CREATE
@@ -1195,6 +1722,26 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             RGFX_CMD_ARGUMENT_LAYOUT => {
                 self.argument_layout(poster, message);
+                return;
+            }
+            RGFX_CMD_PIPELINE_ANSWERS => {
+                self.pipeline_answers(poster, message);
+                return;
+            }
+            RGFX_CMD_RATE_MAP_CREATE | RGFX_CMD_RATE_MAP_RESET => {
+                self.rate_map_state(poster, message);
+                return;
+            }
+            RGFX_CMD_RATE_MAP_QUERY => {
+                self.rate_map_query(poster, message);
+                return;
+            }
+            RGFX_CMD_FUNCTION_HANDLE_CREATE | RGFX_CMD_FUNCTION_TABLE_CREATE => {
+                self.function_pointer_state(poster, message);
+                return;
+            }
+            RGFX_CMD_DYNAMIC_LIBRARY_CREATE => {
+                self.dynamic_library_create(poster, message);
                 return;
             }
             RGFX_CMD_SAMPLER_CREATE => {
@@ -1220,6 +1767,17 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             }
             RGFX_CMD_ICB_WRITE => self.pending.wait_for_icb_write(message),
             RGFX_CMD_ICB_SLOTS => self.pending.wait_for_icb_slots(&self.region, message),
+            // Its slots lie in pages blocks, which the sender's decoder finds, as it would carry
+            // the message out.
+            RGFX_CMD_ICB_SLOTS_IN_PAGES => self.pending.wait_for_named(|| {
+                let _carried = self.reset_gate.read();
+                if poster.stale() {
+                    return Vec::new();
+                }
+                (self.decoders)
+                    .sender(Some(sender_context(poster, message)), Sinks::default())
+                    .icb_slots_in_pages_pipelines(&self.device, message)
+            }),
             // The destroy of an indirect command buffer still being made (the kext destroys
             // behind a create it stopped waiting for, after a minute, or one made for a context
             // that had closed) waits for its create, so it and everything after it keep their
@@ -1241,15 +1799,20 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 if r#type == RGFX_CMD_OBJECT_DESTROY {
                     let (_, _, obj_id) = message_identity(message);
                     self.pending.cancel(obj_id);
-                    // A queue's destroy: nothing more of it finishes for a present to wait for.
+                    // A queue's destroy: nothing more of it finishes for a present to wait for,
+                    // and no more of its buffers is begun.
                     self.presents.queue_gone(obj_id);
+                    self.queue_sinks.write().remove(&obj_id);
                 }
                 let foreign = foreign_queue(poster, message);
                 // An ICB_WRITE's records and an ICB_SLOTS's slots run on the control ring, ahead
                 // of the process's later command buffers: how long they take is logged
                 // (diagnostics).
-                let icb_start = (r#type == RGFX_CMD_ICB_WRITE || r#type == RGFX_CMD_ICB_SLOTS)
-                    .then(|| self.pool.now());
+                let icb_start = matches!(
+                    r#type,
+                    RGFX_CMD_ICB_WRITE | RGFX_CMD_ICB_SLOTS | RGFX_CMD_ICB_SLOTS_IN_PAGES
+                )
+                .then(|| self.pool.now());
                 let outcome = if foreign {
                     Ok(Err(DecodeError::BadReference))
                 } else {
@@ -1259,7 +1822,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                     log::debug!(
                         target: "reims_vgpu::graphics::icb",
                         "{} of {} bytes applied in {} us",
-                        if r#type == RGFX_CMD_ICB_SLOTS { "ICB_SLOTS" } else { "ICB_WRITE" },
+                        match r#type {
+                            RGFX_CMD_ICB_SLOTS => "ICB_SLOTS",
+                            RGFX_CMD_ICB_SLOTS_IN_PAGES => "ICB_SLOTS_IN_PAGES",
+                            _ => "ICB_WRITE",
+                        },
                         message.len(),
                         self.pool.now().saturating_duration_since(start).as_micros()
                     );
@@ -1293,16 +1860,23 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let queue_poster = poster.clone();
         let presents = Arc::clone(&self.presents);
         let queue = poster.queue_obj_id();
-        let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete| {
-            queue_poster.post(record.as_bytes());
-            // A present waiting for the buffer is shown once its completion is posted.
-            if let Some(queue) = queue {
-                presents.finished(queue, record.header.seqno, &queue_poster);
-            }
+        // Each posted waiting for nothing, on whichever thread finds the buffer complete
+        // (`CompletionPoster::post_unwaiting`).
+        let completion: CompletionSink = Arc::new(move |record: RgfxCbComplete, then: Then| {
+            let seqno = record.header.seqno;
+            let (presents, poster) = (Arc::clone(&presents), queue_poster.clone());
+            let then: Then = Box::new(move || {
+                // A present waiting for the buffer is shown once its completion is posted.
+                if let Some(queue) = queue {
+                    presents.finished(queue, seqno, &poster);
+                }
+                then();
+            });
+            queue_poster.post_unwaiting(record.as_bytes(), Some(then));
         });
         let signal_poster = poster.clone();
-        let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled| {
-            signal_poster.post(record.as_bytes());
+        let signal: SignalSink = Arc::new(move |record: RgfxEventSignalled, then: Then| {
+            signal_poster.post_unwaiting(record.as_bytes(), Some(then));
         });
         // A buffer's submission handler posts these, on whichever thread runs it
         // ([`post_from_handler`]).
@@ -1325,6 +1899,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             submitted: Some(submitted),
             reflection: Some(reflection),
         }
+    }
+
+    /// [`Self::sinks`] of a command queue's `poster`, for a buffer begun on the queue's service
+    /// thread ([`Self::begin_command_buffer`]): made at the queue's first buffer, and shared by
+    /// each buffer after it whose poster posts as theirs does ([`CompletionPoster::posts_as`]).
+    /// What sinks post depends on their poster and the presents alone, so shared ones post what
+    /// new ones would. Made at each begin, they cost the begin five closures and six posters
+    /// (measured: 0.30 us of a buffer's 14.9 us from its take to its begin on an Iris Xe's queue
+    /// thread, in Geekbench 7's Super Resolution), and its lane their release after the walk.
+    fn queue_sinks(&self, poster: &CompletionPoster) -> Sinks {
+        let Some(queue) = poster.queue_obj_id() else {
+            return self.sinks(poster);
+        };
+        if let Some((made_for, sinks)) = self.queue_sinks.read().get(&queue)
+            && made_for.posts_as(poster)
+        {
+            return sinks.clone();
+        }
+        let sinks = self.sinks(poster);
+        self.queue_sinks
+            .write()
+            .insert(queue, (poster.clone(), sinks.clone()));
+        sinks
     }
 
     /// Logs a stage-3 `message` the decoder did not carry out (`outcome`), and posts its command
@@ -1350,7 +1947,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Ok(Err(e)) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = e;
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
@@ -1361,7 +1958,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Err(raise) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "a message (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                      {raise}"
                 );
@@ -1377,7 +1974,9 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// taken first and its `CB_SUBMITTED` posted where it gets it at its take
     /// ([`GraphicsDecoder::begin_taken`]), then walked and committed on the lane, in its turn
     /// ([`Self::carry_out`]), so the thread goes on to the queue's next buffer meanwhile, `message`
-    /// going there as it is.
+    /// going there as it is. A buffer longer than [`INLINE_WALK_MAX`] has the lane's idle thread
+    /// woken for it as its turn is taken, so the thread wakes during the rest of its begin
+    /// (`decode::lane`, "Woken as the buffer is begun").
     fn begin_command_buffer(
         self: &Arc<Self>,
         poster: &CompletionPoster,
@@ -1392,10 +1991,11 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             if poster.stale() {
                 return;
             }
-            let mut decoder =
-                (self.decoders).sender(Some(sender_context(poster, &message)), self.sinks(poster));
-            let begun =
-                refusing(|| decoder.begin_taken(&self.device, &message, poster.queue_obj_id()));
+            let sinks = self.queue_sinks(poster);
+            let mut decoder = (self.decoders).sender(Some(sender_context(poster, &message)), sinks);
+            let to_lane = self.goes_to_lane(&message);
+            let queue = poster.queue_obj_id();
+            let begun = refusing(|| decoder.begin_taken(&self.device, &message, queue, to_lane));
             self.carry_out(decoder, begun, carried, poster.clone(), message, claim);
         });
     }
@@ -1443,6 +2043,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         claim: Option<&mut QueueClaim<'_>>,
     ) {
         let lane = decoder.lane();
+        let expected = self.goes_to_lane(&message);
         let begun_whole = matches!(&begun, Ok(Ok(_)));
         let here = match &begun {
             Ok(Ok(b)) if b.ordered() => decoder.turn_is_next(),
@@ -1482,7 +2083,12 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         };
         match lane {
             Some(lane) if !here => lane.run(Box::new(job)),
-            _ => {
+            lane => {
+                // A long buffer walked in its turn here: the lane's thread woken for it as it was
+                // begun waits for it no more.
+                if let Some(lane) = lane.filter(|_| expected) {
+                    lane.withdraw();
+                }
                 // Begun, its place among the queue's buffers taken: the queue's next buffer may
                 // be answered while this one is walked here, as while a lane's thread walks it.
                 if let Some(claim) = claim.filter(|_| begun_whole) {
@@ -1493,6 +2099,13 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         }
     }
 
+    /// Whether the `COMMAND_BUFFER` `message` goes to its queue's lane wherever it is not walked
+    /// in its turn with its turn next ([`Self::carry_out`]): it is longer than the service thread
+    /// walks itself, [`INLINE_WALK_MAX`] bytes.
+    fn goes_to_lane(&self, message: &[u8]) -> bool {
+        message.len() > self.inline_walk_max.load(Ordering::Relaxed)
+    }
+
     /// [`Host::answer_command_buffer`]: answers the `COMMAND_BUFFER` `message` of the queue
     /// `poster` posts onto `CB_SUBMITTED`, on a doorbell's thread or on the lane's thread that ends
     /// its queue's thread's wait for ring 0, before the queue's service thread hands it over,
@@ -1500,7 +2113,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// [`Decoders::answer_at_doorbell`]): it runs on that queue, no
     /// reset is under way, every lock it takes is free, each tried, no pipeline it names is still
     /// compiling, and no no-copy buffer of its context is being made on the surface worker
-    /// ([`Self::start_buffer_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is
+    /// ([`Self::start_over_pages`]), which its begin waits for. Its `CB_SUBMITTED` is
     /// posted through `poster` waiting for nothing, and its `CB_SCHEDULED` after it where no buffer
     /// before it on its queue owes its own, once
     /// its turn in its queue's lane and its ticket in the commit order are taken, which its begin
@@ -1522,6 +2135,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             return false;
         }
         (self.decoders).answer_at_doorbell(context, message, |record| poster.try_post(record))
+    }
+
+    /// [`Host::scheduled_ask`]: a thread of the process of the queue `poster` posts onto waits for
+    /// the queue's command buffer the `SCHEDULED_ASK` `message` names to be scheduled, on the
+    /// queue's service thread, which began that buffer before it: its `CB_SCHEDULED` is posted
+    /// through `poster` where it may be now ([`GraphicsDecoder::ask_scheduled`]). Nothing is
+    /// posted for the ask itself, nor where a reset ended the queue.
+    fn scheduled_ask(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (Ok((ask, _)), Some(queue)) = (
+            RgfxScheduledAsk::read_from_prefix(message),
+            poster.queue_obj_id(),
+        ) else {
+            return;
+        };
+        entry::run(|_| {
+            let _carried = self.reset_gate.read();
+            if poster.stale() {
+                return;
+            }
+            let decoder =
+                (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+            decoder.ask_scheduled(queue, ask.cb_seqno, ask.cb_obj_id);
+        });
     }
 
     /// A pipeline create from ring 0: prepared here, on its context's lane, with the decoder's
@@ -1552,7 +2188,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             Err(e) => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = e;
                     "a pipeline create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {e:?}"
                 );
@@ -1580,15 +2216,21 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// reflection, or a refusal) through `poster`.
     fn compile(&self, job: PipelineJob<P>, began: u64, poster: &CompletionPoster) {
         entry::run(|_| {
-            let (obj_id, seqno) = (job.obj_id, job.seqno);
+            let (obj_id, seqno, key) = (job.obj_id, job.seqno, job.key());
             let compiled = compile_refusing::<P>(&self.device, job);
             if let Some(reason) = compiled.refusal() {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = reason;
                     "a pipeline create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
             let reply = compiled.reply();
+            // A keyed create's answer is kept for the next runs, or drops the kept one where it
+            // was refused or answered otherwise, before the guest has it.
+            if let Some(key) = key {
+                let made = (!compiled.is_refused()).then_some(&reply.reflection);
+                self.answers.observe(&key, made);
+            }
             // Stored where no destroy, close or reset cancelled it, under the lock of its table,
             // which its destroy removes from after cancelling it; a reset waits for the store.
             {
@@ -1611,8 +2253,10 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
         let (obj_id, size) = RgfxLibraryLookup::read_from_prefix(message)
             .map_or((0, 0), |(m, _)| (m.obj_id, m.slice_size));
-        log::info!(
-            target: "reims_vgpu::graphics",
+        // Each guest process's library lookups: a debug line of its own target, which a run that
+        // times the guest's launches names (`reims_vgpu::graphics::library=debug`).
+        log::debug!(
+            target: "reims_vgpu::graphics::library",
             "library lookup (object {obj_id:#x}, {size} bytes): {}",
             if status == RGFX_STATUS_OK { "hit" } else { "miss" }
         );
@@ -1656,7 +2300,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
         if ty == RGFX_CMD_SHARED_EVENT_NAME {
             let (seqno, status) = entry::run(|_| decoder.name_shared_event(message, listen));
-            log::info!(
+            log::debug!(
                 target: "reims_vgpu::graphics",
                 "shared event {obj_id:#x} named for other processes: status {status}"
             );
@@ -1666,7 +2310,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         } else {
             let answer = entry::run(|_| decoder.import_shared_event(message, listen));
             if let Some(answer) = answer {
-                log::info!(
+                log::debug!(
                     target: "reims_vgpu::graphics",
                     "shared event {obj_id:#x} made from another process's: status {}, value {}",
                     answer.status,
@@ -1674,6 +2318,161 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 );
                 poster.post(answer.as_bytes());
             }
+        }
+    }
+
+    /// A rasterization rate map's create or reset from ring 0, answered at once through `poster`
+    /// with the map's state (`RATE_MAP_STATE`), the map stored under its id before the answer
+    /// (`decode::rate_map`). A create or reset the platform raises or dies at is answered refused,
+    /// as one it refuses, and makes nothing.
+    fn rate_map_state(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let reset = ty == RGFX_CMD_RATE_MAP_RESET;
+        let answer =
+            entry::run(|_| refusing(|| decoder.rate_map_state(&self.device, message, reset)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a rate map's create or reset (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxRateMapState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_RATE_MAP_STATE,
+                        size: size_of::<RgfxRateMapState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxRateMapState::default()
+                })
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        if answer.status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = answer.status;
+                "a rate map's create or reset (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 was answered status {}",
+                answer.status
+            );
+        }
+        poster.post(answer.as_bytes());
+    }
+
+    /// A compute pipeline state's function handle or visible function table from ring 0
+    /// (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE`), made and answered at once through
+    /// `poster` (`FUNCTION_POINTER_STATE`, `decode::function_table`), after the compile of the
+    /// state it names where that is still under way. A create the platform raises at is answered
+    /// refused.
+    fn function_pointer_state(&self, poster: &CompletionPoster, message: &[u8]) {
+        if let Some(pipeline) = decode::function_table_pipeline(message) {
+            self.pending.wait_for_ids(&[pipeline]);
+        }
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.function_pointer_state(message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a function handle's or table's create (type {ty:#x}, seqno {seqno}, object \
+                 {obj_id:#x}) faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxFunctionPointerState {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_FUNCTION_POINTER_STATE,
+                        size: size_of::<RgfxFunctionPointerState>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxFunctionPointerState::default()
+                })
+        });
+        let Some(answer) = answer else {
+            return;
+        };
+        // A handle Metal answers nil for (a function the state does not link) is not found, as
+        // asked; the rest are logged.
+        if answer.status != RGFX_STATUS_OK
+            && !(ty == RGFX_CMD_FUNCTION_HANDLE_CREATE && answer.status == RGFX_STATUS_NOT_FOUND)
+        {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a function handle's or table's create (type {ty:#x}, seqno {seqno}, object \
+                 {obj_id:#x}) was answered status {}",
+                answer.status
+            );
+        }
+        poster.post(answer.as_bytes());
+    }
+
+    /// A dynamic library's create from ring 0, answered through `poster` (`COMPLETE`,
+    /// `decode::dynamic_library`) once the library it names is made. A create the platform raises
+    /// at is answered refused.
+    fn dynamic_library_create(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer =
+            entry::run(|_| refusing(|| decoder.dynamic_library_create(&self.device, message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a dynamic library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) \
+                 faulted: {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| (header.seqno, RGFX_STATUS_REFUSED))
+        });
+        let Some((seqno, status)) = answer else {
+            return;
+        };
+        if status != RGFX_STATUS_OK {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "a dynamic library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was \
+                 answered status {status}"
+            );
+        }
+        poster.post(complete(seqno, status).as_bytes());
+    }
+
+    /// A rasterization rate map's query from ring 0, answered at once through `poster`
+    /// (`RATE_MAP_ANSWER`, `decode::rate_map`). A query the platform raises or dies at, where
+    /// Metal ends the process, is answered refused.
+    fn rate_map_query(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (ty, seqno, obj_id) = message_identity(message);
+        let decoder =
+            (self.decoders).sender(Some(sender_context(poster, message)), Sinks::default());
+        let answer = entry::run(|_| refusing(|| decoder.rate_map_answer(message)));
+        let answer = answer.unwrap_or_else(|raise| {
+            log::warn!(
+                target: "reims_vgpu::graphics", kind:% = raise;
+                "a rate map's query (type {ty:#x}, seqno {seqno}, map {obj_id:#x}) faulted: \
+                 {raise}"
+            );
+            RgfxMsgHeader::read_from_prefix(message)
+                .ok()
+                .map(|(header, _)| RgfxRateMapAnswer {
+                    header: RgfxMsgHeader {
+                        r#type: RGFX_EVT_RATE_MAP_ANSWER,
+                        size: size_of::<RgfxRateMapAnswer>() as u32,
+                        seqno: header.seqno,
+                    },
+                    status: RGFX_STATUS_REFUSED,
+                    ..RgfxRateMapAnswer::default()
+                })
+        });
+        if let Some(answer) = answer {
+            poster.post(answer.as_bytes());
         }
     }
 
@@ -1690,7 +2489,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let answer = entry::run(|_| refusing(|| decoder.sampler_state(&self.device, message)));
         let answer = answer.unwrap_or_else(|raise| {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "a sampler create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) faulted: \
                  {raise}"
             );
@@ -1720,9 +2519,38 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         poster.post(answer.as_bytes());
     }
 
-    /// A `BUFFER_OVER_PAGES` from ring 0 that makes its pages block's view (the block's first),
-    /// follows its block's `SURFACE_PAGES` still on the surface worker, or follows another of its
-    /// context's still being made: begun here, in ring order, and carried out on the surface
+    /// Waits for the no-copy buffers and heaps of `message`'s context being made on the surface
+    /// worker ([`Self::start_over_pages`]), which it may name. A ring-0 message waits on its
+    /// context's lane, which hands no later message over meanwhile, so no view behind it can
+    /// join the context's group being formed: the group closes once the views handed over before
+    /// it have joined, rather than at its window's end (`decode::surface_pages`, "Group
+    /// dma-bufs"). A message of a queue's ring leaves the group its window, as a later view of the
+    /// context may still come on ring 0.
+    fn wait_for_pages_buffers(&self, poster: &CompletionPoster, message: &[u8]) {
+        let context = sender_context(poster, message);
+        let key = pages_context(context);
+        if !self.pages_buffers.any(std::iter::once(key)) {
+            return;
+        }
+        let begun = self.pool.now();
+        let ring_0 = poster.queue_obj_id().is_none();
+        let waits = ring_0.then(|| self.decoder().wait_for_views(context));
+        self.pages_buffers.wait(key);
+        drop(waits);
+        let (ty, seqno, _) = message_identity(message);
+        log::debug!(
+            target: "reims_vgpu::graphics::surface_pages",
+            "a message (type {ty:#x}, seqno {seqno}) of context {context} on {} waited {} us for \
+             its no-copy buffers being made",
+            if ring_0 { "ring 0" } else { "its queue's ring" },
+            self.pool.now().saturating_duration_since(begun).as_micros()
+        );
+    }
+
+    /// A `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` from ring 0 that makes its pages block's view
+    /// (the block's first; a heap over a block of one run makes none), follows its block's
+    /// `SURFACE_PAGES` still on the surface worker, or follows another of its context's still
+    /// being made: begun here, in ring order, and carried out on the surface
     /// worker behind its block's jobs handed to it before (another block's may be made first:
     /// `decode::worker`), so the view's mapping and import hold neither ring 0 nor the views'
     /// lock (`decode::surface_pages`). Until it is made its context and its block are unsettled
@@ -1733,49 +2561,114 @@ impl<P: ApiPlatform> GraphicsControl<P> {
     /// create. Made under the reset gate, held shared recursively, as the surface
     /// worker's other jobs are; where the device was reset since, nothing is made. Whether it was
     /// handed over; else it is carried out here.
-    fn start_buffer_over_pages(
-        self: &Arc<Self>,
-        poster: &CompletionPoster,
-        message: &[u8],
-    ) -> bool {
-        let Ok((m, _)) = RgfxBufferOverPages::read_from_prefix(message) else {
+    fn start_over_pages(self: &Arc<Self>, poster: &CompletionPoster, message: &[u8]) -> bool {
+        let Some((name, block)) = over_pages_block(message) else {
             return false;
         };
         let context = pages_context(sender_context(poster, message));
         let decoder = self.decoder();
-        if !self
-            .pages_buffers
-            .any([context, m.block_offset].into_iter())
-            && !decoder.buffer_over_pages_makes(message)
+        if !self.pages_buffers.any([context, block].into_iter())
+            && !decoder.over_pages_makes(message)
         {
             return false;
         }
         let begun = self.pool.now();
         let settles = (
             self.pages_buffers.begin(context, 0, begun),
-            self.pages_buffers.begin(m.block_offset, 0, begun),
+            self.pages_buffers.begin(block, 0, begun),
         );
+        // Counted until its job has joined its context's group or gone on alone, so a message of
+        // the context that waits behind it on its lane leaves the group open for it.
+        let handed = decoder.hand_over_pages(sender_context(poster, message));
         let (me, poster, message) = (Arc::clone(self), poster.clone(), message.to_vec());
-        decoder.on_surface_worker(m.block_offset, Box::new(move || {
+        decoder.on_surface_worker(
+            block,
+            Box::new(move || {
+                let context = sender_context(&poster, &message);
+                // Where the platform groups views, the block's view is mapped here and joins its
+                // context's group, and the rest waits for the group's seal
+                // (`decode::surface_pages`, "Group dma-bufs").
+                let joined = {
+                    let _carried = me.reset_gate.read_recursive();
+                    if poster.stale() {
+                        return;
+                    }
+                    let carry = (poster.clone(), message.clone(), name, block, settles);
+                    let then = Arc::clone(&me).over_pages_job(carry);
+                    let decoder = (me.decoders).sender(Some(context), Sinks::default());
+                    decoder.join_group(&message, then)
+                };
+                drop(handed);
+                match joined {
+                    Joined::Now(then) => then(),
+                    Joined::Waits => {}
+                    Joined::Opened(number) => {
+                        let sealer = Arc::clone(&me);
+                        let seal = Box::new(move || sealer.seal_group(number));
+                        me.decoder().on_surface_worker(group_key(context), seal);
+                    }
+                }
+            }),
+        );
+        true
+    }
+
+    /// The carrying out of a `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` handed to the surface
+    /// worker ([`Self::start_over_pages`]): `carry` is its poster, the message, its name, its
+    /// block and its settles, which drop once it is made. Made under the reset gate, held shared
+    /// recursively; where the device was reset since, nothing is made.
+    fn over_pages_job(
+        self: Arc<Self>,
+        carry: (
+            CompletionPoster,
+            Vec<u8>,
+            &'static str,
+            u64,
+            (Settle, Settle),
+        ),
+    ) -> Job {
+        let (poster, message, name, block, settles) = carry;
+        Box::new(move || {
             let outcome = {
-                let _carried = me.reset_gate.read_recursive();
+                let _carried = self.reset_gate.read_recursive();
                 if poster.stale() {
                     return;
                 }
-                let mut decoder = (me.decoders)
-                    .sender(Some(sender_context(&poster, &message)), me.sinks(&poster));
-                decoder.decode_refusing(&me.device, &message)
+                let mut decoder = (self.decoders)
+                    .sender(Some(sender_context(&poster, &message)), self.sinks(&poster));
+                decoder.decode_refusing(&self.device, &message)
             };
-            me.report(&poster, &message, outcome, false);
+            self.report(&poster, &message, outcome, false);
             log::debug!(
                 target: "reims_vgpu::graphics::surface_pages",
-                "BUFFER_OVER_PAGES of the block at {:#x} made on the worker {} us after its begin",
-                m.block_offset,
-                me.pool.now().saturating_duration_since(begun).as_micros()
+                "{name} of the block at {block:#x} made on the worker {} us after its begin",
+                self.pool.now().saturating_duration_since(settles.0.begun).as_micros()
             );
             drop(settles);
-        }));
-        true
+        })
+    }
+
+    /// The seal of the group of pages blocks' views numbered `number` (`decode::surface_pages`,
+    /// "Group dma-bufs"), on the surface worker, under its context's key ([`group_key`]): waits
+    /// for its window to close, makes the members' imports under the reset gate, held shared
+    /// recursively, as the worker's other jobs are, then carries out the messages that waited
+    /// for them, in their order, each as [`Self::over_pages_job`] does. Where the group went (its
+    /// context's close, the device's reset), nothing.
+    fn seal_group(&self, number: u64) {
+        let decoder = self.decoder();
+        let Some(sealing) = decoder.group_closed(number) else {
+            return;
+        };
+        {
+            let _carried = self.reset_gate.read_recursive();
+            decoder.seal_group(&self.device, sealing);
+        }
+        // The members' messages, and those that join a member while they are carried out.
+        while let Some(jobs) = decoder.group_jobs(number) {
+            for job in jobs {
+                job();
+            }
+        }
     }
 
     /// An `ICB_CREATE` from ring 0: unsettled here, in ring order, and made on the ICB worker,
@@ -1830,7 +2723,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let answer = entry::run(|_| refusing(|| decoder.icb_state(&self.device, message)));
         let answer = answer.unwrap_or_else(|raise| {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "an indirect command buffer create (type {ty:#x}, seqno {seqno}, object \
                  {obj_id:#x}) faulted: {raise}"
             );
@@ -1864,7 +2757,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         let (seqno, status) = answer.unwrap_or((Some(seqno), RGFX_STATUS_REFUSED));
         if status != RGFX_STATUS_OK {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = status;
                 "an argument layout (type {ty:#x}, object {obj_id:#x}) was answered status \
                  {status}"
             );
@@ -1872,6 +2765,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         if let Some(seqno) = seqno {
             poster.post(complete(seqno, status).as_bytes());
         }
+    }
+
+    /// A `PIPELINE_ANSWERS` from the kext, answered at once on the control ring: each kept answer
+    /// it asks for as a keyed `PIPELINE_REFLECTION` of the query's seqno, newest first, then a
+    /// `COMPLETE` of how many went.
+    fn pipeline_answers(&self, poster: &CompletionPoster, message: &[u8]) {
+        let (_, seqno, _) = message_identity(message);
+        let Ok((query, _)) = RgfxPipelineAnswersQuery::read_from_prefix(message) else {
+            poster.post(complete(seqno, RGFX_STATUS_INVALID_ARGUMENT).as_bytes());
+            return;
+        };
+        let replies = self.answers.replies(query.first, query.most, seqno);
+        for reply in &replies {
+            poster.post(reply);
+        }
+        log::debug!(
+            target: "reims_vgpu::graphics::answers",
+            "the kext took {} kept pipeline answers from the {}th",
+            replies.len(),
+            query.first
+        );
+        let count = u32::try_from(replies.len()).unwrap_or(u32::MAX);
+        poster.post(complete(seqno, count).as_bytes());
     }
 
     /// A library create from ring 0 (a `LIBRARY_CREATE`, or a `LIBRARY_FROM_REGION` chunk):
@@ -1890,7 +2806,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             LibraryStart::Refused { error, answer } => {
                 let (ty, seqno, obj_id) = message_identity(message);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = error;
                     "a library create (type {ty:#x}, seqno {seqno}, object {obj_id:#x}) was not \
                      carried out: {error:?}"
                 );
@@ -1929,7 +2845,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
             if status != RGFX_STATUS_OK {
                 let reason = reason.as_deref().unwrap_or("it was cancelled");
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = reason;
                     "a library create (seqno {seqno}, object {obj_id:#x}) was refused: {reason}"
                 );
             }
@@ -1937,16 +2853,29 @@ impl<P: ApiPlatform> GraphicsControl<P> {
         });
     }
 
-    /// Shows the IOSurface `iosurface_id` (0: the scanout) once the command buffers committed that
-    /// write its copy have finished, after the presents before it ([`PresentQueue`]), with the
-    /// colour stages staged since the last present ([`ColorStaging::take`]), answering once the
-    /// window shows it; answered invalid at once, with nothing changed and the colour still
-    /// staged, where the decoder holds no texture over it.
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
+    /// Shows the IOSurface `iosurface_id` (0: the scanout) on display `display` once the command
+    /// buffers committed that write its copy have finished, after the display's presents before
+    /// it ([`PresentQueue`]), with the colour stages staged for it since its last present
+    /// ([`ColorStaging::take`]), answering once its window shows it; answered invalid at once,
+    /// with nothing changed and the colour still staged, where the decoder holds no texture over
+    /// it, or the device has no such display (which the device never hands on).
+    fn present_surface(
+        &self,
+        display: usize,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
+        let (Some(presented), Some(staging)) =
+            (self.presented.get(display), self.colors.get(display))
+        else {
+            answer.answer(RGFX_STATUS_INVALID_ARGUMENT);
+            return;
+        };
         if iosurface_id == 0 {
-            let color = self.color.lock().take();
+            let color = staging.lock().take();
             self.presents
-                .present(0, None, color, answer, Vec::new(), None);
+                .present(display, 0, None, color, answer, Vec::new(), None);
             return;
         }
         let decoder = self.decoder();
@@ -1957,7 +2886,7 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 entry::run(|_| decoder.fill_presented(&self.device, iosurface_id, generation));
             filled.unwrap_or_else(|raise| {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "IOSurface {iosurface_id}: the platform raised at its device cache's fill for \
                      a present ({raise:?})"
                 );
@@ -1978,29 +2907,44 @@ impl<P: ApiPlatform> GraphicsControl<P> {
                 self.pool.favour(owner);
                 // Its block is held from here, before the texture's destroy and the block's
                 // release can come: the present shows it later.
-                let shown = self.presented.hold(texture, span);
-                let color = self.color.lock().take();
-                self.presents
-                    .present(iosurface_id, Some(shown), color, answer, writers, fill);
+                let shown = presented.hold(texture, span);
+                let color = staging.lock().take();
+                self.presents.present(
+                    display,
+                    iosurface_id,
+                    Some(shown),
+                    color,
+                    answer,
+                    writers,
+                    fill,
+                );
             }
             None => answer.answer(RGFX_STATUS_INVALID_ARGUMENT),
         }
     }
 
-    /// A present that keeps what the display shows (`RGFX_PRESENT_KEEP`), with the colour stages
-    /// staged since the last present, after the presents before it, answered once the window
-    /// shows it.
-    fn present_kept(&self, answer: PresentAnswer) {
-        let color = self.color.lock().take();
-        self.presents.present_kept(color, answer);
+    /// A present that keeps what display `display` shows (`RGFX_PRESENT_KEEP`), with the colour
+    /// stages staged for it since its last present, after its presents before it, answered once
+    /// its window shows it; at once where the device has no such display (which the device never
+    /// hands on).
+    fn present_kept(&self, display: usize, answer: PresentAnswer) {
+        let Some(staging) = self.colors.get(display) else {
+            answer.answer(RGFX_STATUS_OK);
+            return;
+        };
+        let color = staging.lock().take();
+        self.presents.present_kept(display, color, answer);
     }
 
-    /// One `DISPLAY_COLOR` part, staged for the next present ([`ColorStaging::part`]); one the
-    /// staging refuses is logged.
+    /// One `DISPLAY_COLOR` part, staged for its display's next present ([`ColorStaging::part`]);
+    /// one the staging refuses is logged.
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
-        if let Err(dropped) = self.color.lock().part(color, entries) {
+        let Some(staging) = self.colors.get(color.display as usize) else {
+            return;
+        };
+        if let Err(dropped) = staging.lock().part(color, entries) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:? = dropped;
                 "a display colour part of transaction {} (stage {}, entries {} on of {}, {} \
                  carried) was dropped ({dropped:?}): the stage keeps its table",
                 color.transaction_id,
@@ -2034,11 +2978,14 @@ impl<P: ApiPlatform> GraphicsControl<P> {
 
 /// The host's callbacks and its stage-3 decoder as the device's [`Host`].
 struct CallbackHost<P: ApiPlatform> {
-    /// The host's interrupt and dirty-log callbacks.
+    /// The host's callbacks: the device raises its interrupt through them.
     callbacks: GraphicsCallbacks,
     /// The `RGFX_FEATURE_*` the decoder carries out, fixed at the device's make: the guest reads
     /// them on a vCPU, which takes no lock of the decoder's.
     features: u64,
+    /// Those it carries out only for a guest that takes `RGFX_FEATURE_PAGES_16K`, also fixed at
+    /// the make: the guest RAM's on a host of 16 KiB pages, else none.
+    features_16k: u64,
     /// The deferred blocks' budget ([`deferred_budget`]), read once at the device's make, so the
     /// kext's one read holds.
     deferred_budget: u64,
@@ -2053,52 +3000,97 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         }
     }
 
-    fn scanout_written(&self, offset: u64, length: u64) -> bool {
-        self.callbacks
-            .scanout_written
-            .as_ref()
-            .is_none_or(|f| f(offset, length))
+    fn route_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32, bell: RawDoorbell) -> bool {
+        match at {
+            DoorbellAt::Register => (self.callbacks.route_doorbell)
+                .as_ref()
+                .is_some_and(|f| f(route, ring_id, Some(bell))),
+            DoorbellAt::Page(page) => (self.callbacks.route_doorbell_page)
+                .as_ref()
+                .is_some_and(|f| f(route, page, ring_id, Some(bell))),
+        }
     }
 
-    fn present_surface(&self, iosurface_id: u32, generation: Option<u64>, answer: PresentAnswer) {
-        self.control
-            .present_surface(iosurface_id, generation, answer);
+    fn routes_doorbell_pages(&self) -> bool {
+        self.callbacks.route_doorbell_page.is_some()
     }
 
-    fn present_keep(&self, answer: PresentAnswer) {
-        self.control.present_kept(answer);
+    fn unroute_doorbell(&self, route: u64, at: DoorbellAt, ring_id: u32) {
+        match at {
+            DoorbellAt::Register => {
+                if let Some(f) = &self.callbacks.route_doorbell {
+                    f(route, ring_id, None);
+                }
+            }
+            DoorbellAt::Page(page) => {
+                if let Some(f) = &self.callbacks.route_doorbell_page {
+                    f(route, page, ring_id, None);
+                }
+            }
+        }
+    }
+
+    fn trace(&self, kind: &'static str, values: &[u64]) {
+        reims_vgpu_vulkan::core::trace::event(kind, values);
+    }
+
+    fn ring_degraded(&self, kind: RingDegradation) {
+        reims_vgpu_vulkan::answer::count_kind(kind.code());
+    }
+
+    fn present_surface(
+        &self,
+        display: u32,
+        iosurface_id: u32,
+        generation: Option<u64>,
+        answer: PresentAnswer,
+    ) {
+        stepped(|| {
+            self.control
+                .present_surface(display as usize, iosurface_id, generation, answer);
+        });
+    }
+
+    fn present_keep(&self, display: u32, answer: PresentAnswer) {
+        stepped(|| self.control.present_kept(display as usize, answer));
     }
 
     fn display_color(&self, color: &RgfxDisplayColor, entries: &[RgfxColorEntry]) {
-        self.control.display_color(color, entries);
+        stepped(|| self.control.display_color(color, entries));
     }
 
     fn surface_textures(&self, iosurface_id: u32) -> Vec<u64> {
         self.control.decoder().surface_textures(iosurface_id)
     }
 
-    fn refreshed(&self) {
-        self.control.presented.refreshed();
+    fn refreshed(&self, display: u32) {
+        if let Some(presented) = self.control.presented.get(display as usize) {
+            stepped(|| presented.refreshed());
+        }
     }
 
     fn context_closed(&self, context: u32, answer: CompleteAnswer) {
-        self.control.close_context(context, answer);
+        stepped(|| self.control.close_context(context, answer));
     }
 
     fn block_released(&self, release: &RgfxBlockRelease, answer: CompleteAnswer) {
-        self.control.release_block(release, answer);
+        stepped(|| self.control.release_block(release, answer));
     }
 
     fn block_unshared(&self, unshare: &RgfxBlockGrant) {
-        self.control.unshare_block(unshare);
+        stepped(|| self.control.unshare_block(unshare));
     }
 
     fn device_reset(&self) {
-        self.control.reset();
+        stepped(|| self.control.reset());
     }
 
     fn features(&self) -> u64 {
         self.features
+    }
+
+    fn features_with_16k_pages(&self) -> u64 {
+        self.features_16k
     }
 
     fn deferred_budget(&self) -> u64 {
@@ -2110,14 +3102,17 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         pages: &RgfxSurfacePages,
         runs: Vec<RgfxPageRun>,
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         answer: CompleteAnswer,
     ) {
-        self.control
-            .start_surface_pages(*pages, runs, flags, answer);
+        stepped(|| {
+            self.control
+                .start_surface_pages(*pages, runs, flags, layout, answer);
+        });
     }
 
     fn surface_download(&self, block_offset: u64, answer: CompleteAnswer) {
-        self.control.download_surface(block_offset, answer);
+        stepped(|| self.control.download_surface(block_offset, answer));
     }
 
     fn try_surface_download(
@@ -2125,20 +3120,22 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         block_offset: u64,
         answer: CompleteAnswer,
     ) -> Result<(), CompleteAnswer> {
-        self.control.try_download_surface(block_offset, answer)
+        stepped(|| self.control.try_download_surface(block_offset, answer))
     }
 
     fn surface_downloaded(&self, block_offset: u64) -> bool {
-        self.control.downloaded_at_doorbell(block_offset)
+        stepped(|| self.control.downloaded_at_doorbell(block_offset))
     }
 
     fn stage3_message(&self, completion: &CompletionPoster, message: &[u8]) {
-        self.control
-            .handle_stage3(completion, Cow::Borrowed(message), None);
+        stepped(|| {
+            self.control
+                .handle_stage3(completion, Cow::Borrowed(message), None);
+        });
     }
 
     fn queue_made(&self, completion: &CompletionPoster) {
-        self.control.queue_made(completion);
+        stepped(|| self.control.queue_made(completion));
     }
 
     fn command_buffer(
@@ -2147,38 +3144,56 @@ impl<P: ApiPlatform> Host for CallbackHost<P> {
         message: Vec<u8>,
         claim: &mut QueueClaim<'_>,
     ) {
-        (self.control).handle_stage3(completion, Cow::Owned(message), Some(claim));
+        stepped(|| (self.control).handle_stage3(completion, Cow::Owned(message), Some(claim)));
     }
 
     fn answer_command_buffer(&self, completion: &CompletionPoster, message: &[u8]) -> bool {
-        self.control.answer_command_buffer(completion, message)
+        stepped(|| self.control.answer_command_buffer(completion, message))
+    }
+
+    fn scheduled_ask(&self, completion: &CompletionPoster, message: &[u8]) {
+        stepped(|| self.control.scheduled_ask(completion, message));
     }
 }
 
-/// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`: at once,
-/// raising the queue's vector there, on a thread the header names for the device's raise
-/// (`RvgGraphicsRaiseFn`: the device's and the decoder's own threads, and the platform's that
-/// run a buffer's handlers); handed to the queue's service thread, which posts it and raises
-/// there, where a submission handler runs inside a commit on any other thread
-/// ([`foreign_committer`]). The platform's runtime may run every ready buffer's submission
-/// handlers inside one commit (`reims_vgpu_core::platform::command::committing`): the window's
-/// render thread, the host's thread inside `rvg_graphics_device_read_display`, or another
-/// device's, which neither post nor raise for this one, so none of them waits for room on a full
-/// ring either.
+/// Runs `f`, a callback of the device's that may call the GPU's driver, as a step of the exit
+/// gate's ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for it, and one called
+/// once the exit began parks its thread for good, on any thread but the exiting one (as an entry
+/// does, [`entry`]'s module doc).
+fn stepped<T>(f: impl FnOnce() -> T) -> T {
+    let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+        reims_vgpu_vulkan::exit_gate::stay()
+    };
+    f()
+}
+
+/// Posts a command buffer's `CB_SUBMITTED` or `CB_SCHEDULED` `record` through `poster`, waiting
+/// for nothing: on a thread the header names for the device's raise (`RvgGraphicsRaiseFn`: the
+/// device's and the decoder's own threads, and the platform's that run a buffer's handlers), at
+/// once where the ring has room and no record is handed over before it, raising the queue's
+/// vector there, else handed to the queue's service thread
+/// (`CompletionPoster::post_unwaiting`); handed to it always, which posts it and raises there,
+/// where a submission handler runs inside a commit on any other thread ([`foreign_committer`]).
+/// The platform's runtime runs submission handlers on its scheduler thread, and may run every
+/// ready buffer's inside one commit (`reims_vgpu_vulkan::core::platform::command::committing`):
+/// a lane's of any queue, the window's render thread, the host's thread inside
+/// `rvg_graphics_device_read_display`, or another device's. A wait for room on any of them would
+/// hold up every queue's submissions, and the record's mutex, which the buffer's completion
+/// handler takes, across the wait: none waits.
 fn post_from_handler(poster: &CompletionPoster, record: &[u8]) {
     if foreign_committer() {
         poster.post_elsewhere(record);
     } else {
-        poster.post(record);
+        poster.post_unwaiting(record, None);
     }
 }
 
 /// Whether this thread runs a submission handler inside a platform commit
-/// (`reims_vgpu_core::platform::command::inside_commit`) and is none of the threads the
+/// (`reims_vgpu_vulkan::core::platform::command::inside_commit`) and is none of the threads the
 /// header names for the device's raise ([`RAISE_THREADS`]). A handler run outside a commit runs
 /// on the platform's own thread.
 fn foreign_committer() -> bool {
-    reims_vgpu_core::platform::command::inside_commit()
+    reims_vgpu_vulkan::core::platform::command::inside_commit()
         && !std::thread::current()
             .name()
             .is_some_and(|name| RAISE_THREADS.iter().any(|named| name.starts_with(named)))
@@ -2202,14 +3217,52 @@ const RAISE_THREADS: [&str; 11] = [
     "reims-vgpu.graphics-closes-",
 ];
 
-/// What the window and its sink share: the scanout the guest set, and the size of the drawable
-/// the window's render thread last drew into, its size in pixels.
+/// What the window and its sink share: the scanout the guest set, whether the display's panel is
+/// off, the drawable the window's render thread last drew into (its size in pixels, and its
+/// pixels a point), and whether the window draws black while the guest shows nothing.
 #[derive(Debug, Default)]
 pub(crate) struct Shown {
     /// The guest's scanout; `None` shows black.
     pub(crate) scanout: Mutex<Option<Scanout>>,
-    /// The window's size in pixels, once drawn into.
-    pub(crate) drawable: Mutex<Option<(u64, u64)>>,
+    /// The display's panel is off (`SET_DISPLAY_POWER`, the guest's display asleep): the window
+    /// and the host's reads show black, whatever the scanout or the presented surface.
+    pub(crate) asleep: AtomicBool,
+    /// The window's drawable, once drawn into.
+    pub(crate) drawable: Mutex<Option<Drawable>>,
+    /// A display after display 0, whose window draws black while the guest shows nothing on it
+    /// (no scanout, no presented surface; `sink`'s module doc, "A display the guest does not
+    /// drive"). Display 0's draws nothing then, as before: the option ROM drives it at once.
+    pub(crate) black_undriven: bool,
+}
+
+impl Shown {
+    /// Whether the display's panel is off.
+    pub(crate) fn asleep(&self) -> bool {
+        self.asleep.load(Ordering::Acquire)
+    }
+}
+
+/// A drawable the window's render thread drew into.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct Drawable {
+    /// Its size in pixels, width then height: the window's size.
+    pub(crate) pixels: (u64, u64),
+    /// Its pixels a point: the backing scale of the screen the window is on.
+    pub(crate) scale: f64,
+}
+
+/// `scale` pixels a point in 120ths, as `RgfxDisplayScale` carries it: rounded to nearest, and 0
+/// where it is not a positive number.
+fn scale_in_120ths(scale: f64) -> u32 {
+    if !(scale.is_finite() && scale > 0.0) {
+        return 0;
+    }
+    #[expect(
+        clippy::as_conversions,
+        reason = "a backing scale of a few units, rounded to nearest; a cast saturates"
+    )]
+    let scale = (scale * 120.0).round() as u32;
+    scale
 }
 
 /// The display's window as the device's [`Screen`] (the module doc).
@@ -2218,6 +3271,8 @@ pub(crate) struct WindowScreen {
     window: Arc<Window>,
     /// What it shows.
     shown: Arc<Shown>,
+    /// Whether it shows a presented surface in place of the scanout ([`Presented`]).
+    shows_surface: Box<dyn Fn() -> bool + Send + Sync>,
     /// The refresh rate of the host screen it opened on, in thousandths of a hertz.
     refresh_mhz: u32,
     /// The guest's cursor, as last told.
@@ -2225,25 +3280,191 @@ pub(crate) struct WindowScreen {
 }
 
 /// The guest's cursor, as the window shows it: over the image while the guest has an image and
-/// shows it.
+/// shows it, and the display's panel is on.
 #[derive(Debug)]
 struct CursorState {
     /// The guest has an image.
     image: bool,
     /// The guest shows its cursor: until it says otherwise, it does.
     visible: bool,
+    /// The display's panel is off: no cursor shows.
+    asleep: bool,
     /// What the window was last told, once told.
     shown: Option<bool>,
 }
 
 impl CursorState {
+    /// Whether the cursor shows, where that changed since it was last told.
+    fn changed(&mut self) -> Option<bool> {
+        let show = self.image && self.visible && !self.asleep;
+        if self.shown == Some(show) {
+            return None;
+        }
+        self.shown = Some(show);
+        Some(show)
+    }
+
     /// Tells `window` whether the cursor shows, where that changed.
     fn update(&mut self, window: &Window) {
-        let show = self.image && self.visible;
-        if self.shown != Some(show) {
-            self.shown = Some(show);
+        if let Some(show) = self.changed() {
             window.cursor_show(show);
         }
+    }
+}
+
+/// The guest's cursor as the host is told it ([`GraphicsCallbacks`]' `cursor_*`), beside what
+/// the screen shows of it. Each change is queued onto the display thread under the state's lock,
+/// so the host's callbacks run in the order the device took the guest's commands, and never
+/// inside a call of the host's: the device's reset tells the screen inside the host's reset or
+/// the guest's `STATUS` write.
+struct HostCursor {
+    /// The host's `cursor_glyph`.
+    glyph: Option<CursorGlyphFn>,
+    /// The host's `cursor_show`.
+    show: Option<CursorShowFn>,
+    /// The host's `cursor_move`.
+    moved: Option<CursorMoveFn>,
+    /// The display thread, where the host takes any of them.
+    queue: Option<Arc<dyn HostQueue>>,
+    /// What the host was told: hidden until the guest shows it.
+    state: Mutex<CursorState>,
+    /// Where the guest last put its cursor's hot spot, each axis kept to 0 to 65535: x in the
+    /// high 16 bits, y in the low.
+    position: AtomicU32,
+}
+
+/// The host's cursor callbacks of display `display` among `callbacks`: display 0's
+/// `cursor_glyph`, `cursor_show` and `cursor_move`, and another display's the `_at` three, which
+/// name it.
+fn display_cursor(
+    callbacks: &GraphicsCallbacks,
+    display: usize,
+) -> (
+    Option<CursorGlyphFn>,
+    Option<CursorShowFn>,
+    Option<CursorMoveFn>,
+) {
+    if display == 0 {
+        return (
+            callbacks.cursor_glyph.clone(),
+            callbacks.cursor_show.clone(),
+            callbacks.cursor_move.clone(),
+        );
+    }
+    let at = u32::try_from(display).unwrap_or(u32::MAX);
+    let glyph = callbacks.cursor_glyph_at.clone().map(|f| {
+        let f: CursorGlyphFn = Arc::new(move |glyph: &CursorGlyph<'_>| f(at, glyph));
+        f
+    });
+    let show = callbacks.cursor_show_at.clone().map(|f| {
+        let f: CursorShowFn = Arc::new(move |show| f(at, show));
+        f
+    });
+    let moved = callbacks.cursor_move_at.clone().map(|f| {
+        let f: CursorMoveFn = Arc::new(move || f(at));
+        f
+    });
+    (glyph, show, moved)
+}
+
+impl HostCursor {
+    /// A display's host cursor, with the host's callbacks `glyph`, `show` and `moved`, run on
+    /// `platform`'s display thread, which is made here where the host takes any.
+    fn new<P: ApiPlatform>(
+        platform: &Arc<P>,
+        glyph: Option<CursorGlyphFn>,
+        show: Option<CursorShowFn>,
+        moved: Option<CursorMoveFn>,
+    ) -> HostCursor {
+        let takes = glyph.is_some() || show.is_some() || moved.is_some();
+        HostCursor {
+            glyph,
+            show,
+            moved,
+            queue: takes.then(|| api_state(platform).display_thread(platform)),
+            state: Mutex::new(CursorState {
+                image: false,
+                visible: true,
+                asleep: false,
+                shown: Some(false),
+            }),
+            position: AtomicU32::new(0),
+        }
+    }
+
+    /// Queues `job` onto the display thread.
+    fn queue(&self, job: impl FnOnce() + Send + 'static) {
+        if let Some(queue) = &self.queue {
+            queue.exec_async(Box::new(job));
+        }
+    }
+
+    /// Tells the host whether the cursor shows, where that changed: each change a debug line of
+    /// its own target (`reims_vgpu::graphics::cursor`), which a boot's check of the display's
+    /// sleep reads.
+    fn tell_shown(&self, state: &mut CursorState) {
+        let show = state.changed();
+        if let Some(show) = show {
+            log::debug!(
+                target: "reims_vgpu::graphics::cursor",
+                "the host is told the guest's cursor {}",
+                if show { "shows" } else { "is hidden" }
+            );
+        }
+        if let Some(show) = show
+            && let Some(f) = &self.show
+        {
+            let f = Arc::clone(f);
+            self.queue(move || f(u8::from(show)));
+        }
+    }
+
+    /// The guest set its cursor image, or removed it (`None`).
+    fn image(&self, image: Option<&CursorImage>) {
+        let mut state = self.state.lock();
+        state.image = image.is_some();
+        if let (Some(image), Some(f)) = (image, &self.glyph) {
+            let (f, image) = (Arc::clone(f), image.clone());
+            self.queue(move || {
+                let hot = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+                f(&CursorGlyph {
+                    width: image.width,
+                    height: image.height,
+                    hot_spot: (hot(image.hot_spot.0), hot(image.hot_spot.1)),
+                    rgba: &image.rgba,
+                });
+            });
+        }
+        self.tell_shown(&mut state);
+    }
+
+    /// The guest moved its cursor's hot spot to (`x`, `y`), and shows it where `visible`.
+    fn moved(&self, x: i32, y: i32, visible: bool) {
+        let mut state = self.state.lock();
+        state.visible = visible;
+        let axis = |v: i32| u32::from(u16::try_from(v.max(0)).unwrap_or(u16::MAX));
+        self.position
+            .store((axis(x) << 16) | axis(y), Ordering::Release);
+        if let Some(f) = &self.moved {
+            let f = Arc::clone(f);
+            self.queue(move || f());
+        }
+        self.tell_shown(&mut state);
+    }
+
+    /// The display's panel went off (`on` false) or on: while it is off, the host is told the
+    /// cursor does not show.
+    fn power(&self, on: bool) {
+        let mut state = self.state.lock();
+        state.asleep = !on;
+        self.tell_shown(&mut state);
+    }
+
+    /// Where the guest last put its cursor's hot spot.
+    fn position(&self) -> (u16, u16) {
+        let p = self.position.load(Ordering::Acquire);
+        let half = |v: u32| u16::try_from(v & 0xffff).unwrap_or(u16::MAX);
+        (half(p >> 16), half(p))
     }
 }
 
@@ -2268,68 +3489,94 @@ impl Screen for HeadlessScreen {
     fn cursor_image(&self, _image: Option<CursorImage>) {}
 
     fn cursor_moved(&self, _x: i32, _y: i32, _visible: bool) {}
+
+    /// The host's reads of the display show black while the panel is off.
+    fn power(&self, on: bool) {
+        self.shown.asleep.store(!on, Ordering::Release);
+    }
 }
 
-/// The device's [`Screen`], which the host's reads of the display share: each call goes to the
-/// one it holds.
-struct SharedScreen(Arc<dyn Screen>);
+/// The device's [`Screen`]: each call goes to the screen it holds, which the host's reads of
+/// the display share, and the cursor's to the host as well ([`HostCursor`]).
+struct SharedScreen {
+    /// The window's screen, or the headless one.
+    screen: Arc<dyn Screen>,
+    /// The cursor as the host is told it.
+    cursor: Arc<HostCursor>,
+}
 
 impl Screen for SharedScreen {
     fn mode(&self) -> Mode {
-        self.0.mode()
+        self.screen.mode()
     }
 
     fn scanout(&self, scanout: Option<Scanout>) {
-        self.0.scanout(scanout);
+        self.screen.scanout(scanout);
     }
 
     fn present(&self) {
-        self.0.present();
+        self.screen.present();
     }
 
     fn cursor_image(&self, image: Option<CursorImage>) {
-        self.0.cursor_image(image);
+        self.cursor.image(image.as_ref());
+        self.screen.cursor_image(image);
     }
 
     fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
-        self.0.cursor_moved(x, y, visible);
+        self.cursor.moved(x, y, visible);
+        self.screen.cursor_moved(x, y, visible);
+    }
+
+    fn power(&self, on: bool) {
+        self.cursor.power(on);
+        self.screen.power(on);
     }
 }
 
 impl WindowScreen {
-    /// The window of a display over `region`, opened with its sink on `platform` where the
-    /// platform draws one (no sink: the window never opens), and the screen over it.
+    /// The window of the display on `port` (its id) over `region`, opened with its sink on
+    /// `platform` where the platform draws one (no sink: the window never opens), and the screen
+    /// over it. The window is titled as the port's, and opens on the port's host screen
+    /// (`reims-vgpu-window`'s `handle::title` and `screens::screen_for_port`).
     fn open<P: ApiPlatform>(
         platform: &Arc<P>,
         region: &Arc<Region>,
         presented: &Arc<Presented<P>>,
         mut config: WindowConfig,
+        port: u64,
     ) -> (WindowLink, WindowScreen) {
         config.keeps_its_size = true;
         let first = config.mode.unwrap_or((1920, 1080));
-        let window = Window::new(config, 0, reims_vgpu_window::handle::title(0));
+        let window = Window::new(config, port, reims_vgpu_window::handle::title(port));
         window.offered_mode(first.0, first.1);
         // In the crate's tests the display runs at 60 Hz, asking the host for no screen: on Linux
         // the ask starts the windows' UI thread.
         let refresh_mhz = if cfg!(test) {
             FALLBACK_MODE.refresh_mhz
         } else {
-            reims_vgpu_window::screens::screen_for_port(0)
+            reims_vgpu_window::screens::screen_for_port(port)
                 .map_or(FALLBACK_MODE.refresh_mhz, |s| hz_to_mhz(s.refresh_hz))
         };
-        let shown = Arc::new(Shown::default());
+        let shown = Arc::new(Shown {
+            black_undriven: port > 0,
+            ..Shown::default()
+        });
         if let Some(sink) = scanout_sink(platform, region, &shown, presented) {
             window.attach(sink);
             // Presents wait for the window's draw only where it has a sink to draw them.
             let _ = presented.window.set(Arc::clone(&window));
         }
+        let presented = Arc::clone(presented);
         let screen = WindowScreen {
             window: Arc::clone(&window),
             shown,
+            shows_surface: Box::new(move || presented.shows_surface()),
             refresh_mhz,
             cursor: Mutex::new(CursorState {
                 image: false,
                 visible: true,
+                asleep: false,
                 shown: None,
             }),
         };
@@ -2358,11 +3605,15 @@ const RESERVATION_CHECKS: usize = 16;
 /// Metal takes a texture reservation only before the device's first texture (it ignores a later
 /// one, logging so), and one after the device's first command queue keeps the pool's first range
 /// beside the ids it leaves, which it hands out twice. So this is the first call on the device,
-/// and a few plain textures check it took: one inside the guest's ids is logged as an error.
+/// and a few plain textures check it took: one inside the guest's ids is logged as an error. A
+/// platform whose device makes a queue or texture of its own as it is made reserves the ids there
+/// first, told them before the device ([`ApiPlatform::present_guest_texture_ids`]), and answers
+/// this call at once.
 fn reserve_guest_texture_ids<P: Platform>(platform: &P, device: &P::Device) {
     let ids: Vec<u64> = guest_texture_ids().collect();
     if let Err(raise) = refusing(|| device.reserve_resource_indices(0, &ids)) {
         log::error!(
+            kind:% = raise;
             "the guest's texture resource ids are not reserved ({raise}): its textures may \
              share ids with the host's"
         );
@@ -2408,19 +3659,25 @@ fn hz_to_mhz(hz: f64) -> u32 {
 }
 
 impl Screen for WindowScreen {
-    /// The window's size in pixels as last drawn into, else the mode it opened for, at its host
-    /// screen's rate.
+    /// The window's size in pixels as last drawn into, else the mode it opened for, its width
+    /// rounded down to a multiple of 16 and its height to even ([`geometry::offered_mode`]), at
+    /// its host screen's rate, with the backing scale it was last drawn at (none before its first
+    /// draw).
     fn mode(&self) -> Mode {
         let drawn = *self.shown.drawable.lock();
-        let (width, height) = drawn.unwrap_or_else(|| {
-            let (w, h) = self.window.offered().unwrap_or((1920, 1080));
-            (u64::from(w), u64::from(h))
-        });
+        let (width, height) = geometry::offered_mode(drawn.map_or_else(
+            || {
+                let (w, h) = self.window.offered().unwrap_or((1920, 1080));
+                (u64::from(w), u64::from(h))
+            },
+            |d| d.pixels,
+        ));
         let clamp = |v: u64| u32::try_from(v.max(1)).unwrap_or(u32::MAX);
         Mode {
             width: clamp(width),
             height: clamp(height),
             refresh_mhz: self.refresh_mhz,
+            scale_120ths: drawn.map_or(0, |d| scale_in_120ths(d.scale)),
         }
     }
 
@@ -2434,8 +3691,13 @@ impl Screen for WindowScreen {
         self.window.new_frame();
     }
 
+    /// The window draws the scanout again where it shows it; while it shows a presented surface,
+    /// or black while the display's panel is off, a refresh draws nothing, and the guest's
+    /// presents draw (`Presented`).
     fn present(&self) {
-        self.window.new_frame();
+        if !self.shown.asleep() && !(self.shows_surface)() {
+            self.window.new_frame();
+        }
     }
 
     /// The host's cursor over the image takes the guest's image; with none, nothing shows
@@ -2455,18 +3717,33 @@ impl Screen for WindowScreen {
         cursor.update(&self.window);
     }
 
-    /// The window shows or hides the guest's cursor as the guest does; the position is the
-    /// host's pointer's (the module doc).
-    fn cursor_moved(&self, _x: i32, _y: i32, visible: bool) {
+    /// The window shows or hides the guest's cursor as the guest does, and takes the place the
+    /// guest put its hot spot, each axis kept to 0 to 65535 (`Window::cursor_at`): where the
+    /// guest moved it on its own, the window draws it (the module doc).
+    fn cursor_moved(&self, x: i32, y: i32, visible: bool) {
         let mut cursor = self.cursor.lock();
         cursor.visible = visible;
         cursor.update(&self.window);
+        drop(cursor);
+        let axis = |v: i32| u16::try_from(v.max(0)).unwrap_or(u16::MAX);
+        self.window.cursor_at((axis(x), axis(y)));
+    }
+
+    /// The window shows black, and no guest cursor, while the panel is off, and what the guest
+    /// shows again once it is on: a frame is drawn at each change.
+    fn power(&self, on: bool) {
+        self.shown.asleep.store(!on, Ordering::Release);
+        let mut cursor = self.cursor.lock();
+        cursor.asleep = !on;
+        cursor.update(&self.window);
+        drop(cursor);
+        self.window.new_frame();
     }
 }
 
-/// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): Metal's on macOS's
-/// product platform, the Vulkan platform's swapchain presenter with the `vulkan` feature;
-/// `None` on any other platform (the testkit's), or where the platform refuses a command queue.
+/// The window's sink over `region` on `platform` ([`sink::ScanoutDraw`]): the Vulkan platform's
+/// swapchain presenter; `None` on any other platform (the testkit's), or where the platform
+/// refuses a command queue.
 fn scanout_sink<P: ApiPlatform>(
     platform: &Arc<P>,
     region: &Arc<Region>,
@@ -2475,14 +3752,6 @@ fn scanout_sink<P: ApiPlatform>(
 ) -> Option<Arc<dyn FrameSink>> {
     let any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(platform) as _;
     let presented_any: Arc<dyn std::any::Any + Send + Sync> = Arc::clone(presented) as _;
-    #[cfg(target_os = "macos")]
-    if let (Ok(metal), Ok(presented)) = (
-        Arc::clone(&any).downcast::<reims_vgpu_metal::MetalPlatform>(),
-        Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_metal::MetalPlatform>>(),
-    ) {
-        return metal::sink(metal, region, shown, &presented);
-    }
-    #[cfg(feature = "vulkan")]
     if let (Ok(vulkan), Ok(presented)) = (
         Arc::clone(&any).downcast::<reims_vgpu_vulkan::VulkanPlatform>(),
         Arc::clone(&presented_any).downcast::<Presented<reims_vgpu_vulkan::VulkanPlatform>>(),
@@ -2491,6 +3760,45 @@ fn scanout_sink<P: ApiPlatform>(
     }
     let _ = (any, presented_any, region, shown);
     None
+}
+
+/// The video caps of the host's hardware video `video` on a device of `features`: its codecs,
+/// each with what an encode takes beyond it, and either the layout a decode lands its pictures in
+/// place in, or `RGFX_VIDEO_CAPS_OUTPUT_CACHED` and no layout, where the guest asks its outputs
+/// cached. Pictures land in device caches only where the kext makes them: of every surface it
+/// asks one for (`SURFACE_CACHE`), or of those whose textures would not lie in place in their
+/// pages, where the GPU shares the CPU's memory (`SURFACE_CACHE_REFUSED`), and where `video` lands
+/// pictures in them. The guest's decoder then asks a cache for its outputs with their layout, as
+/// for any other surface, and a picture lands in place only in a surface's pages.
+fn video_caps<P: Platform>(features: u64, video: &dyn GraphicsVideo<P>) -> RgfxVideoCaps {
+    let caches =
+        u64::from(RGFX_FEATURE_SURFACE_CACHE) | u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    let cached = features & caches != 0 && video.lands_in_device_caches();
+    let mut caps = RgfxVideoCaps {
+        version: RGFX_VIDEO_CAPS_VERSION,
+        flags: if cached {
+            RGFX_VIDEO_CAPS_OUTPUT_CACHED
+        } else {
+            0
+        },
+        ..RgfxVideoCaps::default()
+    };
+    let slots = caps
+        .codecs
+        .iter_mut()
+        .zip(&mut caps.layouts)
+        .zip(&mut caps.encode)
+        .zip(&mut caps.decode);
+    for ((((slot, layout), encode), decode), codec) in slots.zip(video.caps()) {
+        if !cached {
+            *layout = video.layout(&codec);
+        }
+        *encode = video.encode_caps(&codec);
+        *decode = video.decode_caps(&codec);
+        *slot = codec;
+        caps.codec_count += 1;
+    }
+    caps
 }
 
 #[cfg(test)]
@@ -2537,10 +3845,31 @@ fn sender_context(poster: &CompletionPoster, message: &[u8]) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
 }
 
-/// The key the no-copy buffers of context `context` being made are unsettled under in
+/// The key the no-copy buffers and heaps of context `context` being made are unsettled under in
 /// `GraphicsControl::pages_buffers`, apart from their blocks' offsets, which lie below 2^63.
 fn pages_context(context: u32) -> u64 {
     1 << 63 | u64::from(context)
+}
+
+/// The surface worker's key the seals of context `context`'s groups of views run under
+/// (`GraphicsControl::seal_group`), apart from its blocks' offsets, which lie below 2^63, and the
+/// views' teardowns' key (`u64::MAX`).
+fn group_key(context: u32) -> u64 {
+    0xffff_fffe_0000_0000 | u64::from(context)
+}
+
+/// The name of the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message`, and its pages block's
+/// offset; `None` for any other message.
+fn over_pages_block(message: &[u8]) -> Option<(&'static str, u64)> {
+    match RgfxMsgHeader::read_from_prefix(message).ok()?.0.r#type {
+        RGFX_CMD_BUFFER_OVER_PAGES => RgfxBufferOverPages::read_from_prefix(message)
+            .ok()
+            .map(|(m, _)| ("BUFFER_OVER_PAGES", m.block_offset)),
+        RGFX_CMD_HEAP_OVER_PAGES => RgfxHeapOverPages::read_from_prefix(message)
+            .ok()
+            .map(|(m, _)| ("HEAP_OVER_PAGES", m.block_offset)),
+        _ => None,
+    }
 }
 
 /// Whether `message` is a `COMMAND_BUFFER` off a queue's ring that names another queue to run on:

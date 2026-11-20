@@ -1,57 +1,37 @@
 # The kexts an x86-64 macOS guest's OpenCore image injects for the reims-graphics
-# device: one [[kext]] per Kernel > Add entry, in order, after Lilu's, each the bundle
+# device: one [[kext]] per Kernel > Add entry, in order, each the bundle
 # beside this file named by BundlePath. Written by `make -C guest prebuilt`; do not edit.
 # The keys are OpenCore's, but sha256, the SHA-256 of the entry's executable.
 format = 1
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
+MinKernel = "20.0.0"
+MaxKernel = ""
 
 [[kext]]
-BundlePath = "ReimsGraphicsLoader.kext"
-ExecutablePath = "Contents/MacOS/ReimsGraphicsLoader"
+BundlePath = "Graft.kext"
+ExecutablePath = "Contents/MacOS/Graft"
 PlistPath = "Contents/Info.plist"
 Arch = "x86_64"
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
-Comment = "Binds ReimsGraphics to IOGraphicsFamily and AppleGraphicsDeviceControl"
-sha256 = "b4ba581f334b060d4b42d0c7d61353242197b5cfbe1ea36cd895d229ac7981d0"
-
-[[kext]]
-BundlePath = "RgfxIOGraphicsFamilyBridge.kext"
-ExecutablePath = "Contents/MacOS/RgfxIOGraphicsFamilyBridge"
-PlistPath = "Contents/Info.plist"
-Arch = "x86_64"
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
-Comment = "IOGraphicsFamily placeholders ReimsGraphics links against"
-sha256 = "347b0d81deeb1aba5a6bb2640c9f69bce68607b88b3d7fc5b7f43687ce365253"
-
-[[kext]]
-BundlePath = "RgfxAppleGraphicsDeviceControlBridge.kext"
-ExecutablePath = "Contents/MacOS/RgfxAppleGraphicsDeviceControlBridge"
-PlistPath = "Contents/Info.plist"
-Arch = "x86_64"
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
-Comment = "AppleGraphicsDeviceControl placeholders ReimsGraphics links against"
-sha256 = "12bded4c6d70f1177662195121927ca9ce0af450a80f3fcf79ba1b555887f95d"
+MinKernel = "20.0.0"
+MaxKernel = ""
+Comment = "Binds and routes the owned guest kexts"
+sha256 = "1f5c4d79ad933272e904168ada4d66d5b4d651c193c5fe4c17b4c7a4665a342a"
 
 [[kext]]
 BundlePath = "ReimsGraphics.kext"
 ExecutablePath = "Contents/MacOS/ReimsGraphics"
 PlistPath = "Contents/Info.plist"
 Arch = "x86_64"
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
+MinKernel = "20.0.0"
+MaxKernel = ""
 Comment = "The reims-graphics display, accelerator and device control"
-sha256 = "b091b773681dc6771d7cd807f877cd5c682e6cca3a21cd1c6ae61e8342473c89"
+sha256 = "c9bf0438bb000d4e2fd89818b69e6cfe33058bb4f9b3d8f0515c8df18b8279e5"
 
 [[kext]]
 BundlePath = "RgfxGate.kext"
 ExecutablePath = "Contents/MacOS/RgfxGate"
 PlistPath = "Contents/Info.plist"
 Arch = "x86_64"
-MinKernel = "25.4.0"
-MaxKernel = "25.99.99"
-Comment = "Installs the reims-graphics Metal bundle and lets macOS load it"
-sha256 = "44d238921f7b5e20afd64649c464ad2a8748d7e35b89ea0c2e08a66b4c4af0b7"
+MinKernel = "20.0.0"
+MaxKernel = ""
+Comment = "Installs the reims-graphics Metal bundle and admits it"
+sha256 = "1c3804c31ad1348725bbd2f77f81ff8fb286c6ec697afa19699c5e8270580039"

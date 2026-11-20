@@ -7,11 +7,13 @@ measured, read or inferred tags, are kept outside the repository.
 
 ## Goal
 
-A second lane beside the Apple paravirt lane, with our own guest kext and
-Metal GPU bundle, our own protocol, and our own QEMU device and host side.
-Resources are stored and rendered in host GPU memory. The guest names them by
-handle, and the guest CPU reaches GPU memory only where Metal gives it a
-pointer.
+Our own GPU device for macOS guests, with our own guest kext and Metal GPU
+bundle, our own protocol, and our own QEMU device and host side. It has its
+own PCI vendor:device ID, so Apple's paravirt kext never matches it, and it
+serves x86-64 guests through OpenCore and arm64 guests from macOS 14 on
+Ambrosia (Decided 13). Resources are stored and rendered in host GPU memory.
+The guest names them by handle, and the guest CPU reaches GPU memory only
+where Metal gives it a pointer.
 
 It is engineered for maximum performance from the first version, without
 cheating: every result a guest observes is Metal's, and no fast path trades
@@ -31,6 +33,9 @@ Stages:
    a VM is given. The lane serves x86-64 guests: Apple says third-party kexts
    are not supported in macOS VMs on Apple silicon, and vmapple guests boot
    the same way, so arm64 guests stay on the Apple lane.
+   Superseded 2026-11-08: one lane. Apple's paravirt lane is deleted
+   (2026-11-07), and arm64 guests from macOS 14 take this device's arm64e set
+   on Ambrosia (Decided 13).
 2. **The cut: Metal-level calls.** The guest bundle streams Metal's calls,
    and the host decodes them into the library's `Platform`, which has a Metal
    and a metal2vulkan implementation, so both arms come with it. A
@@ -113,7 +118,7 @@ Stages:
    - IOSurfaces are the one place the host reaches guest RAM: where the
      device has `RGFX_FEATURE_SURFACE_PAGES`, the host maps a surface's own
      guest pages for its GPU in place (Decided 14, "Today"), from the guest
-     RAM's map QEMU gives it, as the apple-gfx lane maps guest memory.
+     RAM's map QEMU gives it.
    - VRAM mapped into the guest was considered and dropped. It needed kernel
      6.13 or later and resizable BAR, and was good for guest writes only:
      measured on amdgpu, CPU reads from VRAM run at 15 MiB/s with memcpy,
@@ -122,11 +127,70 @@ Stages:
    - The BAR is one host memory region that the device reserves at start and
      registers with KVM once. Blocks are ranges inside it, so making or
      freeing a block never changes the VM's memory map. It is ordinary
-     cached memory, and the guest maps it write-back. Uncached loads cost
-     79-138 ns against 2-4 ns cached, and AMD CPUs apply the guest's choice.
-   - The region is private anonymous memory of QEMU's process, and the host
-     side runs in that process: RADV refuses to import a memfd's or any shared
-     mapping (measured on the 780M and the RX 7900 XTX).
+     cached memory on the host, but the guest's kernel maps it uncached
+     wherever the kext asks for write-back: xnu's pmap sets PCD on every page
+     it does not manage (its PAT's UC-), and the region is no RAM of the
+     guest's. A write-combined ask takes, since the region's descriptor is
+     physically contiguous and xnu's fault path maps such an object's pages
+     in its own mode (read from the public xnu source: vm_fault's
+     `pmap_map_block_addr`). An AMD
+     host applies the guest's memory type, where an Intel host's EPT ignores
+     it: measured on the Radeon 780M host, the guest's stores there ran at
+     13 MB/s and its loads at 8 to 180 MB/s, against 5.6 to 123 GB/s in its
+     own RAM. Uncached loads cost 79-138 ns against 2-4 ns cached. So what
+     the CPU touches most lies in the process's own pages instead (its Shared
+     and Managed buffers' slabs and its upload chunks, "Managed storage", and
+     its indirect command buffers' slots, `ICB_SLOTS_IN_PAGES`),
+     and what the process only writes takes a write-combined part of its
+     block, which the kext maps so (a submission ring's data, command
+     buffers' bodies and a library's staging chunks; the bundle's
+     `RgfxRegion.hpp`): measured on the 780M host, draws.10k's encode took
+     9.2-9.5 ms with everything in the region, 7.7 ms with the slabs and
+     chunks in the process's pages, and 1.05-1.3 ms with those parts
+     write-combined as well. The kext maps those parts from a descriptor of
+     the region of their own: a mapping's cache mode is set on its
+     descriptor's one VM object, for every page of it, so asked of the
+     region's own descriptor it would hold for every region page faulted
+     after it, and each later write-back ask would walk the object's pages
+     to take it back (`RgfxAccelerator::copyWriteCombinedRegion`).
+     The kext writes ring 0's submit data the same way on x86-64: the
+     data's whole 4 KiB pages past its header's, through a write-combined
+     map of a descriptor of their own, the header's page uncached
+     (`RgfxControlRing.hpp`). A write-combined store is ordered with no
+     later store, so the kext fences its stores (SFENCE) before it stores
+     the producer: the host never sees the producer before the data it
+     covers. arm64 maps no write-combined part, and its release store of the
+     producer orders the data's stores before it. `control_ring_test` holds
+     both orders, under each architecture's rules. Measured in Geekbench's
+     Metal Super Resolution on the 780M host, a SubmitBatch call, the
+     creates and destroys a commit posts there, took 33.6 us p50 (59.4 p90)
+     with the data uncached and 31.3 us (58.2) write-combined, so the data's
+     stores are a small part of it (15.2 us p50 on the Iris Xe host, whose
+     EPT ignores the guest's memory type). The kext's kdebug stamps split the
+     call (33.3 us p50 in the same benchmark): 16.1 us went to the look-up of
+     the framebuffer, which every post made, 5.5 us to ring 0's doorbell
+     write, an exit to the host, 4.7 us to the system call's entry and 3.4 us
+     to its return, and 1.0 us to the data's stores. The look-up is the
+     guest kernel's own code, 1.6-1.8 times slower on the 780M host than on
+     the Iris Xe; the exits, entry and return cost the same on both hosts
+     when warm, and grow after an idle. The kext now keeps the framebuffer
+     it found started, and a commit behind held messages publishes its
+     buffer in the same call ("A commit behind held messages is one call"),
+     so the call now goes to the exits: 18.9 us p50 in the same benchmark
+     (entry 4.6, ring 0's doorbell 5.4, the queue's doorbell 4.1 where the
+     host's queue thread sleeps, return 3.3, the kext's own work about 3),
+     and the benchmark's own doorbell calls fell from 763 to 166. A commit
+     behind held messages, timed in the guest, took 17.4-18.0 us p50 before
+     and 8.7-9.6 us after on the 780M host, and 15.1-15.2 us before and
+     8.8-9.0 us after on the Iris Xe (11-14).
+   - The region is memory of QEMU's process, and the host side runs in that
+     process. On Linux it is a shared mapping of a memfd of the library's
+     (`reims-vgpu-vulkan`'s `RegionMemory`): RADV refuses a pointer to a
+     memfd's or any shared mapping (measured on the 780M and the RX 7900 XTX),
+     and imports dma-bufs of each block's pages instead, which cost a
+     submission the same at any size, where amdgpu walks every page of every
+     pointer import in each submission; NVIDIA imports it by pointer. On macOS
+     it is private anonymous memory.
    - Blocks are few and large, each imported into Vulkan once, and the guest
      sub-allocates buffers inside them. RADV lists every import in every
      submission, and an import costs 17-43 us plus about 16 us per MiB of
@@ -209,6 +273,30 @@ Stages:
      no (Metal4, ray tracing, function pointers, dynamic libraries and the
      rest). One table in `crates/reims-vgpu/src/graphics/device_info.rs`
      lists each such answer with what it waits on.
+   - The guest's architecture, which the host names in the device's config
+     (`guest_arch`, from QEMU's target), decides one answer:
+     `isFramebufferReadSupported` is the host GPU's for an arm64 guest, as
+     an Apple silicon Mac answers yes, and no for an x86-64 guest, as an AMD
+     Mac answers (an Intel UHD 630 answers yes). CoreAnimation in an arm64
+     guest blends its generic shader against a destination it reads by
+     framebuffer fetch, which it compiles in by this answer: with no, the
+     menu bar drew black (2026-11-09).
+   - It also decides the class of Mac the host's GPU device presents to
+     metal2vulkan's runtime (`GuestArch::mac_class`), whose GPU results
+     Metal leaves to the Mac's GPU: an Apple silicon Mac's for an arm64
+     guest, an Intel or AMD Mac's for an x86-64 guest, whatever GPU the
+     host has. On Apple silicon a new `Private` texture reads Metal's
+     fixed pattern where Metal keeps it compressed (an `RGBA8Unorm` one
+     opaque magenta), blits through such a texture write three formats'
+     canonical encodings, a `half` NaN clear keeps its sign, and a `Clear`
+     load in a pass without a draw call reaches the whole level of a
+     compressed texture and the render area's 32x32 tiles of another; on
+     an Intel or AMD Mac a new `Private` texture holds what its memory held
+     (zero, filled so, on an Apple GPU), blits keep their bytes, the NaN
+     clear goes through `half`, and the `Clear` load reaches the whole
+     level. The runtime fixes the class of a device as it makes it, so it
+     is the process's, taken from its first graphics device; QEMU makes
+     every device of a process for its own target's guests.
 11. **Stage 2 lays the final transport.** The rings, doorbells, interrupts,
     contexts and the display path are the final ones from stage 2 on, and
     stage 3 adds commands to them. The stage 2 display scans out host memory
@@ -220,43 +308,113 @@ Stages:
     matches any display-class device. WindowServer composites in software
     with no Metal device: x86-64 macOS 26.5.2, 26.6.1 and 26.7.1 reach the
     desktop that way ("Software compositor activated"; measured).
-13. **Loading: through OpenCore, with a bridge for our kext only.** OpenCore
-    injects kexts into the Boot kernel collection and links them only against
-    Boot-collection symbols, but a display kext uses IOGraphicsFamily, which
-    is in the System collection. So our kext loads through a loader, a Lilu
-    plugin, and two generated shims: ReimsGraphicsLoader
-    (guest/loader/README.md). The image carries only Lilu and the set
-    `make -C guest set` builds, in this order: the loader, the shims for
-    IOGraphicsFamily and AppleGraphicsDeviceControl, ReimsGraphics.kext,
-    and RgfxGate.kext. None of the x86-64 port's kexts are in it, and the
-    loader needs none of them. Nothing of the guest OS is patched or hooked
-    beyond what the loader does.
+13. **Loading: through OpenCore, bound by Graft.** OpenCore injects kexts
+    into the Boot kernel collection and links them only against
+    Boot-collection symbols, but a display kext uses IOGraphicsFamily and
+    AppleGraphicsDeviceControl, which are in the System collection. So
+    ReimsGraphics is built with Graft's consumer rules
+    (`guest/graft/sdk/consumer.mk`): its System-collection imports point at
+    placeholders inside the kext, and it carries a manifest
+    (`__DATA,__graft`) of every imported site and of the library classes it
+    derives from, with no System-collection `OSBundleLibraries`. Its
+    personalities stay, each gated by an `IOPropertyMatch` requiring
+    `ai.aneesiqbal.ReimsGraphics.graft-bound` on its provider, and the
+    manifest carries each personality's provider matching (its
+    `IOProviderClass` and `IOPCIPrimaryMatch`: the 1234:5247 device).
+    The personalities hold those and the keys that name the driver
+    (`IOClass`, `CFBundleIdentifier`, `IOProbeScore`, `IOMatchCategory`)
+    alone: the accelerator sets its driver keys on its registry entry in
+    `start` ("Stage 3 accelerator kext").
+    OpenCore links that dormant kext in the Boot collection. Graft
+    (`guest/graft`, a copy of Graft's release build) starts from its own
+    kext start and finds ReimsGraphics among the placed kexts by its
+    manifest. Once the libraries are registered, it checks each parent
+    class's size and vtable against the running library, resolves each site
+    by name, writes the sites and vtables, then sets the gate property on
+    each nub a personality's provider matching matches, the 1234:5247 nub,
+    and registers the nub again. The registry root's
+    `GraftClient.ai.aneesiqbal.ReimsGraphics` reads `bound: imports and
+    vtables committed; waiting for a provider of personality <names> to
+    open the gate` once the sites and vtables are written while no such nub
+    is published yet, and `bound: imports and vtables committed; activation
+    gate open on a provider of personality <name>` once the property is set
+    on one, which the lane gate's `graft-bind` check requires. Until then the passive property match fails,
+    so IOKit does not even construct ReimsGraphics' classes, whose parent
+    constructors run through the sites (an `IOResourceMatch` would hold
+    back only `start()`). On a missing symbol or a layout that
+    differs, Graft declines ReimsGraphics by name in its log and in the
+    registry root's `GraftClient.ai.aneesiqbal.ReimsGraphics`, and the
+    guest boots on. The image carries the set `make -C guest set` builds,
+    in this order: Graft.kext, ReimsGraphics.kext and RgfxGate.kext.
+    OpenCore injects it from Darwin 20 (macOS 11), the releases whose
+    x86-64 matrix row passes in full (`MIN_KERNEL` in
+    guest/tools/prebuilt.py); a release joins once its row passes.
+    Nothing of the guest OS is patched or hooked beyond what Graft does for
+    these two.
     - Iterating: patch a copy of a VM's OpenCore image directly
       (scripts/internal/opencore-add-kexts.sh). No rebuild inside the guest.
-    - The loader binds our kext from a table generated from one build of
-      it. The table holds each bridge site by its offset in the binary: a
-      GOT or vtable pointer, or a call into IOGraphicsFamily or
-      AppleGraphicsDeviceControl. Swapping a new ReimsGraphics binary into an
-      image's set therefore binds only while those sites stay put. A change
-      that grows the kext's `__const` or `__data` (a new initialized global,
-      or a member of one) moves every pointer after it. A change in an
-      object linked before the provider calls (`ReimsGraphics.o`,
-      `RgfxAccelerator.o`) moves those calls. Either fails to bind. To spot
-      it, the loader logs `rgfxload: ... ReimsGraphics: got +0x...
-      <symbol> failed the placeholder check (old 0x...)`, then
-      `publish: ReimsGraphics not ready (bind failed)`, and the guest boots
-      with no framebuffer or Metal device. So never swap ReimsGraphics
-      alone: `make -C guest set` builds the kext, its shims and the loader
-      together, and stages the kext with an `Info.plist` whose
-      `OSBundleLibraries` name the shims and which carries no personalities.
-      The kext build's own `Info.plist` makes OpenCore refuse the kext
-      ("Prelinked injection ReimsGraphics.kext ... Invalid Parameter" on
-      the serial log).
+      Graft reads the sites from the kext's own manifest, so a new
+      ReimsGraphics binds without a new Graft. Swap in the kext
+      `make -C guest/kext` builds: that build stages it dormant with its
+      manifest. A kext built without Graft's rules carries personalities
+      and System-collection libraries, which OpenCore refuses.
+    - Checking: `make -C guest set-check` links the set into a release's
+      Boot collection with OpenCore's own linker, in user space, and checks
+      with Graft's `graft-kext check-prelinked`, built from the SDK's
+      sources, that the manifest and every site survive it.
     - Shipping: the repository carries the set prebuilt in guest/prebuilt,
       with its Kernel > Add entries in `set.toml` and the record of its
       sources in `sources.toml` (`make -C guest prebuilt`;
       `make -C guest prebuilt-check` fails when they differ from the tree).
       reims-ctl adds the set to an image, since a Linux host cannot build it.
+    - Arm64 guests: the same sources build for arm64e (`ARCH_NAME=arm64e`)
+      into a second set, guest/prebuilt-arm64e (`make -C guest
+      prebuilt-arm64e`), for the arm64 guests from macOS 14 that Ambrosia
+      boots (arm64 macOS 11 to 13 are not supported for now: 13.6 offers
+      the device no MSI, and the kexts have no INTx path); Ambrosia's config bundle adds it to the guest's kernel
+      collection (docs/qemu.md, "arm64 guests"). An arm64 kernel collection
+      has no AppleGraphicsDeviceControl and no IOAcceleratorFamily2, so the
+      arm64e kext has a Graft declaration and an Info.plist of its own
+      (src/graft-arm64e.json, src/Info-arm64e.plist): IOFramebuffer and
+      IOAccelerator from IOGraphicsFamily, and no device control. The set
+      starts with Graft's arm64e build, Graft-arm64e.kext from guest/graft,
+      which starts each library the arm64e manifest declares,
+      IOMobileGraphicsFamily among them, before it binds against it.
+    - The arm64 display (owner, 2026-11-08): an arm64 WindowServer drives no
+      IOFramebuffer (measured on 27.0.1 with SIP on: a bound IOFramebuffer
+      consumer got no user client, and the system had no
+      IOFramebufferUserClient with WindowServer up), so the arm64e display
+      is an IOMobileFramebuffer: a subclass of IOMobileFramebufferLegacy,
+      as Apple's own paravirtual display, AppleParavirtDisplay, is on every
+      release from 13 to 27. Its vtable grows release by release (Legacy's
+      has 445 slots on 13.6 and 484 on 27.0.1), so Graft builds the
+      subclass's vtable from the live parent at bind time and places its
+      overrides by method. The front end (ReimsGraphicsMobile.cpp)
+      publishes the display as the paravirtual display does: its
+      attributes, and its modes as IOAVFamily's timing and colour elements,
+      a timing for each mode the device lists and one 8-bit colour mode.
+      WindowServer sets one of them by its colour and timing IDs
+      (set_digital_out_mode), which the device then shows by `SET_SCANOUT`,
+      as x86-64's setDisplayMode does. The display is external and
+      plugged in from its start (`hotPlug_notify`), as the paravirtual
+      display's are: WindowServer reads an external display's modes, and
+      sets one, at its start and at each hot-plug notice, and asks for an
+      internal display's notices only on 27 (QuartzCore's AccelServer and
+      IOMFBDisplay). The display starts in its preferred mode
+      (start_hardware), which WindowServer then sets.
+    - The arm64 display's cursor and mode changes, as the paravirtual
+      display has them: a swap's layer 1 is the display's cursor
+      (RgfxMobileCursor.hpp), and the display publishes `CursorPlane`. A
+      swap that gives layer 1 sets the device's cursor from its surface's
+      image (`SET_CURSOR`, through the cursor's slot) and moves it
+      (`MOVE_CURSOR`, the swap's place plus the hot spot), or hides it
+      where the layer has no surface; a surface with no image is shown as
+      the swap's in place of layer 0's. A change of the device's modes
+      (`DISPLAY_CHANGED`, as a resize of the host's window makes one)
+      publishes the display's attributes and modes again, shows the new
+      preferred mode where the device no longer lists the one shown, and
+      tells WindowServer through the class's hot-plug notice
+      (`hotPlug_notify`) and `kIOMessageServicePropertyChange`.
 14. **IOSurfaces follow the discrete model.** IOSurface.kext allocates
     surfaces in guest RAM, CAMetalLayer drawables and window backing stores
     included. The accelerator gets a per-surface device cache with a sync
@@ -276,8 +434,10 @@ Stages:
       over every plane (the base is a page's, each plane's offset from it and
       its rows are multiples of the host's linear texture alignment, every
       plane lies in the allocation), the bundle asks the kext for the surface's shared
-      block in place. The kext wires the surface's whole allocation, writes
-      its page runs into the block past the part the processes map, and
+      block in place. The kext wires the surface's whole allocation (on
+      x86-64 it first faults in the pages from the last down, so that the
+      kernel lays them out in runs of a 16 KiB clump: `RgfxTopDown.hpp`),
+      writes its page runs into the block past the part the processes map, and
       hands them to the host (`SURFACE_PAGES`, answered), which maps them as
       one view. Each process's buffer lies over the view
       (`BUFFER_OVER_SURFACE_PAGES`), and each texture over its plane's own
@@ -366,15 +526,59 @@ Stages:
     - **The device cache:** where the host's GPU does not share the CPU's
       memory, the device has `RGFX_FEATURE_SURFACE_CACHE`, and a block the
       kext marks cached (`RGFX_SURFACE_PAGES_CACHED`) gets a device cache on
-      the host: a Private buffer of the surface's bytes in the pages' layout,
-      which every buffer over the block is, so every texture over the
-      surface, of any shape, plane or format, lies over the same bytes. Each
+      the host: a Private buffer of the surface's bytes, which every buffer
+      over the block is, so every texture over the surface, of any shape,
+      plane or format, lies over the same bytes. The
+      block's `SURFACE_PAGES` carries the surface's `RgfxSurfacePagesLayout`
+      where the bundle gave it, a deferred block's too, and the host lays
+      the cache out by it as by an ask's layout (below, *Device caches on a
+      GPU that shares the CPU's memory*): its first plane's first byte where
+      the host's GPU's textures over the cache may start in place, as
+      CoreVideo lays a frame's planes 32 bytes into their surface, past every
+      linear image's alignment measured (128 bytes on an RTX 5080 Laptop
+      GPU, 256 on RADV), so the textures over a decoder's planes are images
+      of the cache's own memory, not the runtime's shadows, which copy them
+      in before each command buffer's use; and its copies into the pages
+      take the surface's texels alone, each plane's rows, so its buffer
+      declares the bytes between a texture's rows unobserved, and a texture
+      whose rows lie with bytes between them may be an image over the
+      cache's memory too, where the runtime makes one (on an RTX 2080 it
+      makes none, for reasons of its own: `decode::surface_cache`). Where a
+      plane's rows lie at another pitch than the GPU's own linear images lay
+      them (CoreAnimation names its backing stores' rows at multiples of 64
+      bytes, and RADV lays its images' at 256), the host lays the cache's
+      planes out at the GPU's pitch instead, each texture over a plane at
+      the same byte of the same row there, and the cache's copies move each
+      row between its place in the pages and its place in the cache
+      (`decode::surface_cache`, "Laid out at the GPU's pitch"). A texture
+      over the surface that does not lie in its plane's texels there (wider
+      than the plane's row, or taller, which Metal makes inside the
+      surface's rows) lies over the block's wide home at the surface's own
+      place and pitch: over its view of the pages where it has one, else a
+      stand-in of their layout; each encoder that writes through either side
+      is followed in its command buffer by a copy of its texel rows into the
+      other (`decode::surface_cache`, "Wider than the plane";
+      dgpu-oracle.md Q37). The
+      answer is that of a message with no layout. Each
       command buffer names the cached surfaces it uses
       (`RGFX_OP_SURFACE_USE`) with the kext's count of the surface's
       read-write locks when it was committed; the host fills the cache from
       the pages before the first buffer of a newer count, on its own transfer
-      queue, after every buffer that used the cache before. The pages are
-      written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
+      queue, after every buffer that used the cache before. A new cache is
+      made as zeros and owes its first fill from the pages, as of the count in
+      the block's header then, which the first thing that reads it makes: a
+      named use, a present, a buffer of render, compute or blit work in the
+      process that made the block's first buffer, and a buffer over the block
+      in any other, so a texture that a buffer reaches through an argument
+      buffer with no `useResource:` (which no `RGFX_OP_SURFACE_USE` names)
+      reads the pages. A buffer of decodes alone that writes the whole of both
+      planes of a new two-plane 4:2:0 surface (a decoder's new output) takes
+      the fill as met instead: its picture lands over the zeros, and the
+      cache's copies into the pages copy those planes' rows alone from then
+      on, so the pages' other bytes (CoreVideo's header) stay as the CPU wrote
+      them; a decode that answers no picture makes the fill. A block named
+      again over the same pages is filled again, as of the count then. The pages
+      are written from the cache only at `SURFACE_DOWNLOAD`, which the kext asks
       at a CPU lock that follows a GPU write, and at the block's
       `BLOCK_RELEASE`, and only where a buffer that may write the surface was
       committed since the last copy (`reims-vgpu`'s
@@ -404,8 +608,16 @@ Stages:
         since a fill waits for it; a buffer of an older count taken after a
         fill of a newer one (two queues' buffers committed apart and taken in
         the other order) reads the newer bytes; a download of a cache nothing
-        wrote since its last copy copies nothing; and a host whose GPU shares
-        the CPU's memory keeps no cache, its surfaces in place as above.
+        wrote since its last copy copies nothing; a decoder's new output whose
+        picture fails to land, or lands short of its planes, reads zeros where
+        the picture did not write, where the pages would give their bytes
+        (Metal leaves a failed decode's output undefined, and a new surface's
+        texels are the kernel's zero-filled pages unless its client wrote them
+        under a lock, which moves the count and has the decode's use fill the
+        cache); and a host whose GPU shares
+        the CPU's memory keeps a cache only of a surface whose textures
+        cannot lie in place over its pages (below), the rest in place as
+        above.
       - *Which surfaces are cached:* the guest's choice, and the host's
         invalidation. The bundle asks every block in place cached, of any
         planes and format, as a GPU of its own memory keeps a copy of each
@@ -417,7 +629,12 @@ Stages:
         the bus into the pages. The outputs of the bundle's own video driver
         ask no cache where the host lands no picture in one (no
         `RGFX_VIDEO_CAPS_OUTPUT_CACHED`, item 16), its decode writing their
-        pages: their textures ask under `RgfxAskUncachedScope`. Correctness
+        pages: their textures ask under `RgfxAskUncachedScope`. A host
+        whose hardware video lands pictures in device caches says the flag
+        wherever the kext makes them, on a GPU of its own memory
+        (`SURFACE_CACHE`) or one that shares the CPU's
+        (`SURFACE_CACHE_REFUSED`), where the outputs then ask with their
+        layout as any other surface does. Correctness
         does not rest on that choice:
         a surface a host-side device writes (the M2 scaler, the VideoToolbox
         decoder) may be cached all the same, and the host invalidates the
@@ -487,16 +704,64 @@ Stages:
         use). Where the kext took `RGFX_FEATURE_SURFACE_DEFERRED`, and no
         IOSurface mapper device (`IOSurfaceParavirtMapperService`) is matched,
         a cacheable ask in place of a surface that reads fresh (its seed 0,
-        none of its pages resident) defers its block: the kext makes the
-        device cache and sets its control function first, then reads the seed
-        and the resident pages under a read-only `lockSurface`, which waits
-        out any lock calling the control functions, so a read-write lock
-        either moved the seed before the read or calls the control function
-        after it (`RgfxIOSurfaceKPI.hpp`). Found fresh, its `SURFACE_PAGES`
+        none of its pages resident, compressed or paged out) defers its
+        block: the kext makes the device cache and sets its control function
+        first, then reads the seed and the pages' counts under a read-only
+        `lockSurface`, which waits out any lock calling the control
+        functions, so a read-write lock either moved the seed before the read
+        or calls the control function after it (`RgfxIOSurfaceKPI.hpp`). A
+        page a writer that takes no lock dirtied is resident, or, compressed
+        or paged out since, counted so, and holds bytes the cache's zeros
+        would lose. The kext counts only a surface whose memory is a buffer
+        the kernel allocated (`IOBufferMemoryDescriptor`, anonymous memory,
+        never a client's own, which may be a file's). It counts them on every
+        kernel the same way: it maps the memory read-only into the kernel's
+        map for the count (IOKit puts a pageable buffer's kernel mapping
+        inside one of its pageable maps, a submap of the kernel's, which the
+        kext finds through `IOIteratePageableMaps`), and `mach_vm_region`'s
+        `VM_REGION_EXTENDED_INFO` walks the mapping's regions, which count
+        each page resident or compressed or paged out (`pages_swapped_out`;
+        **measured** on 11.7.11 against each page's disposition, with the
+        pages in the compressor and on swap). `mach_vm_region` and
+        `kernel_map` are strong imports from `com.apple.kpi.unsupported`,
+        which every release kernel checked exports (x86-64 11.7.10 to 26.7.2,
+        arm64 13 to 26). The regions must be the mapping exactly, none a
+        pager's: a region past it, a gap, or one with nothing to count
+        refuses the count. A surface not counted is never fresh, so its
+        block's pages are named at its ask
+        (`guest/kext/src/RgfxAcceleratorLocks.cpp`). Found fresh, its `SURFACE_PAGES`
         carries `DEFERRED` and no runs, the block keeping room for one run a
         page of the whole allocation, every plane's; the host makes the cache
         as zeros. Not fresh, or refused, the kext names the pages at once, as
-        for any block. A deferred block is found by its surface, never by
+        for any block. A surface no CPU lock touched may still have a few
+        pages resident, written by a process that takes no lock:
+        **measured** on the 780M, VTDecoderXPCService writes page 0 of each
+        new decoder output before the first decode (all 208 of a 4K HEVC
+        session's in Safari, macOS 26, the other pages never resident), so a
+        test of no page resident named each one's 12 MiB at once, wired and
+        filled with zeros (5 to 7 ms of the guest's each). Where the kext
+        took `RGFX_FEATURE_SURFACE_DEFERRED_CARRY`, the bundle's cacheable
+        ask lists after the layout the surface's resident pages it finds in
+        its mapping (`mach_vm_page_range_query`), 16 at most, and the kext
+        defers a surface fresh but for them: under the same read, the fresh
+        test's own verdict on its counts with as many pages resident as listed
+        and none compressed or paged out (so where nothing is counted nothing
+        is carried), the listed runs wired with `kIODirectionPrepareNoFault`,
+        and the counts read again after the wire the same, so a listed page
+        not resident either fails the wire or, faulted in, raises the count,
+        and a page written or compressed meanwhile shows too (**measured** on
+        a macOS 26.7.2 guest: such a wire fails, `kIOReturnNoResources`,
+        faulting nothing in; `guest/kext/src/RgfxDeferCarry.hpp`). Its
+        `SURFACE_PAGES` then carries `DEFERRED` with runs: the surface's bytes
+        in order, each carried page at its guest address, every other run
+        `RGFX_PAGE_RUN_ZEROS`. The host makes the cache of zeros and copies
+        the carried pages into it as a new cache's first fill, after the
+        zeros: before what reads the cache next, or never where a decode
+        writes the planes whole first. The kext keeps the carried pages wired
+        until the block's pages are named or its release is answered, and
+        lets them go at a refusal; any other read, a wire refused or a page
+        faulted in names the pages at once, as before. A deferred block is
+        found by its surface, never by
         pages, and its holders wire none. Its first read-write lock, or a
         read-only one after a GPU write, wires the pages and names them
         (`ATTACH`) before it goes on, one lock at a time, under no lock of the
@@ -510,6 +775,540 @@ Stages:
         blocks fit the host's budget (`DEFERRED_BUDGET_LO` and `_HI`), held
         and dormant, and dormant ones are let go past half of it, the oldest
         first (`guest/kext/src/RgfxSurfaceBlocks.hpp`).
+    - **Device caches on a GPU that shares the CPU's memory:** there a
+      surface's textures use its pages in place, but not every surface's
+      can. The runtime makes a texture over pages it cannot place one over
+      (rows that end inside the line of memory the GPU writes back whole, on
+      an Intel GPU; more pieces than one dma-buf takes, on RADV) its own copy,
+      a shadow, which every command buffer copies in before its first use
+      and merges back after a write. Such a surface takes a device cache
+      instead, copied only at CPU locks and unlocks, as on a GPU of its own
+      memory: IOSurface's own protocol, with no tracking of its own, while
+      every other surface stays in place. The host offers
+      `RGFX_FEATURE_SURFACE_CACHE_REFUSED` and not `SURFACE_CACHE`, and
+      decides surface by surface: the kext asks at a new cacheable block in
+      place (`RGFX_SURFACE_PAGES_ASK_CACHE`), with the surface's planes as
+      the bundle gives them (each plane's offset, rows, row pitch and the
+      bytes of a row's texels), and the host maps the pages and asks its
+      platform whether textures over them, for any access (a read, a render,
+      a shader's write), lie in place (`GpuDevice::surface_pages_in_place`;
+      the Vulkan platform's `gpu/pages_in_place.rs`, which asks the runtime
+      where a texture over each plane lies, as its making decides: the
+      device's check of the pages, the rows' pitch and place, the texels'
+      reach). Where they do, where the runtime's verdict is not known yet,
+      or where a texture over a cache would be the runtime's copy too, it
+      answers OK, the block in place. Where they do not, it answers
+      `RGFX_STATUS_CACHE`, its view of
+      the pages left in its cache of views, and the kext makes the surface's
+      device cache and posts the block again cached, which takes that view
+      and the host's cache, kept from then on as above. It answers
+      `RGFX_STATUS_CACHE` too, with no view made, where the platform has no
+      room for the view's kernel mappings (`HostVm::view_room`; on Linux the
+      views' budget short of its headroom, which Intel's ANV, importing a
+      view's pages only mapped from their files, a mapping a run, reaches at
+      a stock `vm.max_map_count`; a view one udmabuf holds, within 1,024
+      runs and 64 MiB at its stock limits, takes one mapping instead on a
+      device whose textures over it lie in place, `ONE_DMA_BUF_VIEWS`, ANV
+      at metal2vulkan fb33065288): past that room the view's buffers would
+      be copied rather than imported. Such a cache's copies
+      into the pages copy the surface's texels alone, each plane's rows from
+      the layout the ask gave, so the bytes between rows stay as the guest's
+      CPU wrote them, whatever a render over the cache leaves in its own
+      (`decode/surface_cache.rs`, "Download"). So the cache's buffer
+      declares the bytes between a texture's rows unobserved
+      (`GpuDevice::new_buffer_of_length_padding_unobserved`; metal2vulkan's
+      `BufferDescriptor::padding_unobserved`), and a texture over it whose
+      rows lie with bytes between them, the desktop's among them, is an
+      image over the cache's own memory that holds them, not another copy
+      of the texels. A block asked with no
+      layout (an older bundle's) stays in place, as every block of such a
+      host did before (`reims-vgpu`'s `graphics/decode/surface_pages.rs`,
+      "Device caches where the pages cannot serve").
+      Such a surface's pages are the CPU's copy alone, so where it is fresh
+      they wait for a CPU lock that needs them, as *Deferred pages* above
+      has them on a GPU of its own memory. The host offers
+      `RGFX_FEATURE_SURFACE_DEFERRED_ASK` beside `SURFACE_CACHE_REFUSED`,
+      with a budget as `SURFACE_DEFERRED`'s, and the kext's deferral then
+      asks with the surface's layout (`DEFERRED` with `ASK_CACHE` and no
+      runs). The host defers the block only where textures over the layout
+      would lie in place over no import of any pages the surface may come
+      to have (`GpuDevice::fresh_surface_never_in_place`, the runtime's
+      answer before any import of the pages, which makes no image): rows
+      that end inside the GPU's lines, which no pages change, or, on RADV, a
+      plane of more pages than one dma-buf takes pieces, each counted a piece
+      of its own, as a fresh surface's come (**measured** on the 780M: Safari's
+      WebKit tiles of 1,824 pages came in 1,379 to 1,824 runs). It refuses
+      every other with nothing made, as it refuses one past its budget, and
+      the kext then names the block's pages asking as above: answered a
+      cache, it posts them again cached; answered OK, the surface is not
+      cached, and the device cache's entry the deferral made goes. So no
+      surface whose pages could serve in place takes a cache for being
+      deferred, and a full budget leaves a surface as it was without the
+      feature. A deferred block is the deferred block above from then on:
+      its pages wired, named (`ATTACH`) and copied into the cache only at a
+      CPU lock that needs them. Before it, Safari's WebKit tiles, which the
+      GPU alone draws, wired each its 7 MiB of the guest's memory at its
+      first use, with the host copying the zeros into the cache, and the
+      wired pages counted in the owner's footprint though WebKit marked the
+      tiles volatile: about 400 of them took a WebContent past its 2 GB
+      footprint limit (**measured** on the 780M and the Iris, an 8 GiB
+      macOS 26.7.2 guest scrolling a long page), whose corpse and memory
+      pressure stalled it for 100 to 800 ms.
+      The guest lays its surfaces' rows out as the GPU's images take them
+      in place: where the host's GPU aligns a linear image's rows to more
+      than IOSurface's 64 bytes (256 on RADV), the host says so in the
+      device info's `linear_row_alignment`, and the kext has IOSurface align
+      the bytes per row and the plane offsets it works out for a surface to
+      it, at the accelerator's start, as a GPU's accelerator does
+      (`IOSurfaceRoot::updateLimits`; `guest/kext/src/RgfxSurfaceRows.hpp`),
+      since the GPU's linear image of a plane starts at such an offset too.
+      IOSurfaceGetPropertyAlignment answers both to the processes that work
+      out their own. A client that places its planes or rows itself keeps
+      them (CoreVideo's first plane 32 bytes into its surface, its rows at
+      its own alignment, measured in a macOS 26.7.2 guest whose IOSurface
+      answered 256): a device cache of the surface places that plane where
+      the GPU's images may start (above), and a texture over it in the
+      pages that the GPU's linear images cannot hold is the runtime's
+      shadow. Macs answer 64 bytes there (Intel) and 128 (the M3),
+      and an Intel Mac's GPUs answer 256 for
+      `minimumLinearTextureAlignmentForPixelFormat:`, so rows at 256 bytes
+      lie inside what Macs do. A host whose GPU has memory of its own
+      answers its GPU's alignment as well (the runtime's
+      `minimumLinearTextureAlignmentForPixelFormat:` of BGRA8: 256 on RADV,
+      discrete or not, and 128 on the RTX 3090 and RTX 2080, docs/lessons.md):
+      a texture over a surface's pages takes the GPU's own linear image
+      there only where its rows lie at the GPU's pitch, and otherwise is the
+      runtime's shadow; a device cache of a surface whose layout the kext
+      gives lays the planes' rows at the GPU's pitch (*The device cache*,
+      above), so a texture over it takes the GPU's image whatever the
+      surface's pitch.
+      At the same start the kext lowers the largest surface IOSurface
+      answers to `IOSurfaceGetPropertyMaximum`, as a Mac's GPU accelerators
+      do: as wide and as tall as the device's 2D textures (the device
+      info's `max_texture_width_2d` and `max_texture_height_2d`, which the
+      bundle answers to Metal: 16384 on our device), and 16 bytes a pixel
+      of that width a row, the largest pixel a texture over a surface has
+      (`guest/kext/src/RgfxSurfaceLimits.hpp`). Macs answer 16384 wide and
+      tall (the Intel and AMD Mac with 131072 bytes a row, the M3 with
+      32768). Left at IOSurface's own INT_MAX, Safari 16.6 under macOS 13
+      drew no tiles of a page that scrolls only vertically at 1x
+      (**measured**, 13.7.8; docs/lessons.md).
+    - **Measured, 2026-11-13: surfaces in place first on a GPU of its own
+      memory.** A host whose GPU has memory of its own caches every surface
+      (*The device cache*, above). The unlanded branch `steelbrain/routeb`
+      has such a host offer what a GPU that shares the CPU's memory offers
+      (`SURFACE_CACHE_REFUSED`, `SURFACE_DEFERRED_ASK` and
+      `SURFACE_DEFERRED_CARRY`, never `SURFACE_CACHE` or
+      `SURFACE_DEFERRED`), so every surface lies in place first and takes a
+      device cache only where its pages cannot serve (*Device caches on a
+      GPU that shares the CPU's memory*, above). One walk per GPU, the same
+      in each run: the desktop, Finder, Launchpad, Mission Control, Safari
+      (a page's scroll and autoscroll, WebGL, a GL 3D page, a video) and
+      Maps. Each GPU ran it on development at b615cec64 and on the branch
+      over the same base, and the runs counted the compositor's presents,
+      the GPU's busy time per present, and the bytes on the GPU's link
+      (`nvidia-smi dmon`). In place first laid 3800 to 6900 textures in
+      place where the base laid 240 to 590, and on the NVIDIA GPUs the link
+      then carried 100 to 560 MB a present where the base's carried 1 to
+      44 MB: the GPU reads the layers it composites from guest RAM at each
+      present, changed or not.
+      - RTX 5080 (laptop, PCIe 5.0 x16): presents 6839 to 6415 (-6%), GPU
+        time 2.6 to 7.8 ms a present. Safari's scroll fell from 636
+        presents to 543, its longest gaps (p99) from 92 to 309 ms. The link
+        carried 130 MB/s to 6.6 GB/s over the walk, 16 GB/s at Launchpad.
+      - RX 7900 XTX (PCIe 4.0 x16): level, 5468 presents to 5503, 3.4 to
+        3.8 ms a present; the GL 3D page's GPU time 2.0 to 4.5 ms a present.
+        Its link's bytes were not read: amdgpu gives this GPU no `pcie_bw`.
+      - RTX 3090 (PCIe 3.0, the link trained at x4): presents 4818 to 1236
+        (-74%), GPU time 19.9 to 109 ms a present, and a present shown
+        3.5 to 110 ms (median) after its take. Launchpad fell from 197
+        presents to 30 with 559 MB a present at 2.1 GB/s, Mission Control
+        from 602 to 203 with the GPU 99% busy, Safari's scroll from 369 to
+        90 with its longest gaps (p99) from 0.4 to 6.3 s.
+      - RTX 2080 (Thunderbolt 3), the steps up to the GL 3D page: the GPU
+        fell off its bus (Xid 79) in the in-place run's video step, as it
+        had once before that day with neither run going. Launchpad fell
+        from 219 presents to 30 with 429 MB a present at 1.6 GB/s, Mission
+        Control from 607 to 200 with the GPU 99% busy, Safari's scroll from
+        374 to 91 with its longest gaps (p99) from 0.6 to 6.4 s, the GL 3D
+        page from 498 to 56; a present was shown 3.5 to 84 ms (median)
+        after its take.
+      The cost is the reads, and the link sets how much it is. At 16 GB/s
+      (the 5080) the GPU's time per present triples and the presents fall
+      6%; at the x4 links' 1.6 to 2.4 GB/s the GPU waits on them, and the
+      steps' presents fall three- to ninefold. The path's other work did
+      not grow: the runtime's first copies into its shadows over host pages
+      fell (10.1 to 9.8 GB on the XTX, 2.8 to 2.7 GB on the 5080, 1.7 to
+      0.4 GB on the 3090). On the XTX, in place first also took the
+      runtime's shadows off most of the video's frames: in the walk's 57 s
+      of 1080p video the runtime copied 74.0 million texels into shadow
+      images with every surface cached and 1.6 million in place first
+      (shadow copies 2230 to 977), the decoder's NV12 frames taking device
+      caches through the ask, whose textures are images over the caches'
+      own memory. A host whose GPU has memory of its own keeps caching
+      every surface until a cache can follow measured use (below).
+    - **Proposed, not built: in place first, caches by measured use.** In
+      place first (above) keeps a surface in place for its whole life, so
+      the GPU reads every layer it composites across its link at each
+      present. The proposal keeps every surface in place first and gives
+      one a device cache only once the guest's own use shows it re-read
+      unchanged, from guest behaviour alone, never from a table of hosts or
+      drivers:
+      - *Counting, on the host.* For each block in place, the decoder counts
+        the command buffers that read the surface (a texture over it
+        sampled or read, a blit from it, a render pass that loads it) since
+        its last write. A write is a command that writes it (a render
+        pass's store, a shader's write, a blit into it), or a CPU write by
+        the guest. The host sees a CPU write as the surface's CPU generation
+        moving in the block's header (`surface_cache::cpu_generation`), the
+        count the kext moves at each read-write lock in its op 2. IOSurface
+        calls op 2 only for a surface with a device cache, and a block in
+        place has none today, so the proposal gives each block in place a
+        device cache that copies nothing, for op 2's count alone. Whether
+        such a cache changes IOSurface's lock path in any other way is to
+        be checked (`RgfxIOSurfaceKPI.hpp`). A block read by N command
+        buffers with no write between them is promoted. N is measured, not
+        guessed: from the walks' counts of reads between writes per
+        surface, the least N at which the copy a promotion costs (the
+        surface's bytes across the link once, and back once at the next CPU
+        lock where the GPU wrote it) is below the reads it saves.
+      - *The step.* The host posts the kext a notice naming the block. The
+        kext names the block again, cached (`SURFACE_PAGES` with
+        `RGFX_SURFACE_PAGES_CACHED`, the naming a block takes today only
+        before any process holds it), once no submitted command buffer
+        holds it, and makes the surface's IOSurface device cache with it.
+        The host fills the cache from the pages and moves every buffer and
+        texture over the block onto it. From then on the block is a cached
+        block as any other: its command buffers name it in `SURFACE_USE`,
+        and its locks download as a cached block's do. A surface written by
+        the guest's CPU, or written between its reads, never leaves its
+        pages. Whether IOSurface takes a device cache for a surface that is
+        already in use is the first thing to check (`RgfxIOSurfaceKPI.hpp`).
+      - *The reverse.* A CPU write ends a promotion. IOSurface calls the
+        kext's op 2 at every read-write lock of a surface with a device
+        cache. There the kext asks `SURFACE_DOWNLOAD` where the GPU wrote
+        the surface since the pages last took the cache, as it does today,
+        and then names the block in place again. The host moves the block's
+        buffers and textures back over the pages, which by then hold every
+        GPU write, and lets the cache go once the command buffers that use
+        it finish. The CPU then writes the pages, and the block's count
+        starts over. A read-only lock leaves the promotion as it is.
+      - *The contract.* Every value that reached the guest stays: object
+        ids, GPU addresses, resource ids, and every texture's contents and
+        layout. CPU locks wait as they do now. The notice is a new event
+        behind a new `FEATURES` bit: a host whose GPU has memory of its own
+        offers in place first only with it, and a kext without it keeps
+        every surface cached, as now. Where the host can't promote (no room
+        in the GPU's memory, a texture the GPU can't place there) the block
+        stays in place: the fallback is at the refusal, on every driver.
+      - *What it needs.* The host can't move live objects today: each
+        `BUFFER_OVER_SURFACE_PAGES` buffer is made over either the view or
+        the cache when it is created (`decode::surface_pages`), and
+        metal2vulkan's runtime rebinds a no-copy buffer only to other host
+        pages (`Buffer::detach_backing`, `rebind_bytes_no_copy`). It needs
+        the runtime to move a no-copy buffer, and the textures over it,
+        into device memory at the same GPU address and back (asked of
+        metal2vulkan 2026-11-13), then the event, the kext's naming, the
+        host's counting, and the offer of in place first from
+        `steelbrain/routeb`.
+    - **Measured, 2026-11-13: what crosses a GPU's link at each present
+      with every surface cached.** On development at 459e76e6a, the walk
+      above, the link of a GPU whose compositor runs on another GPU
+      carries the window's presents, and little else:
+      - RTX 3090 on PCIe 3.0 x4, its host's one screen (3840 x 2160, scale
+        2.1) on a Radeon 780M, which KWin composites on: the window's
+        swapchain (3648 x 2039) handed KWin four LINEAR XRGB8888 buffers
+        of 29.75 MB, and each of its 4010 presents moved one across the
+        link, 0.93 to each of the guest's 4324. nvidia-smi counted 34.8 MB
+        from the GPU a window present and 2.3 MB to it a guest present,
+        and the GPU was busy 20.2 ms a present (Mission Control: 43 window
+        presents a second, the GPU 96% busy, in P2).
+      - RTX 5080 Laptop GPU, which drives its panel: the window's buffers
+        are the GPU's own tiled images, and nothing crosses: 5985 window
+        presents to 5984 of the guest's, 0.8 MB from the GPU and 1.4 MB
+        to it a present, the GPU busy 2.8 ms a present.
+      - On the host of the RX 7900 XTX and the RTX 2080 the screen is the
+        XTX's: the XTX's presents cross nothing, and the 2080's cross its
+        Thunderbolt link (28.4 MB from the GPU a present, the base runs
+        above).
+      - The link is the limit, not the GPU's engines. The 3090's carries
+        1.83 GB/s from the GPU to the host: a 3648 x 2060 image (30.1 MB)
+        copied into host memory takes 16.4 ms from its graphics family,
+        its compute family and its family of transfers alone alike, and
+        a bare swapchain of that size presenting a cleared image to the
+        780M's compositor reaches 61 presents a second, 1.84 GB/s. Only
+        the graphics family presents to the window's surface. Smaller
+        copies keep the rate: 16 regions of 256 x 256 (4.2 MB) in 2.4 ms,
+        64 of 64 x 64 (1.05 MB) in 0.63 to 0.69 ms.
+      - The compositor's GPU does its part fast: the 780M copies a 30.1 MB
+        image from host memory in 1.25 to 1.44 ms, and presents a cleared
+        image of the window's size 4656 times a second.
+    - **Built: the window shown by the compositor's GPU.**
+      Where the compositor runs on another GPU, the window's swapchain is
+      made on that GPU, whose buffers are its own, and only what changed of
+      each frame crosses the runtime's GPU's link. Two routes were weighed.
+      Route 2 was measured and rejected (below); route 1 is built:
+      - *Which device, either route.* The GPU the compositor composites on
+        is the main device of the window's surface's dma-buf feedback
+        (`zwp_linux_dmabuf_feedback_v1`), matched to a physical device by
+        its DRM nodes (`VK_EXT_physical_device_drm`). Where it is the
+        runtime's own GPU, the window stays as it is. Otherwise the window
+        makes a second `VkDevice` there (one graphics queue,
+        `VK_KHR_swapchain`, `VK_EXT_external_memory_host`), apart from the
+        runtime's, and its swapchain over the window's surface.
+      - *Route 1, built: a mirror of the changed tiles* (reims-vgpu's
+        `graphics::mirror`). The window's mirror is a frame-sized buffer
+        of host memory of its own. The runtime's device and the window's
+        device each make a buffer over it. At each draw of a presented
+        surface on the compositor's GPU:
+        - The runtime's GPU copies the presented texture into a buffer of
+          its own memory, as rows of the mirror's pitch.
+        - It compares that copy with the frame it sent last, in 64 x 64
+          tiles (`displayMirrorTile`, the display's shaders). It copies
+          each tile that differs into the mirror, and a tile that changed
+          nothing crosses no link. The copy then stands for the frame sent.
+          A mirror made again (its first sync, a frame of another format
+          or size) sends every tile.
+        - The compositor's GPU draws from a linear texture over its import
+          of the mirror, through the draw the runtime's device would make:
+          the same bytes, so the same pixels.
+        - The compositor's GPU waits for the sync. The sync's command
+          buffer exports its completion as a sync file (metal2vulkan's
+          `add_completion_sync_file`), which the draw that reads the
+          mirror imports and waits for before its work, so the window's
+          thread waits for no GPU work of the sync's. The next sync waits
+          on the host for that draw and for the sync before it. Where the
+          runtime exports no sync file (MoltenVK), the sync finished
+          before the export looked, or the compositor's device imports
+          none, the window's thread waits for the sync before it encodes
+          the draw.
+        - It touches the window's path alone: no guest, kext or placement
+          change. Its fallback, at each refusal on every driver, is the
+          window's present from the runtime's GPU, as before: no feedback,
+          the runtime's own GPU, no second device or swapchain, a surface
+          the mirror does not carry (not 4 or 8 bytes a pixel), or a
+          mirror, sync, import or texture refused.
+        - *Measured 2026-11-13: route 1 against today.* The walk above on
+          um870's RTX 3090, whose compositor composites on its Radeon 780M,
+          with every GPU's driver listed to QEMU and the 3090 picked: route
+          1 (`steelbrain/x4route`) against development at fe56cae17, on the
+          same runtime, both mostly in P2. For each guest present: the
+          megabytes the 3090's link carried from and to the GPU
+          (nvidia-smi), the window's presents, the 3090's busy time, and
+          the time from a present's take to its show (median / 99th
+          percentile):
+
+          | step | build | link MB, from / to the GPU | window presents | busy ms | take to show, ms |
+          |---|---|---|---|---|---|
+          | Mission Control | today | 28.3 / 2.2 | 0.92 | 20.1 | 2.2 / 55.5 |
+          | | route 1 | 1.2 / 2.7 | 1.00 | 6.7 | 14.4 / 45.7 |
+          | autoscroll | today | 28.7 / 0.3 | 0.88 | 17.0 | 5.1 / 15.0 |
+          | | route 1 | 9.9 / 0.6 | 1.00 | 8.9 | 3.3 / 7.1 |
+          | GL 3D | today | 23.8 / 0.4 | 0.84 | 17.0 | 5.7 / 8.4 |
+          | | route 1 | 16.6 / 0.3 | 1.00 | 12.9 | 3.6 / 4.3 |
+          | the walk | today | 31.2 / 2.0 | 0.93 | 21.0 | |
+          | | route 1 | 6.1 / 2.5 | 1.00 | 9.5 | |
+
+          - The guest's presents a second held: 47.8 and 57.7 in Mission
+            Control, 45.7 and 45.0 in the autoscroll, 40.9 and 40.5 in GL
+            3D. The pages' own rates were 60, 59.8 and 60 both times.
+          - The window presents every guest present.
+          - Ordered on the CPU, as route 1 was first built, each sync
+            cost the render thread a wait for the 3090's copy of the
+            changed tiles over its link: 1.6 ms a present in Mission
+            Control (1.0 MB of tiles at most), 7.3 ms in the autoscroll
+            (11.8 MB) and 10.8 ms in GL 3D (18.5 MB). The guest does not
+            wait for it.
+          - Mission Control's median from take to show rose from 2.2 to
+            14.4 ms, while its mean fell from 18.2 to 10.0 ms. Its presents
+            fall in two groups: those whose writers had finished by their
+            take, shown within 4 ms (55% of them, then 46%), and those whose
+            writers still ran, shown at a median of 39.1 ms, then 15.2 ms.
+            Route 1 makes the second group faster and, at 57.7 presents a
+            second against 47.8, larger, so the median moves from the first
+            group into the second. From take to answer, the mean fell from
+            29.1 to 23.3 ms (1.94 to 1.61 refreshes). The XTX, whose
+            compositor composites on the runtime's own GPU, shows the same
+            two groups: 37% within 4 ms, the rest at a median of 12.0 ms.
+          - The runtime's memory log shows the mirror's host pages
+            imported by their pointer on both devices.
+        - *Measured 2026-11-13: the sync waited for on the compositor's
+          GPU.* The same walk on metal2vulkan's pin 83, with each sync
+          waited for by the render thread (development at 36b382f9e) and
+          by the compositor's GPU (`steelbrain/x4route`), each after a walk
+          that filled the caches the pin left cold: um870's RTX 3090,
+          whose compositor composites on its Radeon 780M, and um790's
+          Radeon 780M, whose compositor composites on its RX 7900 XTX.
+          The render thread's wait for the syncs:
+
+          | runtime's GPU | sync waited for by | syncs | on the compositor's GPU | render thread's wait a sync |
+          |---|---|---|---|---|
+          | 3090 | the render thread | 6447 | 0 | 4.63 ms |
+          | | the compositor's GPU | 6416 | 6416 | 0.45 ms |
+          | 780M | the render thread | 6709 | 0 | 4.25 ms |
+          | | the compositor's GPU | 6746 | 6746 | 0.99 ms |
+
+          - On the 3090, by step: Mission Control 1.61 ms a sync, then
+            0.38 ms; the autoscroll 7.27, then 0.37 ms; GL 3D 10.79, then
+            0.34 ms.
+          - The runtime exported a sync file for each sync, none of them
+            after host copies (its work counts `sync_files_exported` and
+            `sync_files_after_host_copies`), and neither compositor's
+            device refused one.
+          - The guest's presents a second, the 3090's link and busy time,
+            and the times from take to show stayed as they were. On the
+            3090: 57.7 and 57.6 presents a second in Mission Control, 44.9
+            and 45.2 in the autoscroll, 40.3 and 40.6 in GL 3D. On the
+            780M: 59.7 and 59.1, 45.8 and 45.5, 37.3 and 36.6.
+          - Mission Control's take to show on the 3090, median / 99th
+            percentile: 14.7 / 59.1 ms in the walk that filled the caches,
+            14.2 / 48.6 ms with the render thread's wait, 14.1 / 52.4 ms
+            with the GPU's. Its two groups stayed as they were: 46% of the
+            presents within 4 ms, the rest at a median of 15.6, 15.1 and
+            15.1 ms. The render thread's wait did not hold the shows, and
+            the median above is where the two groups split.
+          - What the render thread still spends on a sync is its encoding,
+            commit and export, and its wait for the last draw and the sync
+            before it.
+        - *Measured 2026-11-14: route 1 under a GPU-bound guest.* The walk's
+          applesample step (a GPU-bound guest app, 125 s) on um870's RTX
+          3090 on PCIe 3.0 x4, whose compositor composites on its Radeon
+          780M, the guest at 3648 x 2038, metal2vulkan's pin 92, at
+          d2e5a7d46 (`steelbrain/gpupick`): with NVIDIA's driver alone
+          listed to QEMU or every GPU's, and with no window or a Wayland
+          one. The 3090 was in P2 throughout every arm:
+
+          | drivers listed | window | frames | frame, median ms | guest's GPU time a frame, median ms | link MB/s from the GPU |
+          |---|---|---|---|---|---|
+          | NVIDIA's alone | none | 1631 | 33.5 | 37.8 | 300 |
+          | every GPU's | none | 1627 | 38.3 | 38.2 | 307 |
+          | NVIDIA's alone | presents from the 3090 | 1149 | 50.1 | 53.2 | 798 |
+          | every GPU's | route 1 | 1025 | 83.2 | 68.1 | 643 |
+
+          - Listing every driver cost the guest no frames. A window
+            presenting from the 3090 cost it 30% of them, about the 20.2 ms
+            the 3090 is busy at each of its 15.0 window presents a second
+            (measured 2026-11-13, above). Route 1 cost another 11%: 1025
+            frames against 1149.
+          - Route 1 made 13.5 syncs a second, each sending 1651 of the
+            frame's 1824 tiles (27.1 MB), every one waited for on the 780M.
+            The render thread waited 71.4 ms a sync, for the sync before it.
+          - The tile kernel writes the changed tiles into host memory
+            itself. Those writes hold the engine every queue of the 3090's
+            graphics family runs on for as long as they take to cross the
+            link, at least 14.8 ms for 27.1 MB at 1.83 GB/s. No other queue
+            of that family runs meanwhile: in metal2vulkan's measure, a
+            readback on another queue of the family waited 1.88 s behind a
+            2 s kernel, and one on the copy engine took 7.8 to 13.5 ms beside
+            it (its `src/device/staging.rs`). Each sync also waits behind
+            the guest's command buffers.
+          - The arms without a window had none at all: with
+            `WAYLAND_DISPLAY` left out and no `XAUTHORITY`, Xwayland
+            refused SDL's connection.
+        - *Built: the copies on a copy engine.* Where the platform gives a
+          queue whose copies run on a copy engine of the runtime's GPU
+          (`GpuDevice::new_command_queue_for_copies`):
+          - The sync's command buffer copies the presented texture into
+            the runtime's buffer and compares it with the frame sent last,
+            as above, but only lists the tiles that differ
+            (`displayMirrorTileList`). It writes nothing into host memory.
+          - The render thread commits it at once, then waits for it, for
+            the last draw that read the mirror and for the last copy into
+            it. Then it copies the listed tiles into the mirror on the copy
+            engine: a run of tiles side by side is one copy in each of its
+            pixel rows, a run of whole rows of tiles one copy.
+          - The draw waits for that copy as it waited for the sync. No tile
+            changed means no copy, and the draw waits for nothing.
+          - The bytes that cross the link are the changed tiles' bytes, as
+            before. The compositor's GPU still waits for the compare, which
+            runs on the engine the guest's work runs on.
+          - Where the platform gives no such queue, each sync is the one
+            command buffer above. That is the case on the Vulkan platform
+            until metal2vulkan's runtime gives a program a queue on a copy
+            engine (asked 2026-11-14). It is also the case where the
+            runtime refuses the list's kernel.
+      - *Route 2: the presented surfaces in place.* The surfaces the
+        display pipe presents lie in place in guest RAM (route B's
+        placement for them alone; every other surface keeps its device
+        cache), and the compositor's GPU imports their pages and copies
+        from them into its image. Nothing computes damage: the runtime's
+        GPU writes into guest RAM what the guest's composite draws,
+        through the runtime's shadow of the surface, whose copies in and
+        back cover only the rectangle a pass loads and writes inside its
+        draws' scissors (metal2vulkan's `shadow.rs` at 522a8245e2, read
+        from its code). The link carries the composite's passes over the
+        surface, its loads as well as its writes, and each of the
+        compositor's two or three surfaces catches up on the frames it was
+        not drawn in. It is in place: the runtime's GPU writes the guest's
+        pages, and the compositor's GPU reads them.
+        - It touches placement and the window: the kext names the
+          presented surfaces' blocks in place on a host whose GPU has
+          memory of its own (route B's offer, for those blocks alone), and
+          the window's second device imports the pages of the surface each
+          present shows. The window part is route 1's but the copy.
+        - Its fallback: a presented surface whose pages the compositor's
+          GPU cannot import, or no second device, keeps today's device
+          cache and the window's present from the runtime's GPU, at the
+          refusal, on every driver.
+      - *Route 2, measured 2026-11-13: rejected.* A prototype placed the
+        presented surfaces alone in place. The kext named WindowServer's
+        single-plane surfaces of the scanout's shape in place, not route B
+        wholesale. The window stayed as today. The build was
+        `steelbrain/x4route-proto` on development at 9cb5693ab. It ran
+        the walk above on the RTX 3090, against the same walk on
+        development at 459e76e6a, both mostly in P2. Megabytes a guest
+        present (route 2's are the prototype's, less today's 34.8 MB
+        window copy):
+
+        | step | today, from / to the GPU | route 2, from + to the GPU | what changed (below) |
+        |---|---|---|---|
+        | Finder | 48.3 / 4.4 | 54.8 + 304.6 | 2.7 |
+        | Apps | 34.5 / 5.0 | 99.6 + 257.1 | 0.65 |
+        | Mission Control | 30.2 / 2.0 | 28.6 + 63.6 | 1.6 |
+        | Safari's scroll | 41.6 / 4.9 | 132.7 + 107.5 | 6.1 |
+        | autoscroll | 26.2 / 0.3 | 91.9 + 93.3 | 12.1 |
+        | the WebGL page | 34.6 / 0.1 | 9.4 + 37.4 | 0.3 |
+        | GL 3D | 23.9 / 0.4 | 93.2 + 66.0 | 18.2 |
+        | video | 31.0 / 0.8 | 122.3 + 44.3 | 6.2 |
+        | Maps | 31.1 / 11.3 | 77.0 + 203.6 | 1.6 |
+        | the walk | 30.8 / 2.2 | 90.5 + 78.8 | 6.27 |
+
+        - About 169 MB crossed the link a present, five times today's
+          copy, and the guest slowed to match. Its presents over the walk
+          fell from 4324 to 1735, and the GPU's busy time went from 20.2 to
+          80.0 ms a present.
+        - Rates fell in Mission Control from 47 to 20 presents a second,
+          in the autoscroll from 45 to 9, and in GL 3D from 41 to 7.
+        - The median from a present's take to its show went from 23 to
+          147 ms in Finder, and from 5.6 to 182 ms in GL 3D.
+        - The runtime's shadow counts barely moved: the texels it copied
+          into shadows from host pages stayed under 1.3 MB a present. The
+          bytes are the composite's own passes. The runtime's GPU renders
+          and blends WindowServer's frame straight into guest RAM over the
+          link, its loads as well as its writes, several passes a frame:
+          an in-place display surface puts the whole composite on the
+          link, not one write of the frame.
+        - So the presented surfaces keep their device caches, as every
+          surface does on a GPU with memory of its own (route B's
+          decision holds for them too).
+        - Route 1's bytes are the change measured below.
+      - *What the guest's frames change.* The same walk on the RX 7900 XTX,
+        with a measuring build (`steelbrain/x4link-damage` at 32bfa734c,
+        not landed: a thread that reads what the display shows as
+        `read_display` does, about once a present, 8 ms a read, and
+        compares each read with the one before in 64 x 64 tiles): 6.27 MB
+        of the 29.7 MB frame changed a present on average, 136 MB/s over
+        the walk, where the 3090's link carried 599 MB/s. By step: the
+        GL 3D page 18.2 MB a present, the autoscroll 12.1, the video 6.2,
+        Safari's scroll 6.1, Finder 2.7, Maps 1.6, Mission Control 1.6,
+        Apps 0.65, the WebGL page 0.3. Presents that come closer together
+        than a read are compared as one, so where presents come fast the
+        figure a present is low. At the 3090's rate that change is 3.5 ms
+        of its link a present on average, where the window's copy takes
+        16.4 ms now (the GL 3D page 10 ms, Mission Control 0.9 ms).
+      - *The contract, either route.* Nothing the guest sees changes:
+        presents are taken, shown and answered as now, and the window
+        shows the same pixels.
 
 15. **The stage 3 stack is IOGPUFamily.** x86-64 macOS 26 carries IOGPUFamily
     and IOGPU.framework, and the x86-64 port runs Metal compositing on them:
@@ -529,7 +1328,7 @@ Stages:
     `/Library/GPUBundles` and open IOAccelerator user clients. A video
     plug-in of our own in `/Library/Video/Plug-Ins` is no way in: CoreMedia
     lists only Apple-signed plug-ins.
-    - **Identity:** the accelerator's personality names the bundle,
+    - **Identity:** the accelerator's registry entry names the bundle,
       `reims-graphics`, as the video driver, with `IOVARendererID` 0x1020004,
       the AMD Navi family's, and `IOGVACodec`; the bundle exports the two
       entry points beside its Metal device
@@ -542,12 +1341,30 @@ Stages:
       Macs without an Intel GPU, or where `com.apple.AppleGVA`'s
       `gvaForceAMDKE` is set; elsewhere, an iMac20,1 among them, it looks for
       an Intel GPU and gives up without one. RgfxGate's install thread keeps
-      the key set in `/Library/Preferences/com.apple.AppleGVA.plist` at every
-      boot, after the bundle step (`guest/rgfxgate/src/RgfxGatePrefs.cpp`): an
-      absent file gets a fresh XML plist, an XML plist gets the key with every
-      other byte kept, and a binary or unreadable one is left and logged.
+      the key set at every boot, after the bundle step
+      (`guest/rgfxgate/src/RgfxGatePrefs.cpp`), in two files:
+      `/Library/Preferences/com.apple.AppleGVA.plist`, and on x86-64 the
+      global domain's for every user,
+      `/Library/Preferences/.GlobalPreferences.plist`. In each, a key already
+      true leaves the file untouched, an absent file gets a fresh XML plist
+      of the key alone, an XML plist gets the key with every other byte kept,
+      a binary one, as cfprefsd writes it (`defaults delete` leaves an empty
+      one), gets the key with every other object's bytes kept, and an
+      unreadable one is left and logged. An arm64 guest keeps the key in the
+      AppleGVA file alone, as before: AppleGVA's AMD flow, the key's one
+      reader, is x86-64's, and the arm64e shared cache of macOS 27.0.1 holds
+      no image with the key's name.
       AppleGVA reads it from the next service start (measured on the guest,
-      macOS 26.6.1).
+      macOS 26.6.1). The global domain is for the processes that run AppleGVA
+      in a sandbox of their own: Safari's H.264 decodes in WebKit's GPU
+      process, not in VTDecoderXPCService, and that process's sandbox denies
+      it `com.apple.AppleGVA.plist` (the kernel logs `deny(1) file-read-data`)
+      while it reads the global domains. With the key in the AppleGVA file
+      alone, AppleGVA there found no Intel GPU and every H.264 video in Safari
+      decoded in software; with the key in the global domain the same
+      process's sessions reached the driver (measured on the guest, macOS
+      26.6.1, a 4K60 H.264 clip on the RTX 5080: NVDEC decoded all 980 of its
+      pictures). Safari's HEVC decodes in VTDecoderXPCService either way.
     - **The GPU is named GFX0.** AppleGVA's video routing finds the GPU by
       the name real AMD Macs give its PCI device, `GFX0`. HEVC needs it: the
       accelerator names its IOPCIDevice provider `GFX0` in `start`, before
@@ -561,6 +1378,18 @@ Stages:
       WhateverGreen, or a second GPU), the name is left as it was and that is
       logged, so two are never published
       (`guest/kext/src/RgfxAccelerator.cpp`, `nameProviderForVideo`).
+    - **macOS 11 keeps small H.264 pictures off the hardware.** AppleGVA's
+      H.264 decoder on 11 declines a picture of at most 480×320 pixels
+      (153,600) where the session plays video (read from AppleGVA's code,
+      108.7.2). Its session create fails with
+      −12913 (`kVTVideoDecoderNotAvailableNowErr`), which
+      `VTIsHardwareDecodeSupported` still counts as supported. AppleGVA logs
+      why only with its debug preference set. From 12 the floor is 64×64
+      (AppleGVA logs "Playback Usage, resolution constrains: 64x64"). A Mac
+      on 11 declines the same streams, so nothing of the device answers it,
+      and a check of 11's hardware H.264 decodes a larger picture. Measured
+      on the 780M host, 2026-11-08: on 11.7.11, 320×240 and 480×320 failed
+      their create and 496×320's succeeded; on 12.7.6 all three decoded.
     - **Capabilities are the host's:** the block lists the engines and, per
       codec and direction, a function record (its ID, sub-ID, input format
       `rawb` for a bitstream or `NV12` for frames, and output formats), from
@@ -591,26 +1420,62 @@ Stages:
       carries the output surface; an HEVC decode is a bare decode command with
       no output on it and no transfer command. AppleGVA names the output frame
       in its own decoded-picture record instead: the record pointer at the
-      parameters' `+0x10`, its current frame at the record's `+0x08`, and that
-      frame's global IOSurface id at the frame's `+0x88`. The driver looks the
-      surface up there (`guest/bundle/src/RgfxVideoDriver.cpp`,
-      `hevcOutputSurface`; measured on the guest with the RTX 5080: the id is
-      that of the IOSurface VideoToolbox hands back for the picture, 7 for
-      picture 0 and 27 for picture 1, and an IDR with no references resolves
-      there too).
+      parameters' `+0x10`, its current frame at the record's `+0x08`, and in
+      that frame a description of its surface: the global IOSurface id, a
+      size, the width, the height, a pitch, 8 bytes, then the pixel format.
+      Where the fields start and how wide each is differ by release: fields
+      of 4 bytes from the frame's `+0x70` on macOS 11.7.10 and 11.7.11, from
+      `+0x78` on 12.7.6 and from `+0x80` on 13.7.8; fields of 8 bytes from
+      `+0x80` on 14.8.9 and from `+0x88` on 15.8.2 and 26.7.2 (measured on
+      the guest with the RTX 5080, and 13.7.8 and 26.7.2 with the 780M; on
+      26 the id is that of the IOSurface VideoToolbox hands back for the
+      picture, 7 for picture 0 and 27 for picture 1, and an IDR with no
+      references resolves there too). So the driver searches for the
+      layout rather than listing them: every start from `+0x60` to `+0xa0`
+      in steps of 4, with fields of 4 or 8 bytes, where the id names a live
+      surface whose width, height and pixel format the description gives.
+      The window starts two 8-byte steps below 11's `+0x70`, for the 11
+      releases before 11.7.10, which no base boots; in the frames of every
+      release measured, no start and width in it but the release's own
+      reads the surface's width, height and pixel format.
+      The first picture of a session whose frame describes its surface in
+      exactly one layout shows the session's layout, which the session keeps;
+      a picture whose frame describes no surface, or one in more than one
+      layout, or none in its session's layout, is refused before it reaches
+      the host (`guest/bundle/src/RgfxVideoDriver.cpp`, `hevcOutputSurface`).
     - **A decode the driver cannot complete is a decode error, never a silent
       success.** AppleGVA reports a decode error only when scheduling the
       command fails: a schedule that answers 5 reaches the client as
-      `kVTVideoDecoderMalfunctionErr` (-12911). It ignores every failure a
-      status query can answer, a detail word, a failed query call, and the
-      statuses 0 and 3 alike, and takes the picture for decoded (measured on
-      the guest with the RTX 5080). So a command the driver cannot resolve or
-      send (no output surface, refused parameter sets, no command buffer)
-      fails its own schedule, and logs one line. A failure the host reports
-      for a picture the driver sent is known only when the picture's status
-      is queried: the driver marks its session, and the session's next
-      schedule fails, one picture late (`guest/bundle/src/RgfxVideoStatus.hpp`,
-      `queryReport` and `scheduleFails`).
+      `kVTVideoDecoderMalfunctionErr` (-12911). It takes every query of a
+      decode for its completion, reading neither its status nor its error
+      word (read from AppleGVA's code on macOS 26.7.1), and a detail word, a
+      failed query call, and the statuses 0 and 3 alike deliver the picture
+      as decoded (measured on the guest with the RTX 5080). So a command the
+      driver cannot resolve or send (no output surface, refused parameter
+      sets, no command buffer) fails its own schedule, and logs one line. The
+      schedule of an HEVC picture the driver sent waits for the host's
+      verdict on it, out of the lock that orders the sessions' pictures, and
+      fails where the host failed it: AppleGVA reports the error from that
+      picture on, and no frame of it reaches the client
+      (`guest/bundle/src/RgfxVideoStatus.hpp`, `waitsForHost` and
+      `scheduleFails`). AppleGVA's H.264 decoder reports no failure, neither
+      a failed schedule nor any query answer tried, and a picture whose
+      schedule failed is not decoded at all (measured on the guest with the
+      RTX 5080, 2026-11-07); its pipelines schedule their commands one at a
+      time and keep no decode's result (read from its code). So an H.264
+      schedule waits for no verdict, and an H.264 picture the host fails
+      reaches the client as decoded ([D25](../video/bugs.md)). What the
+      driver can tell before a picture, the coded size AppleGVA gives each
+      context it asks for, it checks at the create: a size outside the
+      host's H.264 decode entry fails `CreateContexts` with kUnsupported,
+      AppleGVA fails the session's create, and VideoToolbox decodes in
+      software (`sizeTaken`, `guest/bundle/src/RgfxVideoStatus.hpp`). The host
+      reports a failure as the
+      picture's command buffer failing: an op it cannot carry out faults the
+      buffer, and a picture it took but could not land (its planes refused,
+      or a decode the hardware failed once it ran) still signals the
+      session's event, so the buffer completes, failed with Metal's internal
+      error (`crates/reims-vgpu/src/graphics/decode/video.rs`, `Landed`).
     - **Bitstreams:** AppleGVA asks for one bitstream buffer and writes the
       next access unit into it as soon as a picture is scheduled, without
       waiting for the decode that reads it. The driver copies each access
@@ -644,9 +1509,9 @@ Stages:
 
 ## What metal2vulkan adds in stage 3
 
-- No-copy Managed buffers and heaps over our host blocks, whose VRAM copy
-  syncs at `didModifyRange:` and `synchronizeResource:`. Today a no-copy
-  buffer has no device copy.
+- No-copy Managed heaps over our host blocks, whose VRAM copy syncs at
+  `didModifyRange:` and `synchronizeResource:`, as a no-copy Managed buffer's
+  does on a GPU of its own memory since metal2vulkan's runtime 2050.
 - Two-copy Managed textures, whose host copy is one of our blocks.
 - Per-context address and texture-ID tables. Today one device has one
   address space and one texture table of up to 2^16 entries.
@@ -660,7 +1525,10 @@ same formats. All values are little-endian.
 
 **PCI.** Class 0x0380 (display controller, other). The vendor:device ID is
 the owner's call (Open); development uses the placeholder `1234:5247`.
-Apple's paravirt kext matches only `106b:eeee`.
+Apple's paravirt kext matches only `106b:eeee`. In the guest's registry the
+kext states the class an x86 Mac's GPU states, 0x030000, as the PCI device's
+`class-code`, which software that lists the Mac's GPUs reads
+(`guest/kext/src/RgfxPciClass.hpp`); configuration space keeps 0x0380.
 
 **BAR0: registers**, 4 KiB of MMIO, 32-bit accesses. The MSI-X table and PBA
 sit in BAR0 from 0x800.
@@ -674,17 +1542,18 @@ sit in BAR0 from 0x800.
 | 0x010 | `STATUS` | RW | writing 0 resets the device; the guest writes 1 (driver ready) once it has read the rings' headers |
 | 0x014 | `REGION_SIZE_LO` | RO | BAR2's size, low 32 bits |
 | 0x018 | `REGION_SIZE_HI` | RO | BAR2's size, high 32 bits |
-| 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`) |
+| 0x020 | `DOORBELL` | WO | writing a ring's id wakes its consumer (an `ioeventfd`); under `DOORBELL_ASKS` bit 0 set asks for the answer at the doorbell |
 | 0x024 | `DRIVER_FEATURES_LO` | RW | feature bits 0-31 the guest's driver takes; reads back the ones the host took ("Negotiated features", below) |
 | 0x028 | `DRIVER_FEATURES_HI` | RW | feature bits 32-63, likewise |
 | 0x02c | `CONSUMED` | WO | writing a completion ring's offset wakes its producer waiting for room, under `CONSUMED_DOORBELL`; no host handles it yet, so it reads 0 and a write is ignored |
-| 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without the feature |
+| 0x030 | `DEFERRED_BUDGET_LO` | RO | under `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`, the bytes of the host GPU's memory deferred blocks' device caches may hold, low 32 bits: a quarter of the device-local heap's budget, the same for the device's life; 0 without either feature |
 | 0x034 | `DEFERRED_BUDGET_HI` | RO | its high 32 bits |
-| 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits: the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
+| 0x038 | `HOST_TIME_LO` | RO | under `HOST_TIME`, the host's monotonic clock at the read in ns, low 32 bits, at the rate the guest's clock runs ("Refresh times"): the clock `VBLANK`s are stamped on; nothing is latched, so the guest reads `HI`, `LO`, `HI` and takes the second `HI` where `LO` is below 2^31, else the first; 0 where the guest did not take the feature |
 | 0x03c | `HOST_TIME_HI` | RO | its high 32 bits |
+| 0x040 | `DOORBELL_PAGE_BIND` | WO | under `DOORBELL_PAGES`, binds doorbell page `value & 0xff` of BAR4 to context `value >> 8`, or unbinds it for context 0 ("BAR4: the doorbell pages", below); a reset unbinds every page; reads 0 |
 
 **The wire's version.** `VERSION` reads `RGFX_VERSION`
-(`crates/reims-graphics/src/wire.rs`), the version of the wire the host
+(`crates/reims-vgpu-graphics/src/wire.rs`), the version of the wire the host
 speaks. The kext's framebuffer and accelerator, and the option ROM, each
 accept only the version they were built with. They read it right after
 `MAGIC`, before anything else of the device, and on any other version they
@@ -747,19 +1616,20 @@ only where no negotiation can carry it.
   (`INVALID_ARGUMENT`).
 - New ops and messages are decoded wherever the host offers their bit, as
   `RGFX_OP_SUBMITTED` is.
-- The accelerator answers its processes' `Features` call (selector 0x10f) with
-  two words: the device's, which they work by (bits 0-2 as offered, and from
-  bit 3 the bits taken), and the kext's own (below, "The accelerator's user
-  client"). `QueueCreate` (0x103) takes a seventh input, the flags the process
-  wants, and answers a second output, the flags granted: those whose feature
-  the device's word holds. A kext older than the call answers
-  `kIOReturnUnsupported`, and the bundle then works by the device info's
-  `features_lo` bits 0-2, with no kext feature.
+- The accelerator answers its processes' `Features` call (selector 3) with
+  three words: the device's, which they work by (bits 0-2 as offered, and from
+  bit 3 the bits taken), the kext's own, and the kext's selector map (below,
+  "The accelerator's user client"). `QueueCreate` (0x103) takes a seventh
+  input, the flags the process wants, and answers a second output, the flags
+  granted: those whose feature the device's word holds. A kext whose map is
+  not the bundle's, one of the map before it (whose `Features` was 0x10f)
+  among them, and a sandbox that refuses the call, leave the process with no
+  Metal device, logged: the bundle works by no guess at the words.
 - Bits 3-8 are named (`QUIET_SCHEDULED`, `CONSUMED_DOORBELL`, `QUEUE_BARRIER`,
   `CB_PARTS`, `PAGES_BUFFERS`, `QUEUE_VECTORS`; `wire.rs`), and bits 9-12 are
   reserved. Of them the host offers bit 7, `PAGES_BUFFERS`, where it offers
   `SURFACE_PAGES`, and the kext takes it: a process's no-copy buffers lie over
-  its own pages, wired by the kext in a pages block (selector 0x10e, "The
+  its own pages, wired by the kext in a pages block (selector 4, "The
   accelerator's user client"; `BUFFER_OVER_PAGES`). No host offers the others
   yet, the kext takes none of them, and the host carries out none of their
   queue flags: each lands with its feature, which says what it changes.
@@ -795,7 +1665,8 @@ only where no negotiation can carry it.
   host offers it where it offers `SURFACE_CACHE`, with its budget in
   `DEFERRED_BUDGET_LO` and `_HI`.
 - Bit 20 is `HOST_TIME`: `HOST_TIME_LO` and `_HI` read the host's monotonic
-  clock, the one `VBLANK`s are stamped on, so the kext measures the two
+  clock, the one `VBLANK`s are stamped on, at the rate the guest's clock runs
+  ("Refresh times"), so the kext measures the two
   clocks' offset rather than infer it from the `VBLANK`s' delivery ("Refresh
   times", below). Every host offers it, and the kext takes it.
 - Bit 21 is `MANAGED_TEXTURE_SLABS`: a `MANAGED_TEXTURE_CREATE` may name any
@@ -807,7 +1678,7 @@ only where no negotiation can carry it.
   Managed buffer whose CPU copy is the first bytes of any Shared buffer over
   the sender's memory, read and written where that buffer's contents lie, so
   the bundle takes a Managed buffer's CPU copy from its Shared slabs, its own
-  superpages among them, on every host ("Managed storage", below). Every host
+  pages among them, on every host ("Managed storage", below). Every host
   offers it, and the kext takes it.
 - Bit 23 is `SMALL_ID_CHUNKS`: ring 0 carries `RESOURCE_ID_SMALL_CHUNK`, a grant
   of 16 texture resource ids, so the kext hands each process its ids 16 at a
@@ -832,6 +1703,312 @@ only where no negotiation can carry it.
   shared events one process hands another, and the host posts the values one
   holder gives the event to the others' listen queues ("Shared events across
   processes", below). Every host offers it, and the kext takes it.
+- Bit 27 is `OPENCL_MODE`: a `COMPUTE_PIPELINE_CREATE` may carry
+  `RGFX_COMPUTE_PIPELINE_OPENCL_MODE`, and the host makes that pipeline of
+  OpenCL mode: Metal links the kernel behind three buffers of its own (the
+  global offsets and dimension count at 0, then 1 and 2) with its arguments at
+  their indices plus three. The bundle makes a kernel's function of OpenCL mode
+  (`newFunctionWithPluginData:bitcodeType:2`) only where the kext carries the
+  bit. A host offers it where its platform makes such pipelines: the Metal
+  platform where Metal's compute pipeline descriptors answer
+  `setOpenCLModeEnabled:` (the M3 Max on macOS 27, the AMD 5300M and Intel 630
+  on macOS 26.7.1), and the Vulkan platform always, its runtime linking the
+  kernel as Metal does.
+- Bit 28 is `PRIVATE_RENDER_STATE`: a `RENDER_PIPELINE_CREATE` may carry
+  `RGFX_RENDER_PIPELINE_PRIVATE_STATE` (flag bit 6), and then an
+  `RgfxRenderPipelinePrivateState` (24 bytes) follows its head, ahead of the
+  tail. It holds the descriptor's private state that Apple's OpenGL renderer
+  sets: `openGLModeEnabled`, `sampleMask`, `sampleCoverage`,
+  `sampleCoverageInvert`, `logicOperationEnabled`, `logicOperation` and
+  `depthStencilWriteDisabled`, each the guest's raw value. The bundle reads
+  them by key from every render pipeline descriptor where the kext took the
+  bit. Measured on the Intel 630 (macOS 26.7.1), the renderer sets
+  `openGLModeEnabled`, a sample mask and copy (2) on every pipeline. It sets
+  a GL logic operation, sample mask or sample coverage as their properties.
+  It sets `depthStencilWriteDisabled` on a pipeline that writes no depth or
+  stencil. It does alpha test, two-sided colour and the point sprite origin
+  in its shaders. A host offers it where its platform takes that state. The
+  Vulkan platform always does, filling metal2vulkan's `PrivateRenderState`.
+
+  The guest's renderer sets the same properties on our device. This was
+  measured over gl_cases' 48 cases in arm64 macOS 27.0.1 (the M3 Max under
+  HVF, job m3-max-17093) and in x86-64 macOS 26.7.2 (ms01's Iris Xe, job
+  m3-max-17106). Each case ran in a process of its own, with every setter the
+  renderer sends a render pipeline descriptor, its colour attachments and our
+  render encoder traced. At each create, the descriptor's properties that
+  differ from a new descriptor's were logged.
+  - On both architectures, every pipeline gets `openGLModeEnabled` 1,
+    `sampleMask` `0xffffffff`, `sampleCoverage` 1, `sampleCoverageInvert` 0,
+    `logicOperationEnabled` 0 with `logicOperation` 2, and
+    `depthStencilWriteDisabled` (1 where the pipeline writes no depth or
+    stencil).
+  - GL's XOR gives `logicOperationEnabled` 1 and `logicOperation` 10. GL's
+    sample coverage of 0.5 and sample mask of 3 give `sampleCoverage` 0.5 and
+    `sampleMask` 3.
+  - The renderer also sets `twoSideEnabled`, `pointCoordLowerLeft`,
+    `pointSizeOutputVS` and `needsCustomBorderColorSamplers`, always to 0,
+    including in the two-sided colour and lower-left point sprite cases. The
+    record does not carry these four. metal2vulkan measured that they change
+    nothing Metal draws, at any value it tried.
+  - The renderer never sets `alphaTestEnabled`, `alphaTestFunction`,
+    `clipDistanceEnableMask`, either depth-compare clamp mask,
+    `pointSmoothEnabled`, `vertexAmplificationMode` or
+    `explicitVisibilityGroupID`. It never calls `setAlphaTestReferenceValue:`
+    or `setPointSize:` on the encoder.
+  - So every property the renderer sets to something other than Metal's
+    default is in the record.
+
+  On a host whose Vulkan device lacks `logicOp`, such as MoltenVK on a Mac,
+  metal2vulkan refuses a pipeline of any logic operation other than copy or
+  no-op. The renderer then asks for the same pipeline for its software vertex
+  and fragment fallbacks, each create answers nil, and the draw is lost
+  (gl_cases' logicop case in arm64 27.0.1 on the M3 Max). x86 guests draw the
+  case right on the 780M (RADV), the 3090 (NVIDIA) and the Iris Xe (ANV),
+  whose devices have `logicOp`.
+- Bit 29 is `SURFACE_CACHE_REFUSED`: the host's GPU shares the CPU's memory,
+  and it keeps a device cache only of the surfaces whose pages its textures
+  cannot use in place, which it answers surface by surface (Decided 14,
+  "Device caches on a GPU that shares the CPU's memory"). The kext asks at a
+  new cacheable block in place (`RGFX_SURFACE_PAGES_ASK_CACHE`, with the
+  surface's `RgfxSurfacePagesLayout` after the cache part), and posts the
+  block again cached where the host answers `RGFX_STATUS_CACHE`. A host
+  offers it where it offers `SURFACE_PAGES` and its GPU shares the CPU's
+  memory, where it offers neither `SURFACE_CACHE` nor `SURFACE_DEFERRED`.
+- Bit 30 is `SURFACE_DEFERRED_ASK`, which means nothing without
+  `SURFACE_CACHE_REFUSED`: a fresh surface that would need a device cache
+  whatever its pages gets none until a CPU lock needs them, as under
+  `SURFACE_DEFERRED`. The kext's deferral carries `ASK_CACHE` and the
+  surface's layout; the host defers only such a surface and refuses the
+  rest, whose pages the kext then names asking (Decided 14, "Device caches
+  on a GPU that shares the CPU's memory"). A host offers it where it offers
+  `SURFACE_CACHE_REFUSED`, with its budget in `DEFERRED_BUDGET_LO` and
+  `_HI`.
+- Bit 32, `FEATURES_HI`'s bit 0, is `SURFACE_DEFERRED_CARRY`, which means
+  nothing without `SURFACE_DEFERRED` or `SURFACE_DEFERRED_ASK`: a deferral
+  may carry the few resident pages of a surface no CPU lock touched, its
+  runs the surface's bytes in order, each run of pages not resident
+  `RGFX_PAGE_RUN_ZEROS` (Decided 14, *Deferred pages*). The bundle lists
+  them after the layout of its 0x109 call, the kext proves them under its
+  read of the surface, and the host fills the cache from them as a new
+  cache's first fill. A host offers it where it offers either deferral.
+- Bit 33, `FEATURES_HI`'s bit 1, is `SCHEDULED_ASK`: a queue's ring carries
+  `SCHEDULED_ASK` (0x303), a thread's ask of a command buffer's scheduling
+  ("Scheduled", below). The bundle posts it from `waitUntilScheduled` on the
+  rings it writes itself, so the kext takes the bit with nothing of its own
+  to do. Every host offers it.
+- Bit 34, `FEATURES_HI`'s bit 2, is `PAGES_16K`: every run of guest RAM the
+  guest names, and a `SURFACE_PAGES`' length, is whole 16 KiB pages from a
+  16 KiB page's first byte, as an arm64 guest's pages are. A host whose page
+  is 16 KiB (a Mac) can map guest RAM for its GPU only in whole pages of its
+  own, so it offers its features over guest RAM (`SURFACE_PAGES`,
+  `PAGES_BUFFERS`, `HEAP_OVER_PAGES`, and with them `SURFACE_CACHE_REFUSED`,
+  `SURFACE_DEFERRED_ASK` and `SURFACE_DEFERRED_CARRY`) only to a guest that
+  took `PAGES_16K`, where it maps the guest's RAM at all:
+  - until the driver takes it, `FEATURES_LO` and `_HI` read the host's
+    other bits and `PAGES_16K`, and `DEFERRED_BUDGET_LO` and `_HI` read 0,
+    exactly as from a host that maps no guest RAM, and a write cannot take
+    the features over guest RAM;
+  - the `DRIVER_FEATURES_HI` write that takes it shows them in `FEATURES_LO`
+    and `_HI` (and the budget), and that write and later ones may take them;
+    a write that lets `PAGES_16K` go lets them go, and a reset hides them;
+  - the arm64 kext writes `DRIVER_FEATURES_HI` with `PAGES_16K` first, reads
+    the offer again, and then writes both halves as before. An x86-64 kext
+    never takes it, so an x86-64 guest on a Mac reads the features it read
+    before the bit: the guest RAM features stay hidden, and its surfaces are
+    copied into the region.
+  The device info's `features_lo` and `linear_row_alignment` stay as a host
+  that maps no guest RAM writes them, as the info is written before any
+  guest takes the bit. A host whose page is 4 KiB never offers `PAGES_16K`:
+  every guest's runs are whole pages of its own there.
+- Bit 35, `FEATURES_HI`'s bit 3, is `DISPLAY_SCALE`: each display's record in
+  `DISPLAYS` is followed by the scale of the host screen that shows it, the
+  screen's pixels a point in 120ths (120 at 1x, 240 at 2x, 252 at KDE's 2.1;
+  0 while no window has drawn the display), and a change of the scale alone
+  is a change of the display's mode, told with `DISPLAY_CHANGED` ("Display",
+  below). Every host offers it, and the kext takes it.
+- Bit 36, `FEATURES_HI`'s bit 4, is `TEXTURE_DID_MODIFY_DATA`: ring 0 carries
+  `TEXTURE_DID_MODIFY_DATA` (0x232, `RgfxTextureDidModifyData`, the texture's
+  `ObjId`), the bundle's post of a mipmapped texture over a buffer's
+  `didModifyData` (SPI). Such a texture (`TEXTURE_FROM_BUFFER` of more than
+  one level) is a copy of the buffer's bytes with every level made from them,
+  taken at its first use, as the x86 Macs' (dgpu-oracle.md, Q11), and the
+  platform's `didModifyData` makes it take them again at its next use. The
+  host carries it out as a range message ("Range messages", below), so a
+  command buffer of the process begun after it takes the bytes, a CPU write
+  made after the call among them. Every host offers it, and the kext takes
+  it; a guest that did not take it posts nothing, and the copy keeps what it
+  took.
+- Bit 37, `FEATURES_HI`'s bit 5, is `DISPLAY_POWER`: ring 0 carries
+  `SET_DISPLAY_POWER` (8, `RgfxSetDisplayPower`: display u32, on u32),
+  answered by `COMPLETE`, which turns the display's panel off while the
+  guest's display sleeps and on at its wake ("The display's sleep", below).
+  Every host offers it, and the x86-64 kext takes it.
+- Bit 38, `FEATURES_HI`'s bit 6, is `RATE_MAPS`: ring 0 carries
+  `RATE_MAP_CREATE` (0x233) and `RATE_MAP_RESET` (0x234), both
+  `RgfxRateMapCreate` (the map's `ObjId`, the descriptor's screen size, its
+  private mutability where set, and its layers' `RgfxRateMapLayer` records
+  with their samples after them), answered by `RATE_MAP_STATE` (0x40a,
+  `RgfxRateMapState`: the status, and the map's screen size, granularity,
+  layer count, mutability and parameter data's size and alignment), and
+  `RATE_MAP_QUERY` (0x235, `RgfxRateMapQuery`), answered by `RATE_MAP_ANSWER`
+  (0x40b, `RgfxRateMapAnswer`): a layer's physical size, a coordinate mapped
+  either way, or a copy of the parameter data into a buffer of the sender's,
+  which the platform writes where the buffer's contents lie before it
+  answers. A render pass names its map after its other records
+  (`RGFX_PASS_FLAG_RATE_MAP`, `RgfxRenderPassRateMap`). The platform compiles
+  each map, so its answers and its parameter data are the platform's, and the
+  layer counts it makes maps of are the device info's
+  (`largest_rasterization_rate_map_layer_count`). Every host offers it, and
+  the kext takes it; a bundle on a host that did not offer it makes no map and
+  supports no layer count.
+- Bit 39, `FEATURES_HI`'s bit 7, is `FUNCTION_POINTERS`: a compute pipeline
+  state's function handles and visible function tables. Ring 0 carries
+  `FUNCTION_HANDLE_CREATE` (0x236, `RgfxFunctionHandleCreate`: the handle's
+  `ObjId`, the pipeline state's, and its function as an `RgfxLinkedFunction`
+  record of `RGFX_LINKED_FUNCTIONS`, its strings and constants after the
+  head) and `FUNCTION_TABLE_CREATE` (0x237, `RgfxFunctionTableCreate`: the
+  table's `ObjId`, the pipeline state's and its entry count), each answered
+  by `FUNCTION_POINTER_STATE` (0x40c, `RgfxFunctionPointerState`: the status,
+  and for a table its `gpuResourceID`, `allocatedSize` and `resourceOptions`),
+  and `FUNCTION_TABLE_SET` (0x238, `RgfxFunctionTableSet`: the table's
+  `ObjId`, the first entry and the count, then that many handle `ObjId`s, 0 a
+  nil entry), which the device does not answer. The platform makes the handle
+  of the function among those the state's kernel links, and a function it
+  does not link is `RGFX_STATUS_NOT_FOUND`, Metal's nil; a message naming a
+  state still being compiled waits for it. A set is carried out before any
+  command buffer the process posts after it, so a dispatch encoded before a
+  set and committed after it calls the entry set. A compute pass binds a table
+  at a buffer index (`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE`, 0x201e) or
+  a range of them (`RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES`, 0x201f), and
+  an argument buffer holds a table by its `gpuResourceID`, which the kernel
+  reads with or without `useResource:`. Render stages carry no function
+  pointers. Every host offers it, and the kext takes it; a bundle on a host
+  that did not offer it makes no handle or table, and answers NO to
+  `supportsFunctionPointers`.
+- Bit 40, `FEATURES_HI`'s bit 8, is `DYNAMIC_LIBRARIES`: a compute
+  pipeline's dynamic libraries. Ring 0 carries `DYNAMIC_LIBRARY_CREATE`
+  (0x239, `RgfxDynamicLibraryCreate`: the dynamic library's `ObjId` and that
+  of the sender's library of type dynamic it is made of), answered by
+  `COMPLETE` with its status: `RGFX_STATUS_NOT_FOUND` for a library the
+  sender does not hold, `RGFX_STATUS_REFUSED` for one the host refused or the
+  platform refuses as a dynamic library (one whose code reads a function
+  constant). A message naming a library still being made waits for it. A
+  `COMPUTE_PIPELINE_CREATE` with a nonzero `library_count` ends with that many
+  `RgfxPipelineLibrary` records (the dynamic library's `ObjId`, and the offset
+  and length of an install name in the message): one of no name is preloaded
+  (`preloadedLibraries`, searched first in the run's order), and one with a
+  name is the library that install name loads. Metal reads the file each
+  install name names when it creates the pipeline, for a library made from a
+  file alone; the bundle reads them in the guest's process, each name the
+  kernel's library, its linked functions' libraries and these dynamic
+  libraries name, and refuses the pipeline as the AMD Radeon Pro 5300M does
+  where one loads nothing or a library made of bytes or source names one, so
+  the host links only what the guest sent and reads no file of its own. Render stages carry
+  no dynamic libraries. Every host offers it, and the kext takes it; a bundle
+  on a host that did not offer it makes no dynamic library, and refuses a
+  pipeline whose kernel's libraries name an install name.
+- Bit 41, `FEATURES_HI`'s bit 9, is `PIPELINE_KEYS`: a render or compute
+  pipeline create may ask for its pipeline key
+  (`RGFX_RENDER_PIPELINE_ANSWER_KEY`, 1 << 7 of its flags;
+  `RGFX_COMPUTE_PIPELINE_ANSWER_KEY`, 1 << 3). Where it asks, the device made
+  the pipeline, and the device holds every library the create names under a
+  content key it checked against the library's bytes (one bound by
+  `LIBRARY_LOOKUP`, or made of bytes sent with their key and kept in the
+  library cache), the `PIPELINE_REFLECTION` sets `RGFX_PIPELINE_REFLECT_KEYED`
+  (1 << 2) and carries the key, 32 bytes, after the reflection
+  (`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`, 80; its `size` 112). The key is the
+  SHA-256 of `rgfx-pipeline-v1`, then the create's message with its `seqno`,
+  its `obj_id` and every library id it names zeroed, then each named
+  library's content key in the order the ids lie (a compute create's function
+  library, then each linked function's; a render create's vertex and fragment
+  libraries, then each vertex and each fragment linked function's), 32 zero
+  bytes for an id of 0. A mesh create, and a compute create that links
+  dynamic libraries, is never keyed. The kext keeps keyed answers for every
+  process's equal creates ("Known pipeline creates"). Every host offers it,
+  and the kext takes it; a bundle on a host that did not offer it asks for no
+  key.
+- Bit 42, `FEATURES_HI`'s bit 10, is `ICB_SLOTS_IN_PAGES`, which means
+  nothing without `ICB_SLOTS` and `PAGES_BUFFERS`: an indirect command
+  buffer's slots may lie in the pages of a pages block of the process's, its
+  own memory, rather than in a block of the region, which the guest's kernel
+  maps uncached on an AMD host. Ring 0 carries `ICB_SLOTS_IN_PAGES` (0x23a,
+  `RgfxIcbSlots` then `RgfxIcbSlotPagesRun`s: an `ICB_SLOTS` run whose first
+  slot lies `pages_offset` bytes into the pages of the pages block at
+  `block_offset`), which the host reads and takes in place, in the guest's RAM
+  for a block of one run and in the block's view for one of more. The bundle
+  takes a chunked pages block of the kext's for each buffer's slots, its
+  table's bytes rounded up to whole 64 KiB chunks, and a block of the region
+  where the kext gives none; the block goes back after the buffer's destroy.
+  A host offers it where it offers `PAGES_BUFFERS`, and the kext takes it; a
+  bundle on a host that did not offer it lays every buffer's slots in the
+  region.
+- Bit 43, `FEATURES_HI`'s bit 11, is `DOORBELL_ASKS`: a queue's doorbell is
+  written with the ring's id and `RGFX_DOORBELL_ASKS` (bit 0; a ring's id is a
+  region offset, a multiple of 8) for a command buffer whose stream ends in its
+  ask for its `CB_SUBMITTED`, and with the id alone otherwise. The host
+  answers at the doorbell only an asking write ("The answer at the
+  doorbell"), and may take a plain one with no exit to its process, waking
+  the queue's thread from the guest's vCPU directly ("Routed doorbells").
+  A host offers it where it routes doorbells: on Linux, where its host gives
+  the library's `route_doorbell` (QEMU's KVM ioeventfds); a Mac host (QEMU
+  under HVF or TCG) does not offer it
+  (`doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux`).
+  The kext takes it, and the bundle sets
+  the bit where the device's word holds it; where it does not, every
+  doorbell write may be answered, as before the bit.
+- Bit 44, `FEATURES_HI`'s bit 12, is `GUEST_TIMES`, which means nothing
+  without `HOST_TIME`: a diagnostic. Each command buffer's stream starts with
+  `GUEST_TIMES` (0x000e), the guest's clock as the buffer was made, committed
+  and put on its ring, and the framebuffer keeps the offset of the guest's
+  clock from the host's in ring 0's header, so the host splits the time before
+  it takes each buffer ("Guest times"). Every host offers it, and the kext
+  takes it; a bundle on a host that did not offer it stamps nothing, and the
+  host reads no times of a guest that did not take it.
+- Bit 45, `FEATURES_HI`'s bit 13, is `READ_ONLY_PAGES`, which means nothing
+  without `PAGES_BUFFERS`: the kext makes pages blocks of memory a process
+  maps read-only too, wired for reading alone (`kIODirectionOut`), and marks
+  their `SURFACE_PAGES` `RGFX_SURFACE_PAGES_READ_ONLY` (1 << 5, with
+  `RGFX_SURFACE_PAGES_PRIVATE` alone). The host keeps every object over such
+  a block from writing its pages: a `BUFFER_OVER_PAGES` over it carries
+  `MTLResourceOptions` bit 24, whose GPU writes the platform drops as Metal
+  drops them (accuracy-ledger.md, `read-only-pages-written`), and one without
+  the bit, a `HEAP_OVER_PAGES`, an `ICB_SLOTS_IN_PAGES` and a Managed
+  object's CPU copy over it are refused. The mark is where the host holds that
+  line: a process can post any message on its rings, and the pages may be a
+  file's, so the kext makes such a block only where the host took the bit,
+  and a kext on a host without it refuses read-only memory, which the bundle
+  then copies ("No-copy buffers"). A host offers it where it offers
+  `PAGES_BUFFERS`, and the kext takes it.
+- Bit 46, `FEATURES_HI`'s bit 14, is `DOORBELL_PAGES`: BAR4 holds the
+  doorbell pages, which the kext binds to its contexts with
+  `DOORBELL_PAGE_BIND` and maps into their processes, where the bundle rings
+  its queues with no call into the kext ("BAR4: the doorbell pages"). A host
+  offers it where it maps BAR4 and hands the device its writes: QEMU's
+  `reims-graphics-pci` does, through the C API's `doorbell_pages` and
+  `rvg_graphics_device_doorbell_write`
+  (`doorbell_pages_is_offered_only_where_the_host_maps_bar_4`). The kext takes
+  it. A guest that does not take it, or a host that does not offer it, has
+  every doorbell on `DOORBELL` as before the bit: the device ignores
+  `DOORBELL_PAGE_BIND` and drops every write to BAR4
+  (`without_doorbell_pages_the_doorbells_are_the_register_s`).
+- Bit 47, `FEATURES_HI`'s bit 15, is `PIPELINE_ANSWERS`, which means nothing
+  without `PIPELINE_KEYS`: the device keeps the keyed answers it gave made
+  pipelines' creates from one run of the host to the next, and ring 0 carries
+  the kext's `PIPELINE_ANSWERS` (0x2f9, `RgfxPipelineAnswersQuery`: `first`
+  and `most`), which asks for them, newest first, from the `first`th, at most
+  `most`. Each goes on the control completion ring as a
+  `PIPELINE_REFLECTION` of the query's `seqno`, a keyed reply (status OK,
+  `RGFX_PIPELINE_REFLECT_KEYED`, the key after it) with its `obj_id`,
+  `gpu_resource_id`, unique identifier and resource index 0, then a
+  `COMPLETE` of that `seqno` whose `status` is how many went, fewer than
+  `most` where none is left. It makes nothing and holds up no command buffer.
+  The kext seeds the answers it keeps for every process with them at its
+  start ("Known pipeline creates"). Every host offers it, and the kext takes
+  it; a host without it refuses the message as one it does not know.
+- Bit 48, `FEATURES_HI`'s bit 16, is `MULTI_DISPLAY`: the device has two
+  displays or more, and a guest that takes it drives each ("Multiple
+  displays", below). A host offers it only on a device of two displays or
+  more; no host offers it yet, and no kext takes it.
 
 **BAR2: the region.** A 64-bit prefetchable BAR over host memory (1 GiB),
 mapped write-back by the guest. The device places the control rings at fixed
@@ -869,6 +2046,62 @@ framebuffer's ring lock. Every other ring is one command queue's own ring pair,
 in a block the accelerator kext handed to the queue's process, so each ring
 keeps a single producer and a single consumer however many processes run
 Metal.
+
+**BAR4: the doorbell pages.** A 32-bit, non-prefetchable memory BAR of 4 MiB:
+256 pages of 16 KiB, the largest page a guest maps (an arm64 guest's), so a
+process's mapping of one page reaches no other. QEMU's `reims-graphics-pci`
+always has it, and offers `DOORBELL_PAGES` with it. Every read answers 0, and
+a page holds no register: a process that writes its page can wake its own
+queues and nothing else, never reset or reconfigure the device.
+
+- **Binding.** The kext binds a free page to a context as the context opens,
+  with a write to `DOORBELL_PAGE_BIND` (the page in bits 0 to 7, the context
+  from bit 8, so a context of 2^24 or more gets none), which the device takes
+  before the write returns, and then maps the page into the context's
+  process, uncached (`guest/kext/src/RgfxDoorbellPages.hpp`). The context's
+  close unmaps it, then unbinds it (context 0), then gives it back. Pages are
+  taken round-robin, so a page given back is the last the next contexts take.
+  A busy desktop held 74 contexts ("Contexts", below); a context past the 256,
+  or whose page the kext could not map, has none, and its process rings
+  through the kext's `Doorbell` call, as before the pages.
+- **A page's write.** A 32-bit write at a bound page's first byte of a ring's
+  id, with `RGFX_DOORBELL_ASKS` as `DOORBELL` takes it, is that context's own
+  `DOORBELL`: it wakes the ring where it is one of the context's command
+  queues' rings, and an asking write is answered at the doorbell as there.
+  Every other write is dropped and counted, logged once per kind: at an
+  unbound page or another offset of a page (`unbound`), or of ring 0 or a
+  ring of another context's queue (`foreign`). A ring of no queue is ignored,
+  as at `DOORBELL`
+  (`a_doorbell_page_wakes_only_the_rings_of_the_context_it_is_bound_to`). A
+  reset unbinds every page (`a_reset_unbinds_every_doorbell_page`).
+- **Routes.** Where the guest took `DOORBELL_PAGES`, a queue whose context has
+  a page is routed on the page's doorbell, not `DOORBELL` (the C API's
+  `route_doorbell_page`): QEMU registers its ioeventfd at the page's first
+  byte, matching the ring's id ("Routed doorbells", below). A queue whose
+  context has none is routed on `DOORBELL` as before, and a host that routes
+  no page leaves a queue of a context with one unrouted, its writes taken by
+  the page's write (`a_queue_is_routed_on_its_context_s_doorbell_page`). The
+  kext's own publish of a queue's ring ("A commit behind held messages is one
+  call") rings at the context's page too, so its write meets the route. A
+  page bound to another context drops every route on it of its old context's
+  queues, so the host wakes no ring at a page but its context's
+  (`a_page_bound_again_drops_the_routes_of_its_old_context`); the kext
+  unbinds a page only once its process's mapping is gone, and its context's
+  queues are closed with it.
+- **Security.** The host trusts nothing a process writes but the ring's id:
+  the context is the page's, bound by the kext. A process maps only its own
+  page, and wakes, and asks the answer of, only its own context's queues, as
+  through the kext's `Doorbell` call, which writes any ring's id the process
+  names (ring 0's and other processes' included) and so allows more. The one
+  reach past a context: a process that makes an alias of its page's mapping
+  (`mach_vm_remap`) keeps it past its context's close, as the kext cannot
+  take an alias down, and its writes there reach the page's next context.
+  Their bound is what a page's write does: a wake of a ring of that
+  context's queues, which takes only what the context's process published
+  on it, and an asking write's answer, which goes into that context's own
+  completion ring. Never more than the `Doorbell` call allows any process
+  today. A storm of writes at a page costs the writing process a VM exit
+  each, as a storm of `Doorbell` calls does.
 
 **Contexts.** Each process that opens the accelerator's user client gets a
 context from the kext: a number `c`, handed out once from 1 (its object ids are
@@ -933,16 +2166,20 @@ only by its name ("Shared events across processes"): the process that makes an
 event of another's posts its own `SHARED_EVENT_IMPORT`, an object message of
 its context's, which its buffers that name the event wait for, and the kext's
 `SHARED_EVENT_UNNAME` is context 0's, which no buffer is. A
-display command (`GET_DISPLAYS` to `DISPLAY_COLOR`) or a `SURFACE_DOWNLOAD`
-holds up no buffer: none reads what they make. A present waits for the writers
-the guest's record of its surface names, whatever the host has taken. A
+display command (`GET_DISPLAYS` to `SET_DISPLAY_POWER`), a `SURFACE_DOWNLOAD`
+or a `PIPELINE_ANSWERS` holds up no buffer: none reads what they make. A
+present waits for the writers
+the guest's record of its surface names, whatever the host has taken, those of
+a queue created just before among them: the device tells the host of a queue
+before it answers its create, so the present knows the queue though the host has
+yet to make its handle. A
 download waits for the buffers that used the surface's device cache before it
 was taken, so a buffer posted after it that writes the surface, but taken
 before it, is among them, as one posted before it is: the guest writes a
 surface a CPU lock holds only racing the lock. Every buffer waits for a message
 of any other type, which the host refuses. The queues' threads read
 ring 0 ahead of the control thread, each message once, and keep the count
-through each context's last message (`reims_graphics`'s `device::backlog`), so
+through each context's last message (`reims_vgpu_graphics`'s `device::backlog`), so
 a buffer behind another process's backlog on ring 0 is decoded at once.
 Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 `a_command_buffer_waits_for_no_other_process_s_later_object_messages`,
@@ -951,7 +2188,8 @@ Tested by `a_command_buffer_waits_for_no_other_process_s_creates`,
 and `a_doorbell_write_answers_a_command_buffer_behind_another_process_s_create`.
 
 **Ring 0's lanes.** The control thread takes ring 0 in ring order and carries
-out only the display commands itself. It hands each context's messages, in ring
+out only the display commands and the kext's `PIPELINE_ANSWERS` itself. It
+hands each context's messages, in ring
 order, to that context's lane, every `PRESENT_SURFACE` and `DISPLAY_COLOR` to
 the presents' lane, in ring order, and every `SURFACE_PAGES` and
 `SURFACE_DOWNLOAD` to the lane of the block it names, whichever process posted
@@ -964,7 +2202,7 @@ at most in a boot on an RTX 5080 host) holds up only that process's later
 messages and command buffers. A message
 waits for another context's lane only where it reads what that lane's earlier
 messages change, and only for messages published before it
-(`reims_graphics`'s `device::lanes`):
+(`reims_vgpu_graphics`'s `device::lanes`):
 - a present waits for each lane's `TEXTURE_FROM_IOSURFACE` of its surface's
   plane 0, its destroy of a texture the host names the surface by, and the
   close of a context that holds one: the host shows the newest live texture
@@ -986,10 +2224,15 @@ messages change, and only for messages published before it
   `BLOCK_RELEASE` waits for its block's lane: each reads the view or device
   cache the block's lane makes and copies;
 - a `SURFACE_PAGES` waits for its context's lane only through the last message
-  of those four kinds that names its block; a `SURFACE_DOWNLOAD` waits for no
-  other lane, as on the control thread before.
+  of those four kinds that names its block, and for each lane through its last
+  `BLOCK_RELEASE` of a block described cached whose runs share a page with its
+  own: the release copies that block's device cache into the pages, and the
+  kext makes a surface's new block over them once it has waited 10 s for the
+  release's answer, when a slow message on the release's lane may still hold
+  it; a `SURFACE_DOWNLOAD` waits for no other lane, as on the control thread
+  before.
 
-`reims_graphics`'s `device::lanes` lists every message that names a block or
+`reims_vgpu_graphics`'s `device::lanes` lists every message that names a block or
 its pages by offset, and what orders each against the block's lane.
 
 A close's job on its lane is its table work: it lets go of the context's
@@ -1014,7 +2257,7 @@ Ring 0's threads (`reims-vgpu.graphics-ring0-<i>`) serve the lanes. A lane
 handed a message while it has no thread is given the thread that went idle
 last, or one made for it where none waits, and keeps it until it has no
 message left; the thread then waits for the next lane, and goes once it has
-waited 10 s for one (`reims_graphics`'s `keep`). So the device holds as many
+waited 10 s for one (`reims_vgpu_graphics`'s `keep`). So the device holds as many
 threads as it had lanes busy at once in the last 10 s, whichever contexts and
 blocks they were. With a thread of each lane's own, made as a message came to a
 lane with none and gone after 1 s with none, every new block's first
@@ -1055,7 +2298,7 @@ A queue's thread waiting for ring 0 before it hands a command buffer on is
 woken once the control thread has taken the messages the buffer waits for, and
 once its context's lane has carried out the context's among them, and by
 nothing else but a reset, its queue's end and the device's
-(`reims_graphics`'s `device::gate`): no other process's message wakes it.
+(`reims_vgpu_graphics`'s `device::gate`): no other process's message wakes it.
 Tested by `the_gate_wakes_each_waiter_once_what_it_waits_for_holds`, which
 moves the count and many contexts' lanes at random beside many waiting
 threads. Beside 75 other processes' queues each waiting on a held create, a
@@ -1064,6 +2307,36 @@ the median when every lane's message and control step woke every waiting
 queue, and take 49 to 123 us now, as beside none
 (`a_burst_beside_waiting_queues`, release build, M3 Max under other builds'
 load).
+
+A queue's thread that waits so for its context's lane carries out the lane's
+next job itself where no thread of the lane's carries one out yet, the buffer
+waits for it, and it is a `BUFFER_AT_OFFSET` or an `OBJECT_DESTROY` of no queue:
+the creates and destroys the bundle holds and posts ahead of each commit
+("Destroys and creates no one waits for go together"). The job is the lane's
+running one meanwhile, so the lane still carries its jobs out one at a time in
+ring order, and the lane's thread waits for it before its next. The buffer
+waits for the same messages as before, carried out through the same host code
+before its begin; only the thread that carries them out changes, and the
+buffer's wait ends with neither a ring-0 thread's wake before the job nor its
+own after it. A queue's destroy routes the queue's doorbell and ends a queue's
+thread, and the other kinds may wait long or for a queue's command buffers, so
+each stays with the lane's thread. Measured before the change in Geekbench
+7.1's Super Resolution on the Radeon 780M (a macOS 26.7.2 guest, development
+cee5813f2's timed pass, 19.19 s): 3480 of 6289 command buffers waited so, 30.2
+us at the median and 87.5 us at the 90th percentile from the take to the gate's
+end, 138 ms in all. Each waited only for those two kinds, 6 jobs at the median
+that ran in 17.5 us, and 8.8 us at the median went on the queue's thread's wake
+after the last of them. 56% of them found a ring-0 thread already carrying one
+out at the take, which carries the rest on as before. For the others, carried
+out on the trace's own times with the wakes taken away, the waits shrink by 42.5
+ms over the workload (45.5 ms in the warm pass), 0.2% of it: under a walk's
+run-to-run spread (about 0.5%), so the change was not walked apart. A wait
+without sleeping before the gate was measured against the same trace and
+dropped: it saves only the queue's thread's own wake, at most 17 ms over the
+workload for 34 ms of a core spinning. Tested by `a_buffer_s_thread_carries_out_the_creates_and_destroys_it_waits_for`,
+`a_buffer_s_thread_leaves_other_kinds_to_the_lane_s_thread`,
+`only_a_buffer_at_offset_and_a_destroy_of_no_queue_are_a_buffer_s_thread_s` and
+`buffers_wait_for_their_context_s_messages_over_random_interleavings`.
 
 **The surface and ICB workers.** A lane hands what it would wait long for, and
 the guest learns of only through an answer or a later message, to a worker of
@@ -1085,7 +2358,11 @@ for each other: a `BUFFER_OVER_PAGES` waits only for its own block's
 build checks. What the guest can tell apart from one thread: two
 `BUFFER_OVER_PAGES` of one process on different blocks are made in either
 order, which no answer orders, and the process's later messages wait for
-both. Tested by `a_key_whose_job_hangs_holds_no_other_keys_jobs`,
+both. Where the host groups the pages blocks' views (below, "Group dma-bufs of
+the pages blocks' views"), a group's seal is a job under its process's key,
+which waits at most for the group's 1 ms window, never for another key's job,
+and then carries out its members' messages. Tested by
+`a_key_whose_job_hangs_holds_no_other_keys_jobs`,
 `a_key_waits_for_a_free_thread_once_every_thread_is_busy`,
 `each_keys_jobs_run_one_at_a_time_in_handed_order`,
 `an_idle_thread_ends_after_keep` and
@@ -1113,10 +2390,10 @@ from: on an RTX 5080 host at the display's 3840x2400 mode, WindowServer held
 opened, with 2 queues (measured). With some 70 processes open its blocks came to
 1358 and 169.7 MiB, past the reserve's 160 (measured), most of the bytes its
 no-copy buffers' copies and its Managed textures' CPU copies. Those lie in its own
-pages now, as its Managed buffers' CPU copies do ("Managed storage"), so what
-WindowServer keeps in the region is what no page of its own can hold: its rings,
-its encoders' upload chunks and command buffers' bodies, its surfaces' blocks,
-and the slabs the kernel had no superpage for. The entries hold three times the
+pages now, as its Managed buffers' CPU copies and its encoders' upload chunks
+do ("Managed storage"), so what WindowServer keeps in the region is what no page
+of its own can hold: its rings, its command buffers' bodies and its surfaces'
+blocks. The entries hold three times the
 1358 blocks. A larger display, or a second one, needs the reserve measured
 again.
 
@@ -1146,8 +2423,8 @@ input never grants the flag. The host makes such a queue with the platform's
 `new_command_queue_unshared` (`GpuDevice`): on the Vulkan platform the
 runtime's queue `unshared_queue` makes, and on Metal the queue any create
 makes. The host logs each unshared queue
-at info level (`reims_vgpu::graphics`). Nothing the guest's processes see
-changes.
+at debug level, on its own target (`reims_vgpu::graphics::queues`). Nothing
+the guest's processes see changes.
 
 **Reset.** A reset leaves the device as one just made, as a device's
 function reset does: `STATUS` 0, which the framebuffer writes at its start,
@@ -1172,7 +2449,7 @@ fails) it resets it again on the way out; the OS then draws into the
 firmware's framebuffer, which the firmware's scanout, kept through both
 resets, still shows. Tested by
 `a_reset_keeps_the_scanout_and_what_the_guest_writes_there_shows`
-(`reims-graphics`) and
+(`reims-vgpu-graphics`) and
 `a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window`
 (`graphics/tests.rs`).
 
@@ -1193,10 +2470,15 @@ than the 1024 contexts the GPU addresses hold (a busy desktop held 74,
 "Contexts"), where small chunks let 1020; the pool's ids are as many either way.
 The host reserves the pool's ids on its device as it makes the graphics device,
 its first call on the device (`reserve_guest_texture_ids`,
-`crates/reims-vgpu/src/graphics.rs`). Metal hands the id of a texture placed at
-one out again to plain allocation, so without it the guest's textures would share
-ids with the host's own (the window's drawables, the cursor), and a texture placed
-past the table a fresh device has corrupts Metal's heap (placements from 10000 up
+`crates/reims-vgpu/src/graphics.rs`). The Vulkan platform is told the ids before
+the device is made and reserves them as the device's first call, before its own
+probes: on Linux, a GPU whose imports of views need their pages mapped from
+their files makes a command queue as its device is made, where its driver's
+fold verdict is not kept yet (a cold cache, a new driver or kernel). Metal hands
+the id of a texture placed at one out again to plain allocation, so without it
+the guest's textures would share ids with the host's own (the window's
+drawables, the cursor), and a texture placed past the table a fresh device has
+corrupts Metal's heap (placements from 10000 up
 crashed some runs). The reservation keeps the ids from plain allocation and grows
 the table to hold them (measured on an M3 Max, macOS 27; metal2vulkan imitates
 both). Metal takes one only before the device's first texture, and once the device
@@ -1204,8 +2486,7 @@ has a queue it hands the pool's first range out twice, so the host checks it wit
 a few plain textures and logs an error where one takes a guest id. Were the
 paravirt lane's device in the same process, on the same GPU, the graphics lane's
 reservation would win: it is made as the device is, before any guest runs, while
-the paravirt lane reserves its placed objects as each task starts
-(`crates/reims-vgpu-core/src/resources/manager/reserve.rs`), and Metal takes only
+the paravirt lane reserves its placed objects as each task starts, and Metal takes only
 a type's first reservation. That would not make the two safe together: both lanes'
 guests place textures in the device's one table, at ids each picks alone. So a
 process runs one lane's device on a GPU, and today a VM has one lane or the other.
@@ -1253,6 +2534,109 @@ library the app let go names a library the host still holds. The host makes the
 pipeline from the library before the library's destroy, and the pipeline needs
 it no more.
 
+**Destroys and creates no one waits for go together.** Each call into the
+kext costs the guest its trip through the kernel, and a post that finds the
+host's control thread asleep a doorbell's exit too: 14 us a destroy in a Vision
+request on the RTX 3090 host (9 to 10 us without the doorbell), 3415 destroys
+and 68 to 70 ms a process, in runs of about 70 an app lets go back to back,
+and 12 to 15 us a `BUFFER_AT_OFFSET`, the buffer a heap places (each small
+buffer of a slab), 3079 and 40 to 48 ms a process, between them; and on the
+RX 7900 XTX host 8 to 13 us each of a Vision process's 276
+`TEXTURE_CREATE`s, 82 `TEXTURE_VIEW`s, 46 `MANAGED_TEXTURE_CREATE`s, 204
+`MANAGED_BUFFER_CREATE`s and 204 `BUFFER_DID_MODIFY_RANGE`s, 8.8 ms a
+process. So where the kext
+carries `SubmitBatch` (selector 5), the bundle holds each of these messages,
+none of which anyone waits for or which names a block
+(`RgfxSerializer::postUnwaited`, `RgfxRingWriter::postLater`), and posts what
+it holds in one call, at most 4096 bytes (170 destroys, 73 buffers, 39
+textures), before anything else the process posts
+or asks of the kext (every `IOConnectCall` of the device's goes through
+`rgfxKextConn`, which posts the held first) and before any command buffer it
+commits (the host reads a command buffer after the control ring's messages
+posted before it), once the held fill a call, or 1 ms after the first held.
+The kext checks each as `Submit` checks one, all before it posts any, puts
+the runs on the ring under one hold of its lock with one doorbell at most,
+ends a queue's as `Submit` does, after the messages before it, and follows a
+buffer made for a context that closed since its check with its destroy, as
+`Submit` does. What an object lay over goes back as its destroy is held, as it
+went back once its destroy was posted: whatever takes it again, a create over
+the bytes or with the id, or a block's free, is posted after the destroy, so
+the host has dropped the object first, and every answer the guest reads (a
+heap's `usedSize`, a new object's GPU address and resource id) is the one it
+read before. A texture over an IOSurface goes at once, made and destroyed: a
+present of the surface, by any process, shows the newest live texture the
+host names it by, and waits for its create and its destroy. So do the creates
+that name a block (`BUFFER_OVER_PAGES`, `BUFFER_OVER_SURFACE_PAGES`), which the
+block's lane orders.
+Where the kext stops taking them (its ring stayed full 5 s, or the device
+stopped), the rest stay held, first: the process's next post retries them,
+under its own post's bound, and is refused only where they are refused again,
+as the full ring refuses it; a commit that finds a buffer still held fails the
+command buffer, unposted, with `MTLCommandBufferErrorInternal`, as a GPU
+recovery's victim fails, as the buffer may name it; so does any message held
+but a destroy, each of the kinds above (a create the buffer may name, a
+Managed range it may read). Two answers differ from an unbatched post's
+then, and only then: an object held when the kext stopped taking them was
+answered as made, where its refused post answered nil (as Metal makes
+objects on a GPU that is gone, and fails the work at commit), and its
+refusal reaches the app at the next post, refused in that call, or the next
+commit, failed, never later; and
+what the held destroys lay over has gone back, which a guest reading a heap's
+`usedSize` through a 5 s stall of the control ring sees lower than it did.
+Tested by `serializer_tests`' `test_held_destroys` and
+`test_held_buffers` and `test_held_creates`, `shell_tests`'
+`test_held_destroys_change_nothing_seen`,
+`test_surface_texture_destroys_go_at_once` and
+`test_commit_behind_an_untaken_buffer_fails`, and the kext's by
+`submit_gate_test`, `spans_test` and `user_client_words_test`.
+
+**A commit behind held messages is one call.** A command buffer committed
+while the control ring holds messages (above) made two kext calls: the held
+went in a `SubmitBatch`, and the bundle then published the buffer on its
+queue's ring and, where the host's queue thread slept, rang its doorbell
+through the kext. Where the kext takes it (1 << 11 `QueuePublish`), the
+bundle writes the buffer on its ring and fences its stores, but leaves the
+producer, and hands the queue, the new producer and the doorbell's flags
+(whether the host answers the buffer at the doorbell, and whether that
+doorbell names `RGFX_DOORBELL_ASKS`) to the `SubmitBatch` that posts the held
+(`RgfxRingWriter::tryPost`'s `via`, `RgfxSerializer::publishVia`). Once
+every held message is posted, the kext stores the producer, fences, reads
+`consumer_idle` and rings the queue's doorbell as the bundle would
+(`RgfxQueuePublish.hpp`), so the host sees what it saw before: the held on
+ring 0, then the buffer on its queue's ring. The kext keeps a kernel mapping
+of each queue's ring header for it, made at the queue's create while the
+ring's block is pinned, and let go at the queue's destroy, at the free of
+the block the ring lies in and at the context's close, before the blocks go,
+so it never writes a ring the process no longer holds; a queue past its first
+64, or a ring outside the process's own blocks, has its buffers published by
+the bundle. A commit with nothing held, or behind an encode into an indirect
+command buffer or a refused destroy waiting, goes as before. Where the kext
+leaves a held message other than a destroy unposted, it publishes nothing,
+and the bundle takes the buffer off its ring unseen (its seqno the next
+buffer's, its completion's handlers dropped) and fails it as above; with
+only destroys left, the bundle publishes the buffer itself. The buffer's
+posted time (`GUEST_TIMES`) is stamped before the call, not just before the
+producer moves. Tested by `shell_tests`'
+`test_commit_hands_its_publish_to_the_held` (the route, nothing held, a kext
+without the feature, a refused create and refused destroys) and the kext's
+`queue_publish_test` (the publish against the bundle's own, and the headers'
+table).
+
+**A waiter looks for its answer.** A lifecycle message the kext waits for
+(`postLifecycle`: a heap texture's size, a library's lookup, a surface's
+pages) is answered within tens of microseconds of its post, 60 to 110 us for a
+surface's pages on the RTX 3090 host; the answer then waited for the
+interrupt, the work loop's wake and the waiter's, about 25 us more. So the
+waiter looks for it for at most 150 us (`RgfxAnswerLook.hpp`) before it
+sleeps: where the control completion ring holds a record the work loop has
+not taken, it takes the ring in the work loop's gate, as the work loop does,
+and else pauses the CPU. It never waits for the gate: where another thread
+holds it, the waiter pauses and looks again, so a holder that waits for a lock
+the waiter's caller holds is bounded by the waiter's deadline, as before. The
+rest of the work loop's service follows at the interrupt the record raised. Only a thread whose call waits for an answer
+looks, and only that long; a later answer wakes it as before. Tested by the
+kext's `answer_look_test`.
+
 **Rings.** A 256-byte header, then a byte ring whose size is a power of two
 (64 KiB minus the header for the control rings). Each header field sits in its
 own 64-byte line:
@@ -1261,8 +2645,11 @@ own 64-byte line:
 |---|---|---|
 | 0x00 | `producer`: u64, free-running byte count | producer |
 | 0x08 | `completed_seqno`: u64, on a queue's completion ring the seqno of the last command buffer that finished OK, 0 before one has | host (queue completion rings) |
+| 0x10 | `producer_waiting`: u32, 1 while a producer waits for room (`SUBMIT_ROOM`, `CONSUMED_DOORBELL`) | the waiting side; host 0 |
+| 0x18 | `guest_clock_offset_ns`: i64, on ring 0 where the guest took `GUEST_TIMES`, the guest's clock less the host's | guest (ring 0) |
+| 0x20 | `guest_clock_bound_ns`: u32, how far that offset may be off; 0 while the guest holds none, stored after it with release | guest (ring 0) |
 | 0x40 | `consumer`: u64, free-running byte count | consumer |
-| 0x80 | `consumer_idle`: u32, 1 while the consumer sleeps | consumer |
+| 0x80 | `consumer_idle`: u32, 1 (`RGFX_CONSUMER_ASLEEP`) while the consumer sleeps, 2 (`RGFX_CONSUMER_WALKING`) while a queue's consumer walks a command buffer | consumer |
 | 0xc0 | `armed`: u32, 1 when the guest wants an interrupt | guest (completion rings) |
 
 - A message starts with `type: u32`, `size: u32` (bytes including this
@@ -1271,9 +2658,15 @@ own 64-byte line:
   ring's end.
 - Doorbell. The producer writes the message, publishes `producer` (release),
   then issues a full fence and reads `consumer_idle`. If it reads 1, it writes
-  the ring's id to `DOORBELL`. Before sleeping, the consumer sets
-  `consumer_idle`, issues a full fence and reads `producer` again, so no wake
-  is lost. It clears `consumer_idle` when it wakes.
+  the ring's id to `DOORBELL`; if it reads 2, it does so only for a command
+  buffer whose last op asks for its `CB_SUBMITTED`, which the host may answer
+  inside the write. Under `DOORBELL_ASKS` that buffer's write carries
+  `RGFX_DOORBELL_ASKS` with the id, and every other write the id alone. Before sleeping, the consumer sets `consumer_idle` to 1,
+  issues a full fence and reads `producer` again, so no wake is lost. It
+  clears `consumer_idle` when it wakes. A queue's consumer sets it to 2 while
+  it walks a buffer on its own thread, after which it takes the ring again
+  with no doorbell. A producer that rings only on 1 rings for nothing on 2,
+  and its asking buffer is answered at that take.
 - Interrupts. The host publishes a completion, issues a full fence and reads
   `armed`. If it reads 1, it clears it and raises the ring's vector. The guest
   sets `armed` after draining, issues a full fence and checks `producer`
@@ -1289,13 +2682,26 @@ own 64-byte line:
   so a clear that read its arm sees its take, and only the host writes 0, so
   the 1 undoes nothing of the guest's. The fix is the host's alone: no kext or
   bundle changes, and ring 0's completion ring takes it too.
+- The completion thread's arm, once. The header is uncached memory to the
+  guest on an AMD host, so the completion thread writes it only where
+  something changed (`RgfxReplyReader::armAndCheck`): a ring its last arm
+  found empty, from which it has taken nothing since, it does not arm again
+  while `producer` reads as it did then, as the host clears `armed` only in a
+  post, after its publish; and a pump that took nothing leaves `consumer` as
+  it was.
   `ring/interleavings.rs` walks every interleaving of the host's post, the
-  kext's look and the completion thread's take, arm and sleep (up to 3
-  records and 2 vectors for something else): none leaves a record untaken or
-  the thread asleep unarmed. A wake index the host only reads (virtio's
-  `used_event`) was weighed and declined: it would change a ring's format in
-  the host, the kext and the bundle, and the re-arm closes the race without
-  one.
+  kext's look and the completion thread's take, arm, arm skipped and sleep (up
+  to 3 records and 2 vectors for something else): none leaves a record
+  untaken or the thread asleep unarmed. The kext's take of ring 0's
+  completion ring, at each interrupt of the control vector, which every
+  queue's completions share, and at a waiter's look, keeps the same rule
+  (`ReimsGraphics::takeCompletions`, `RgfxCompletionArm.hpp`): it arms only
+  where it took records since its last arm or that arm found records behind
+  it, and stores `consumer` only where it moved; `completion_arm_test` walks
+  every interleaving of the host's post against its take. A wake index the
+  host only reads (virtio's `used_event`) was weighed and declined: it would
+  change a ring's format in the host, the kext and the bundle, and the
+  re-arm closes the race without one.
 
 **Control commands** (guest to host, ring 0). Each is answered by a
 `COMPLETE` with its `seqno` and a status (0 for success), or by the reply
@@ -1308,6 +2714,7 @@ named.
 | 3 | `SET_CURSOR` | display u32, width u32, height u32, hot_x u32, hot_y u32, offset u64 of a BGRA8 premultiplied image; width 0 removes the image | `COMPLETE` |
 | 4 | `MOVE_CURSOR` | display u32, x i32, y i32, visible u32 | none |
 | 5 | `SET_VBLANK` | display u32, enabled u32 | `COMPLETE` |
+| 8 | `SET_DISPLAY_POWER` | display u32, on u32; 0 turns the display's panel off (`DISPLAY_POWER`) | `COMPLETE` |
 
 Scanout pixels are 32-bit BGRA8 (`kIO32BGRAPixelFormat`), the one format in
 stage 2.
@@ -1317,25 +2724,89 @@ stage 2.
 | type | name | payload |
 |---|---|---|
 | 0x100 | `COMPLETE` | status u32 |
-| 0x101 | `DISPLAYS` | count u32, then per display: id u32, connected u32, preferred mode index u32, mode count u32, then per mode: width u32, height u32, refresh in mHz u32 |
+| 0x101 | `DISPLAYS` | count u32, then per display: id u32, connected u32, preferred mode index u32, mode count u32, where the guest took `DISPLAY_SCALE` its host screen's scale in 120ths u32 and a reserved u32, then per mode: width u32, height u32, refresh in mHz u32 |
 | 0x102 | `DISPLAY_CHANGED` | display u32; the guest asks `GET_DISPLAYS` again |
 | 0x103 | `VBLANK` | display u32, count u64, host time in ns u64 |
 
-**Display.** The modes offered are the host window's size and its screen's
-refresh rate (the guest runs at the host screen's rate). The host presents the
-scanout buffer to the display's window at the host's refresh rate, only when
-the guest wrote it, which it learns from KVM's dirty log over the scanout range
-(QEMU's VGA devices do the same). The GPU reads the buffer in place: the host
+**Display.** The modes offered are the host window's size, its width rounded
+down to a multiple of 16 pixels and its height to even, and its screen's
+refresh rate (the guest runs at the host screen's rate). 16 BGRA8 pixels are a
+64-byte line of the GPU's memory: a guest surface of the mode's width over the
+guest's RAM, as the desktop's are, starts and ends each row on a line, which
+Intel's Vulkan driver needs to draw it in place (the window crate's
+`geometry`). The host presents the
+scanout buffer to the display's window at each refresh while the window shows
+no presented surface, with no dirty log: the scanout shows only at boot and in
+recovery, where its full cost is paid for the simpler design (owner,
+2026-11-07). The GPU reads the buffer in place: the host
 pages under the scanout are imported at its first draw, and again only when
 the guest moves the scanout or changes its size, so no copy is made on the way
 to the window, and no other page of the region is pinned for it. While vblank is
-enabled, the host sends `VBLANK` at each refresh of the window's screen.
+enabled, the host sends `VBLANK` at each refresh of the window's screen. A
+`VBLANK` the control completion ring has no room for is dropped, and the next
+carries the count; the host counts each dropped one (`vblank-dropped`), each
+spell of that ring with no room (`control-ring-full`), and each post onto it
+that waited for room (`control-ring-post-waited`) in its degradation counts,
+and logs the first of each kind. An answer the host gives off the control
+thread waits for no room on it: a present's at its refresh, a close's or a
+block release's as the last command buffer it waits for completes (on the
+platform's thread that sees it, which holds up every queue's completions
+while it waits), a download's as its copy lands. One the ring has no room
+for, or that finds answers handed over before it, is handed to the control
+thread, which posts them in their order ahead of its own answers; a `VBLANK`
+that finds answers handed over is dropped, as one that finds no room is.
+
+**The display's density.** Where the guest took `DISPLAY_SCALE`, the host
+tells it the scale of the screen its window was last drawn on, and the kext
+gives the OS the display's density from it, 110 pixels per inch a point
+(`guest/kext/src/RgfxDisplayIdentity.hpp`): 110 at 1x, 220 at 2x, 231 at
+2.1, and 110 before the window first draws. The x86-64 kext puts it in each
+mode's size in millimetres and in the EDID's size, which is a 1920 × 1080
+display's at that density whatever the window's size, and the arm64 kext in
+`DisplayAttributes`' size and the dot pitch. The modes are valid for HiDPI
+(`kDisplayModeValidForHiResFlag`, on x86-64) only on a screen above 1x, at
+any size whose pixels halve exactly. arm64's WindowServer follows the
+published size (measured): it runs at 1x on a 1x screen and HiDPI above 1x
+at every size. x86-64 macOS starts a display HiDPI on a default mode of at
+least 3840 × 2160, from 3800 pixels wide where its EDID is 32 inches across
+or more, and, where the display is built in, on a default mode of at least
+2048 × 1536 at more than 160 pixels per inch (read from macOS 26.7.2's
+CoreDisplay). The x86-64 framebuffer says its display is built in
+(`kIOConnectionBuiltIn`, as a Mac's own panel is), and its EDID is at most
+20 inches across, so on a screen at 1.5x or more (above 160 pixels per inch)
+the guest runs HiDPI at every window size from 2048 × 1536, at 1x below
+that, and on a screen at 1.45x or less at 1x up to 3840 × 2160 (measured on
+26.7.2 at 2.1 and at 1, and on 11.7.11 to 15.8.2 at 2.1). Before, with no
+connection flags and the EDID at the window's size, it started at 1x on
+every window from 2400 to 3648 pixels wide at 330 ppi, and HiDPI on a 3888
+pixels wide one on a 1x screen (measured). The EDID names the window's size
+in a text descriptor, so each window size is a display of its own to the
+guest, which keeps a mode chosen for it. WindowServer keeps a mode while the
+framebuffer lists it valid: with an EDID that stayed the same across sizes
+it kept its old mode through every resize, and it restored a mode chosen at
+one size to a display resized to another (measured;
+[lessons](../lessons.md)). The framebuffer lists the mode set until another
+is set, for a WindowServer that reads it mid-change
+(`RgfxDisplayModes.hpp`), and answers it never shown and not valid once the
+device no longer shows it.
 
 **Refresh times.** The host stamps each `VBLANK` with its refresh's time on
-the display's grid, a period after the one before, on its monotonic clock. It
+the display's grid, a period after the one before, on its monotonic clock. That
+clock runs at the counter's own rate, as the guest's does (an x86-64 guest's
+`mach_absolute_time` counts its TSC, an arm64 guest's counter is the host's):
+`CLOCK_MONOTONIC_RAW` on Linux and macOS, whose `CLOCK_MONOTONIC` NTP
+disciplines (+45.1 ppm on homelab-um790-xtx-1, -30.1 ppm on homelab-gem10-1,
++3.9 ppm on the M3 Max, measured 2026-11-15), and the performance counter on
+Windows, whose frequency nothing changes (`reims-vgpu-graphics`'s `clock`). So
+the kext's offset of the two clocks holds between its readings, whatever the
+host's NTP does. It
 answers a `PRESENT_SURFACE` in the refresh that shows its surface, right after
-that refresh's `VBLANK`. The kext maps each `VBLANK`'s host time into the
-guest's `mach_absolute_time` by the clocks' offset
+that refresh's `VBLANK`: the first refresh after the command buffers that write
+the surface have finished, whether or not the host's window has drawn it yet.
+An answer frees the surfaces of the presents before it, never its own, so the
+host holds it only while a window draw still running may read one of those
+(`crates/reims-vgpu/src/graphics/present.rs`). The kext maps each `VBLANK`'s
+host time into the guest's `mach_absolute_time` by the clocks' offset
 (`guest/kext/src/RgfxVblankClock.hpp`). Where it took `HOST_TIME`, it reads
 the host's clock at each `VBLANK`, `HOST_TIME_LO` between two reads of its
 own, and maps by the reading whose round trip bounds the offset closest, that
@@ -1389,14 +2860,59 @@ refused: no WindowServer seen calls them, and IOPresentment sends 11 only for a
 gamma entry of the configuration type (1), which the AMD adds as a second entry
 where its display path has it and the device control does not answer.
 
+**The display's sleep.** A Mac's display goes dark when the OS puts it to
+sleep (Energy Saver's timer, `pmset displaysleepnow`), and lights with the
+desktop at its wake. Where the guest took `DISPLAY_POWER`, the kext sends
+`SET_DISPLAY_POWER` with `on` 0 as the guest's display sleeps and 1 as it
+wakes (`guest/kext/src/RgfxDisplayPower.hpp`). The x86-64 framebuffer stays
+out of power management, so it hears of the sleep from the OS's display
+wrangler (`IODisplayWrangler`), whose power messages its general interest
+takes: the panel goes dark as the wrangler goes below its dimmed state (3),
+and lights as it is dimmed or on again. An arm64 guest has no display
+wrangler, and the arm64e framebuffer does not take `DISPLAY_POWER`, so its
+panel stays lit through the display's sleep. The host's panel follows, as a
+monitor's does: while it is off, the display's window and the host's reads of
+the display (`rvg_graphics_device_read_display`, QEMU's console) show black,
+and the host is told the guest's cursor does not show (`cursor_show`). Nothing
+else changes: the guest's scanout and presents are taken and answered as with
+the panel on, `VBLANK`s go on, and modes and the cursor's image stay, so the
+guest's compositor runs as before and the first frame after the wake shows
+what the guest shows then. The device's reset turns the panel on. The host
+code is `reims_vgpu_graphics`'s `control.rs` (the command) and
+`crates/reims-vgpu/src/graphics/sink.rs` ("The panel").
+
 **The display pipe's notification words.** The kext answers a pipe client with
 asynchronous results whose words IOAccelerator's notification callbacks read
 (`guest/kext/src/RgfxDisplayPipeUserClient.cpp`, `completeLocked` and `sendVbl`,
 which build them with `RgfxPipeNotifications.hpp`; `tests/user_client_words_test.cpp`
 pins them).
-A transaction's completion is exactly 11 words: the transaction's cookie in word
-0, its id in the high half of word 1 (the low half 0), the time it was shown in
-word 3, and the action 1 in word 8, the rest 0. The callback reads it as follows:
+A transaction's completion holds the transaction's cookie in word 0, its id in
+the high half of word 1 (the low half 0), the time it was shown in word 3, and,
+where it has nine words or more, the action 1 in word 8, the rest 0. Its word
+count is the one the client's IOAccelerator expects, which differs by release,
+so the kext picks it for each pipe client at the client's first submit
+(`rgfxPipeCompletionCount`):
+- 8 for a client that submits 0x108-byte transactions, as macOS 11.7.11's
+  WindowServer does: the 0x118-byte layout without its last 16 bytes, which
+  12.7.6's and 26's WindowServers send as zeros. The kext reads it as 0x118
+  bytes with zeros past its end;
+- for a client that submits 0x118-byte transactions, 11 where
+  IOAcceleratorFamily2 exports
+  `IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const`, and 9 where it
+  does not. The kernel collections of macOS 13.7.8 to 26.7.2 export it, and
+  those of 11.7.10 to 12.7.6 do not (read). ReimsGraphics references the symbol
+  weakly, through its `OSBundleLibraries` and its Graft declaration
+  (`guest/kext/src/graft.json`, where the family is verified through its class
+  IOAccelMemoryMap, which the KCs of 11.7.11 to 26.7.2 define), never calls
+  it, and reads at its start whether its binder resolved it
+  (`ReimsGraphics::assignedLengthExported`).
+
+Each count was measured by booting the kext with the others: with any other
+count, WindowServer aborts at its first completion (on 11.7.11 its crash report
+names a failed assertion in IOAccelerator's transaction callback that the
+argument count equals its notification's), and with its own it completes every
+transaction: 8 on 11.7.11, 9 on 12.7.6, 11 on 13.7.8, 14.8.9, 15.7.9 and 26.
+The callback reads a completion as follows:
 - it refuses any other word count;
 - it takes word 0 as the completion block the client registered with the
   transaction, so a completion with no cookie is not sent (a null word 0 ends the
@@ -1440,6 +2956,305 @@ window draws it into a texture of the display's mode, so QEMU's own displays and
 a QMP `screendump` see what the guest shows (docs/qemu.md, "The reims-graphics
 device").
 
+## Multiple displays
+
+Status: designed, not built (the owner's decision of 2026-11-15: several
+displays on this device, each in a window of its own, on x86-64 macOS 11 to 26
+and arm64 macOS from 14). The wire's definitions are in `wire.rs`
+(`RGFX_FEATURE_MULTI_DISPLAY`, `RGFX_DISPLAYS_MAX`, `RGFX_SCANOUT_ROOM_ALIGN`,
+`RGFX_SCANOUT_STRIDE_ALIGN`); no host offers the feature and no kext takes it
+yet. The lanes at the end of this section build it.
+
+**A device of one display is what it was.** A device has 1 to
+`RGFX_DISPLAYS_MAX` (4) displays, 1 by default, fixed when it is made. With
+one, everything the guest and the host observe stays as before this section:
+the registers (`FEATURES_HI` offers no new bit), every message and event,
+`DISPLAYS` with display 0 alone, the scanout's room and the modes offered, the
+C API's results and callbacks, QEMU's one console and its properties, the
+window and its register (`crates/reims-vgpu-window/features.md`), and the
+option ROM's bytes. Each lane holds that line with the tests that hold it
+today, unchanged, and with a one-display boot that logs the feature words a
+boot before the change logged (`RgfxFeaturesOffered`, `RgfxFeaturesWanted`,
+`RgfxFeaturesTaken`).
+
+**How the guest learns the count.** By `MULTI_DISPLAY` (feature bit 48,
+`FEATURES_HI` bit 16), which the host offers only on a device of two displays
+or more. A guest that takes it, as it takes any bit ("Negotiated features"),
+is answered `DISPLAYS` with every display, ids 0 to count − 1, each connected,
+and gets each display's events. One that does not (the option ROM, Ambrosia's
+module as it is, a kext built before the bit, the arm64e kext until its lane
+lands) is answered display 0 alone, as by a device of one display: its
+commands for another display are refused `NO_DISPLAY`, as now, and the host
+sends it no `VBLANK` or `DISPLAY_CHANGED` of another display, since today's
+framebuffer reads neither event's display (`ReimsGraphics.cpp`, the completion
+ring's service). No register is added: the kext reads `DISPLAYS` in its start,
+before it registers a framebuffer, which is the first point the count is
+needed. A reset clears the take, as it clears every bit's.
+
+**The count is fixed; no display is plugged in or out (decided for v1).** The
+count is QEMU's `displays` property, and every display is connected from the
+device's start to its end:
+- an arm64 guest's processes count their displays once each, from device-tree
+  nodes the firmware placed before the kernel started ("The arm64e kext",
+  below), so a display added later reaches no running WindowServer;
+- the x86-64 kext would make and end framebuffers while WindowServer runs, which
+  nothing calls for while closing any window powers the VM off (features.md,
+  "Leaving");
+- the device makes its consoles in QEMU's realize, and its windows as it is
+  made.
+`RgfxDisplayEntry.connected` stays in the wire for a later lane that
+disconnects a display rather than ending the VM.
+
+**Messages name their display.** Each display message carries the display's
+id already: `SET_SCANOUT`, `SET_CURSOR`, `MOVE_CURSOR`, `SET_VBLANK`,
+`SET_DISPLAY_POWER`, `PRESENT_SURFACE`, `DISPLAY_COLOR`, `DISPLAY_CHANGED` and
+`VBLANK`. Display 0 keeps today's encoding exactly, and display i's id is i, so
+no layout changes and `VERSION` stays 2. An id at or past the count is
+refused `NO_DISPLAY` (a `DISPLAY_COLOR` dropped and logged, as now). Each
+display has its own:
+- **scanout**, in a room of its own (below);
+- **mode**: the one mode today's rule ("Display", above) gives, from its own
+  window: the window's pixels, the width rounded down to a multiple of 16 and
+  the height to even, at the refresh rate of the window's screen, with that
+  screen's scale where the guest took `DISPLAY_SCALE`. A resize of window i, or
+  its move to a screen of another scale, sends `DISPLAY_CHANGED` of display i.
+  Without windows every display offers 1920 × 1080 at 60 Hz;
+- **`VBLANK`s**, while the guest has them on for it, at each refresh of its
+  window's screen, stamped on a grid of its own and counted from 0 at a reset;
+  one dropped for want of room counts as `vblank-dropped`, as now;
+- **presents and colour**: `PRESENT_SURFACE` and `DISPLAY_COLOR` of display i
+  show and colour display i alone, and a present is answered at the refresh of
+  display i that shows it. A block's release waits until no display reads a
+  surface's texture over the block;
+- **cursor**: `SET_CURSOR` and `MOVE_CURSOR` of display i set and move display
+  i's (its image below);
+- **panel**: `SET_DISPLAY_POWER` of display i turns display i's panel off and
+  on;
+- across a reset, as display 0 now: its scanout kept, its cursor image gone,
+  its panel on.
+
+**The scanout's rooms.** The scanout's room, `RGFX_SCANOUT_SPAN` (128 MiB) at
+`RGFX_ALLOCATIONS_OFFSET`, is split evenly among the displays: each room is
+`RGFX_SCANOUT_SPAN / count` rounded down to a multiple of
+`RGFX_SCANOUT_ROOM_ALIGN` (64 KiB), display i's from
+`RGFX_ALLOCATIONS_OFFSET + i × room`. That is 128 MiB for one display, 64 MiB
+each for two, 0x2aa_0000 bytes (42.6 MiB) each for three and 32 MiB each for
+four. The host refuses (`INVALID_ARGUMENT`) a display's `SET_SCANOUT` outside
+its own room. Nothing else of the region moves: the accelerator's blocks start
+at `RGFX_CONTEXT_ALLOCATIONS_OFFSET`, and a scanout's grant (`BLOCK_GRANT` in
+the scanout's span) lies in the span, as now. Growing the span with the count
+was weighed and declined: each display would take 128 MiB of the blocks' room,
+about 892 MiB of the 1 GiB region with one display and 508 MiB with four,
+whose last 160 MiB is WindowServer's reserve ("WindowServer's reserve", above).
+On a device of more than one display the host offers each display only modes
+whose rows, `width × 4` bytes rounded up to `RGFX_SCANOUT_STRIDE_ALIGN` (256,
+the kexts' and the option ROM's row alignment), fit its room `height` times:
+a window too large for its room is offered the largest mode of the window's
+ratio that fits, in the same steps of 16 and 2, which the window draws as it
+draws any mode of other pixels (the window crate's `geometry`). So four
+displays take up to 3840 × 2160 each (31.6 MiB of 32), and two up to
+5120 × 2880 each (56.3 MiB of 64). With one display the host offers what it
+offers today. The option ROM and Ambrosia's module, which take no feature,
+scan out display 0 at `RGFX_ALLOCATIONS_OFFSET` in display 0's preferred mode,
+which the host's sizing keeps inside display 0's room.
+
+**One cursor slot.** The region keeps one cursor slot (`RGFX_CURSOR_SPAN` at
+its end). The host copies a `SET_CURSOR`'s image out of the region before it
+answers (`control.rs`, `set_cursor`), so the kexts set every display's image
+through the one slot in turn: the framebuffer that owns the device holds a lock
+from its write into the slot to the command's answer.
+
+**Interrupts.** Every display's events go on the control completion ring,
+MSI-X vector 0, as now: `RGFX_MSIX_VECTORS` stays 1. Four displays at 120 Hz
+send 480 `VBLANK`s a second there.
+
+**The C API.** Additions only. Each function and callback there now is display
+0's, so a host of one display, or one built before the additions, sees what it
+sees today, and QEMU's side changes with them:
+- `RvgGraphicsDeviceConfig`, version 4: `display_count` (0 and 1 are one
+  display, as a host built before the field has; 2 to
+  `RVG_GRAPHICS_DISPLAYS_MAX`; any other value `RVG_ERR_INVALID_ARGUMENT`), and
+  `display_windows`, the window configs of displays 1 to count − 1, given
+  exactly where `window` is;
+- `RvgGraphicsCallbacks`, version 4: `cursor_glyph_at(ctx, display, glyph)`,
+  `cursor_show_at(ctx, display, show)` and `cursor_move_at(ctx, display)`,
+  called for displays 1 and up on the display thread, in order with every
+  display callback; display 0's stay `cursor_glyph`, `cursor_show` and
+  `cursor_move`;
+- `rvg_graphics_device_read_display_at(device, display, dst, dst_length,
+  width, height)` and `rvg_graphics_device_cursor_position_at(device,
+  display)`, whose display 0 is `rvg_graphics_device_read_display` and
+  `rvg_graphics_device_cursor_position`; a display at or past the count is
+  `RVG_ERR_INVALID_ARGUMENT`, and (0, 0) for the position;
+- `RVG_GRAPHICS_DISPLAYS_MAX`, 4. docs/api.md gives the versions (section 1)
+  and the threads (section 5).
+
+The Rust API mirrors it. Inside the library each display gets what display 0
+has now: its `Screen` (`reims-vgpu-graphics`' `display.rs`), its
+`DisplayState` and refresh grid (`device.rs`), and its window
+(`WindowScreen`), presented surface, present queue, colour, read-back and
+host cursor (`crates/reims-vgpu/src/graphics.rs` and `graphics/`);
+`Host::present_surface`, `present_keep`, `display_color` and `refreshed` take
+the display. Which threads run the displays' refreshes is free (AGENTS.md,
+"What is free").
+
+**QEMU.** `reims-graphics-pci` takes `displays`, 1 to 4 and 1 by default
+(realize refuses others), makes a graphic console per display
+(`qemu_graphic_console_create` with head i), fills console i with
+`rvg_graphics_device_read_display_at` and gives it display i's cursor, and
+under `-display none` has the library open a window per display whose input
+goes to console i. `resolution` is every window's first size, and QMP's
+`screendump` with head i saves display i. With `displays` 1 nothing of QEMU's
+changes.
+
+**The pointer across displays.** Each window's pointer goes to its display's
+console, in that display's pixels, and keys from every window reach the one
+keyboard. A VM has one USB tablet, which reports a position in its range with
+no display in it, so how a pointer over display 1's window reaches the guest's
+display 1 waits on X1 (below). Until it is settled, reims-ctl offers no
+setting for it (its lane lands last).
+
+**The windows.** One window per display, as the window crate already makes
+them (`Window::new(config, port, title(port))`, `screens::screen_for_port`):
+display i's is port i's, titled "Reims vGPU (port i)", opened on host screen i
+or the main screen (`REIMS_VGPU_WINDOW_SCREENS` picks), and cascaded where two
+share a screen. In features.md:
+- each window keeps the entries of "The picture", "Matching the host's
+  screen", "Borderless", "Pointer", "Keyboard", "Capture", "Scrolling" and
+  "Cursor" for its own display ("Pointer"'s first entry, the guest's pointer
+  under the host's, waits on X1 for displays 1 and up). A capture holds the
+  pointer over its own window's image, so reaching another display's window
+  takes a release (⌃⌥⌘) or a move uncaptured;
+- "The VM is an app", the switches and "Leaving" (closing any window powers the
+  VM off) are the process's;
+- the entries written for several windows were never walked with a second
+  display driven, since apple-gfx's guests drove port 0 alone (docs/qemu.md):
+  one window per guest display, the port in the title, display i on screen i,
+  the cascade, the screens changing, and on Linux the cursor set only by the
+  window the pointer is in (`manual (a VM with two displays)`);
+- new entries, in a commit of their own: each window offers its display its
+  own mode, rate and scale; a window whose display the guest does not drive
+  shows black; and the pointer's, once X1 settles it.
+
+**The x86-64 kext.** `ReimsGraphics` stays the device's driver and display
+0's IOFramebuffer. Where it took `MULTI_DISPLAY` and `DISPLAYS` lists more
+displays, its start makes an IOFramebuffer of the kext's for each display from
+1, registered after display 0's (where each attaches in the service plane is
+the lane's to settle), each with:
+- its own connection, mode list (`RgfxDisplayModes.hpp`), timings, EDID (its
+  serial is the display's already, `rgfxDisplaySerial`), cursor, vblank and
+  connect interrupts, and server connection's scanout owner;
+- `IOFBDependentID` display 0's registry ID and `IOFBDependentIndex` i, as
+  IOGraphics groups one GPU's framebuffers, and `IOAccelTypes` and
+  `IOAccelIndex` 0, the one accelerator;
+- its aperture and VRAM range in display i's room (`scanoutLimit` per
+  display);
+- its commands posted on display 0's control ring under its lock, naming
+  display i; the work loop hands display i's `VBLANK` and `DISPLAY_CHANGED` to
+  framebuffer i.
+Each display pipe client works on the framebuffer whose index IOPresentment
+associates it with (X3), and the scanout grant (selector 0x108) grants the room
+of the display the surface is drawn for. `DisplayPortCount` is the count where
+the bit was taken (X4). The x86-64 build carries the bit
+(`kRgfxCarriedFeatures`) only once all of this lands, and the arm64e build once
+its own lane lands.
+
+**The arm64e kext.** `ReimsGraphics` stays display 0's IOMobileFramebuffer, on
+`/arm-io/reims-display0`. Each display i from 1 needs an IOMobileFramebuffer
+service of its own, on a node `/arm-io/reims-display<i>` that the firmware
+placed before the kernel started, with its own attributes (`IOMFBUUID` and
+`DisplayAttributes` carry the display's serial), timings, swaps (layer 0 its
+surface, layer 1 its cursor, `RgfxMobileCursor.hpp`), `VBLANK`s and
+republished modes. A1 and A2 (below) settle its shape before it is built.
+
+**The option ROM** drives display 0 alone, unchanged: it takes no feature, so
+it sees one display, and its GOP framebuffer lies in display 0's room. Its
+bytes do not change. Displays 1 and up show black until the kext drives them.
+Ambrosia's module likewise brings up display 0 alone.
+
+**reims-ctl.** A VM's `[display]` takes `count`, 1 to 4, saved only above 1,
+so a one-display VM's file is unchanged. It is the key reims-ctl saved for
+apple-gfx's display ports (1 to 8), which it reads past since apple-gfx was
+dropped (`crates/reims-ctl/src/vm.rs`, `apple_gfx_s_settings_are_read_past`):
+such a VM's count comes back, one above 4 read as 4. The QEMU command gives
+`reims-graphics-pci` `displays=N` only above 1, as it gives `resolution` only
+where it is not the device's own, since a QEMU built before the property
+refuses it. `resolution` and `borderless` are every window's. The VM form of
+the terminal UI has a Displays field beside Resolution, shown on reims-vgpu and
+hidden on VMware SVGA, which has one display; `create` and `set` take
+`--displays N`; a VM's summary says how many windows it opens. The terminal
+viewer shows display 0, the head its screendumps name.
+
+**Unknowns.** None is guessed: each lane measures its own before it builds on
+it.
+- X1, the pointer. Where macOS 11 to 26 puts the USB tablet's position with
+  two displays: over the box around all its displays, or over its main display
+  alone. Found on mmx86's first boot with two displays: with display 1's window
+  sending known positions, read where the guest puts its cursor
+  (`MOVE_CURSOR`'s display, x and y, logged by the host) beside the displays'
+  arrangement (`system_profiler SPDisplaysDataType`, and the screens' frames
+  from a tool of our own). Over the box, the host maps window i's pointer by
+  display i's place in the guest's arrangement, which it learns from the
+  cursor's moves or from the guest, in a command added to `MULTI_DISPLAY`
+  before any host offers it (an x86-64 IOFramebuffer is told its screen's
+  bounds, `extSetBounds` into its shared memory's `screenBounds` in IOGraphics'
+  public source, to be checked on the guests). Over the main display alone, no
+  mapping on the host reaches display 1, and the pointer needs a pointing
+  service of the kext's own: a lane of its own.
+- X2, the second display's connection. Whether macOS 11 to 26 runs two
+  displays that both say they are built in (`kIOConnectionBuiltIn`, which
+  display 0 says so that its HiDPI start follows its density): booted with
+  displays 1 and up built in, then external, reading CoreDisplay's choice of
+  default mode and System Settings' names. External would start display 1 at
+  1x below 3800 pixels wide ("The display's density", above).
+- X3, the pipe's index. Which index IOPresentment associates display 1's pipe
+  client with (today's kext takes 0 and 0xffffffff), read from the kext's log
+  of each associate on the first boot with two displays.
+- X4, `DisplayPortCount`. What on x86-64 reads the accelerator's
+  `DisplayPortCount`; on arm64 IOMobileFramebuffer.framework reads it only of an
+  AppleParavirtGPU (`ReimsGraphicsMobile.cpp`).
+- X5, WindowServer's reserve. WindowServer's peak blocks at four displays of
+  3840 × 2160 against the reserve's 160 MiB and 4096 entries, from the kext's
+  log of its peak ("WindowServer's reserve", above).
+- A1, the arm64 display nodes. Ambrosia adds one node, `Graphics` >
+  `DisplayNode` (a string; Ambrosia's docs/configuration.md), and a
+  process waits up to 30 seconds for a service for each node it counted, so
+  the nodes must number the device's displays. Ambrosia needs a change, its
+  owner's to make: its graphics driver interface's next revision lets the
+  module say how many displays the device has (it reads `DISPLAYS` having taken
+  `MULTI_DISPLAY`), and Ambrosia adds that many nodes from a list in the
+  configuration; or `DisplayNode` takes a list, and each configuration bundle
+  is made for one count. The first leaves no bundle that disagrees with its
+  device.
+- A2, the arm64 services. How IOMobileFramebuffer.framework pairs the displays
+  it counted with services, and what a second service of one kext needs for
+  WindowServer to drive it (its index, its UUID, its swaps and cursor): read
+  from macOS 14.6.1's and 27.0.1's framework (`iomfb_populate_all_display_infos`
+  and the service matching) and from how AppleParavirtGPU publishes a display
+  per port, kept local and never committed, then checked by a boot of arm64 14
+  with two displays under TCG.
+- A3, the pointer on arm64: X1's question on an arm64 guest, found on mma64's
+  first boot of arm64 14 with two displays, as X1 is.
+
+**The lanes**, in the order they land:
+
+| lane | owns | waits for | checks |
+|---|---|---|---|
+| mmhost | the device crate (each display's state, rooms, mode sizing, events by the bit, the offer), `reims-vgpu` (each display's screen, window, presents, colour, read-back and cursor), the C API, its header and docs/api.md, `vendor/qemu` (`displays`, a console and window per display), features.md's new entries, docs/qemu.md, and the pointer's host side once X1 is settled | this design | `cargo xtask check` (the Mac's and Linux's); QEMU built, realized paused (`-S`) at `displays` 1 and 4, refused at 0 and 5; boots of x86-64 26.7 at `displays` 1 (the feature words unchanged) and 2 with today's kexts (display 0 as before, display 1's window black); features.md's entries for several windows walked on a Linux host |
+| mmx86 | `guest/kext`: the owner's code per display shared by both architectures (the display table, events by display, the cursor slot's lock), the x86-64 framebuffers per display, X1 to X5 and the guest side of the pointer; both prebuilt sets | mmhost, for its boots | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed; boots of x86-64 11.7, 12.7, 13.7, 14.8, 15.8 and 26.7 at `displays` 2 and 1 |
+| mma64 | the arm64e framebuffers per display (`ReimsGraphicsMobile.cpp`), `firmware/ambrosia`'s nodes, A1 to A3 | mmhost; mmx86's shared code; Ambrosia's nodes (A1) | `make -C guest test`; `make -C guest prebuilt` and `prebuilt-arm64e` committed (each set's record lists every kext source); `make -C firmware/ambrosia bundle` and `config-bundle`; boots of arm64 14, 15 and 26 under TCG and 27 under HVF on the M3 at `displays` 2 and 1 |
+| mmctl | `crates/reims-ctl`: the setting, the QEMU command, the terminal UI and the command line | mmhost's `displays` landed, and the pointer reaching display 1 (X1) | `cargo test`, `cargo fmt --check` and `cargo clippy --all-targets` in it; an install and a boot at `displays` 2 on a Linux host |
+
+mmhost, mmctl and the reading for X2 to X5, A1 and A2 start at once; mmx86
+builds and unit-tests its framebuffers at once and boots them on mmhost's
+branch; mma64 builds once mmx86's shared code has landed. A boot at `displays`
+2 passes where `system_profiler SPDisplaysDataType` lists both displays at
+their windows' modes, a `screendump` of each head shows the desktop, both
+displays get `VBLANK`s, the cursor shows on the display it is on, no
+`reims-vgpu: fatal` line is logged, and the boot's usual checks pass; one at
+`displays` 1 passes the usual checks with the feature words of a boot before
+the change.
+
 ## Stage 3 wire protocol: the Metal-call stream
 
 Stage 3 keeps the stage-2 transport unchanged — the registers, the region, the
@@ -1452,7 +3267,7 @@ completion rings.
 Our guest Metal GPU bundle is the host of Apple's Metal SPI: every Metal call
 an app makes lands in one of the bundle's objects, and the bundle serialises it
 into this stream. The host reads the stream and drives the library's `Platform`
-(Metal on the Mac, metal2vulkan on Linux), the same trait reims-vgpu-core
+(Metal on the Mac, metal2vulkan on Linux), the same trait core
 already drives from the Apple-lane command stream. So the host decoder is: wire
 message → handle-table lookup/insert → `Platform` call → completion. The
 bundle's serialiser is the mirror of that decoder.
@@ -1496,7 +3311,7 @@ buffer then completes as it would have. Where there is no stand-in (a message
 too short to name its queue, a queue the process does not hold), the error
 status is posted at once. Nothing in
 this lane ends the offending context or its process on malformed input. The
-host runs each op in a refusal scope (`reims_vgpu_core::raise::refusals`): a
+host runs each op in a refusal scope (`reims_vgpu_vulkan::core::raise::refusals`): a
 death at a platform call, where the platform refuses a create or an encode and
 the paravirt device ends the process, unwinds to the op's scope instead, and the
 op is refused there, logged once at WARN with the platform's reason. A panic in
@@ -1555,7 +3370,7 @@ plane 0, which a process presents through its own CPU mapping of the plane
 block, whatever id it claims. The kext wires those pages while the process holds the block,
 posts `BLOCK_SHARE` (context, offset, size) for each holder before the process
 learns of the block, and `BLOCK_UNSHARE` as a holder other than the last lets
-it go (selector 0x10a, or its close). The last holder's let-go frees the block
+it go (selector 8, or its close). The last holder's let-go frees the block
 as a free does, and its `BLOCK_RELEASE` ends every hold; a cached block in
 place instead sleeps, its last holder's `BLOCK_UNSHARE` posted, until an ask of
 its surface holds it again with a `BLOCK_SHARE` alone or the kext lets it go
@@ -1569,7 +3384,13 @@ ask answers `kIOReturnUnsupported`, so the process copies the surface. Where
 the device has `RGFX_FEATURE_SURFACE_CACHE`, 0x109's fifth and sixth inputs
 (the surface's IOSurfaceID, and 1 where the process asks it cached) have the
 kext mark a block it makes cached in its `SURFACE_PAGES`, and a fifth output
-answers whether the block is, whichever ask made it. The kext then writes the
+answers whether the block is, whichever ask made it. Where the device has
+`RGFX_FEATURE_SURFACE_CACHE_REFUSED` instead, a struct input with the six
+(`RgfxSurfacePagesLayout`) is the surface's layout, with which the kext asks
+the device whether the block needs a cache, and marks it cached only where
+the device answers so; the surface's resident pages may follow the layout
+(`RgfxSurfaceResident`), where the kext took `RGFX_FEATURE_SURFACE_DEFERRED_CARRY`,
+for a deferral that carries them. The kext then writes the
 surface's CPU generation at offset 16 of the block, and asks `SURFACE_DOWNLOAD`
 (block offset) at a CPU lock that follows a GPU write, answered once the
 surface's pages hold the host's device cache (Decided 14, "The device cache").
@@ -1577,7 +3398,7 @@ A command buffer that writes surfaces' shared blocks is named to the kext
 after it is posted and before its commit returns (selector 0x10c: the queue,
 the buffer's seqno, and a pair of the block's offset and the surface's
 IOSurfaceID for each surface), and its completion retires the queue's writes
-up to it once any copy is written back (selector 0x10d). Only a holder of a
+up to it once any copy is written back (selector 9). Only a holder of a
 block names it, only for one of its own queues, and the kext keeps a block's
 surface only where the surface's memory holds the block's pages, so no
 process makes another's locks wait (§14, "CPU locks").
@@ -1605,6 +3426,10 @@ before a block's free marks it freed, and when a hold ends, a scanout grant
 goes or a mode change moves the scanout. At the close the whole window goes,
 every span in it, before the context's blocks are freed. Each span is whole
 pages past the region's head, so no mapped page holds a byte of anything else.
+A page here is the process's: 4 KiB on x86-64 and 16 KiB on arm64, where the
+kext maps the whole 16 KiB pages of a block's part a process uses (a plane's
+bytes, whole 4 KiB guest pages) and of the scanout's rows. Every block is whole
+such pages, and a surface block's runs start past the mapped pages.
 The device info shares its page with the control completion ring's tail, so
 the kext reads it for the process (selector 0x10b), and the region's own map
 (`kRgfxAccelMemoryRegion`) is refused. One difference from Apple's: a process
@@ -1736,6 +3561,76 @@ again. Where the kext has no slot left (64 per process, 256 in all), the create
 waits as any. The bundle posts this way only where the kext's feature word
 has `kRgfxKextFeatureDeferredAnswers`.
 
+Across processes, the key is the create's pipeline key (`PIPELINE_KEYS`,
+above), which names its libraries by their content, not by the process's
+ids. The kext keeps the device's answer to every create it waited for that
+carries a key (`RgfxSharedPipelines.hpp`): the reflection with its header,
+object id, `gpuResourceID`, unique identifier and resource index zeroed, in a
+table of 2,048 answers (256 sets of 8, a full set replacing the answer found
+or learnt longest ago), seeded at each start of the kext with the device's
+answers of earlier runs (below). The bundle computes
+the key of each create whose libraries all have content keys, and posts it
+with Submit's `kRgfxSubmitShared` flag and the key: where the kext keeps an
+answer of that key and has a slot left, it posts the create as a deferred one
+and hands back the kept answer, stamped with the create's seqno and object id,
+which the state takes as it takes a known create's; the process then knows the
+create too. Else the create is posted and waits as any, and its answer is kept.
+A process sees the same answers as with its own equal create before: the
+reflection at once, its own `gpuResourceID` at the first read, and a refusal
+at the create only where no process's equal create was accepted. Where the
+device refuses a create a kept answer answered, the kext forgets that answer
+(the deferred slot holds the key), so the next equal create of any process
+waits for its own answer and takes the refusal at the create. And the kext
+keeps the device's own answer to every create posted so that made a keyed
+pipeline, so a kept answer the device answers otherwise, which only a seed of
+an earlier run can be (below), answers no later create. The create it
+answered keeps the kept values: a state takes its reflection once, and only
+its `gpuResourceID` from its own answer. The kext
+learns only answers the device gave, whose key the host computed, so no
+process can place an answer for another's key; a process naming a key that is
+not its create's only takes a wrong reflection for its own pipeline. The
+bundle posts so only where the kext's feature word has
+`kRgfxKextFeatureSharedPipelines` and the device's has `PIPELINE_KEYS`.
+
+Across runs, the device keeps its answers to keyed creates
+(`PIPELINE_ANSWERS`, above), as a Mac's Metal keeps its compiled pipelines on
+disk. The host keeps each made pipeline's keyed answer, with the fields it
+gives each create alone zeroed, in a file of its own, under the identity of
+what decides its answers: the platform's translation profile (its
+fingerprint), its runtime's semantic, artifact and runtime versions, the
+driver's version, the build of the library that runs (the host's executable,
+which links it, by path, size and modification time: how the library decodes a
+create and replies is its build's), and the file's format
+(`crates/reims-vgpu/src/graphics/answers.rs`). A file of another identity is
+never read, so an upgrade of the library or of its host starts from none. The file is a header (its magic,
+format, record size and identity, with their checksum) and 128-byte records,
+each one key's answer or the drop of a key's answer, with its checksum over
+the identity and its bytes; a damaged or foreign file, or one holding an
+answer no create could be given, reads as none and is started again. A
+record is appended when an answer is learnt or dropped, and the kept record
+again at a run's first create of a key an earlier run kept, so an answer is
+as new as the last run that used it. The file holds at most 8,192 records
+(1 MiB): one past half of that is written again at the next open, and one at
+all of them before the run's next record, with its newest 2,048 answers, the
+kext table's size. A drop that cannot be written removes the file, so no
+dropped answer reaches a later run. The QEMUs of one build on a host share
+the file: each appends, writes it again or removes it only under the file's
+lock, and then to the file its path names, and a rewrite takes every QEMU's
+records from the file, so none is lost and no dropped answer comes back. The
+host keeps the 8 newest files. A
+refusal is never kept, and a create of a kept key that the device refuses or
+answers with other values drops the kept answer, the second a degradation
+logged once per boot. At its start, once the
+display is listed and before any process can make a pipeline, the kext asks
+for the kept answers, 64 a query, newest first, until the device has no more
+or it has asked 2,048, and seeds its table with them: a seed takes only a free
+entry of a key the table does not hold, so a full set keeps the newer seeds,
+and ranks below every answer the run learns or finds, the newer seed above
+the older. A create of a key the device accepted in an earlier run then takes
+its answer at once, as an equal create of another process does; its
+`gpuResourceID` still waits for its own answer. The kext seeds only where the
+host took `PIPELINE_KEYS` and `PIPELINE_ANSWERS`.
+
 Every reason the host refuses a pipeline create is either impossible for an
 equal create or known to the process when it posts:
 - its object id is new;
@@ -1765,7 +3660,11 @@ that waits for its answer would close it, at the cost the known creates remove.
 |---|---|---|
 | memory | `HEAP_OVER_HOST_MEMORY`, `HEAP_CREATE`, `BUFFER_CREATE`, `BUFFER_OVER_HOST_MEMORY`, `BUFFER_AT_OFFSET`, `BUFFER_MANAGED_AT_OFFSET`, `HEAP_OVER_PAGES`, `TEXTURE_CREATE`, `TEXTURE_FROM_BUFFER`, `TEXTURE_FROM_IOSURFACE`, `MANAGED_TEXTURE_CREATE`, `MANAGED_BUFFER_CREATE`, `*_DESTROY` | `new_heap_over_host_memory`, `new_heap`, `new_buffer`, `Heap::new_buffer_at_offset`, `new_texture`, `Buffer::new_texture`, drop |
 | Managed ranges | `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION` | `Buffer::did_modify_range`, `Texture::replace_region` |
+| a texture's bytes changed | `TEXTURE_DID_MODIFY_DATA` (not answered; carried out as a range message) | `Texture::did_modify_data` |
 | heap sizes | `HEAP_TEXTURE_SIZE_AND_ALIGN` (answered `SIZE_AND_ALIGN` on the control completion ring; makes nothing) | `heap_texture_size_and_align` |
+| rasterization rate maps | `RATE_MAP_CREATE`, `RATE_MAP_RESET` (answered `RATE_MAP_STATE`), `RATE_MAP_QUERY` (answered `RATE_MAP_ANSWER`; makes nothing), `*_DESTROY` | `new_rate_map`, `RateMap::reset`, `RateMap::physical_size`, `screen_to_physical` and `physical_to_screen`, `RateMap::copy_parameter_data` |
+| function pointers | `FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` (answered `FUNCTION_POINTER_STATE`), `FUNCTION_TABLE_SET` (not answered; makes nothing), `*_DESTROY` | `ComputePipeline::function_handle`, `ComputePipeline::new_visible_function_table`, `VisibleFunctionTable::set_functions` |
+| dynamic libraries | `DYNAMIC_LIBRARY_CREATE` (answered `COMPLETE`), `*_DESTROY`; a `COMPUTE_PIPELINE_CREATE`'s run of `RgfxPipelineLibrary` | `new_dynamic_library`; the compute descriptor's `libraries` (`preloaded`, and `loaded` by install name) |
 | state | `SAMPLER_CREATE`, `DEPTH_STENCIL_CREATE`, `*_DESTROY` | `new_sampler_state`, `new_depth_stencil_state` |
 | shaders | `LIBRARY_LOOKUP` (the content key of the `.metallib`'s AIR slice: a hit binds the library the device made for any process, and no bytes cross), `LIBRARY_CREATE` and `LIBRARY_FROM_REGION` (the slice's bytes forwarded unchanged on a miss, answered once made), `RENDER_PIPELINE_CREATE`, `MESH_RENDER_PIPELINE_CREATE`, `COMPUTE_PIPELINE_CREATE`, `*_DESTROY` | the device's library cache, `new_library_with_data`, `new_render_pipeline_state_full`, `new_mesh_render_pipeline_state_full` and `new_compute_pipeline_state_full` (the whole descriptor the guest set: vertex or stage-input descriptor, every colour attachment, each stage's linked functions, those made with options or a specialized name by `Library::new_function_with_options`; the Vulkan platform refuses a specialized name, which its runtime's function descriptor lacks) |
 | sync | `EVENT_CREATE`, `SHARED_EVENT_CREATE`, `FENCE_CREATE`, `*_DESTROY`; the kext's `SHARED_EVENT_NAME` (answered `COMPLETE`), `SHARED_EVENT_IMPORT` (answered `SHARED_EVENT_VALUE`) and `SHARED_EVENT_UNNAME` (not answered) | `new_event`, `new_shared_event`, `new_fence`; an import's value `SharedEvent::signaled_value` |
@@ -1784,7 +3683,7 @@ the host's import, and the kext's block table holds one entry per slab:
   `MANAGED_BUFFER_SLABS`, a Managed buffer lies in the Shared class of its
   cache and hazard tracking modes: its CPU copy is a Shared buffer of that
   class, made as any (a `BUFFER_AT_OFFSET`, or the `BUFFER_OVER_PAGES` of a
-  larger slab of superpages, below), and the buffer a `MANAGED_BUFFER_CREATE`
+  larger slab of the process's own pages, below), and the buffer a `MANAGED_BUFFER_CREATE`
   over it at an address of its own, so a Managed buffer of any size lies where
   a Shared one of its size does, on every host; its range goes back once the
   copy's destroy follows the buffer's. Without that feature, where the device
@@ -1808,31 +3707,58 @@ the host's import, and the kext's block table holds one entry per slab:
   for a `BLOCK_RELEASE`.
 - Where the host maps a process's own pages (`PAGES_BUFFERS`, and the kext's
   `PagesBlock`) and makes heaps over them (`HEAP_OVER_PAGES`), a heaped slab
-  of 2 MiB is the process's own memory instead: a 2 MiB superpage
-  (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, tagged `VM_MEMORY_IOACCELERATOR`), one run
-  of guest RAM, wired into a pages block and made one `HEAP_OVER_PAGES`, its
-  buffers placed in it as in a region slab's heap. A larger dedicated Shared
-  slab is superpages too, more than one run, with no heap: its one buffer is a
-  `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy.
-  A larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is
-  the region's, as is a slab where the kernel has no superpage to give (no
-  contiguous 2 MiB free, or the wire budget spent) or the kext gives no pages
-  block. Each superpage is one kernel call: a slab of several reserves its
-  range (no access, at a 2 MiB boundary), then gives back each piece in turn
-  and makes a superpage in its hole (`VM_FLAGS_FIXED`), and one refusal gives
-  back the superpages before it and the reservation after it, so the slab is
-  the region's. A
-  call for several superpages that runs out partway takes down past what it
-  made on macOS 26.4 and later (xnu's `vm_map_enter` deletes up to the
-  request's end after shrinking its size), a deallocation gap whose
-  `EXC_GUARD` (`DEALLOC_GAP`) is fatal in every process whose VM guard is on:
-  Apple's platform binaries and the hardened browser processes, WebKit's GPU
-  process among them (`src/RgfxSuperpages.hpp`). A slab let go
-  destroys its heap, releases its pages block (the kext answers once the host
-  let go of it, and unwires the pages), then deallocates its pages. On the
-  RTX 5080 a heap over a run of guest RAM took 13.4 us and a 4 KiB buffer
-  placed in it 1.93 us, where a no-copy buffer over a block's view took
-  65-75 us, an import of its own (`slab_heap_costs`, `slab_nocopy_costs`).
+  of 2 MiB is the process's own memory instead: the kext's chunks where it
+  gives them (`PagesChunked`, below), else 2 MiB of plain pages
+  (`mach_vm_allocate`, tagged `VM_MEMORY_IOACCELERATOR`), which the take asks
+  for, wired into a pages block and made one `HEAP_OVER_PAGES`, its buffers
+  placed in it as in a region slab's heap. The host makes the heap over the
+  block's view, which it makes off ring 0 as a `BUFFER_OVER_PAGES`'s, or over
+  the run where the guest's RAM is mapped where the block is one run. A larger
+  dedicated Shared slab is plain pages too, with no heap: its one buffer is a
+  `BUFFER_OVER_PAGES` over the block's view, or a Managed buffer's CPU copy. A
+  larger Managed slab of a class of its own (no `MANAGED_BUFFER_SLABS`) is the
+  region's, as is a slab where the kernel gives no pages or the kext gives no
+  pages block. Why the process's own pages: in the region the guest's stores
+  ran at 13 MB/s (Decided 5, "The guest maps host memory only"). A queue's
+  upload chunks, the bytes `set*Bytes:` hands in, are Shared buffers of the
+  slabs too. A slab let go destroys its heap, releases its pages block (the
+  kext answers once the host let go of it, and unwires the pages), then
+  deallocates its pages.
+- The kext's chunks first (selector 12, `PagesChunked`, where the kext's word
+  holds `PagesChunked`): the kext takes the slab's bytes in physically
+  contiguous chunks of 64 KiB, zero-filled, maps them into the process in
+  order and makes the pages block of their runs, so a 2 MiB slab is 32 runs
+  of guest RAM at most, where plain pages are up to 512. The host maps each
+  run of a view apart, against a budget of mappings per process
+  (`vm.max_map_count` on Linux, 65530 by default): on NVIDIA, views of
+  scattered pages, slabs' among them, used it up, and the buffers made after
+  were copies (docs/qemu.md). The memory is the block's: the slab's release takes it, the
+  kext unmapping it from the process and freeing the chunks once the host has
+  let go of the block, and the process unmaps nothing. A 64 KiB run is one the
+  kernel finds at once however long the guest has run: on the guest and host
+  the superpages below were measured on, 4,096 chunks in a row each took
+  0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages had been taken, the
+  slowest 0.74 ms, none refused. A slab the kext gives no chunks for is plain
+  pages.
+- Plain pages, never superpages (`VM_FLAGS_SUPERPAGE_SIZE_2MB`, 2 MiB of RAM in
+  one run): superpages run out, and asking for one stalls the process, on
+  whatever thread asks. Measured on an x86-64 macOS 26.7.2 guest of 8 GiB on
+  the Radeon 780M host, a process got 19 at boot with 2.5 GiB free, then
+  `KERN_NO_SPACE`, and none three minutes later; each refused ask spent 140 to
+  190 ms in the kernel's search for a contiguous 2 MiB (`vm_map_enter`'s
+  superpage path, in `cpm_allocate`, which sleeps as it goes and moves pages to
+  make a run), sampled with spindump. The search runs with the process's map
+  held: in the public xnu-12377.101.15 source, `vm_map_enter` holds the map's
+  interlock and the new entry locked exclusive across it, and a walk of the
+  map past that entry (`vm_map_region`) waits for it. Sampled with tailspin on
+  that guest: asked on the thread that takes the slab, WindowServer's main
+  thread, making a texture over a layer's image as a window moved, was in
+  `cpm_allocate` in two samples 100 ms apart, and Safari's page drew no frame
+  for 151 ms; asked ahead on the slabs' background thread instead, the main
+  thread, making such a texture as a window was resized, waited in
+  `mach_vm_region` behind it, and the page drew no frame for 179 ms. Plain
+  pages are what every slab took once superpages ran out, minutes after a
+  boot.
 - Where no source has memory for a new slab, the process's own empty and
   cached slabs go first, then smaller region slabs are tried down to the
   buffer's size; nil only past that. Any other block of the process's the
@@ -1852,13 +3778,35 @@ process's lies over them in place (`BUFFER_OVER_HOST_MEMORY` at their offset).
 Metal makes one over any range the process maps readable, at any alignment:
 malloc'd, `vm_allocate`d, read-only, or a file mapping (measured on an M3 Max,
 16 KiB and 4 KiB pages). Writable Shared or Managed memory the kext wires lies
-in place (`PagesBlock`, `BUFFER_OVER_PAGES`). A Managed one is one copy on every
-host, as the Intel UHD 630's no-copy Managed buffer is (dgpu-oracle.md Q3): the
-host's buffer over the pages is a Shared one, and its `didModifyRange:` and a
-blit's synchronize of it, or of a texture over it, send nothing. Over any other
-memory (read-only, or memory the kext or host makes no pages block of) the buffer lies
+in place (`PagesBlock`, `BUFFER_OVER_PAGES`). A Managed one is a Managed buffer
+whose CPU copy is the Shared buffer over the pages (`MANAGED_BUFFER_CREATE`, as
+a slab's, above): two copies where the host's GPU has memory of its own,
+as the AMD Radeon Pro 5300M's no-copy Managed buffer is, its GPU copy filled
+from the pages at the create, and one copy, over the pages, where the GPU
+shares the CPU's memory, as the Intel UHD 630's is (dgpu-oracle.md Q3). Its
+`didModifyRange:`, and a blit's synchronize of it or of a texture over it, go
+to the host as any Managed buffer's do; Apple's OpenCL makes them around its
+maps of a buffer's memory. Shared memory the process maps read-only lies in
+place too, where the device took `READ_ONLY_PAGES`: the kext wires it for
+reading alone and marks its block read-only, and the buffer over it is made
+with `MTLResourceOptions` bit 24, sent to the host alone (the buffer's options
+answer the app's, as Metal's leave the bit out), whose GPU writes the host
+drops as Metal drops them: Metal makes a buffer over read-only memory whose GPU
+reads see the memory and whose blit fills and kernel stores complete with their
+writes dropped, a file mapped under it unchanged (the AMD 5300M and the Intel
+UHD 630, `oracle_bundle` `nocopy.ro`; the M3, accuracy-ledger.md
+`read-only-pages-written`, whose row the host's drop follows). A texture over
+such a buffer takes the same answers: a draw's, a kernel's or a blit's write of
+it completes, dropped, and a render pass that stores into it or resolves into
+it fails its command buffer with a page fault, as the M3's does, where the x86
+Macs, on which bit 24 does nothing, complete it and write the pages
+(dgpu-oracle.md Q38). Over any other
+memory (read-only Managed memory, whose copies the host would write back to
+its pages; read-only memory where the kext makes no block of it; a Managed
+buffer's where the device makes no Managed buffer over a Shared one; or memory
+the kext or host makes no pages block of) the buffer lies
 over a range of a slab of its own options, as a device buffer of them does
-("Shared and Managed buffers lie in slabs"): the process's own superpages where
+("Shared and Managed buffers lie in slabs"): the process's own pages where
 the device takes them, so no app-sized copy lies in the region. `contents`
 stays the app's pointer. The range syncs with the memory as the IOSurface copies do
 (Decided 14): from the memory before the commit of each command buffer that uses
@@ -1867,13 +3815,63 @@ completion is reported. Each side's bytes that moved since the two last agreed g
 to the other, byte by byte, so CPU and GPU writes beside each other both stand
 (`guest/bundle/src/RgfxMemoryShadow.hpp`). A GPU write shows in the memory at
 its command buffer's completion, not as it runs, and memory mapped read-only is
-never written back. That is why read-only memory never lies in place: Metal
-makes a buffer over it whose GPU reads see the memory and whose blit fills and
-kernel stores complete with their writes dropped, a file mapped under it
-unchanged (the AMD 5300M and the Intel UHD 630, `oracle_bundle` `nocopy.ro`;
-the M3, accuracy-ledger.md `read-only-pages-written`), where the host's buffer
-over a pages block takes the GPU's writes (`BUFFER_OVER_PAGES` has no read-only
-form), which would reach pages the process maps read-only, a file's among them.
+never written back, though the GPU's writes stay in the range for later command
+buffers to read, where Metal's are dropped.
+
+**Group dma-bufs of the pages blocks' views.** The host imports each pages
+block's view once, as a buffer over the whole view that the block's
+`BUFFER_OVER_PAGES` buffers lie in. Where the Vulkan platform imports a view as
+a dma-buf of its own and the driver lists every import in every submission
+(RADV), each live view is one more buffer object every `vkQueueSubmit` lists, at
+about 0.5 us each. Measured on the Radeon 780M (Geekbench 7.1 Metal in a macOS
+26.7.2 guest): at Super Resolution's midpoint about 580 such imports were live,
+under about 1,573 no-copy objects, of the 945 buffer objects the process held
+(about 605 of them the runtime's own memory, by its gauges), and a submission
+took about 494 us; grouping is projected to bring a submission to about 250 us
+or less. In Feature Matching, Particle Physics and Fluid Simulation other buffer
+objects of the process (2,000 to 8,700) outnumber the imports, and grouping cuts
+less there. There the surface worker gathers a process's views for a window: the
+`BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` that makes a block's view maps it and
+joins its process's open group, which stays open 1 ms from its first member, or
+until its members reach one dma-buf's limits: udmabuf's `list_limit` runs and
+`size_limit_mb` bytes, as the host has them (the host sets neither), and at most
+64 MiB, whatever udmabuf takes (below). It closes sooner once nothing more can
+join it: a later message of the process on the control ring waits for the views,
+which holds the process's messages behind it, and every view posted before that
+message has joined. The group is then sealed: the views' pages go into shared
+dma-bufs back to back, and each view's import is a piece of its group's file, so
+the driver lists one import for the group. Only then are the members' messages
+carried out, and the process's and the blocks' later messages wait for that, so
+each sees its buffer as right after its create. A `BUFFER_OVER_PAGES` has no
+answer, so the window delays only the process's messages that wait for the views.
+A Geekbench 7.1 Metal walk on the Radeon 780M (2026-11-15) put 3,665 of its 4,686
+views in 930 groups. A walk of a macOS 26.7.2 desktop on the same GPU, Finder
+then Launchpad, made 559 groups of one view each and a view took 1.25 ms at the
+median from its begin on the host to its make, nearly all of it the window; with
+the early close, 537 of its 553 groups closed as a message of the process waited
+for them, and a view took 0.20 ms.
+
+Some views take no group: a view over 16 MiB, one past a group's limits alone,
+a view the host's cache of views holds, a heap over the guest's RAM, a block of
+pages its process maps read-only and a read-only buffer (both made over a copy
+of the pages), and a texture's import. A view whose group the host refuses is
+imported alone, as before. A process's close and the device's reset drop its
+groups being formed, which make nothing. What the guest sees does not change
+beyond timing: object ids, GPU addresses, refusals, and the order of events and
+interrupts are as before.
+
+A member whose buffers went keeps its pages pinned (udmabuf holds them) and
+mapped in the GPU's address space inside its group's import until the group's
+last member goes, though no object covers them: in each group, at most the
+group's bytes, 64 MiB. That cap is the host's own: udmabuf's default
+`size_limit_mb` is 64, but CachyOS's 7.3 kernels boot with it at 2147483647,
+where `list_limit` alone would let a group of large views pin gigabytes. With
+the cap, a simulation over the creates and frees of Geekbench's Super
+Resolution on the Radeon 780M holds 26 to 182 MiB of such pages at once, in all
+groups, by the runs' sizes (4 KiB to 64 KiB), on every host alike. They are the
+guest's RAM, resident anyway, and only a stale GPU address would reach them, as
+it would reach any freed memory; the guest reuses them once the kext unwires
+them.
 
 **Managed storage** (Decided 4). A Managed buffer's or texture's CPU copy is
 memory of its process's, which the guest maps: a buffer's a Shared buffer of
@@ -1881,47 +3879,54 @@ the slabs where the device takes `RGFX_FEATURE_MANAGED_BUFFER_SLABS`, else a
 range of a slab ("Shared and Managed buffers lie in slabs") or a region block;
 a texture's a Shared buffer of the slabs where the device takes
 `RGFX_FEATURE_MANAGED_TEXTURE_SLABS`, else a region block. The slabs are the
-process's own superpages where the device takes them, so no app-sized copy
-lies in the region. The host decides the form from the platform's answer of whether the GPU
-shares the CPU's memory:
-- **Shared memory:** one copy. The buffer is a no-copy buffer over its block,
-  and a one-level 2D texture or 2D array of a linear format a texture over its
-  block's Shared buffer (an array by the linear SPI, whose slices lie as the
-  layout's); the range messages are checked and do nothing more. A texture of
-  any other shape (more levels, a cube, a 3D texture, a block-compressed
-  format) is two copies, as below: no texture over a buffer has its shape, and
-  without the CPU copy an upload would be a staging blit the call waits for,
-  hundreds of times a Managed one's (dgpu-oracle.md Q17). The guest's
-  `getBytes:` of it reads its GPU copy, copied on the device: on a GPU that
-  shares the CPU's memory Metal's CPU reads of a Managed texture see the GPU's
-  writes with no synchronize (the Intel UHD 630 and the M3, dgpu-oracle.md
-  Q2).
-- **Otherwise:** two copies. The object the command buffers name is the
-  platform's own Managed buffer (at the guest's address) or texture, and the
-  block sits beside it as a Shared buffer.
-  - `BUFFER_DID_MODIFY_RANGE` copies the named range from the block to the
-    platform buffer's host copy, and the platform's `didModifyRange:` copies it
-    to the GPU's before any command of its next submission.
-  - `TEXTURE_REPLACE_REGION` is the platform's `replaceRegion:` from the block,
-    done before the call returns.
-  - Ring 0 is carried out before any later command buffer of the process, on
-    any queue, so a range is ordered before every command buffer committed after
-    it, as Metal promises.
-  - A blit encoder's `synchronizeResource:` and `synchronizeTexture:` become
-    copies of the GPU's copy into the block at that point of the encoder.
-  - Where the platform refuses the GPU's copy, the create is refused, as
-    Metal's answers nil. Metal makes Managed resources past a discrete GPU's
-    memory (measured on the AMD 5300M: 12 GiB of Managed buffers, three times
-    its 4 GiB, made, used by one command buffer and read back as written), and
-    the platform does too (the Vulkan platform's runtime places them in system
-    memory past a full device-local heap), so it refuses one only where that
-    memory is gone as well.
+process's own pages where the device takes them, so no app-sized copy
+lies in the region.
+- **A buffer**, on any host: a no-copy Managed buffer over its CPU copy's bytes
+  at the guest's address, whose copies the platform keeps as Metal does. Where
+  the GPU shares the CPU's memory that is one copy. Otherwise the Vulkan
+  platform's runtime keeps a GPU copy in the GPU's memory, with the guest's
+  bytes its CPU copy: copied in whole at the create, a range at each
+  `didModifyRange:` before the next submission, and out whole at each
+  `synchronizeResource:` where the blit encoder runs it. Where the GPU's memory
+  has no room for that copy, the buffer lies in its bytes, as a Shared one does,
+  which the runtime announces. `BUFFER_DID_MODIFY_RANGE` is the platform's
+  `didModifyRange:` of the range, and a blit's synchronize of the buffer the
+  platform's own.
+- **A texture** takes its form from the platform's answer of whether the GPU
+  shares the CPU's memory:
+  - **Shared memory:** one copy. A one-level 2D texture or 2D array of a
+    linear format is a texture over its block's Shared buffer (an array by the
+    linear SPI, whose slices lie as the layout's); the range messages are
+    checked and do nothing more. A texture of any other shape (more levels, a
+    cube, a 3D texture, a block-compressed format) is two copies, as below: no
+    texture over a buffer has its shape, and without the CPU copy an upload
+    would be a staging blit the call waits for, hundreds of times a Managed
+    one's (dgpu-oracle.md Q17). The guest's `getBytes:` of it reads its GPU
+    copy, copied on the device: on a GPU that shares the CPU's memory Metal's
+    CPU reads of a Managed texture see the GPU's writes with no synchronize
+    (the Intel UHD 630 and the M3, dgpu-oracle.md Q2).
+  - **Otherwise:** two copies. The object the command buffers name is the
+    platform's own Managed texture, and the block sits beside it as a Shared
+    buffer. `TEXTURE_REPLACE_REGION` is the platform's `replaceRegion:` from
+    the block, done before the call returns, and a blit encoder's
+    `synchronizeResource:` and `synchronizeTexture:` become copies of the GPU's
+    copy into the block at that point of the encoder.
+- Ring 0 is carried out before any later command buffer of the process, on any
+  queue, so a range message is ordered before every command buffer committed
+  after it, as Metal promises.
+- Where the platform refuses a buffer, or a texture's GPU copy, the create is
+  refused, as Metal's answers nil. Metal makes Managed resources past a
+  discrete GPU's memory (measured on the AMD 5300M: 12 GiB of Managed buffers,
+  three times its 4 GiB, made, used by one command buffer and read back as
+  written), and the platform does too (the Vulkan platform's runtime places a
+  texture in system memory past a full device-local heap, and lays a buffer in
+  its bytes), so it refuses one only where that memory is gone as well.
 - A buffer comes from `BUFFER_OVER_HOST_MEMORY` with Managed options; a texture
   from `MANAGED_TEXTURE_CREATE`, which names the copy's Shared buffer and the
   texel block of its format (bytes, width, height). The host reads the copy
   where the buffer's contents lie: its block, its heap's bytes at its offset
   (over a block or over a pages block's guest RAM), or a pages block's view. Both sides compute the
-  copy's linear layout from it (`crates/reims-graphics/src/managed.rs`,
+  copy's linear layout from it (`crates/reims-vgpu-graphics/src/managed.rs`,
   `guest/bundle/src/RgfxManagedLayout.hpp`): levels in order, then slices,
   images and rows of blocks, each row rounded up to 256 bytes.
 - In the guest, `replaceRegion:` and `getBytes:` are memcpys of the block, and
@@ -1934,7 +3939,8 @@ shares the CPU's memory:
   (dgpu-oracle.md Q2). A depth or stencil texture in Managed storage ends the
   process first, as on both x86 oracles.
 - Until the device's identity answers carry `hasUnifiedMemory`, the host takes
-  the two copies on every GPU, which hold Metal's contract on any of them.
+  a texture's two copies on every GPU, which hold Metal's contract on any of
+  them.
 
 **Command buffers** (per-queue submission ring). A `COMMAND_BUFFER` message is
 one command buffer: its `ObjId`, then a byte stream of encoder ops. The decoder
@@ -1959,19 +3965,30 @@ opens the `Platform` command buffer and walks the ops:
   before the buffer's work where it holds an older count (Decided 14, "The
   device cache"). One naming a block with no cache does nothing.
 - `SUBMITTED` (no body), where the device has `CB_SUBMITTED`: the buffer is
-  committed by `commitAndWaitUntilSubmitted`, and asks for its `CB_SUBMITTED`
-  ("Submitted", below). The bundle puts it last, as it commits; the host reads
+  committed by `commitAndWaitUntilSubmitted`, or by a queue one of whose
+  buffers has presented a drawable ("Present hold", below), and asks for its
+  `CB_SUBMITTED` ("Submitted", below). The bundle puts it last, as it commits; the host reads
   it as it takes the buffer, before its other ops.
+- `GUEST_TIMES` (made, committed and posted, each the guest's clock), where
+  the guest took `GUEST_TIMES`: first in the stream, once, a diagnostic the
+  host reads as it takes the buffer ("Guest times", below). The walk steps
+  past it.
 
 A command buffer too large for half its queue's submission ring goes out of
 line: the whole `COMMAND_BUFFER` message lies in a block of the process's own,
 from its queue's pool, and the ring carries a `COMMAND_BUFFER_IN_REGION`
 (region offset and length).
-- The bundle builds the message on its own heap while it fits half the ring.
-- When it outgrows that, the message moves once into a block as large as the
-  queue's recent largest message, and doubles from block to block after that.
+- The bundle builds the message on its own heap, write-back memory, whatever
+  its size. When it outgrows half the ring, its buffer grows at once to the
+  queue's recent largest message, and doubles after that.
 - The header and the commit's `SURFACE_USE` ops go into room kept before the
-  ops, so the commit posts the block with no copy.
+  ops, so they move nothing.
+- At the commit, the whole message is copied once into a block of the pool,
+  from the block's start. It is not built there: the block is write-combined
+  where the kext maps it so, and on an AMD host, which applies the guest's
+  memory type, a write-combined store still pending stalls the encoding
+  thread's next locked instruction (an app's retain or release among them) by
+  about 90 ns (`RgfxEncoder.hpp`).
 
 The queue's service thread copies the message out of the block once, as it
 does a ring's, with the reference's seqno, and the host walks and commits the
@@ -2013,7 +4030,19 @@ events it signalled ahead of it: on metal2vulkan the runtime's thread that saw
 the buffer complete runs it, in its queue's commit order, and with no
 completed handler on the buffer no handler thread is woken; on Metal, which
 tells of a completion only on its completed handlers' thread, a completed
-handler.
+handler. Where a queue's completion ring has no room, the host counts each
+spell of it (`queue-ring-full`) and each post onto it that waited for room
+(`queue-ring-post-waited`) in its degradation counts, and logs the first of
+each kind, naming the thread that waited. No handler of the buffer's waits
+for room: the platform's thread that runs one holds up every queue's
+completions or submissions behind it. A record the ring has room for, with
+no record handed over before it, is posted on the handler's thread; any
+other is handed to the queue's service thread, which posts the records in
+the order handed, waiting for room, and runs what follows each right after
+it: a value's posts to the other holders of the event's name, the shows of
+the presents waiting for the buffer, and the answers waiting for its
+context's drain. So the guest sees them in the order it would had the
+handler waited, and every later post onto the ring goes behind them.
 
 **Scheduled** (per-queue completion ring). A `CB_SCHEDULED` record (the command-buffer
 `ObjId`, at the buffer's seqno; 24 bytes, and the guest reads a record of at least that size)
@@ -2022,7 +4051,7 @@ goes on the queue's completion ring once, ahead of its `CB_COMPLETE`. A buffer t
 right after its `CB_SUBMITTED`, where no buffer begun before it on its queue owes its own, so a
 queue's records keep their order; one answered on its doorbell's thread gets it there, with its
 `CB_SUBMITTED`, where the same holds there. A buffer that does not ask keeps it to its
-scheduling: posted at its take, it would need the buffer's ticket in its process's commit order
+scheduling, or to a waiting thread's ask ("Scheduled at an ask", below): posted at its take, it would need the buffer's ticket in its process's commit order
 there, as the `CB_SUBMITTED` does, and a walk held on one of the process's queues would then hold
 up the commits of its others (`a_walk_held_in_a_draw_holds_up_no_other_queue`). Metal makes such
 a buffer `Scheduled` within a
@@ -2058,15 +4087,39 @@ buffer the host could not
 carry out has no `CB_SCHEDULED`, and its `CB_COMPLETE` stands for both; so does every
 `CB_COMPLETE` from a host that posts none.
 
+**Scheduled at an ask.** A thread that waits for a buffer that does not ask for its
+`CB_SUBMITTED` to be scheduled (`waitUntilScheduled`) asks for it, where the device's word holds
+`SCHEDULED_ASK`: the bundle posts `SCHEDULED_ASK` (`RgfxScheduledAsk`, the buffer's `ObjId` and
+the seqno of its message; 32 bytes) on the buffer's queue's ring, after the buffer's message,
+once, unless the buffer is held as far as the process knows or is scheduled already. The queue's
+service thread takes the ask after its begin of the buffer. Where the buffer would have got its
+`CB_SCHEDULED` at its take had it asked for its `CB_SUBMITTED` (it waits for no event, follows
+no deferred copy of a device cache, is behind no buffer of its queue that waits for one, and
+found no buffer before it on its queue owing its `CB_SCHEDULED`), the host issues the buffer's
+ticket in the commit order, given back at its commit, and posts the record then, whether or not
+the walk is done; for a buffer already committed, the record goes at once with no ticket. Any
+other ask changes nothing. So a walk held on one of a process's queues holds up the commits of
+its other queues only for buffers sent once a thread has asked to wait for it, as after a
+`CB_SUBMITTED` at its take
+(`a_held_walk_holds_up_its_process_s_other_queues_only_once_waited_for`). Without the ask,
+during a window's live resize on a 780M host (macOS 26.7.2, 11-09), the guest's GPU process
+waited in `waitUntilScheduled` 349 times for 291.5 ms over 50 s, 288 ms of it before the host
+posted the buffer's record at the platform's submission, 1.3 to 1.5 ms after the buffer's begin
+on average; 192 of the waits, 205 ms, came in the busiest second. The ask is posted for blocking
+waits alone: a scheduled handler, which no thread waits on, runs at the buffer's scheduling.
+
 **Submitted** (per-queue completion ring), where the device has `CB_SUBMITTED` (`FEATURES_LO`
 bit 2; every host sets it). A command buffer committed by `commitAndWaitUntilSubmitted` carries a
 `SUBMITTED` op, and the host posts its `CB_SUBMITTED` record (the command-buffer `ObjId`, at the
 buffer's seqno; 24 bytes) once, ahead of its `CB_SCHEDULED` and `CB_COMPLETE`: as soon as the
-host takes it, before it walks the buffer's ops, where the buffer waits for no event (its
-`WAIT_EVENT` ops), the host fills no device cache it uses first (decided at the take from its
-`SURFACE_USE` ops, which lead the stream; a fill not yet done counts), it follows no copy of one
-asked before it and not yet made ("What a walk sees", "Device caches") and no buffer before it on
-its queue waits for one and is not yet scheduled; else at its scheduling. The call returns
+host takes it, before it walks the buffer's ops and before the fills of device caches it makes
+at the take, where the buffer waits for no event (its `WAIT_EVENT` ops), it follows no copy of a
+device cache asked before it and not yet made, nor needs a fill of one that must wait for buffers
+begun before it (decided at the take from its `SURFACE_USE` ops, which lead the stream; "What a
+walk sees", "Device caches"), and no buffer before it on its queue waits for one and is not yet
+scheduled; else at its scheduling. A fill made at once at the take, or one made before and not
+yet done, holds back nothing, as a wait for another queue's buffer does not ("Surface order"):
+it waits for nothing of the guest's to come. The call returns
 there. A guest whose bundle sends no such op never sees the event,
 and a bundle sends it only where the bit is set, which it reads in the device info's
 `features_lo`. What Metal does, on the M3, the 5300M and the 630
@@ -2088,7 +4141,14 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   the time the call returns. Ours is the cheapest: still `Committed`, the handlers at its
   `CB_SCHEDULED`, as on an idle queue on all three.
 - Loose (later than Metal, inside the envelope): a buffer that waits for an event already
-  reached is answered at its scheduling, not at its take.
+  reached is answered at its scheduling, not at its take; so is one that follows a deferred copy
+  of a device cache, which Metal has none of.
+- Loose (inside the envelope): a buffer whose take fills a device cache at once is answered
+  before the fill, as Metal, which has no fill, answers it at once. The host takes its ticket in
+  the commit order first and holds the caches it uses from the answer until it has made their
+  fills, so no other begin counts a use of one between and defers a fill decided at once. The
+  answer comes at the take, not at the doorbell: a doorbell cannot know the fill will be made at
+  once, as another queue's begin before the take may count a use of the cache.
 - Loose (what "submitted" means on the host): Metal answers once it has submitted the buffer;
   ours once the host has taken the message, before it encodes the buffer on its platform, which
   the guest cannot tell apart, as nothing the guest sends after the answer is carried out
@@ -2102,8 +4162,9 @@ and a bundle sends it only where the bit is set, which it reads in the device in
   nothing of the guest's is ordered by a buffer's scheduling but its later commits, which the
   ticket orders, and what the GPU reads and writes, which a present, a CPU lock and another
   queue's or process's buffer wait for from the commit or the post on, not from the scheduling
-  (§14, "CPU locks"; "Surface order", below). A buffer that waits on an event or a fill, or is
-  behind one that does, is `Scheduled` at its scheduling, past its waits, as on a Mac.
+  (§14, "CPU locks"; "Surface order", below). A buffer that waits on an event or a deferred copy
+  of a device cache, or is behind one that does, is `Scheduled` at its scheduling, past its
+  waits, as on a Mac.
 - Inside the envelope (a fault): a buffer whose ops the host cannot carry out after it was
   answered fails at its `CB_COMPLETE`, as Metal reports a command buffer's errors at its
   completion, not at its commit.
@@ -2161,10 +4222,10 @@ event that gave it is gone, while the port is held.
   in `com.apple.kpi.private` alone), so the bundle opens a connection of its own
   type on the accelerator for each event it hands out
   (`RgfxSharedEventUserClient`, user-client type 'RGSE'), and its send right is
-  the event's `eventPort`. Its `Export` (0x113) has the kext name the event
+  the event's `eventPort`. Its `Export` (10) has the kext name the event
   device-wide: `SHARED_EVENT_NAME`, a name from 1 the kext never gives again,
   answered `COMPLETE`; the kext answers the bundle only then, so an import that
-  follows finds the name. Its `Import` (0x114), by any process that holds the
+  follows finds the name. Its `Import` (11), by any process that holds the
   port, has the kext make the caller's new event of the name:
   `SHARED_EVENT_IMPORT`, answered `SHARED_EVENT_VALUE` with the host event's
   value, which the new event starts at. A call on the port proves the caller
@@ -2285,6 +4346,40 @@ the front posts every ready buffer behind it, in order, on its own thread. An
 enqueued buffer let go uncommitted stays, holding back the buffers after it,
 as Metal's does.
 
+**Present hold.** A buffer that presents drawables (`presentDrawable:` and its
+variants) holds back its queue's later buffers until each of those drawables
+reports its present scheduled, as Metal's queue does. Metal's base command
+buffer asks the drawable for that report (`addPresentScheduledHandler:`,
+CoreAnimation's), and its queue submits up to and including the presenting
+buffer, then waits for one report a present before it submits more (read from
+code, macOS 27). On the MBP16's AMD 5300M and Intel 630 (macOS 26.7.1), with a
+drawable that reported 200 ms after its present, a buffer committed right
+behind the presenting one was scheduled and ran at 200.7 to 210.5 ms, against
+0.3 to 1.3 ms with an immediate report, and both commits returned in 0.03 ms.
+So the bundle asks every drawable for the report as Metal does (a drawable that
+cannot report ends the process there, as on the MBP), the queue counts the
+presents each posted buffer owes and the reports that came, and posts nothing
+past a buffer while they fall short: the later buffers stay `Committed` and
+unposted, as behind a buffer not yet committed, and the report posts them, on
+a thread of its own. A report that came first counts, so a drawable with no
+layer on screen, which CoreAnimation reports at once, holds nothing. A
+CAMetalDrawable reports once its layer's image queue has taken the present,
+which WindowServer paces (CoreAnimation's `layer_collectable_signal`, the
+layer's next drawable or flush, or after 1.1 s, read from code), so a GPU-bound
+app's frames reach the GPU paced by what WindowServer takes. The report comes
+after the presenting buffer is scheduled, where its present is made, and the
+next frame waits for it. Metal schedules a buffer that waits for nothing within
+a fraction of a millisecond of its commit, whatever its queue runs before it
+("Scheduled", above); the host schedules a buffer that does not ask for its
+`CB_SUBMITTED` at its platform's submission, which can wait for the queue's
+earlier work on the GPU. On the RTX 3090 host, the Modern Rendering sample's
+presenting buffer behind its frame's 89 ms pass was scheduled at the pass's
+end, 88.6 ms after its commit, and the GPU stood idle 19 to 22 ms a frame
+until the next frame came. So once a buffer of a queue presents, it and every
+buffer the queue commits after it ask for their `CB_SUBMITTED` (`SUBMITTED`),
+and the host schedules each at its take where it waits for nothing and no
+buffer before it on its queue owes its scheduling.
+
 **Surface order**, where the guest took `SURFACE_ORDER` (`FEATURES_LO` bit 11).
 On a Mac, a GPU access to an IOSurface committed after another process's
 pending GPU access to it runs after that access, where either writes:
@@ -2365,9 +4460,9 @@ committed in. The bundle names the order instead, as it posts each buffer:
   platform holds a wait for a shared event's value on the host until it is
   reached). So does every buffer committed behind it on its queue while the
   platform holds it, and each buffer's records still go in its queue's order. A
-  buffer that waits for an event, or for the host's fill of a device cache or a
-  copy of one it follows, or is behind one, keeps its records at its
-  scheduling.
+  buffer that waits for an event, or for a deferred copy of a device cache it
+  follows, or is behind one, keeps its records at its scheduling; a fill the
+  host makes at once holds back none of them.
 - Work the host starts off a buffer's own GPU timeline waits for the same
   buffers on the CPU first: a video session's decode runs on a queue of its own
   as the host walks the buffer, so its output lands only after the reads and
@@ -2443,14 +4538,60 @@ every word stale). The bundle names the order as it posts each buffer:
 - Nothing else changes: no GPU wait is added, the buffer's records go as they
   did, and the platform orders what the buffers share by the commit order.
 
+**Guest times**, where the guest took `GUEST_TIMES` (`FEATURES_HI` bit 12), a
+diagnostic. The host sees a command buffer only once its queue's thread takes
+it off the ring, so the time before that, the app's encode and the buffer's
+way to the host, shows as one span with nothing pending on the host. The guest
+stamps each buffer so the host can split it:
+- The bundle reads its clock (`mach_absolute_time` in nanoseconds, the kext's
+  clock) as the buffer is made (`commandBuffer`), as its `commit` is entered,
+  and as its message goes on its ring: under the ring's lock, after the copy
+  and before `producer` is published, written in the ring's copy at
+  `RGFX_GUEST_TIMES_POSTED_OFFSET` (64), as the seqno is stamped; for a buffer
+  in a block, into the block, under the ring's lock as its reference goes on
+  the ring. The op, 32 bytes, goes first, the last op put before the stream.
+- At each `VBLANK`'s reading of `HOST_TIME` the framebuffer writes ring 0's
+  `guest_clock_offset_ns`, the held reading's offset, then
+  `guest_clock_bound_ns`, its bound (half the reading's round trip, widened by
+  50 ppm of its age), with release. The host zeroes both at a reset.
+- The queue's thread stamps the host's clock as it takes the buffer, before
+  the gate, and as it comes back to the ring after the buffer before it
+  (`ring_free`, 0 for the first of a take). It reads the bound with acquire,
+  then the offset, and gives each buffer `encode` (committed − made),
+  `post_wait` (posted − committed: the ring's room, the queue's buffers
+  committed before it, its commit order's naming), and where the bound is not
+  0, `queued` (`ring_free` − posted, where the thread came back after the
+  post: behind the queue's buffer before it, the host's) and `transport` (the
+  take less the later of posted and `ring_free`: the doorbell, the thread's
+  wake and the ring), posted mapped to the host's clock by the offset.
+- The host writes them to its trace (`REIMS_VGPU_TRACE`) as `cbguest queue
+  seqno encode post_wait queued transport bound held` (`cbguest queue seqno
+  encode post_wait held` with no offset held), `held` the time from the take
+  to the event (the buffer's wait at the gate, the read of a block), so a
+  reader places the take at the event less it. Once a second a debug line of
+  target `reims_vgpu_graphics::guest_times` gives the buffers' count, each
+  span's sum and median and the longest transport.
+- The offset is off by at most its bound, microseconds, under the millisecond
+  spans it splits, as the host's clock runs at the guest's clock's rate
+  ("Refresh times"), though the kext reads it only at a `VBLANK`, seconds
+  apart while the display's `VBLANK`s are off. On `CLOCK_MONOTONIC`, which
+  NTP disciplines, the offset drifted between readings: homelab-um790-xtx-1's
+  +45 ppm showed in Geekbench 7.1's compute as a transport that climbed from
+  about 10 us to 230 us between readings 5 s apart (p50 128 us over 20,597
+  buffers), where a host trace of the same run placed each doorbell's write
+  13 us p50 before the take, and homelab-gem10-1's -30 ppm as a transport of
+  0. The stamps cost three clock reads a buffer. Nothing else
+  the guest or the host observes changes: a guest that did not take the bit
+  stamps nothing, and the host ignores the op.
+
 **Left for later** (extends the same op families, not the transport):
 command-buffer/queue descriptors and `errorOptions`; labels and debug groups
 answered guest-side; residency sets (`useResource`/`useHeap` are in);
 `MTLIOCommandQueue`; Metal 4.
 
-**Where the decoder lives.** In reims-vgpu-core, generic over `P: Platform`,
+**Where the decoder lives.** In reims-vgpu (`graphics::decode`), generic over `P: Platform`,
 beside the Apple-lane decode it mirrors (same handle machinery, descriptor
-structs and `Platform` calls). The reims-graphics crate stays the transport
+structs and `Platform` calls). The reims-vgpu-graphics crate stays the transport
 (rings, region, registers); the decoder consumes ring bytes and drives
 `Platform`.
 
@@ -2476,7 +4617,7 @@ commit. Each outcome the new design allows is one of those two:
   keeps naming its objects; the buffer took its context's drain before its
   view, so the close is answered after the buffer's completion handler. The
   begin comes after ring 0 has carried out every message of its context's
-  published before the buffer was taken (`reims_graphics`'s queue gate, "A
+  published before the buffer was taken (`reims_vgpu_graphics`'s queue gate, "A
   buffer's wait on ring 0"), so a buffer finds every create its process sent
   before it. Tested by
   `a_walk_names_what_its_table_held_at_its_begin`,
@@ -2510,8 +4651,8 @@ commit. Each outcome the new design allows is one of those two:
   `a_commit_waits_only_for_the_tickets_issued_before_its_begin`,
   `a_commit_waits_for_its_own_context_s_tickets_alone` and
   `tickets_given_back_out_of_order_hold_through_the_oldest`.
-- **Range messages.** `BUFFER_DID_MODIFY_RANGE` and `TEXTURE_REPLACE_REGION`
-  reach the platform's next submission. One is carried out once every ticket
+- **Range messages.** `BUFFER_DID_MODIFY_RANGE`, `TEXTURE_REPLACE_REGION`
+  and `TEXTURE_DID_MODIFY_DATA` reach the platform's next submission. One is carried out once every ticket
   its context held when it came is given back, so a buffer answered before the
   message was sent does not see its bytes, as under the lock, where the message
   waited for that buffer's commit. Another context's tickets are not waited
@@ -2521,7 +4662,7 @@ commit. Each outcome the new design allows is one of those two:
   could have come before its take, and the buffer may see the bytes, as it may
   on Metal. Ring 0 does not wait for those tickets: the message is checked
   there (a bad reference or a range past its object is found at once), and its
-  copy and its platform call are made where the last ticket is given back,
+  platform call is made where the last ticket is given back,
   after that buffer's commit, a context's range messages one at a time in the
   order they came. Every command buffer of the context begun after it came is
   committed after it, as one begun after ring 0 carried it out was, and it
@@ -2530,7 +4671,8 @@ commit. Each outcome the new design allows is one of those two:
   CPU write made after the message and before the next commit may reach the
   GPU with it, as Metal's copy of a `Managed` resource is made at the next
   submission. Tested by `a_buffer_sent_after_an_answer_is_committed_after_it`
-  (its range messages) and the sequencer's
+  (its range messages), `a_texture_s_modified_data_is_carried_out_before_a_later_command_buffer`
+  (`graphics/tests.rs`) and the sequencer's
   `a_range_message_is_carried_out_once_its_context_s_tickets_are_given_back`.
 - **Device caches.** A command buffer counts among the users of each cached
   block it uses from its begin to its commit, each use under a number of its own
@@ -2549,7 +4691,7 @@ commit. Each outcome the new design allows is one of those two:
   asked is ordered after it on the GPU instead: it waits for the cache's own
   event, which the copy's command buffer signals to the copy's number, where it
   reads what the copy writes (a fill) or may write what the copy reads (any
-  copy), and it holds its queue, as a buffer that waits for a fill does; its
+  copy), and it holds its queue, as a buffer that waits for an event does; its
   marks of the cache and its end value are kept apart until the copy is made, so
   the copy follows none of them. A buffer finished before a copy it follows is
   made stays counted among the users of every cache it used until it is: the
@@ -2603,8 +4745,8 @@ commit. Each outcome the new design allows is one of those two:
   run in the order they are committed, and metal2vulkan resolves barriers,
   layouts and fences at submit, in commit order. Four things a buffer does
   before its commit are seen beyond it, and each keeps the lock's order:
-  - its hold of its queue: a buffer that waits for an event, or for the host's
-    fill of a device cache or a copy of one it follows, holds its queue from its
+  - its hold of its queue: a buffer that waits for an event, or for a deferred
+    copy of a device cache it follows, holds its queue from its
     begin, not its commit, so a buffer after it that asks for its `CB_SUBMITTED`
     is answered at its scheduling, as behind one already committed;
   - a video encoder's work, which its session starts as it is walked: a buffer
@@ -2620,11 +4762,16 @@ commit. Each outcome the new design allows is one of those two:
     thread offers the queue's next buffer to the host there, as a doorbell's
     thread does, so a buffer that asks for its `CB_SUBMITTED` behind it is
     answered before the walk, or at its own doorbell during it, as behind a
-    walk on a lane thread. Through the walk the thread marks the ring idle
-    (`consumer_idle` 1), as before it sleeps, since the guest rings a
-    queue's doorbell only for a ring marked so; it clears the mark when it
-    takes the claim back. Held through the walk, the claim kept the doorbell
-    from answering, and with the ring marked busy the guest rang none, so a
+    walk on a lane thread. Through the walk the thread marks the ring
+    walking (`consumer_idle` 2), for which the guest rings a queue's doorbell
+    only for a buffer that asks for its `CB_SUBMITTED`; it clears the mark
+    when it takes the claim back, and takes what the guest published meanwhile.
+    With the ring marked as before a sleep (1), the guest would ring for each
+    buffer it publishes during a walk, a VM exit that answers nothing for a
+    buffer that does not ask (measured on a 26.7.2 guest of a 780M host:
+    11.9 µs a doorbell, in two of three commits of a back-to-back run). Held
+    through the walk, the claim kept the doorbell from answering, and with
+    the ring marked busy the guest rang none, so a
     guest's `commitAndWaitUntilSubmitted` behind a buffer of fills waited for
     that walk and its commit (tested by
     `a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends`);
@@ -2647,31 +4794,56 @@ commit. Each outcome the new design allows is one of those two:
   oldest of the device: the waits end, by induction on the begin order. A
   buffer carried out on its service thread is its lane's oldest unfinished
   one, and the lane gets no job while it runs. A
-  job that comes while every thread of the lane is busy gets another, up to
-  four a lane, only where the device-wide budget of twice the host's cores has
-  one free, which a lane never waits for. So 2048 busy queues hold one thread
-  each and the budget's at most. A job goes to the thread that went idle last,
+  job that comes while every thread of the lane is busy gets another, only
+  where the device-wide budget has one free, which a lane never waits for. At
+  most eight of a lane's jobs walk at once; a job that waits for what is
+  committed before its buffer (its turn, its tickets, the buffers its
+  `COMMIT_ORDER` names, a split of its context) is not among them while it
+  waits, so the lane starts its next job meanwhile, up to 64 threads a lane,
+  as many command buffers as the host's queue holds uncompleted. The budget is
+  twice the host's cores and 64 more, for a busy queue's buffers walked ahead
+  of their turns. So 2048 busy queues hold one thread each and the budget's at
+  most. The waits are the same and where they were, so the commits, records
+  and interrupts are too; only how far the walks run ahead changed. A job
+  held back by the eight is later than every job started, so it holds none of
+  their waits. A job goes to the thread that went idle last,
   and a thread goes after 10 s with no job, the budget's before the lane's
   own: the threads a burst made go 10 s after it, while a steady load's stay
   through its pauses and jobs that come one at a time stay on one thread
   (`a_lane_keeps_its_thread_through_a_steady_load_s_pauses`,
   `a_burst_s_other_threads_go_after_keep_while_one_takes_the_jobs`). Each lane
-  thread gives itself the FIFO thread's scheduler hints as it starts (on Linux,
-  a utilization floor; no thread is bound to a CPU). Tested through the device
-  by
+  thread gives itself the walk hints as it starts (on Linux, a utilization
+  floor; no thread is bound to a CPU). A buffer longer than its service
+  thread walks itself has the lane's idle thread woken as its turn is taken,
+  before the rest of its begin, and that thread spins for the job for 50 µs
+  at most, so its wake is made while the buffer is begun: no job, turn or
+  order changes, only when the thread wakes
+  (`a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun`). Tested
+  through the device by
   `a_queue_s_buffers_are_walked_at_once_and_committed_in_order`,
-  `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`
+  `every_buffer_behind_a_held_walk_is_walked_beside_it_and_committed_in_turn`,
+  `a_queue_s_buffers_past_its_lane_s_most_threads_wait_to_start_and_commit_in_turn`,
+  `a_process_s_buffers_behind_its_held_answered_one_are_walked_and_committed_after_it`,
+  `a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling`,
   `a_video_buffer_is_walked_in_its_turn` and
   `a_lone_video_buffer_is_walked_on_its_queue_s_service_thread`
   (`graphics/tests.rs`), and by the lane's
   `a_turn_waits_for_every_turn_before_it`,
   `a_turn_is_next_once_every_turn_before_it_has_passed`,
+  `many_waiting_turns_each_go_in_their_turn`,
   `a_lane_runs_its_jobs_at_once_on_the_budget_s_threads`,
+  `a_lane_starts_its_next_jobs_while_its_jobs_wait`,
+  `a_lane_of_waiting_jobs_holds_lane_most_threads_at_most`,
+  `a_wait_off_the_lane_s_threads_or_inside_another_is_the_wait_alone`,
   `a_lane_with_no_budget_left_runs_its_jobs_on_its_own_thread_in_order`,
   `busy_lanes_hold_one_thread_each_and_the_budget_s`,
   `a_burst_s_threads_go_while_jobs_come_one_at_a_time`,
-  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again` and
-  `each_thread_gives_itself_the_fifo_hints_before_its_first_job`.
+  `a_burst_after_the_threads_went_grows_the_lane_to_its_limit_again`,
+  `each_thread_gives_itself_the_walk_hints_before_its_first_job`,
+  `an_expected_job_starts_on_the_thread_woken_for_it`,
+  `an_expected_job_that_comes_after_the_spin_wakes_its_thread_as_it_comes`,
+  `a_withdrawn_expectation_or_the_close_ends_the_spin_at_once` and
+  `an_expectation_wakes_only_an_idle_thread_and_one_at_a_time`.
 - **A command buffer in parts.** Where the platform starts a command buffer's
   GPU work only at its commit (the Vulkan platform's runtime records it and
   submits it then), a long buffer's walk and its GPU work run in series:
@@ -2690,8 +4862,13 @@ commit. Each outcome the new design allows is one of those two:
   last commit is met at the first part, so the walk never waits between
   parts. The parts run in their order on the queue, as one buffer's encoders
   do. The buffer's handlers, records, ticket and commit marks are its last
-  part's, and its outcome is all of them: the first failed part's error, the
-  first part's GPU start, the last part's GPU end. While a buffer's parts are
+  part's, and its outcome is all of them: the first failed part's error, and
+  GPU times that start at the first part's start and span the parts' GPU time
+  summed, never ending after the last part's end (`decode/split.rs`, "Its GPU
+  times": the GPU's waits between parts are for the host's walk, which a
+  Mac's GPU, handed the whole buffer at its commit, never has; one buffer on
+  both x86 Macs spans its encoders' GPU time summed, and macOS's compositor
+  reads a buffer's GPU times). While a buffer's parts are
   out, from its first part's commit to its last, no other command buffer of
   its context is committed (each waits at its commit, never at its walk), and
   the context's range messages that come are carried out after its last
@@ -2704,8 +4881,11 @@ commit. Each outcome the new design allows is one of those two:
   completion, as one whose walk faults whole; the parts committed before the
   fault ran, as the encoders before a fault of Metal's GPU run. The Vulkan
   platform keeps a buffer whole where a part would answer otherwise than the
-  whole (`gpu/command.rs`, "A command buffer in parts"); the Metal platform
-  keeps every buffer whole, as Metal's commit starts the GPU at once. Tested
+  whole (`gpu/command.rs`, "A command buffer in parts"); a buffer of compute
+  encoders alone is cut too, its unit of command predication going on in the
+  next part, and a buffer shaped like Geekbench 7's Fluid Simulation's, of
+  2,600 one-dispatch encoders, then completed in 34.8 ms where it took 87.0 ms
+  whole on the M3 Max (`decode/split.rs`, "What it gains"). Tested
   by `a_buffer_walked_long_is_committed_in_parts_with_one_outcome`,
   `a_buffer_is_committed_whole_where_its_parts_would_wait`,
   `another_queue_s_commit_waits_for_a_buffer_s_last_part` and
@@ -2718,7 +4898,7 @@ commit. Each outcome the new design allows is one of those two:
   finished (not for the fill itself: the fill is committed there, and the
   present waits for it in the present queue, shown at the fill's completion);
   and the device's reset, for every message in flight. A context's close waits for no
-  walk: `reims_graphics` fences each of its queues, which waits only for a take
+  walk: `reims_vgpu_graphics` fences each of its queues, which waits only for a take
   of the queue's submission ring or a post onto its completion ring under way,
   and the close is answered once its buffers have finished
   (`a_close_during_a_walk_holds_up_nothing_on_ring_0`). A doorbell's take tries
@@ -2738,7 +4918,7 @@ commit. Each outcome the new design allows is one of those two:
   `reims-graphics-pci` sends that write through `_mmio_write_taking` too.
 - **The answer at the doorbell.** A queue's doorbell write, on the guest's
   vCPU, may answer `CB_SUBMITTED` to the buffer at the head of the queue's ring
-  before the queue's thread wakes to take it (`reims_graphics`'s
+  before the queue's thread wakes to take it (`reims_vgpu_graphics`'s
   `Device::mmio_write_taking`), where the buffer would get it at its take and
   nothing need be waited for or allocated: the vCPU copies the message onto its
   stack, reads its ops where they lie, and tries every lock it takes. It reads
@@ -2781,7 +4961,7 @@ commit. Each outcome the new design allows is one of those two:
   A buffer the doorbell leaves to the queue's thread because ring 0 is behind
   (a create of its process's not yet carried out) is offered the same way on
   the lane's thread whose carrying out ends the queue's thread's wait, before
-  that thread is woken (`reims_graphics`'s queue gate, its offers), so its
+  that thread is woken (`reims_vgpu_graphics`'s queue gate, its offers), so its
   `CB_SUBMITTED` no longer waits for the queue's thread's wake
   (`a_buffer_behind_its_process_s_create_is_answered_on_the_lane_s_thread`).
   Tested by `a_doorbell_s_answer_allocates_nothing` and
@@ -2795,6 +4975,59 @@ commit. Each outcome the new design allows is one of those two:
   `a_buffer_using_a_cache_is_answered_at_its_doorbell_where_it_waits_for_no_copy`,
   the decoder's fuzz (`an_answer_at_the_doorbell_keeps_the_order_of_a_take`),
   and the device's `an_answered_command_buffer_waits_for_no_later_ring_0_message`.
+  Under `DOORBELL_ASKS` only a write that carries `RGFX_DOORBELL_ASKS` is
+  answered there; a plain write wakes the queue's thread alone
+  (`only_an_asking_doorbell_write_is_answered_at_the_doorbell`,
+  `a_guest_without_doorbell_asks_is_answered_at_any_doorbell_and_not_routed`).
+- **Routed doorbells.** A plain doorbell write needs nothing of the host but
+  the wake of the queue's thread, so where the guest took `DOORBELL_ASKS` each
+  queue's thread sleeps on an eventfd of its own as well as on its wake, and
+  the device hands the host that eventfd with the ring's id at the queue's
+  create (the C API's `route_doorbell`). QEMU registers it with KVM as an
+  ioeventfd on `DOORBELL` matching the ring's id exactly, so KVM signals it
+  inside the guest's write and the vCPU returns to the guest with no exit to
+  QEMU; the asking write, the id with bit 0, matches no route and goes to
+  QEMU and the library as before. Measured on the Radeon 780M host before
+  the routes: a write QEMU takes as an ioeventfd (ring 0's) costs the guest
+  8.9 us, one it runs through the library 13.4 us. The thread drains the
+  eventfd and walks the ring on each wake, so writes that coalesce into one
+  wake are all taken, in ring order
+  (`a_routed_doorbell_wakes_its_queue_which_takes_every_buffer_published`).
+  The device routes at most 128 queues' doorbells (KVM holds 1000 devices on
+  its MMIO bus, and QEMU ends the VM where KVM refuses one); a queue past them,
+  or one whose route the host refuses, keeps its doorbell on the write, logged
+  once per kind (`full`, `refused`) and then counted
+  (`a_queue_past_the_routes_or_refused_keeps_its_doorbell_on_the_write`). A
+  queue's route goes at its destroy, its context's close and the device's
+  reset (`a_reset_drops_the_queues_routes`), and QEMU drops every route at its
+  teardown. QEMU adds and drops a route under the BQL before the callback
+  returns, so the device calls it holding no lock of its own: on the lane's
+  thread after the queues' table is let go, and in a reset after its rings
+  and table are; and no device function a host calls under the BQL waits
+  for a lane
+  (`the_host_s_lock_held_around_its_calls_while_a_route_waits_for_it_holds_up_nothing`). A route changes no order: the ring's records, its completions and
+  interrupts are the thread's, as for a doorbell the host takes in the write.
+  Where the guest took `DOORBELL_PAGES`, a queue of a context with a doorbell
+  page is routed at the page's doorbell in BAR4 instead, and the page's
+  routes count among the 128 ("BAR4: the doorbell pages").
+- **A process rings at its doorbell page.** Where the kext mapped the
+  context's doorbell page (`OpenContext`'s seventh output), the bundle rings
+  a queue with one 32-bit store of the ring's id at the page's first byte, a
+  DMB OSHST before it on arm64 and the store one STR of a W register, the one
+  form a hypervisor decodes from its abort's syndrome
+  (`guest/bundle/src/RgfxDoorbellPage.hpp`). The store exits to the
+  hypervisor as the kext's register write does, so what it saves is the call
+  into the kext: the Mach trap and IOUserClient's dispatch. The control
+  ring's held messages still go first, as before any call of the process's
+  into the kext. With no page the bundle calls `Doorbell`, as before.
+- **Ring 0's doorbell rings out of its lock.** The framebuffer publishes a
+  post on ring 0 under its submit lock and reads whether the host's consumer
+  sleeps there, and writes `DOORBELL` once it has let the lock go
+  (`rgfxControlPublishWantsBell`, `guest/kext/src/RgfxControlRing.hpp`): the
+  write exits to the host, and another CPU's post would wait that exit out
+  under the lock. The ring's order is its producer's, which the lock keeps; a
+  doorbell is a wake, and two posts that both find the consumer asleep ring
+  twice, as they did under the lock.
 
 ## Stage 3 guest stack (from the prior-art study)
 
@@ -2803,7 +5036,7 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 
 - **Discovery/load.** The bundle installs under `/Library/GPUBundles/`. Metal
   does not scan that directory; it loads the bundle from two properties on the
-  accelerator service's IOKit personality — `MetalPluginName` (the path) and
+  accelerator service's registry entry — `MetalPluginName` (the path) and
   `MetalPluginClassName` (the Obj-C class Metal instantiates as the
   `MTLDevice`) — under `IOMatchCategory IOAccelerator`. So stage 3 needs a
   guest **accelerator kext** that matches our PCI device and publishes those
@@ -2816,7 +5049,7 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   volume does not carry it, so with SIP on Metal declines to load it and
   WindowServer, finding the accelerator registered, crashes and restarts in a
   loop.
-  Our install kext (`guest/rgfxgate`, a Lilu plug-in) therefore writes the
+  Our install kext (`guest/rgfxgate`, a Graft client) therefore writes the
   bundle to the data volume and gives the whole tree that exact storage class
   and the matching restricted flag from kernel context, below the file-system
   MAC layer, so only our bundle's own paths are tagged and SIP is relaxed for
@@ -2838,14 +5071,14 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
   appears) and creates the container, with the same class, only where it is
   missing.
   - *Checklist (per supported OS).* The three load hooks and the three install
-    hooks are Lilu routes of six XNU MAC dispatchers
+    hooks are Graft routes of six XNU MAC dispatchers
     (`_mac_file_check_library_validation`, `_mac_file_check_mmap`,
     `_mac_vnode_check_signature`, `_mac_vnode_check_{create,open,truncate}`),
     whose argument lists `RgfxGateHooks.cpp` hard-codes. Routing is by symbol,
     not by raw bytes, so a moved patch site is not the risk; a changed
-    *prototype* is. When a new `KernelVersion` is added to the supported range
-    (Info.plist, BigSur..Tahoe), re-verify each of the six prototypes against
-    that OS's KDK before shipping it, and confirm `_csfg_get_cdhash` and
+    *prototype* is. RgfxGate has no kernel version range, so when a release
+    joins the test matrix, re-verify each of the six prototypes against that
+    release's kernel before shipping it, and confirm `_csfg_get_cdhash` and
     `_csblob_get_cdhash` still resolve (a miss on either now logs loudly and
     leaves the gate inert rather than bricking silently).
 - **Bundle updates.** The marker beside the executable (below, "Registration
@@ -2919,12 +5152,109 @@ How a Metal bundle plugs into macOS, in Apple's own terms (notes:
 IOService in the one kext, on the same PCI device as the Stage-2 framebuffer:
 the framebuffer matches in category `IOFramebuffer`, the accelerator in category
 `IOAccelerator`, both children of the one `IOPCIDevice`. Its `Info.plist`
-personality carries `MetalPluginName = reims-graphics` (the bundle
+personality holds only what matches the provider and names the driver, as
+Graft takes a personality's other keys for the provider's matching ("Graft",
+above). The accelerator sets its driver keys on its registry entry at the
+start of `start`, before it registers (`setDriverKeys`), of the same types on
+x86-64 and arm64: `MetalPluginName = reims-graphics` (the bundle
 `/Library/GPUBundles/reims-graphics.bundle`) and `MetalPluginClassName
 = RgfxMetalDevice`, which is how Metal (`IOServiceMatching("IOAccelerator")`)
-finds and loads the bundle. The accelerator maps BAR 0 for the doorbell and
+finds and loads the bundle; `IOGLBundleName` (OpenGL, below);
+`IODVDBundleName`, `IOVARendererID` and `IOGVACodec` (hardware video,
+Decided 16); `AcceleratorProperties`, whose
+`IOAccelDisplayPipeCapabilities` say the display pipe and its transactions
+are supported; and `DisplayPortCount` 1. The accelerator maps BAR 0 for the doorbell and
 holds BAR 2 to map each process's part of it in; it touches no pixels and no
 control ring (the framebuffer owns those).
+
+**OpenGL.** The accelerator also carries `IOGLBundleName =
+AppleMetalOpenGLRenderer`, the GL renderer OpenGL loads for an accelerator: the
+system's own GL over Metal, which finds its Metal device among
+`MTLCopyAllDevices()` by the accelerator's registry entry ID (the device's
+`registryID`). The renderer hands the device each GL shader as GL IR and each
+variant as plugin data; Metal's own devices lower the two to AIR in their
+compiler service. The bundle has none, so it lowers a variant in the app's
+process, through the GL code generator the system ships beside the renderer
+(`libGLDPlugin<V>.dylib`, called in place), into a .metallib of one function,
+and makes an ordinary library of it (`guest/bundle/src/RgfxGLFunction.h`,
+`RgfxGLLowering.hpp`): the host compiles GL shaders as it compiles any
+library. A tessellated draw's vertex and control shaders are one kernel the
+renderer makes a compute pipeline of under a stage input descriptor; the
+kernel takes the draw's vertices as a patch control point input, which Metal
+compiles in no kernel, so its pipeline is made of the kernel made one without
+the input under that descriptor (`RgfxGLStageInKernel`), whose fetch reads what
+Metal's `[[stage_in]]` fetch reads (bit for bit on the M3 Max, every
+attribute format: `guest/bundle/tests/gl_tests.mm`). Measured on an x86 Mac (macOS 26.7.1, the Intel UHD 630): the
+renderer runs on a non-Apple Metal device, and the bundle's lowering draws what
+Metal's own does (`guest/bundle/tools/gl_probe.m`, `gl_inject.mm`). An
+on-screen context's drawable is the IOGPU base's, over the kext's GL drawable
+and window surface ("A GL window", below). OpenCL lists a GPU for every
+accelerator that names an `IOGLBundleName`, and runs its kernels through the
+same renderer.
+
+**The renderer's settings.** The renderer picks a set of per-vendor settings
+for a device when it makes its first context, read from its code (macOS
+27.0.1, both slices): by the device's `vendorName`, "AMD" or "ATI" (AMD's
+settings only where the device's class is the one of AMD's older Metal driver,
+NVIDIA's otherwise), "NVIDIA" or "Intel"; for any other vendor by
+`supportsFamily:` of Apple7, then Apple5; and it ends the process on a device
+that answers none ("Unknown GPU!!"). Among what the settings decide:
+- Whether the renderer sends GL's provoking vertex to the encoder
+  (`setProvokingVertexMode:`, 1 for GL's default last-vertex convention, 0
+  for the first). The Apple and AMD settings do. Under NVIDIA's and Intel's,
+  the renderer reorders each triangle's vertices itself, and a line keeps its
+  first vertex's flat value: gl_cases' provoking-line-last fails. Measured:
+  the M3 Max sends 1 and 0 to its encoder and passes every provoking case
+  (macOS 27.0.1, job m3-max-26643); the Intel 630's Metal GL renderer fails
+  that one case (macOS 26.7.1, commit 17b468160's measurement). The AMD
+  Radeon Pro 5300M's Metal device is not of the older driver's class, so it
+  takes NVIDIA's settings (its class read on macOS 26.7.1, job m3-max-26630).
+- Whether GL's `GL_POINT` polygon mode goes to the encoder as
+  `setTriangleFillMode:` 2, which no public `MTLTriangleFillMode` names. The
+  Apple, AMD and Intel settings send it. Measured with a triangle at mode 2:
+  the M3 Max and the Intel 630 draw its three vertices' pixels, the 5300M
+  fills it (jobs m3-max-26654 and m3-max-26650).
+  The Vulkan platform draws them as the M3 Max does, as points of one pixel
+  (the runtime's `TriangleFillMode::Points`, `VK_POLYGON_MODE_POINT`), where
+  the device has `fillModeNonSolid`, and `pointPolygons` on a
+  portability-subset device; elsewhere, MoltenVK among them, the runtime
+  refuses the mode and the platform dies on the refusal
+  (`fill_mode_2_draws_a_triangles_vertices_as_points` in
+  `crates/reims-vgpu-vulkan/src/gpu/encode_render.rs`). A guest given Intel's
+  settings sends it.
+- Whether texture uploads and mipmap generation take the renderer's other
+  path (`gldModifyTexSubImage`, `gldGenerateTexMipmaps`): the Apple settings
+  alone.
+- Whether it keeps `supportsForceSeamsOnCubemaps`' answer: the Apple settings
+  alone; every other vendor's drop it.
+- The largest point the renderer draws (`updateRenderPointSettings` clamps
+  GL's point size to it): 16 pixels under Apple5's settings, 64 under every
+  other set.
+
+Apple7's settings and Apple5's are the same but for that point size: both
+answer each of the settings above as Apple's (read from the five settings
+records and the code that copies them, macOS 27.0.1's arm64e slice). So the
+narrowest answers that give a device the Apple settings are a `vendorName`
+that holds none of "AMD", "ATI", "NVIDIA" and "Intel" and `supportsFamily:`
+of Apple5; "Apple" without Apple5 or Apple7 ends every process that makes a
+GL context.
+
+Our device answers `vendorName` with the host GPU's vendor, and "AMD" for any
+other (`rgfxVendorNameOf` in `guest/bundle/src/RgfxCaps.hpp`), and no Apple
+family short of Apple7 (`crates/reims-vgpu/src/graphics/device_info.rs`). So
+its guests get NVIDIA's settings, or Intel's on an Intel host, as the x86
+Macs' GPUs measured above would. An arm64 guest on the M3 Max gets NVIDIA's
+settings where the M3 Max's own renderer takes the Apple ones: GL lines under
+the last-vertex convention take their first vertex's flat value there (arm64
+macOS 27.0.1, a64walk2's walks), whatever the bundle and the host do with the
+setter. The device does not answer Apple5 for it: Apple4's and Apple5's rows
+hold tile shaders, imageblocks and nonsquare tile dispatch, which the device
+does not carry (no tile pipeline crosses the wire) and the Vulkan platform's
+runtime refuses on every device (its family audit, measured on an Iris Xe at
+metal2vulkan c796a88d6a: 26 rows of Apple5's block it, these four among
+them). Apple5 without Apple7 is also no Mac's answer, which is why the
+device claims no Apple family short of Apple7 (`FIRST_MAC_APPLE_FAMILY` in
+`device_info.rs`).
 
 **Registration waits for the bundle.** Where the accelerator is registered and
 its bundle is not on disk, every WindowServer aborts in CoreDisplay as it
@@ -2963,6 +5293,18 @@ registers only once its bundle is on disk:
   connection waits up to 5 s for it, and leaves the accelerator unregistered
   for the boot where the pass is still under way. Without RgfxGate there is no
   property, and the check counts what it finds.
+- **The framebuffer comes first too.** A process's context reaches the
+  device only through the framebuffer's rings, so the check registers the
+  accelerator only once the framebuffer has started as well: its start has
+  taken the device and brought its rings up (`ReimsGraphics::hasStarted`).
+  The check says once in the kernel log when the bundle waits for it. A
+  context opens only while the framebuffer is started (`kIOReturnNotReady`
+  otherwise, taking no units), and a close that finds none started gives its
+  context's units back at once: none has carried a message of the context
+  since the device's last reset (a failed start's or the stop's), which
+  dropped every context's objects ("Reset"). Seen on arm64 27.0.1, where an
+  accelerator registered after ReimsGraphics' start failed had its contexts'
+  messages and closes refused, and their units kept from use for good.
 - **A bundle installed later takes effect at the next boot**: a running
   WindowServer never sees a GPU appear under it. The guest's install puts the
   bundle in place and reboots.
@@ -2984,45 +5326,101 @@ the bundle's wire handshake opens them with `IOServiceOpen` /
 `IOConnectCallStructMethod` / `IOConnectCallScalarMethod`.
 
 **The accelerator's user client: its numbers.** This table gives out every
-number of the 'RGFX' user client. A new selector takes the next free number
-here first. A selector or a flag that a kext may lack gets a kext feature bit,
-which the kext sets in the second word `Features` answers once it carries it
-out, and the bundle uses it only where that word holds the bit. The numbers
-and the kext feature bits are in `guest/kext/src/RgfxUserClientABI.hpp`, which
-the kext and the bundle include.
+number of the 'RGFX' user client and of a shared event's port. A new selector
+takes the next free number here first, among the numbers below. A selector or
+a flag that a kext may lack gets a kext feature bit, which the kext sets in
+the second word `Features` answers once it carries it out, and the bundle uses
+it only where that word holds the bit. The numbers and the kext feature bits
+are in `guest/kext/src/RgfxUserClientABI.hpp`, which the kext and the bundle
+include.
+
+Every number is one that every WebKit web-content sandbox lets its process
+call on an IOAccelerator connection, on every release from 11 to 26. WebKit's
+web-content profile (`com.apple.WebProcess.sb`, its
+`IOAcceleratorMessageFilter`) lists numbers on macOS 12 alone and refuses any
+other there before the kext sees it: from Safari 15.1 to 17.6 (WebKit 612.2 to
+7618.3) every list holds 0-13, 15-18, 22-24, 28-31, 40, 42, 48, 256-265, 267,
+268 and 512, the numbers Apple's own drivers take (17.6's adds 41, 43, 46, 49,
+266, 269 and 513). On macOS 11 and from 13 on it lists none, and allows every
+number; its asynchronous methods (0 and 47 on 12) and traps the bundle makes
+none of. Read from WebKit's source at each release branch, and on 11.7.11,
+12.7.6 and 13.7.8 guests. `user_client_words_test` holds the set, checks every
+number here against it, and checks that every `IOConnectCall*Method` in the
+bundle's sources names one of these selectors.
+
+The numbers move only with the set: the bundle and the kext ship together. A
+move takes the next selector map number (`kRgfxSelectorMap`), which `Features`
+answers third, at a number it keeps in every map. A bundle whose map is not
+the kext's has no Metal device in its process, logged, rather than call a
+number that means another call there. Map 0, before the number, had
+`SurfaceBlockRelease` at 0x10a, `SurfaceRetire` at 0x10d, `PagesBlock` at
+0x10e, `Features` at 0x10f, `TakeAnswers` at 0x112 and the port's selectors at
+0x113 and 0x114, outside the numbers above: macOS 12's web content process
+could not call `Features`, took 64-id chunks where the kext granted 16, and had
+its textures past each chunk's first 16 ids refused (`BadResourceId`). A kext of map 1 gives
+none of those numbers a meaning, so a bundle of map 0 is refused at each.
+
+Map 1:
 
 | number | name | kext feature bit | what |
 |---|---|---|---|
-| doorbell 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
-| doorbell 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
-| 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output) | the context and its window; five outputs, or six with its GPU addresses' span |
-| 0x101 | `Alloc` | | a region block |
+| 0 | `Doorbell` | | writes a ring's id to `DOORBELL` |
+| 1 | `Consumed` | 1 << 3 `ConsumedDoorbell` | reserved: a completion ring's room doorbell (`CONSUMED`) |
+| 2 | | | given to none: the IOGPU base's device-info call on its own client type, so a trace names one call per number |
+| 3 | `Features` | | the device's feature word, the kext's and the selector map; at 3 in every map |
+| 4 | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
+| 5 | `SubmitBatch` | 1 << 1 `SubmitBatch`, 1 << 11 `QueuePublish` (three inputs and a second output: a queue's publish after them) | a process's destroys, and its creates and writes no one waits for that name no block, onto ring 0 in one call ("Destroys and creates no one waits for go together"), and with three inputs a command buffer's publish on its queue's ring after them ("A commit behind held messages is one call") |
+| 6 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
+| 7 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
+| 8 | `SurfaceBlockRelease` | | lets go of a shared block |
+| 9 | `SurfaceRetire` | | a queue's writes up to a seqno retire |
+| 10 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
+| 11 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
+| 12 | `PagesChunked` | 1 << 8 `PagesChunked` | a block of the runs of 64 KiB chunks of the kext's own, mapped into the process, for its slabs |
+| 13 | `SurfaceSeeds` | 1 << 10 `SurfaceSeeds` | an IOSurface's lock and unlock seeds, for a copy synced while a CPU held the surface locked for writing |
+| 0x100 | `OpenContext` | 1 << 5 `ContextSpan` (its sixth output), 1 << 12 `DoorbellPage` (its seventh) | the context and its window; five outputs, six with its GPU addresses' span, or seven with its doorbell page's address in the process, 0 for none ("BAR4: the doorbell pages") |
+| 0x101 | `Alloc` | 1 << 7 `WriteCombined` (its third input) | a region block; 2 inputs, or 3 with the byte its write-combined part starts at |
 | 0x102 | `Free` | | frees a block |
 | 0x103 | `QueueCreate` | | a command queue; 6 inputs, or 7 with the flags wanted |
 | 0x104 | `QueueDestroy` | | closes a queue |
-| 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag) | one lifecycle message onto ring 0 |
-| 0x106 | `ResourceIds` | | a chunk of texture resource ids |
+| 0x105 | `Submit` | 1 << 4 `DeferredAnswers` (its deferred flag), 1 << 9 `SharedPipelines` (its shared flag: the pipeline key in four more inputs, and a second output) | one lifecycle message onto ring 0 |
+| 0x106 | `ResourceIds` | | a chunk of texture resource ids, and with a second output its size |
 | 0x107 | `WaitCompletions` | | waits for the client's completions |
 | 0x108 | `SurfaceScanout` | | the scanout an IOAccel surface is drawn into |
 | 0x109 | `SurfaceBlock` | | an IOSurface plane's shared block |
-| 0x10a | `SurfaceBlockRelease` | | lets go of a shared block |
 | 0x10b | `DeviceInfo` | | the device info and video caps |
 | 0x10c | `SurfaceWrites` | | the surfaces a command buffer writes |
-| 0x10d | `SurfaceRetire` | | a queue's writes up to a seqno retire |
-| 0x10e | `PagesBlock` | 1 << 0 `PagesBlock` | a block of the runs of a process's own pages, wired, for its no-copy buffers |
-| 0x10f | `Features` | | the device's feature word and the kext's |
-| 0x110 | `SubmitBatch` | 1 << 1 `SubmitBatch` | reserved: lifecycle messages in one call |
-| 0x111 | `WakeCompletions` | 1 << 2 `WakeCompletions` | reserved: wakes the client's completion waiters |
-| 0x112 | `TakeAnswers` | 1 << 4 `DeferredAnswers` | hands a process its held pipeline-create answers ("Known pipeline creates") |
-| 0x113 | `Export`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | names the caller's shared event for other processes ("Shared events across processes") |
-| 0x114 | `Import`, on a shared event's port ('RGSE') | 1 << 6 `SharedEvents` | makes the caller's new shared event of the one the port names |
 
 A shared event's port is a connection of a second type, 'RGSE' (0x52475345), on
-the accelerator, which the bundle opens for each event it hands out: 0x113 and
-0x114 are its own selectors, numbered past the accelerator's own so that a call
+the accelerator, which the bundle opens for each event it hands out: 10 and 11
+are its own selectors, numbered apart from the accelerator's own so that a call
 on a connection of another kind finds none of that number there.
 
-The kext sets 1 << 0 `PagesBlock`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan` and 1 << 6 `SharedEvents`; no other bit yet.
+The kext sets 1 << 0 `PagesBlock`, 1 << 1 `SubmitBatch`, 1 << 4 `DeferredAnswers`, 1 << 5 `ContextSpan`, 1 << 6 `SharedEvents`, 1 << 7 `WriteCombined`, 1 << 8 `PagesChunked`, 1 << 9 `SharedPipelines`, 1 << 10 `SurfaceSeeds`, 1 << 11 `QueuePublish` and 1 << 12 `DoorbellPage`, `SurfaceSeeds` only where the release's IOSurface exports its unlock seed; no other bit yet.
+
+**A GL window: the drawable (type 7) and the window surface (type 0x20).**
+These are IOGPU's types, not ours. The bundle leaves `newGLDrawable` to its
+IOGPU base, which opens type 7. The kext serves both types
+(`guest/kext/src/RgfxGLUserClients.{hpp,cpp}`, with the rules in
+`RgfxGLSurfaces.hpp` and their native test). Measured on a macOS 26.6.1
+guest, for window-backed and layer-backed `NSOpenGLView`s alike:
+- the app opens type 7, then its `SLSBindSurface` opens type 0x20 for the
+  window's surface: `SetIDMode`(id, 0x4024), then `SetShape` with the
+  view's size;
+- the drawable's set surface (selector 1) names that id. Its lookups
+  (selector 5) of indexes 0 and 1 get two IOSurfaces, which the kext makes
+  in the app's task;
+- the app draws into those IOSurfaces through the bundle, and WindowServer
+  composites the window from them (screen dumps show the frames). It opens
+  no user client of the accelerator for the window.
+
+The rules are IOGPU's, read from IOGPUFamily's x86_64 code in the 26.7.1
+KDK: the mode and shape checks, the request bits a drawable's mode gives,
+the eleven buffer slots and their formats, and when buffers are made again.
+Not served, each answering `kIOReturnUnsupported`:
+- surface modes of IOGPU's shared buffers (0x700000);
+- a drawable's scaled sources and shared events;
+- every surface method but `SetIDMode` and `SetShape`.
 
 - **Boot-gated — base class / kernel family (notes UNKNOWN #1).** The scaffold
   subclasses `IOAccelerator`, the base the macOS SDK and KDK expose (the IOGPU
@@ -3054,7 +5452,7 @@ builds a pipe), and refuses the rest.
 ## Open
 
 - **Stage 3 bundle placement — RESOLVED:** the bundle sits in
-  `/Library/GPUBundles` and our accelerator kext's personality carries
+  `/Library/GPUBundles` and our accelerator's registry entry carries
   `MetalPluginName`/`MetalPluginClassName`. The library-validation boot state
   is settled: the install kext gives the bundle the rootless storage class so
   Metal trusts its path, and answers the library-validation, mmap and signature

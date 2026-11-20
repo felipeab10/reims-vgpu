@@ -1,5 +1,5 @@
 //! The command-buffer decoder: it carries out one
-//! [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
+//! [`RGFX_CMD_COMMAND_BUFFER`](reims_vgpu_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
 //! message (docs/graphics-kext/design.md, "Stage 3 wire protocol"). It resolves
 //! the queue the buffer runs on, opens a `P::CommandBuffer`, walks the op stream
 //! that follows the message, and at the end registers the completion path and
@@ -20,33 +20,38 @@
 //! finishes, and always ahead of its completion record ([`Signals`]); a buffer that
 //! waits is watched, and named in the log where it waits long ([`super::waits`]).
 //!
-//! **Submission.** A buffer committed by `commitAndWaitUntilSubmitted` asks for its
-//! `CB_SUBMITTED` (`SUBMITTED`), at which that call returns in the guest. Metal's returns once the
-//! buffer is submitted (measured on the 5300M, the 630 and the M3: about 0.3 ms behind a 100 ms
-//! buffer, the buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer
-//! that waits on an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7).
-//! The host posts it as soon as it takes a buffer that waits for no event, needs no fill of a
-//! device cache and has none before it on its queue that waits for one and is not yet scheduled
-//! ([`Held`]), before it walks the buffer's ops ([`Take`]); a GPU wait for a buffer of another
-//! queue ([`super::surface_order`]) holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`,
-//! which then goes at its commit ([`Line`]), as a Mac's order of IOSurface accesses holds back no
-//! record (Q16). Its ticket in the commit order is issued first ([`super::sequencer`]), so every
-//! command buffer its process sends after it, on any queue, is committed after the buffer's
-//! commit, and the platform orders the process's later work after it as it orders by commit;
-//! another process's buffers wait for no ticket of its, as they name none of its tracked
-//! resources. A buffer whose walk then faults has its failure at its completion, as Metal reports
-//! a command buffer's errors. Any other buffer gets it at its scheduling, once the waits are
-//! satisfied: Metal orders a tracked resource across queues behind what it has
-//! submitted, not behind a buffer its queue holds (measured on the M3 through the decoder, a
-//! later commit on another queue ran first), and the host's fills of device caches are waits
-//! too. Either way it goes once, ahead of the buffer's `CB_SCHEDULED` and `CB_COMPLETE`
-//! ([`Submitted`]).
+//! **Submission.** A buffer committed by `commitAndWaitUntilSubmitted` asks for its `CB_SUBMITTED`
+//! (`SUBMITTED`), at which that call returns in the guest. Metal's returns once the buffer is
+//! submitted (measured on the 5300M, the 630 and the M3: about 0.3 ms behind a 100 ms buffer, the
+//! buffer then `Committed` or `Scheduled` by a race, and at the signal for a buffer that waits on
+//! an event or is behind one on its queue; docs/graphics-kext/dgpu-oracle.md, Q7). The host posts
+//! it as soon as it takes a buffer that waits for no event, follows no deferred copy of a device
+//! cache and has none before it on its queue that waits for one and is not yet scheduled
+//! ([`Held`]), before it walks the buffer's ops ([`Take`]) and before the fills of device caches
+//! its begin makes at once; a GPU wait for a buffer of another queue ([`super::surface_order`])
+//! holds back neither its `CB_SUBMITTED` nor its `CB_SCHEDULED`, which then goes at its commit
+//! ([`Line`]), as a Mac's order of IOSurface accesses holds back no record (Q16), and nor does a
+//! fill made at once, which waits for nothing of the guest's to come (a new surface's first fill,
+//! at its first use, takes milliseconds: WindowServer's capture of a window list for Dock waited
+//! about 4 ms in `commitAndWaitUntilSubmitted` for one on the 780M host, 11-08). Its ticket in the
+//! commit order is issued first ([`super::sequencer`]), so every command buffer its process sends
+//! after it, on any queue, is committed after the buffer's commit, and the platform orders the
+//! process's later work after it as it orders by commit; another process's buffers wait for no
+//! ticket of its, as they name none of its tracked resources. A buffer whose walk then faults has
+//! its failure at its completion, as Metal reports a command buffer's errors. Any other buffer gets
+//! it at its scheduling, once the waits are satisfied: Metal orders a tracked resource across
+//! queues behind what it has submitted, not behind a buffer its queue holds (measured on the M3
+//! through the decoder, a later commit on another queue ran first), and a deferred copy of a device
+//! cache waits for buffers begun before it, which may wait so. Either way it goes once, ahead of
+//! the buffer's `CB_SCHEDULED` and `CB_COMPLETE` ([`Submitted`]).
 //!
 //! **An answer on the doorbell's thread.** A buffer that gets its `CB_SUBMITTED` at its take may
 //! get it on the thread of the guest's doorbell write instead, before its queue's service thread
-//! takes it off its ring (`reims_graphics`'s `Device::mmio_write_taking`), where nothing need be
+//! takes it off its ring (`reims_vgpu_graphics`'s `Device::mmio_write_taking`), where nothing need be
 //! waited for or allocated there ([`Decoders::answer_at_doorbell`]): it waits for no copy of a
-//! device cache it uses, and every lock the answer takes is tried. Its turn in its queue's lane
+//! device cache it uses, and every lock the answer takes is tried. One whose begin fills a cache
+//! is answered at its take, before the fill: a doorbell cannot know the fill will be made at once,
+//! as another queue's begin before the take may count a use of the cache, which defers it. Its turn in its queue's lane
 //! and its ticket in the commit order are taken there, in the order its begin would take them,
 //! and kept on its queue with its mark in that order ([`Answered`]), then its `CB_SUBMITTED` is
 //! posted. Its begin, on the service thread, takes them in place of its own
@@ -65,7 +70,11 @@
 //! handler unless it holds something. A buffer that does not ask keeps its `CB_SCHEDULED` to its
 //! scheduling: posted at its take, it would need its ticket in the commit order there, as a
 //! `CB_SUBMITTED` there does, and a walk held on one of a process's queues would then hold up the
-//! process's other queues' commits ([`Begun::scheduled_at_take`]). Metal makes such a buffer `Scheduled` within a fraction of a millisecond of its
+//! process's other queues' commits ([`Begun::scheduled_at_take`]). A thread that waits for it to
+//! be scheduled asks for it (`SCHEDULED_ASK`), and where it would have got the record at its take
+//! had it asked for its `CB_SUBMITTED`, the ask posts it, its ticket issued first ([`Askable`]):
+//! then a held walk holds up the process's other queues' later commits, as after a `CB_SUBMITTED`,
+//! only once a thread waits for it. Metal makes such a buffer `Scheduled` within a fraction of a millisecond of its
 //! commit, whatever its queue runs on the GPU before it: on the M3 Max (macOS 27) the scheduled
 //! handler of a buffer on an idle queue runs about 10 us after `commitAndWaitUntilSubmitted`
 //! returns, and behind a 120 ms buffer `waitUntilScheduled` returns in 0.1 ms; commit to the
@@ -87,59 +96,74 @@
 
 use std::collections::VecDeque;
 use std::mem::MaybeUninit;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::time::Duration;
 
-use reims_graphics::ops::render::{
-    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives,
-    RgfxOpSetVertexBuffer,
+use reims_vgpu_graphics::ops::blit::{
+    RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER, RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER,
+    RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER, RGFX_OP_BLIT_UPDATE_FENCE, RGFX_OP_BLIT_WAIT_FOR_FENCE,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::compute::{
+    RGFX_OP_COMPUTE_UPDATE_FENCE, RGFX_OP_COMPUTE_WAIT_FOR_FENCE,
+};
+use reims_vgpu_graphics::ops::render::{
+    RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER,
+    RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
+    RGFX_OP_RENDER_UPDATE_FENCE, RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES,
+    RGFX_OP_RENDER_WAIT_FOR_FENCE, RgfxOpDrawPrimitives, RgfxOpSetVertexBuffer,
+};
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_COMPUTE_PASS_FLAG_DISPATCH_TYPE, RGFX_OP_BODY_OFFSET,
     RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
     RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
     RGFX_OP_GROUP_BLIT, RGFX_OP_GROUP_COMPUTE, RGFX_OP_GROUP_FRAMING, RGFX_OP_GROUP_RENDER,
-    RGFX_OP_GROUP_VIDEO, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
-    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT,
+    RGFX_OP_GROUP_VIDEO, RGFX_OP_GUEST_TIMES, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED,
+    RGFX_OP_SURFACE_ORDER, RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT,
+    RGFX_PASS_FLAG_DEFAULT_RASTER_SAMPLE_COUNT, RGFX_PASS_FLAG_RATE_MAP,
     RGFX_PASS_FLAG_RT_ARRAY_LENGTH, RGFX_PASS_FLAG_RT_SIZE, RGFX_PASS_FLAG_SAMPLE_POSITIONS,
     RGFX_PASS_FLAG_VISIBILITY_RESULT, RGFX_PASS_MAX_SAMPLE_POSITIONS,
     RGFX_RENDER_PASS_COLOR_OFFSET, RgfxCommandBuffer, RgfxComputePassDesc, RgfxOpEvent,
     RgfxOpHeader, RgfxOpSurfaceUse, RgfxOpVideoPass, RgfxRenderPassColorAttachment,
-    RgfxRenderPassDesc, RgfxRenderPassSamplePositions, RgfxRenderPassVisibility,
-    RgfxSurfaceOrderWait, op_group,
+    RgfxRenderPassDesc, RgfxRenderPassRateMap, RgfxRenderPassSamplePositions,
+    RgfxRenderPassVisibility, RgfxSurfaceOrderWait, op_group,
 };
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_EVT_CB_SCHEDULED, RGFX_EVT_CB_SUBMITTED, RGFX_EVT_EVENT_SIGNALLED, RgfxCbScheduled,
     RgfxCbSubmitted, RgfxEventSignalled, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
-use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler,
+use reims_vgpu_vulkan::core::num::ToU64 as _;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::caps::{DeviceCaps, SAMPLE_COUNTS};
+use reims_vgpu_vulkan::core::platform::command::{
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, KeptWhole, PartCut,
+    ScheduledHandler,
 };
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
-use reims_vgpu_core::platform::resource::Buffer as _;
-use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
-use reims_vgpu_core::platform::values::{
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent as _};
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder, VertexDraw};
+use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+use reims_vgpu_vulkan::core::platform::types::{ClearColor, MtlSamplePosition};
+use reims_vgpu_vulkan::core::platform::values::{
     ColorAttachmentSet, ComputePassDesc, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, IntoBytes};
 
-use super::super::completion::{cb_complete, cb_failed};
+use super::super::completion::{cb_complete, cb_failed, cb_unlanded};
 use super::commit_order::Until;
+use super::helpers::{Hand, Slots};
 use super::lane::{Lane, Turn};
 use super::sequencer::Ticket;
 use super::shares::FanOut;
 use super::split::{Parts, SplitHold};
-use super::surface_cache::Uses;
+use super::surface_cache::{Reach, Uses};
 use super::surface_order::{Marks, Signalled};
 use super::tables::QueueCounts;
 use super::{
@@ -151,15 +175,27 @@ use super::{
 /// raise returns for the handler to catch.
 const ON: OnFault = OnFault::Return;
 
+/// How many names of its op stream a command buffer's walk finds at its start
+/// ([`GraphicsDecoder::find_named`]): every name of a few dozen dispatches, and no more of a
+/// longer buffer's, whose walk finds the rest as it reaches them.
+const NAMES_AT_ONCE: usize = 128;
+
+/// `MTLRenderStageFragment`: a render encoder's update of the writers' fence covers its fragment
+/// stage and every stage before it, its render targets' writes among them.
+const RENDER_STAGE_FRAGMENT: u64 = 0x2;
+
 /// What a command buffer's op stream does with events: the shared events it signals, whose values
-/// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), and the events it
-/// waits for.
+/// go to the guest as the GPU reaches them or once it finishes ([`Signals`]), the events it
+/// waits for, and the decodes of its video encoders, whose sessions' events it waits for too.
 #[derive(Default)]
 struct EventOps {
     /// Each (shared event, value) the buffer signals, in stream order.
     signals: Finisher,
     /// Each (event, value) the buffer waits for, in stream order.
     waits: Vec<(u64, u64)>,
+    /// Whether each of its decodes' pictures landed: the buffer completes failed where one did
+    /// not ([`video::Landed`]).
+    landings: Vec<Arc<video::Landed>>,
 }
 
 /// A buffer's [`Signals`], made at its first signal of a shared event and held for its completion
@@ -203,7 +239,7 @@ impl Drop for Finisher {
 /// ([`RgfxEventSignalled`]). A signal the buffer runs more work after (an encoder, or a wait for
 /// an event: [`work_after`]) is posted by the platform's notification as the host's event reaches
 /// its value
-/// ([`notify_listener`](reims_vgpu_core::platform::event::SharedEvent::notify_listener)): where
+/// ([`notify_listener`](reims_vgpu_vulkan::core::platform::event::SharedEvent::notify_listener)): where
 /// the GPU gets to it in the buffer, as Metal's value and listeners move there (measured:
 /// docs/graphics-kext/dgpu-oracle.md, Q18). So a guest thread that waits on the CPU for it before
 /// it sets a value the buffer waits for later is released, where a post at the buffer's end would
@@ -253,8 +289,10 @@ impl Signals {
             && !*posted
         {
             *posted = true;
-            sink(event_signalled(*obj_id, *value));
-            fan_out.reached(*obj_id, *value);
+            sink(
+                event_signalled(*obj_id, *value),
+                fanned(fan_out, *obj_id, *value),
+            );
         }
     }
 
@@ -271,11 +309,21 @@ impl Signals {
         for (obj_id, value, posted) in signals {
             if !*posted {
                 *posted = true;
-                sink(event_signalled(*obj_id, *value));
-                fan_out.reached(*obj_id, *value);
+                sink(
+                    event_signalled(*obj_id, *value),
+                    fanned(fan_out, *obj_id, *value),
+                );
             }
         }
     }
+}
+
+/// What follows the post of shared event `obj_id`'s `value` to its own holder: its post to the
+/// other holders of the event's name through `fan_out`, once the guest's ring holds the holder's
+/// own, so no other process has a value before the process that signalled it.
+fn fanned(fan_out: &Arc<dyn FanOut>, obj_id: u64, value: u64) -> super::Then {
+    let fan_out = Arc::clone(fan_out);
+    Box::new(move || fan_out.reached(obj_id, value))
 }
 
 /// A command buffer's `CB_SUBMITTED`, posted once: by the first of the answer on a doorbell's
@@ -376,8 +424,9 @@ type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
 /// event on the host until its value is reached), and the buffers behind it on its queue with it.
 /// So such a buffer gets its `CB_SUBMITTED` at its take, as one that waits for nothing does, and
 /// its `CB_SCHEDULED` there too where it gets that, else at its commit; so does every buffer of
-/// its queue committed while one of them is not yet taken by the platform. A buffer that waits for an event, or for the host's fill of a device cache, or is
-/// behind one on its queue, keeps its records at its scheduling ([`Held`]).
+/// its queue committed while one of them is not yet taken by the platform. A buffer that waits for
+/// an event, or follows a deferred copy of a device cache, or is behind one on its queue, keeps
+/// its records at its scheduling ([`Held`]).
 ///
 /// The records of a queue go in its commit order: a buffer whose records go at its commit first
 /// posts those of every buffer committed before it on its queue not yet posted, whose order on the
@@ -390,6 +439,9 @@ type Records = (Option<Arc<Submitted>>, Arc<Scheduled>);
 pub(crate) struct Line {
     /// The committed buffers' records not seen posted, oldest first.
     line: Mutex<VecDeque<Records>>,
+    /// The begun buffers whose `CB_SCHEDULED` a waiting thread's ask may post ([`Askable`]),
+    /// oldest first, each until its record is posted, or it ends uncommitted.
+    asks: Mutex<VecDeque<Arc<Askable>>>,
     /// How many committed buffers of the queue that wait on the GPU for a buffer of another queue
     /// the platform has not yet taken.
     ordered: Arc<AtomicUsize>,
@@ -444,6 +496,36 @@ impl Line {
         line.push_back((submitted, scheduled));
     }
 
+    /// Notes `askable`, a buffer just begun whose `CB_SCHEDULED` an ask may post, last in the
+    /// queue's order; those at the front whose records went, or that ended uncommitted, leave
+    /// first. A queue's records are posted in its order, so its asks close in it, but for a buffer
+    /// that ends uncommitted, which leaves once those before it have: an ask of one that closed
+    /// does nothing, here or gone ([`Askable::ask`]). Only the front is looked at: the retain over
+    /// every open ask, which took each one's lock (and its record's) on every begin, took 0.47 µs
+    /// of a Super Resolution buffer's begin on the Iris Xe host (**measured** 2026-11-14, laps of
+    /// the begin, gpre m3-max-31335).
+    fn askable(&self, askable: Arc<Askable>) {
+        let mut asks = self.asks.lock();
+        while asks.front().is_some_and(|a| !a.open()) {
+            asks.pop_front();
+        }
+        asks.push_back(askable);
+    }
+
+    /// How many asks the queue keeps (for the tests).
+    #[cfg(test)]
+    fn asks_kept(&self) -> usize {
+        self.asks.lock().len()
+    }
+
+    /// The buffer at `seqno`, `cb_obj_id`, where an ask may still post its `CB_SCHEDULED`.
+    fn asked(&self, seqno: u64, cb_obj_id: u64) -> Option<Arc<Askable>> {
+        let asks = self.asks.lock();
+        (asks.iter())
+            .find(|a| a.seqno == seqno && a.cb_obj_id == cb_obj_id)
+            .cloned()
+    }
+
     /// Posts, in commit order, the records of every buffer up to and including `last` (one
     /// [`Self::committed`] noted), each `CB_SUBMITTED` ahead of its `CB_SCHEDULED`, and lets them
     /// leave. Posted at most once each, whoever posts them.
@@ -458,6 +540,85 @@ impl Line {
                 break;
             }
         }
+    }
+}
+
+/// A begun command buffer whose `CB_SCHEDULED` a thread of its process that waits for it to be
+/// scheduled may ask for (`SCHEDULED_ASK`, [`GraphicsDecoder::ask_scheduled`]): one that would get
+/// it at its take had it asked for its `CB_SUBMITTED` ([`Begun::askable`]). The ask posts it at
+/// once, its ticket in the commit order issued first and given back at its commit, as an answer at
+/// its take does: a buffer its process sends once the record is posted is committed after it.
+/// So a walk held on one of a process's queues holds up the process's other queues' commits only
+/// once a thread has asked to wait for it; until then the buffer keeps its record to its
+/// scheduling, holding none of them up.
+pub(crate) struct Askable {
+    /// Its message's seqno, and the guest's id of the buffer.
+    seqno: u64,
+    cb_obj_id: u64,
+    /// Its context, its ticket's.
+    context: Option<u32>,
+    /// Where it is.
+    state: Mutex<Asking>,
+}
+
+/// Where an [`Askable`] buffer is.
+enum Asking {
+    /// Begun and not yet committed, its record unposted.
+    Begun(Arc<Scheduled>),
+    /// Asked before its commit: its record posted, its ticket out until its commit. Nothing reads
+    /// the ticket: it is held for its drop, which gives it back to the commit order where
+    /// [`Askable::end`] leaves this state, at the buffer's commit or as it ends uncommitted.
+    Asked { _ticket: Option<Ticket> },
+    /// Committed before an ask: an ask posts its record at once, with no ticket, as its commit
+    /// already has its place.
+    Committed(Arc<Scheduled>),
+    /// Ended: asked and committed, or never committed (its stand-in's completion stands for its
+    /// record).
+    Ended,
+}
+
+impl Askable {
+    /// Whether an ask may still post its record, or it holds its ticket.
+    fn open(&self) -> bool {
+        match &*self.state.lock() {
+            Asking::Begun(_) | Asking::Asked { .. } => true,
+            Asking::Committed(scheduled) => !scheduled.is_posted(),
+            Asking::Ended => false,
+        }
+    }
+
+    /// A thread waits for it to be scheduled: before its commit, its ticket in the commit order
+    /// is issued, then its `CB_SCHEDULED` posted; after it, its record is posted. Once asked, or
+    /// once it ended, an ask does nothing.
+    fn ask(&self, sequencer: &Arc<super::sequencer::Sequencer>) {
+        let scheduled = {
+            let mut state = self.state.lock();
+            match std::mem::replace(&mut *state, Asking::Ended) {
+                Asking::Begun(scheduled) => {
+                    *state = Asking::Asked {
+                        _ticket: sequencer.issue(self.context, false),
+                    };
+                    scheduled
+                }
+                Asking::Committed(scheduled) => scheduled,
+                other => {
+                    *state = other;
+                    return;
+                }
+            }
+        };
+        scheduled.post();
+    }
+
+    /// Its commit is done (`committed`), or it ends uncommitted: a ticket an ask issued is given
+    /// back, and an ask from now on posts its record only where it was committed.
+    fn end(&self, committed: bool) {
+        let mut state = self.state.lock();
+        let ended = match std::mem::replace(&mut *state, Asking::Ended) {
+            Asking::Begun(scheduled) if committed => Asking::Committed(scheduled),
+            _ => Asking::Ended,
+        };
+        *state = ended;
     }
 }
 
@@ -508,6 +669,103 @@ struct Splitting {
     parts: Option<Arc<Parts>>,
     /// The platform keeps it whole from now on.
     whole: bool,
+}
+
+/// A chunk of a command buffer dealt to two threads, walked ([`GraphicsDecoder::walk_dealt`]).
+struct Walked<P: Platform> {
+    /// The command buffer it was walked into, apart from the walk's current one, with its place
+    /// among its queue's command buffers (none for the buffer's own, whose place goes on to its
+    /// last part); `None` where it was walked into the walk's current one.
+    cb: Option<(P::CommandBuffer, Option<InFlight>)>,
+    /// The walk's outcome.
+    outcome: RaiseResult<Result<(), DecodeError>>,
+    /// The blocks the walk saw written through textures over laid-out device caches or their
+    /// wide homes ([`GraphicsDecoder::reconcile_laid`]).
+    written: Vec<u64>,
+    /// From the hand-over to its walk's start.
+    began: Duration,
+    /// Its walk.
+    walk: Duration,
+}
+
+impl<P: Platform> Walked<P> {
+    /// Whether the whole chunk was carried out: no fault, and no stop at a malformed op.
+    fn walked(&self) -> bool {
+        matches!(self.outcome, Ok(Ok(())))
+    }
+}
+
+/// The part of a walk dealt to two threads that the platform keeps whole by how Metal's GPU
+/// fails it from one of its encoders on ([`PartCut::Fails`]), which every later chunk's command
+/// buffer is folded into ([`GraphicsDecoder::commit_dealt`]).
+enum Kept<P: Platform> {
+    /// None: each chunk is committed as a part.
+    No,
+    /// One apart from the walk's current command buffer.
+    Apart(P::CommandBuffer),
+    /// The walk's current command buffer.
+    Here,
+}
+
+/// A walk dealt to two threads, on the lane's thread ([`GraphicsDecoder::walk_dealt`]).
+struct Deal<'a, P: Platform> {
+    /// Its chunks, each a range of its op stream.
+    chunks: &'a [Range<usize>],
+    /// Which of them the helper walks ([`helper_chunks`]).
+    helper: &'a [bool],
+    /// The slots the helper publishes its chunks to.
+    slots: &'a Slots<Walked<P>>,
+    /// The helper's chunks, handed over.
+    hand: &'a Hand,
+    /// The command buffers of this thread's chunks after its first, each with its place among
+    /// its queue's command buffers, in their order.
+    ours: VecDeque<(P::CommandBuffer, InFlight)>,
+    /// Its queue's count of command buffers made and not completed ([`InFlight`]).
+    in_flight: Arc<AtomicUsize>,
+    /// This thread's chunks walked and not yet committed or folded, at their index.
+    own: Vec<Option<Walked<P>>>,
+    /// The next chunk to commit or fold.
+    next: usize,
+    /// The part kept whole, where one is.
+    kept: Kept<P>,
+    /// A part was committed.
+    parts_out: bool,
+    /// The place among its queue's command buffers of the walk's current one, but for the
+    /// buffer's own, whose place goes on to its last part.
+    place: Option<InFlight>,
+    /// When the helper's chunks were handed over.
+    handed: MonoTime,
+    /// Its queue, for the trace.
+    queue: u64,
+    /// Its message's seqno, for the trace.
+    seqno: u64,
+    /// What the trace gives of it.
+    stats: DealStats,
+}
+
+/// A chunk dealt to the helper ([`GraphicsDecoder::walk_chunks`]): its index among the buffer's,
+/// its ops among those handed over, and its command buffer with its place among its queue's.
+type Theirs<P> = (
+    usize,
+    Range<usize>,
+    (<P as Platform>::CommandBuffer, InFlight),
+);
+
+/// What a walk dealt to two threads took, which the trace gives (`cbpar`).
+#[derive(Default)]
+struct DealStats {
+    /// The helper's chunks were taken back.
+    back: bool,
+    /// This thread's walk of its chunks.
+    walk_here: Duration,
+    /// From the hand-over to the helper's walk of its first chunk.
+    helper_began: Option<Duration>,
+    /// The helper's walk of its chunks taken.
+    walk_helper: Duration,
+    /// This thread's waits for the helper's chunks.
+    waited: Duration,
+    /// The helper's chunks this thread waited for.
+    waits: u64,
 }
 
 /// The op stream of the `COMMAND_BUFFER` `message` whose fixed part is `m`: all of the message's
@@ -572,8 +830,9 @@ impl<P: Platform> Begun<P> {
     }
 
     /// Its `CB_SUBMITTED`, where it gets it at its take: it asks for one, waits for no event and
-    /// no fill of a device cache (a GPU wait for a buffer of another queue holds back nothing,
-    /// [`Line`]), and no buffer before it on its queue holds the queue. Any other gets it at its
+    /// follows no deferred copy of a device cache (a GPU wait for a buffer of another queue holds
+    /// back nothing, [`Line`], and nor does a fill made at its begin: it gets it before the
+    /// fill), and no buffer before it on its queue holds the queue. Any other gets it at its
     /// scheduling.
     pub(crate) fn submitted_at_take(&self) -> Option<&Arc<Submitted>> {
         (self.submitted.as_ref()).filter(|_| self.held.is_none() && !self.behind)
@@ -590,6 +849,16 @@ impl<P: Platform> Begun<P> {
     /// its process's other queues (`a_walk_held_in_a_draw_holds_up_no_other_queue`).
     fn scheduled_at_take(&self) -> Option<&Arc<Scheduled>> {
         (self.scheduled.as_ref()).filter(|_| self.first && self.submitted_at_take().is_some())
+    }
+
+    /// Its `CB_SCHEDULED`, where a thread that waits for it to be scheduled may ask for it there
+    /// and then (`SCHEDULED_ASK`, [`Askable`]): it would get it at its take had it asked for its
+    /// `CB_SUBMITTED` ([`Self::scheduled_at_take`]), and did not ask (one that did got it there,
+    /// or has a buffer before it on its queue that owes its own).
+    fn askable(&self) -> Option<&Arc<Scheduled>> {
+        (self.scheduled.as_ref())
+            .filter(|_| self.first && self.submitted.is_none())
+            .filter(|_| self.held.is_none() && !self.behind)
     }
 
     /// Whether it gets a record at its take ([`Self::post_at_take`]), so its ticket in the commit
@@ -693,8 +962,8 @@ fn submission_handler(
 }
 
 /// Whether the queue whose counts are `counts` is held, a buffer of it begun before that waits for
-/// an event and is not yet scheduled; and, where the buffer begun now `waits` for an event (the
-/// host's fill of a device cache among them), its own hold of the queue, counted from now, which
+/// an event and is not yet scheduled; and, where the buffer begun now `waits` for an event (a
+/// deferred copy of a device cache among them), its own hold of the queue, counted from now, which
 /// keeps it and the queue's later buffers from being submitted before it is scheduled, as Metal
 /// submits a queue's buffers in order. It is counted at the buffer's begin, not its commit, so a
 /// buffer of the queue begun before this one commits (its lane walks several at once,
@@ -775,6 +1044,10 @@ struct Take {
     commit_after: Vec<RgfxSurfaceOrderWait>,
     /// The stream holds a video encoder, whose session's work starts as it is walked.
     video: bool,
+    /// The stream holds a render, compute or blit encoder, or an op of one.
+    work: bool,
+    /// The luma and chroma textures of each of its decodes, in stream order.
+    decodes: Vec<(u64, u64)>,
 }
 
 /// Whether the op stream `ops` ends in a `SUBMITTED`, where the bundle puts it: appended as the
@@ -821,7 +1094,21 @@ fn take(mut ops: &[u8]) -> Take {
                 out.commit_after = Glance::order_waits(body).collect();
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => out.video = true,
-            _ => {}
+            RGFX_OP_ENCODER_BEGIN_RENDER
+            | RGFX_OP_ENCODER_BEGIN_COMPUTE
+            | RGFX_OP_ENCODER_BEGIN_BLIT => out.work = true,
+            // The device's diagnostic, read as it took the buffer: no work, and nothing taken.
+            RGFX_OP_GUEST_TIMES => {}
+            tag => match op_group(tag) {
+                RGFX_OP_GROUP_RENDER | RGFX_OP_GROUP_COMPUTE | RGFX_OP_GROUP_BLIT => {
+                    out.work = true;
+                }
+                RGFX_OP_GROUP_VIDEO => {
+                    let body = &ops[RGFX_OP_BODY_OFFSET as usize..len];
+                    out.decodes.extend(video::decode_textures(tag, body));
+                }
+                _ => {}
+            },
         }
         ops = &ops[len..];
     }
@@ -933,7 +1220,7 @@ pub(crate) struct Answered {
 
 impl<P: Platform> Decoders<P> {
     /// A `SURFACE_DOWNLOAD` of the block at `block` on a doorbell's thread, the guest's vCPU
-    /// (`reims_graphics::Host::surface_downloaded`): whether it is carried out already, its
+    /// (`reims_vgpu_graphics::Host::surface_downloaded`): whether it is carried out already, its
     /// `SURFACE_PAGES` settled ([`super::worker::Unsettled`]) and the caches answering it at once
     /// with nothing to copy and nothing to wait for ([`super::surface_cache`]), as
     /// [`super::GraphicsDecoder::try_surface_download`] would; each lock tried. Allocates and
@@ -1165,14 +1452,15 @@ fn makes_sample_count(caps: &DeviceCaps, count: u32) -> bool {
 
 impl<P: Platform> GraphicsDecoder<P> {
     /// Carries out one `COMMAND_BUFFER` message (`decode`'s
-    /// [`RGFX_CMD_COMMAND_BUFFER`](reims_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
+    /// [`RGFX_CMD_COMMAND_BUFFER`](reims_vgpu_graphics::wire::RGFX_CMD_COMMAND_BUFFER)
     /// arm): opens a command buffer on the named queue, walks the op stream, and
     /// commits with a completion handler, which holds `drain` (its context's) until it has run.
     /// The IOSurfaces whose device caches it uses (its `SURFACE_USE` ops) are filled first where
     /// they hold an older generation, and it signals its queue's end event for their later copies
     /// ([`super::surface_cache`]). A buffer that asks for its `CB_SUBMITTED` and waits for nothing
-    /// gets it before the walk, and its `CB_SCHEDULED` there too where none begun before it on its
-    /// queue owes its own ([`Begun::post_at_take`]); any other at its scheduling.
+    /// but fills made at its begin gets it before them and the walk, and its `CB_SCHEDULED` there
+    /// too where none begun before it on its queue owes its own ([`Begun::post_at_take`]); any
+    /// other at its scheduling.
     pub(super) fn decode_command_buffer(
         &self,
         device: &P::Device,
@@ -1183,10 +1471,10 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(begun) => begun,
             Err(e) => return Ok(Err(e)),
         };
-        // Submitted and scheduled at once where it asks, unless it waits (for an event, or for the
-        // host's fill of a device cache) or a buffer before it on its queue does: then at its
+        // Submitted and scheduled at once where it asks, unless it waits (for an event, or for a
+        // deferred copy of a device cache) or a buffer before it on its queue does: then at its
         // scheduling; and scheduled at its take only where no buffer before it on its queue owes
-        // its scheduling.
+        // its scheduling. Its begin posted them before its fills where it gets them here.
         // Its ticket in the commit order is issued first, so a buffer its process sends after the
         // answer is committed after this one ([`super::sequencer`]).
         if begun.posts_at_take() {
@@ -1204,6 +1492,29 @@ impl<P: Platform> GraphicsDecoder<P> {
             return;
         }
         *self.ticket.borrow_mut() = self.shared.sequencer.issue(self.context, false);
+    }
+
+    /// The command buffer is committed (`committed`), or its message ends with it uncommitted: an
+    /// ask of its `CB_SCHEDULED` gives its ticket back, and posts the record from now on only
+    /// where it was committed ([`Askable`]).
+    pub(super) fn end_ask(&self, committed: bool) {
+        if let Some(asked) = self.asked.borrow_mut().take() {
+            asked.end(committed);
+        }
+    }
+
+    /// A `SCHEDULED_ASK` on the ring of queue `queue_obj_id`, taken by its service thread: a
+    /// thread of the queue's process waits for the queue's command buffer `cb_obj_id`, at
+    /// `cb_seqno`, to be scheduled. Where an ask may post its `CB_SCHEDULED` ([`Askable`]), it
+    /// does, once its ticket in the commit order is issued where it is not yet committed; any
+    /// other buffer is scheduled as it would have been.
+    pub(crate) fn ask_scheduled(&self, queue_obj_id: u64, cb_seqno: u64, cb_obj_id: u64) {
+        let Some(counts) = self.queue_counts(queue_obj_id) else {
+            return;
+        };
+        if let Some(askable) = counts.line.asked(cb_seqno, cb_obj_id) {
+            askable.ask(&self.shared.sequencer);
+        }
     }
 
     /// The command buffer's turn in the lane of the queue whose counts are `counts`
@@ -1233,12 +1544,15 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// where it was answered there ([`Answered`]). A context closed before the buffer came gets
     /// [`DecodeError::ContextClosed`], with no turn taken; and where it gets its
     /// `CB_SUBMITTED` or its `CB_SCHEDULED` at its take, they are posted here, once its ticket in
-    /// the commit order is issued, unless the answer posted them ([`Begun::post_at_take`]).
+    /// the commit order is issued, unless the answer posted them ([`Begun::post_at_take`]). Where
+    /// the rest of its work goes to the lane (`to_lane`), the lane's idle thread is woken for it
+    /// once its turn is taken ([`Lane::expect`]), so it wakes during the rest of the begin.
     pub(crate) fn begin_taken(
         &mut self,
         device: &P::Device,
         message: &[u8],
         queue: Option<u64>,
+        to_lane: bool,
     ) -> RaiseResult<Result<Begun<P>, DecodeError>> {
         self.end_message();
         let drain = self.command_buffer_drain();
@@ -1256,6 +1570,9 @@ impl<P: Platform> GraphicsDecoder<P> {
                     self.scheduled_at_doorbell.set(answered.scheduled);
                 }
                 None => *self.turn.borrow_mut() = Self::turn_on(counts),
+            }
+            if to_lane && let Some(lane) = &counts.lane {
+                lane.expect();
             }
             // Its queue's commit marks rise to it, in its turn, whether it is committed, stood in
             // for or fails, however little of its message can be read ([`super::commit_order`]).
@@ -1279,10 +1596,21 @@ impl<P: Platform> GraphicsDecoder<P> {
     }
 
     /// Waits, with no lock held, for the turns in its queue's lane before the command buffer's
-    /// (one taken before it), where it has one ([`super::lane`]).
+    /// (one taken before it), where it has one ([`super::lane`]), as a wait of its lane's job
+    /// ([`Self::waiting`]).
     pub(crate) fn wait_turn(&self) {
         if let Some(turn) = self.turn.borrow().as_ref() {
-            turn.wait();
+            turn.lane().waiting(|| turn.wait());
+        }
+    }
+
+    /// Runs `wait`, a wait of the command buffer's for what is committed before it, where it has a
+    /// turn in its queue's lane as a wait of the lane's job ([`Lane::waiting`]): the lane starts
+    /// its next buffer's walk meanwhile.
+    fn waiting<R>(&self, wait: impl FnOnce() -> R) -> R {
+        match self.lane() {
+            Some(lane) => lane.waiting(wait),
+            None => wait(),
         }
     }
 
@@ -1314,6 +1642,15 @@ impl<P: Platform> GraphicsDecoder<P> {
         tickets && ranges
     }
 
+    /// How many idle threads of queue `queue`'s lane a job woke as it came, how many a begin woke
+    /// for a job about to come ([`Lane::expect`]), and how many wait for a job; `None` where the
+    /// queue has no lane (for the tests).
+    #[cfg(test)]
+    pub(crate) fn lane_wakes(&self, queue: u64) -> Option<(usize, usize, usize)> {
+        let lane = self.queue_counts(queue)?.lane.as_ref()?;
+        Some(lane.wakes())
+    }
+
     /// The lane of the command buffer's queue, where it was given a turn there.
     pub(crate) fn lane(&self) -> Option<Arc<Lane>> {
         self.turn
@@ -1333,8 +1670,10 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// command buffer on the named queue, readies the device caches its `SURFACE_USE` ops use
     /// (filling each that holds an older generation), has it wait on the GPU for the buffers of
     /// other queues its `SURFACE_ORDER` names that have not finished, and makes its
-    /// `CB_SUBMITTED` and, where it waits for an event or a fill, its hold of its queue
-    /// ([`Begun`]).
+    /// `CB_SUBMITTED` and, where it waits for an event or a deferred copy of a cache, its hold of
+    /// its queue ([`Begun`]); where it gets its records at its take, they are posted before its
+    /// fills, its ticket in the commit order issued first
+    /// ([`super::surface_cache::Caches::before_answering`]).
     pub(crate) fn begin_command_buffer(
         &self,
         device: &P::Device,
@@ -1344,6 +1683,12 @@ impl<P: Platform> GraphicsDecoder<P> {
         // The op stream follows the message's fixed part; `op_bytes` must count all of it.
         let parsed = read::<RgfxCommandBuffer>(message)
             .and_then(|m| ops_of(message, &m).map(|ops| (m, ops, take(ops))));
+        // Past a recovery of the device, its process's two-copy `Managed` textures have their GPU
+        // copies filled again first, before anything of the buffer reaches the platform
+        // ([`GraphicsDecoder::refill_managed`]).
+        if let Some((m, _, _)) = &parsed {
+            self.refill_managed(device, context_of(m.queue_obj_id));
+        }
         // The buffers of its process's other queues it is committed after, as its `COMMIT_ORDER`
         // names them ([`super::commit_order`]).
         if let Some((m, _, take)) = &parsed
@@ -1399,25 +1744,61 @@ impl<P: Platform> GraphicsDecoder<P> {
         for u in &take.uses {
             self.settle_surface(u.block_offset);
         }
-        let (fill_waits, uses) = (self.surface_caches).before(device, &cb, &take.uses)?;
-        // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
-        // off it (`surface_order`).
-        let order_waits = match &take.order {
-            Some(waits) => {
-                (self.shared.surface_order.lock()).before(device, m.queue_obj_id, &cb, waits)?
-            }
-            None => Vec::new(),
+        // What its work reaches of the caches beyond its uses: a decode's new output takes its
+        // first fill as met, where the buffer holds no other work ([`Reach`]).
+        let reach = Reach {
+            context: self.context,
+            work: take.work,
+            decoded: match take.work {
+                true => Vec::new(),
+                false => self.decoded_whole(&take.decodes),
+            },
         };
-        let waits_for_order = !order_waits.is_empty();
-        *self.order_waits.borrow_mut() = order_waits;
         let submitted = self.submitted(m.cb_obj_id, m.header.seqno, take.asks);
         // Owed by its queue from now until it is posted, after every buffer begun before it.
         let (scheduled, first) = self
             .scheduled(m.cb_obj_id, m.header.seqno, Some(&counts.line))
             .map_or((None, false), |(s, first)| (Some(s), first));
-        // Those GPU waits hold back none of its records, nor its queue ([`Line`]).
-        let (behind, held) = hold(counts, fill_waits || take.waits);
-        Ok(Ok(Begun {
+        // Where it gets its records at its take, they are posted before the fills its uses need,
+        // once its ticket in the commit order is issued: a fill the host makes at once waits for
+        // nothing of the guest's to come, so it holds back none of them, as a GPU wait for a
+        // buffer of another queue does not ([`Begun::submitted_at_take`]). Only a buffer that
+        // follows a deferred copy of a cache waits for buffers begun before it, which may wait
+        // for the guest; the caches answer no such buffer here.
+        let early = submitted.is_some() && !take.waits && counts.held.load(Ordering::Acquire) == 0;
+        let mut answer = || {
+            self.issue_ticket();
+            if let Some(submitted) = &submitted {
+                submitted.post();
+            }
+            if first && let Some(scheduled) = &scheduled {
+                scheduled.post();
+            }
+        };
+        let answer = early.then_some(&mut answer as &mut dyn FnMut());
+        let (_, follows, uses) =
+            (self.surface_caches).before_answering(device, &cb, &take.uses, &reach, answer)?;
+        // The buffers of other queues it runs after, on the GPU, kept for the work the host starts
+        // off it (`surface_order`).
+        let order_waits = match &take.order {
+            Some(waits) => {
+                let now = self.shared.platform.clock().now_mono();
+                (self.shared.surface_order.lock()).before(
+                    device,
+                    m.queue_obj_id,
+                    &cb,
+                    waits,
+                    now,
+                )?
+            }
+            None => Vec::new(),
+        };
+        let waits_for_order = !order_waits.is_empty();
+        *self.order_waits.borrow_mut() = order_waits;
+        // Those GPU waits hold back none of its records, nor its queue ([`Line`]), and nor do the
+        // fills of caches made at its begin: only an event's wait, or a deferred copy's, does.
+        let (behind, held) = hold(counts, follows || take.waits);
+        let begun = Begun {
             queue_obj_id: m.queue_obj_id,
             queue: (take.video && uses.is_some()).then(|| queue.clone_ref()),
             cb_obj_id: m.cb_obj_id,
@@ -1436,7 +1817,23 @@ impl<P: Platform> GraphicsDecoder<P> {
             behind,
             drain,
             ordered: take.video,
-        }))
+        };
+        // A thread of its process that waits for it to be scheduled may ask for its record from
+        // now, where it would have got it here had it asked for its `CB_SUBMITTED`.
+        if let Some(scheduled) = begun.askable() {
+            let askable = Arc::new(Askable {
+                seqno: m.header.seqno,
+                cb_obj_id: m.cb_obj_id,
+                context: self.context,
+                state: Mutex::new(Asking::Begun(Arc::clone(scheduled))),
+            });
+            counts.line.askable(Arc::clone(&askable));
+            *self.asked.borrow_mut() = Some(askable);
+        }
+        // cbbegun: queue, seqno: its begin is done, on the thread that began it (its queue's
+        // service thread), before its walk there or on its lane (`cenc`)
+        reims_vgpu_vulkan::core::trace::event("cbbegun", &[m.queue_obj_id, m.header.seqno]);
+        Ok(Ok(begun))
     }
 
     /// Finishes the `COMMAND_BUFFER` `message` that `begun` began: walks its op stream into its
@@ -1472,6 +1869,25 @@ impl<P: Platform> GraphicsDecoder<P> {
         let Some(ops) = read::<RgfxCommandBuffer>(message).and_then(|m| ops_of(message, &m)) else {
             return Ok(Err(DecodeError::Malformed));
         };
+        // cenc: queue, seqno, its op bytes, then its ops, encoders, dispatches, fence updates and
+        // fence waits ([`walk_counts`]): its walk's start, on the thread that walks it and commits
+        // it, whose `cbcommit`s up to its `cbwalked` are its parts'
+        if reims_vgpu_vulkan::core::trace::on() {
+            let [n, encoders, dispatches, updates, waits] = walk_counts(ops);
+            reims_vgpu_vulkan::core::trace::event(
+                "cenc",
+                &[
+                    queue_obj_id,
+                    seqno,
+                    ops.len().to_u64(),
+                    n,
+                    encoders,
+                    dispatches,
+                    updates,
+                    waits,
+                ],
+            );
+        }
         // A structural malformation in the stream stops the walk and is reported;
         // everything else faults the exec and propagates.
         let mut events = EventOps::default();
@@ -1492,7 +1908,23 @@ impl<P: Platform> GraphicsDecoder<P> {
                 whole: false,
             });
         let mut cb = cb;
-        if let Err(e) = self.walk_ops(ops, &mut cb, &mut events, &mut split)? {
+        // Dealt to two threads at once, where it may be cut and its queue holds room for a command
+        // buffer of each chunk but its first ([`super::split`], "Two threads at once").
+        let cuts = (split.as_ref())
+            .map(|s| TAKE_IN_FLIGHT_MAX.saturating_sub(s.in_flight.load(Ordering::Acquire)) + 1)
+            .and_then(|most| deal(ops, self.deal_min_bytes(), self.deal_chunk_bytes(), most));
+        let walked = match cuts {
+            Some(cuts) => self.walk_dealt(
+                ops,
+                &cuts,
+                (queue_obj_id, seqno),
+                &mut cb,
+                &mut events,
+                &mut split,
+            )?,
+            None => self.walk_ops(ops, &mut cb, &mut events, &mut split)?,
+        };
+        if let Err(e) = walked {
             return Ok(Err(e));
         }
         // Its parts' gate, held to its last commit, and their outcome, which its last part's
@@ -1556,26 +1988,32 @@ impl<P: Platform> GraphicsDecoder<P> {
         // its context whose parts are out, where its own are not ([`super::split`]).
         self.wait_to_commit();
         let under_way = match (&split_hold, self.context) {
-            (None, Some(context)) => Some(self.shared.split_gate.commit(context)),
+            (None, Some(context)) => Some(self.waiting(|| self.shared.split_gate.commit(context))),
             _ => None,
         };
         match uses {
             // Its end event signalled for the caches' later copies under their lock, committed
             // with it let go, still among their users, and then the early copies behind it on its
-            // queue ([`super::surface_cache::Caches::finish`]).
-            Some(uses) => self.surface_caches.finish(
-                device,
-                queue_obj_id,
-                queue.as_ref(),
-                &cb,
-                uses,
-                commit,
-            )?,
+            // queue ([`super::surface_cache::Caches::finish`]); the blocks its walk saw written
+            // through textures over laid-out caches or their wide homes told first.
+            Some(mut uses) => {
+                uses.saw_written(self.laid_written.borrow_mut().drain(..));
+                self.surface_caches.finish(
+                    device,
+                    queue_obj_id,
+                    queue.as_ref(),
+                    &cb,
+                    uses,
+                    commit,
+                )?
+            }
             None => commit()?,
         }
         // Committed: a buffer behind it in the commit order goes on, and so does its context's
-        // next commit and its range messages held while its parts were out.
+        // next commit and its range messages held while its parts were out; so does one sent
+        // after an ask's record ([`Askable`]).
         self.ticket.borrow_mut().take();
+        self.end_ask(true);
         drop((under_way, split_hold));
         // Last in its queue's order: its records, and those before it, go now where they go at
         // its commit.
@@ -1585,6 +2023,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                 line.post_through(&scheduled);
             }
         }
+        // cbwalked: queue, seqno: its walk and its last commit are done (`cenc`)
+        reims_vgpu_vulkan::core::trace::event("cbwalked", &[queue_obj_id, seqno]);
         Ok(Ok(()))
     }
 
@@ -1767,22 +2207,25 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// its queue taken before it ([`super::lane`]), every buffer of its context answered
     /// `CB_SUBMITTED` before its begin, and its context's range messages that came before its begin
     /// ([`super::sequencer`]); then after the buffers of its process's other queues its
-    /// `COMMIT_ORDER` names ([`super::commit_order`]).
+    /// `COMMIT_ORDER` names ([`super::commit_order`]); as a wait of its lane's job
+    /// ([`Self::waiting`]).
     fn wait_to_commit(&self) {
-        self.wait_turn();
-        let sequencer = &self.shared.sequencer;
-        if let Some(mark) = self.mark.get() {
-            sequencer.wait_for(self.context, mark);
-        }
-        if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
-            sequencer.wait_for_ranges(context, asked);
-        }
-        let after = std::mem::take(&mut *self.commit_after.borrow_mut());
-        if !after.is_empty() {
-            let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
-            let cancel = &self.shared.commit_cancel;
-            super::commit_order::wait(&after, own.as_deref(), cancel, Until::Committed);
-        }
+        self.waiting(|| {
+            self.wait_turn();
+            let sequencer = &self.shared.sequencer;
+            if let Some(mark) = self.mark.get() {
+                sequencer.wait_for(self.context, mark);
+            }
+            if let (Some(context), Some(Some(asked))) = (self.context, self.ranges.get()) {
+                sequencer.wait_for_ranges(context, asked);
+            }
+            let after = std::mem::take(&mut *self.commit_after.borrow_mut());
+            if !after.is_empty() {
+                let own = (self.committed.borrow().as_ref()).map(|(marks, _)| Arc::clone(marks));
+                let cancel = &self.shared.commit_cancel;
+                super::commit_order::wait(&after, own.as_deref(), cancel, Until::Committed);
+            }
+        });
     }
 
     /// The `CB_SCHEDULED` of command buffer `cb_obj_id`, at `seqno`, where there is a sink: posted
@@ -1819,7 +2262,8 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// `submitted` and its `scheduled`; then it posts the values the buffer signalled its shared
     /// events to that no notification posted ([`Signals::finish`]), then its completion, which
     /// for a `stand_in` ([`Self::stand_in_for_failed`]) is its failure whatever the stand-in's
-    /// outcome, and lets `drain` (its context's) go.
+    /// outcome, and for a buffer one of whose decodes' pictures did not land is its failure too
+    /// ([`cb_unlanded`]), and lets `drain` (its context's) go.
     fn completed_handler(
         &self,
         cb_obj_id: u64,
@@ -1832,6 +2276,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let sink = self.sinks.completion.clone();
         let context = self.context;
         let signals = events.signals;
+        let landings = events.landings;
         let watched = (!events.waits.is_empty()).then(|| {
             self.shared
                 .waits
@@ -1866,17 +2311,30 @@ impl<P: Platform> GraphicsDecoder<P> {
             // buffer that failed may have signalled them before its fault, and a guest waiting
             // for one would wait for good: each is posted whatever the outcome.
             signals.finish();
+            let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
             let record = if stand_in {
                 cb_failed(cb_obj_id, seqno)
+            } else if info.error.is_none() && landings.iter().any(|landed| landed.failed()) {
+                cb_unlanded(cb_obj_id, seqno, start, end)
             } else {
-                let (start, end) = info.gpu_times_ns.unwrap_or((0, 0));
                 cb_complete(cb_obj_id, seqno, start, end, info.error.as_ref())
             };
-            if let Some(sink) = &sink {
-                sink(record);
+            if let Some(error) = &info.error {
+                log::debug!(
+                    target: "reims_vgpu::graphics::completion",
+                    "command buffer {cb_obj_id:#x} (seqno {seqno}) failed: status {}, code {} \
+                     ({})",
+                    record.status,
+                    record.error_code,
+                    error.description
+                );
             }
-            // The buffer's work and its completion are done: a drain of its context may end.
-            drop(drain);
+            // The buffer's work and its completion are done: a drain of its context may end,
+            // once the record is on the guest's ring.
+            match &sink {
+                Some(sink) => sink(record, Box::new(move || drop(drain))),
+                None => drop(drain),
+            }
         })
     }
 
@@ -1951,6 +2409,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 *cb = next;
                 s.hold = Some(hold);
                 s.since = clock.now_mono();
+                self.note_part_cut();
             }
             None => {
                 // Kept whole: the handler just added sees the buffer's own completion, which
@@ -2003,12 +2462,541 @@ impl<P: Platform> GraphicsDecoder<P> {
         events: &mut EventOps,
         split: &mut Option<Splitting>,
     ) -> RaiseResult<Result<(), DecodeError>> {
+        self.walk_begins(ops);
+        self.walk_range(ops, cb, events, split)
+    }
+
+    /// What a command buffer's walk does once, before its first op, whatever ranges it is
+    /// walked in: finds the names of its op stream `ops` ([`Self::find_named`]), and forgets
+    /// what an earlier walk on the handle noted of laid-out device caches.
+    fn walk_begins(&self, ops: &[u8]) {
+        #[cfg(test)]
+        (self.shared.walks_begun).fetch_add(1, Ordering::Relaxed);
+        self.find_named(ops);
+        self.laid_uses.borrow_mut().clear();
+        self.laid_written.borrow_mut().clear();
+    }
+
+    /// [`Self::walk_ops`]' walk of `ops`, the whole of a command buffer's op stream or a range
+    /// of it that starts at an encoder's begin, after what it does once ([`Self::walk_begins`]).
+    fn walk_range(
+        &self,
+        ops: &[u8],
+        cb: &mut P::CommandBuffer,
+        events: &mut EventOps,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
         let mut encoder: Option<OpenEncoder<P>> = None;
         let walked = refusing(|| self.walk(ops, cb, &mut encoder, events, split));
         if let Some(open) = encoder.take() {
             end_abandoned(open);
         }
         walked
+    }
+
+    /// [`Self::walk_ops`] for a command buffer whose op stream `ops` is cut at `cuts` into chunks
+    /// dealt to two threads at once ([`super::split`], "Two threads at once"), `queue` and `seqno`
+    /// its queue and its message's, for the trace: this thread walks the first chunk and those
+    /// [`helper_chunks`] leaves it, and a helper ([`super::helpers`]) the others, each thread its
+    /// chunks in their order, handed over at once, on a handle of its own
+    /// ([`GraphicsDecoder::twin`]), each chunk into a command buffer of its own that the platform
+    /// makes on the buffer's queue before any is walked ([`CommandBuffer::part`]), each while the
+    /// queue holds room, the first chunk into `cb`; where the platform makes none, or the queue's
+    /// room runs out first, the buffer is walked as a whole is. After each of its own
+    /// chunks this thread commits every chunk walked, in their order, as a part
+    /// ([`CommandBuffer::commit_part`]), waiting for the helper only for the chunk it is to commit
+    /// next ([`Self::commit_dealt`]), so the GPU starts on each part while the rest is walked; the
+    /// last chunk's command buffer is `cb` from then on, the last part, which its handlers and
+    /// records go on. Chunks no helper started by the end of the first are taken back and walked
+    /// here, into `cb`, as a whole walk goes on. A walk that faults or stops in a chunk answers as
+    /// the first such chunk in their order does, nothing at or after it committed
+    /// ([`Self::first_fault`]). Each op is walked once, on one handle or the other.
+    fn walk_dealt(
+        &self,
+        ops: &[u8],
+        cuts: &[usize],
+        (queue, seqno): (u64, u64),
+        cb: &mut P::CommandBuffer,
+        events: &mut EventOps,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(in_flight) = split.as_ref().map(|s| Arc::clone(&s.in_flight)) else {
+            return self.walk_ops(ops, cb, events, split);
+        };
+        let ends = cuts.iter().copied().chain(std::iter::once(ops.len()));
+        let chunks: Vec<Range<usize>> = (std::iter::once(0).chain(cuts.iter().copied()))
+            .zip(ends)
+            .map(|(start, end)| start..end)
+            .collect();
+        let n = chunks.len();
+        // Every chunk's command buffer but the first's, made now from `cb`, which holds no op of
+        // the walk's, each with its place among its queue's command buffers: so the walk makes
+        // none while parts of it wait uncommitted, which the queue's room for command buffers
+        // would hold up for good where it is full. Each is made only while the queue holds room,
+        // as a cut's is ([`Self::split_here`]): [`deal`] took the room there was as it started,
+        // and other walks and begins make command buffers on the queue meanwhile.
+        let mut parts = Vec::with_capacity(n - 1);
+        for _ in 1..n {
+            let room = in_flight.load(Ordering::Acquire) < TAKE_IN_FLIGHT_MAX;
+            match if room { cb.part(ON)? } else { None } {
+                Some(part) => parts.push((part, InFlight::new(&in_flight))),
+                None => {
+                    drop(parts);
+                    return self.walk_ops(ops, cb, events, split);
+                }
+            }
+        }
+        let helper = helper_chunks(&chunks);
+        let (mut theirs, mut ours) = (Vec::new(), VecDeque::new());
+        for (i, part) in (1..n).zip(parts) {
+            if helper[i] {
+                theirs.push((i, part));
+            } else {
+                ours.push_back(part);
+            }
+        }
+        self.walk_begins(ops);
+        let slots = Slots::new(n);
+        let clock = self.shared.platform.clock();
+        let handed = clock.now_mono();
+        let job = {
+            // The helper's chunks, copied: a hand outlives no borrow of the message.
+            let mut bytes = Vec::with_capacity(ops.len() / 2 + 1);
+            let theirs: Vec<Theirs<P>> = (theirs.into_iter())
+                .map(|(i, part)| {
+                    let at = bytes.len();
+                    bytes.extend_from_slice(&ops[chunks[i].clone()]);
+                    (i, at..bytes.len(), part)
+                })
+                .collect();
+            let twin = self.twin();
+            let slots = Arc::clone(&slots);
+            // Part of this walk's entry, which waits for it ([`crate::entry::run_within`]).
+            move || {
+                crate::entry::run_within(|_| {
+                    let ending = slots.ending();
+                    twin.walk_chunks(&bytes, theirs, &slots, handed);
+                    drop((twin, ending));
+                });
+            }
+        };
+        let hand = self.shared.helpers.hand(Box::new(job));
+        #[cfg(test)]
+        if self.shared.helper_first.load(Ordering::Relaxed) {
+            hand.wait_started();
+        }
+        let mut deal = Deal {
+            chunks: &chunks,
+            helper: &helper,
+            slots: &slots,
+            hand: &hand,
+            ours,
+            in_flight,
+            own: (0..n).map(|_| None).collect(),
+            next: 0,
+            kept: Kept::No,
+            parts_out: false,
+            place: None,
+            handed,
+            queue,
+            seqno,
+            stats: DealStats::default(),
+        };
+        let walked = self.deal_here(ops, &mut deal, cb, events, split);
+        // The helper starts no chunk more, and its walk ends before this one's, which it is part
+        // of; one it never started is let go of here.
+        slots.stop_at(0);
+        match hand.take_back() {
+            Some(job) => drop(job),
+            None => hand.wait(),
+        }
+        let s = &deal.stats;
+        let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+        let bytes = |theirs: bool| -> u64 {
+            let dealt = chunks.iter().zip(&helper).filter(|(_, h)| **h == theirs);
+            dealt.map(|(c, _)| c.len()).sum::<usize>() as u64
+        };
+        // cbpar: queue, seqno, its chunks, the bytes of this thread's and of the helper's, 1
+        // where the helper's were taken back (else 0), this thread's walk of its chunks, the hand
+        // to the helper's start, the helper's walk of its chunks, this thread's waits for them and
+        // how many it waited for, and the hand to the walk's end, each in ns
+        reims_vgpu_vulkan::core::trace::event(
+            "cbpar",
+            &[
+                queue,
+                seqno,
+                n as u64,
+                bytes(false),
+                bytes(true),
+                u64::from(s.back),
+                ns(s.walk_here),
+                s.helper_began.map_or(0, ns),
+                ns(s.walk_helper),
+                ns(s.waited),
+                s.waits,
+                ns(clock.now_mono().saturating_duration_since(handed)),
+            ],
+        );
+        walked
+    }
+
+    /// [`Self::walk_dealt`] on this thread: its chunks walked, and every chunk committed or folded
+    /// in their order.
+    fn deal_here(
+        &self,
+        ops: &[u8],
+        deal: &mut Deal<'_, P>,
+        cb: &mut P::CommandBuffer,
+        events: &mut EventOps,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let n = deal.chunks.len();
+        let clock = self.shared.platform.clock();
+        for k in (0..n).filter(|&k| !deal.helper[k]) {
+            let began = clock.now_mono();
+            let outcome = self.walk_range(&ops[deal.chunks[k].clone()], cb, events, &mut None);
+            let walk = clock.now_mono().saturating_duration_since(began);
+            deal.stats.walk_here += walk;
+            // No helper took its chunks: they are walked here, as a whole walk goes on from the
+            // first chunk's last encoder's end, where it may cut a part; the command buffers made
+            // for the later chunks are let go of unused.
+            if k == 0
+                && let Some(job) = deal.hand.take_back()
+            {
+                drop(job);
+                deal.ours.clear();
+                deal.stats.back = true;
+                if let Err(e) = outcome? {
+                    return Ok(Err(e));
+                }
+                self.split_here(cb, split)?;
+                return self.walk_range(&ops[deal.chunks[1].start..], cb, events, split);
+            }
+            let walked = Walked {
+                cb: None,
+                outcome,
+                written: std::mem::take(&mut *self.laid_written.borrow_mut()),
+                began: began.saturating_duration_since(deal.handed),
+                walk,
+            };
+            if !walked.walked() {
+                return self.first_fault(k, walked, deal);
+            }
+            // This thread's next chunk goes into its own command buffer, `cb` from now on.
+            deal.own[k] = Some(match deal.ours.pop_front() {
+                Some((part, place)) => {
+                    let done = std::mem::replace(cb, part);
+                    let done_place = deal.place.replace(place);
+                    Walked {
+                        cb: Some((done, done_place)),
+                        ..walked
+                    }
+                }
+                None => walked,
+            });
+            let committed = self.commit_dealt(k, false, deal, cb, split)?;
+            if let Err(e) = committed {
+                return Ok(Err(e));
+            }
+        }
+        self.commit_dealt(n - 1, true, deal, cb, split)
+    }
+
+    /// A helper's walk of its chunks of a buffer dealt to two threads ([`Self::walk_dealt`]), on
+    /// the twin of the walk's handle: each of `chunks` (its index among the buffer's, its ops in
+    /// `bytes`, and its command buffer) walked, and published to its slot. It stops at a chunk it
+    /// may not start ([`Slots::starts`]), and after one whose walk faults or stops.
+    fn walk_chunks(
+        &self,
+        bytes: &[u8],
+        chunks: Vec<Theirs<P>>,
+        slots: &Slots<Walked<P>>,
+        handed: MonoTime,
+    ) {
+        let clock = self.shared.platform.clock();
+        for (at, range, (mut cb, place)) in chunks {
+            if !slots.starts(at) {
+                return;
+            }
+            let began = clock.now_mono();
+            let mut events = EventOps::default();
+            let outcome = self.walk_range(&bytes[range], &mut cb, &mut events, &mut None);
+            let walked = Walked {
+                cb: Some((cb, Some(place))),
+                outcome,
+                written: std::mem::take(&mut *self.laid_written.borrow_mut()),
+                began: began.saturating_duration_since(handed),
+                walk: clock.now_mono().saturating_duration_since(began),
+            };
+            let went_on = walked.walked();
+            slots.fill(at, walked);
+            if !went_on {
+                return;
+            }
+        }
+    }
+
+    /// Commits, as parts, each chunk of a walk dealt to two threads from its next one through
+    /// `through`, in their order ([`Self::walk_dealt`]), waiting for the helper's walk of one
+    /// only where it is next: where the gate of the buffer's context is held, or the buffer could
+    /// be committed now and its gate is free ([`Self::may_commit_now`], [`SplitGate::try_split`]);
+    /// else nothing, and the walk goes on, unless `end`, at the walk's end, where it waits to
+    /// commit as its commit would ([`Self::wait_to_commit`], [`SplitGate::split`]). The last chunk
+    /// is not committed: its command buffer is `cb` from then on, the buffer's last part. A part
+    /// the platform keeps whole only by how Metal's GPU fails it from one of its encoders on
+    /// ([`PartCut::Fails`]) is kept: every later chunk's command buffer is folded into it in
+    /// their order ([`CommandBuffer::fold`]), its encoders running nothing either way, and it is
+    /// `cb` at the end, its commit the whole's. One kept whole for a reason of [`KeptWhole`] fails
+    /// the buffer ([`kept_whole`]). The first chunk in their order whose walk faulted or stopped
+    /// answers for the walk, nothing at or after it committed. What each chunk's walk saw written
+    /// of laid-out device caches goes to the buffer's in their order.
+    ///
+    /// [`SplitGate::try_split`]: super::split::SplitGate::try_split
+    /// [`SplitGate::split`]: super::split::SplitGate::split
+    fn commit_dealt(
+        &self,
+        through: usize,
+        end: bool,
+        deal: &mut Deal<'_, P>,
+        cb: &mut P::CommandBuffer,
+        split: &mut Option<Splitting>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(s) = split.as_mut() else {
+            return Err(op_fault("a dealt command buffer may not be cut"));
+        };
+        let last = deal.chunks.len() - 1;
+        let clock = self.shared.platform.clock();
+        while deal.next <= through {
+            let j = deal.next;
+            // A part goes now where it could be committed now, as a cut does; at the walk's end,
+            // once every wait of its commit is met, holding its context's gate then.
+            if j < last && matches!(deal.kept, Kept::No) && s.hold.is_none() {
+                let now = (self.may_commit_now())
+                    .then(|| self.shared.split_gate.try_split(s.context))
+                    .flatten();
+                s.hold = match now {
+                    Some(hold) => Some(hold),
+                    None if end => {
+                        self.wait_to_commit();
+                        Some(self.waiting(|| self.shared.split_gate.split(s.context)))
+                    }
+                    None => return Ok(Ok(())),
+                };
+            }
+            let (chunk, waited) = match deal.own[j].take() {
+                Some(chunk) => (chunk, Duration::ZERO),
+                None => {
+                    let waiting = clock.now_mono();
+                    let (chunk, did) = deal.slots.wait_for(j);
+                    let waited = clock.now_mono().saturating_duration_since(waiting);
+                    deal.stats.waited += waited;
+                    deal.stats.waits += u64::from(did);
+                    #[cfg(test)]
+                    (self.shared.deal_waits).fetch_add(u64::from(did), Ordering::Relaxed);
+                    let Some(chunk) = chunk else {
+                        return Err(op_fault("a dealt chunk was walked by no helper"));
+                    };
+                    deal.stats.walk_helper += chunk.walk;
+                    deal.stats.helper_began = deal.stats.helper_began.or(Some(chunk.began));
+                    (chunk, waited)
+                }
+            };
+            let Walked {
+                cb: walked_into,
+                outcome,
+                written,
+                began,
+                walk,
+            } = chunk;
+            if let Err(e) = outcome? {
+                return Ok(Err(e));
+            }
+            deal.next = j + 1;
+            self.laid_written.borrow_mut().extend(written);
+            // cbdeal: queue, seqno, the chunk, 1 where the helper walked it (else 0), its op
+            // bytes, the hand to its walk's start, its walk, this thread's wait for it, and the
+            // hand to now, each in ns
+            let ns = |d: Duration| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX);
+            reims_vgpu_vulkan::core::trace::event(
+                "cbdeal",
+                &[
+                    deal.queue,
+                    deal.seqno,
+                    j as u64,
+                    u64::from(deal.helper[j]),
+                    deal.chunks[j].len() as u64,
+                    ns(began),
+                    ns(walk),
+                    ns(waited),
+                    ns(clock.now_mono().saturating_duration_since(deal.handed)),
+                ],
+            );
+            // Folded into the part kept whole, where one is; else the last part, or a part
+            // committed.
+            match (std::mem::replace(&mut deal.kept, Kept::No), walked_into) {
+                (Kept::Apart(whole), Some((later, _))) => {
+                    whole.fold(later);
+                    deal.kept = Kept::Apart(whole);
+                    continue;
+                }
+                (Kept::Apart(whole), None) => {
+                    let later = std::mem::replace(cb, whole);
+                    cb.fold(later);
+                    deal.place = None;
+                    deal.kept = Kept::Here;
+                    continue;
+                }
+                (Kept::Here, Some((later, _))) => {
+                    cb.fold(later);
+                    deal.kept = Kept::Here;
+                    continue;
+                }
+                (Kept::Here, None) => {
+                    return Err(op_fault(
+                        "a dealt chunk was walked into the part kept whole",
+                    ));
+                }
+                (Kept::No, walked_into) if j == last => {
+                    // The last part: its place is the buffer's.
+                    if let Some((part, _)) = walked_into {
+                        *cb = part;
+                    }
+                    deal.place = None;
+                    continue;
+                }
+                (Kept::No, walked_into) => {
+                    // A part, committed: one walked into `cb` is let go of once the last chunk's
+                    // command buffer takes its place there. The part's handler holds its place
+                    // among its queue's command buffers, or one of its own for the buffer's
+                    // first, whose place goes on to its last part.
+                    let (part, place) = match walked_into {
+                        Some((part, place)) => (Some(part), place),
+                        None => (None, deal.place.take()),
+                    };
+                    let place = place.unwrap_or_else(|| InFlight::new(&deal.in_flight));
+                    let parts = Arc::clone(s.parts.get_or_insert_with(Arc::default));
+                    let committing = part.as_ref().unwrap_or(&*cb);
+                    committing.add_completion_seen_handler(ON, parts.part_handler(place))?;
+                    match committing.commit_part(ON)? {
+                        PartCut::Cut => {
+                            deal.parts_out = true;
+                            self.note_part_cut();
+                        }
+                        PartCut::Fails => {
+                            // Kept whole, as a cut the platform refuses keeps it
+                            // ([`Self::split_here`]): the handler just added sees its completion,
+                            // and the gate stays held only where parts are out.
+                            s.whole = true;
+                            if !deal.parts_out {
+                                s.hold = None;
+                            }
+                            deal.kept = match part {
+                                Some(part) => Kept::Apart(part),
+                                None => Kept::Here,
+                            };
+                        }
+                        PartCut::Whole(reason) => return Err(kept_whole(reason)),
+                    }
+                }
+            }
+        }
+        Ok(Ok(()))
+    }
+
+    /// The answer of a walk dealt to two threads ([`Self::walk_dealt`]) whose chunk `at`, `fault`,
+    /// faulted or stopped: the first such chunk's in their order.
+    /// The helper starts no chunk from `at` on, and this thread waits for its walk of each chunk
+    /// before it not yet taken; nothing more is committed.
+    fn first_fault(
+        &self,
+        at: usize,
+        fault: Walked<P>,
+        deal: &Deal<'_, P>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        deal.slots.stop_at(at);
+        let before = deal.own.iter().enumerate().take(at).skip(deal.next);
+        for (j, _) in before.filter(|(_, own)| own.is_none()) {
+            match deal.slots.wait_for(j).0 {
+                Some(chunk) if !chunk.walked() => return chunk.outcome,
+                Some(_) => {}
+                None => return Err(op_fault("a dealt chunk was walked by no helper")),
+            }
+        }
+        fault.outcome
+    }
+
+    /// Finds the first [`NAMES_AT_ONCE`] objects of the current context the compute ops of the
+    /// command buffer's op stream `ops` name ([`each_named`]) in its view of the context's table,
+    /// where it has one, a few under each hold of the table's lock ([`View::find_all`]): the walk
+    /// then answers them from the view's names, as it would have found them as it reached them.
+    ///
+    /// [`View::find_all`]: super::tables::View::find_all
+    fn find_named(&self, ops: &[u8]) {
+        let Some(context) = self.context else {
+            return;
+        };
+        let views = self.views.borrow();
+        let Some(view) = views.iter().find(|v| v.context().id == context) else {
+            return;
+        };
+        let mut ids = [0u64; NAMES_AT_ONCE];
+        let mut n = 0;
+        each_named(ops, |id| {
+            if self.owned(id) {
+                ids[n] = id;
+                n += 1;
+            }
+            n < NAMES_AT_ONCE
+        });
+        view.find_all(ids[..n].iter().copied());
+    }
+
+    /// The writers' fence ([`super::surface_cache::Caches::writes_fence`]) where the encoder being
+    /// walked noted a use that may write a laid-out cache or its wide home ([`Self::note_laid`]),
+    /// for it to update as it ends; `None` where it noted none.
+    fn laid_writes_fence(&self, cb: &P::CommandBuffer) -> RaiseResult<Option<P::Fence>> {
+        if !self.laid_uses.borrow().iter().any(|u| u.writes) {
+            return Ok(None);
+        }
+        let Some(device) = cb.device() else {
+            return Ok(None);
+        };
+        self.surface_caches.writes_fence(&device)
+    }
+
+    /// The encoder just ended in `cb` wrote, through textures over the planes of laid-out device
+    /// caches or over their wide homes, the blocks its uses noted ([`Self::note_laid`]): each
+    /// side written is copied into the other in `cb` before the next encoder
+    /// ([`super::surface_cache::Caches::reconcile`]), so it reads the write through either, as
+    /// the Macs' next encoders read it (docs/graphics-kext/dgpu-oracle.md, Q37). An encoder that
+    /// wrote both sides of a block keeps the home's writes in the texels both hold.
+    fn reconcile_laid(&self, cb: &P::CommandBuffer) -> RaiseResult<()> {
+        let uses = std::mem::take(&mut *self.laid_uses.borrow_mut());
+        let mut written: Vec<(u64, bool)> = Vec::new();
+        for u in uses.iter().filter(|u| u.writes) {
+            match written.iter_mut().find(|(block, _)| *block == u.block) {
+                Some((_, from_home)) => *from_home |= u.wide,
+                None => written.push((u.block, u.wide)),
+            }
+        }
+        if written.is_empty() {
+            return Ok(());
+        }
+        let both = written.iter().any(|&(block, from_home)| {
+            from_home && uses.iter().any(|u| u.block == block && u.writes && !u.wide)
+        });
+        if both {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "an encoder may write an IOSurface through textures over its device cache laid \
+                 out at the GPU's pitch and over its wide home at once: the home's writes are kept \
+                 in the texels both hold"
+            );
+        }
+        self.laid_written
+            .borrow_mut()
+            .extend(written.iter().map(|&(block, _)| block));
+        self.surface_caches.reconcile(cb, &written)
     }
 
     /// [`Self::walk_ops`]'s walk, `encoder` the one it holds open, `split` where it may commit
@@ -2030,6 +3018,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             match op_group(tag) {
                 RGFX_OP_GROUP_FRAMING => {
                     self.framing_op((tag, body, &ops[len..]), cb, encoder, events)?;
+                    if tag == RGFX_OP_ENCODER_END {
+                        self.reconcile_laid(cb)?;
+                    }
                     if tag == RGFX_OP_ENCODER_END && len < ops.len() {
                         self.split_here(cb, split)?;
                     }
@@ -2079,7 +3070,8 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(OpenEncoder::Video(session)) = encoder.as_ref() else {
                         return Err(no_encoder(tag, "video"));
                     };
-                    match video::decode_op(tag, body, self, session.session(), cb) {
+                    let landings = &mut events.landings;
+                    match video::decode_op(tag, body, self, session.session(), cb, landings) {
                         Ok(true) => {}
                         Ok(false) => return Err(unknown_op(tag)),
                         Err(raise) => contain(raise)?,
@@ -2241,6 +3233,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         match tag {
             RGFX_OP_ENCODER_BEGIN_RENDER => {
                 already_open(encoder, "ENCODER_BEGIN_RENDER")?;
+                self.laid_blit.set(false);
                 let built = self.build_render_pass(body, |count| {
                     cb.device()
                         .is_some_and(|d| makes_sample_count(&d.caps(), count))
@@ -2262,6 +3255,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_COMPUTE => {
                 already_open(encoder, "ENCODER_BEGIN_COMPUTE")?;
+                self.laid_blit.set(false);
                 let desc = compute_pass(body)?;
                 let enc = cb
                     .compute_encoder_for_pass(&desc)?
@@ -2270,6 +3264,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_BLIT => {
                 already_open(encoder, "ENCODER_BEGIN_BLIT")?;
+                self.laid_blit.set(true);
                 let enc = cb
                     .blit_encoder(ON)?
                     .ok_or_else(|| op_fault("the blit encoder was nil"))?;
@@ -2277,6 +3272,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             RGFX_OP_ENCODER_BEGIN_VIDEO => {
                 already_open(encoder, "ENCODER_BEGIN_VIDEO")?;
+                self.laid_blit.set(false);
                 let pass = RgfxOpVideoPass::read_from_prefix(body)
                     .map(|(pass, _)| pass)
                     .map_err(|_| op_fault("ENCODER_BEGIN_VIDEO: body too short"))?;
@@ -2289,13 +3285,44 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Err(raise) => return Err(raise),
                 });
             }
-            RGFX_OP_ENCODER_END => match encoder.take() {
-                Some(OpenEncoder::Render(enc, _)) => enc.encode(ON, RenderCmd::EndEncoding)?,
-                Some(OpenEncoder::Compute(enc, _)) => enc.encode(ON, ComputeCmd::EndEncoding)?,
-                Some(OpenEncoder::Blit(enc)) => enc.encode(ON, BlitCmd::EndEncoding)?,
-                Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) => {}
-                None => return Err(op_fault("ENCODER_END with no open encoder")),
-            },
+            RGFX_OP_ENCODER_END => {
+                // An encoder that may have written a laid-out cache or its wide home updates the
+                // writers' fence as it ends, which the copies of its writes into the other side
+                // wait for ([`Self::reconcile_laid`]).
+                let fence = match encoder {
+                    Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) | None => None,
+                    Some(_) => self.laid_writes_fence(cb)?,
+                };
+                let fence = fence.as_ref();
+                match encoder.take() {
+                    Some(OpenEncoder::Render(enc, _)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(
+                                ON,
+                                RenderCmd::UpdateFence {
+                                    fence,
+                                    stages: RENDER_STAGE_FRAGMENT,
+                                },
+                            )?;
+                        }
+                        enc.encode(ON, RenderCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Compute(enc, _)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(ON, ComputeCmd::UpdateFence { fence })?;
+                        }
+                        enc.encode(ON, ComputeCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Blit(enc)) => {
+                        if let Some(fence) = fence {
+                            enc.encode(ON, BlitCmd::UpdateFence { fence })?;
+                        }
+                        enc.encode(ON, BlitCmd::EndEncoding)?;
+                    }
+                    Some(OpenEncoder::Video(_) | OpenEncoder::Skipped(_)) => {}
+                    None => return Err(op_fault("ENCODER_END with no open encoder")),
+                }
+            }
             RGFX_OP_SIGNAL_EVENT | RGFX_OP_WAIT_EVENT => {
                 let signal = tag == RGFX_OP_SIGNAL_EVENT;
                 let name = if signal { "SIGNAL_EVENT" } else { "WAIT_EVENT" };
@@ -2332,11 +3359,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                     events.waits.push((op.event_obj_id, op.value));
                 }
             }
-            // Carried out before the walk, wherever they lie ([`take`]).
+            // Carried out before the walk, wherever they lie ([`take`]); the guest's times are
+            // the device's, read as it took the buffer.
             RGFX_OP_SURFACE_USE
             | RGFX_OP_SUBMITTED
             | RGFX_OP_SURFACE_ORDER
-            | RGFX_OP_COMMIT_ORDER => {}
+            | RGFX_OP_COMMIT_ORDER
+            | RGFX_OP_GUEST_TIMES => {}
             _ => return Err(unknown_op(tag)),
         }
         Ok(())
@@ -2344,9 +3373,9 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Builds a `P::RenderPassDescriptor` from an `ENCODER_BEGIN_RENDER` op's body
     /// (an [`RgfxRenderPassDesc`] then its `color_count`
-    /// [`RgfxRenderPassColorAttachment`] records, then its sample positions and its visibility
-    /// result buffer where its flags say so), with what the pass's render ops' checks read of
-    /// it. A body too short faults; a reference to a texture or a buffer the host does not
+    /// [`RgfxRenderPassColorAttachment`] records, then its sample positions, its visibility
+    /// result buffer and its rasterization rate map where its flags say so), with what the pass's
+    /// render ops' checks read of it. A body too short faults; a reference to a texture or a buffer the host does not
     /// hold faults through the resolution API; and so do sample positions Metal does not take
     /// ([`sample_positions_taken`]), of which `makes` answers whether the device makes textures
     /// of their count, and so does a visibility result type Metal does not define.
@@ -2388,6 +3417,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             let tex = self.require_texture(a.texture_obj_id)?;
             let resolve = self.get_texture(a.resolve_texture_obj_id)?;
+            // The pass may write each attachment, and each resolve texture.
+            self.texture_written(a.texture_obj_id);
+            self.texture_written(a.resolve_texture_obj_id);
             let aset = ColorAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -2453,12 +3485,28 @@ impl<P: Platform> GraphicsDecoder<P> {
                 visibility_result_type: Some(u64::from(v.result_type)),
                 ..PassSet::default()
             });
+            off += size_of::<RgfxRenderPassVisibility>();
+        }
+        if desc.flags & RGFX_PASS_FLAG_RATE_MAP != 0 {
+            let r = body
+                .get(off..off + size_of::<RgfxRenderPassRateMap>())
+                .and_then(|s| RgfxRenderPassRateMap::read_from_bytes(s).ok())
+                .ok_or_else(|| {
+                    op_fault("ENCODER_BEGIN_RENDER: no whole rasterization rate map record")
+                })?;
+            let map = self.require_rate_map(r.map_obj_id)?;
+            pass.set_pass(&PassSet {
+                rasterization_rate_map: Some(Some(map)),
+                ..PassSet::default()
+            });
         }
 
         if desc.depth.texture_obj_id != 0 {
             let d = &desc.depth;
             let tex = self.require_texture(d.texture_obj_id)?;
             let resolve = self.get_texture(d.resolve_texture_obj_id)?;
+            self.texture_written(d.texture_obj_id);
+            self.texture_written(d.resolve_texture_obj_id);
             let dset = DepthAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -2481,6 +3529,8 @@ impl<P: Platform> GraphicsDecoder<P> {
             let s = &desc.stencil;
             let tex = self.require_texture(s.texture_obj_id)?;
             let resolve = self.get_texture(s.resolve_texture_obj_id)?;
+            self.texture_written(s.texture_obj_id);
+            self.texture_written(s.resolve_texture_obj_id);
             let sset = StencilAttachmentSet {
                 texture: Some(Some(tex)),
                 resolve_texture: resolve.map(Some),
@@ -2566,6 +3616,199 @@ fn next_op(ops: &[u8]) -> Option<(u16, &[u8], usize)> {
     Some((h.tag, &ops[RGFX_OP_BODY_OFFSET as usize..len], len))
 }
 
+/// The degradation a command buffer dealt to two threads counts where the platform keeps it
+/// whole at a chunk's end for a reason of [`KeptWhole`] ([`kept_whole`]).
+pub(super) const KEPT_WHOLE: &str = "two-ranges-kept-whole";
+
+/// Whether this process logged a buffer kept whole for each reason of [`KeptWhole::ALL`], at the
+/// reason's place there: the line is logged the first time alone, the rest counted
+/// ([`KEPT_WHOLE`], docs/conventions.md).
+static KEPT_WHOLE_LOGGED: [AtomicBool; KeptWhole::ALL.len()] =
+    [const { AtomicBool::new(false) }; KeptWhole::ALL.len()];
+
+/// The fault of a command buffer dealt to two threads ([`GraphicsDecoder::walk_dealt`]) that
+/// the platform keeps whole at a chunk's end for `reason`, no encoder failing it: its later chunks
+/// were walked into other command buffers, which then run nothing, so the buffer fails at its
+/// stand-in, where a walk of it whole would not. [`deal`] takes no buffer with an op that sets
+/// any [`KeptWhole`] reason, and its tests pin the two lists together; so it is not reached, and
+/// where it is, it shows: counted as a degradation ([`KEPT_WHOLE`]) and logged once per reason
+/// (docs/conventions.md). It fails the buffer rather than walk its later chunks again.
+fn kept_whole(reason: KeptWhole) -> Raise {
+    reims_vgpu_vulkan::answer::count_kind(KEPT_WHOLE);
+    let at = KeptWhole::ALL
+        .iter()
+        .position(|&r| r == reason)
+        .unwrap_or(0);
+    if !KEPT_WHOLE_LOGGED[at].swap(true, Ordering::Relaxed) {
+        log::error!(
+            target: "reims_vgpu::graphics", kind:% = reason.code();
+            "a command buffer dealt to two threads was kept whole at a chunk's end ({}), no \
+             encoder failing it: it fails, its later chunks being in other command buffers; the \
+             deal's choice of buffers lets in an op that keeps one whole (logged once per \
+             reason, counted as {KEPT_WHOLE})",
+            reason.code()
+        );
+    }
+    op_fault(format_args!(
+        "the platform kept a command buffer dealt to two threads whole at a chunk's end ({}): \
+         its later chunks are in other command buffers",
+        reason.code()
+    ))
+}
+
+/// The least op bytes of a command buffer dealt to two threads at once ([`deal`]): one of fewer
+/// walks in a fraction of a millisecond, as long as handing chunks over takes on the walk's
+/// thread and the helper's wake.
+pub(super) const DEAL_MIN_BYTES: usize = 16 * 1024;
+
+/// The least encoders of a command buffer dealt to two threads at once ([`deal`]): the runtime's
+/// costs a buffer is cut for come by the encoder (its pass ends, [`super::split`]).
+pub(super) const DEAL_MIN_ENCODERS: usize = 8;
+
+/// The op bytes of a chunk dealt to a thread, at least ([`deal`]): each chunk is a part, which
+/// the GPU runs while the walk goes on, and the last one's GPU work is left at the walk's end.
+/// WindowServer's frame in Launchpad's open view holds about 125 KiB of ops (m3-max-31226),
+/// walked in 14.8 ms on one thread (m3-max-31216; an RTX 3090 host, every driver listed,
+/// measured): so about 31 chunks of about 0.5 ms of walk each, near the 36 parts its walk on one
+/// thread cut of it (m3-max-30753, [`super::split::SPLIT_AFTER`]).
+pub(super) const DEAL_CHUNK_BYTES: usize = 4 * 1024;
+
+/// Where a command buffer's op stream `ops` is cut into chunks dealt to two threads at once
+/// ([`super::split`], "Two threads at once"): at the end of each encoder, before the stream's
+/// last op, that ends `chunk_bytes` of ops after the last cut or more (a `most`th of the stream,
+/// where that is more), into `most` chunks at most; where it holds [`DEAL_MIN_ENCODERS`]
+/// encoders and `min_bytes` of ops at least, every one of them a render or blit encoder or an op
+/// the walk reads before it starts (`SURFACE_USE`, `SUBMITTED`, `SURFACE_ORDER`,
+/// `COMMIT_ORDER`, `GUEST_TIMES`), and none of them a pass of a rasterization rate map, an
+/// indirect command buffer's execution, reset, copy or optimization, or a residency of resources
+/// (`useResource:`, which may name an indirect command buffer): what each of those does keeps the
+/// platform's progress of the command buffer, or commands read at its commit, which keep it whole
+/// (the Vulkan platform's `CommandBufferObject::splits`). So no event's signal or wait, compute or
+/// video encoder, rate map or indirect command buffer lies in any chunk, and the platform cuts
+/// the buffer at each chunk's end, or keeps it whole only where it fails from an encoder in it
+/// on ([`PartCut`]). `None` otherwise, and for a stream that does not parse, which the walk then
+/// faults at. Reads each op's header, and a render pass's flags; a stream shorter than
+/// `min_bytes` is not read.
+fn deal(ops: &[u8], min_bytes: usize, chunk_bytes: usize, most: usize) -> Option<Vec<usize>> {
+    if ops.len() < min_bytes || most < 2 {
+        return None;
+    }
+    let each = chunk_bytes.max(ops.len() / most);
+    let (mut at, mut encoders, mut from) = (0, 0, 0);
+    let mut cuts = Vec::new();
+    while at < ops.len() {
+        let (tag, body, len) = next_op(&ops[at..])?;
+        match tag {
+            RGFX_OP_ENCODER_BEGIN_RENDER => {
+                let pass = read::<RgfxRenderPassDesc>(body)?;
+                if pass.flags & RGFX_PASS_FLAG_RATE_MAP != 0 {
+                    return None;
+                }
+                encoders += 1;
+            }
+            RGFX_OP_ENCODER_BEGIN_BLIT => encoders += 1,
+            RGFX_OP_ENCODER_END => {
+                let end = at + len;
+                if end < ops.len() && end - from >= each && cuts.len() + 1 < most {
+                    cuts.push(end);
+                    from = end;
+                }
+            }
+            RGFX_OP_SURFACE_USE
+            | RGFX_OP_SUBMITTED
+            | RGFX_OP_SURFACE_ORDER
+            | RGFX_OP_COMMIT_ORDER
+            | RGFX_OP_GUEST_TIMES => {}
+            RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER
+            | RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT
+            | RGFX_OP_RENDER_USE_RESOURCES
+            | RGFX_OP_RENDER_USE_RESOURCES_STAGES
+            | RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER
+            | RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER
+            | RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER => return None,
+            tag if matches!(op_group(tag), RGFX_OP_GROUP_RENDER | RGFX_OP_GROUP_BLIT) => {}
+            _ => return None,
+        }
+        at += len;
+    }
+    (!cuts.is_empty() && encoders >= DEAL_MIN_ENCODERS).then_some(cuts)
+}
+
+/// Which of the `chunks` of a command buffer dealt to two threads at once the helper walks
+/// ([`super::split`], "Two threads at once"), `true` at each of the helper's. The first chunk is
+/// the lane's thread's, walked into the buffer's own command buffer. The others go the longest
+/// first (by their op bytes, as far as the stream tells a walk's length), each to the thread
+/// dealt fewer bytes so far, the lane's thread on a tie: so the longest chunk starts as the walk
+/// starts, on whichever thread is free, and chunks of one length go in turn, the odd ones to the
+/// helper. Each thread walks its chunks in their order, and they are committed in their order
+/// whichever thread walked them, so only when the walk ends moves.
+///
+/// Dealt in turn, Unigine Heaven's frame buffer (five chunks of 161, 135, 471, 51 and under 1 KiB)
+/// had the lane's thread walk its 471 KiB pass, 12 to 15 ms, only after the 6 ms first chunk,
+/// while the helper walked the second and fourth and then waited: the run's 10,022 dealt walks
+/// took 15.3 ms from the hand-over to the walk's end at the median and 25.3 ms at the 90th
+/// percentile (1920 x 1080, an RX 7900 XTX host, m3-max-32395; measured). From the chunk walks the
+/// trace gave, the turns end the walks in 12.6 and 22.7 ms, and this deal in 9.7 and 16.4 ms
+/// (modelled). WindowServer's composite of the app's window waits for the app's frame, which its
+/// commit order holds until that walk ends.
+fn helper_chunks(chunks: &[Range<usize>]) -> Vec<bool> {
+    let mut helper = vec![false; chunks.len()];
+    let mut longest_first: Vec<usize> = (1..chunks.len()).collect();
+    longest_first.sort_by_key(|&i| std::cmp::Reverse(chunks[i].len()));
+    let (mut here, mut there) = (chunks.first().map_or(0, |c| c.len()), 0);
+    for i in longest_first {
+        if there < here {
+            helper[i] = true;
+            there += chunks[i].len();
+        } else {
+            here += chunks[i].len();
+        }
+    }
+    helper
+}
+
+/// What the trace's `cenc` counts of a command buffer's op stream `ops`, read only while the
+/// trace is on: its ops, its encoders (their ends), its dispatches ([`compute::dispatches`]), and
+/// its fence updates and fence waits, of every encoder kind.
+fn walk_counts(mut ops: &[u8]) -> [u64; 5] {
+    let mut counts = [0u64; 5];
+    while let Some((tag, _, len)) = next_op(ops) {
+        counts[0] += 1;
+        match tag {
+            RGFX_OP_ENCODER_END => counts[1] += 1,
+            RGFX_OP_COMPUTE_UPDATE_FENCE
+            | RGFX_OP_RENDER_UPDATE_FENCE
+            | RGFX_OP_BLIT_UPDATE_FENCE => {
+                counts[3] += 1;
+            }
+            RGFX_OP_COMPUTE_WAIT_FOR_FENCE
+            | RGFX_OP_RENDER_WAIT_FOR_FENCE
+            | RGFX_OP_BLIT_WAIT_FOR_FENCE => counts[4] += 1,
+            tag if op_group(tag) == RGFX_OP_GROUP_COMPUTE && compute::dispatches(tag) => {
+                counts[2] += 1;
+            }
+            _ => {}
+        }
+        ops = &ops[len..];
+    }
+    counts
+}
+
+/// Calls `found` with each object id (not nil) the compute ops of the op stream `ops` name, read
+/// as the walk reads them ([`next_op`], [`compute::names`]), in stream order, until it answers
+/// false, the stream ends or is malformed, or a compute op's body is too short for what it names
+/// or its tag is one the walk does not decode: where the walk faults, if it gets there.
+fn each_named(mut ops: &[u8], mut found: impl FnMut(u64) -> bool) {
+    while let Some((tag, body, len)) = next_op(ops) {
+        if op_group(tag) == RGFX_OP_GROUP_COMPUTE
+            && compute::names(tag, body, &mut found) != Some(true)
+        {
+            return;
+        }
+        ops = &ops[len..];
+    }
+}
+
 /// The most draws [`Draws`] holds before it sends them.
 pub(super) const DRAWS_HELD: usize = 32;
 
@@ -2647,7 +3890,7 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::ops::render::{
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_INDEXED_PRIMITIVES, RGFX_OP_RENDER_DRAW_PRIMITIVES,
         RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
         RGFX_OP_RENDER_SET_SCISSOR_RECT, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
@@ -2656,31 +3899,37 @@ mod tests {
         RgfxOpSetRenderPipelineState, RgfxOpSetScissorRect, RgfxOpSetVertexBuffer,
         RgfxOpSetViewport, RgfxOpSetVisibilityResultMode,
     };
-    use reims_graphics::ops::video::{
+    use reims_vgpu_graphics::ops::video::{
         RGFX_OP_VIDEO_DECODE_H264, RGFX_OP_VIDEO_DECODE_H265, RgfxVideoOpDecodeH264,
         RgfxVideoOpDecodeH265,
     };
-    use reims_graphics::wire::{
-        RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE,
-        RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-        RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_VIDEO_SESSION_CREATE,
-        RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS, RGFX_VIDEO_CODEC_H264,
-        RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxBufferCreate, RgfxCbComplete,
-        RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-        RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
+    use reims_vgpu_graphics::wire::{
+        RGFX_CB_INTERNAL, RGFX_CB_OK, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER,
+        RGFX_CMD_EVENT_CREATE, RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE,
+        RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+        RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_EVT_CB_COMPLETE, RGFX_SURFACE_NO_WRITERS,
+        RGFX_VIDEO_CODEC_H264, RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE, RgfxBufferCreate,
+        RgfxCbComplete, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
+        RgfxSharedEventSetValue, RgfxTextureCreate, RgfxTextureDescriptor,
+        RgfxTextureFromIOSurface, RgfxVideoSessionCreate,
     };
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor;
-    use reims_vgpu_core::platform::values::AttachmentState;
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::Step;
-    use reims_vgpu_core::testkit::calllog::Arg;
-    use reims_vgpu_core::testkit::objects::CompleteOn;
+    use reims_vgpu_video::core::device_memory::MemoryIdentity;
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::platform::ObjId;
+    use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor;
+    use reims_vgpu_vulkan::core::platform::values::AttachmentState;
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::HeldCall;
+    use reims_vgpu_vulkan::core::testkit::Step;
+    use reims_vgpu_vulkan::core::testkit::calllog::Arg;
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
     use zerocopy::IntoBytes;
 
     use super::super::split::SPLIT_AFTER;
-    use super::super::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+    use super::super::{
+        Decoded, GraphicsVideo, GraphicsVideoSession, Landed, VideoDecode, VideoPlane, no_raise,
+    };
     use super::*;
 
     /// One op: its header then its body, `len` the whole op.
@@ -2699,11 +3948,16 @@ mod tests {
     /// A fresh decoder with a queue (id 1), two buffers (2 vertex, 3 index) and two
     /// textures (4 colour attachment, 5 fragment) already created.
     fn setup() -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
+        setup_over(0x10000)
+    }
+
+    /// [`setup`], over a region of `size` bytes.
+    fn setup_over(size: usize) -> (Arc<FakePlatform>, GraphicsDecoder<FakePlatform>) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(size).unwrap()),
         );
 
         let queue = RgfxQueueCreate {
@@ -3097,6 +4351,8 @@ mod tests {
     /// A decode a fake host's video was handed: its session's codec, its access unit (offset,
     /// size), its parameter sets and its planes (offset, bytes per row, width, height).
     type SeenDecode = (u32, u64, u64, Vec<u8>, [u64; 4], [u64; 4]);
+    /// A plane's memory: its identity, where the plane's buffer lies in it, and its bytes.
+    type SeenPages = [Option<(MemoryIdentity, u64, usize)>; 2];
 
     /// What a fake host's video was handed: each decode, whether each of its planes was in a
     /// device cache, and the thread each of its sessions ended on.
@@ -3104,7 +4360,14 @@ mod tests {
     struct VideoSeen {
         decodes: Mutex<Vec<SeenDecode>>,
         cached: Mutex<Vec<[bool; 2]>>,
+        /// Each plane's memory: its identity, where the plane's buffer lies in it, and its bytes.
+        pages: Mutex<Vec<SeenPages>>,
+        output_rows: Mutex<Vec<u32>>,
         ended_on: Mutex<Vec<Option<String>>>,
+        /// Each decode's picture fails to land, as its session finds once the decode ran.
+        unlanded: std::sync::atomic::AtomicBool,
+        /// Each decode answers no picture, as for one the stream's random access skips.
+        skipped: std::sync::atomic::AtomicBool,
     }
 
     /// A fake host's video of H.264 and HEVC decode, recording into its [`VideoSeen`]; each of
@@ -3120,7 +4383,7 @@ mod tests {
     }
 
     impl GraphicsVideo<FakePlatform> for FakeVideo {
-        fn caps(&self) -> Vec<reims_graphics::wire::RgfxVideoCodecCaps> {
+        fn caps(&self) -> Vec<reims_vgpu_graphics::wire::RgfxVideoCodecCaps> {
             Vec::new()
         }
         fn session(
@@ -3149,15 +4412,15 @@ mod tests {
     }
 
     impl GraphicsVideoSession<FakePlatform> for FakeSession {
-        fn event(&self) -> reims_vgpu_core::platform::event::EventRef<'_, FakePlatform> {
-            reims_vgpu_core::platform::event::EventRef::Shared(&self.event)
+        fn event(&self) -> reims_vgpu_vulkan::core::platform::event::EventRef<'_, FakePlatform> {
+            reims_vgpu_vulkan::core::platform::event::EventRef::Shared(&self.event)
         }
 
         fn codec(&self) -> u32 {
             self.codec
         }
 
-        fn decode(&self, d: &VideoDecode<'_, FakePlatform>) -> RaiseResult<u64> {
+        fn decode(&self, d: &VideoDecode<'_, FakePlatform>) -> RaiseResult<Decoded> {
             let plane =
                 |p: &VideoPlane<'_, FakePlatform>| [p.offset, p.bytes_per_row, p.width, p.height];
             self.seen.decodes.lock().push((
@@ -3172,7 +4435,29 @@ mod tests {
                 .cached
                 .lock()
                 .push([d.luma.cached, d.chroma.cached]);
-            Ok(self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1)
+            let pages = |p: &VideoPlane<'_, FakePlatform>| {
+                (p.pages.as_ref()).map(|pages| {
+                    (
+                        pages.memory.identity(),
+                        pages.buffer_offset,
+                        pages.memory.length(),
+                    )
+                })
+            };
+            self.seen
+                .pages
+                .lock()
+                .push([pages(&d.luma), pages(&d.chroma)]);
+            self.seen.output_rows.lock().push(d.output_rows);
+            let landed = Arc::new(Landed::default());
+            if self.seen.unlanded.load(Ordering::Relaxed) {
+                landed.fail();
+            }
+            Ok(Decoded {
+                value: self.decodes.fetch_add(1, Ordering::Relaxed) as u64 + 1,
+                skipped: self.seen.skipped.load(Ordering::Relaxed),
+                landed: Some(landed),
+            })
         }
     }
 
@@ -3216,8 +4501,9 @@ mod tests {
     }
 
     /// A video encoder hands its session each decode with the objects it names resolved: the
-    /// access unit's place in its buffer, the parameter sets that follow the op's body, and where
-    /// each plane's texture lies in the surface's buffer; the command buffer then waits for the
+    /// access unit's place in its buffer, the parameter sets that follow the op's body, where
+    /// each plane's texture lies in the surface's buffer, and the rows the surface holds
+    /// (`output_rows`); the command buffer then waits for the
     /// session's event to reach the value the decode answers, before its commit. A session the
     /// host has no video for is refused.
     #[test]
@@ -3269,7 +4555,7 @@ mod tests {
             luma_texture_obj_id: 7,
             chroma_texture_obj_id: 8,
             parameter_sets_size: sets.len() as u32,
-            ..RgfxVideoOpDecodeH264::default()
+            output_rows: 16,
         }
         .as_bytes()
         .to_vec();
@@ -3296,6 +4582,11 @@ mod tests {
             )]
         );
         assert_eq!(*seen.cached.lock(), [[false, false]], "a buffer of its own");
+        assert!(
+            seen.pages.lock()[0].iter().all(Option::is_none),
+            "a device buffer is no memory the host's video reaches in place"
+        );
+        assert_eq!(*seen.output_rows.lock(), [16], "the rows the surface holds");
         let calls = p.call_log().calls();
         let sels: Vec<&str> = calls
             .iter()
@@ -3310,13 +4601,181 @@ mod tests {
         assert_eq!(wait.args.get(1), Some(&Arg::U64(1)));
     }
 
+    /// A decode's command buffer completes as its GPU work did where its picture landed, and
+    /// failed, Metal's internal error with its code and its GPU times, where it did not (its
+    /// planes refused, or a decode the hardware failed once it ran), which the guest's video
+    /// driver answers as a decode error; never as a picture decoded.
+    #[test]
+    fn a_decode_whose_picture_did_not_land_fails_its_command_buffer() {
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
+        let sink = Arc::clone(&captured);
+        dec.set_completion_sink(Arc::new(move |record| sink.lock().push(record)));
+        assert_eq!(
+            dec.decode(&device, video_session_create(40).as_bytes())
+                .unwrap(),
+            Ok(())
+        );
+        let buffer = RgfxBufferCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_CREATE,
+                size: size_of::<RgfxBufferCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            length: 65536,
+            ..RgfxBufferCreate::default()
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: 0,
+            output_rows: 16,
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for (cb_obj_id, unlanded) in [(100, false), (101, true)] {
+            seen.unlanded.store(unlanded, Ordering::Relaxed);
+            let message = command_buffer_message(cb_obj_id, cb_obj_id, &ops);
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+            let committed = p.world().committed();
+            assert_eq!(committed.len(), 1);
+            assert!(p.world().set_gpu_times(committed[0], 7_000, 9_000));
+            p.world().complete_all(CompleteOn::Caller);
+        }
+        let recs: Vec<_> = (captured.lock().iter())
+            .map(|r| {
+                (
+                    r.cb_obj_id,
+                    r.status,
+                    r.error_code,
+                    r.gpu_start_ns,
+                    r.gpu_end_ns,
+                )
+            })
+            .collect();
+        assert_eq!(
+            recs,
+            [
+                (100, RGFX_CB_OK, 0, 7_000, 9_000),
+                (101, RGFX_CB_INTERNAL, 1, 7_000, 9_000)
+            ]
+        );
+    }
+
+    /// A plane of a buffer over host memory in a block of the region reaches the host's video as
+    /// the block's memory: the block's bytes, the buffer's place in them, and an identity that
+    /// ends at the block's `BLOCK_RELEASE`, one for the block whichever decode names it.
+    #[test]
+    fn a_video_decode_s_planes_carry_their_block_s_memory() {
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
+            RgfxBufferOverHostMemory,
+        };
+
+        let block = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        let size = (block + 0x10_0000 + RGFX_CURSOR_SPAN) as usize;
+        let (p, mut dec) = setup_over(size);
+        let device = p.device();
+        let seen = Arc::new(VideoSeen::default());
+        dec.set_video(Arc::new(FakeVideo(Arc::clone(&seen), p.device())));
+        let session = RgfxVideoSessionCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_VIDEO_SESSION_CREATE,
+                size: size_of::<RgfxVideoSessionCreate>() as u32,
+                seqno: 0,
+            },
+            obj_id: 40,
+            codec: RGFX_VIDEO_CODEC_H264,
+            direction: RGFX_VIDEO_DECODE,
+        };
+        assert_eq!(dec.decode(&device, session.as_bytes()).unwrap(), Ok(()));
+        dec.region.grant(0, block, 0x1_0000);
+        let buffer = RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id: 6,
+            gpu_address: 0,
+            region_offset: block + 0x1000,
+            length: 0x8000,
+            options: 0,
+            reserved_34: 0,
+        };
+        assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
+        for t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            assert_eq!(dec.decode(&device, t.as_bytes()).unwrap(), Ok(()));
+        }
+        let decode = RgfxVideoOpDecodeH264 {
+            bitstream_buffer_obj_id: 2,
+            bitstream_offset: 16,
+            bitstream_size: 100,
+            luma_texture_obj_id: 7,
+            chroma_texture_obj_id: 8,
+            parameter_sets_size: 0,
+            output_rows: 0,
+        };
+        let pass = RgfxOpVideoPass { session_obj_id: 40 };
+        let mut ops = op(RGFX_OP_ENCODER_BEGIN_VIDEO, pass.as_bytes());
+        ops.extend(op(RGFX_OP_VIDEO_DECODE_H264, decode.as_bytes()));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for seq in [1, 2] {
+            let message = command_buffer_message(100 + seq, seq, &ops);
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        }
+        let pages = seen.pages.lock().clone();
+        assert_eq!(pages.len(), 2);
+        let mut keys = Vec::new();
+        for planes in &pages {
+            for plane in planes {
+                let (identity, at, bytes) = plane.clone().expect("the block's memory");
+                assert_eq!((at, bytes), (0x1000, 0x1_0000));
+                assert!(identity.is_live());
+                keys.push(identity.key());
+            }
+        }
+        assert!(
+            keys.iter().all(|&k| k == keys[0]),
+            "one identity for the block"
+        );
+        dec.block_released(&device, block, 0, Box::new(|| ()), no_raise());
+        assert!(
+            pages
+                .iter()
+                .flatten()
+                .flatten()
+                .all(|(identity, ..)| !identity.is_live()),
+            "the block's release ends it"
+        );
+    }
+
     /// A video decode of a command buffer that waits for a buffer of another queue starts once
     /// that buffer has finished: the session's work runs on a queue of its own, which the command
     /// buffer's GPU wait does not hold, so the host waits on the CPU first. A decode whose named
     /// buffer has finished starts at once.
     #[test]
     fn a_video_decode_waits_for_the_buffers_its_command_buffer_runs_after() {
-        use reims_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_ORDER, RgfxSurfaceOrderWait};
 
         let (p, mut dec) = setup();
         let device = p.device();
@@ -3518,15 +4977,45 @@ mod tests {
     /// bitstream buffer 2, the H.264 session 40 of a fake host's video, buffer 6 over the block
     /// and textures 7 and 8 over its planes; and what the video is handed.
     fn cached_video() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
-        use super::super::surface_pages::tests::{BLOCK, rig};
-        use reims_graphics::wire::RGFX_STATUS_OK;
+        video_rig(false)
+    }
+
+    /// [`cached_video`]'s rig, its block, where `carrying`, deferred carrying its first page, a
+    /// page of guest RAM, the other a run of zeros, as a decoder's new output with a page its
+    /// process wrote without a lock is (`RGFX_FEATURE_SURFACE_DEFERRED_CARRY`).
+    fn video_rig(carrying: bool) -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        use super::super::surface_pages::tests::{BLOCK, RAM, rig};
+        use reims_vgpu_graphics::wire::{
+            RGFX_PAGE_RUN_ZEROS, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_CACHED,
+            RGFX_SURFACE_PAGES_DEFERRED, RgfxPageRun,
+        };
 
         let mut r = rig(8);
         let page = r.page;
-        assert_eq!(
-            r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
-            RGFX_STATUS_OK
-        );
+        if carrying {
+            r.dec.set_deferred_budget(8 * page);
+            r.dec.set_deferred_carries();
+            let runs = [
+                RgfxPageRun {
+                    address: RAM + page,
+                    length: page,
+                },
+                RgfxPageRun {
+                    address: RGFX_PAGE_RUN_ZEROS,
+                    length: page,
+                },
+            ];
+            let flags = RGFX_SURFACE_PAGES_CACHED | RGFX_SURFACE_PAGES_DEFERRED;
+            assert_eq!(
+                r.pages_of_runs(BLOCK, 0, &runs, 2 * page, flags, None),
+                RGFX_STATUS_OK
+            );
+        } else {
+            assert_eq!(
+                r.pages_cached(BLOCK, &[(1, 2)], 2 * page, true),
+                RGFX_STATUS_OK
+            );
+        }
         let queue = RgfxQueueCreate {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_QUEUE_CREATE,
@@ -3578,7 +5067,9 @@ mod tests {
     /// session 40.
     fn writes_cached_video(cb_obj_id: u64, seqno: u64, decodes: bool) -> Vec<u8> {
         use super::super::surface_pages::tests::BLOCK;
-        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse};
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_SURFACE_USE, RGFX_SURFACE_USE_WRITES, RgfxOpSurfaceUse,
+        };
 
         let surface_use = RgfxOpSurfaceUse {
             block_offset: BLOCK,
@@ -3602,6 +5093,246 @@ mod tests {
             ops.extend(op(RGFX_OP_ENCODER_END, &[]));
         }
         command_buffer_message(cb_obj_id, seqno, &ops)
+    }
+
+    /// [`cached_video`]'s rig with its textures 7 and 8 made again, each over the whole of its
+    /// plane of a two-plane 4:2:0 surface 64 by 16 pixels (its message's facts): a decoder's
+    /// output, whose planes' rows are the surface's bytes 32 to 1568. The block's cache owes its
+    /// first fill, its zeros done.
+    fn cached_video_whole() -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        video_whole(false)
+    }
+
+    /// [`cached_video_whole`] of [`video_rig`]'s rig, its block deferred carrying a page where
+    /// `carrying`.
+    fn video_whole(carrying: bool) -> (super::super::surface_pages::tests::Rig, Arc<VideoSeen>) {
+        use reims_vgpu_graphics::wire::{
+            RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_709_2, RgfxSurfaceFacts,
+        };
+
+        let (mut r, seen) = video_rig(carrying);
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*b"420v"),
+            plane_count: 2,
+            width: 64,
+            height: 16,
+            chroma_offset: 32 + 64 * 16,
+            chroma_bytes_per_row: 64,
+            ycbcr_matrix: RGFX_YCBCR_MATRIX_ITU_R_709_2,
+            reserved_24: 0,
+        };
+        for mut t in [
+            surface_plane_texture(7, 0, 10, 32, 64, 16),
+            surface_plane_texture(8, 1, 30, 32 + 64 * 16, 32, 8),
+        ] {
+            let at = RGFX_SURFACE_FACTS_OFFSET as usize;
+            t.header.size = (at + size_of::<RgfxSurfaceFacts>()) as u32;
+            let mut message = t.as_bytes().to_vec();
+            message.resize(at, 0);
+            message.extend_from_slice(facts.as_bytes());
+            assert_eq!(r.dec.decode(&r.device, &message).unwrap(), Ok(()));
+        }
+        // The make's zeros done, which a decode waits for on the CPU.
+        r.p.world().complete_all(CompleteOn::Caller);
+        (r, seen)
+    }
+
+    /// The copies into `cache` since `mark`, and the copies out of it: each one's source offset
+    /// and size, from the platform's buffer copies.
+    fn cache_copies(
+        r: &super::super::surface_pages::tests::Rig,
+        mark: u64,
+        cache: u64,
+    ) -> (usize, Vec<(u64, u64)>) {
+        const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
+        let calls = r.p.call_log().since(mark);
+        let id = |a: &Arg| a.as_obj().map_or(0, |o| o.0);
+        let into = (calls.iter())
+            .filter(|c| c.sel == COPY && id(&c.args[2]) == cache)
+            .count();
+        let out = (calls.iter())
+            .filter(|c| c.sel == COPY && id(&c.args[0]) == cache)
+            .map(|c| {
+                (
+                    c.args[1].as_u64().unwrap_or(0),
+                    c.args[4].as_u64().unwrap_or(0),
+                )
+            })
+            .collect();
+        (into, out)
+    }
+
+    /// The id of [`cached_video`]'s block's cache.
+    fn video_cache(r: &super::super::surface_pages::tests::Rig) -> u64 {
+        use super::super::surface_pages::tests::BLOCK;
+        Arg::obj(r.dec.caches().buffer(BLOCK).unwrap())
+            .as_obj()
+            .unwrap()
+            .0
+    }
+
+    /// A decoder's new output, a command buffer of a decode alone whose textures are the whole of
+    /// the surface's two planes, takes no fill of its cache: the cache made as zeros, the decode
+    /// waits for those, its picture lands over them, and nothing is copied in from the pages. The
+    /// lock's download that follows copies the planes' rows alone into the pages, the bytes 32 to
+    /// 1568, so every other byte of the pages, the surface's header among them, stays as the
+    /// guest's CPU wrote it
+    #[test]
+    fn a_decoders_new_output_takes_no_fill_and_copies_out_its_planes_alone() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "no fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (counts.fills, counts.made_fills, counts.decode_firsts),
+            (0, 0, 1)
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            super::super::no_raise(),
+        );
+        let (into, out) = cache_copies(&r, mark, cache);
+        assert_eq!((into, out), (0, vec![(32, 1536)]), "the planes' rows alone");
+        r.p.world().complete_all(CompleteOn::Caller);
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A decoder's new output deferred carrying a page its process wrote without a lock, a
+    /// command buffer of a decode alone whose textures are the whole of the surface's two planes,
+    /// takes no fill of its cache either: the carried page's first fill is taken as met, as a new
+    /// cache's is, nothing copied in, and the cache holds the use's generation, so a later use of
+    /// it fills nothing
+    #[test]
+    fn a_decode_takes_a_carried_fill_as_met() {
+        let (mut r, seen) = video_whole(true);
+        let cache = video_cache(&r);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "no fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.carried,
+                counts.fills,
+                counts.made_fills,
+                counts.decode_firsts
+            ),
+            (1, 0, 0, 1)
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(101, 2, false))
+                .unwrap(),
+            Ok(())
+        );
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "generation 0 held");
+    }
+
+    /// A decoder's new output whose picture fails to land holds the cache's zeros where the
+    /// picture did not write, and no byte of the pages or of any other memory: its cache is the
+    /// platform's new buffer, zeros as made, which the host fills no further, and nothing was
+    /// copied into it. The command buffer completes failed, and the lock's download copies the
+    /// planes' rows alone
+    #[test]
+    fn a_failed_landing_into_a_new_output_leaves_zeros_and_no_host_bytes() {
+        use super::super::surface_pages::tests::BLOCK;
+
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        // No fill of the cache from the rig's start: its zeros are the platform's.
+        let fills = (r.p.call_log().calls().iter())
+            .filter(|c| c.sel == "fillBuffer:range:value:")
+            .filter(|c| c.args[0].as_obj().map(|o| o.0) == Some(cache))
+            .count();
+        assert_eq!(fills, 0, "the platform's zeros alone");
+        seen.unlanded.store(true, Ordering::Relaxed);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let done = Arc::new(AtomicBool::new(false));
+        let set = Arc::clone(&done);
+        r.dec.surface_download(
+            &r.device,
+            BLOCK,
+            Box::new(move || set.store(true, Ordering::SeqCst)),
+            super::super::no_raise(),
+        );
+        r.p.world().complete_all(CompleteOn::Caller);
+        let (into, out) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 0, "nothing copied into the cache");
+        assert_eq!(out, [(32, 1536)], "the planes' rows alone copied out");
+        assert!(done.load(Ordering::SeqCst));
+    }
+
+    /// A decode into a new output that answers no picture (one the stream's random access skips)
+    /// makes the cache's first fill before anything reads it: in the finish of its command
+    /// buffer, which still uses the cache, so a use after it waits for the fill
+    #[test]
+    fn a_skipped_picture_fills_its_new_output() {
+        let (mut r, seen) = cached_video_whole();
+        let cache = video_cache(&r);
+        seen.skipped.store(true, Ordering::Relaxed);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, true))
+                .unwrap(),
+            Ok(())
+        );
+        let (into, _) = cache_copies(&r, mark, cache);
+        assert_eq!(into, 1, "the first fill");
+        let counts = r.dec.caches().counts();
+        assert_eq!(
+            (
+                counts.made_fills,
+                counts.decode_firsts,
+                counts.fills_deferred
+            ),
+            (1, 1, 1)
+        );
+        // A later decode's picture lands over the fill: nothing more is copied in.
+        seen.skipped.store(false, Ordering::Relaxed);
+        r.p.world().complete_all(CompleteOn::Caller);
+        let mark = r.p.call_log().mark();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(101, 2, true))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(cache_copies(&r, mark, cache).0, 0);
     }
 
     /// A video output whose surface's block has a device cache is handed to the session as in
@@ -3628,6 +5359,83 @@ mod tests {
         assert_eq!(r.dec.caches().counts().fills, 1);
     }
 
+    /// A decode whose output's device cache is still being filled waits for the fill as long as
+    /// it takes, as a Mac's video work waits for its GPU's earlier work on its surface: held past
+    /// 2 s on the platform's clock, the wait is named in the log and goes on, and once the fill is
+    /// done the picture lands in the cache and the command buffer is taken
+    #[test]
+    fn a_decode_waits_for_its_outputs_fill_however_long_it_takes() {
+        let (mut r, seen) = cached_video();
+        // The first use fills the cache, and the fill is held.
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, false))
+                .unwrap(),
+            Ok(())
+        );
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let message = writes_cached_video(101, 2, true);
+        let p = Arc::clone(&r.p);
+        let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).unwrap());
+            let mut lines = Vec::new();
+            let named = |lines: &[reims_vgpu_vulkan::core::testkit::logs::Line]| {
+                (lines.iter()).any(|(level, _, line)| {
+                    *level == log::Level::Warn && line.contains("has not finished after 2s")
+                })
+            };
+            // The platform's clock moves on, a second at a time, until the log names the wait.
+            for _ in 0..1000 {
+                lines.extend(logs.take());
+                if named(&lines) {
+                    break;
+                }
+                p.virtual_clock().advance(std::time::Duration::from_secs(1));
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(named(&lines), "the wait is named: {lines:?}");
+            p.virtual_clock()
+                .advance(std::time::Duration::from_secs(60));
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            assert!(
+                !walk.is_finished() && seen.decodes.lock().is_empty(),
+                "the decode waits for the fill"
+            );
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(*seen.cached.lock(), [[true, true]], "into the cache");
+    }
+
+    /// A reset of the device ends a decode's wait for its output's fill, as it ends every wait
+    /// of the decoder's, so none holds the reset up: the op faults its command buffer, and the
+    /// session is handed nothing
+    #[test]
+    fn a_reset_ends_a_decodes_wait_for_its_outputs_fill() {
+        let (mut r, seen) = cached_video();
+        assert_eq!(
+            r.dec
+                .decode(&r.device, &writes_cached_video(100, 1, false))
+                .unwrap(),
+            Ok(())
+        );
+        let message = writes_cached_video(101, 2, true);
+        let p = Arc::clone(&r.p);
+        let decoders = r.dec.decoders();
+        let mut walker = r.dec.sender(None, super::super::Sinks::default());
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message));
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            assert!(!walk.is_finished(), "the decode waits for the fill");
+            decoders.resetting();
+            assert!(walk.join().unwrap().is_err(), "the op faults");
+        });
+        decoders.reset_done();
+        assert!(seen.decodes.lock().is_empty());
+        p.world().complete_all(CompleteOn::Caller);
+    }
+
     /// A decoder's output that its client locks to read each picture is copied into its pages
     /// behind the next decode into it, by a command buffer of the host's committed on the
     /// decode's own queue right after it, and the lock's download that follows copies nothing
@@ -3637,7 +5445,7 @@ mod tests {
     #[test]
     fn a_decode_read_back_is_copied_out_behind_the_next_decode() {
         use super::super::surface_pages::tests::{BLOCK, Rig};
-        use reims_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
+        use reims_vgpu_graphics::ops::{RGFX_OP_SURFACE_USE, RgfxOpSurfaceUse};
         use std::sync::atomic::AtomicBool;
 
         const COPY: &str = "copyFromBuffer:sourceOffset:toBuffer:destinationOffset:size:";
@@ -3789,7 +5597,7 @@ mod tests {
     /// as `GPUStartTime` and `GPUEndTime`; a failed buffer the platform gives none of carries 0.
     #[test]
     fn a_completion_record_carries_the_platforms_gpu_times() {
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
         let (p, mut dec) = setup();
         let device = p.device();
         let captured = Arc::new(Mutex::new(Vec::<RgfxCbComplete>::new()));
@@ -3895,7 +5703,7 @@ mod tests {
     /// One whose submission handler ran has them posted there, once.
     #[test]
     fn a_buffer_never_submitted_is_scheduled_ahead_of_its_completion() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
         let (_p, dec, posted) = posting(true);
         for ran in [false, true] {
             posted.lock().clear();
@@ -3965,6 +5773,60 @@ mod tests {
 
     /// The records a decoder of [`posting`] posted: each one's type, buffer and seqno.
     type Posted = Arc<Mutex<Vec<(u32, u64, u64)>>>;
+
+    /// A queue's asks leave from the front, once closed, at a begin: one that closes behind an
+    /// open one (a buffer that ended uncommitted) waits there, and an ask of it posts nothing, as
+    /// an ask of one gone does; once those before it close, the next begin lets them all go. An
+    /// ask of a buffer committed and posted posts nothing again.
+    #[test]
+    fn closed_asks_leave_from_the_front() {
+        let line = Line::default();
+        let sequencer = Arc::new(super::super::sequencer::Sequencer::default());
+        let posted = Arc::new(Mutex::new(Vec::new()));
+        let sink: ScheduledSink = {
+            let posted = Arc::clone(&posted);
+            Arc::new(move |r: RgfxCbScheduled| posted.lock().push(r.cb_obj_id))
+        };
+        // A buffer at `seqno` begun on the queue, its `CB_SCHEDULED` an ask may post.
+        let begin = |seqno: u64| {
+            let scheduled = Arc::new(Scheduled {
+                sink: Arc::clone(&sink),
+                record: scheduled_record(100 + seqno, seqno),
+                posted: Mutex::new(false),
+                owed: None,
+            });
+            let askable = Arc::new(Askable {
+                seqno,
+                cb_obj_id: 100 + seqno,
+                context: None,
+                state: Mutex::new(Asking::Begun(Arc::clone(&scheduled))),
+            });
+            line.askable(Arc::clone(&askable));
+            (askable, scheduled)
+        };
+        let (first, first_scheduled) = begin(1);
+        let (second, _) = begin(2);
+        second.end(false);
+        let _third = begin(3);
+        assert_eq!(line.asks_kept(), 3, "the second waits behind the first");
+        line.asked(2, 102).expect("kept").ask(&sequencer);
+        assert!(
+            posted.lock().is_empty(),
+            "an ask of the ended buffer posts nothing"
+        );
+        first.end(true);
+        first_scheduled.post();
+        assert_eq!(*posted.lock(), [101]);
+        let _fourth = begin(4);
+        assert_eq!(
+            line.asks_kept(),
+            2,
+            "the first two left: the third and the fourth"
+        );
+        assert!(line.asked(1, 101).is_none() && line.asked(2, 102).is_none());
+        first.ask(&sequencer);
+        assert_eq!(*posted.lock(), [101], "posted once");
+    }
 
     /// A command buffer that asks for its `CB_SUBMITTED` gets it once, ahead of its
     /// `CB_SCHEDULED` and `CB_COMPLETE`, at its seqno; one that does not ask gets none.
@@ -4322,7 +6184,7 @@ mod tests {
             assert!(answer(&dec, &message, &posted, posts));
             assert!(p.call_log().sels_since(mark).is_empty(), "a platform call");
             let begun = dec
-                .begin_taken(&device, &message, Some(1))
+                .begin_taken(&device, &message, Some(1), false)
                 .unwrap()
                 .unwrap();
             assert!(!let_go_of_answer(&dec), "the begin took the answer");
@@ -4463,7 +6325,7 @@ mod tests {
         assert_eq!(*posted.lock(), [(SUB, 185, 115), (SCHED, 185, 115)]);
         let mark = p.call_log().mark();
         let begun = dec
-            .begin_taken(&device, &message, Some(1))
+            .begin_taken(&device, &message, Some(1), false)
             .unwrap()
             .unwrap();
         assert_eq!(
@@ -4485,7 +6347,7 @@ mod tests {
         assert!(answer(&dec, &message, &posted, true));
         assert_eq!(posted.lock()[2..], [(SUB, 186, 116)]);
         let begun = dec
-            .begin_taken(&device, &message, Some(1))
+            .begin_taken(&device, &message, Some(1), false)
             .unwrap()
             .unwrap();
         assert_eq!(posted.lock().len(), 3, "still owed at its take");
@@ -4521,7 +6383,7 @@ mod tests {
         assert!(answer(&dec, &asking(191, 121), &posted, true));
         dec.shared.closed.forget_all();
         let begun = dec
-            .begin_taken(&device, &asking(191, 121), Some(1))
+            .begin_taken(&device, &asking(191, 121), Some(1), false)
             .unwrap()
             .unwrap();
         assert!(!let_go_of_answer(&dec), "taken off its queue");
@@ -4566,7 +6428,6 @@ mod tests {
     /// A command buffer begun after another's answer on a doorbell's thread, on another queue, is
     /// committed after the answered buffer, which is begun only after it: the answer's ticket in
     /// the commit order holds it, as the ticket of one answered at its begin would.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[test]
     fn a_buffer_begun_after_an_answer_is_committed_after_the_answered_buffer() {
         let (p, mut dec, posted) = posting(false);
@@ -4606,7 +6467,7 @@ mod tests {
                 .name("first".into())
                 .spawn_scoped(scope, || {
                     let device = p.device();
-                    let begun = first.begin_taken(&device, &asked, Some(1)).unwrap();
+                    let begun = first.begin_taken(&device, &asked, Some(1), false).unwrap();
                     first.finish_command_buffer(&device, &asked, begun.unwrap())
                 })
                 .unwrap();
@@ -4629,7 +6490,7 @@ mod tests {
     /// queue, and its failure comes after that buffer's completion.
     #[test]
     fn a_refused_make_after_an_answer_fails_in_turn() {
-        use reims_vgpu_core::testkit::script::Step;
+        use reims_vgpu_vulkan::core::testkit::script::Step;
 
         let (p, mut dec, posted) = posting(false);
         let device = p.device();
@@ -4639,12 +6500,15 @@ mod tests {
             seen.lock().push((m.cb_obj_id, m.status));
         }));
         let first = command_buffer_message(193, 123, &render_ops());
-        let begun = dec.begin_taken(&device, &first, Some(1)).unwrap().unwrap();
+        let begun = dec
+            .begin_taken(&device, &first, Some(1), false)
+            .unwrap()
+            .unwrap();
         let mut later = dec.decoders().sender(None, dec.sinks.clone());
         assert!(answer(&later, &asking(194, 124), &posted, true));
         p.script().push("commandBuffer", Step::Nil);
         let refused = later
-            .begin_taken(&device, &asking(194, 124), Some(1))
+            .begin_taken(&device, &asking(194, 124), Some(1), false)
             .unwrap();
         assert!(matches!(refused, Err(DecodeError::Refused)));
         let stand_in = {
@@ -4684,7 +6548,6 @@ mod tests {
 
     /// A `COMMAND_BUFFER` message for queue `queue_obj_id`, command buffer `cb_obj_id`, carrying
     /// `ops`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn command_buffer_on(queue_obj_id: u64, cb_obj_id: u64, ops: &[u8]) -> Vec<u8> {
         let mut msg = command_buffer_message(cb_obj_id, cb_obj_id, ops);
         let (mut m, _) = RgfxCommandBuffer::read_from_prefix(&msg).unwrap();
@@ -4699,24 +6562,23 @@ mod tests {
     /// out. Whether A was answered before the CPU let H go, 100 ms on, and the bytes B copied.
     /// Two processes' queues are two queues of the platform's device to the decoder, and an
     /// IOSurface's device cache one tracked buffer to every process that uses it.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_later_commit_on_another_queue<P: crate::platform::ApiPlatform>() -> (bool, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_graphics::wire::RgfxSharedEventSetValue;
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
@@ -4825,24 +6687,12 @@ mod tests {
         (early, bytes.to_vec())
     }
 
-    /// On Metal, a command buffer behind one of its queue that waits for an event is not
-    /// answered as submitted until that one is scheduled, as Metal's
-    /// `commitAndWaitUntilSubmitted` returns only then (the M3, the 5300M and the 630,
-    /// docs/graphics-kext/dgpu-oracle.md, Q7): Metal orders a tracked resource across queues
-    /// behind work it has submitted, not behind work a queue holds. A buffer committed on another
-    /// queue once the answer comes, which reads a tracked buffer the first one writes, sees its
-    /// writes (Q6).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
-        let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_metal::MetalPlatform>();
-        assert!(!early, "answered as submitted while its queue was held");
-        assert!(bytes.iter().all(|&b| b == 0x5a));
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes`).
-    #[cfg(feature = "vulkan")]
+    /// A command buffer behind one of its queue that waits for an event is not answered as
+    /// submitted until that one is scheduled, as Metal's `commitAndWaitUntilSubmitted` returns
+    /// only then (the M3, the 5300M and the 630, docs/graphics-kext/dgpu-oracle.md, Q7): Metal
+    /// orders a tracked resource across queues behind work it has submitted, not behind work a
+    /// queue holds. A buffer committed on another queue once the answer comes, which reads a
+    /// tracked buffer the first one writes, sees its writes (Q6).
     #[test]
     fn on_vulkan_a_later_commit_on_another_queue_sees_a_submitted_buffer_s_writes() {
         let (early, bytes) = a_later_commit_on_another_queue::<reims_vgpu_vulkan::VulkanPlatform>();
@@ -4855,19 +6705,18 @@ mod tests {
     /// sets 2 encodes it. Whether the value 1 reached the guest within 5 s of the commit, before
     /// the buffer completed; then the CPU sets 2, whatever came: whether the buffer completed
     /// within 10 s of that, and whether the value went ahead of its completion, once.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_cpu_wait_for_a_mid_buffer_signal<P: crate::platform::ApiPlatform>() -> (bool, bool, bool) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
+        use reims_vgpu_graphics::ops::blit::{RGFX_OP_BLIT_FILL_BUFFER, RgfxBlitOpFillBuffer};
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let posted = Arc::new(Mutex::new(Vec::<(u32, u64, u64)>::new()));
         let sink = Arc::clone(&posted);
@@ -4959,23 +6808,11 @@ mod tests {
         (early, finished, posted == [signalled, completed])
     }
 
-    /// On Metal, a guest thread that waits on the CPU for a signal from the middle of a command
-    /// buffer, before it sets the value the buffer waits for next, gets the signal while the
-    /// buffer runs, as Metal's CPU does (docs/graphics-kext/dgpu-oracle.md, Q18), and the buffer
-    /// then completes: the value goes as the host's event reaches it, once, ahead of the buffer's
+    /// A guest thread that waits on the CPU for a signal from the middle of a command buffer,
+    /// before it sets the value the buffer waits for next, gets the signal while the buffer runs,
+    /// as Metal's CPU does (docs/graphics-kext/dgpu-oracle.md, Q18), and the buffer then
+    /// completes: the value goes as the host's event reaches it, once, ahead of the buffer's
     /// completion.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
-        let (early, finished, once) =
-            a_cpu_wait_for_a_mid_buffer_signal::<reims_vgpu_metal::MetalPlatform>();
-        assert!(early, "the signal came only at the buffer's end, or never");
-        assert!(finished && once);
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends`).
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_a_cpu_wait_for_a_mid_buffer_signal_is_released_before_the_buffer_ends() {
         let (early, finished, once) =
@@ -4990,24 +6827,23 @@ mod tests {
     /// first, on a thread of its own; A is begun 50 ms on and committed 100 ms after that, and
     /// its message ends, raising its queue's commit mark, once the platform has scheduled it. The
     /// bytes B copied.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn a_plain_commit_after_a_named_buffer_of_another_queue<P: crate::platform::ApiPlatform>()
     -> Vec<u8> {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -5074,14 +6910,20 @@ mod tests {
         std::thread::scope(|scope| {
             let device = &device;
             let taken_first = scope.spawn(|| {
-                let _pool = reims_vgpu_core::rt::Pool::here();
-                let begun = second.begin_taken(device, &b, Some(2)).unwrap().unwrap();
+                let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
+                let begun = second
+                    .begin_taken(device, &b, Some(2), false)
+                    .unwrap()
+                    .unwrap();
                 let done = second.finish_command_buffer(device, &b, begun).unwrap();
                 second.end_message();
                 done
             });
             std::thread::sleep(Duration::from_millis(50));
-            let begun = first.begin_taken(device, &a, Some(1)).unwrap().unwrap();
+            let begun = first
+                .begin_taken(device, &a, Some(1), false)
+                .unwrap()
+                .unwrap();
             std::thread::sleep(Duration::from_millis(100));
             assert_eq!(
                 first.finish_command_buffer(device, &a, begun).unwrap(),
@@ -5116,29 +6958,11 @@ mod tests {
         bytes.to_vec()
     }
 
-    /// On Metal, a plain commit on another queue that the guest made after a buffer's, and that
-    /// names it in its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took
-    /// it first: the host commits it only once the buffer it names is committed, here once Metal
-    /// has scheduled that one, and Metal orders a tracked resource across queues behind work it
-    /// has submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7). Committed as soon as the
-    /// named buffer's `commit` returned, it missed that buffer's writes in 1 of 40 runs of
-    /// `graphics::decode`'s tests in one process (measured on the M3 Max; Q6's 0 of 5 ran on an
-    /// idle GPU).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
-        let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
-            reims_vgpu_metal::MetalPlatform,
-        >();
-        assert!(
-            bytes.iter().all(|&b| b == 0x5a),
-            "committed before the buffer it names"
-        );
-    }
-
-    /// The same on the Vulkan platform
-    /// (`on_metal_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names`).
-    #[cfg(feature = "vulkan")]
+    /// A plain commit on another queue that the guest made after a buffer's, and that names it in
+    /// its `COMMIT_ORDER`, reads the tracked buffer it writes, though the host took it first: the
+    /// host commits it only once the buffer it names is committed, here once the platform has
+    /// scheduled that one, as Metal orders a tracked resource across queues behind work it has
+    /// submitted (docs/graphics-kext/dgpu-oracle.md, Q6 and Q7).
     #[test]
     fn on_vulkan_a_plain_commit_on_another_queue_sees_the_writes_of_the_buffer_it_names() {
         let bytes = a_plain_commit_after_a_named_buffer_of_another_queue::<
@@ -5155,25 +6979,24 @@ mod tests {
     /// names A in its surface order, asks for its submission and copies the buffer out. The
     /// records of B posted by the time its decode returned, whether B was still unfinished 100 ms
     /// on, the order of the completions, and the bytes B copied.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn an_order_behind_a_held_buffer<P: crate::platform::ApiPlatform>()
     -> (Vec<u32>, bool, Vec<u64>, Vec<u8>) {
         use std::time::{Duration, Instant};
 
-        use reims_graphics::ops::blit::{
+        use reims_vgpu_graphics::ops::blit::{
             RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
             RgfxBlitOpCopyBufferToBuffer, RgfxBlitOpFillBuffer,
         };
-        use reims_graphics::wire::RgfxSharedEventSetValue;
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_graphics::wire::RgfxSharedEventSetValue;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         const LEN: u64 = 1 << 20;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         // B's records, and every completion.
         let records = Arc::new(Mutex::new(Vec::new()));
@@ -5293,28 +7116,14 @@ mod tests {
         (posted, waited, completed, bytes.to_vec())
     }
 
-    /// On Metal, a command buffer that waits on the GPU for a buffer of another queue the
-    /// platform holds is answered as submitted and scheduled as its commit returns, as a Mac
-    /// answers a buffer it orders after another queue's access to an IOSurface
-    /// (docs/graphics-kext/dgpu-oracle.md, Q16), and still runs after that buffer: it completes
-    /// after it and copies what it wrote.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_an_order_behind_a_held_buffer_holds_back_no_record() {
-        let (posted, waited, completed, bytes) =
-            an_order_behind_a_held_buffer::<reims_vgpu_metal::MetalPlatform>();
-        assert_eq!(posted, [RGFX_EVT_CB_SUBMITTED, RGFX_EVT_CB_SCHEDULED]);
-        assert!(waited, "B ran before the buffer it names");
-        assert_eq!(completed, [20, 21]);
-        assert!(bytes.iter().all(|&b| b == 0x5a));
-    }
-
-    /// The same on the Vulkan platform, which holds a wait for a shared event's value on the host
-    /// until it is reached (`on_metal_an_order_behind_a_held_buffer_holds_back_no_record`). B
-    /// still runs after A, copying what A wrote; the order in which the runtime reports the two
-    /// queues' completions is its own: on MoltenVK on the M3 Max it reported B's before A's in 20
-    /// runs of 20, with B's records held back to its scheduling as with them posted at its commit.
-    #[cfg(feature = "vulkan")]
+    /// A command buffer that waits on the GPU for a buffer of another queue the platform holds is
+    /// answered as submitted and scheduled as its commit returns, as a Mac answers a buffer it
+    /// orders after another queue's access to an IOSurface (docs/graphics-kext/dgpu-oracle.md,
+    /// Q16), though the Vulkan platform holds a wait for a shared event's value on the host until
+    /// it is reached. B still runs after A, copying what A wrote; the order in which the runtime
+    /// reports the two queues' completions is its own: on MoltenVK on the M3 Max it reported B's
+    /// before A's in 20 runs of 20, with B's records held back to its scheduling as with them
+    /// posted at its commit.
     #[test]
     fn on_vulkan_an_order_behind_a_held_buffer_holds_back_no_record() {
         let (posted, waited, mut completed, bytes) =
@@ -5332,23 +7141,22 @@ mod tests {
     /// counts its draw at 16, the second starts at `Disabled` at 0, as the bundle starts a
     /// sub-encoder after one that set a mode, and draws; then `Disabled` at 24 and a draw. The
     /// buffer's words once the command buffer finished.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     #[allow(clippy::disallowed_methods)] // test scaffolding: real-time waits for the GPU's work
     fn sub_encoders_after_a_count<P: crate::platform::ApiPlatform>() -> [u64; 4] {
         use std::time::{Duration, Instant};
 
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::values::{RenderPipelineDesc, TextureDesc};
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::values::{RenderPipelineDesc, TextureDesc};
 
         use super::super::draw_cost::fixture;
         const SIDE: u64 = 64;
         const BGRA8: u64 = 80;
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let completed = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&completed);
@@ -5414,7 +7222,6 @@ mod tests {
                 vertex: &fixture::<P>(&device, "render_vbuf"),
                 fragment: &fixture::<P>(&device, "render_color"),
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()
@@ -5488,23 +7295,10 @@ mod tests {
         [words[0], words[1], words[2], words[3]]
     }
 
-    /// On Metal, the sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the
-    /// count at 16 is the square's 4096 samples, and the words at 0 and 24 keep their bytes. Sent
-    /// at those offsets, `Disabled` makes the M3 Max write 0 at 24 (measured), which
-    /// [`render::visibility_offset`] keeps it from.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_sub_encoders_after_a_count_write_nothing_under_disabled() {
-        let fill = u64::from_ne_bytes([0xee; 8]);
-        assert_eq!(
-            sub_encoders_after_a_count::<reims_vgpu_metal::MetalPlatform>(),
-            [fill, fill, 4096, fill]
-        );
-    }
-
-    /// The same on the Vulkan platform, whose runtime writes nothing under `Disabled` at any
-    /// offset.
-    #[cfg(feature = "vulkan")]
+    /// The sub-encoders' draws under `Disabled` write nothing, as every Mac's do: the count at 16
+    /// is the square's 4096 samples, and the words at 0 and 24 keep their bytes. The runtime
+    /// writes nothing under `Disabled` at any offset; the M3 Max writes 0 at 24 for `Disabled` sent
+    /// at those offsets (measured), which [`render::visibility_offset`] keeps it from.
     #[test]
     fn on_vulkan_sub_encoders_after_a_count_write_nothing_under_disabled() {
         let fill = u64::from_ne_bytes([0xee; 8]);
@@ -5516,7 +7310,6 @@ mod tests {
 
     /// A `BUFFER_CREATE` of `length` bytes, id `obj_id`, at `gpu_address` (0: where the host
     /// places it).
-    #[cfg(feature = "vulkan")]
     fn buffer_at(obj_id: u64, gpu_address: u64, length: u64) -> RgfxBufferCreate {
         RgfxBufferCreate {
             header: RgfxMsgHeader {
@@ -5537,25 +7330,23 @@ mod tests {
     /// refused in 4 of 20 one-process runs of `graphics::decode` (measured on the M3 Max), where
     /// `on_vulkan_the_host_s_own_ranges_lie_below_every_unit`'s pin at the range's base, 96 KiB,
     /// covers its address.
-    #[cfg(feature = "vulkan")]
     static CONTEXT_RANGE_PINS: Mutex<()> = Mutex::new(());
 
     /// A decoder on the Vulkan platform with a queue (1), and, as a process in slot 0 picks
     /// (`RgfxIdSpace`, next fit from the slot's base, a pick of Metal's span of a pin), a
     /// device-placed 1 MiB texture buffer (10) at the slot's first pick, which the host takes no
     /// pin of: the runtime makes its bytes at an address it picks itself.
-    #[cfg(feature = "vulkan")]
     fn decoder_with_a_texture_buffer() -> (
         GraphicsDecoder<reims_vgpu_vulkan::VulkanPlatform>,
         <reims_vgpu_vulkan::VulkanPlatform as Platform>::Device,
     ) {
         use crate::platform::ApiPlatform as _;
-        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let platform = reims_vgpu_vulkan::VulkanPlatform::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         dec.hold_resource_ids(0, 0);
         let queue = RgfxQueueCreate {
@@ -5599,12 +7390,11 @@ mod tests {
     /// A guest's pin meets no range the Vulkan platform's runtime placed for itself: a buffer
     /// pinned at the pick after a texture buffer's is made, though the runtime made the texture
     /// buffer's bytes where it picks.
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_a_pin_meets_no_range_of_a_texture_buffer() {
-        use reims_graphics::wire::RGFX_CONTEXT_VA_BASE;
+        use reims_vgpu_graphics::wire::RGFX_CONTEXT_VA_BASE;
         let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let buffer = buffer_at(11, RGFX_CONTEXT_VA_BASE + 0x8000, 0x1_0000);
         assert_eq!(dec.decode(&device, buffer.as_bytes()).unwrap(), Ok(()));
@@ -5614,15 +7404,14 @@ mod tests {
     /// itself lies below them, and, with it, a queue's and a texture buffer's ranges made, the
     /// first pick of every unit the kext hands the contexts out in and the last unit's last pick
     /// are made.
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_the_host_s_own_ranges_lie_below_every_unit() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_CONTEXT_VA_BASE, RGFX_CONTEXT_VA_END, RGFX_CONTEXT_VA_UNIT, RGFX_CONTEXT_VA_UNITS,
         };
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
         let _pins = CONTEXT_RANGE_PINS.lock();
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let (mut dec, device) = decoder_with_a_texture_buffer();
         let placed = buffer_at(11, 0, 64 << 20);
         assert_eq!(dec.decode(&device, placed.as_bytes()).unwrap(), Ok(()));
@@ -5669,7 +7458,7 @@ mod tests {
     /// the flag sets none.
     #[test]
     fn a_render_pass_takes_its_sample_positions() {
-        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
         let (p, dec) = setup();
         let mut caps = (*p.device().caps()).clone();
         caps.sample_counts = [Ok(true), Ok(true), Ok(true), Ok(false)];
@@ -5771,7 +7560,7 @@ mod tests {
     /// neither.
     #[test]
     fn a_render_pass_takes_its_visibility_result_buffer() {
-        use reims_vgpu_core::testkit::impls::descriptor::PassModel;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
         let (_p, dec) = setup();
         let Some(ObjHandle::Buffer(buffer)) = dec.object(2) else {
             panic!("no buffer 2");
@@ -5821,6 +7610,58 @@ mod tests {
         assert!(dec.build_render_pass(&texture, |_| true).is_err());
         let undefined = begin_render_with_visibility(2, 2, None);
         assert!(dec.build_render_pass(&undefined, |_| true).is_err());
+    }
+
+    /// A pass's rasterization rate map, after its colour records, its sample positions and its
+    /// visibility result buffer, is set on the platform's pass; a pass whose flag says so but
+    /// carries no whole record faults, and so does one naming no map the host holds.
+    #[test]
+    fn a_render_pass_takes_its_rasterization_rate_map() {
+        use reims_vgpu_vulkan::core::platform::values::RateMapDesc;
+        use reims_vgpu_vulkan::core::testkit::impls::descriptor::PassModel;
+        let (p, dec) = setup();
+        let map = p
+            .device()
+            .new_rate_map(&p.rate_map_descriptor(&RateMapDesc::default()))
+            .unwrap()
+            .unwrap();
+        let id = map.id();
+        dec.insert(0x40, ObjHandle::RateMap(map)).unwrap().unwrap();
+        let with = |map_obj_id, visibility: bool| {
+            let mut body = if visibility {
+                begin_render_with_visibility(2, 0, None)
+            } else {
+                begin_render_body()
+            };
+            let mut head = RgfxRenderPassDesc::read_from_prefix(&body).unwrap().0;
+            head.flags |= RGFX_PASS_FLAG_RATE_MAP;
+            body[..size_of::<RgfxRenderPassDesc>()].copy_from_slice(head.as_bytes());
+            body.extend_from_slice(RgfxRenderPassRateMap { map_obj_id }.as_bytes());
+            body
+        };
+        for visibility in [false, true] {
+            let (pass, _) = dec
+                .build_render_pass(&with(0x40, visibility), |_| true)
+                .unwrap();
+            assert_eq!(
+                pass.with_model(|m: &PassModel| m.rasterization_rate_map_id()),
+                Some(id)
+            );
+        }
+        let (plain, _) = dec
+            .build_render_pass(&begin_render_body(), |_| true)
+            .unwrap();
+        assert_eq!(
+            plain.with_model(|m: &PassModel| m.rasterization_rate_map_id()),
+            None
+        );
+        let whole = with(0x40, false);
+        assert!(
+            dec.build_render_pass(&whole[..whole.len() - 4], |_| true)
+                .is_err()
+        );
+        assert!(dec.build_render_pass(&with(0x41, false), |_| true).is_err());
+        assert!(dec.build_render_pass(&with(2, false), |_| true).is_err());
     }
 
     /// A `BUFFER_CREATE` of buffer `obj_id`, `length` bytes.
@@ -5955,6 +7796,109 @@ mod tests {
         ops.extend(op(0x1fff, &[0u8; 8]));
         let message = command_buffer_message(101, 1, &ops);
         assert!(dec.decode(&device, &message).is_err());
+    }
+
+    /// A buffer whose stream starts with the guest's times (`GUEST_TIMES`) is carried out as the
+    /// same buffer without them: the walk steps past the op, which is the device's diagnostic,
+    /// whatever its stamps hold, and a stream of the times alone is an empty buffer.
+    #[test]
+    fn a_buffer_s_guest_times_change_nothing_it_does() {
+        use reims_vgpu_graphics::ops::RgfxOpGuestTimes;
+        let times = RgfxOpGuestTimes {
+            began_ns: u64::MAX,
+            committed_ns: 3,
+            posted_ns: 0,
+        };
+        let stamped = |ops: &[u8]| {
+            let mut v = op(RGFX_OP_GUEST_TIMES, times.as_bytes());
+            v.extend_from_slice(ops);
+            v
+        };
+        let mut blit = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        blit.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let mut render = pass_of(&draw_ops(2, 0, 0));
+        render.extend(op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]));
+        render.extend(op(RGFX_OP_ENCODER_END, &[]));
+        for (i, ops) in [Vec::new(), blit, render].into_iter().enumerate() {
+            let i = i as u64;
+            let (p, mut dec) = setup();
+            let device = p.device();
+            let mark = p.call_log().mark();
+            let plain = command_buffer_message(300 + i, 1, &ops);
+            assert_eq!(dec.decode(&device, &plain).unwrap(), Ok(()), "case {i}");
+            p.world().complete_all(CompleteOn::Caller);
+            let without = p.call_log().sels_since(mark);
+
+            let (p, mut dec) = setup();
+            let device = p.device();
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(300 + i, 1, &stamped(&ops));
+            assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()), "case {i}");
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(p.call_log().sels_since(mark), without, "case {i}");
+        }
+    }
+
+    /// With the trace on, a command buffer's begin's end, its walk's start (with its op bytes and
+    /// the counts of its ops, encoders, dispatches and fence updates and waits) and its end after
+    /// its commit are each an event of its queue and seqno, in that order, on the thread that
+    /// carries it out; a buffer whose walk faults has no end.
+    #[test]
+    fn a_traced_buffer_marks_its_begin_walk_and_end() {
+        use reims_vgpu_graphics::ops::compute::RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS;
+        use reims_vgpu_vulkan::core::trace;
+        // nextest runs each test in a process of its own, whose trace file is this one
+        let path = std::env::temp_dir().join(format!("rvg-cbtrace-{}.txt", std::process::id()));
+        assert!(trace::to_file(&path));
+        trace::set_clock(|| 5);
+        let (p, mut dec) = setup();
+        let device = p.device();
+        let mut blit = op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]);
+        blit.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(310, 7, &blit);
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        // The walk faults at the unknown op: the ops after it are counted, never walked.
+        let mut faults = op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body());
+        faults.extend(op(0x1fff, &[0u8; 8]));
+        for tag in [
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+            RGFX_OP_COMPUTE_UPDATE_FENCE,
+            RGFX_OP_BLIT_WAIT_FOR_FENCE,
+            RGFX_OP_RENDER_WAIT_FOR_FENCE,
+            RGFX_OP_ENCODER_END,
+        ] {
+            faults.extend(op(tag, &[0u8; 8]));
+        }
+        let message = command_buffer_message(311, 8, &faults);
+        assert!(dec.decode(&device, &message).is_err());
+        trace::flush_before_death();
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_file(&path).unwrap();
+        let events: Vec<(&str, &str)> = text
+            .lines()
+            .filter_map(|l| {
+                let mut fields = l.splitn(3, ' ');
+                let (_, thread, rest) = (fields.next()?, fields.next()?, fields.next()?);
+                let kind = rest.split(' ').next()?;
+                ["cbbegun", "cenc", "cbwalked"]
+                    .contains(&kind)
+                    .then_some((thread, rest))
+            })
+            .collect();
+        let thread = events[0].0;
+        assert!(events.iter().all(|(t, _)| *t == thread), "{events:?}");
+        let rests: Vec<&str> = events.iter().map(|(_, rest)| *rest).collect();
+        let faulted = format!("cenc 1 8 {} 7 1 1 1 2", faults.len());
+        assert_eq!(
+            rests,
+            [
+                "cbbegun 1 7",
+                "cenc 1 7 16 2 1 0 0 0",
+                "cbwalked 1 7",
+                "cbbegun 1 8",
+                faulted.as_str()
+            ]
+        );
     }
 
     /// A render op with no open encoder faults the exec.
@@ -6121,11 +8065,11 @@ mod tests {
     /// stands in for the GPU reaching the signal. So does a stand-in's signal before its wait.
     #[test]
     fn a_signal_before_more_of_its_buffer_goes_as_the_event_reaches_it() {
-        use reims_graphics::ops::compute::{
+        use reims_vgpu_graphics::ops::compute::{
             RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
         };
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
-        use reims_vgpu_core::platform::event::SharedEvent as _;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_vulkan::core::platform::event::SharedEvent as _;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6305,10 +8249,10 @@ mod tests {
     /// decoder holds has no stand-in.
     #[test]
     fn a_faulted_command_buffer_is_stood_in_for_by_its_event_ops() {
-        use reims_graphics::ops::compute::{
+        use reims_vgpu_graphics::ops::compute::{
             RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
         };
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6384,7 +8328,7 @@ mod tests {
     /// among them, so none is dropped with the ops the count leaves out.
     #[test]
     fn a_buffer_whose_op_bytes_are_short_is_refused_and_stood_in_for_by_all_its_events() {
-        use reims_graphics::wire::RGFX_CB_INTERNAL;
+        use reims_vgpu_graphics::wire::RGFX_CB_INTERNAL;
         let (p, mut dec) = setup();
         let device = p.device();
         create_events(&p, &mut dec, 0);
@@ -6432,7 +8376,7 @@ mod tests {
     /// queue's next buffer is committed and completes.
     #[test]
     fn a_commit_refused_after_its_handlers_were_added_fails_that_buffer_alone() {
-        use reims_graphics::wire::{RGFX_CB_INTERNAL, RGFX_CB_OK};
+        use reims_vgpu_graphics::wire::{RGFX_CB_INTERNAL, RGFX_CB_OK};
         for (step, death) in [
             (Step::crash(), true),
             (
@@ -6550,7 +8494,10 @@ mod tests {
 
     /// A gate the first walk to reach it stops at, after its op `at`, until the test opens it.
     /// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
-    type GateState = Arc<(Mutex<(bool, bool, bool)>, reims_vgpu_core::sync::Condvar)>;
+    type GateState = Arc<(
+        Mutex<(bool, bool, bool)>,
+        reims_vgpu_vulkan::core::sync::Condvar,
+    )>;
 
     struct Gate(GateState);
 
@@ -6559,7 +8506,7 @@ mod tests {
         fn on(dec: &GraphicsDecoder<FakePlatform>, at: usize) -> Gate {
             let state = Arc::new((
                 Mutex::new((false, false, false)),
-                reims_vgpu_core::sync::Condvar::new(),
+                reims_vgpu_vulkan::core::sync::Condvar::new(),
             ));
             let hook = Arc::clone(&state);
             dec.set_walk_hook(Some(Arc::new(move |index: usize| {
@@ -6583,7 +8530,7 @@ mod tests {
         fn reached(&self) {
             let (lock, moved) = &*self.0;
             let mut s = lock.lock();
-            for _ in 0..3000 {
+            for _ in 0..crate::graphics::tests::PATIENCE {
                 if s.1 {
                     return;
                 }
@@ -6601,10 +8548,10 @@ mod tests {
     }
 
     fn destroy(obj_id: u64) -> Vec<u8> {
-        reims_graphics::wire::RgfxObjectDestroy {
+        reims_vgpu_graphics::wire::RgfxObjectDestroy {
             header: RgfxMsgHeader {
-                r#type: reims_graphics::wire::RGFX_CMD_OBJECT_DESTROY,
-                size: size_of::<reims_graphics::wire::RgfxObjectDestroy>() as u32,
+                r#type: reims_vgpu_graphics::wire::RGFX_CMD_OBJECT_DESTROY,
+                size: size_of::<reims_vgpu_graphics::wire::RgfxObjectDestroy>() as u32,
                 seqno: 0,
             },
             obj_id,
@@ -6721,6 +8668,242 @@ mod tests {
         assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
     }
 
+    /// The ids [`each_named`] reads off an op stream: its compute ops' in stream order, each run's
+    /// records each, nil ids, ops that name nothing and ops of other groups left out.
+    #[test]
+    fn a_stream_s_compute_names_come_in_order() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS, RGFX_OP_COMPUTE_SET_BUFFERS,
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RGFX_OP_COMPUTE_USE_HEAPS,
+            RgfxComputeHeapBinding, RgfxComputeOpDispatchThreadgroups,
+            RgfxComputeOpSetComputePipelineState, RgfxComputeOpUseHeaps,
+        };
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11, 0, 12])));
+        let mut heaps = RgfxComputeOpUseHeaps { count: 1 }.as_bytes().to_vec();
+        heaps.extend_from_slice(RgfxComputeHeapBinding { heap_obj_id: 31 }.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_USE_HEAPS, &heaps));
+        ops.extend(op(
+            RGFX_OP_COMPUTE_DISPATCH_THREADGROUPS,
+            RgfxComputeOpDispatchThreadgroups::default().as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        assert_eq!(named(&ops), [7, 11, 12, 31]);
+    }
+
+    /// [`each_named`] reads no further than the walk decodes: an op whose head counts more records
+    /// than its body holds, whose length overruns the stream or is no multiple of 8, or a compute
+    /// tag the walk does not decode ends the reading there; and an answer of false ends it at once.
+    #[test]
+    fn a_short_or_malformed_stream_ends_the_reading() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_BUFFERS, RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState,
+        };
+        let mut counted = op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11]));
+        let mut short = set_buffers(&[12, 13]);
+        // The head counts 3 records; the op holds 2.
+        short[8..16].copy_from_slice(&3u64.to_le_bytes());
+        counted.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &short));
+        counted.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[14])));
+        assert_eq!(
+            named(&counted),
+            [11],
+            "the second op's records run past its body"
+        );
+        let mut cut = op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11]));
+        cut.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[12])));
+        cut.truncate(cut.len() - 8);
+        assert_eq!(named(&cut), [11], "the second op runs past the stream");
+        let mut odd = op(
+            RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE,
+            RgfxComputeOpSetComputePipelineState { pipeline_obj_id: 7 }.as_bytes(),
+        );
+        odd[4..8].copy_from_slice(&12u32.to_le_bytes());
+        assert_eq!(named(&odd), Vec::<u64>::new());
+        let mut unknown = op(0x2fff, &[0; 8]);
+        unknown.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11])));
+        assert_eq!(
+            named(&unknown),
+            Vec::<u64>::new(),
+            "an op the walk does not decode"
+        );
+        let mut first = Vec::new();
+        each_named(
+            &op(RGFX_OP_COMPUTE_SET_BUFFERS, &set_buffers(&[11, 12, 13])),
+            |id| {
+                first.push(id);
+                false
+            },
+        );
+        assert_eq!(first, [11]);
+    }
+
+    /// The ids [`each_named`] reads off `ops`, in order.
+    fn named(ops: &[u8]) -> Vec<u64> {
+        let mut out = Vec::new();
+        each_named(ops, |id| {
+            out.push(id);
+            true
+        });
+        out
+    }
+
+    /// A `SET_BUFFERS` body binding `ids` from slot 0, each at offset 256.
+    fn set_buffers(ids: &[u64]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::compute::{
+            RgfxComputeBufferBinding, RgfxComputeOpSetBuffers,
+        };
+        let mut body = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: ids.len() as u64,
+        }
+        .as_bytes()
+        .to_vec();
+        for &buffer_obj_id in ids {
+            let binding = RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 256,
+            };
+            body.extend_from_slice(binding.as_bytes());
+        }
+        body
+    }
+
+    /// The names a walk's compute ops give, found as it starts ([`each_named`]), are what its
+    /// table held at its begin, as each op would have found them alone: destroys after the walk
+    /// found them, of the buffers and the texture it binds, and an id destroyed, made again and
+    /// destroyed again, leave it binding the objects it began with, let go of once it ends. One
+    /// destroyed before its begin is found by neither, and stays unfound though made again
+    /// mid-walk: the op naming it faults.
+    #[test]
+    fn a_walk_s_compute_names_found_at_its_start_are_its_begin_s() {
+        use reims_vgpu_graphics::ops::compute::{
+            RGFX_OP_COMPUTE_SET_BUFFERS, RGFX_OP_COMPUTE_SET_TEXTURE, RgfxComputeBufferBinding,
+            RgfxComputeOpSetBuffers, RgfxComputeOpSetTexture,
+        };
+        let (p, dec) = setup();
+        let device = p.device();
+        let buffer = |id| match dec.object(id) {
+            Some(ObjHandle::Buffer(b)) => b,
+            _ => panic!("no buffer {id}"),
+        };
+        let bound = Arg::objs(&[Some(buffer(2)), Some(buffer(3))]);
+        let textured = Arg::opt(match dec.object(5) {
+            Some(ObjHandle::Texture(t)) => Some(t),
+            _ => panic!("no texture 5"),
+        });
+        let mut ring0 = dec.sender(None, super::super::Sinks::default());
+        let mut walker = dec.sender(None, super::super::Sinks::default());
+        drop(dec);
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        let mut binds = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: 2,
+        }
+        .as_bytes()
+        .to_vec();
+        for buffer_obj_id in [2, 3] {
+            let b = RgfxComputeBufferBinding {
+                buffer_obj_id,
+                offset: 0,
+            };
+            binds.extend_from_slice(b.as_bytes());
+        }
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &binds));
+        ops.extend(op(
+            RGFX_OP_COMPUTE_SET_TEXTURE,
+            RgfxComputeOpSetTexture {
+                texture_obj_id: 5,
+                index: 0,
+            }
+            .as_bytes(),
+        ));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(100, 1, &ops);
+        // The gate stops the walk after its encoder's begin: past its start, before its binds.
+        let gate = Gate::on(&ring0, 0);
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| {
+                let outcome = walker.decode(&p.device(), &message).unwrap();
+                walker.end_message();
+                outcome
+            });
+            gate.reached();
+            for m in [
+                destroy(5),
+                destroy(2),
+                buffer_create(2),
+                destroy(2),
+                destroy(3),
+            ] {
+                assert_eq!(ring0.decode(&device, &m).unwrap(), Ok(()));
+            }
+            assert_eq!(kept(&ring0), 3, "kept for the walk: 5, 2 and 3");
+            gate.open();
+            assert_eq!(walk.join().unwrap(), Ok(()));
+        });
+        assert_eq!(kept(&ring0), 0, "let go of with the walk");
+        let log = p.call_log();
+        assert_eq!(
+            log.calls_to("setBuffers:offsets:withRange:")
+                .last()
+                .unwrap()
+                .args[0],
+            bound,
+            "the buffers it began with"
+        );
+        assert_eq!(
+            log.calls_to("setTexture:atIndex:").last().unwrap().args[0],
+            textured,
+            "the texture it began with"
+        );
+        // Buffer 2 is gone before this walk's begin, and made again while it walks: the walk
+        // names neither, and faults at its bind; one begun after the make names it.
+        let mut ops = op(
+            RGFX_OP_ENCODER_BEGIN_COMPUTE,
+            RgfxComputePassDesc::default().as_bytes(),
+        );
+        let mut bind = RgfxComputeOpSetBuffers {
+            location: 0,
+            length: 1,
+        }
+        .as_bytes()
+        .to_vec();
+        let b = RgfxComputeBufferBinding {
+            buffer_obj_id: 2,
+            offset: 0,
+        };
+        bind.extend_from_slice(b.as_bytes());
+        ops.extend(op(RGFX_OP_COMPUTE_SET_BUFFERS, &bind));
+        ops.extend(op(RGFX_OP_ENCODER_END, &[]));
+        let message = command_buffer_message(101, 2, &ops);
+        ring0.set_walk_hook(None);
+        let gate = Gate::on(&ring0, 0);
+        std::thread::scope(|scope| {
+            let walk = scope.spawn(|| walker.decode(&p.device(), &message).map_err(|_| ()));
+            gate.reached();
+            assert_eq!(ring0.decode(&device, &buffer_create(2)).unwrap(), Ok(()));
+            gate.open();
+            assert!(
+                walk.join().unwrap().is_err(),
+                "named the buffer made after its begin"
+            );
+        });
+        ring0.set_walk_hook(None);
+        assert_eq!(walker.decode(&device, &message).unwrap(), Ok(()));
+    }
+
     /// A context's close leaves the decoder no state of it, whatever comes after: a command buffer
     /// handed over after the close (taken off its ring before it) is refused unrun, as a closed
     /// context's, and makes it none; a drain begun after the close (a release the kext posted
@@ -6750,7 +8933,7 @@ mod tests {
         let late = command_buffer_message(101, 2, &render_ops());
         let mut taken = dec.sender(Some(0), super::super::Sinks::default());
         assert!(matches!(
-            taken.begin_taken(&device, &late, Some(1)).unwrap(),
+            taken.begin_taken(&device, &late, Some(1), false).unwrap(),
             Err(DecodeError::ContextClosed)
         ));
         taken.end_message();
@@ -6848,10 +9031,10 @@ mod tests {
         let gate = Gate::on(&dec, 0);
         drop(dec);
         let range = |obj_id| {
-            reims_graphics::wire::RgfxBufferDidModifyRange {
+            reims_vgpu_graphics::wire::RgfxBufferDidModifyRange {
                 header: RgfxMsgHeader {
-                    r#type: reims_graphics::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
-                    size: size_of::<reims_graphics::wire::RgfxBufferDidModifyRange>() as u32,
+                    r#type: reims_vgpu_graphics::wire::RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+                    size: size_of::<reims_vgpu_graphics::wire::RgfxBufferDidModifyRange>() as u32,
                     seqno: 0,
                 },
                 obj_id,
@@ -6891,7 +9074,7 @@ mod tests {
                 other
                     .decode(
                         &device,
-                        &range((2 << reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT) | 2)
+                        &range((2 << reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT) | 2)
                     )
                     .unwrap(),
                 Err(DecodeError::BadReference)
@@ -6964,11 +9147,12 @@ mod tests {
 
     /// A command buffer of three render passes walked long is committed in three parts as it is
     /// walked, and is one command buffer to the guest: one `CB_SCHEDULED` and one `CB_COMPLETE`,
-    /// after its last part's completion, with the GPU times from its first part's start to its
-    /// last part's end, and the error of a part that failed.
+    /// after its last part's completion, with GPU times from its first part's start that span its
+    /// parts' GPU time summed ([`super::super::split`], "Its GPU times"), and the error of a part
+    /// that failed.
     #[test]
     fn a_buffer_walked_long_is_committed_in_parts_with_one_outcome() {
-        use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
         let Split {
             p,
             mut dec,
@@ -7003,7 +9187,8 @@ mod tests {
         let r = records.lock()[0];
         assert_eq!(
             (r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns, r.status),
-            (300, 10, 60, RGFX_CB_OK)
+            (300, 10, 50, RGFX_CB_OK),
+            "10 + 15 + 15 of GPU time, from the first part's start"
         );
         // A part that fails fails the command buffer, whose later parts complete as they do.
         let message = command_buffer_message(301, 31, &ops);
@@ -7039,7 +9224,7 @@ mod tests {
                 (
                     RGFX_EVT_CB_COMPLETE,
                     301,
-                    reims_graphics::wire::RGFX_CB_PAGE_FAULT
+                    reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
                 )
             ]
         );
@@ -7131,13 +9316,10 @@ mod tests {
                 out_tx.lock().take();
             }
             if index == last {
-                for _ in 0..1000 {
-                    if gate.waiting(0) == 1 {
-                        return;
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(10));
-                }
-                panic!("the other queue's buffer never waited at its commit");
+                assert!(
+                    crate::graphics::tests::eventually(|| gate.waiting(0) == 1),
+                    "the other queue's buffer never waited at its commit"
+                );
             }
         })));
         let mut other = dec.sender(Some(0), super::super::Sinks::default());
@@ -7200,7 +9382,7 @@ mod tests {
             [(
                 RGFX_EVT_CB_COMPLETE,
                 330,
-                reims_graphics::wire::RGFX_CB_INTERNAL
+                reims_vgpu_graphics::wire::RGFX_CB_INTERNAL
             )]
         );
         assert!(
@@ -7225,7 +9407,7 @@ mod tests {
     /// completion, after its last part, never at a part's.
     #[test]
     fn a_split_after_a_mid_buffer_signal_keeps_the_signal_before_the_cut() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
+        use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
         let Split {
             p, mut dec, posted, ..
         } = splitting();
@@ -7331,5 +9513,995 @@ mod tests {
         posted.lock().clear();
         p.world().complete_all(CompleteOn::Caller);
         assert_eq!(*posted.lock(), [(RGFX_EVT_CB_COMPLETE, 350, RGFX_CB_OK)]);
+    }
+
+    /// `n` passes of [`render_ops`].
+    fn passes(n: usize) -> Vec<u8> {
+        (0..n).map(|_| render_ops()).collect::<Vec<_>>().concat()
+    }
+
+    /// `n` passes each of one draw that names its pass's index: each pass's calls tell it from
+    /// the others'.
+    fn numbered(n: u64) -> Vec<u8> {
+        (0..n)
+            .map(|i| pass_of(&draw_ops(2, 16 * i, i)))
+            .collect::<Vec<_>>()
+            .concat()
+    }
+
+    /// A walk's call: its selector, and its arguments but the objects, which a walk makes anew.
+    type Shape = (&'static str, Vec<String>);
+
+    /// The calls a walk made since `mark`, each with whether a helper made it
+    /// ([`super::super::helpers`]), and the object its command buffer makes an encoder on: every
+    /// call of the platform's but the command buffers' makes, commits, parts and handlers, which a
+    /// dealt walk makes otherwise than a whole one.
+    fn walk_calls(p: &FakePlatform, mark: u64) -> Vec<(bool, Shape, Option<ObjId>)> {
+        const NOT_THE_WALK: [&str; 6] = [
+            "commandBuffer",
+            "commit",
+            "split",
+            "part",
+            "commitPart",
+            "fold",
+        ];
+        (p.call_log().since(mark).into_iter())
+            .filter(|c| !NOT_THE_WALK.contains(&c.sel) && !c.sel.contains("Handler"))
+            .map(|c| {
+                let args = (c.args.iter())
+                    .filter(|a| !matches!(a, Arg::Obj(_)))
+                    .map(|a| format!("{a:?}"))
+                    .collect();
+                let made = c.sel.starts_with("renderCommandEncoder").then_some(c.obj);
+                (
+                    c.thread.as_deref() == Some("reims-vgpu.graphics-helper"),
+                    (c.sel, args),
+                    made,
+                )
+            })
+            .collect()
+    }
+
+    /// `calls`' chunks, each with the command buffer it was encoded into, in their order: each
+    /// thread's calls cut where an encoder is made on another command buffer than the last, and
+    /// the chunks of both threads ordered by their command buffers, which the walk makes in the
+    /// chunks' order before it walks any, the first chunk's the buffer's own, made before them
+    /// ([`GraphicsDecoder::walk_dealt`]). A whole walk's, in its order, where each op of a dealt
+    /// buffer was walked once, its chunks in their order ([`shapes`]).
+    fn dealt_chunks(calls: &[(bool, Shape, Option<ObjId>)]) -> Vec<(Vec<Shape>, ObjId)> {
+        let of = |helper: bool| {
+            let mut chunks: Vec<(Vec<Shape>, ObjId)> = Vec::new();
+            for (_, shape, made) in calls.iter().filter(|c| c.0 == helper) {
+                match made {
+                    Some(cb) if chunks.last().is_none_or(|(_, last)| last != cb) => {
+                        chunks.push((vec![shape.clone()], *cb));
+                    }
+                    _ => chunks.last_mut().unwrap().0.push(shape.clone()),
+                }
+            }
+            chunks
+        };
+        let mut dealt = [of(false), of(true)].concat();
+        dealt.sort_by_key(|(_, cb)| *cb);
+        dealt
+    }
+
+    /// The calls of `chunks`, in their order.
+    fn shapes(chunks: &[(Vec<Shape>, ObjId)]) -> Vec<Shape> {
+        chunks.iter().flat_map(|(c, _)| c.iter().cloned()).collect()
+    }
+
+    /// The calls of a whole walk, `calls`, all made here, in their order.
+    fn whole_shapes(calls: &[(bool, Shape, Option<ObjId>)]) -> Vec<Shape> {
+        assert!(calls.iter().all(|(helper, ..)| !helper), "walked here");
+        calls.iter().map(|(_, shape, _)| shape.clone()).collect()
+    }
+
+    /// The command buffers of `chunks`, in their order.
+    fn cbs_of(chunks: &[(Vec<Shape>, ObjId)]) -> Vec<ObjId> {
+        chunks.iter().map(|(_, cb)| *cb).collect()
+    }
+
+    /// Each record [`splitting`]'s sinks were handed since they were last emptied, by its type and
+    /// status, emptied.
+    fn answered(posted: &Sunk<(u32, u64, u32)>) -> Vec<(u32, u32)> {
+        let taken = std::mem::take(&mut *posted.lock());
+        taken
+            .into_iter()
+            .map(|(kind, _, status)| (kind, status))
+            .collect()
+    }
+
+    /// [`splitting`], its buffers of any length dealt to two threads, a chunk each encoder, the
+    /// helper's started before this thread walks its own.
+    fn dealing() -> Split {
+        let split = splitting();
+        split.dec.set_deal_min_bytes(Some(0));
+        split.dec.set_deal_chunk_bytes(Some(0));
+        split.dec.set_helper_first(true);
+        split
+    }
+
+    /// Where an op stream is cut into chunks dealt to two threads: at the end of each encoder that
+    /// ends the least bytes of a chunk after the last cut, into the most chunks at most, where it
+    /// holds 8 render or blit encoders and the least bytes at least; never where it holds an
+    /// event's signal or wait, a compute or video encoder, a rasterization rate map's pass, an
+    /// indirect command buffer's command or a residency of resources.
+    #[test]
+    fn deal_cuts_only_streams_of_render_and_blit_encoders() {
+        let pass = render_ops().len();
+        let eight = passes(8);
+        let at = |passes: &[usize]| Some(passes.iter().map(|n| n * pass).collect::<Vec<_>>());
+        assert_eq!(
+            deal(&eight, 0, 0, 64),
+            at(&[1, 2, 3, 4, 5, 6, 7]),
+            "each encoder"
+        );
+        assert_eq!(
+            deal(&eight, eight.len(), 2 * pass, 64),
+            at(&[2, 4, 6]),
+            "chunks of two passes"
+        );
+        assert_eq!(
+            deal(&eight, 0, 3 * pass, 64),
+            at(&[3, 6]),
+            "the last chunk shorter"
+        );
+        assert_eq!(deal(&eight, 0, 0, 3), at(&[3, 6]), "3 chunks at most");
+        assert_eq!(deal(&eight, 0, 0, 2), at(&[4]), "2 chunks at most");
+        assert_eq!(deal(&eight, 0, 0, 1), None, "no room for a second chunk");
+        assert_eq!(deal(&eight, 0, 8 * pass, 64), None, "one chunk");
+        assert_eq!(
+            deal(&eight, eight.len() + 1, 0, 64),
+            None,
+            "under the least bytes"
+        );
+        assert_eq!(deal(&passes(7), 0, 0, 64), None, "7 encoders");
+        let blits = (0..8).map(|_| blit_ops()).collect::<Vec<_>>().concat();
+        assert_eq!(
+            deal(&blits, 0, 4 * blit_ops().len(), 64),
+            Some(vec![4 * blit_ops().len()]),
+            "blit encoders"
+        );
+        let with = |extra: Vec<u8>| [passes(4), extra, passes(4)].concat();
+        let compute = [
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        assert_eq!(deal(&with(compute), 0, 0, 64), None, "a compute encoder");
+        assert_eq!(
+            deal(&with(event_op(RGFX_OP_SIGNAL_EVENT, 7, 3)), 0, 0, 64),
+            None,
+            "a signal"
+        );
+        assert_eq!(
+            deal(&with(event_op(RGFX_OP_WAIT_EVENT, 7, 3)), 0, 0, 64),
+            None,
+            "a wait"
+        );
+        let mut short = eight.clone();
+        short.truncate(eight.len() - 4);
+        assert_eq!(deal(&short, 0, 0, 64), None, "a stream that does not parse");
+    }
+
+    /// The ops of the guest's whose commands keep a command buffer whole for `reason`, each with
+    /// the encoder it lies in, which [`deal`] keeps out of a buffer dealt to two threads
+    /// ([`kept_whole`]): a match over every reason the platform keeps one whole for
+    /// ([`KeptWhole`]), so a new reason does not build until its ops are named here.
+    fn keeping_whole(reason: KeptWhole) -> Vec<Vec<u8>> {
+        use reims_vgpu_graphics::ops::render::{
+            RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER, RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT,
+            RGFX_OP_RENDER_USE_RESOURCES, RGFX_OP_RENDER_USE_RESOURCES_STAGES,
+        };
+        let compute = [
+            op(RGFX_OP_ENCODER_BEGIN_COMPUTE, &[]),
+            op(RGFX_OP_ENCODER_END, &[]),
+        ]
+        .concat();
+        let render_with = |tag: u16| {
+            [
+                op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin_render_body()),
+                op(tag, &[0; 32]),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let blit_with = |tag: u16| {
+            [
+                op(RGFX_OP_ENCODER_BEGIN_BLIT, &[]),
+                op(tag, &[0; 32]),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let rate_map = {
+            let mut body = begin_render_body();
+            let flags = RGFX_PASS_FLAG_RT_SIZE | RGFX_PASS_FLAG_RATE_MAP;
+            body[4..8].copy_from_slice(&flags.to_le_bytes());
+            [
+                op(RGFX_OP_ENCODER_BEGIN_RENDER, &body),
+                op(RGFX_OP_ENCODER_END, &[]),
+            ]
+            .concat()
+        };
+        let executions = [
+            render_with(RGFX_OP_RENDER_EXECUTE_COMMANDS_IN_BUFFER),
+            render_with(RGFX_OP_RENDER_EXECUTE_COMMANDS_INDIRECT),
+            compute.clone(),
+        ];
+        match reason {
+            // The chunks are cut at an encoder's end, and a walk ends each encoder it opens.
+            KeptWhole::OpenEncoder => vec![],
+            // No op of the guest's has the walk send `setProtectionOptions:` or
+            // `encodeSignalEventScheduled:value:`
+            // (`deal_keeps_out_every_op_that_keeps_a_buffer_whole`).
+            KeptWhole::ProtectionOptions | KeptWhole::ScheduledSignal => vec![],
+            KeptWhole::Execution => executions.to_vec(),
+            KeptWhole::Progress => [
+                vec![rate_map],
+                executions.to_vec(),
+                vec![
+                    render_with(RGFX_OP_RENDER_USE_RESOURCES),
+                    render_with(RGFX_OP_RENDER_USE_RESOURCES_STAGES),
+                    blit_with(RGFX_OP_BLIT_RESET_COMMANDS_IN_BUFFER),
+                    blit_with(RGFX_OP_BLIT_COPY_INDIRECT_COMMAND_BUFFER),
+                    blit_with(RGFX_OP_BLIT_OPTIMIZE_INDIRECT_COMMAND_BUFFER),
+                ],
+            ]
+            .concat(),
+            KeptWhole::Predication => vec![compute],
+            // The walk commits a chunk's command buffer once, as a part or as the whole.
+            KeptWhole::Committed => vec![],
+        }
+    }
+
+    /// Every reason the platform keeps a command buffer whole for, but how its GPU fails it, is
+    /// set only by ops [`deal`] keeps out of a buffer dealt to two threads, so [`kept_whole`] is
+    /// not reached: each op [`keeping_whole`] names makes a stream it would cut one it does not,
+    /// wherever it lies, and no walk of an op sends the two calls whose reasons name no op.
+    #[test]
+    fn deal_keeps_out_every_op_that_keeps_a_buffer_whole() {
+        assert!(deal(&passes(8), 0, 0, 64).is_some());
+        for reason in KeptWhole::ALL {
+            for ops in keeping_whole(reason) {
+                for before in [0, 1, 4, 8] {
+                    let stream = [passes(before), ops.clone(), passes(8 - before)].concat();
+                    assert_eq!(deal(&stream, 0, 0, 64), None, "{reason:?} after {before}");
+                }
+            }
+        }
+        let walk = [
+            include_str!("cmdbuf.rs"),
+            include_str!("render.rs"),
+            include_str!("blit.rs"),
+            include_str!("compute.rs"),
+            include_str!("video.rs"),
+            include_str!("managed.rs"),
+            include_str!("refused.rs"),
+            include_str!("surface_cache.rs"),
+            include_str!("icb.rs"),
+            include_str!("rate_map.rs"),
+            include_str!("argument.rs"),
+            include_str!("mod.rs"),
+        ]
+        .concat();
+        for call in ["set_protection_options", "encode_signal_when_scheduled"] {
+            assert!(
+                !walk.contains(&format!(".{call}(")),
+                "the decoder sends {call}"
+            );
+        }
+    }
+
+    /// A dealt command buffer the platform keeps whole at a chunk's end for a reason of its own
+    /// ([`PartCut::Whole`]) fails at its stand-in, counted as a degradation ([`KEPT_WHOLE`]), no
+    /// chunk walked again, the chunks before it committed and nothing at or after it, and its
+    /// context's gate let go; the line is logged for the first buffer kept whole for its reason
+    /// alone, each counted.
+    #[test]
+    fn a_dealt_buffer_kept_whole_at_a_chunk_s_end_is_counted() {
+        let Split {
+            p, mut dec, posted, ..
+        } = dealing();
+        let device = p.device();
+        let counted = || {
+            (reims_vgpu_vulkan::answer::degradation_counts().into_iter())
+                .find(|(code, _)| code == KEPT_WHOLE)
+                .map_or(0, |(_, n)| n)
+        };
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
+        let before = counted();
+        // Kept whole at chunk 0's end, then at chunk 3's.
+        for (n, (seqno, skip)) in [(395, 0), (396, 3)].into_iter().enumerate() {
+            let whole = Step::value(PartCut::Whole(KeptWhole::Progress));
+            p.script().after("commitPart", skip, whole);
+            let begun = dec.walks_begun();
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(seqno, 120, &numbered(8));
+            assert!(refusing(|| dec.decode(&device, &message)).is_err());
+            assert_eq!(p.script().pending(), 0, "{seqno}: its script ran");
+            assert_eq!(counted(), before + n as u64 + 1, "{seqno}: counted");
+            assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+            let dealt = dealt_chunks(&walk_calls(&p, mark));
+            assert_eq!(
+                p.world().committed(),
+                cbs_of(&dealt)[..skip as usize],
+                "{seqno}: the chunks before committed"
+            );
+            assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                posted.lock().split_off(0),
+                [(RGFX_EVT_CB_COMPLETE, seqno, RGFX_CB_INTERNAL)]
+            );
+            assert!(dec.shared.split_gate.try_split(0).is_some());
+        }
+        let lines = (logs.take().into_iter())
+            .filter(|(level, target, line)| {
+                *level == log::Level::Error
+                    && target == "reims_vgpu::graphics"
+                    && line.contains("was kept whole at a chunk's end (progress)")
+            })
+            .count();
+        assert_eq!(lines, 1, "logged for the first alone");
+    }
+
+    /// A dealt command buffer that the platform makes no command buffer for one of its chunks of
+    /// ([`CommandBuffer::part`]), each made before any chunk is walked, is walked whole, as one
+    /// not dealt: each op once, here, the command buffers made let go of unused, and its parts and
+    /// records as a whole walk's. So is one whose queue's room runs out while its chunks' are
+    /// made, as other walks and begins make command buffers on it: no make past the room, and no
+    /// cut either, its queue full.
+    #[test]
+    fn a_dealt_buffer_whose_chunk_gets_no_command_buffer_or_room_is_walked_whole() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let ops = numbered(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(375, 105, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        let parts_whole = p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        p.script().after("part", 3, Step::Nil);
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(376, 106, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        assert_eq!(
+            whole_shapes(&walk_calls(&p, mark)),
+            whole,
+            "walked whole, here"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "part").count(), 4);
+        assert!(!sels.contains(&"commitPart"), "cut as a whole walk is");
+        assert_eq!(
+            p.world().complete_all(CompleteOn::Caller),
+            parts_whole,
+            "its parts"
+        );
+        assert_eq!(answered(&posted), answered_whole);
+
+        // Its third chunk's make held while other command buffers take the queue's room.
+        let in_flight = Arc::clone(&dec.queue_counts(1).unwrap().in_flight);
+        let held = HeldCall::new();
+        p.script().after("part", 2, Step::Hold(held.clone()));
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        let walked = std::thread::scope(|s| {
+            let filler = s.spawn(|| {
+                assert!(held.reached(Duration::from_secs(10)), "a make held");
+                in_flight.fetch_add(TAKE_IN_FLIGHT_MAX, Ordering::AcqRel);
+                held.open();
+            });
+            let walked = dec.decode(&device, &command_buffer_message(377, 107, &ops));
+            filler.join().unwrap();
+            walked.unwrap()
+        });
+        in_flight.fetch_sub(TAKE_IN_FLIGHT_MAX, Ordering::AcqRel);
+        assert_eq!(walked, Ok(()));
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        assert_eq!(
+            whole_shapes(&walk_calls(&p, mark)),
+            whole,
+            "walked whole, here"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "part").count(), 3);
+        assert!(
+            !sels.contains(&"commitPart") && !sels.contains(&"split"),
+            "not cut, its queue full"
+        );
+        assert_eq!(p.world().complete_all(CompleteOn::Caller), 1, "one commit");
+        assert_eq!(answered(&posted), answered_whole);
+    }
+
+    /// What finding the cuts costs ([`deal`]): nothing measurable on a stream under the least
+    /// bytes, which it does not read; a read of each op's header on a long one. Printed (run
+    /// with `--no-capture`).
+    #[test]
+    #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
+    fn deal_reads_nothing_of_a_short_stream() {
+        use std::hint::black_box;
+        let short = passes(2);
+        let long = passes(107);
+        let each = |ops: &[u8], runs: u32| {
+            let start = std::time::Instant::now();
+            for _ in 0..runs {
+                black_box(deal(
+                    black_box(ops),
+                    DEAL_MIN_BYTES,
+                    DEAL_CHUNK_BYTES,
+                    TAKE_IN_FLIGHT_MAX,
+                ));
+            }
+            start.elapsed().as_nanos() as f64 / f64::from(runs)
+        };
+        assert!(short.len() < DEAL_MIN_BYTES && long.len() >= DEAL_MIN_BYTES);
+        let cuts = deal(&long, DEAL_MIN_BYTES, DEAL_CHUNK_BYTES, TAKE_IN_FLIGHT_MAX);
+        assert!(cuts.is_some());
+        let (short_ns, long_ns) = (each(&short, 1_000_000), each(&long, 1_000));
+        let ops = op_bodies(&long).count();
+        eprintln!(
+            "deal: {short_ns:.2} ns a stream of {} bytes; {long_ns:.0} ns one of {} bytes, {ops} \
+             ops, in {} chunks",
+            short.len(),
+            long.len(),
+            cuts.map_or(0, |c| c.len() + 1)
+        );
+        assert!(short_ns < 50.0, "{short_ns} ns a short stream");
+    }
+
+    /// A command buffer dealt to two threads answers as one walked whole, whichever thread is
+    /// ahead: each op walked once, its even chunks here and its odd ones on a helper; each chunk's
+    /// command buffer committed as a part in their order, the last chunk's the last; its walk
+    /// begun once; one `CB_SCHEDULED` and one `CB_COMPLETE`, after its last part; and the error
+    /// of a part that failed.
+    #[test]
+    fn a_dealt_buffer_answers_as_walked_whole() {
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let ops = numbered(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(360, 90, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+        assert_eq!(
+            answered_whole,
+            [
+                (RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK),
+                (RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)
+            ]
+        );
+
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        dec.set_helper_first(true);
+        // The helper ahead, this thread's walk held 2 ms an op; then this thread ahead, the
+        // helper's held so, so this thread waits for each of its chunks.
+        for (seqno, ahead) in [(361, true), (362, false)] {
+            let clock = Arc::clone(&p);
+            dec.set_walk_hook(Some(Arc::new(move |_| {
+                let helper = std::thread::current().name() == Some("reims-vgpu.graphics-helper");
+                if helper != ahead {
+                    std::thread::sleep(std::time::Duration::from_millis(2));
+                }
+                clock.virtual_clock().advance(SPLIT_AFTER);
+            })));
+            let (begun, waits, mark) = (dec.walks_begun(), dec.deal_waits(), p.call_log().mark());
+            assert_eq!(
+                dec.decode(&device, &command_buffer_message(seqno, 91, &ops))
+                    .unwrap(),
+                Ok(())
+            );
+            assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+            let calls = walk_calls(&p, mark);
+            let dealt = dealt_chunks(&calls);
+            assert_eq!(dealt.len(), 8, "a chunk a pass");
+            assert_eq!(
+                shapes(&dealt),
+                whole,
+                "each op walked once, its chunks in their order"
+            );
+            assert_eq!(
+                calls.iter().filter(|(helper, ..)| *helper).count(),
+                calls.len() / 2,
+                "the odd chunks on a helper"
+            );
+            if !ahead {
+                assert!(
+                    dec.deal_waits() > waits,
+                    "this thread waited for the helper"
+                );
+            }
+            let sels = p.call_log().sels_since(mark);
+            assert_eq!(sels.iter().filter(|s| **s == "part").count(), 7);
+            assert_eq!(sels.iter().filter(|s| **s == "commitPart").count(), 7);
+            assert!(!sels.contains(&"split"), "no cut inside a chunk");
+            let parts = p.world().committed();
+            assert_eq!(parts, cbs_of(&dealt), "each chunk a part, in their order");
+            assert_eq!(
+                answered(&posted),
+                [(RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK)],
+                "at its take"
+            );
+            for part in &parts[..7] {
+                let ok = CommandBufferStatus::COMPLETED;
+                assert!(p.world().complete(*part, ok, None, CompleteOn::Caller));
+            }
+            assert!(posted.lock().is_empty(), "completed before its last part");
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(answered(&posted), [(RGFX_EVT_CB_COMPLETE, RGFX_CB_OK)]);
+        }
+
+        // A part between the first and the last fails: the buffer's error, as a part's of a
+        // whole walk.
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(363, 92, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 8);
+        let error = NsErrorText {
+            domain: "MTLCommandBufferErrorDomain".to_owned(),
+            code: 3,
+            description: "Page Fault".to_owned(),
+        };
+        let failed = CommandBufferStatus::ERROR;
+        assert!(
+            p.world()
+                .complete(parts[3], failed, Some(error), CompleteOn::Caller)
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            answered(&posted),
+            [
+                (RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK),
+                (
+                    RGFX_EVT_CB_COMPLETE,
+                    reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
+                )
+            ]
+        );
+    }
+
+    /// A dealt buffer's chunks go to the two threads the longest first, each to the thread dealt
+    /// fewer bytes so far, this thread on a tie, the first chunk always this thread's: chunks of
+    /// one length in turn, the odd ones to the helper; a longest chunk anywhere after the first
+    /// to the helper, which takes the others only while it holds fewer bytes.
+    #[test]
+    fn helper_chunks_deals_the_longest_first_to_the_thread_dealt_fewer_bytes() {
+        let chunks_of = |lens: &[usize]| -> Vec<Range<usize>> {
+            let mut at = 0;
+            (lens.iter())
+                .map(|len| {
+                    at += len;
+                    at - len..at
+                })
+                .collect()
+        };
+        let (f, t) = (false, true);
+        for (lens, helper) in [
+            (&[4, 4, 4, 4, 4, 4][..], &[f, t, f, t, f, t][..]),
+            (&[4, 4, 4, 4, 4], &[f, t, f, t, f]),
+            (&[5, 7], &[f, t]),
+            // Heaven's frame buffer's chunks, in KiB (m3-max-32395).
+            (&[161, 135, 471, 51, 1], &[f, f, t, f, f]),
+            (&[10, 10, 10, 100], &[f, f, f, t]),
+            (&[100, 10, 10, 10], &[f, t, t, t]),
+            (&[30, 10, 50, 40, 20], &[f, f, t, f, t]),
+        ] {
+            assert_eq!(helper_chunks(&chunks_of(lens)), helper, "{lens:?}");
+        }
+    }
+
+    /// A dealt buffer whose third pass is far the longest has the helper walk that pass alone,
+    /// from the walk's start, and this thread every other chunk: each op walked once, each
+    /// chunk a part committed in their order, and the buffer's records as a whole walk's.
+    #[test]
+    fn a_dealt_buffer_s_longest_chunk_goes_to_the_helper_and_the_order_stays() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let draws = |pass: u64, n: u64| -> Vec<u8> {
+            (0..n).flat_map(|d| draw_ops(2, 16 * pass, d)).collect()
+        };
+        let long = 2;
+        let ops: Vec<u8> = (0..8)
+            .map(|i| pass_of(&draws(i, if i == long { 40 } else { 2 })))
+            .collect::<Vec<_>>()
+            .concat();
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(365, 95, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        dec.set_helper_first(true);
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(366, 96, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        // Each call to the chunk whose command buffer its thread's last encoder was made on.
+        let calls = walk_calls(&p, mark);
+        let mut chunk_of: Vec<(ObjId, bool, Vec<Shape>)> = Vec::new();
+        let mut last = [None::<usize>, None];
+        for (helper, shape, made) in calls {
+            let at = match made {
+                Some(cb) => {
+                    chunk_of.push((cb, helper, Vec::new()));
+                    chunk_of.len() - 1
+                }
+                None => last[usize::from(helper)].expect("a call in an encoder"),
+            };
+            last[usize::from(helper)] = Some(at);
+            chunk_of[at].2.push(shape);
+        }
+        let parts = p.world().committed();
+        assert_eq!(parts.len(), 8, "a chunk a pass, each a part");
+        let in_order: Vec<&(ObjId, bool, Vec<Shape>)> = (parts.iter())
+            .map(|cb| {
+                chunk_of
+                    .iter()
+                    .find(|c| c.0 == *cb)
+                    .expect("a chunk walked")
+            })
+            .collect();
+        assert_eq!(
+            in_order.iter().map(|c| c.1).collect::<Vec<_>>(),
+            [false, false, true, false, false, false, false, false],
+            "the longest chunk the helper's alone"
+        );
+        assert_eq!(
+            in_order
+                .iter()
+                .flat_map(|c| c.2.iter().cloned())
+                .collect::<Vec<_>>(),
+            whole,
+            "each op walked once, its chunks committed in their order"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(sels.iter().filter(|s| **s == "commitPart").count(), 7);
+        assert_eq!(
+            answered(&posted),
+            [(RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK)],
+            "at its take"
+        );
+        p.world().complete_all(CompleteOn::Caller);
+        assert_eq!(
+            answered(&posted),
+            answered_whole[1..],
+            "completed as a whole walk"
+        );
+    }
+
+    /// The chunks of a dealt buffer no helper has taken by the end of this thread's first are
+    /// taken back and walked here, as a whole walk goes on: each op once, the walk begun once,
+    /// the command buffers made for the chunks let go of unused, and the buffer's parts and
+    /// records as a whole walk's.
+    #[test]
+    fn a_dealt_buffer_no_helper_takes_is_walked_here() {
+        let Split {
+            p, mut dec, posted, ..
+        } = splitting();
+        let device = p.device();
+        let ops = numbered(8);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(370, 100, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        let parts_whole = p.world().complete_all(CompleteOn::Caller);
+        let answered_whole = answered(&posted);
+
+        dec.set_deal_min_bytes(Some(0));
+        dec.set_deal_chunk_bytes(Some(0));
+        let held = dec.shared.helpers.hold_all();
+        let (begun, mark) = (dec.walks_begun(), p.call_log().mark());
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(371, 101, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        drop(held);
+        assert_eq!(dec.walks_begun(), begun + 1, "its walk begun once");
+        assert_eq!(
+            whole_shapes(&walk_calls(&p, mark)),
+            whole,
+            "each op walked once, in its order"
+        );
+        let sels = p.call_log().sels_since(mark);
+        assert_eq!(
+            sels.iter().filter(|s| **s == "part").count(),
+            7,
+            "every chunk's but the first's"
+        );
+        assert!(!sels.contains(&"commitPart"), "cut as a whole walk is");
+        assert_eq!(
+            p.world().complete_all(CompleteOn::Caller),
+            parts_whole,
+            "its parts"
+        );
+        assert_eq!(answered(&posted), answered_whole);
+    }
+
+    /// A part of a dealt buffer that fails from one of its encoders on keeps the buffer whole
+    /// from it, as a whole walk's cut would, whichever thread walked it: every later chunk's
+    /// command buffer folded into it in their order, never committed, the parts before it
+    /// committed, each op walked once, and the buffer's records and its error as a whole walk's.
+    #[test]
+    fn a_dealt_part_that_fails_from_an_encoder_on_takes_in_every_later_chunk() {
+        use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+        let Split {
+            p,
+            mut dec,
+            posted,
+            records,
+        } = dealing();
+        let device = p.device();
+        let ops = numbered(8);
+        dec.set_deal_min_bytes(None);
+        let mark = p.call_log().mark();
+        assert_eq!(
+            dec.decode(&device, &command_buffer_message(379, 109, &ops))
+                .unwrap(),
+            Ok(())
+        );
+        let whole = whole_shapes(&walk_calls(&p, mark));
+        p.world().complete_all(CompleteOn::Caller);
+        posted.lock().clear();
+        dec.set_deal_min_bytes(Some(0));
+        // The chunk whose part fails (its index among the commits): the first, kept whole with
+        // no part out; one of this thread's; one of the helper's; and the last but one, this
+        // thread's last, whose command buffer is the walk's.
+        for (seqno, failing) in [(380, 0), (381, 2), (382, 3), (383, 6)] {
+            p.script()
+                .after("commitPart", failing, Step::value(PartCut::Fails));
+            let mark = p.call_log().mark();
+            assert_eq!(
+                dec.decode(&device, &command_buffer_message(seqno, 110, &ops))
+                    .unwrap(),
+                Ok(())
+            );
+            let dealt = dealt_chunks(&walk_calls(&p, mark));
+            assert_eq!(shapes(&dealt), whole, "{seqno}: each op walked once");
+            let cbs = cbs_of(&dealt);
+            let sels = p.call_log().sels_since(mark);
+            assert_eq!(
+                sels.iter().filter(|s| **s == "commitPart").count(),
+                failing as usize + 1,
+                "{seqno}: no commit tried after the part kept whole"
+            );
+            let folds = p.call_log().calls_to("fold");
+            let folded: Vec<_> = (folds.iter().rev().take(7 - failing as usize).rev())
+                .map(|c| c.args[0].as_obj().unwrap())
+                .collect();
+            assert_eq!(
+                folded,
+                cbs[failing as usize + 1..],
+                "{seqno}: every later chunk folded, in their order"
+            );
+            let into = folds.iter().rev().take(7 - failing as usize);
+            assert!(
+                into.into_iter().all(|c| c.obj == cbs[failing as usize]),
+                "{seqno}: into the part kept whole"
+            );
+            let parts = p.world().committed();
+            assert_eq!(
+                parts,
+                cbs[..=failing as usize],
+                "{seqno}: the parts before it, then the whole"
+            );
+            records.lock().clear();
+            let error = NsErrorText {
+                domain: "MTLCommandBufferErrorDomain".to_owned(),
+                code: 3,
+                description: "Page Fault".to_owned(),
+            };
+            let last = *parts.last().unwrap();
+            assert!(p.world().set_gpu_times(last, 10, 30));
+            let failed = CommandBufferStatus::ERROR;
+            assert!(
+                p.world()
+                    .complete(last, failed, Some(error), CompleteOn::Caller)
+            );
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                answered(&posted),
+                [
+                    (RGFX_EVT_CB_SCHEDULED, RGFX_CB_OK),
+                    (
+                        RGFX_EVT_CB_COMPLETE,
+                        reims_vgpu_graphics::wire::RGFX_CB_PAGE_FAULT
+                    )
+                ],
+                "{seqno}"
+            );
+            let r = records.lock()[0];
+            if failing == 0 {
+                assert_eq!(
+                    (r.cb_obj_id, r.gpu_start_ns, r.gpu_end_ns),
+                    (seqno, 10, 30),
+                    "its one part's GPU times, counted once"
+                );
+            }
+            assert!(
+                dec.shared.split_gate.try_split(0).is_some(),
+                "{seqno}: the gate let go"
+            );
+        }
+    }
+
+    /// A dealt walk that faults in a chunk has its failure at its stand-in's completion alone, as
+    /// one whose walk faults whole: the fault of the first chunk in their order that faults,
+    /// whichever thread found its own first, the parts before it committed, nothing at or after
+    /// it committed, and its context's gate let go.
+    #[test]
+    fn a_dealt_walk_that_faults_answers_its_first_faulting_chunk() {
+        use reims_vgpu_graphics::ops::blit::RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER;
+        let Split {
+            p, mut dec, posted, ..
+        } = dealing();
+        let device = p.device();
+        // A render op and a blit op with no encoder open fault the walk, each its own way.
+        let render = op(
+            RGFX_OP_RENDER_DRAW_PRIMITIVES,
+            RgfxOpDrawPrimitives {
+                primitive_type: 3,
+                vertex_start: 0,
+                vertex_count: 3,
+            }
+            .as_bytes(),
+        );
+        let blit = op(RGFX_OP_BLIT_COPY_BUFFER_TO_BUFFER, &[0; 40]);
+        // Chunk `i` is what follows pass `i - 1`'s end, and pass `i`: the stream with `bad` at
+        // the start of each of `chunks`.
+        let with = |faults: &[(u64, &[u8])]| {
+            (0..8u64)
+                .map(|i| {
+                    let bad: Vec<u8> = (faults.iter())
+                        .filter(|(at, _)| *at == i)
+                        .flat_map(|(_, b)| b.iter().copied())
+                        .collect();
+                    [bad, pass_of(&draw_ops(2, 16 * i, i))].concat()
+                })
+                .collect::<Vec<_>>()
+                .concat()
+        };
+        // The stream; the chunk that faults first, and its group: the helper's, this thread's
+        // later chunk walked; the helper's, found as this thread found its own later one; this
+        // thread's, the helper's later; and this thread's first chunk. A chunk with a fault op is
+        // longer than the others, so it is dealt first ([`helper_chunks`]): the longest to the
+        // helper, the next to this thread.
+        let cases: [(u64, Vec<u8>, usize, &str); 4] = [
+            (390, with(&[(3, &render[..])]), 3, "render"),
+            (391, with(&[(2, &blit[..]), (5, &render[..])]), 2, "blit"),
+            (392, with(&[(3, &render[..]), (4, &blit[..])]), 3, "render"),
+            (393, with(&[(0, &blit[..])]), 0, "blit"),
+        ];
+        for (cb, ops, first, group) in cases {
+            assert!(deal(&ops, 0, 0, 64).is_some());
+            let mark = p.call_log().mark();
+            let message = command_buffer_message(cb, cb - 300, &ops);
+            let fault = refusing(|| dec.decode(&device, &message)).unwrap_err();
+            let detail = fault.detail().unwrap_or_default().to_owned();
+            assert!(
+                detail.contains(&format!("a {group} op")),
+                "{cb}: the first chunk's fault ({detail})"
+            );
+            let cbs = cbs_of(&dealt_chunks(&walk_calls(&p, mark)));
+            let parts = p.world().committed();
+            assert!(
+                parts.len() <= first,
+                "{cb}: nothing at or after it committed"
+            );
+            assert_eq!(parts, cbs[..parts.len()], "{cb}: the parts before it");
+            assert!(dec.stand_in_for_failed(&device, &message).unwrap());
+            p.world().complete_all(CompleteOn::Caller);
+            assert_eq!(
+                *posted.lock(),
+                [(RGFX_EVT_CB_COMPLETE, cb, RGFX_CB_INTERNAL)]
+            );
+            posted.lock().clear();
+            assert!(
+                dec.shared.split_gate.try_split(0).is_some(),
+                "{cb}: the gate held after the walk"
+            );
+        }
+    }
+
+    /// A dealt walk begun in an entry before the process's exit began ends after it, its helper
+    /// starting its chunks once the exit closed the gate and walking all of them, so the entry,
+    /// and the exit waiting for it, end: the helper's walk is part of the entry's, with no step of
+    /// the exit gate of its own ([`crate::entry::run_within`]). In a child, which exits.
+    #[test]
+    fn a_dealt_walk_ends_once_the_process_s_exit_began() {
+        const TEST: &str =
+            "graphics::decode::cmdbuf::tests::a_dealt_walk_ends_once_the_process_s_exit_began";
+        const CHILD: &str = "RVG_DEAL_EXIT_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", TEST, "--nocapture", "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            let err = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{err}");
+            assert!(
+                err.contains("dealt walk ended: Ok(Ok(())), 4 of 8 chunks on the helper"),
+                "{err}"
+            );
+            return;
+        }
+        let Split { p, dec, .. } = dealing();
+        let in_step = Arc::new(AtomicBool::new(false));
+        let walker = {
+            let in_step = Arc::clone(&in_step);
+            std::thread::Builder::new()
+                .name("walker".to_owned())
+                .spawn(move || {
+                    crate::entry::run(|_| {
+                        in_step.store(true, Ordering::SeqCst);
+                        while !reims_vgpu_vulkan::exit_gate::closed() {
+                            std::thread::sleep(std::time::Duration::from_millis(1));
+                        }
+                        let mark = p.call_log().mark();
+                        let device = p.device();
+                        let mut dec = dec;
+                        let message = command_buffer_message(400, 130, &numbered(8));
+                        let walked = refusing(|| dec.decode(&device, &message));
+                        let calls = walk_calls(&p, mark);
+                        let theirs: Vec<_> = calls.iter().filter(|c| c.0).cloned().collect();
+                        let theirs = dealt_chunks(&theirs);
+                        let _ = std::io::Write::write_fmt(
+                            &mut std::io::stderr(),
+                            format_args!(
+                                "dealt walk ended: {walked:?}, {} of 8 chunks on the helper\n",
+                                theirs.len()
+                            ),
+                        );
+                    });
+                })
+                .unwrap()
+        };
+        while !in_step.load(Ordering::SeqCst) {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        reims_vgpu_vulkan::exit_gate::arm();
+        drop(walker);
+        crate::graphics::tests::host_exit(0);
     }
 }

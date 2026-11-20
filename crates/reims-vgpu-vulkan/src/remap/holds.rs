@@ -18,6 +18,13 @@ pub(super) struct Holds {
     lengths: BTreeMap<u64, usize>,
     /// The unmaps that wait, no two sharing a page: each made whole once no hold meets it.
     waiting: Vec<Range<u64>>,
+    /// The unmaps released holds are making now, taken out of [`Self::waiting`]: an overwrite
+    /// that meets one waits until it is made (`super::UnmapHold`'s drop).
+    unmapping: Vec<Range<u64>>,
+    /// Each live keep's pages ([`super::ImportKeep`]), by their first byte and the keep's number,
+    /// to their end: pages a runtime import holds that no unmap here defers, which only
+    /// [`Holds::imported`] reads, so [`Holds::meets`] walks no such range.
+    kept: BTreeMap<(u64, u64), u64>,
 }
 
 impl Holds {
@@ -28,6 +35,8 @@ impl Holds {
             held: BTreeMap::new(),
             lengths: BTreeMap::new(),
             waiting: Vec::new(),
+            unmapping: Vec::new(),
+            kept: BTreeMap::new(),
         }
     }
 
@@ -40,6 +49,27 @@ impl Holds {
             .or_default() += 1;
         self.held.insert((pages.start, id), pages.end);
         id
+    }
+
+    /// A keep on `pages` ([`super::ImportKeep`]): its number, from the holds' numbering.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+    pub(super) fn keep(&mut self, pages: Range<u64>) -> u64 {
+        let id = self.next;
+        self.next = self.next.wrapping_add(1);
+        self.kept.insert((pages.start, id), pages.end);
+        id
+    }
+
+    /// The keep `id` on the pages from `first` goes.
+    #[cfg_attr(not(any(test, target_os = "linux")), allow(dead_code))]
+    pub(super) fn unkeep(&mut self, first: u64, id: u64) {
+        self.kept.remove(&(first, id));
+    }
+
+    /// Whether a runtime import holds a page of `pages`: a live hold or a live keep meets them.
+    pub(super) fn imported(&self, pages: &Range<u64>) -> bool {
+        self.meets(pages)
+            || (self.kept.iter()).any(|(&(first, _), &end)| first < pages.end && pages.start < end)
     }
 
     /// The most bytes a live hold took.
@@ -95,10 +125,26 @@ impl Holds {
         !self.waiting.is_empty()
     }
 
-    /// Whether an unmap of a page of `pages` waits.
+    /// Whether an unmap of a page of `pages` waits, or is being made.
     #[cfg(test)]
     pub(super) fn waits(&self, pages: &Range<u64>) -> bool {
         (self.waiting.iter()).any(|waiting| waiting.start < pages.end && pages.start < waiting.end)
+            || self.unmapping_meets(pages)
+    }
+
+    /// `unmaps`, which [`Self::release`] answered, are being made from now on.
+    pub(super) fn unmapping(&mut self, unmaps: &[Range<u64>]) {
+        self.unmapping.extend_from_slice(unmaps);
+    }
+
+    /// `unmaps`, which [`Self::unmapping`] took, are made.
+    pub(super) fn unmapped(&mut self, unmaps: &[Range<u64>]) {
+        self.unmapping.retain(|making| !unmaps.contains(making));
+    }
+
+    /// Whether an unmap being made meets `pages`.
+    pub(super) fn unmapping_meets(&self, pages: &Range<u64>) -> bool {
+        (self.unmapping.iter()).any(|making| making.start < pages.end && pages.start < making.end)
     }
 
     /// The hold `id` on the pages from `first` goes: the unmaps no live hold meets any more,
@@ -182,6 +228,24 @@ mod tests {
         assert_eq!(h.release(0, long), vec![pages(999, 1)]);
     }
 
+    /// A keep holds its pages imported, as a hold does, until it goes; an unmap of them is made
+    /// at once, and the longest hold stays the holds' alone
+    #[test]
+    fn a_keep_holds_its_pages_imported_and_defers_no_unmap() {
+        let mut h = Holds::new();
+        let keep = h.keep(pages(0, 1000));
+        let hold = h.hold(pages(2000, 1));
+        assert!(h.imported(&pages(999, 1)), "the keep");
+        assert!(h.imported(&pages(2000, 1)), "the hold");
+        assert!(!h.imported(&pages(1000, 1000)), "between them");
+        assert_eq!(h.longest(), PAGE, "the keep widens no search");
+        assert!(!h.unmap(pages(10, 1)), "made at once");
+        h.unkeep(0, keep);
+        assert!(!h.imported(&pages(999, 1)));
+        assert!(h.release(2000 * PAGE, hold).is_empty());
+        assert!(!h.imported(&pages(2000, 1)));
+    }
+
     /// A long hold, once released, no longer widens the search below a range: the longest live
     /// hold bounds it, whichever went before
     #[test]
@@ -238,6 +302,31 @@ mod tests {
             let longest = live.iter().map(|(held, _)| held.end - held.start).max();
             assert_eq!(h.longest(), longest.unwrap_or(0), "step {step}");
         }
+    }
+
+    /// An unmap a release answered meets pages while it is being made, and no more once made;
+    /// those of another release stay
+    #[test]
+    fn a_released_unmap_meets_pages_until_it_is_made() {
+        let mut h = Holds::new();
+        let (a, b) = (h.hold(pages(0, 4)), h.hold(pages(10, 2)));
+        assert!(h.unmap(pages(0, 4)) && h.unmap(pages(10, 2)));
+        let first = h.release(0, a);
+        assert_eq!(first, vec![pages(0, 4)]);
+        h.unmapping(&first);
+        let second = h.release(10 * PAGE, b);
+        h.unmapping(&second);
+        assert!(h.unmapping_meets(&pages(3, 2)) && h.waits(&pages(3, 1)));
+        assert!(!h.unmapping_meets(&pages(4, 6)), "between them");
+        assert!(!h.unmaps_wait(), "none waits: both are being made");
+        h.unmapped(&first);
+        assert!(!h.unmapping_meets(&pages(0, 4)) && !h.waits(&pages(0, 4)));
+        assert!(
+            h.unmapping_meets(&pages(11, 1)),
+            "the other is still being made"
+        );
+        h.unmapped(&second);
+        assert!(!h.unmapping_meets(&pages(0, 20)));
     }
 
     /// Pages mapped anew, or unmapped now, under a waiting unmap leave it: what of it they cover

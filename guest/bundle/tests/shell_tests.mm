@@ -42,10 +42,15 @@
 #import "RgfxBinaryArchive.h"
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
+#import "RgfxDynamicLibrary.h"
 #import "RgfxFunction.h"
+#import "RgfxFunctionTable.h"
+#import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
+#import "RgfxRasterizationRateMap.h"
 #import "RgfxRenderPipelineState.h"
 #include <set>
 #include <vector>
@@ -65,16 +70,21 @@
 #include <IOSurface/IOSurface.h>
 
 #include <crt_externs.h>
+#include <mach-o/dyld.h>
 #include <mach/mach.h>
 #include <pthread.h>
 #include <signal.h>
 #include <spawn.h>
+#include <limits.h>
+#include <stdlib.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
 #include <atomic>
 #include <chrono>
 #include <condition_variable>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -102,35 +112,78 @@
 @implementation TestHandle
 @end
 
-// A drawable that records how it was presented: "now", "at T" or "after D", in order.
+// MTLLibrarySPI's form of newFunctionWithName:constantValues:error:, which macOS 13's Maps
+// (VectorKit) sends to the libraries it makes without asking respondsToSelector: first.
+@protocol RgfxTestLibrarySPI
+- (id<MTLFunction>)newFunctionWithName:(NSString *)name
+                        constantValues:(MTLFunctionConstantValues *)constantValues
+                       pipelineLibrary:(id)pipelineLibrary
+                                 error:(NSError **)error;
+@end
+
+// A drawable that records how it was presented: "now", "at T" or "after D", in order. It keeps
+// the present-scheduled handlers Metal's presentDrawable: adds (addPresentScheduledHandler:,
+// RgfxMetalPrivate.h) and calls them at reportPresentScheduled, as CAMetalDrawable does once its
+// layer's image queue has taken the present; or, where `reports` says, at the add (a drawable with
+// no layer on screen) or at its present.
+typedef NS_ENUM(int, TestDrawableReports) {
+	TestDrawableReportsWhenTold,
+	TestDrawableReportsAtAdd,
+	TestDrawableReportsAtPresent,
+};
 @interface TestDrawable : NSObject <MTLDrawable>
 @property(nonatomic) NSMutableArray<NSString *> *presents;
+@property(nonatomic) NSMutableArray *scheduledHandlers;
+@property(nonatomic) TestDrawableReports reports;
+- (void)reportPresentScheduled;
 @end
 
 @implementation TestDrawable
 - (instancetype)init
 {
-	if ((self = [super init]))
+	if ((self = [super init])) {
 		_presents = [NSMutableArray array];
+		_scheduledHandlers = [NSMutableArray array];
+	}
 	return self;
+}
+- (void)addPresentScheduledHandler:(void (^)(id<MTLDrawable>))block
+{
+	@synchronized(self) {
+		[_scheduledHandlers addObject:[block copy]];
+	}
+	if (_reports == TestDrawableReportsAtAdd)
+		[self reportPresentScheduled];
+}
+- (void)reportPresentScheduled
+{
+	NSArray *handlers = nil;
+	@synchronized(self) {
+		handlers = [_scheduledHandlers copy];
+		[_scheduledHandlers removeAllObjects];
+	}
+	for (void (^h)(id<MTLDrawable>) in handlers)
+		h(self);
+}
+- (void)noteAndReport:(NSString *)how
+{
+	@synchronized(self) {
+		[_presents addObject:how];
+	}
+	if (_reports == TestDrawableReportsAtPresent)
+		[self reportPresentScheduled];
 }
 - (void)present
 {
-	@synchronized(self) {
-		[_presents addObject:@"now"];
-	}
+	[self noteAndReport:@"now"];
 }
 - (void)presentAtTime:(CFTimeInterval)presentationTime
 {
-	@synchronized(self) {
-		[_presents addObject:[NSString stringWithFormat:@"at %g", presentationTime]];
-	}
+	[self noteAndReport:[NSString stringWithFormat:@"at %g", presentationTime]];
 }
 - (void)presentAfterMinimumDuration:(CFTimeInterval)duration
 {
-	@synchronized(self) {
-		[_presents addObject:[NSString stringWithFormat:@"after %g", duration]];
-	}
+	[self noteAndReport:[NSString stringWithFormat:@"after %g", duration]];
 }
 - (void)addPresentedHandler:(MTLDrawablePresentedHandler)block
 {
@@ -156,6 +209,259 @@ uint64_t nextDestroyed(TestRing &ring);
 bool ringEmpty(TestRing &ring);
 void drainRing(TestRing &ring);
 void syncAsCommitted(std::initializer_list<id> textures);
+
+// A device that answers as the M3 Max does where the texture rules ask: an Apple GPU (every Apple
+// family) that makes 1, 2 and 4 samples a texel (oracle_texdesc device ms.s8: "sampleCount (8) is
+// not supported by device").
+@interface RgfxAppleFamilyDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count;
+@end
+@implementation RgfxAppleFamilyDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count
+{
+	return count == 1 || count == 2 || count == 4;
+}
+@end
+
+// An Apple GPU's device that sizes a heap's buffers as the M3 Max under macOS 27.0.1 does in a
+// Shared heap: its length, 256-byte aligned (oracle_bundle Apple heap.shared).
+@interface RgfxAppleHeapDevice : RgfxAppleFamilyDevice
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length
+                                            options:(MTLResourceOptions)options;
+@end
+@implementation RgfxAppleHeapDevice
+- (MTLSizeAndAlign)heapBufferSizeAndAlignWithLength:(NSUInteger)length
+                                            options:(MTLResourceOptions)options
+{
+	(void)options;
+	return {length, 256};
+}
+@end
+
+// A device as an arm64 guest's answers: no Apple family, as the host lets it answer none, and an
+// Apple GPU's texture rules (RgfxAppleRulesDevice, on arm64 builds).
+@interface RgfxGuestRulesDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+- (BOOL)rgfxAppleRules;
+@end
+@implementation RgfxGuestRulesDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	(void)family;
+	return NO;
+}
+- (BOOL)rgfxAppleRules
+{
+	return YES;
+}
+@end
+
+// An Apple GPU's device that answers the M3 Max's linear texture alignment, 16 bytes, for the
+// formats the tests make textures over buffers of (oracle_pastlen Apple, R32Uint and R8Uint).
+@interface RgfxAppleLinearDevice : RgfxAppleHeapDevice
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+@implementation RgfxAppleLinearDevice
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 16;
+}
+@end
+
+// The device of a texture over a buffer as the host's platform answers the CPU's copies the
+// bundle routes through it: a blit between a staging buffer of its own and a slice-0 region of
+// level 0 reads and writes the buffer's bytes inside its length in place, and those past it in
+// `tail`, from the length on, as metal2vulkan's runtime keeps them in a tail of the texture's own
+// (linear_plan.rs, "Length"). Texels are `texelBytes` long; `blits` counts its blits and `lastY`
+// and `lastRows` give the last one's first row and rows.
+@class RgfxTailDevice;
+@interface RgfxTailStage : NSObject
+@property(nonatomic, strong) NSMutableData *bytes;
+- (void *)contents;
+- (NSUInteger)length;
+@end
+@implementation RgfxTailStage
+- (void *)contents
+{
+	return _bytes.mutableBytes;
+}
+- (NSUInteger)length
+{
+	return _bytes.length;
+}
+@end
+@interface RgfxTailDevice : NSObject
+@property(nonatomic, strong) NSMutableData *tail;
+@property(nonatomic) NSUInteger texelBytes;
+@property(nonatomic) NSUInteger blits;
+@property(nonatomic) NSUInteger lastY;
+@property(nonatomic) NSUInteger lastRows;
+- (id)newCommandQueue;
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options;
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
+@end
+@interface RgfxTailBlit : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailBlit
+// The byte `o` of the texture's buffer, from its start: inside the length, in place; past it, in
+// the tail.
+- (uint8_t *)byteOf:(id<MTLTexture>)t at:(uint64_t)o
+{
+	id<MTLBuffer> b = t.buffer;
+	return o < b.length ? static_cast<uint8_t *>(b.contents) + o
+	                    : static_cast<uint8_t *>(_device.tail.mutableBytes) + (o - b.length);
+}
+- (void)copyRegion:(MTLOrigin)origin
+              size:(MTLSize)size
+             slice:(NSUInteger)slice
+           texture:(id<MTLTexture>)t
+             stage:(id<MTLBuffer>)stage
+            offset:(NSUInteger)stageOffset
+               bpr:(NSUInteger)stageBpr
+         toTexture:(BOOL)toTexture
+{
+	CHECK(slice == 0);
+	const NSUInteger tb = _device.texelBytes;
+	uint8_t *staged = static_cast<uint8_t *>(stage.contents) + stageOffset;
+	for (NSUInteger y = 0; y < size.height; y++) {
+		for (NSUInteger x = 0; x < size.width * tb; x++) {
+			const uint64_t o = t.bufferOffset + (origin.y + y) * t.bufferBytesPerRow +
+			                   origin.x * tb + x;
+			uint8_t *in = [self byteOf:t at:o];
+			uint8_t *at = staged + y * stageBpr + x;
+			if (toTexture)
+				*in = *at;
+			else
+				*at = *in;
+		}
+	}
+	_device.blits++;
+	_device.lastY = origin.y;
+	_device.lastRows = size.height;
+}
+- (void)copyFromTexture:(id<MTLTexture>)t
+                 sourceSlice:(NSUInteger)slice
+                 sourceLevel:(NSUInteger)level
+                sourceOrigin:(MTLOrigin)origin
+                  sourceSize:(MTLSize)size
+                    toBuffer:(id<MTLBuffer>)stage
+           destinationOffset:(NSUInteger)offset
+      destinationBytesPerRow:(NSUInteger)bpr
+    destinationBytesPerImage:(NSUInteger)bpi
+{
+	CHECK(level == 0);
+	[self copyRegion:origin size:size slice:slice texture:t stage:stage offset:offset bpr:bpr toTexture:NO];
+}
+- (void)copyFromBuffer:(id<MTLBuffer>)stage
+           sourceOffset:(NSUInteger)offset
+      sourceBytesPerRow:(NSUInteger)bpr
+    sourceBytesPerImage:(NSUInteger)bpi
+             sourceSize:(MTLSize)size
+              toTexture:(id<MTLTexture>)t
+       destinationSlice:(NSUInteger)slice
+       destinationLevel:(NSUInteger)level
+      destinationOrigin:(MTLOrigin)origin
+{
+	CHECK(level == 0);
+	[self copyRegion:origin size:size slice:slice texture:t stage:stage offset:offset bpr:bpr toTexture:YES];
+}
+- (void)endEncoding
+{
+}
+@end
+@interface RgfxTailCommandBuffer : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailCommandBuffer
+- (id)blitCommandEncoder
+{
+	RgfxTailBlit *blit = [RgfxTailBlit new];
+	blit.device = _device;
+	return blit;
+}
+- (void)commit
+{
+}
+- (void)waitUntilCompleted
+{
+}
+- (MTLCommandBufferStatus)status
+{
+	return MTLCommandBufferStatusCompleted;
+}
+@end
+@interface RgfxTailQueue : NSObject
+@property(nonatomic, weak) RgfxTailDevice *device;
+@end
+@implementation RgfxTailQueue
+- (id)commandBuffer
+{
+	RgfxTailCommandBuffer *cb = [RgfxTailCommandBuffer new];
+	cb.device = _device;
+	return cb;
+}
+@end
+@implementation RgfxTailDevice
+- (id)newCommandQueue
+{
+	RgfxTailQueue *queue = [RgfxTailQueue new];
+	queue.device = self;
+	return queue;
+}
+- (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
+{
+	(void)options;
+	RgfxTailStage *stage = [RgfxTailStage new];
+	stage.bytes = [NSMutableData dataWithLength:length];
+	return stage;
+}
+- (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
+{
+	(void)format;
+	return 16;
+}
+@end
+
+// A device whose newDynamicLibraryWithURL: answers a URL whose last part names one of `made` with
+// that dynamic library (made by `make`, which the test sets), keeping each path it was asked for,
+// as the pipeline's loads ask the device for the libraries their install names name.
+@interface RgfxTestDylibDevice : NSObject
+@property(nonatomic, copy) id<MTLDynamicLibrary> _Nullable (^make)(NSURL *url);
+@property(nonatomic, strong) NSMutableArray<NSString *> *asked;
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error;
+@end
+@implementation RgfxTestDylibDevice
+- (instancetype)init
+{
+	self = [super init];
+	_asked = [NSMutableArray array];
+	return self;
+}
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	(void)error;
+	[_asked addObject:url.path];
+	return _make ? _make(url) : nil;
+}
+@end
+
+// The same as an Apple GPU's device (every Apple family).
+@interface RgfxAppleTestDylibDevice : RgfxTestDylibDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+@end
+@implementation RgfxAppleTestDylibDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
+}
+@end
 
 namespace {
 
@@ -414,6 +720,28 @@ void test_device_buffers_take_pages_of_slabs()
 			// Metal's default hazard tracking for a buffer: Tracked.
 			CHECK(b.resourceOptions == MTLResourceHazardTrackingModeTracked);
 		}
+		// A buffer made with bit 20, as the GL renderer makes its no-copy ones, answers the three
+		// modes alone, as both x86 Macs do (0x200 for 0x100000, 0x210 for 0x100010).
+		CHECK(make(256, static_cast<MTLResourceOptions>(0x100000)).resourceOptions == 0x200);
+		CHECK(make(256, static_cast<MTLResourceOptions>(0x100010)).resourceOptions == 0x210);
+		// None with bit 18 (0x40000), of a length or of bytes, in any storage mode, as both x86
+		// Macs make none; bits 17 and 19 make one.
+		static const uint8_t seed[256] = {};
+		for (MTLResourceOptions mode : {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+		                                MTLResourceStorageModePrivate}) {
+			CHECK(make(256, mode | kRgfxOptionBit18) == nil);
+			CHECK(make(256, mode | (kRgfxOptionBit18 >> 1)) != nil);
+			CHECK(make(256, mode | (kRgfxOptionBit18 << 1)) != nil);
+			CHECK([RgfxBuffer bufferForDeviceWithLength:256
+			                                    options:mode | kRgfxOptionBit18
+			                                      bytes:seed
+			                                  maxLength:0
+			                                      slabs:&slabs
+			                                     device:nil
+			                                 serializer:&fx.ser] == nil);
+		}
+		CHECK(RgfxMakesNoResourceOf(MTLResourceStorageModePrivate | kRgfxOptionBit18) &&
+		      !RgfxMakesNoResourceOf(MTLResourceStorageModePrivate | 0x100000));
 		CHECK(make(0x10000, MTLResourceStorageModeShared).allocatedSize == 0x10000);
 		CHECK(make(0x10001, MTLResourceStorageModeShared).allocatedSize == 0x11000);
 		RgfxBuffer *mib = make(0x100001, MTLResourceStorageModeManaged);
@@ -568,6 +896,57 @@ void test_device_heaps_answer_as_metal()
 		CHECK(ringEmpty(fx.ring));
 	}
 	drainRing(fx.ring);
+}
+
+// The device's newTextureWithDescriptor: makes no texture of more bytes than maxBufferLength,
+// as the Intel 630 under macOS 26.7.1 makes none (oracle_texdesc device, Q24): its 2 GiB
+// maxBufferLength holds a 16384 x 8192 RGBA32Float texture, made there, and not one a row taller,
+// nil there. The bytes are every level of every slice and sample, in the format's blocks, as the
+// texture's allocatedSize answers; a limit of 0 holds none back.
+void test_textures_past_max_buffer_length_are_nil()
+{
+	auto shape = [](MTLPixelFormat format, MTLTextureType type, NSUInteger width,
+	                NSUInteger height, NSUInteger depth, NSUInteger array) {
+		MTLTextureDescriptor *d = [MTLTextureDescriptor new];
+		d.pixelFormat = format;
+		d.textureType = type;
+		d.width = width;
+		d.height = height;
+		d.depth = depth;
+		d.arrayLength = array;
+		return d;
+	};
+	@autoreleasepool {
+		const uint64_t intel = 2147483648ull; // the Intel 630's maxBufferLength
+		CHECK(!rgfxTexturePastLength(
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2D, 16384, 8192, 1, 1), intel));
+		CHECK(rgfxTexturePastLength(
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2D, 16384, 8193, 1, 1), intel));
+		// What all three Macs answer nil for (huge.2darray, huge.3d), past ours on the RTX 5080
+		// (12821200896), and past no limit at 0.
+		MTLTextureDescriptor *slices =
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType2DArray, 16384, 16384, 1, 2048);
+		MTLTextureDescriptor *volume =
+		    shape(MTLPixelFormatRGBA32Float, MTLTextureType3D, 2048, 2048, 2048, 1);
+		CHECK(rgfxTexturePastLength(slices, 12821200896ull));
+		CHECK(rgfxTexturePastLength(volume, 12821200896ull));
+		CHECK(!rgfxTexturePastLength(slices, 0) && !rgfxTexturePastLength(volume, 0));
+		// Levels, faces, samples and blocks count: 64 x 64 BGRA8Unorm of a full chain is 21844
+		// bytes, a cube of one level 98304, 4 samples 65536, BC1 2048.
+		MTLTextureDescriptor *chain =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureType2D, 64, 64, 1, 1);
+		chain.mipmapLevelCount = 7;
+		CHECK(!rgfxTexturePastLength(chain, 21844) && rgfxTexturePastLength(chain, 21843));
+		MTLTextureDescriptor *cube =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64, 64, 1, 1);
+		CHECK(!rgfxTexturePastLength(cube, 98304) && rgfxTexturePastLength(cube, 98303));
+		MTLTextureDescriptor *ms =
+		    shape(MTLPixelFormatBGRA8Unorm, MTLTextureType2DMultisample, 64, 64, 1, 1);
+		ms.sampleCount = 4;
+		CHECK(!rgfxTexturePastLength(ms, 65536) && rgfxTexturePastLength(ms, 65535));
+		MTLTextureDescriptor *bc1 = shape(MTLPixelFormatBC1_RGBA, MTLTextureType2D, 64, 64, 1, 1);
+		CHECK(!rgfxTexturePastLength(bc1, 2048) && rgfxTexturePastLength(bc1, 2047));
+	}
 }
 
 // The id space is monotonic across wrappers: a second buffer gets the next objId
@@ -1111,9 +1490,47 @@ void test_tiled_texture_over_backing()
 	while (fx.ring.next(&h, &bytes)) {
 	}
 
-	// More than one level answers nil, sending nothing: the host does not carry levels 1 and up.
+	// More than one level is made, as the AMD and the Intel GPU make it: the message carries the
+	// levels, level 0 over the buffer's bytes, and the CPU reaches level 0 there.
 	desc.mipmapLevelCount = 2;
-	CHECK([tiled newTiledTextureWithDescriptor:desc offset:tileOffset bytesPerRow:pitch] == nil);
+	id<MTLTexture> levels = [tiled newTiledTextureWithDescriptor:desc
+	                                                       offset:tileOffset
+	                                                  bytesPerRow:pitch];
+	CHECK(levels != nil && levels.mipmapLevelCount == 2 && levels.buffer == buf &&
+	      levels.bufferOffset == tileOffset && levels.bufferBytesPerRow == pitch);
+	auto mipmapped = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+	CHECK(mipmapped.desc.mipmap_level_count == 2 && mipmapped.offset == tileOffset &&
+	      mipmapped.bytes_per_row == pitch && mipmapped.buffer_obj_id == buf.rgfxObjId);
+	CHECK(ringEmpty(fx.ring));
+	std::memset(out, 0, sizeof(out));
+	[levels getBytes:out bytesPerRow:12 fromRegion:MTLRegionMake2D(0, 0, 3, 2) mipmapLevel:0];
+	CHECK(std::memcmp(&out[0], &memory[tileOffset], 12) == 0);
+	CHECK(std::memcmp(&out[12], &memory[tileOffset + pitch], 12) == 0);
+	// Its didModifyData tells the host where the host carries the message
+	// (TEXTURE_DID_MODIFY_DATA), so the host's copy of the bytes takes them again at its next use,
+	// as Metal's does (dgpu-oracle.md, Q11); where the host does not carry it it posts nothing, and
+	// so does the didModifyData of the one of one level, which reads the Shared buffer's bytes in
+	// place.
+	[(id<RgfxMetalTextureInternals>)levels didModifyData];
+	CHECK(ringEmpty(fx.ring));
+	fx.ser.setCarriesTextureDidModifyData(true);
+	[(id<RgfxMetalTextureInternals>)levels didModifyData];
+	CHECK(expectMessage<RgfxTextureDidModifyData>(fx.ring, RGFX_CMD_TEXTURE_DID_MODIFY_DATA)
+	          .obj_id == [(RgfxTexture *)levels rgfxObjId]);
+	[(id<RgfxMetalTextureInternals>)tex didModifyData];
+	CHECK(ringEmpty(fx.ring));
+	// A replaceRegion: of its level 0 writes the buffer's bytes and tells the host as its
+	// didModifyData does, as Metal's copy takes the bytes again at its next use after one; the
+	// one of one level's tells nothing.
+	[levels replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(std::memcmp(&memory[tileOffset], in, 8) == 0);
+	CHECK(expectMessage<RgfxTextureDidModifyData>(fx.ring, RGFX_CMD_TEXTURE_DID_MODIFY_DATA)
+	          .obj_id == [(RgfxTexture *)levels rgfxObjId]);
+	CHECK(ringEmpty(fx.ring));
+	[tex replaceRegion:MTLRegionMake2D(1, 1, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
+	CHECK(ringEmpty(fx.ring));
+	fx.ser.setCarriesTextureDidModifyData(false);
+	[levels replaceRegion:MTLRegionMake2D(0, 0, 2, 1) mipmapLevel:0 withBytes:in bytesPerRow:8];
 	CHECK(ringEmpty(fx.ring));
 	desc.mipmapLevelCount = 1;
 	// So does a type other than 2D, which the AMD and the Intel GPU make and the host does not
@@ -1541,6 +1958,51 @@ static const DescriptorCase kDescriptorCases[] = {
     {"usage.write", 80, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
     {"usage.bit7", 80, 2, 64, 64, 1, 1, 1, 1, 0x81, 2,
      RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x80.\n'"},
+    // The usage bits and the atomic bit's formats (oracle_surftex's sixth and seventh rounds, the
+    // M3 Max's alike but where kAppleDescriptorCases says).
+    {"usage.bit3", 80, 2, 64, 64, 1, 1, 1, 1, 0x9, 2, nullptr},
+    {"usage.bit6", 80, 2, 64, 64, 1, 1, 1, 1, 0x41, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x40.\n'"},
+    {"usage.bit8", 80, 2, 64, 64, 1, 1, 1, 1, 0x101, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x100.\n'"},
+    {"usage.bit13", 80, 2, 64, 64, 1, 1, 1, 1, 0x2001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x2000.\n'"},
+    {"usage.bit14", 80, 2, 64, 64, 1, 1, 1, 1, 0x4001, 2, nullptr},
+    {"usage.bit15", 80, 2, 64, 64, 1, 1, 1, 1, 0x8001, 2, nullptr},
+    {"usage.bit16", 80, 2, 64, 64, 1, 1, 1, 1, 0x10001, 2, nullptr},
+    {"usage.bit17", 80, 2, 64, 64, 1, 1, 1, 1, 0x20001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x20000.\n'"},
+    {"usage.bit31", 80, 2, 64, 64, 1, 1, 1, 1, 0x80000001, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x80000000.\n'"},
+    {"usage.bits6to8", 80, 2, 64, 64, 1, 1, 1, 1, 0x1c1, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x1c0.\n'"},
+    {"atomic.r32u", 53, 2, 64, 64, 1, 1, 1, 1, 0x23, 2, nullptr},
+    {"atomic.r32s", 54, 2, 64, 64, 1, 1, 1, 1, 0x23, 2, nullptr},
+    {"atomic.r32u.all", 53, 2, 64, 64, 1, 1, 1, 1, 0x37, 2, nullptr},
+    {"atomic.bgra8", 80, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatBGRA8Unorm is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.r32f", 55, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatR32Float is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.r16u", 23, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatR16Uint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rg32s", 104, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatRG32Sint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rgba32u", 123, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatRGBA32Uint is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"atomic.rg32u", 103, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "This device does not support ulong texture atomics, so "
+                   "MTLPixelFormatRG32Uint cannot be used with texture atomics\n'"},
+    {"atomic.bits6to8.bgra8", 80, 2, 64, 64, 1, 1, 1, 1, 0x1e1, 2,
+     RGFX_VALIDATE "MTLTextureUsage has unknown bits 0x1c0.\nMTLPixelFormatBGRA8Unorm is not a "
+                   "valid format to be used with texture atomics.\n'"},
+    {"atomic.ycbcr500", 500, 2, 64, 64, 1, 1, 1, 1, 0x23, 2,
+     RGFX_VALIDATE "MTLPixelFormatYCBCR8_420_2P is not a valid format to be used with texture "
+                   "atomics.\nMTLTextureDescriptor has invalid pixelFormat (500).\n'"},
     {"srgb.write", 81, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
     {"bc1.rt", 130, 2, 64, 64, 1, 1, 1, 1, 0x4, 2, nullptr},
     {"bc1.write", 130, 2, 64, 64, 1, 1, 1, 1, 0x2, 2, nullptr},
@@ -1613,6 +2075,25 @@ static const DescriptorCase kDescriptorCases[] = {
     {"texbuf.h4", 80, 9, 64, 4, 1, 1, 1, 1, 0x1, 2,
      RGFX_VALIDATE "MTLTextureDescriptor has height (4) greater than the maximum allowed size of "
                    "1.\n'"},
+    // Texture buffers past 16384 wide, as oracle_texdesc --texbuf asked them of the device's, a
+    // Private heap's and a Shared buffer's creators, alike on the AMD 5300M and the Intel 630 under
+    // macOS 26.7.1 and the M3 Max under 27.0.1: made up to 2^28 elements of any format, and one
+    // element more ends the process with the width line (Q24). The 46626-wide R8Sint one is a
+    // guest MoltenVK's texel buffer view's.
+    {"texbuf.w16385", 14, 9, 16385, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.r8sint.w46626", 14, 9, 46626, 1, 1, 1, 1, 1, 0x1, 0, nullptr},
+    {"texbuf.rgba32f.w2^27", 125, 9, 134217728, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.w2^28", 14, 9, 268435456, 1, 1, 1, 1, 1, 0x1, 2, nullptr},
+    {"texbuf.rgba32f.w2^28", 125, 9, 268435456, 1, 1, 1, 1, 1, 0x1, 0, nullptr},
+    {"texbuf.w2^28+1", 14, 9, 268435457, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (268435457) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
+    {"texbuf.rgba32f.w2^28+1", 125, 9, 268435457, 1, 1, 1, 1, 1, 0x1, 0,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (268435457) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
+    {"texbuf.w2^32", 70, 9, 4294967296, 1, 1, 1, 1, 1, 0x1, 2,
+     RGFX_VALIDATE "MTLTextureDescriptor has width (4294967296) greater than the maximum allowed "
+                   "size of 268435456.\n'"},
     {"1darray.h2", 80, 1, 64, 2, 1, 2, 1, 1, 0x1, 2,
      RGFX_VALIDATE "MTLTextureDescriptor has height (2) greater than the maximum allowed size of "
                    "1.\nMTLTextureDescriptor requests a height of 2 but the texture type "
@@ -1648,6 +2129,64 @@ static const DescriptorCase kDescriptorCases[] = {
                    "device.\nMTLTextureDescriptor: Multisample textures cannot be allocated with "
                    "MTLStorageModeShared or MTLStorageModeManaged on this device.\n'"},
 };
+
+// The kDescriptorCases the M3 Max under macOS 27.0.1 answers otherwise than the x86 Macs, at the
+// device's newTextureWithDescriptor: (oracle_texdesc Apple device, 11-09): its words where it ends
+// the process, null where it makes the texture or answers nil. It answers every other case as the
+// x86 Macs, in the same words.
+struct AppleDescriptorCase {
+	const char *name;
+	const char *words;
+};
+static const AppleDescriptorCase kAppleDescriptorCases[] = {
+    {"ms.s8", RGFX_VALIDATE "MTLTextureDescriptor sampleCount (8) is not supported by device.\n'"},
+    {"ms.shared", nullptr},
+    {"ms.managed", nullptr},
+    {"ms.bgr5a1", nullptr},
+    {"ms.rgb9e5", nullptr},
+    {"memoryless", nullptr},
+    {"depth32f.shared", nullptr},
+    {"depth32f.shared.ms", nullptr},
+    {"fmt.b5g6r5", nullptr},
+    {"fmt.a1bgr5", nullptr},
+    {"fmt.abgr4", nullptr},
+    {"fmt.r8srgb", nullptr},
+    {"fmt.rg8srgb", nullptr},
+    {"fmt.bgra10xr", nullptr},
+    {"fmt.bgr10xr", nullptr},
+    {"fmt.astc4x4", nullptr},
+    {"fmt.etc2", nullptr},
+    {"fmt.eac", nullptr},
+    {"fmt.pvrtc", nullptr},
+    {"fmt.ycbcr500", nullptr},
+    {"fmt.unspecialized", nullptr},
+    {"w0.ms.shared.s1",
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor sampleCount "
+                   "must be > 1 for multisample textures.\n'"},
+    {"bc1.ms.shared",
+     RGFX_VALIDATE "MTLTextureDescriptor pixelFormat (MTLPixelFormatBC1_RGBA) does not support "
+                   "multisample textures.\nMTLTextureDescriptor has a compressed pixel format set "
+                   "with a sample count greater than one.\nMTLTextureDescriptor: compressed pixel "
+                   "formats require texture type of MTLTextureType2D[Array], MTLTextureType3D or "
+                   "MTLTextureTypeCube[Array].\n'"},
+    {"atomic.rg32u", nullptr},
+    {"atomic.ycbcr500",
+     RGFX_VALIDATE "MTLPixelFormatYCBCR8_420_2P is not a valid format to be used with texture "
+                   "atomics.\n'"},
+    {"b5g6r5.w0.d2",
+     RGFX_VALIDATE "MTLTextureDescriptor has width of zero.\nMTLTextureDescriptor has depth (2) "
+                   "greater than the maximum allowed size of 1.\nMTLTextureDescriptor requests a "
+                   "depth of 2 but the texture type MTLTextureType2D requires that depth is 1\n'"},
+};
+
+// The words the M3 Max ends the process with at `c`, null where it goes on.
+static const char *appleWords(const DescriptorCase &c)
+{
+	for (const AppleDescriptorCase &a : kAppleDescriptorCases)
+		if (std::strcmp(a.name, c.name) == 0)
+			return a.words;
+	return c.words;
+}
 #define RGFX_HEAP_MISMATCH(MODE)                                                                   \
 	"-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]: failed assertion `The " \
 	"requested storage mode (" MODE ") is not compatible with the heap's mode "                    \
@@ -1764,6 +2303,162 @@ static const uint64_t kTwoPlaneFormats[] = {500, 502, 503, 505, 506, 507, 508, 5
                                             520, 522, 523, 525, 526, 527, 528, 529, 530,
                                             540, 541, 542, 543, 544, 545, 550, 551};
 
+// Textures over a surface as oracle_surftex asked them of the M3 Max under macOS 27.0.1 (11-13,
+// with no validation layer; docs/graphics-kext/dgpu-oracle.md, Q20) where an Apple GPU answers
+// otherwise than the x86 Macs, or where the x86 Macs were not asked: over a 64 x 64 'BGRA'
+// surface without planes or of one plane (SurfaceKind), or a 64 x 64 '420v' one (k420vPlane0 and
+// k420vPlane1), with the M3's words where it ended the process, else whether it answered nil.
+enum AppleSurface { kAppleFlat, kAppleOnePlane, k420vPlane0, k420vPlane1 };
+struct AppleSurfaceCase {
+	const char *name;
+	AppleSurface surface;
+	MTLPixelFormat format;
+	MTLTextureType type;
+	NSUInteger width, height;
+	MTLTextureUsage usage;
+	MTLStorageMode storage;
+	const char *words; // null: it goes on
+	bool none;         // where it goes on: nil, else made
+};
+static const MTLTextureUsage kRead = MTLTextureUsageShaderRead;
+static const MTLTextureUsage kTarget = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+static const MTLTextureUsage kWritten = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite;
+#define RGFX_FMT(N) static_cast<MTLPixelFormat>(N)
+static const AppleSurfaceCase kAppleSurfaceCases[] = {
+    // A cube over a plane: the M3's IOGPUMetalTexture asserts.
+    {"apple-surface-plane-cube", kAppleOnePlane, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube, 64,
+     64, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-plane-cube-32", kAppleOnePlane, MTLPixelFormatBGRA8Unorm, MTLTextureTypeCube,
+     32, 32, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-plane-cube-array", kAppleOnePlane, MTLPixelFormatBGRA8Unorm,
+     MTLTextureTypeCubeArray, 64, 64, kRead, kManaged, "carriesComplexTexture || numFaces == 1",
+     false},
+    {"apple-surface-420v-cube", k420vPlane0, MTLPixelFormatR8Unorm, MTLTextureTypeCube, 64, 64,
+     kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    {"apple-surface-420v-cube-array", k420vPlane0, MTLPixelFormatR8Unorm, MTLTextureTypeCubeArray,
+     64, 64, kRead, kManaged, "carriesComplexTexture || numFaces == 1", false},
+    // A compressed format: its rows and height checked as the x86 Macs check them, then nil.
+    {"apple-surface-astc-wider", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 68, 64, kRead,
+     kManaged, "Descriptor rowBytes (272) > IOSurface rowBytes (256)'", false},
+    {"apple-surface-astc-taller", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 68, kRead,
+     kManaged, "Descriptor height*arrayLength > IOSurface height'", false},
+    {"apple-surface-bc1-wider", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 132, 64, kRead, kManaged,
+     "Descriptor rowBytes (264) > IOSurface rowBytes (256)'", false},
+    {"apple-surface-bc1", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead, kManaged, nullptr,
+     true},
+    {"apple-surface-bc1-128", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 128, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-bc1-62", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 62, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-bc1-private", kAppleFlat, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead,
+     MTLStorageModePrivate, nullptr, true},
+    {"apple-surface-bc7", kAppleFlat, MTLPixelFormatBC7_RGBAUnorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-astc", kAppleFlat, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-etc2", kAppleFlat, MTLPixelFormatETC2_RGB8, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-eac", kAppleFlat, MTLPixelFormatEAC_R11Unorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    {"apple-surface-pvrtc", kAppleFlat, RGFX_FMT(166), k2D, 64, 64, kRead, kManaged, nullptr, true},
+    {"apple-surface-plane-bc1", kAppleOnePlane, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-bc7", kAppleOnePlane, MTLPixelFormatBC7_RGBAUnorm, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-astc", kAppleOnePlane, MTLPixelFormatASTC_4x4_LDR, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-plane-etc2", kAppleOnePlane, MTLPixelFormatETC2_RGB8, k2D, 64, 64, kRead,
+     kManaged, nullptr, true},
+    {"apple-surface-420v-bc1", k420vPlane0, MTLPixelFormatBC1_RGBA, k2D, 64, 64, kRead, kManaged,
+     nullptr, true},
+    // A subsampled two-plane format of an odd side, written: nil; read, or of even sides: made;
+    // a 4:4:4 or XR10 one: made.
+    {"apple-surface-500-63x63-target", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-64x63-target", k420vPlane0, RGFX_FMT(500), k2D, 64, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-63x64-target", k420vPlane0, RGFX_FMT(500), k2D, 63, 64, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-500-63x63-written", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kWritten,
+     kManaged, nullptr, true},
+    {"apple-surface-500-chroma-31x31-target", k420vPlane1, RGFX_FMT(500), k2D, 31, 31, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-500-plane-63x63-target", kAppleOnePlane, RGFX_FMT(500), k2D, 63, 63, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-500-flat-63x63-target", kAppleFlat, RGFX_FMT(500), k2D, 63, 63, kTarget,
+     kManaged, nullptr, true},
+    {"apple-surface-502-64x63-target", k420vPlane0, RGFX_FMT(502), k2D, 64, 63, kTarget, kManaged,
+     nullptr, true},
+    {"apple-surface-544-63x63-written", k420vPlane0, RGFX_FMT(544), k2D, 63, 63, kWritten,
+     kManaged, nullptr, true},
+    {"apple-surface-500-63x63-read", k420vPlane0, RGFX_FMT(500), k2D, 63, 63, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-500-flat-63x63-read", kAppleFlat, RGFX_FMT(500), k2D, 63, 63, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-500-62x62-target", k420vPlane0, RGFX_FMT(500), k2D, 62, 62, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-500-target", k420vPlane0, RGFX_FMT(500), k2D, 64, 64, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-503-63x63-target", k420vPlane0, RGFX_FMT(503), k2D, 63, 63, kTarget, kManaged,
+     nullptr, false},
+    {"apple-surface-545-63x63-written", k420vPlane0, RGFX_FMT(545), k2D, 63, 63, kWritten,
+     kManaged, nullptr, false},
+    {"apple-surface-550-63x63-target", k420vPlane0, RGFX_FMT(550), k2D, 63, 63, kTarget, kManaged,
+     nullptr, false},
+    // What the x86 Macs end the process at and the M3 makes.
+    {"apple-surface-b5g6r5", kAppleFlat, MTLPixelFormatB5G6R5Unorm, k2D, 64, 64, kRead, kManaged,
+     nullptr, false},
+    {"apple-surface-memoryless", kAppleFlat, MTLPixelFormatBGRA8Unorm, k2D, 64, 64, kRead,
+     MTLStorageModeMemoryless, nullptr, false},
+    {"apple-surface-500-flat", kAppleFlat, RGFX_FMT(500), k2D, 64, 64, kRead, kManaged, nullptr,
+     false},
+    {"apple-surface-plane-array", kAppleOnePlane, MTLPixelFormatBGRA8Unorm,
+     MTLTextureType2DArray, 64, 64, kRead, kManaged, nullptr, false},
+};
+#undef RGFX_FMT
+
+// The surface of `c`, retained, and the 420v pixel buffer that holds it where it is one.
+static IOSurfaceRef surfaceOf(const AppleSurfaceCase &c, CVPixelBufferRef *pb)
+{
+	*pb = nullptr;
+	if (c.surface == kAppleFlat || c.surface == kAppleOnePlane) {
+		const SurfaceCase s = {c.name, c.surface == kAppleFlat ? kFlat : kOnePlane, 0, c.format,
+		                       c.type, c.width, c.height, 1, 1, 1, 1, c.storage, nullptr};
+		return surfaceOf(s);
+	}
+	NSDictionary *attrs = @{(id)kCVPixelBufferIOSurfacePropertiesKey : @{}};
+	CHECK(CVPixelBufferCreate(kCFAllocatorDefault, 64, 64, '420v', (__bridge CFDictionaryRef)attrs,
+	                          pb) == kCVReturnSuccess);
+	IOSurfaceRef surface = CVPixelBufferGetIOSurface(*pb);
+	CHECK(surface != nullptr && IOSurfaceGetPlaneCount(surface) == 2);
+	CFRetain(surface);
+	return surface;
+}
+
+static MTLTextureDescriptor *descriptorOf(const AppleSurfaceCase &c)
+{
+	MTLTextureDescriptor *td = [MTLTextureDescriptor new];
+	td.textureType = c.type;
+	td.pixelFormat = c.format;
+	td.width = c.width;
+	td.height = c.height;
+	td.usage = c.usage;
+	td.storageMode = c.storage;
+	return td;
+}
+
+// Runs `c`'s checks of rgfxEndAtInvalidSurfaceTexture on `device`.
+static void endAtAppleSurfaceCase(const AppleSurfaceCase &c, id<MTLDevice> device)
+{
+	CVPixelBufferRef pb = nullptr;
+	IOSurfaceRef surface = surfaceOf(c, &pb);
+	rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface,
+	                               c.surface == k420vPlane1 ? 1 : 0, device);
+	CFRelease(surface);
+	if (pb != nullptr)
+		CVPixelBufferRelease(pb);
+}
+
 std::vector<uint8_t> nextMessage(TestRing &ring, uint32_t type); // below
 
 // A library of the mesh pipeline tests' functions (named as oracle_mesh's), with its create read
@@ -1819,6 +2514,77 @@ static RgfxRenderPipelineState *meshState(Fixture &fx, MTLMeshRenderPipelineDesc
 	                                                                error:error];
 }
 
+// The device's answers to the rate map messages: a map of a 256 x 128 screen, of `layers` layers,
+// and a query's answer of (1.5, 2.5), or `status` for each; what it was last asked.
+struct RateMapDevice {
+	uint32_t status = RGFX_STATUS_OK;
+	uint64_t layers = 1;
+	uint32_t calls = 0;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<RateMapDevice *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		if (h.type == RGFX_CMD_RATE_MAP_QUERY) {
+			RgfxRateMapAnswer answer = {};
+			answer.header = {RGFX_EVT_RATE_MAP_ANSWER, sizeof(answer), 2};
+			answer.status = self->status;
+			const float x = 1.5f, y = 2.5f;
+			std::memcpy(&answer.values[0], &x, 4);
+			std::memcpy(&answer.values[1], &y, 4);
+			CHECK(capacity >= sizeof(answer));
+			std::memcpy(reply, &answer, sizeof(answer));
+			*reply_size = sizeof(answer);
+			return true;
+		}
+		RgfxRateMapState answer = {};
+		answer.header = {RGFX_EVT_RATE_MAP_STATE, sizeof(answer), 1};
+		answer.status = self->status;
+		answer.screen_width = 256;
+		answer.screen_height = 128;
+		answer.granularity_width = answer.granularity_height = 32;
+		answer.granularity_depth = 1;
+		answer.layer_count = self->layers;
+		answer.mutability = 2;
+		answer.parameter_size = 24624;
+		answer.parameter_align = 4;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+	RgfxRateMapQuery query() const
+	{
+		RgfxRateMapQuery q = {};
+		if (asked.size() >= sizeof(q))
+			std::memcpy(&q, asked.data(), sizeof(q));
+		return q;
+	}
+};
+
+// A rate map of one layer over 256 x 128, labelled.
+static MTLRasterizationRateMapDescriptor *rateMapDescriptor()
+{
+	const float h[] = {1.0f, 0.25f, 1.0f};
+	const float v[] = {1.0f, 0.5f};
+	MTLRasterizationRateLayerDescriptor *layer =
+	    [[MTLRasterizationRateLayerDescriptor alloc] initWithSampleCount:MTLSizeMake(3, 2, 0)
+	                                                          horizontal:h
+	                                                            vertical:v];
+	MTLRasterizationRateMapDescriptor *d =
+	    [MTLRasterizationRateMapDescriptor rasterizationRateMapDescriptorWithScreenSize:MTLSizeMake(256, 128, 0)
+	                                                                              layer:layer];
+	d.label = @"probe";
+	return d;
+}
+
+static void rateMapDiesCase(Fixture &fx, const char *name);
+
 // The cases checkDies runs, each in a process of its own: each ends the process where it should,
 // else it answers 0, which its check fails.
 static int dies_case(const char *name)
@@ -1833,10 +2599,46 @@ static int dies_case(const char *name)
 		rgfxEndAtInvalidSurfaceTexture(descriptorOf(c), surface, c.plane);
 		CFRelease(surface);
 	}
+	// test_compute_threadgroup_fields_end_the_process: a compute pipeline of a required size with
+	// an axis of 0, or of 64 threads over a maxTotalThreadsPerThreadgroup of 32.
+	if (std::strncmp(name, "compute-required-", 17) == 0) {
+		const uint8_t libBytes[] = {9, 9, 9};
+		uint32_t libStatus = 0;
+		RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+		                                        length:sizeof(libBytes)
+		                                           key:nullptr
+		                                        device:nil
+		                                    serializer:&fx.ser
+		                                        status:&libStatus];
+		MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+		d.computeFunction = [lib newFunctionWithName:@"kmain"];
+		if (std::strcmp(name, "compute-required-0x1x1") == 0) {
+			d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 1, 1);
+		} else {
+			d.requiredThreadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+			d.maxTotalThreadsPerThreadgroup = 32;
+		}
+		(void)[RgfxComputePipelineState computePipelineStateWithDescriptor:d
+		                                                           device:nil
+		                                                       serializer:&fx.ser
+		                                                            error:nil];
+	}
 	if (std::strncmp(name, "texdesc-", 8) == 0) {
 		for (const DescriptorCase &c : kDescriptorCases)
 			if (std::strcmp(name + 8, c.name) == 0)
 				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c));
+	}
+	if (std::strncmp(name, "apple-surface-", 14) == 0) {
+		id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+		for (const AppleSurfaceCase &c : kAppleSurfaceCases)
+			if (std::strcmp(name, c.name) == 0)
+				endAtAppleSurfaceCase(c, apple);
+	}
+	if (std::strncmp(name, "apple-texdesc-", 14) == 0) {
+		id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+		for (const DescriptorCase &c : kDescriptorCases)
+			if (std::strcmp(name + 14, c.name) == 0)
+				rgfxEndAtInvalidTextureDescriptor(descriptorOf(c), apple);
 	}
 	// kCreatorCases: a 64 x 64 BGRA8Unorm texture (of 4 samples where the case says), by the
 	// creator the case names.
@@ -1920,6 +2722,44 @@ static int dies_case(const char *name)
 		                                                   mipmapped:NO];
 		desc.mipmapLevelCount = 2;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:64];
+	}
+	// buffer-texture-buffer-rows-0: a texture buffer of 4 RGBA32Float texels over a buffer, by the
+	// public form, with rows of 0 bytes.
+	if (std::strcmp(name, "buffer-texture-buffer-rows-0") == 0) {
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:0];
+	}
+	// buffer-texture-buffer-wide: a texture buffer of 2^28 + 1 R8Sint texels over a 4096-byte buffer,
+	// by the public form.
+	if (std::strcmp(name, "buffer-texture-buffer-wide") == 0) {
+		std::vector<uint8_t> memory(4096, 0);
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:nil
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Sint
+		                                                           width:268435457
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:268435712];
 	}
 	// buffer-texture-type-N and linear-texture-type-N: a texture of MTLTextureType N over a
 	// buffer, by the public form or the linear SPI.
@@ -2011,6 +2851,12 @@ static int dies_case(const char *name)
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(500));
 	if (std::strcmp(name, "linear-alignment-unnamed") == 0)
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(4096));
+	// On an Apple GPU (test_linear_alignment_as_an_apple_gpu).
+	if (std::strncmp(name, "apple-linear-alignment-", 23) == 0) {
+		const unsigned long f = std::strtoul(name + 23, nullptr, 10);
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f),
+		                                 (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	}
 	// A view of test_texture_views' texture: a Private 2D array of four slices and seven levels,
 	// of usage 0x17, in RGBA8Unorm.
 	auto viewOf = [&](MTLPixelFormat format, MTLTextureType type, NSRange levels, NSRange slices,
@@ -2079,6 +2925,43 @@ static int dies_case(const char *name)
 		desc.storageMode = MTLStorageModeShared;
 		(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
 	}
+	// oracle_bundle Apple buftex.depth16, .stencil8, .d32s8, .x32s8 and .depth (Depth32Float), and
+	// linear.depth, on an Apple GPU: 64 x 64, Shared, over a Shared buffer.
+	if (std::strncmp(name, "apple-buffer-texture-", 21) == 0) {
+		const char *rest = name + 21;
+		const bool linear = std::strncmp(rest, "linear-", 7) == 0;
+		if (linear)
+			rest += 7;
+		const MTLPixelFormat format =
+		    std::strcmp(rest, "depth16") == 0    ? MTLPixelFormatDepth16Unorm
+		    : std::strcmp(rest, "stencil8") == 0 ? MTLPixelFormatStencil8
+		    : std::strcmp(rest, "d32s8") == 0    ? MTLPixelFormatDepth32Float_Stencil8
+		    : std::strcmp(rest, "x32s8") == 0    ? MTLPixelFormatX32_Stencil8
+		                                         : MTLPixelFormatDepth32Float;
+		std::vector<uint8_t> memory(0x10000, 0);
+		id apple = [RgfxAppleFamilyDevice new]; // held: a buffer keeps its device weakly
+		RgfxBuffer *buf =
+		    [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                    regionOffset:0x10000
+		                                          length:memory.size()
+		                                         options:MTLResourceStorageModeShared
+		                                     deallocator:nil
+		                                          device:(id<MTLDevice>)apple
+		                                      serializer:&fx.ser];
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:format
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		if (linear)
+			(void)[(id<RgfxMetalBufferInternals>)buf newLinearTextureWithDescriptor:desc
+			                                                                offset:0
+			                                                           bytesPerRow:512
+			                                                         bytesPerImage:512 * 64];
+		else
+			(void)[buf newTextureWithDescriptor:desc offset:0 bytesPerRow:512];
+	}
 	if (std::strcmp(name, "texture-stencil-managed") == 0) {
 		MTLTextureDescriptor *desc =
 		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatStencil8
@@ -2113,6 +2996,24 @@ static int dies_case(const char *name)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureType3D, one, one, true);
 	if (std::strcmp(name, "view-cube-count") == 0)
 		viewOf(MTLPixelFormatRGBA8Unorm, MTLTextureTypeCube, one, NSMakeRange(0, 4), true);
+	// On an Apple GPU: the rules the M3 Max ends the process at as the x86 Macs do.
+	if (std::strcmp(name, "apple-view-format-class") == 0)
+		rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA16Float, MTLTextureType2D, 1, 1,
+		                       MTLPixelFormatRGBA8Unorm, MTLTextureType2D, one, one, false,
+		                       (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	if (std::strcmp(name, "apple-view-levels") == 0)
+		rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 3, 1,
+		                       MTLPixelFormatRGBA8Unorm, MTLTextureType2D, NSMakeRange(2, 3), one,
+		                       true, (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	// A function of GL IR's encoder, at any buffer index.
+	if (std::strcmp(name, "gl-function-encoder") == 0) {
+		const uint8_t ir[8] = {4, 0, 0, 0, 3, 0, 0, 0};
+		RgfxGLFunction *f = [[RgfxGLFunction alloc] initWithIR:ir
+		                                          functionType:MTLFunctionTypeVertex
+		                                     inputsDescription:nil
+		                                                device:MTLCreateSystemDefaultDevice()];
+		(void)[f newArgumentEncoderWithBufferIndex:0];
+	}
 	if (std::strcmp(name, "function-array-empty") == 0)
 		(void)[RgfxFunctionArrayLibrary libraryOfFunctions:@[] device:nil error:nullptr];
 	// An encoder of tests/air_arguments.metal's every_access at buffer index 5, where it takes
@@ -2138,8 +3039,44 @@ static int dies_case(const char *name)
 		if ([fn rgfxAirFunction] != nullptr)
 			(void)[fn newArgumentEncoderWithBufferIndex:5];
 	}
+	if (std::strncmp(name, "ratemap-", 8) == 0)
+		rateMapDiesCase(fx, name + 8);
 	}
 	return 0;
+}
+
+// A rate map's calls that end the process, as Metal's map does: a copy into a Private buffer,
+// and a coordinate map the host refuses.
+static void rateMapDiesCase(Fixture &fx, const char *name)
+{
+	static RateMapDevice device;
+	fx.ser.setAsker(&RateMapDevice::ask, &device);
+	fx.ser.setCarriesRateMaps(true);
+	RgfxRasterizationRateMap *map = [RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                                                         device:nil
+	                                                                     serializer:&fx.ser];
+	if (std::strcmp(name, "private-copy") == 0) {
+		RgfxBuffer *buffer = [[RgfxBuffer alloc] initWithObjId:0x91
+		                                            gpuAddress:0
+		                                                length:0x8000
+		                                               options:MTLResourceStorageModePrivate
+		                                                device:nil
+		                                            serializer:nullptr];
+		[map copyParameterDataToBuffer:buffer offset:0];
+	}
+	if (std::strcmp(name, "refused-coordinate") == 0) {
+		device.status = RGFX_STATUS_REFUSED;
+		(void)[map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(1, 1) forLayer:0];
+	}
+}
+
+// A copy into a Private buffer and a coordinate map the host refuses end the process.
+void test_rasterization_rate_map_deaths()
+{
+	checkDies("ratemap-private-copy",
+	          "-[RgfxRasterizationRateMap copyParameterDataToBuffer:offset:] ends the process");
+	checkDies("ratemap-refused-coordinate",
+	          "-[RgfxRasterizationRateMap mapScreenToPhysicalCoordinates:forLayer:] ends the process");
 }
 
 // A view ends the process with Metal's words, before the host is asked, where Metal ends it on the
@@ -2173,6 +3110,36 @@ void test_metal_ended_views_end_the_process()
 	          (kWhere + "newSliceRange.length(4) must be a multiple of (6).\n'").c_str());
 }
 
+// On a device that answers as an Apple GPU, a view in no format goes on, as the M3 Max under
+// macOS 27.0.1 answers nil for it (oracle_bundle Apple view.noformat), and its creator answers
+// nil; the view's other rules end the process as on the x86 Macs, in their words (view.class,
+// view.levels, view.slices, view.type and view.slicecount). An arm64 guest's device takes the
+// M3's; where the device answers no Apple family, a view in no format still ends the process
+// (view-no-format, above).
+void test_views_as_an_apple_gpu()
+{
+	const NSRange one = NSMakeRange(0, 1);
+	rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1,
+	                       MTLPixelFormatInvalid, MTLTextureType2D, one, one, false,
+	                       (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	g_checks++;
+#if defined(__arm64__)
+	rgfxEndAtViewMetalEnds(MTLPixelFormatRGBA8Unorm, MTLTextureType2D, 1, 1,
+	                       MTLPixelFormatInvalid, MTLTextureType2D, one, one, false,
+	                       (id<MTLDevice>)[RgfxGuestRulesDevice new]);
+	g_checks++;
+#endif
+	const std::string kWhere = "_mtlValidateArgumentsForTextureViewOnDevice: failed assertion "
+	                           "`Texture Creation\n";
+	checkDies("apple-view-format-class",
+	          (kWhere + "source texture pixelFormat (MTLPixelFormatRGBA16Float) not compatible "
+	                    "with texture view pixelFormat (MTLPixelFormatRGBA8Unorm).\n'")
+	              .c_str());
+	checkDies("apple-view-levels", (kWhere + "(newLevelRange.location + newLevelRange.length)(5) "
+	                                         "must be <= [texture mipmapLevelCount](3).\n'")
+	                                   .c_str());
+}
+
 // A function's encoder at a buffer index where its AIR declares no buffer ends the process with
 // Metal's words, before the host is asked, as on the AMD 5300M and the Intel 630 (oracle_bundle
 // argbuf.index.5).
@@ -2181,6 +3148,15 @@ void test_function_encoder_of_no_buffer_ends_the_process()
 	checkDies("encoder-no-buffer",
 	          "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]: "
 	          "failed assertion `bufferIndex 5 does not identify an argument buffer'");
+}
+
+// A function of GL IR's encoder ends the process with Metal's words, as Metal's own function of GL
+// IR does at buffer 0 (measured: macOS 26.7.1, the Intel 630's device).
+void test_gl_function_encoder_ends_the_process()
+{
+	checkDies("gl-function-encoder",
+	          "-[_MTLFunction newArgumentEncoderWithBufferIndex:reflection:functionReflection:]: "
+	          "failed assertion `bufferIndex 0 does not identify an argument buffer'");
 }
 
 // A Memoryless indirect command buffer ends the process, before the host is asked, as on the AMD
@@ -2251,6 +3227,510 @@ void test_buffer_texture_types_end_the_process()
 	}
 }
 
+// A texture buffer over a buffer's bytes by the public form is made, at any offset, with rows of at
+// least its texels' bytes, its create carrying its type, offset and rows to the host; fewer bytes
+// a row answer nil, posting nothing, and none end the process with Metal's words, as the AMD 5300M
+// answers (measured under macOS 26.7.1, a scratch probe; dgpu-oracle.md Q11). One whose texels run
+// past the buffer's bytes is made and posts its create, as both Macs and the M3 Max make it, and
+// the host's platform makes it too; one past an Apple GPU's allocation of a buffer of 16 KiB or
+// more is nil, posting nothing, as the M3 Max and the host's platform answer it.
+void test_buffer_texture_buffers()
+{
+	checkDies("buffer-texture-buffer-rows-0",
+	          "_mtlValidateStrideTextureParameters: failed assertion `Texture Descriptor Validation\nLinear "
+	          "texture: bytesPerRow (0) must be greater or equal to (64) bytes\n'");
+	// Past 2^28 texels it ends the process at the descriptor's validation, as every Mac measured
+	// does at each creator (oracle_texdesc --texbuf, Q24).
+	checkDies("buffer-texture-buffer-wide",
+	          "-[MTLTextureDescriptorInternal validateWithDevice:]: failed assertion `Texture "
+	          "Descriptor Validation\nMTLTextureDescriptor has width (268435457) greater than the "
+	          "maximum allowed size of 268435456.\n'");
+	Fixture fx;
+	@autoreleasepool {
+		// A guest MoltenVK's texel buffer view: 46626 R8Sint texels over a Shared buffer of rows
+		// 46848 bytes, which all three Macs make, wider than any 2D texture's 16384; its create
+		// carries its width to the host.
+		std::vector<uint8_t> view(46848, 0);
+		RgfxBuffer *viewBuf = [RgfxBuffer bufferOverHostMemoryWithContents:view.data()
+		                                                      regionOffset:0x10000
+		                                                            length:view.size()
+		                                                           options:MTLResourceStorageModeShared
+		                                                       deallocator:nil
+		                                                            device:nil
+		                                                        serializer:&fx.ser];
+		CHECK(viewBuf != nil);
+		drainRing(fx.ring);
+		MTLTextureDescriptor *wide =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Sint
+		                                                           width:46626
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> texels = [viewBuf newTextureWithDescriptor:wide offset:0 bytesPerRow:46848];
+		CHECK(texels != nil && texels.textureType == MTLTextureTypeTextureBuffer &&
+		      texels.width == 46626 && texels.height == 1);
+		auto wm = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+		CHECK(wm.buffer_obj_id == viewBuf.rgfxObjId && wm.offset == 0 && wm.bytes_per_row == 46848);
+		CHECK(wm.desc.texture_type == MTLTextureTypeTextureBuffer && wm.desc.width == 46626 &&
+		      wm.desc.pixel_format == MTLPixelFormatR8Sint);
+		texels = nil;
+		viewBuf = nil;
+		drainRing(fx.ring);
+		std::vector<uint8_t> memory(0x10000, 0);
+		for (const MTLResourceOptions storage : {MTLResourceStorageModeShared, MTLResourceStorageModeManaged}) {
+			RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                  regionOffset:0x10000
+			                                                        length:memory.size()
+			                                                       options:storage
+			                                                   deallocator:nil
+			                                                        device:nil
+			                                                    serializer:&fx.ser];
+			CHECK(buf != nil);
+			drainRing(fx.ring);
+			MTLTextureDescriptor *desc =
+			    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+			                                                           width:4
+			                                                 resourceOptions:storage
+			                                                           usage:MTLTextureUsageShaderRead];
+			NSMutableArray *made = [NSMutableArray array]; // kept, so no destroy posts between
+			for (const NSUInteger offset : {(NSUInteger)0, (NSUInteger)4, (NSUInteger)100}) {
+				id<MTLTexture> t = [buf newTextureWithDescriptor:desc offset:offset bytesPerRow:64];
+				if (t != nil)
+					[made addObject:t];
+				CHECK(t != nil && t.textureType == MTLTextureTypeTextureBuffer && t.width == 4);
+				CHECK(t.buffer == buf && t.bufferOffset == offset && t.bufferBytesPerRow == 64);
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == buf.rgfxObjId && m.offset == offset && m.bytes_per_row == 64);
+				CHECK(m.desc.texture_type == MTLTextureTypeTextureBuffer && m.desc.width == 4);
+			}
+			CHECK([buf newTextureWithDescriptor:desc offset:16 bytesPerRow:4096] != nil);
+			drainRing(fx.ring);
+			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:63] == nil);
+			CHECK([buf newTextureWithDescriptor:desc offset:0 bytesPerRow:1] == nil);
+			// At the buffer's end it is made; past its 64 KiB, its allocation, nil.
+			CHECK([made count] == 3);
+			id<MTLTexture> last = [buf newTextureWithDescriptor:desc offset:memory.size() - 64 bytesPerRow:64];
+			CHECK(last != nil);
+			drainRing(fx.ring);
+			CHECK([buf newTextureWithDescriptor:desc offset:memory.size() - 32 bytesPerRow:64] == nil);
+			CHECK([buf newTextureWithDescriptor:desc offset:memory.size() bytesPerRow:64] == nil);
+			CHECK(ringEmpty(fx.ring));
+			// Past a smaller buffer's bytes it is made: over 4096 bytes from 4064 (the measured
+			// shape, 32 of its 64 bytes past the buffer's) and from 12288, and over 20000 bytes
+			// from 19968, inside its allocation of 32768. Past that allocation it is nil, from 32736
+			// of 20000 bytes and from 16352 of 16384.
+			struct Past {
+				NSUInteger length, offset;
+				bool made;
+			};
+			for (const Past p : {Past{4096, 4064, true}, Past{4096, 12288, true}, Past{20000, 19968, true},
+			                     Past{20000, 32736, false}, Past{16384, 16352, false}}) {
+				RgfxBuffer *over = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+				                                                   regionOffset:0x10000
+				                                                         length:p.length
+				                                                        options:storage
+				                                                    deallocator:nil
+				                                                         device:nil
+				                                                     serializer:&fx.ser];
+				CHECK(over != nil);
+				if (over != nil)
+					[made addObject:over];
+				drainRing(fx.ring);
+				id<MTLTexture> past = [over newTextureWithDescriptor:desc offset:p.offset bytesPerRow:64];
+				if (!p.made) {
+					CHECK(past == nil);
+					CHECK(ringEmpty(fx.ring));
+					continue;
+				}
+				if (past != nil)
+					[made addObject:past];
+				CHECK(past != nil && past.textureType == MTLTextureTypeTextureBuffer && past.width == 4);
+				CHECK(past.buffer == over && past.bufferOffset == p.offset && past.bufferBytesPerRow == 64);
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == over.rgfxObjId && m.offset == p.offset && m.bytes_per_row == 64);
+				CHECK(m.desc.texture_type == MTLTextureTypeTextureBuffer && m.desc.width == 4);
+			}
+			CHECK(ringEmpty(fx.ring));
+		}
+	}
+	drainRing(fx.ring);
+}
+
+// A texture over a buffer's bytes whose texels end past an Apple GPU's allocation of a buffer of
+// 16 KiB or more, its length rounded up to 16 KiB, answers nil and posts nothing, by the public form
+// and the linear SPI, a 2D texture, a 2D array and a texture buffer alike, as the M3 Max answers it
+// and the host's platform answers it on every device (`tbpa`, `oracle_pastlen Apple limits`,
+// docs/graphics-kext/dgpu-oracle.md Q11, where the x86 Macs make them). A 2D texture and a texture
+// buffer end at their last texel, whatever the bytes per row past it, and a 2D array at its slices'
+// end. One ending at the length, inside the allocation or past a smaller buffer's bytes is made,
+// posting its create.
+void test_textures_past_a_buffers_allocation_answer_nil()
+{
+	Fixture fx;
+	@autoreleasepool {
+		std::vector<uint8_t> memory(0x10000, 0);
+		NSMutableArray *kept = [NSMutableArray array]; // kept, so no destroy posts between
+		auto over = [&](NSUInteger length) {
+			RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                regionOffset:0x10000
+			                                                      length:length
+			                                                     options:MTLResourceStorageModeShared
+			                                                 deallocator:nil
+			                                                      device:nil
+			                                                  serializer:&fx.ser];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			return b;
+		};
+		auto rgba = [](MTLTextureType type, NSUInteger height, NSUInteger slices) {
+			MTLTextureDescriptor *d =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+			                                                       width:64
+			                                                      height:height
+			                                                   mipmapped:NO];
+			d.textureType = type;
+			d.arrayLength = slices;
+			d.storageMode = MTLStorageModeShared;
+			return d;
+		};
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		// What a form answers over a buffer of `length` bytes: made, posting its create, or nil,
+		// posting nothing.
+		auto answers = [&](NSUInteger length, MTLTextureDescriptor *d, NSUInteger offset,
+		                   NSUInteger rows, bool linear, bool made) {
+			RgfxBuffer *b = over(length);
+			id<MTLTexture> t =
+			    linear ? [(id<RgfxMetalBufferInternals>)b newLinearTextureWithDescriptor:d
+			                                                                      offset:offset
+			                                                                 bytesPerRow:rows
+			                                                               bytesPerImage:0]
+			           : [b newTextureWithDescriptor:d offset:offset bytesPerRow:rows];
+			if (t != nil)
+				[kept addObject:t];
+			if (!made) {
+				CHECK(t == nil);
+				CHECK(ringEmpty(fx.ring));
+				return;
+			}
+			CHECK(t != nil && t.textureType == d.textureType && t.height == d.height);
+			if (linear) {
+				auto m = expectMessage<RgfxLinearTextureFromBuffer>(fx.ring,
+				                                                    RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == offset && m.bytes_per_row == rows);
+			} else {
+				auto m = expectMessage<RgfxTextureFromBuffer>(fx.ring, RGFX_CMD_TEXTURE_FROM_BUFFER);
+				CHECK(m.buffer_obj_id == b.rgfxObjId && m.offset == offset && m.bytes_per_row == rows);
+			}
+		};
+		for (const bool linear : {false, true}) {
+			// A 2D texture, rows 256 bytes apart: past 4096 bytes, at 16384, inside 20000's
+			// allocation of 32768; past 16384's allocation and past 20000's.
+			answers(4096, rgba(MTLTextureType2D, 17, 1), 0, 256, linear, true);
+			answers(16384, rgba(MTLTextureType2D, 64, 1), 0, 256, linear, true);
+			answers(20000, rgba(MTLTextureType2D, 80, 1), 0, 256, linear, true);
+			answers(16384, rgba(MTLTextureType2D, 65, 1), 0, 256, linear, false);
+			answers(20000, rgba(MTLTextureType2D, 129, 1), 0, 256, linear, false);
+			// A texture buffer of 64 bytes: from 16320 of 16384 bytes, ending at the length, and
+			// from 16352, ending at 16416.
+			answers(16384, texels, 16320, 64, linear, true);
+			answers(16384, texels, 16352, 64, linear, false);
+			// Its last texel, not its row's bytes past it: from 32704 of 20000 bytes, rows 4096
+			// apart, ending at the allocation of 32768 though its row runs to 36800, and from
+			// 32720, ending at 32784.
+			answers(20000, texels, 32704, 4096, linear, true);
+			answers(20000, texels, 32720, 64, linear, false);
+			// A 2D texture from 256, rows 512 apart, over 20000 bytes: of 64 rows, its last texel
+			// ending at 32768 though its rows run to 33024, and of 65, ending at 33280.
+			answers(20000, rgba(MTLTextureType2D, 64, 1), 256, 512, linear, true);
+			answers(20000, rgba(MTLTextureType2D, 65, 1), 256, 512, linear, false);
+		}
+		// The linear SPI's 2D array of two slices, each its rows' bytes rounded up to 128 apart: of
+		// 64 x 32 ending at 16384 over 16384 bytes, and of 64 x 33 ending at 16896.
+		answers(16384, rgba(MTLTextureType2DArray, 32, 2), 0, 256, true, true);
+		answers(16384, rgba(MTLTextureType2DArray, 33, 2), 0, 256, true, false);
+		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
+// Under an Apple GPU's rules, a texture over a buffer's bytes is nil past the M3 Max's allocation
+// of the buffer, counted from the buffer's start, and posts nothing (`oracle_pastlen Apple limits`,
+// docs/graphics-kext/dgpu-oracle.md Q11): for a buffer of fewer than 16 KiB the 128 KiB pool
+// Metal suballocates it from, for a no-copy buffer the 16 KiB pages its bytes meet, for a heap's
+// buffer the heap's size; a 2D texture's and a texture buffer's last texel counted, whatever the
+// bytes per row past it, and a 2D array's slices, each its rows' whole pitch, its texels inside
+// the length or not. The x86 Macs make the 2D textures and texture buffers past the pool (the AMD
+// 5300M and the Intel 630 under macOS 26.7.1), and the bundle makes them under their rules.
+void test_apple_textures_past_a_buffers_allocation_answer_nil()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	@autoreleasepool {
+		id apple = [RgfxAppleLinearDevice new]; // held: a buffer keeps its device weakly
+		id x86 = [RgfxTailDevice new];          // no Apple family, a linear alignment of 16
+		std::vector<uint8_t> memory(0x10000, 0);
+		NSMutableArray *kept = [NSMutableArray array]; // kept, so no destroy posts between
+		auto over = [&](NSUInteger length, id device) {
+			RgfxBuffer *b = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+			                                                regionOffset:0x10000
+			                                                      length:length
+			                                                     options:MTLResourceStorageModeShared
+			                                                 deallocator:nil
+			                                                      device:(id<MTLDevice>)device
+			                                                  serializer:&fx.ser];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			return b;
+		};
+		auto texels = [](NSUInteger width) {
+			return [MTLTextureDescriptor
+			    textureBufferDescriptorWithPixelFormat:MTLPixelFormatR8Uint
+			                                     width:width
+			                           resourceOptions:MTLResourceStorageModeShared
+			                                     usage:MTLTextureUsageShaderRead];
+		};
+		auto rows = [](NSUInteger height, NSUInteger slices) {
+			MTLTextureDescriptor *d =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+			                                                       width:64
+			                                                      height:height
+			                                                   mipmapped:NO];
+			if (slices > 1) {
+				d.textureType = MTLTextureType2DArray;
+				d.arrayLength = slices;
+			}
+			d.storageMode = MTLStorageModeShared;
+			d.usage = MTLTextureUsageShaderRead;
+			return d;
+		};
+		// What a form answers over `b`: made, posting its create, or nil, posting nothing.
+		auto answers = [&](id<MTLBuffer> b, MTLTextureDescriptor *d, NSUInteger offset,
+		                   NSUInteger pitch, bool linear, bool made) {
+			id<MTLTexture> t =
+			    linear ? [(id<RgfxMetalBufferInternals>)b newLinearTextureWithDescriptor:d
+			                                                                      offset:offset
+			                                                                 bytesPerRow:pitch
+			                                                               bytesPerImage:0]
+			           : [b newTextureWithDescriptor:d offset:offset bytesPerRow:pitch];
+			if (t != nil)
+				[kept addObject:t];
+			CHECK((t != nil) == made);
+			if (t != nil)
+				CHECK(!ringEmpty(fx.ring));
+			drainRing(fx.ring);
+		};
+		for (id device : @[ apple, x86 ]) {
+			const bool x = device == x86;
+			// Over 4096 bytes: a texture buffer ending at 128 KiB is made, with 4096 bytes a row
+			// more too; one ending a byte past it is nil.
+			answers(over(4096, device), texels(131072), 0, 131072, false, true);
+			answers(over(4096, device), texels(131072), 0, 131072 + 4096, false, true);
+			answers(over(4096, device), texels(131073), 0, 131073, false, x);
+			// A 2D texture of 512 rows 256 bytes apart, ending at 128 KiB, is made, and of 513
+			// nil; one of 256 rows 512 bytes apart from 256, its last texel at 128 KiB and its last
+			// row's end 256 bytes past, is made. By the linear SPI alike.
+			for (const bool linear : {false, true}) {
+				answers(over(4096, device), rows(512, 1), 0, 256, linear, true);
+				answers(over(4096, device), rows(513, 1), 0, 256, linear, x);
+				answers(over(4096, device), rows(256, 1), 256, 512, linear, true);
+			}
+			// The linear SPI's 2D array of two slices, rows 512 bytes apart from 256: of 127 rows,
+			// its slices ending at 130304, made; of 128, its last texel at 128 KiB and its slices'
+			// end 256 bytes past it, nil. Over 16384 bytes, of 16 rows, its last texel at the
+			// length and its slices' end past it, nil too.
+			answers(over(4096, device), rows(127, 2), 256, 512, true, true);
+			answers(over(4096, device), rows(128, 2), 256, 512, true, x);
+			answers(over(16384, device), rows(16, 2), 256, 512, true, x);
+		}
+		// A no-copy buffer of 4096 bytes from 0x3000 into a 16 KiB page: a texture buffer ending
+		// 16 KiB from the buffer's start, the one page its bytes meet, is made, and a byte past it
+		// nil; one of 4097 bytes meets two pages, 32 KiB.
+		uint8_t *app = static_cast<uint8_t *>(aligned_alloc(0x4000, 0x10000));
+		CHECK(app != nullptr);
+		std::memset(app, 0, 0x10000);
+		for (const NSUInteger length : {NSUInteger{4096}, NSUInteger{4097}}) {
+			RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:app + 0x3000
+			                                                length:length
+			                                               options:MTLResourceStorageModeShared
+			                                           deallocator:nil
+			                                                region:&region
+			                                                 slabs:&slabs
+			                                                device:(id<MTLDevice>)apple
+			                                            serializer:&fx.ser];
+			CHECK(noCopy != nil);
+			if (noCopy != nil)
+				[kept addObject:noCopy];
+			drainRing(fx.ring);
+			const NSUInteger end = length == 4096 ? 0x4000 : 0x8000;
+			answers(noCopy, texels(end), 0, end, false, true);
+			answers(noCopy, texels(end + 1), 0, end + 1, false, false);
+		}
+		// A heap's buffer of 100 bytes, and one of 16 KiB, past whose length rounded up the host's
+		// platform counts the heap's size too: a texture buffer ending the heap's 64 KiB past the
+		// buffer's start is made, wherever the buffer lies, and a byte past it nil.
+		MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+		hd.size = 0x10000;
+		hd.storageMode = MTLStorageModeShared;
+		RgfxHeap *heap = [RgfxHeap heapForDeviceWithDescriptor:hd
+		                                             maxLength:0x100000
+		                                                region:&region
+		                                                device:(id<MTLDevice>)apple
+		                                            serializer:&fx.ser];
+		CHECK(heap != nil && heap.size == 0x10000);
+		drainRing(fx.ring);
+		for (const NSUInteger length : {NSUInteger{100}, NSUInteger{100}, NSUInteger{0x4000}}) {
+			id<MTLBuffer> b = [heap newBufferWithLength:length options:MTLResourceStorageModeShared];
+			CHECK(b != nil);
+			if (b != nil)
+				[kept addObject:b];
+			drainRing(fx.ring);
+			answers(b, texels(0x10000), 0, 0x10000, false, true);
+			answers(b, texels(0x10001), 0, 0x10001, false, false);
+		}
+		CHECK(ringEmpty(fx.ring));
+		[kept removeAllObjects];
+		drainRing(fx.ring);
+		free(app);
+	}
+	drainRing(fx.ring);
+}
+
+// getBytes: and replaceRegion: of a texture over a buffer reach its bytes past the buffer's
+// length through the device's blit, where the host's platform keeps them in a tail of the
+// texture's own, so the CPU's copies and the GPU's paths are one memory there, as Metal's are
+// inside the buffer's allocation on the AMD 5300M, the Intel 630 and the M3 Max (oracle_pastlen,
+// docs/graphics-kext/dgpu-oracle.md Q11). The bytes inside the length, a row's or a texel's across
+// it among them, the CPU copies in place. The guest's memory past the length is neither read nor
+// written, and a copy inside the length blits nothing. A no-copy buffer's copies stay in place.
+void test_buffer_texture_copies_past_the_length_reach_the_tail()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	RgfxRegionSlabSource slabSource(region, fx.ser);
+	RgfxSlabs slabs(slabSource);
+	uint8_t *app = static_cast<uint8_t *>(aligned_alloc(0x4000, 0x4000)); // a no-copy buffer's
+	CHECK(app != nullptr);
+	@autoreleasepool {
+		RgfxTailDevice *device = [RgfxTailDevice new];
+		device.tail = [NSMutableData dataWithLength:0x1000];
+		uint8_t *tail = static_cast<uint8_t *>(device.tail.mutableBytes);
+		for (size_t i = 0; i < 0x1000; i++)
+			tail[i] = static_cast<uint8_t>(0xc0 ^ i);
+		const NSUInteger length = 0x1000;
+		std::vector<uint8_t> memory(2 * length, 0x11); // past the length: the next allocation's
+		for (size_t i = 0; i < length; i++)
+			memory[i] = static_cast<uint8_t>(i * 7);
+		RgfxBuffer *buf = [RgfxBuffer bufferOverHostMemoryWithContents:memory.data()
+		                                                  regionOffset:0x10000
+		                                                        length:length
+		                                                       options:MTLResourceStorageModeShared
+		                                                   deallocator:nil
+		                                                        device:(id<MTLDevice>)device
+		                                                    serializer:&fx.ser];
+		CHECK(buf != nil);
+		drainRing(fx.ring);
+		auto pastUntouched = [&]() {
+			return std::all_of(memory.begin() + length, memory.end(),
+			                   [](uint8_t v) { return v == 0x11; });
+		};
+		uint8_t in[512];
+		for (size_t i = 0; i < sizeof in; i++)
+			in[i] = static_cast<uint8_t>(0x30 + i);
+		uint8_t out[512] = {};
+
+		// A 2D texture of 64 x 17 RGBA8Unorm, rows 256 bytes apart from 0: its last row past the
+		// length. getBytes: of rows 15 and 16 reads row 15 in place and row 16 from the tail, by
+		// one blit of row 16.
+		device.texelBytes = 4;
+		MTLTextureDescriptor *desc =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:17
+		                                                   mipmapped:NO];
+		desc.storageMode = MTLStorageModeShared;
+		desc.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> rows = [buf newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
+		CHECK(rows != nil);
+		drainRing(fx.ring);
+		[rows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data() + 0xf00, 256) == 0);
+		CHECK(std::memcmp(out + 256, tail, 256) == 0);
+		CHECK(device.blits == 1 && device.lastY == 16 && device.lastRows == 1);
+		// replaceRegion: of the same rows writes row 15 in place and row 16 into the tail.
+		[rows replaceRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0 withBytes:in bytesPerRow:256];
+		CHECK(std::memcmp(memory.data() + 0xf00, in, 256) == 0);
+		CHECK(std::memcmp(tail, in + 256, 256) == 0);
+		CHECK(pastUntouched());
+		CHECK(device.blits == 2 && device.lastY == 16 && device.lastRows == 1);
+		CHECK(ringEmpty(fx.ring)); // a Shared buffer's writes post nothing
+		// A copy inside the length blits nothing.
+		[rows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 0, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data(), 512) == 0 && device.blits == 2);
+
+		// A texture buffer of 4 RGBA32Float texels from 4088: 8 bytes of its first texel inside
+		// the length, the rest of it and the other three past it. The bytes inside are copied in
+		// place, the rest through the blit of the region.
+		device.texelBytes = 16;
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeShared
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> across = [buf newTextureWithDescriptor:texels offset:length - 8 bytesPerRow:64];
+		CHECK(across != nil);
+		drainRing(fx.ring);
+		std::memset(out, 0, sizeof out);
+		[across getBytes:out bytesPerRow:64 fromRegion:MTLRegionMake1D(0, 4) mipmapLevel:0];
+		CHECK(std::memcmp(out, memory.data() + length - 8, 8) == 0);
+		CHECK(std::memcmp(out + 8, tail, 56) == 0);
+		CHECK(device.blits == 3 && device.lastY == 0 && device.lastRows == 1);
+		[across replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(std::memcmp(memory.data() + length - 8, in, 8) == 0);
+		CHECK(std::memcmp(tail, in + 8, 56) == 0);
+		CHECK(pastUntouched() && device.blits == 4);
+		CHECK(ringEmpty(fx.ring));
+
+		// A no-copy buffer's bytes past its length are the app's own memory, which Metal's CPU
+		// copies reach in place, faulting where the app's mapping ends: getBytes: and
+		// replaceRegion: of rows past its length copy them in place and blit nothing.
+		for (size_t i = 0; i < 0x4000; i++)
+			app[i] = static_cast<uint8_t>(i * 5);
+		RgfxBuffer *noCopy = [RgfxBuffer bufferWithBytesNoCopy:app
+		                                                length:length
+		                                               options:MTLResourceStorageModeShared
+		                                           deallocator:nil
+		                                                region:&region
+		                                                 slabs:&slabs
+		                                                device:(id<MTLDevice>)device
+		                                            serializer:&fx.ser];
+		CHECK(noCopy != nil && [noCopy contents] == app);
+		drainRing(fx.ring);
+		device.texelBytes = 4;
+		id<MTLTexture> appRows = [noCopy newTextureWithDescriptor:desc offset:0 bytesPerRow:256];
+		CHECK(appRows != nil);
+		drainRing(fx.ring);
+		std::memset(out, 0, sizeof out);
+		[appRows getBytes:out bytesPerRow:256 fromRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0];
+		CHECK(std::memcmp(out, app + 0xf00, 512) == 0);
+		[appRows replaceRegion:MTLRegionMake2D(0, 15, 64, 2) mipmapLevel:0 withBytes:in bytesPerRow:256];
+		CHECK(std::memcmp(app + 0xf00, in, 512) == 0);
+		CHECK(device.blits == 4);
+	}
+	drainRing(fx.ring);
+	free(app);
+}
+
 // A texture over a buffer's bytes of a block-compressed format is nil and posts nothing, by the
 // public form, as the AMD 5300M answers it over a Shared buffer (oracle_texdesc buffer bc1.*,
 // docs/graphics-kext/dgpu-oracle.md, Q24); a plain format's beside it is made.
@@ -2292,6 +3772,99 @@ void test_compressed_buffer_textures_answer_nil()
 		id<MTLTexture> subsampled = over(MTLPixelFormatGBGR422, 64, 64);
 		CHECK(subsampled != nil);
 		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+}
+
+// On a device that answers as an Apple GPU, a texture of a depth or stencil format in Shared
+// storage over a Shared buffer's bytes, by the public form and the linear SPI, ends the process
+// after the descriptor's validation, which takes it, as the M3 Max under macOS 27.0.1 ends it
+// (oracle_bundle Apple buftex.depth16, .stencil8, .d32s8, .x32s8, .depth and linear.depth, 11-13);
+// a colour texture passes. Where the device answers no Apple family, the descriptor's validation
+// ends it at the storage, as the x86 Macs do (buffer-texture-depth), and the check passes every
+// texture. An arm64 guest's device takes the M3's.
+void test_depth_buffer_textures_as_an_apple_gpu()
+{
+	const std::string kStride = "_mtlValidateStrideTextureParameters: failed assertion `Texture "
+	                            "Descriptor Validation\nLinear texture: cannot create compressed, "
+	                            "depth, or stencil textures, pixelFormat (";
+	const struct {
+		const char *name, *format;
+	} cases[] = {
+	    {"apple-buffer-texture-depth16", "MTLPixelFormatDepth16Unorm"},
+	    {"apple-buffer-texture-stencil8", "MTLPixelFormatStencil8"},
+	    {"apple-buffer-texture-d32s8", "MTLPixelFormatDepth32Float_Stencil8"},
+	    {"apple-buffer-texture-x32s8", "MTLPixelFormatX32_Stencil8"},
+	    {"apple-buffer-texture-depth", "MTLPixelFormatDepth32Float"},
+	    {"apple-buffer-texture-linear-depth", "MTLPixelFormatDepth32Float"},
+	};
+	for (const auto &c : cases)
+		checkDies(c.name, (kStride + c.format + ") disallowed\n'").c_str());
+	MTLTextureDescriptor *depth =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatDepth32Float
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	depth.storageMode = MTLStorageModePrivate;
+	rgfxEndAtLinearDepthStencil(depth, nil);
+#if !defined(__arm64__)
+	rgfxEndAtLinearDepthStencil(depth, (id<MTLDevice>)[RgfxGuestRulesDevice new]);
+#endif
+	MTLTextureDescriptor *colour =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	rgfxEndAtLinearDepthStencil(colour, (id<MTLDevice>)[RgfxAppleFamilyDevice new]);
+	g_checks++;
+}
+
+// On a device that answers as an Apple GPU, a Shared heap the device is asked for is made over a
+// block of the region, which its resources lie in, as the M3 Max under macOS 27.0.1 makes one
+// (oracle_bundle Apple heap.shared): the heap posts RGFX_CMD_HEAP_OVER_HOST_MEMORY at the block,
+// answers Shared and its contents there, and a Shared buffer in it has contents in the block.
+// None of 0 bytes or past maxBufferLength, as a Private one; none where the region has no room.
+// An arm64 guest's device takes the M3's; where the device answers no Apple family, a Shared heap
+// still ends the process (heap-shared, below).
+void test_shared_heaps_on_an_apple_gpu()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x20000, 0xee);
+	RgfxRegion region(mem.data(), mem.size());
+	auto make = [&](uint64_t size, NSUInteger maxLength, id device) {
+		MTLHeapDescriptor *d = [MTLHeapDescriptor new];
+		d.size = size;
+		d.storageMode = MTLStorageModeShared;
+		return [RgfxHeap heapForDeviceWithDescriptor:d
+		                                   maxLength:maxLength
+		                                      region:&region
+		                                      device:(id<MTLDevice>)device
+		                                  serializer:&fx.ser];
+	};
+	@autoreleasepool {
+		id apple = [RgfxAppleHeapDevice new];
+		RgfxHeap *heap = make(0x1000, 0x100000, apple);
+		CHECK(heap != nil && heap.storageMode == MTLStorageModeShared);
+		uint8_t *at = static_cast<uint8_t *>(heap.rgfxContents);
+		CHECK(at >= mem.data() && at + 0x4000 <= mem.data() + mem.size());
+		CHECK(at[0] == 0 && at[0x3fff] == 0); // its 16 KiB page zeroed
+		auto over = expectMessage<RgfxHeapOverHostMemory>(fx.ring, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
+		CHECK(over.obj_id == heap.rgfxObjId &&
+		      over.region_offset == static_cast<uint64_t>(at - mem.data()));
+		id<MTLBuffer> b = [heap newBufferWithLength:100 options:MTLResourceStorageModeShared];
+		CHECK(b != nil);
+		uint8_t *contents = static_cast<uint8_t *>([b contents]);
+		CHECK(contents >= at && contents + 100 <= at + 0x4000);
+		drainRing(fx.ring);
+		CHECK(make(0, 0x100000, apple) == nil && make(0x100001, 0x100000, apple) == nil);
+		// No room: nil.
+		CHECK(make(0x40000, 0, apple) == nil);
+		CHECK(ringEmpty(fx.ring));
+#if defined(__arm64__)
+		RgfxHeap *guest = make(0x1000, 0x100000, [RgfxGuestRulesDevice new]);
+		CHECK(guest != nil && guest.rgfxContents != nullptr);
+		drainRing(fx.ring);
+#endif
 	}
 	drainRing(fx.ring);
 }
@@ -2351,6 +3924,84 @@ void test_unalignable_linear_formats_end_the_process()
 	                             586, 587, 628, 629};
 	for (uint64_t f : answered) {
 		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f));
+		g_checks++;
+	}
+}
+
+// What minimumLinearTextureAlignmentForPixelFormat: does on the M3 Max under macOS 27.0.1 with no
+// validation layer (oracle_bundle Apple linalign, 11-13), at each raw value from 0 to 799, and at
+// 1000, 1023, 4096 and 65535 (Invalid): runs of values, each answered (kA, 16), or ending the
+// process at a compressed format (kC), a depth or stencil one (kD), or one it lacks (kI).
+enum LinearAnswer { kA, kC, kD, kI };
+struct LinearRun {
+	uint64_t first, last;
+	LinearAnswer answer;
+};
+static const LinearRun kAppleLinearAlignment[] = {
+    {0, 0, kI}, {1, 1, kA}, {2, 9, kI}, {10, 14, kA}, {15, 19, kI}, {20, 20, kA}, {21, 21, kI},
+    {22, 26, kA}, {27, 29, kI}, {30, 34, kA}, {35, 39, kI}, {40, 44, kA}, {45, 52, kI},
+    {53, 55, kA}, {56, 59, kI}, {60, 60, kA}, {61, 61, kI}, {62, 66, kA}, {67, 69, kI},
+    {70, 74, kA}, {75, 79, kI}, {80, 81, kA}, {82, 83, kI}, {84, 85, kA}, {86, 89, kI},
+    {90, 94, kA}, {95, 102, kI}, {103, 105, kA}, {106, 109, kI}, {110, 110, kA}, {111, 111, kI},
+    {112, 116, kA}, {117, 122, kI}, {123, 125, kA}, {126, 129, kI}, {130, 135, kC}, {136, 139, kI},
+    {140, 143, kC}, {144, 149, kI}, {150, 153, kC}, {154, 159, kI}, {160, 167, kC}, {168, 169, kI},
+    {170, 170, kC}, {171, 171, kI}, {172, 172, kC}, {173, 173, kI}, {174, 174, kC}, {175, 175, kI},
+    {176, 176, kC}, {177, 177, kI}, {178, 183, kC}, {184, 184, kI}, {185, 200, kC}, {201, 202, kI},
+    {203, 218, kC}, {219, 220, kI}, {221, 236, kC}, {237, 239, kI}, {240, 241, kC}, {242, 249, kI},
+    {250, 250, kD}, {251, 251, kI}, {252, 253, kD}, {254, 259, kI}, {260, 261, kD}, {262, 262, kI},
+    {263, 263, kA}, {264, 299, kI}, {300, 304, kA}, {305, 312, kI}, {313, 315, kA}, {316, 322, kI},
+    {323, 325, kA}, {326, 499, kI}, {500, 510, kA}, {511, 519, kI}, {520, 530, kA}, {531, 539, kI},
+    {540, 548, kA}, {549, 549, kI}, {550, 556, kA}, {557, 559, kI}, {560, 560, kA}, {561, 561, kI},
+    {562, 613, kA}, {614, 614, kI}, {615, 629, kA}, {630, 650, kI}, {651, 652, kD}, {653, 799, kI},
+    {1000, 1000, kI}, {1023, 1023, kI}, {4096, 4096, kI}, {65535, 65535, kI},
+};
+
+// On a device that answers as an Apple GPU, minimumLinearTextureAlignmentForPixelFormat: answers
+// and ends the process as the M3 Max does at every raw value it was asked (kAppleLinearAlignment),
+// in the x86 Macs' words for each kind; the x86 Macs' rules stay where the device answers no Apple
+// family: the 64 values they answer (test_unalignable_linear_formats_end_the_process) and none
+// other. An arm64 guest's device takes the M3's.
+void test_linear_alignment_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+#if defined(__arm64__)
+	const bool guestApple = true;
+#else
+	const bool guestApple = false;
+#endif
+	const RgfxLinearAlignmentAnswer kinds[] = {
+	    RgfxLinearAlignmentAnswer::kAnswered, RgfxLinearAlignmentAnswer::kCompressed,
+	    RgfxLinearAlignmentAnswer::kDepthStencil, RgfxLinearAlignmentAnswer::kInvalid};
+	uint64_t asked = 0, answered = 0;
+	for (const LinearRun &r : kAppleLinearAlignment)
+		for (uint64_t f = r.first; f <= r.last; f++) {
+			const MTLPixelFormat format = static_cast<MTLPixelFormat>(f);
+			CHECK(rgfxLinearAlignmentAnswer(format, apple) == kinds[r.answer]);
+			CHECK((rgfxLinearAlignmentAnswer(format, guest) == kinds[r.answer]) ==
+			      (guestApple || rgfxLinearAlignmentAnswer(format, nil) == kinds[r.answer]));
+			asked++;
+			answered += r.answer == kA;
+		}
+	CHECK(asked == 804 && answered == 175);
+	uint64_t x86 = 0;
+	for (uint64_t f = 0; f < 800; f++)
+		x86 += rgfxLinearAlignmentAnswer(static_cast<MTLPixelFormat>(f), nil) ==
+		       RgfxLinearAlignmentAnswer::kAnswered;
+	CHECK(x86 == 64);
+	const char *const kWhere = "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]: failed "
+	                           "assertion `";
+	checkDies("apple-linear-alignment-204",
+	          (std::string(kWhere) + "Linear textures do not support compressed pixel formats'")
+	              .c_str());
+	checkDies("apple-linear-alignment-651",
+	          (std::string(kWhere) + "Linear textures do not support depth/stencil pixel formats'")
+	              .c_str());
+	checkDies("apple-linear-alignment-255",
+	          (std::string(kWhere) + "MTLPixelFormatInvalid is not supported on this device.'")
+	              .c_str());
+	for (uint64_t f : {40, 263, 500, 554, 600}) {
+		rgfxEndAtUnalignableLinearFormat(static_cast<MTLPixelFormat>(f), apple);
 		g_checks++;
 	}
 }
@@ -2422,6 +4073,71 @@ void test_texture_descriptor_validation_as_the_x86_macs()
 		checkDies(c.name, c.words);
 }
 
+// On a device that answers as an Apple GPU, every texture creator ends the process at Metal's
+// descriptor validation as the M3 Max under macOS 27.0.1 ends it, and goes on at what it makes or
+// answers nil for (kAppleDescriptorCases over kDescriptorCases); the device's and a heap's
+// creators answer nil for a two-plane format but the XR10 ones (550, 551), which they make, and
+// for Unspecialized, and a heap's makes a Memoryless
+// texture in a Private heap, as the M3's do. Where the device answers no Apple family, the rules
+// stay the x86 Macs'.
+void test_texture_descriptor_validation_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	CHECK(rgfxAppleGPU(apple) && !rgfxAppleGPU(nil) &&
+	      !rgfxAppleGPU((id<MTLDevice>)[NSObject new]));
+	// An arm64 guest's device takes an Apple GPU's rules though it answers no Apple family, so
+	// its creators answer nil for a two-plane Y'CbCr format (500) where the x86 Macs' rules end the
+	// process, and make one of a two-plane XR10 format (550, which 14.6.1's WindowServer makes);
+	// an x86-64 build keeps the x86 Macs' rules.
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+	MTLTextureDescriptor *twoPlane = [MTLTextureDescriptor new];
+	twoPlane.pixelFormat = (MTLPixelFormat)500;
+	twoPlane.width = 64;
+	twoPlane.height = 64;
+	MTLTextureDescriptor *xr10 = [MTLTextureDescriptor new];
+	xr10.pixelFormat = (MTLPixelFormat)550;
+	xr10.width = 64;
+	xr10.height = 64;
+	xr10.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	xr10.storageMode = MTLStorageModePrivate;
+#if defined(__arm64__)
+	CHECK(rgfxAppleGPU(guest) && rgfxDeviceMakesNoTextureOf(twoPlane, guest) &&
+	      !rgfxDeviceMakesNoTextureOf(xr10, guest));
+#else
+	CHECK(!rgfxAppleGPU(guest) && !rgfxDeviceMakesNoTextureOf(twoPlane, guest) &&
+	      !rgfxDeviceMakesNoTextureOf(xr10, guest));
+#endif
+	for (const DescriptorCase &c : kDescriptorCases) {
+		if (const char *words = appleWords(c)) {
+			checkDies(("apple-texdesc-" + std::string(c.name)).c_str(), words);
+		} else {
+			rgfxEndAtInvalidTextureDescriptor(descriptorOf(c), apple);
+			g_checks++;
+		}
+	}
+	auto ofFormat = [](uint64_t format) {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		d.pixelFormat = static_cast<MTLPixelFormat>(format);
+		return d;
+	};
+	for (uint64_t f : kTwoPlaneFormats)
+		CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(f), apple) == (f != 550 && f != 551) &&
+		      !rgfxDeviceMakesNoTextureOf(ofFormat(f), nil));
+	CHECK(rgfxDeviceMakesNoTextureOf(ofFormat(263), apple));
+	CHECK(!rgfxDeviceMakesNoTextureOf(ofFormat(MTLPixelFormatBGRA8Unorm), apple) &&
+	      !rgfxDeviceMakesNoTextureOf(ofFormat(MTLPixelFormatBGRA10_XR), apple) &&
+	      !rgfxDeviceMakesNoTextureOf(nil, apple));
+	MTLTextureDescriptor *memoryless = ofFormat(MTLPixelFormatBGRA8Unorm);
+	memoryless.storageMode = MTLStorageModeMemoryless;
+	memoryless.usage = MTLTextureUsageRenderTarget;
+	rgfxEndAtHeapStorageMismatch(memoryless, MTLStorageModePrivate, apple);
+	g_checks++;
+}
+
 // A texture over an IOSurface ends the process with Metal's words, before the host is sent
 // anything, where newTextureWithDescriptor:iosurface:plane: ends it on the AMD 5300M and the Intel
 // 630 (oracle_surftex, Q20): at the descriptor's validation, then, over a surface without planes,
@@ -2462,6 +4178,36 @@ void test_invalid_surface_textures_end_the_process()
 	overYCbCrPlane(MTLPixelFormatGBGR422, 0, true);
 	overYCbCrPlane(MTLPixelFormatBGRG422, 0, false);
 	g_checks++;
+}
+
+// On a device that answers as an Apple GPU, a texture over a surface ends the process, answers nil
+// or is made as the M3 Max under macOS 27.0.1 answers (kAppleSurfaceCases): it ends at a cube over
+// a plane, and answers nil for a compressed format and for a subsampled two-plane one of an odd
+// side that is a render target or written (rgfxSurfaceMakesNoTextureOf), sending nothing. Where
+// the device answers no Apple family the x86 Macs' answers stay: none of these is nil, and a
+// cube over a plane is made (kSurfaceCases' surface-plane-cube). An arm64 guest's device takes
+// the M3's.
+void test_surface_textures_as_an_apple_gpu()
+{
+	id<MTLDevice> apple = (id<MTLDevice>)[RgfxAppleFamilyDevice new];
+	id<MTLDevice> guest = (id<MTLDevice>)[RgfxGuestRulesDevice new];
+#if defined(__arm64__)
+	const bool guestApple = true;
+#else
+	const bool guestApple = false;
+#endif
+	for (const AppleSurfaceCase &c : kAppleSurfaceCases) {
+		if (c.words != nullptr) {
+			checkDies(c.name, c.words);
+			continue;
+		}
+		endAtAppleSurfaceCase(c, apple);
+		MTLTextureDescriptor *d = descriptorOf(c);
+		CHECK(rgfxSurfaceMakesNoTextureOf(d, apple) == c.none);
+		CHECK(rgfxSurfaceMakesNoTextureOf(d, guest) == (guestApple && c.none));
+		CHECK(!rgfxSurfaceMakesNoTextureOf(d, nil));
+	}
+	CHECK(!rgfxSurfaceMakesNoTextureOf(nil, apple));
 }
 
 // A texture wrapper's create routes an RGFX_CMD_TEXTURE_CREATE onto the ring
@@ -2521,7 +4267,7 @@ void test_texture_routing()
 
 // One chunk of texture resource ids (ids 1 + 4 * 64 to 64 + 4 * 64), as the kext would hand
 // it, and none after it.
-bool oneChunk(void *context, uint64_t *first_id)
+bool oneChunk(void *context, uint64_t *first_id, uint64_t *ids)
 {
 	int *calls = static_cast<int *>(context);
 	if ((*calls)++ != 0)
@@ -2592,7 +4338,8 @@ void test_texture_resource_ids()
 }
 
 // A sampler wrapper's create routes an RGFX_CMD_SAMPLER_CREATE, mapping every
-// descriptor field (the LOD clamps as f32 bits, the booleans packed into flags).
+// descriptor field (the LOD clamps and bias as f32 bits, the booleans packed into flags, the
+// reduction mode and the bias in the extension).
 void test_sampler_routing()
 {
 	Fixture fx;
@@ -2610,12 +4357,17 @@ void test_sampler_routing()
 	desc.lodMaxClamp = 7.5f;
 	desc.normalizedCoordinates = YES;
 	desc.supportArgumentBuffers = YES;
+	if ([desc respondsToSelector:@selector(setLodBias:)]) {
+		desc.lodBias = -0.5f;
+		desc.reductionMode = MTLSamplerReductionModeMaximum;
+	}
 
 	RgfxSampler *smp = [RgfxSampler samplerWithDescriptor:desc device:nil serializer:&fx.ser];
 	CHECK(smp != nil && smp.rgfxObjId == 1);
 	CHECK([smp conformsToProtocol:@protocol(MTLSamplerState)]);
 
-	auto msg = expectMessage<RgfxSamplerCreate>(fx.ring, RGFX_CMD_SAMPLER_CREATE);
+	auto whole = expectMessage<RgfxSamplerCreateWhole>(fx.ring, RGFX_CMD_SAMPLER_CREATE);
+	const RgfxSamplerCreate &msg = whole.create;
 	CHECK(msg.obj_id == smp.rgfxObjId);
 	CHECK(msg.min_filter == (uint32_t)MTLSamplerMinMagFilterLinear);
 	CHECK(msg.mag_filter == (uint32_t)MTLSamplerMinMagFilterLinear);
@@ -2629,6 +4381,14 @@ void test_sampler_routing()
 	std::memcpy(&lodMax, &msg.lod_max_clamp_bits, 4);
 	CHECK(lodMax == 7.5f);
 	CHECK(msg.flags == (0x1u | 0x4u)); // normalized coords + argument-buffer usable
+	// lodBias and reductionMode, in the extension: Metal's defaults where the descriptor has
+	// neither.
+	float bias = -1.0f;
+	std::memcpy(&bias, &whole.ext.lod_bias_bits, 4);
+	if ([desc respondsToSelector:@selector(lodBias)])
+		CHECK(bias == desc.lodBias && whole.ext.reduction_mode == (uint32_t)desc.reductionMode);
+	else
+		CHECK(bias == 0.0f && whole.ext.reduction_mode == 0);
 }
 
 // A depth/stencil wrapper's create routes an RGFX_CMD_DEPTH_STENCIL_CREATE,
@@ -3043,6 +4803,81 @@ void test_render_pipeline_routing()
 	CHECK(err2 != nil);
 }
 
+// A render pipeline create carries its descriptor's private state, as Apple's OpenGL renderer sets
+// it, after its head where the host took RGFX_FEATURE_PRIVATE_RENDER_STATE, and not elsewhere: the
+// state's properties at their values, Metal's defaults for the ones left alone.
+void test_render_pipeline_private_state()
+{
+	Fixture fx;
+	const uint8_t libBytes[] = {1, 2, 3, 4};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	MTLRenderPipelineDescriptor *desc = [[MTLRenderPipelineDescriptor alloc] init];
+	desc.vertexFunction = [lib newFunctionWithName:@"vmain"];
+	desc.fragmentFunction = [lib newFunctionWithName:@"fmain"];
+	desc.colorAttachments[0].pixelFormat = MTLPixelFormatRGBA8Unorm;
+	// The states live to the test's end, so no destroy comes between the creates.
+	NSMutableArray *states = [NSMutableArray array];
+	auto create = [&]() {
+		NSError *err = nil;
+		RgfxRenderPipelineState *ps =
+		    [RgfxRenderPipelineState renderPipelineStateWithDescriptor:desc
+		                                                       device:nil
+		                                                   serializer:&fx.ser
+		                                                        error:&err];
+		CHECK(ps != nil && err == nil);
+		[states addObject:ps];
+		return nextMessage(fx.ring, RGFX_CMD_RENDER_PIPELINE_CREATE);
+	};
+	RgfxRenderPipelineCreate head;
+	RgfxRenderPipelinePrivateState state;
+
+	// Not carried: no flag, and the tail starts at the head's end.
+	auto bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE) == 0);
+	CHECK(head.vertex_name_offset == sizeof(head));
+
+	// Carried, at Metal's defaults.
+	fx.ser.setCarriesPrivateRenderState(true);
+	bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK((head.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE) != 0);
+	CHECK(head.vertex_name_offset == sizeof(head) + sizeof(state));
+	CHECK(std::memcmp(bytes.data() + head.vertex_name_offset, "vmain", 5) == 0);
+	std::memcpy(&state, bytes.data() + sizeof(head), sizeof(state));
+	float coverage = 0;
+	std::memcpy(&coverage, &state.sample_coverage, sizeof(coverage));
+	CHECK(state.sample_mask == UINT64_MAX);
+	CHECK(coverage == 1.0f);
+	CHECK(state.logic_operation == 0 && state.flags == 0 && state.reserved_14 == 0);
+
+	// Carried, as the renderer sets it for an XOR logic operation, a sample mask and coverage.
+	[desc setValue:@YES forKey:@"openGLModeEnabled"];
+	[desc setValue:@3 forKey:@"sampleMask"];
+	[desc setValue:@0.5f forKey:@"sampleCoverage"];
+	[desc setValue:@YES forKey:@"sampleCoverageInvert"];
+	[desc setValue:@YES forKey:@"logicOperationEnabled"];
+	[desc setValue:@10 forKey:@"logicOperation"];
+	[desc setValue:@YES forKey:@"depthStencilWriteDisabled"];
+	bytes = create();
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	std::memcpy(&state, bytes.data() + sizeof(head), sizeof(state));
+	std::memcpy(&coverage, &state.sample_coverage, sizeof(coverage));
+	CHECK(state.sample_mask == 3);
+	CHECK(coverage == 0.5f);
+	CHECK(state.logic_operation == 10);
+	CHECK(state.flags == (RGFX_PRIVATE_RENDER_OPENGL_MODE | RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT |
+	                      RGFX_PRIVATE_RENDER_LOGIC_OPERATION |
+	                      RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED));
+}
+
 // A mesh render pipeline create maps the MTLMeshRenderPipelineDescriptor into the wire: its three
 // functions and label in the tail, its colours, flags, maxima, payload and required sizes in its
 // head. Its answer's mesh limits are what the state answers, NSUIntegerMax for the wire's highest
@@ -3262,6 +5097,366 @@ void test_invalid_mesh_descriptors_end_the_process()
 	checkDies("mesh-no-fragment", (kWhere + "fragmentFunction must not be nil.\n'").c_str());
 }
 
+// What oracle_threads' steps answered, each a first compile of its kernel on a device of 1024
+// threads a threadgroup: `plain`, `max64` of [[max_total_threads_per_threadgroup(64)]] and `max256`,
+// with the required size and maxTotalThreadsPerThreadgroup its name gives (none where it names none):
+// the 5300M's under macOS 26.7.1, the x86 guest's rules, and the M3 Max's under macOS 27.0.1, the
+// arm64 guest's (RgfxComputeThreadsVerdictOf). A pipeline made answers the required size's threads.
+enum ThreadsAnswerKind { kThreadsMade, kThreadsRefused, kThreadsDies };
+struct ThreadsAnswer {
+	ThreadsAnswerKind kind;
+	NSUInteger threads; // made: its maxTotalThreadsPerThreadgroup, 0 where none is required
+	const char *words;  // refused: the error's description; dies: the failed assertion's message
+};
+struct ThreadsCase {
+	const char *step;
+	NSUInteger kernelMax;
+	MTLSize required;
+	NSUInteger maxTotal;
+	ThreadsAnswer x86, apple;
+};
+static const ThreadsCase kThreadsCases[] = {
+	{"plain", 0, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64", 64, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max256", 256, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt32", 0, {0, 0, 0}, 32,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt96", 0, {0, 0, 0}, 96,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt1024", 0, {0, 0, 0}, 1024,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"plain-mt1025", 0, {0, 0, 0}, 1025,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (1025) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Specified total max threads per threadgroup (1025) exceeds the maximum total threads "
+	   "per threadgroup supported (1024)"}},
+	{"plain-mt2048", 0, {0, 0, 0}, 2048,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Specified total max threads per threadgroup (2048) exceeds the maximum total threads "
+	   "per threadgroup supported (1024)"}},
+	{"max64-mt32", 64, {0, 0, 0}, 32,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (32)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (32)"}},
+	{"max64-mt64", 64, {0, 0, 0}, 64,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64-mt128", 64, {0, 0, 0}, 128,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (128)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (128)"}},
+	{"max64-mt1024", 64, {0, 0, 0}, 1024,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (1024)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (1024)"}},
+	{"max64-mt2048", 64, {0, 0, 0}, 2048,
+	 {kThreadsRefused, 0, "maxThreadsPerThreadgroup pipeline descriptor value (2048) exceeds maximum supported "
+	   "(1024)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (2048)"}},
+	{"plain-req1x1x1", 0, {1, 1, 1}, 0,
+	 {kThreadsMade, 1, nullptr},
+	 {kThreadsMade, 1, nullptr}},
+	{"plain-req7x3x1", 0, {7, 3, 1}, 0,
+	 {kThreadsMade, 21, nullptr},
+	 {kThreadsMade, 21, nullptr}},
+	{"plain-req8x8x2", 0, {8, 8, 2}, 0,
+	 {kThreadsMade, 128, nullptr},
+	 {kThreadsMade, 128, nullptr}},
+	{"plain-req1x1x64", 0, {1, 1, 64}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"plain-req32x32x1", 0, {32, 32, 1}, 0,
+	 {kThreadsMade, 1024, nullptr},
+	 {kThreadsMade, 1024, nullptr}},
+	{"plain-req33x32x1", 0, {33, 32, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(33) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(1056) must be <= 1024 (device limit)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(33) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(1056) must be <= 1024 (device limit)\n"}},
+	{"plain-req64x32x1", 0, {64, 32, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(2048) must be <= 1024 (device limit)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(32) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(2048) must be <= 1024 (device limit)\n"}},
+	{"plain-req0x1x1", 0, {0, 1, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"}},
+	{"plain-req8x0x1", 0, {8, 0, 1}, 0,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(8) * requiredThreadsPerThreadgroup.height(0) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(8) * requiredThreadsPerThreadgroup.height(0) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n"}},
+	{"plain-req0x0x0", 0, {0, 0, 0}, 0,
+	 {kThreadsMade, 0, nullptr},
+	 {kThreadsMade, 0, nullptr}},
+	{"max64-req32x1x1", 64, {32, 1, 1}, 0,
+	 {kThreadsMade, 32, nullptr},
+	 {kThreadsMade, 32, nullptr}},
+	{"max64-req64x1x1", 64, {64, 1, 1}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req8x8x1", 64, {8, 8, 1}, 0,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req65x1x1", 64, {65, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 65,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 65,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req128x1x1", 64, {128, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req16x8x1", 64, {16, 8, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 16,8,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 16,8,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max64-req1024x1x1", 64, {1024, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 1024,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 1024,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+	{"max256-req16x16x1", 256, {16, 16, 1}, 0,
+	 {kThreadsMade, 256, nullptr},
+	 {kThreadsMade, 256, nullptr}},
+	{"max256-req512x1x1", 256, {512, 1, 1}, 0,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 512,1,1 but 'max256' expects max "
+	   "threads per threadgroup 256\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 512,1,1 but 'max256' expects max "
+	   "threads per threadgroup 256\n"}},
+	{"plain-req64x1x1-mt32", 0, {64, 1, 1}, 32,
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	   "(32)\n"},
+	 {kThreadsDies, 0, "Compute Pipeline Descriptor Validation\n"
+	   "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	   "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	   "(32)\n"}},
+	{"plain-req64x1x1-mt64", 0, {64, 1, 1}, 64,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"plain-req64x1x1-mt128", 0, {64, 1, 1}, 128,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (64) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (128)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (64) must match compute pipeline "
+	   "specified max total threads per threadgroup (128)"}},
+	{"max64-req64x1x1-mt64", 64, {64, 1, 1}, 64,
+	 {kThreadsMade, 64, nullptr},
+	 {kThreadsMade, 64, nullptr}},
+	{"max64-req32x1x1-mt64", 64, {32, 1, 1}, 64,
+	 {kThreadsRefused, 0, "max_total_threads_per_threadgroup shader attribute(Metadata) value (32) does not match "
+	   "maxThreadsPerThreadgroup pipeline descriptor value (64)\n"},
+	 {kThreadsRefused, 0, ": Kernel specified max total threads per threadgroup (32) must match compute pipeline "
+	   "specified max total threads per threadgroup (64)"}},
+	{"max64-req32x1x1-mt32", 64, {32, 1, 1}, 32,
+	 {kThreadsMade, 32, nullptr},
+	 {kThreadsMade, 32, nullptr}},
+	{"max64-req128x1x1-mt128", 64, {128, 1, 1}, 128,
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"},
+	 {kThreadsRefused, 0, "error: requested required threads per threadgroup 128,1,1 but 'max64' expects max "
+	   "threads per threadgroup 64\n"}},
+
+};
+
+// Each measured answer of a compute pipeline's threadgroup fields (kThreadsCases), under each
+// guest arch's rules: Metal's assertion, which ends the process at the create, its compiler's
+// refusal, or the pipeline, which answers a required size's threads as its maximum. And macOS 27's
+// forward progress and contention relief fields, which the M3 Max's compiler refuses outside the
+// values Metal names.
+void test_compute_threadgroup_fields_as_metal()
+{
+	for (const ThreadsCase &c : kThreadsCases) {
+		NSString *step = @(c.step);
+		NSString *kernel = [step componentsSeparatedByString:@"-"][0];
+		for (RgfxThreadsRules rules : {RgfxThreadsRulesX86, RgfxThreadsRulesApple}) {
+			const bool x86 = rules == RgfxThreadsRulesX86;
+			const ThreadsAnswer &want = x86 ? c.x86 : c.apple;
+			RgfxThreadsVerdict *v =
+			    RgfxComputeThreadsVerdictOf(rules, c.required, c.maxTotal, c.kernelMax, kernel, 1024);
+			bool ok = false;
+			switch (want.kind) {
+			case kThreadsMade:
+				ok = v.assertion == nil && v.error == nil && v.maxTotalThreads == want.threads;
+				break;
+			case kThreadsRefused:
+				ok = v.assertion == nil && v.error != nil &&
+				     [v.error.domain isEqualToString:x86 ? @"CompilerError" : @"AGXMetalG15X_M1"] &&
+				     v.error.code == (x86 ? 2 : 3) &&
+				     [v.error.localizedDescription isEqualToString:@(want.words)];
+				break;
+			case kThreadsDies:
+				ok = [v.assertion isEqualToString:@(want.words)] && v.error == nil &&
+				     std::strcmp(v.assertionFunction,
+				                 x86 ? "validateWithDevice:1530" : "validateWithDevice:1623") == 0;
+				break;
+			}
+			if (!ok)
+				std::fprintf(stderr, "%s (%s rules): assertion %s, error %s, threads %lu\n", c.step,
+				             x86 ? "x86" : "Apple", v.assertion.UTF8String ?: "none",
+				             v.error.localizedDescription.UTF8String ?: "none",
+				             static_cast<unsigned long>(v.maxTotalThreads));
+			CHECK(ok);
+		}
+	}
+	// A device limit it does not know (0) is not checked.
+	RgfxThreadsVerdict *unknown = RgfxComputeThreadsVerdictOf(RgfxThreadsRulesApple, MTLSizeMake(64, 32, 1),
+	                                                          0, 0, @"plain", 0);
+	CHECK(unknown.assertion == nil && unknown.error == nil && unknown.maxTotalThreads == 2048);
+
+	// Forward progress usage (Automatic 0, Weak 1, SIMDGroupParallel 2) and contention relief
+	// (Automatic 0, None 1), where the guest's Metal has them (oracle_threads' -fp and -cr steps).
+	CHECK(RgfxComputeProgressError(NO, 3, NO, 2) == nil);
+	for (NSInteger fp : {0, 1, 2})
+		CHECK(RgfxComputeProgressError(YES, fp, YES, 0) == nil);
+	for (NSInteger cr : {0, 1})
+		CHECK(RgfxComputeProgressError(YES, 0, YES, cr) == nil);
+	const std::pair<NSInteger, NSInteger> refused[] = {{3, 0}, {-1, 0}, {0, 2}, {0, 3}};
+	for (const auto &[fp, cr] : refused) {
+		NSError *e = RgfxComputeProgressError(YES, fp, YES, cr);
+		CHECK(e != nil && [e.domain isEqualToString:@"AGXMetalG15X_M1"] && e.code == 2);
+		CHECK([e.localizedDescription
+		    isEqualToString:@"Compilation failed due to an interrupted connection: "
+		                    @"XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries."]);
+	}
+}
+
+// A compute pipeline's threadgroup fields end the process with Metal's words where its validation
+// ends it (kThreadsCases), checked before the create posts: a required size with an axis of 0, and
+// one of more threads than maxTotalThreadsPerThreadgroup, in this Mac's arch's words.
+void test_compute_threadgroup_fields_end_the_process()
+{
+	const std::string kWhere =
+	    std::string(RgfxGuestThreadsRules() == RgfxThreadsRulesApple ? "validateWithDevice:1623"
+	                                                                 : "validateWithDevice:1530") +
+	    ": failed assertion `Compute Pipeline Descriptor Validation\n";
+	checkDies("compute-required-0x1x1",
+	          (kWhere + "(requiredThreadsPerThreadgroup.width(0) * requiredThreadsPerThreadgroup.height(1) * "
+	                    "requiredThreadsPerThreadgroup.depth(1))(0) must not be 0.\n'")
+	              .c_str());
+	checkDies("compute-required-64-max-32",
+	          (kWhere + "(requiredThreadsPerThreadgroup.width(64) * requiredThreadsPerThreadgroup.height(1) * "
+	                    "requiredThreadsPerThreadgroup.depth(1))(64) must be <= maxTotalThreadsPerThreadgroup "
+	                    "(32)\n'")
+	              .c_str());
+}
+
+// Over a kernel's own [[max_total_threads_per_threadgroup(32)]] (tests/air_arguments.metal's
+// calls_through_table, read from its AIR): a required size past it, and a
+// maxTotalThreadsPerThreadgroup other than it, are refused before the create posts, in this Mac's
+// arch's words (kThreadsCases); a required size within it makes a pipeline that answers its threads
+// before the host's answer. Its forward progress usage of Automatic answers Weak, and one Metal
+// does not name is refused (where this Mac's Metal has the field).
+void test_compute_threadgroup_fields_over_air()
+{
+	Fixture fx(0x40000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	drainRing(fx.ring);
+	RgfxFunction *kernel = (RgfxFunction *)[lib newFunctionWithName:@"calls_through_table"];
+	CHECK([kernel rgfxAirFunction] != nullptr && [kernel rgfxAirFunction]->maxTotalThreads == 32);
+	const bool apple = RgfxGuestThreadsRules() == RgfxThreadsRulesApple;
+	MTLComputePipelineDescriptor *d = [[MTLComputePipelineDescriptor alloc] init];
+	d.computeFunction = kernel;
+	NSError *err = nil;
+	auto create = [&] {
+		err = nil;
+		return [RgfxComputePipelineState computePipelineStateWithDescriptor:d
+		                                                             device:nil
+		                                                         serializer:&fx.ser
+		                                                              error:&err];
+	};
+	auto refusedWith = [&](NSString *words) {
+		return err != nil && [err.domain isEqualToString:apple ? @"AGXMetalG15X_M1" : @"CompilerError"] &&
+		       err.code == (apple ? 3 : 2) && [err.localizedDescription isEqualToString:words];
+	};
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(64, 1, 1);
+	CHECK(create() == nil);
+	CHECK(refusedWith(@"error: requested required threads per threadgroup 64,1,1 but 'calls_through_table' "
+	                  @"expects max threads per threadgroup 32\n"));
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 0, 0);
+	d.maxTotalThreadsPerThreadgroup = 64;
+	CHECK(create() == nil);
+	CHECK(refusedWith(apple ? @": Kernel specified max total threads per threadgroup (32) must match compute "
+	                          @"pipeline specified max total threads per threadgroup (64)"
+	                        : @"max_total_threads_per_threadgroup shader attribute(Metadata) value (32) does not "
+	                          @"match maxThreadsPerThreadgroup pipeline descriptor value (64)\n"));
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> none;
+	CHECK(!fx.ring.next(&h, &none)); // neither posted
+
+	d.maxTotalThreadsPerThreadgroup = 0;
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(8, 2, 1);
+	RgfxComputePipelineState *cs = create();
+	CHECK(cs != nil && err == nil);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	CHECK(cs.maxTotalThreadsPerThreadgroup == 16);
+	CHECK(sizeIs(cs.requiredThreadsPerThreadgroup, 8, 2, 1));
+
+	if (![d respondsToSelector:@selector(forwardProgressUsage)])
+		return;
+	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageWeak); // of Automatic
+	d.requiredThreadsPerThreadgroup = MTLSizeMake(0, 0, 0);
+	d.forwardProgressUsage = MTLForwardProgressUsageSIMDGroupParallel;
+	cs = create();
+	CHECK(cs != nil && cs.forwardProgressUsage == MTLForwardProgressUsageSIMDGroupParallel);
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	d.forwardProgressUsage = static_cast<MTLForwardProgressUsage>(3);
+	CHECK(create() == nil);
+	CHECK(err != nil && [err.domain isEqualToString:@"AGXMetalG15X_M1"] && err.code == 2);
+	d.forwardProgressUsage = MTLForwardProgressUsageAutomatic;
+	d.contentionRelief = static_cast<MTLContentionRelief>(2);
+	CHECK(create() == nil);
+	CHECK(err != nil && [err.domain isEqualToString:@"AGXMetalG15X_M1"] && err.code == 2);
+	// Neither posted a create (a state let go above posts its destroy).
+	while (fx.ring.next(&h, &none))
+		CHECK(h.type != RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+}
+
 // A compute pipeline create maps the function (and the descriptor knobs) into the
 // wire; the wrapper holds objId + seqno.
 void test_compute_pipeline_routing()
@@ -3456,6 +5651,412 @@ void test_compute_pipeline_routing()
 	CHECK(err3 != nil);
 }
 
+// A device that answers each message it takes with `answer`, keeping each in order: a
+// serialiser over a control ring that forwards each message. Never freed: objects a test lets go
+// post their destroys through it after the test.
+struct Answering {
+	uint32_t answer = RGFX_STATUS_OK;
+	uint64_t seqno = 0;
+	std::vector<std::vector<uint8_t>> messages;
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxRingWriter &control = *new RgfxRingWriter(&Answering::forward, this, 0x8000);
+	RgfxSerializer &ser = *new RgfxSerializer(control, ids);
+
+	static bool forward(void *context, const void *message, uint32_t size, uint64_t *seqno,
+	                    uint32_t *status)
+	{
+		Answering *a = static_cast<Answering *>(context);
+		const uint8_t *b = static_cast<const uint8_t *>(message);
+		a->messages.emplace_back(b, b + size);
+		*seqno = ++a->seqno;
+		if (status)
+			*status = a->answer;
+		return true;
+	}
+	// The messages of `type` it took, in order.
+	std::vector<std::vector<uint8_t>> of(uint32_t type) const
+	{
+		std::vector<std::vector<uint8_t>> out;
+		for (const std::vector<uint8_t> &m : messages) {
+			RgfxMsgHeader h = {};
+			std::memcpy(&h, m.data(), sizeof(h));
+			if (h.type == type)
+				out.push_back(m);
+		}
+		return out;
+	}
+};
+
+// A .metallib's bytes with no functions whose HDYN region names `installName` and `dependencies`,
+// as Apple's `metal -dynamiclib` and `-l` write them (rgfxReadMetallibLinkage): of type dynamic
+// where `dynamic`, else executable. `hdyn` false leaves the extended header without HDYN.
+std::vector<uint8_t> linkedMetallib(const std::string &installName,
+                                    const std::vector<std::string> &dependencies,
+                                    bool dynamic = true, bool hdyn = true)
+{
+	std::vector<uint8_t> b(0x40, 0);
+	std::memcpy(b.data(), "MTLB", 4);
+	b[0x0a] = dynamic ? 2 : 0;
+	b[0x18] = 0x40; // the function list: its count, 0, at 0x40, and no entries after it
+	b.resize(0x44, 0);
+	auto tag = [&](const char *name, const void *data, uint16_t size) {
+		const size_t at = b.size();
+		b.resize(at + 6 + size, 0);
+		std::memcpy(b.data() + at, name, 4);
+		std::memcpy(b.data() + at + 4, &size, 2);
+		std::memcpy(b.data() + at + 6, data, size);
+	};
+	auto text = [&](const char *name, const std::string &value) {
+		tag(name, value.c_str(), static_cast<uint16_t>(value.size() + 1));
+	};
+	const size_t hdynAt = b.size() + 6;
+	if (hdyn) {
+		const uint64_t placeholder[2] = {};
+		tag("HDYN", placeholder, sizeof(placeholder));
+	}
+	b.insert(b.end(), {'E', 'N', 'D', 'T'});
+	const uint64_t region = b.size();
+	text("NAME", installName);
+	for (const std::string &d : dependencies)
+		text("DYNL", d);
+	b.insert(b.end(), {'E', 'N', 'D', 'T'});
+	if (hdyn) {
+		const uint64_t span[2] = {region, b.size() - region};
+		std::memcpy(b.data() + hdynAt, span, sizeof(span));
+	}
+	return b;
+}
+
+// A shadow maker that makes none: the tests' libraries have no Metal of their own behind them.
+RgfxShadowMaker noShadow()
+{
+	return ^id<MTLLibrary>(dispatch_data_t) {
+		return nil;
+	};
+}
+
+// The library of `bytes` on `ser`, keeping them as the device keeps a library's source.
+RgfxLibrary *linkedLibrary(RgfxSerializer &ser, const std::vector<uint8_t> &bytes)
+{
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.data()
+	                                        length:bytes.size()
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&ser
+	                                        status:&status];
+	CHECK(lib != nil);
+	dispatch_data_t source =
+	    dispatch_data_create(bytes.data(), bytes.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	[lib rgfxSetSource:source shadowMaker:noShadow()];
+	return lib;
+}
+
+// A .metallib's linkage reads from its HDYN region: its install name and its dependencies in
+// order; one with no HDYN reads as none, and bytes that are no .metallib, or a region past them,
+// do not read.
+void test_metallib_linkage()
+{
+	const std::vector<std::string> deps = {"@loader_path/libb.metallib", "/abs/libc.metallib"};
+	std::vector<uint8_t> bytes = linkedMetallib("@executable_path/liba.metallib", deps);
+	RgfxMetallibLinkage linkage;
+	CHECK(rgfxReadMetallibLinkage(bytes.data(), bytes.size(), linkage));
+	CHECK(linkage.installName == "@executable_path/liba.metallib");
+	CHECK(linkage.dependencies == deps);
+	std::vector<uint8_t> none = linkedMetallib("x", {}, false, false);
+	CHECK(rgfxReadMetallibLinkage(none.data(), none.size(), linkage));
+	CHECK(linkage.installName.empty() && linkage.dependencies.empty());
+	CHECK(!rgfxReadMetallibLinkage(bytes.data(), bytes.size() - 8, linkage));
+	CHECK(linkage.installName.empty() && linkage.dependencies.empty());
+	std::vector<uint8_t> other = bytes;
+	other[0] = 'X';
+	CHECK(!rgfxReadMetallibLinkage(other.data(), other.size(), linkage));
+	CHECK(!rgfxReadMetallibLinkage(bytes.data(), 0x20, linkage));
+}
+
+// A dynamic library is made only where the host makes them, of the library a
+// DYNAMIC_LIBRARY_CREATE names, nil where the host refuses it; it answers its library's install
+// name and, as airData, its library's bytes, and writes them to a file URL in a directory that is
+// there, and nothing to any other URL, with Metal's "Invalid URL".
+void test_dynamic_library_routing()
+{
+	Answering &a = *new Answering();
+	std::vector<uint8_t> bytes = linkedMetallib("@executable_path/liba.metallib", {});
+	RgfxLibrary *lib = linkedLibrary(a.ser, bytes);
+	CHECK(lib.type == MTLLibraryTypeDynamic);
+	CHECK([lib.installName isEqualToString:@"@executable_path/liba.metallib"]);
+	uint32_t status = 0;
+	const size_t before = a.messages.size();
+	CHECK([RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser
+	                                           status:&status] == nil);
+	CHECK(status == kRgfxNoAnswer && a.messages.size() == before);
+
+	a.ser.setCarriesDynamicLibraries(true);
+	RgfxDynamicLibrary *dylib = [RgfxDynamicLibrary dynamicLibraryOfLibrary:lib
+	                                                                 device:nil
+	                                                             serializer:&a.ser
+	                                                                 status:&status];
+	CHECK(dylib != nil && status == RGFX_STATUS_OK);
+	CHECK(dylib.rgfxLibrary == lib);
+	CHECK([dylib.installName isEqualToString:@"@executable_path/liba.metallib"]);
+	const void *airBytes = nullptr;
+	size_t airSize = 0;
+	dispatch_data_t air = [dylib airData];
+	dispatch_data_t airMap = air ? dispatch_data_create_map(air, &airBytes, &airSize) : nil;
+	CHECK(airMap != nil && airSize == bytes.size());
+	CHECK(std::memcmp(airBytes, bytes.data(), bytes.size()) == 0);
+	// The caller owns what airData answers, as Metal's compile of source takes it: one reference
+	// more than the library's, past the pool the call ran in.
+	void *base = nullptr;
+	@autoreleasepool {
+		base = (__bridge void *)[lib rgfxSource];
+	}
+	const long baseline = CFGetRetainCount(base);
+	void *owned = nullptr;
+	@autoreleasepool {
+		owned = reinterpret_cast<void *(*)(id, SEL)>(objc_msgSend)(dylib, sel_registerName("airData"));
+	}
+	CHECK(owned == base && CFGetRetainCount(owned) == baseline + 1);
+	CFRelease(owned);
+	CHECK(CFGetRetainCount(base) == baseline);
+	std::vector<std::vector<uint8_t>> creates = a.of(RGFX_CMD_DYNAMIC_LIBRARY_CREATE);
+	CHECK(creates.size() == 1);
+	RgfxDynamicLibraryCreate create = {};
+	std::memcpy(&create, creates[0].data(), sizeof(create));
+	CHECK(create.obj_id == dylib.rgfxObjId && create.library_obj_id == lib.rgfxObjId);
+	a.answer = RGFX_STATUS_REFUSED;
+	CHECK([RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser
+	                                           status:&status] == nil);
+	CHECK(status == RGFX_STATUS_REFUSED);
+	a.answer = RGFX_STATUS_OK;
+
+	NSString *dir = [NSTemporaryDirectory()
+	    stringByAppendingPathComponent:[NSString stringWithFormat:@"rgfx-dylib-%d", getpid()]];
+	CHECK([[NSFileManager defaultManager] createDirectoryAtPath:dir
+	                                withIntermediateDirectories:YES
+	                                                 attributes:nil
+	                                                      error:nil]);
+	for (NSURL *url in @[
+		     [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"gone/lib.metallib"]],
+		     [NSURL URLWithString:@"https://example.invalid/lib.metallib"]
+	     ]) {
+		NSError *error = nil;
+		CHECK(![dylib serializeToURL:url error:&error]);
+		CHECK([error.domain isEqualToString:MTLDynamicLibraryDomain]);
+		CHECK(error.code == MTLDynamicLibraryErrorInvalidFile);
+		CHECK([error.localizedDescription isEqualToString:@"Invalid URL"]);
+	}
+	CHECK(![[NSFileManager defaultManager]
+	    fileExistsAtPath:[dir stringByAppendingPathComponent:@"gone"]]);
+	NSURL *file = [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"lib.metallib"]];
+	NSError *error = nil;
+	CHECK([dylib serializeToURL:file error:&error] && error == nil);
+	NSData *written = [NSData dataWithContentsOfURL:file];
+	CHECK(written.length == bytes.size());
+	CHECK(std::memcmp(written.bytes, bytes.data(), bytes.size()) == 0);
+	[[NSFileManager defaultManager] removeItemAtPath:dir error:nil];
+}
+
+// A compute pipeline names the dynamic libraries its kernel links: the descriptor's preloaded
+// ones first, then the library each install name its libraries name loads, which the device reads
+// from the file it names (from the executable's directory, or the directory of the file of the
+// library naming it), each once, and those libraries' own after. A name no file loads refuses the
+// pipeline as the AMD 5300M does, beside a preloaded library or not; so does a name a library made
+// of no file names, its file there or not, the kernel's or a preloaded library's (but on an Apple
+// GPU, an @executable_path name of the kernel's library loads), and a preloaded library of no
+// device of ours; none posts a create.
+void test_compute_pipeline_libraries()
+{
+	Answering &a = *new Answering();
+	a.ser.setCarriesDynamicLibraries(true);
+	const std::vector<uint8_t> kernelBytes = {9, 9, 9};
+	uint32_t status = 0;
+	RgfxLibrary *kernelLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                              length:kernelBytes.size()
+	                                                 key:nullptr
+	                                              device:nil
+	                                          serializer:&a.ser
+	                                              status:&status];
+	// The kernel's library keeps bytes that name liba (its function table reads none of them).
+	std::vector<uint8_t> kernelSource =
+	    linkedMetallib("", {"@executable_path/liba.metallib"}, false);
+	[kernelLib rgfxSetSource:dispatch_data_create(kernelSource.data(), kernelSource.size(), nullptr,
+	                                              DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	             shadowMaker:noShadow()];
+	[kernelLib rgfxSetMadeFromURL:[NSURL fileURLWithPath:@"/app/k.metallib"]];
+	id<MTLFunction> kernel = [kernelLib newFunctionWithName:@"k"];
+	MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+	desc.computeFunction = kernel;
+	auto lastRun = [&](size_t count) {
+		std::vector<std::vector<uint8_t>> creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+		CHECK(!creates.empty());
+		const std::vector<uint8_t> &m = creates.back();
+		RgfxComputePipelineCreate head = {};
+		std::memcpy(&head, m.data(), sizeof(head));
+		CHECK(head.library_count == count);
+		std::vector<std::pair<uint64_t, std::string>> run;
+		for (size_t i = 0; i < count; i++) {
+			RgfxPipelineLibrary r = {};
+			std::memcpy(&r, m.data() + m.size() - (count - i) * sizeof(r), sizeof(r));
+			run.emplace_back(r.obj_id, std::string(reinterpret_cast<const char *>(m.data()) +
+			                                           r.name_offset,
+			                                       r.name_len));
+		}
+		return run;
+	};
+
+	// Unresolved: no preloaded library answers liba, and the device loads none.
+	size_t creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	NSError *error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:nil
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK([error.localizedDescription isEqualToString:@"Error creating compute variant"]);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// Preloaded beside a name that loads nothing: refused as well.
+	RgfxLibrary *libA = linkedLibrary(a.ser, linkedMetallib("@executable_path/liba.metallib", {}));
+	RgfxDynamicLibrary *dylibA = [RgfxDynamicLibrary dynamicLibraryOfLibrary:libA
+	                                                                  device:nil
+	                                                              serializer:&a.ser
+	                                                                  status:&status];
+	CHECK(dylibA != nil);
+	desc.preloadedLibraries = @[ dylibA ];
+	RgfxTestDylibDevice *device = [[RgfxTestDylibDevice alloc] init];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// Loaded: liba from the executable's directory, and the libb it names from liba's, after the
+	// preloaded library.
+	char path[PATH_MAX];
+	uint32_t size = sizeof(path);
+	char real[PATH_MAX];
+	CHECK(_NSGetExecutablePath(path, &size) == 0 && realpath(path, real) != nullptr);
+	NSString *exeDir = [@(real) stringByDeletingLastPathComponent];
+	[device.asked removeAllObjects];
+	device.make = ^id<MTLDynamicLibrary>(NSURL *url) {
+		NSString *name = url.lastPathComponent;
+		std::vector<std::string> deps;
+		if ([name isEqualToString:@"liba.metallib"])
+			deps = {"@loader_path/libb.metallib"};
+		else if (![name isEqualToString:@"libb.metallib"])
+			return nil;
+		RgfxLibrary *lib = linkedLibrary(a.ser, linkedMetallib("", deps));
+		[lib rgfxSetMadeFromURL:[NSURL
+		                            fileURLWithPath:[@"/loaded/here" stringByAppendingPathComponent:name]]];
+		uint32_t s = 0;
+		return [RgfxDynamicLibrary dynamicLibraryOfLibrary:lib device:nil serializer:&a.ser status:&s];
+	};
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:nil] != nil);
+	CHECK(device.asked.count == 2);
+	CHECK([device.asked[0] isEqualToString:[exeDir stringByAppendingPathComponent:@"liba.metallib"]]);
+	CHECK([device.asked[1] isEqualToString:@"/loaded/here/libb.metallib"]);
+	auto run = lastRun(3);
+	CHECK(run[0].first == dylibA.rgfxObjId && run[0].second.empty());
+	CHECK(run[1].second == "@executable_path/liba.metallib");
+	CHECK(run[2].second == "@loader_path/libb.metallib");
+	CHECK(run[1].first != 0 && run[2].first != 0 && run[1].first != run[2].first);
+	CHECK(run[1].first != dylibA.rgfxObjId);
+
+	// The kernel's library made of the same bytes, of no file: liba's file is there, and the
+	// device is asked for nothing, beside dylibA preloaded or not.
+	RgfxLibrary *bytesLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                              length:kernelBytes.size()
+	                                                 key:nullptr
+	                                              device:nil
+	                                          serializer:&a.ser
+	                                              status:&status];
+	[bytesLib rgfxSetSource:dispatch_data_create(kernelSource.data(), kernelSource.size(), nullptr,
+	                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	            shadowMaker:noShadow()];
+	MTLComputePipelineDescriptor *ofBytes = [[MTLComputePipelineDescriptor alloc] init];
+	ofBytes.computeFunction = [bytesLib newFunctionWithName:@"k"];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	for (NSArray *preloaded in @[ @[], @[ dylibA ] ]) {
+		ofBytes.preloadedLibraries = preloaded;
+		[device.asked removeAllObjects];
+		error = nil;
+		CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofBytes
+		                                                            device:(id<MTLDevice>)device
+		                                                        serializer:&a.ser
+		                                                             error:&error] == nil);
+		CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+		CHECK(device.asked.count == 0);
+	}
+	// On an Apple GPU the library of no file loads liba from the executable's directory, as the M3
+	// Max does (oracle_fnptr Apple, macOS 27.0.1), beside dylibA preloaded or not; a name of the
+	// loader's directory, which a library of no file has none of, still refuses it.
+	RgfxAppleTestDylibDevice *appleDevice = [[RgfxAppleTestDylibDevice alloc] init];
+	appleDevice.make = device.make;
+	for (NSArray *preloaded in @[ @[], @[ dylibA ] ]) {
+		ofBytes.preloadedLibraries = preloaded;
+		[appleDevice.asked removeAllObjects];
+		CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofBytes
+		                                                            device:(id<MTLDevice>)appleDevice
+		                                                        serializer:&a.ser
+		                                                             error:nil] != nil);
+		CHECK(appleDevice.asked.count == 2 &&
+		      [appleDevice.asked[0] isEqualToString:[exeDir stringByAppendingPathComponent:@"liba.metallib"]]);
+	}
+	RgfxLibrary *loaderLib = [RgfxLibrary libraryWithData:kernelBytes.data()
+	                                               length:kernelBytes.size()
+	                                                  key:nullptr
+	                                               device:nil
+	                                           serializer:&a.ser
+	                                               status:&status];
+	std::vector<uint8_t> loaderSource = linkedMetallib("", {"@loader_path/liba.metallib"}, false);
+	[loaderLib rgfxSetSource:dispatch_data_create(loaderSource.data(), loaderSource.size(), nullptr,
+	                                              DISPATCH_DATA_DESTRUCTOR_DEFAULT)
+	             shadowMaker:noShadow()];
+	MTLComputePipelineDescriptor *ofLoader = [[MTLComputePipelineDescriptor alloc] init];
+	ofLoader.computeFunction = [loaderLib newFunctionWithName:@"k"];
+	[appleDevice.asked removeAllObjects];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:ofLoader
+	                                                            device:(id<MTLDevice>)appleDevice
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2 && appleDevice.asked.count == 0);
+	ofBytes.preloadedLibraries = @[];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	// A preloaded dynamic library of no file that names liba refuses the kernel of a file too.
+	RgfxDynamicLibrary *dylibC = [RgfxDynamicLibrary
+	    dynamicLibraryOfLibrary:linkedLibrary(a.ser, linkedMetallib("@executable_path/libc.metallib",
+	                                                                {"@executable_path/liba.metallib"}))
+	                     device:nil
+	                 serializer:&a.ser
+	                     status:&status];
+	CHECK(dylibC != nil);
+	desc.preloadedLibraries = @[ dylibC ];
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK([error.domain isEqualToString:@"CompilerError"] && error.code == 2);
+	CHECK(a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+
+	// A preloaded library not of this device.
+	desc.preloadedLibraries = @[ (id<MTLDynamicLibrary>)[[NSObject alloc] init] ];
+	creates = a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size();
+	error = nil;
+	CHECK([RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                            device:(id<MTLDevice>)device
+	                                                        serializer:&a.ser
+	                                                             error:&error] == nil);
+	CHECK(error != nil && a.of(RGFX_CMD_COMPUTE_PIPELINE_CREATE).size() == creates);
+}
+
 // One function of a test .metallib: its entry point, its stage (the TYPE tag's byte: 0
 // vertex, 1 fragment, 2 kernel) and the constants its public metadata declares.
 struct TestFunction {
@@ -3545,7 +6146,7 @@ const RgfxFunctionConstant *constantAt(id<MTLFunction> function, uint32_t index)
 // archive, and made ours from the bytes Metal answers for it: its functions are the graphs'.
 void test_stitched_library_over_shadows()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // the stitchable bytes' two libraries and the stitched one fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -3629,6 +6230,123 @@ void test_stitched_library_over_shadows()
 	CHECK([[ours functionNames] isEqualToArray:@[ @"fused" ]]);
 	CHECK([(RgfxLibrary *)ours rgfxShadow] == stitched);
 	CHECK([ours newFunctionWithName:@"fused"].functionType == MTLFunctionTypeVisible);
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
+// A stitch over functions specialised before it, as MPS stitches its uber shaders' visible
+// functions (MPSLibrary::CreateUberShaderKey: Geekbench 7's GPU benchmark ended there, the stitch
+// refused with "link: function ... has no function of Metal's own library"): a function made with
+// constant values, by a descriptor or by name, or under a specialized name, has a shadow, Metal's
+// own function of the same entry point, values and specialized name, which declares no constants
+// and answers the name a graph's node gives; Metal's stitch over the shadows makes the library.
+void test_stitch_over_specialised_functions()
+{
+	Fixture fx;
+	const char *path = getenv("RGFX_STITCH_CONSTANTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	auto make = [&](const void *p, size_t n) {
+		uint32_t status = 0;
+		return [RgfxLibrary libraryWithData:p
+		                             length:n
+		                                key:nullptr
+		                             device:nil
+		                         serializer:&fx.ser
+		                             status:&status];
+	};
+	RgfxLibrary *lib = make(bytes.bytes, bytes.length);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t d) {
+		       return [metal newLibraryWithData:d error:nil];
+	       }];
+	CHECK([[lib rgfxShadow] newFunctionWithName:@"scaled"].functionConstantsDictionary.count == 1);
+
+	float two = 2.0f, five = 5.0f;
+	MTLFunctionConstantValues *k = [MTLFunctionConstantValues new];
+	[k setConstantValue:&two type:MTLDataTypeFloat atIndex:0];
+	MTLFunctionDescriptor *byDescriptor = [MTLFunctionDescriptor functionDescriptor];
+	byDescriptor.name = @"scaled";
+	byDescriptor.specializedName = @"scaled_k2";
+	byDescriptor.constantValues = k;
+	MTLFunctionConstantValues *bv = [MTLFunctionConstantValues new];
+	[bv setConstantValue:&five type:MTLDataTypeFloat withName:@"b"];
+	MTLFunctionDescriptor *named = [MTLFunctionDescriptor functionDescriptor];
+	named.name = @"add1";
+	named.specializedName = @"add1_named";
+	NSError *err = nil;
+	id<MTLFunction> scaled = [lib newFunctionWithDescriptor:byDescriptor error:&err];
+	CHECK(err == nil);
+	id<MTLFunction> bias = [lib newFunctionWithName:@"bias" constantValues:bv error:&err];
+	CHECK(err == nil);
+	// Its SPI form with a pipeline library answers as it does: macOS 13's Maps ended on an
+	// unrecognized selector there.
+	CHECK([lib respondsToSelector:@selector(newFunctionWithName:constantValues:pipelineLibrary:error:)]);
+	RgfxFunction *spiBias = (RgfxFunction *)[(id<RgfxTestLibrarySPI>)lib newFunctionWithName:@"bias"
+	                                                                        constantValues:bv
+	                                                                       pipelineLibrary:nil
+	                                                                                 error:&err];
+	CHECK(err == nil && spiBias != nil && [spiBias.name isEqualToString:bias.name] &&
+	      spiBias.rgfxLibraryObjId == lib.rgfxObjId &&
+	      [spiBias rgfxConstantCount] == [(RgfxFunction *)bias rgfxConstantCount]);
+	id<MTLFunction> add1 = [lib newFunctionWithDescriptor:named error:&err];
+	CHECK(err == nil && scaled != nil && bias != nil && add1 != nil);
+	if (scaled == nil || bias == nil || add1 == nil)
+		return;
+	CHECK([scaled.name isEqualToString:@"scaled_k2"] && [add1.name isEqualToString:@"add1_named"]);
+	for (id<MTLFunction> fn in @[ scaled, bias, add1 ]) {
+		id<MTLFunction> shadow = [(RgfxFunction *)fn rgfxShadowOrMake];
+		CHECK(shadow != nil && ![(id)shadow isKindOfClass:[RgfxFunction class]]);
+		CHECK([shadow.name isEqualToString:fn.name]);
+		CHECK(shadow.functionConstantsDictionary.count == 0);
+		CHECK([(RgfxFunction *)fn rgfxShadowOrMake] == shadow); // made once
+	}
+
+	MTLFunctionStitchingInputNode *x = [[MTLFunctionStitchingInputNode alloc] initWithArgumentIndex:0];
+	MTLFunctionStitchingFunctionNode *times =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"scaled_k2"
+	                                                 arguments:@[ x ]
+	                                       controlDependencies:@[]];
+	MTLFunctionStitchingFunctionNode *plus =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"bias"
+	                                                 arguments:@[ times ]
+	                                       controlDependencies:@[]];
+	MTLFunctionStitchingFunctionNode *one =
+	    [[MTLFunctionStitchingFunctionNode alloc] initWithName:@"add1_named"
+	                                                 arguments:@[ plus ]
+	                                       controlDependencies:@[]];
+	MTLStitchedLibraryDescriptor *d = [[MTLStitchedLibraryDescriptor alloc] init];
+	d.functionGraphs = @[ [[MTLFunctionStitchingGraph alloc] initWithFunctionName:@"fused"
+	                                                                        nodes:@[ times, plus ]
+	                                                                   outputNode:one
+	                                                                   attributes:@[]] ];
+	d.functions = @[ scaled, bias, add1 ];
+	__block id<MTLLibrary> stitched = nil;
+	err = nil;
+	id<MTLLibrary> ours = RgfxStitchOverShadows(
+	    d, nil,
+	    ^id<MTLLibrary>(MTLStitchedLibraryDescriptor *shadowed, NSError **e) {
+		    stitched = [metal newLibraryWithStitchedDescriptor:shadowed error:e];
+		    return stitched;
+	    },
+	    ^id<MTLLibrary>(dispatch_data_t data, NSError **e) {
+		    const void *p = nullptr;
+		    size_t n = 0;
+		    dispatch_data_t map = dispatch_data_create_map(data, &p, &n);
+		    (void)map;
+		    return make(p, n);
+	    },
+	    &err);
+	CHECK(err == nil && stitched != nil);
+	CHECK([(id)ours isKindOfClass:[RgfxLibrary class]]);
+	CHECK([[ours functionNames] isEqualToArray:@[ @"fused" ]]);
 	std::vector<uint8_t> drain;
 	RgfxMsgHeader h;
 	while (fx.ring.next(&h, &drain)) {
@@ -3842,6 +6560,22 @@ void test_function_array_library_holds_the_functions()
 	CHECK([ours reflectionForFunctionWithName:@"stitch_add"] == nil);
 	CHECK(ours.type == MTLLibraryTypeExecutable && ours.installName == nil && ours.label == nil);
 	CHECK([ours externFunctionNames] == nil);
+	// Its SPI, as Metal's library of a function array answers: the function given as an extern one,
+	// no bitcode and no identifier, and the triple and the validation switch as set.
+	auto ask = [](id object, NSString *member) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	SEL externNamed = NSSelectorFromString(@"newExternFunctionWithName:");
+	CHECK(((id (*)(id, SEL, id))objc_msgSend)(ours, externNamed, @"stitch_mul") == mul);
+	CHECK(((id (*)(id, SEL, id))objc_msgSend)(ours, externNamed, @"nope") == nil);
+	CHECK(ask(ours, @"bitcodeData") == nil && ask(ours, @"libraryIdentifier") == nil);
+	CHECK(ask(ours, @"overrideTriple") == nil);
+	((void (*)(id, SEL, id))objc_msgSend)(ours, NSSelectorFromString(@"setOverrideTriple:"), @"air64");
+	CHECK([ask(ours, @"overrideTriple") isEqualToString:@"air64"]);
+	SEL validation = NSSelectorFromString(@"shaderValidationEnabled");
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(ours, validation));
+	((void (*)(id, SEL, BOOL))objc_msgSend)(ours, NSSelectorFromString(@"setShaderValidationEnabled:"), YES);
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(ours, validation));
 	err = nil;
 	NSURL *url = [NSURL fileURLWithPath:[NSTemporaryDirectory()
 	                                        stringByAppendingPathComponent:@"rgfx-array.metallib"]];
@@ -3864,6 +6598,96 @@ void test_function_array_library_holds_the_functions()
 // through as Metal gave it, the public device's words and code (both x86 Macs: MTLLibraryErrorDomain
 // 1 "Invalid metal package", and 6 "failed to open MPSGraph package"), and nothing reaches the
 // maker or the ring.
+// A library file's URL, read as Metal's newLibraryWithURL:error: reads it (RgfxLibraryFile.h), over
+// a .metallib of our own (RGFX_LIBRARY_FILE): the file at the URL's path, whatever its scheme, a
+// URL of no scheme among them (as Espresso names its kernels' libraries), and Metal's errors for a
+// file it cannot read. Each form's answer is also this Mac's Metal's, which the x86 Macs give alike
+// (measured: macOS 26.7.1, the AMD 5300M and the Intel 630, and macOS 27.0.1, the M3 Max).
+void test_library_file_urls_as_metal()
+{
+	Fixture fx;
+	const char *given = getenv("RGFX_LIBRARY_FILE");
+	char resolved[PATH_MAX];
+	CHECK(given != nullptr && realpath(given, resolved) != nullptr);
+	if (given == nullptr || realpath(given, resolved) == nullptr)
+		return;
+	NSString *lib = @(resolved), *dir = lib.stringByDeletingLastPathComponent, *name = lib.lastPathComponent;
+	NSData *bytes = [NSData dataWithContentsOfFile:lib];
+	NSString *scratch = [NSTemporaryDirectory() stringByAppendingPathComponent:
+	                                                [NSString stringWithFormat:@"rgfx-library-file-%d", getpid()]];
+	NSFileManager *fm = [NSFileManager defaultManager];
+	NSString *spaced = [scratch stringByAppendingPathComponent:@"with space"];
+	CHECK([fm createDirectoryAtPath:spaced withIntermediateDirectories:YES attributes:nil error:nil]);
+	NSString *copy = [spaced stringByAppendingPathComponent:@"lib.metallib"];
+	NSString *empty = [scratch stringByAppendingPathComponent:@"empty.metallib"];
+	NSString *locked = [scratch stringByAppendingPathComponent:@"locked.metallib"];
+	CHECK([bytes writeToFile:copy atomically:NO] && [[NSData data] writeToFile:empty atomically:NO] &&
+	      [bytes writeToFile:locked atomically:NO] && chmod(locked.fileSystemRepresentation, 0) == 0);
+	char cwd[PATH_MAX];
+	CHECK(getcwd(cwd, sizeof cwd) != nullptr && chdir(dir.fileSystemRepresentation) == 0);
+	NSString *escaped = [copy stringByAddingPercentEncodingWithAllowedCharacters:NSCharacterSet.URLPathAllowedCharacterSet];
+	const struct {
+		const char *what;
+		NSURL *url;
+		bool reads;
+	} cases[] = {
+	    {"no scheme, absolute", [NSURL URLWithString:lib], true},
+	    {"a file URL", [NSURL fileURLWithPath:lib], true},
+	    {"relative to a file URL", [NSURL URLWithString:name relativeToURL:[NSURL fileURLWithPath:dir isDirectory:YES]], true},
+	    {"no scheme, relative to the current directory", [NSURL URLWithString:name], true},
+	    {"no scheme, escaped", [NSURL URLWithString:escaped], true},
+	    {"another scheme", [NSURL URLWithString:[@"rgfxtest://" stringByAppendingString:lib]], true},
+	    {"no scheme, missing", [NSURL URLWithString:[dir stringByAppendingPathComponent:@"no-such.metallib"]], false},
+	    {"no scheme, missing, relative", [NSURL URLWithString:@"no-such.metallib"], false},
+	    {"a file URL, missing", [NSURL fileURLWithPath:[dir stringByAppendingPathComponent:@"no-such.metallib"]], false},
+	    {"another scheme, missing", [NSURL URLWithString:@"rgfxtest:///no/such/lib.metallib"], false},
+	    {"of no path", [NSURL URLWithString:@"data:application/octet-stream;base64,AAAA"], false},
+	    {"a directory", [NSURL fileURLWithPath:dir isDirectory:YES], false},
+	    {"an empty file", [NSURL fileURLWithPath:empty], false},
+	    {"a file it may not open", [NSURL URLWithString:locked], false},
+	};
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	for (const auto &c : cases) {
+		NSError *err = nil;
+		NSData *read = RgfxLibraryFileData(RgfxLibraryFilePath(c.url), &err);
+		NSError *metalError = nil;
+		id<MTLLibrary> metals = [metal newLibraryWithURL:c.url error:&metalError];
+		const bool sameError = err == nil ? metalError == nil
+		                                  : metalError != nil && [err.domain isEqual:metalError.domain] &&
+		                                        err.code == metalError.code &&
+		                                        [err.localizedDescription isEqualToString:metalError.localizedDescription] &&
+		                                        [err.userInfo.allKeys isEqualToArray:metalError.userInfo.allKeys];
+		const bool same = (read != nil) == (metals != nil) && sameError;
+		if ((read != nil) != c.reads || !same)
+			fprintf(stderr, "shell_tests: a library file URL, %s (%s): read %d, error %s; Metal's library %d, error %s\n",
+			        c.what, c.url.absoluteString.UTF8String, read != nil, err.description.UTF8String, metals != nil,
+			        metalError.description.UTF8String);
+		CHECK((read != nil) == c.reads && same);
+		if (c.reads)
+			CHECK([read isEqualToData:bytes]);
+	}
+	// The bytes read from a URL of no scheme make the library, as the file's own do.
+	NSData *read = RgfxLibraryFileData(RgfxLibraryFilePath([NSURL URLWithString:lib]), nullptr);
+	uint32_t status = 0;
+	RgfxLibrary *made = [RgfxLibrary libraryWithData:read.bytes
+	                                          length:read.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(made != nil && [made.functionNames containsObject:@"add_one"]);
+	// A missing file of no scheme: MTLLibraryErrorDomain 6, as Espresso's absent libraries answer.
+	NSError *err = nil;
+	CHECK(RgfxLibraryFileData(RgfxLibraryFilePath([NSURL URLWithString:@"/no/such/dir/espresso.metallib"]), &err) ==
+	          nil &&
+	      [err.domain isEqualToString:MTLLibraryErrorDomain] && err.code == MTLLibraryErrorFileNotFound &&
+	      [err.localizedDescription isEqualToString:@"library not found"]);
+	CHECK(chdir(cwd) == 0);
+	chmod(locked.fileSystemRepresentation, 0644);
+	[fm removeItemAtPath:scratch error:nil];
+	drainRing(fx.ring);
+}
+
 void test_package_libraries_answer_metals_refusals()
 {
 	Fixture fx;
@@ -4059,8 +6883,9 @@ void test_library_air_arguments()
 	CHECK([(RgfxFunction *)[bare newFunctionWithName:@"every_access"] rgfxAirFunction] == nullptr);
 	drainRing(fx.ring);
 
-	// A function whose module does not read (its function table's kind spoilt), in two libraries
-	// of the same bytes: unknown in each, its line logged once a process.
+	// A function whose arguments do not read (its function table's kind spoilt), in two libraries
+	// of the same bytes: unknown in each, its line logged once a process, and the library's other
+	// functions read.
 	std::vector<uint8_t> spoilt(static_cast<const uint8_t *>(bytes.bytes),
 	                            static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
 	const char kind[] = "air.visible_function_table";
@@ -4174,8 +6999,8 @@ void test_libraries_over_equal_bytes_share_their_air_reads()
 	const uint64_t afterSecond = rgfxAirModules().reads();
 	CHECK(entryPoints >= 8 && visibles >= 8);
 	// Earlier tests read some of these modules: the first library's lookups read at most one
-	// module per function.
-	CHECK(afterFirst - before <= entryPoints + visibles);
+	// module per function, and once more with its entry points for an entry point's nodes.
+	CHECK(afterFirst - before <= 2 * entryPoints + visibles);
 	CHECK(afterSecond == afterFirst); // the second library reads nothing
 	NSLog(@"RGFX test: %zu functions over two libraries: %zu lookups, each a read for its library "
 	      @"alone; %llu modules read",
@@ -4208,7 +7033,7 @@ void test_libraries_over_equal_bytes_share_their_air_reads()
 // Metal cannot stitch, and for a descriptor that fails on a miss and that no archive holds.
 void test_stitched_libraries_in_archives()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // two libraries of the stitchable bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -4411,9 +7236,113 @@ void test_pipeline_reflection_from_air()
 	CHECK(shape(bindings) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
 	CHECK(shape(ask(basic, @"builtInArguments")) == "gid:15 tid:15 ");
 	CHECK([ask(basic, @"arguments") isEqualToArray:bindings] && ask(basic, @"arguments") != bindings);
+	// On an Apple GPU (rgfxAppleGPU, an arm64 guest's device) a constant buffer's alignment is its
+	// pointee's, but at least 4, 16 for k_basic's params, as the M3 Max answers
+	// (tools/pipeline_reflection_check Apple, macOS 27.0.1), where an x86 Mac's is 32 (below); the
+	// rest of its answers are the same.
+	{
+		id apple = [RgfxAppleFamilyDevice new]; // held: a library keeps its device weakly
+		RgfxLibrary *appleLib = [RgfxLibrary libraryWithData:bytes.bytes
+		                                              length:bytes.length
+		                                                 key:nullptr
+		                                              device:(id<MTLDevice>)apple
+		                                          serializer:&fx.ser
+		                                              status:&status];
+		CHECK(appleLib != nil);
+		[appleLib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			          (void)bytes;
+		          })
+		            shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			            return nil;
+		            }];
+		id appleBasic = RgfxComputePipelineReflectionOf([appleLib newFunctionWithName:@"k_basic"], nil,
+		                                                MTLPipelineOptionBindingInfo);
+		NSArray *appleBindings = ask(appleBasic, @"bindings");
+		CHECK(shape(appleBindings) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
+		if (appleBindings.count == 9) {
+			CHECK(number(appleBindings[1], @"bufferAlignment") == 16 &&
+			      number(appleBindings[1], @"bufferDataSize") == 192 &&
+			      number(ask(appleBindings[1], @"bufferPointerType"), @"alignment") == 16);
+			CHECK(number(appleBindings[0], @"bufferAlignment") == 4 &&
+			      number(appleBindings[2], @"bufferAlignment") == 16);
+		}
+		// At least 4: k_more's constant char, half and half3 are 4, 4 and 8.
+		NSArray *appleMore = ask(RgfxComputePipelineReflectionOf([appleLib newFunctionWithName:@"k_more"], nil,
+		                                                         MTLPipelineOptionBindingInfo),
+		                         @"bindings");
+		CHECK(appleMore.count > 8);
+		if (appleMore.count > 8)
+			CHECK([ask(appleMore[6], @"name") isEqualToString:@"oneChar"] &&
+			      number(appleMore[6], @"bufferAlignment") == 4 && number(appleMore[7], @"bufferAlignment") == 4 &&
+			      number(appleMore[8], @"bufferAlignment") == 8);
+		// A kernel's explicit imageblock is a binding in its place, of binding type 17, kind 1, its
+		// data's size and its struct, at index 0 wherever it is (the M3 Max's answer,
+		// tools/pipeline_reflection_check Apple's c_imageblock_explicit and c_imageblock_late); a false
+		// function constant leaves it out; a fragment function's imageblock data is a binding of type
+		// 16 (r_imageblock_data).
+		auto appleFn = [&](NSString *name) { return [appleLib newFunctionWithName:name]; };
+		NSArray *block =
+		    ask(RgfxComputePipelineReflectionOf(appleFn(@"k_imageblock_explicit"), nil, both), @"bindings");
+		CHECK(shape(block) == "block:17 out:2 ");
+		if (block.count == 2) {
+			NSArray *members = [ask(block[0], @"dataTypeDescription") members];
+			CHECK([NSStringFromClass([block[0] class]) isEqualToString:@"MTLImageBlockArgument"] &&
+			      number(block[0], @"imageBlockKind") == 1 && number(block[0], @"imageBlockDataSize") == 8 &&
+			      number(block[0], @"index") == 0 && number(block[0], @"access") == 0 &&
+			      ask(block[0], @"imageBlockMasterStructMembers") == nil &&
+			      !flag(block[0], @"aliasImplicitImageBlock") &&
+			      number(block[0], @"aliasImplicitImageBlockRenderTarget") == 0xFFFFFFFF && members.count == 1 &&
+			      [((MTLStructMember *)members[0]).name isEqualToString:@"v"] &&
+			      ((MTLStructMember *)members[0]).dataType == MTLDataTypeHalf4);
+		}
+		NSArray *late = ask(RgfxComputePipelineReflectionOf(appleFn(@"k_imageblock_late"), nil, both), @"bindings");
+		CHECK(shape(late) == "out:2 block:17 " && late.count == 2 && number(late[1], @"index") == 0);
+		MTLFunctionConstantValues *blocksOff = [MTLFunctionConstantValues new];
+		const bool off = false;
+		[blocksOff setConstantValue:&off type:MTLDataTypeBool withName:@"kBlocks"];
+		NSError *blocksError = nil;
+		id<MTLFunction> unblocked = [appleLib newFunctionWithName:@"k_imageblock_if"
+		                                           constantValues:blocksOff
+		                                                    error:&blocksError];
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(unblocked, nil, both), @"bindings")) == "out:2 ");
+		id dataReflection =
+		    RgfxRenderPipelineReflectionOf(appleFn(@"v_buffers"), nil, appleFn(@"f_imageblock_data"), both);
+		NSArray *data = ask(dataReflection, @"fragmentBindings");
+		CHECK(shape(data) == "s:16 ");
+		if (data.count == 1) {
+			NSArray *members = [ask(data[0], @"dataTypeDescription") members];
+			CHECK([NSStringFromClass([data[0] class]) isEqualToString:@"MTLImageBlockDataArgument"] &&
+			      number(data[0], @"imageBlockDataSize") == 16 && number(data[0], @"index") == 0 &&
+			      members.count == 2 && ((MTLStructMember *)members[1]).offset == 8);
+		}
+	}
+	// Neither x86 Mac's Metal makes a pipeline of a kernel's imageblock: none is answered. The Intel
+	// GPU makes one of a fragment function's imageblock data, answered as the M3 Max answers it
+	// (r_imageblock_data), and so is ours; the AMD GPU makes none.
+	CHECK(RgfxComputePipelineReflectionOf(fn(@"k_imageblock_explicit"), nil, both) == nil);
+	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_data"), both),
+	                @"fragmentBindings")) == "s:16 ");
+	// A view of a master struct: its master is its imageBlockMasterStructMembers, each member named by
+	// its user name (both x86 Macs make r_imageblock_master). A texture in a raster order group is
+	// answered as one in none (r_rog_texture).
+	NSArray *view = ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_imageblock_master"), both),
+	                    @"fragmentBindings");
+	CHECK(shape(view) == "v:16 ");
+	if (view.count == 1) {
+		NSArray *viewMembers = [ask(view[0], @"dataTypeDescription") members];
+		NSArray *masterMembers = [ask(view[0], @"imageBlockMasterStructMembers") members];
+		CHECK(viewMembers.count == 1 && masterMembers.count == 2 &&
+		      [((MTLStructMember *)viewMembers[0]).name isEqualToString:@"user(depth)"] &&
+		      [((MTLStructMember *)masterMembers[1]).name isEqualToString:@"user(colour)"] &&
+		      ((MTLStructMember *)masterMembers[1]).offset == 8);
+	}
+	NSArray *grouped = ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_rog_texture"), both),
+	                       @"fragmentBindings");
+	CHECK(shape(grouped) == "tex:2 " && grouped.count == 1 && number(grouped[0], @"index") == 3);
 	if (bindings.count == 9) {
 		id params = bindings[1];
 		CHECK(number(params, @"bufferAlignment") == 32 && number(params, @"bufferDataSize") == 192 &&
+		      number(ask(params, @"bufferPointerType"), @"alignment") == 32 &&
 		      number(params, @"bufferDataType") == MTLDataTypeStruct && number(params, @"access") == 0);
 		NSArray *members = [ask(params, @"bufferStructType") members];
 		CHECK(members.count == 12);
@@ -4497,6 +7426,18 @@ void test_pipeline_reflection_from_air()
 		      ((MTLStructMember *)members[4]).arrayType.elementType == MTLDataTypeTexture &&
 		      ((MTLStructMember *)members[5]).argumentIndex == 6);
 	}
+	// An argument encoder's reflection of the function's argument buffer is the binding its
+	// pipelines reflect, not its library's: the array of textures of stride 0, where the library's
+	// reflection gives it the element's size (measured: oracle_bundle argbuf.reflection, the x86
+	// Macs and the M3 Max alike). The library here keeps no reflection of its own.
+	MTLArgument *encoderBinding = [(RgfxFunction *)fn(@"k_argument_buffer") rgfxArgumentOfBufferAtIndex:0];
+	NSArray *encoderMembers = encoderBinding.bufferStructType.members;
+	CHECK(encoderBinding != nil && encoderBinding.index == 0 && encoderBinding.type == MTLArgumentTypeBuffer &&
+	      encoderMembers.count == 7);
+	if (encoderMembers.count == 7)
+		CHECK(((MTLStructMember *)encoderMembers[4]).arrayType.stride == 0 &&
+		      ((MTLStructMember *)encoderMembers[4]).arrayType.argumentIndexStride == 1);
+	CHECK([(RgfxFunction *)fn(@"k_argument_buffer") rgfxArgumentOfBufferAtIndex:7] == nil);
 	// k_nested's members (Metal's answers, measured on both x86 Macs), each its data type, its
 	// argument index, an array's element type, length, stride and index stride, and whether an
 	// array's elements' binding (its -elementIndirectArgumentType) or the member's own is given.
@@ -4541,6 +7482,20 @@ void test_pipeline_reflection_from_air()
 		CHECK(child.pointerType.elementIsArgumentBuffer && child.pointerType.dataSize == 16 &&
 		      child.pointerType.alignment == 8 && child.pointerType.elementStructType.members.count == 2);
 	}
+	// A chain of seven argument buffers, each a pointer to the next, deeper than macOS 27's
+	// frameworks nest them: each a pointer to an argument buffer of its own, to the last's members.
+	id deepAb = [ask(RgfxComputePipelineReflectionOf(fn(@"k_deep_ab"), nil, both), @"bindings") firstObject];
+	MTLStructType *link = [ask(deepAb, @"bufferStructType") isKindOfClass:[MTLStructType class]]
+	                          ? (MTLStructType *)ask(deepAb, @"bufferStructType")
+	                          : nil;
+	int links = 0;
+	while (link.members.count > 0 && [link.members[0].name isEqualToString:@"next"] &&
+	       link.members[0].dataType == MTLDataTypePointer && link.members[0].pointerType.elementIsArgumentBuffer) {
+		link = link.members[0].pointerType.elementStructType;
+		links++;
+	}
+	CHECK(links == 6 && link.members.count == 2 && [link.members[1].name isEqualToString:@"v"] &&
+	      link.members[1].argumentIndex == 1);
 	// Function tables and acceleration structures: bindings of their own types, read only (the
 	// intersection function table's AIR says read_write).
 	NSArray *tables = ask(RgfxComputePipelineReflectionOf(fn(@"k_tables"), nil, both), @"bindings");
@@ -4638,6 +7593,16 @@ void test_pipeline_reflection_from_air()
 	// pipeline).
 	id fetch = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_fetch"), both);
 	CHECK(fetch != nil && ask(fetch, @"fragmentArguments") == nil && [ask(fetch, @"fragmentBindings") count] == 0);
+	// So are one in a raster order group and one at an index a function constant gives.
+	id fetchGroup = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_fetch_group"), both);
+	CHECK(fetchGroup != nil && [ask(fetchGroup, @"fragmentBindings") count] == 0);
+	MTLFunctionConstantValues *fetchValues = [MTLFunctionConstantValues new];
+	const uint32_t fetchAt = 0;
+	[fetchValues setConstantValue:&fetchAt type:MTLDataTypeUInt withName:@"kFetchAt"];
+	NSError *fetchError = nil;
+	id<MTLFunction> fetchAtFn = [lib newFunctionWithName:@"f_fetch_at" constantValues:fetchValues error:&fetchError];
+	id fetchAtReflection = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fetchAtFn, both);
+	CHECK(fetchAtFn != nil && fetchAtReflection != nil && [ask(fetchAtReflection, @"fragmentBindings") count] == 0);
 	CHECK(shape(ask(RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_tables"), both),
 	                @"fragmentBindings")) == "primitives:25 table:24 ");
 	// base_vertex and base_instance are listed, a fragment function's front_facing and sample_id are
@@ -4665,6 +7630,46 @@ void test_pipeline_reflection_from_air()
 		CHECK(number(vertexBuiltIns[1], @"builtInType") == 3 && number(vertexBuiltIns[2], @"builtInType") == 4);
 	CHECK(number(moreOut, @"postVertexDumpStride") == 68 && ask(moreOut, @"fragmentArguments") == nil);
 
+	// Post-tessellation vertex functions, of a descriptor of their control points' attributes 0 to 2
+	// in buffer 0, stepping per control point, and their patch's attribute 3 in buffer 1, stepping
+	// per patch (pipeline_reflection_check's r_patch, r_patch_points, r_patch_plain and
+	// r_patch_unused, measured on the 5300M, the 630 and the M3 Max): the control points and the
+	// patch's attribute are no bindings, the descriptor's buffers are unused though the function
+	// reads them, the position in the patch and the patch's id are built-ins 14 and 13, and the
+	// stride adds a triangle patch's position's 12 bytes or a quad's 8, taken or not.
+	MTLVertexDescriptor *patchVd = [MTLVertexDescriptor vertexDescriptor];
+	const NSUInteger kPatch[][3] = {{0, 0, 0}, {1, 16, 0}, {2, 32, 0}, {3, 0, 1}}; // attribute, offset, buffer
+	for (const auto &a : kPatch) {
+		patchVd.attributes[a[0]].format = a[0] == 1 ? MTLVertexFormatFloat2 : MTLVertexFormatFloat4;
+		patchVd.attributes[a[0]].offset = a[1];
+		patchVd.attributes[a[0]].bufferIndex = a[2];
+	}
+	patchVd.layouts[0].stride = 48;
+	patchVd.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+	patchVd.layouts[1].stride = 16;
+	patchVd.layouts[1].stepFunction = MTLVertexStepFunctionPerPatch;
+	id patch = RgfxRenderPipelineReflectionOf(fn(@"v_patch"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(patch, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- mvp:0 heights:2 unusedBuffer:0- ");
+	CHECK(shape(ask(patch, @"vertexBuiltInArguments")) == "uv:15 patch:15 ");
+	NSArray *patchBuiltIns = ask(patch, @"vertexBuiltInArguments");
+	if (patchBuiltIns.count == 2)
+		CHECK(number(patchBuiltIns[0], @"builtInType") == 14 &&
+		      number(patchBuiltIns[0], @"builtInDataType") == MTLDataTypeFloat2 &&
+		      number(patchBuiltIns[1], @"builtInType") == 13 &&
+		      number(patchBuiltIns[1], @"builtInDataType") == MTLDataTypeUInt);
+	CHECK(number(patch, @"postVertexDumpStride") == 44);
+	id points = RgfxRenderPipelineReflectionOf(fn(@"v_patch_points"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(points, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- ");
+	CHECK(shape(ask(points, @"vertexBuiltInArguments")) == "bc:15 iid:15 ");
+	CHECK(number(points, @"postVertexDumpStride") == 48);
+	id plain = RgfxRenderPipelineReflectionOf(fn(@"v_patch_plain"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(plain, @"vertexBindings")) == "vertexBuffer.0:0- vertexBuffer.1:0- ");
+	CHECK(ask(plain, @"vertexBuiltInArguments") == nil);
+	CHECK(number(plain, @"postVertexDumpStride") == 48);
+	id unread = RgfxRenderPipelineReflectionOf(fn(@"v_patch_unused"), patchVd, fn(@"f_plain"), both);
+	CHECK(shape(ask(unread, @"vertexBuiltInArguments")) == "uv:15- "); // unread
+	CHECK(number(unread, @"postVertexDumpStride") == 44);
+
 	// A mesh pipeline: each stage's payload, the mesh and the object's grid.
 	id mesh = RgfxMeshPipelineReflectionOf(fn(@"o_payload"), fn(@"m_payload"), fn(@"f_mesh"), both);
 	CHECK(shape(ask(mesh, @"objectBindings")) == "payload:34 scale:0 unused:0- ");
@@ -4681,6 +7686,771 @@ void test_pipeline_reflection_from_air()
 		CHECK(number(objectBindings[0], @"access") == MTLBindingAccessReadWrite &&
 		      number(objectBindings[0], @"objectPayloadDataSize") == 8 && number(objectBindings[0], @"index") == 0xFFFFFFFF);
 	CHECK(number(mesh, @"postVertexDumpStride") == 0 && [ask(mesh, @"vertexBindings") count] == 0);
+}
+
+} // namespace
+
+// Stand-ins of macOS 11.7.11's reflection classes that differ from macOS 13's and later, each of
+// the instance variables, initialisers and getters that release's Metal has (measured: the classes'
+// instance variables and methods in an 11.7.11 guest, and what each argument class's getters answer
+// there): its MTLArgumentInternal, the class every argument is of, whose getters of a buffer, a
+// texture and threadgroup memory fail their assertion and end the process there, which each
+// stand-in getter counts in gKindGettersFailed11 instead (its bufferPointerType answers nil, as
+// there); its buffer, texture and threadgroup memory arguments, of the initialisers macOS 13's
+// binding classes of each kind take, which answer their kind's getters (a buffer's struct type from
+// its type object, the stand-in's choice); its built-in and indirect constant arguments; its struct
+// type, of no type name; and its pipelines' reflections, which keep no binding lists. Our own.
+static int gKindGettersFailed11;
+
+@interface RgfxTestsArgument11 : NSObject {
+@public
+	NSString *_name;
+	NSUInteger _type;
+	NSUInteger _access;
+	NSUInteger _index;
+	char _active;
+	NSUInteger _arrayLength;
+	id _typeInfo;
+}
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                       index:(NSUInteger)index
+                      active:(BOOL)active
+                 arrayLength:(NSUInteger)arrayLength
+             typeDescription:(id)typeDescription;
+@end
+
+@implementation RgfxTestsArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                       index:(NSUInteger)index
+                      active:(BOOL)active
+                 arrayLength:(NSUInteger)arrayLength
+{
+	return [self initWithName:name type:type access:access index:index active:active arrayLength:arrayLength
+	          typeDescription:nil];
+}
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                       index:(NSUInteger)index
+                      active:(BOOL)active
+                 arrayLength:(NSUInteger)arrayLength
+             typeDescription:(id)typeDescription
+{
+	if ((self = [super init])) {
+		_name = [name copy];
+		_type = type;
+		_access = access;
+		_index = index;
+		_active = active;
+		_arrayLength = arrayLength;
+		_typeInfo = typeDescription;
+	}
+	return self;
+}
+- (NSString *)name
+{
+	return _name;
+}
+- (NSUInteger)type
+{
+	return _type;
+}
+- (NSUInteger)access
+{
+	return _access;
+}
+- (NSUInteger)index
+{
+	return _index;
+}
+- (BOOL)isActive
+{
+	return _active != 0;
+}
+- (NSUInteger)arrayLength
+{
+	return _arrayLength;
+}
+- (id)dataTypeDescription
+{
+	return _typeInfo;
+}
+- (NSUInteger)bufferDataType
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (NSUInteger)bufferAlignment
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (NSUInteger)bufferDataSize
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (id)bufferStructType
+{
+	gKindGettersFailed11++;
+	return nil;
+}
+- (id)bufferPointerType
+{
+	return nil;
+}
+- (NSUInteger)textureType
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (NSUInteger)textureDataType
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (NSUInteger)threadgroupMemoryDataSize
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+- (NSUInteger)threadgroupMemoryAlignment
+{
+	gKindGettersFailed11++;
+	return 0;
+}
+@end
+
+@interface RgfxTestsBufferArgument11 : RgfxTestsArgument11 {
+	NSUInteger _dataType;
+	BOOL _vertexDescriptorBuffer;
+	NSUInteger _alignment;
+	NSUInteger _dataSize;
+	NSUInteger _pixelFormat;
+	NSUInteger _aluType;
+}
+@end
+
+@implementation RgfxTestsBufferArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                    isActive:(BOOL)isActive
+               locationIndex:(NSUInteger)locationIndex
+                   arraySize:(NSUInteger)arraySize
+                    dataType:(NSUInteger)dataType
+                 pixelFormat:(NSUInteger)pixelFormat
+                     aluType:(NSUInteger)aluType
+            isConstantBuffer:(BOOL)isConstantBuffer
+                    dataSize:(NSUInteger)dataSize
+                   alignment:(NSUInteger)alignment
+{
+	(void)isConstantBuffer;
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:locationIndex
+	                         active:isActive
+	                    arrayLength:arraySize
+	                typeDescription:nil])) {
+		_dataType = dataType;
+		_alignment = alignment;
+		_dataSize = dataSize;
+		_pixelFormat = pixelFormat;
+		_aluType = aluType;
+	}
+	return self;
+}
+- (void)setVertexDescriptorBuffer:(BOOL)value
+{
+	_vertexDescriptorBuffer = value;
+}
+- (BOOL)isVertexDescriptorBuffer
+{
+	return _vertexDescriptorBuffer;
+}
+- (NSUInteger)bufferDataType
+{
+	return _dataType;
+}
+- (NSUInteger)bufferAlignment
+{
+	return _alignment;
+}
+- (NSUInteger)bufferDataSize
+{
+	return _dataSize;
+}
+- (id)bufferPointerType
+{
+	return _typeInfo;
+}
+- (id)bufferStructType
+{
+	return [_typeInfo respondsToSelector:@selector(elementStructType)] ? [_typeInfo elementStructType] : nil;
+}
+@end
+
+@interface RgfxTestsTextureArgument11 : RgfxTestsArgument11 {
+	NSUInteger _textureType;
+	BOOL _isDepthTexture;
+	NSUInteger _textureDataType;
+}
+@end
+
+@implementation RgfxTestsTextureArgument11
+- (instancetype)initWithName:(NSString *)name
+                      access:(NSUInteger)access
+                    isActive:(BOOL)isActive
+               locationIndex:(NSUInteger)locationIndex
+                   arraySize:(NSUInteger)arraySize
+                    dataType:(NSUInteger)dataType
+                 textureType:(NSUInteger)textureType
+              isDepthTexture:(BOOL)isDepthTexture
+{
+	if ((self = [super initWithName:name
+	                           type:MTLArgumentTypeTexture
+	                         access:access
+	                          index:locationIndex
+	                         active:isActive
+	                    arrayLength:arraySize
+	                typeDescription:nil])) {
+		_textureType = textureType;
+		_isDepthTexture = isDepthTexture;
+		_textureDataType = dataType;
+	}
+	return self;
+}
+- (NSUInteger)textureType
+{
+	return _textureType;
+}
+- (NSUInteger)textureDataType
+{
+	return _textureDataType;
+}
+- (BOOL)isDepthTexture
+{
+	return _isDepthTexture;
+}
+@end
+
+@interface RgfxTestsThreadgroupArgument11 : RgfxTestsArgument11 {
+	NSUInteger _alignment;
+	NSUInteger _dataSize;
+	NSUInteger _dataType;
+}
+@end
+
+@implementation RgfxTestsThreadgroupArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                    isActive:(BOOL)isActive
+               locationIndex:(NSUInteger)locationIndex
+                   arraySize:(NSUInteger)arraySize
+                    dataType:(NSUInteger)dataType
+                    dataSize:(NSUInteger)dataSize
+                   alignment:(NSUInteger)alignment
+{
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:locationIndex
+	                         active:isActive
+	                    arrayLength:arraySize
+	                typeDescription:nil])) {
+		_alignment = alignment;
+		_dataSize = dataSize;
+		_dataType = dataType;
+	}
+	return self;
+}
+- (NSUInteger)threadgroupMemoryDataType
+{
+	return _dataType;
+}
+- (NSUInteger)threadgroupMemoryDataSize
+{
+	return _dataSize;
+}
+- (NSUInteger)threadgroupMemoryAlignment
+{
+	return _alignment;
+}
+@end
+
+@interface RgfxTestsBuiltInArgument11 : RgfxTestsArgument11 {
+	uint16_t _builtInType;
+	uint16_t _builtInDataType;
+}
+@end
+
+@implementation RgfxTestsBuiltInArgument11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                      active:(BOOL)active
+                       index:(NSUInteger)index
+                    dataType:(NSUInteger)dataType
+                 builtInType:(NSUInteger)builtInType
+{
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:index
+	                         active:active
+	                    arrayLength:1
+	                typeDescription:nil])) {
+		_builtInType = static_cast<uint16_t>(builtInType);
+		_builtInDataType = static_cast<uint16_t>(dataType);
+	}
+	return self;
+}
+- (NSUInteger)builtInType
+{
+	return _builtInType;
+}
+- (NSUInteger)builtInDataType
+{
+	return _builtInDataType;
+}
+@end
+
+@interface RgfxTestsIndirectConstant11 : RgfxTestsArgument11 {
+	uint16_t _dataType;
+	uint16_t _alignment;
+	uint16_t _dataSize;
+	NSUInteger _pixelFormat;
+	NSUInteger _aluType;
+}
+@end
+
+@implementation RgfxTestsIndirectConstant11
+- (instancetype)initWithName:(NSString *)name
+                        type:(NSUInteger)type
+                      access:(NSUInteger)access
+                    isActive:(BOOL)isActive
+               locationIndex:(NSUInteger)locationIndex
+                    dataType:(NSUInteger)dataType
+                 pixelFormat:(NSUInteger)pixelFormat
+                     aluType:(NSUInteger)aluType
+                    dataSize:(NSUInteger)dataSize
+                   alignment:(NSUInteger)alignment
+{
+	if ((self = [super initWithName:name
+	                           type:type
+	                         access:access
+	                          index:locationIndex
+	                         active:isActive
+	                    arrayLength:1
+	                typeDescription:nil])) {
+		_dataType = static_cast<uint16_t>(dataType);
+		_alignment = static_cast<uint16_t>(alignment);
+		_dataSize = static_cast<uint16_t>(dataSize);
+		_pixelFormat = pixelFormat;
+		_aluType = aluType;
+	}
+	return self;
+}
+- (NSUInteger)indirectConstantDataSize
+{
+	return _dataSize;
+}
+- (NSUInteger)indirectConstantDataType
+{
+	return _dataType;
+}
+@end
+
+@interface RgfxTestsStructType11 : NSObject {
+	NSUInteger _dataType;
+	NSDictionary *_dictionary;
+	NSArray *_members;
+	char _isIndirectArgumentBuffer;
+}
+@end
+
+@implementation RgfxTestsStructType11
+- (instancetype)initWithMembers:(__unsafe_unretained id const *)members count:(NSUInteger)count
+{
+	if ((self = [super init])) {
+		_dataType = MTLDataTypeStruct;
+		_members = [NSArray arrayWithObjects:members count:count];
+	}
+	return self;
+}
+- (void)setIsIndirectArgumentBuffer:(BOOL)value
+{
+	_isIndirectArgumentBuffer = value;
+}
+- (BOOL)isIndirectArgumentBuffer
+{
+	return _isIndirectArgumentBuffer != 0;
+}
+- (NSArray *)members
+{
+	return _members;
+}
+- (NSUInteger)dataType
+{
+	return _dataType;
+}
+- (id)memberByName:(NSString *)name
+{
+	for (id m in _members)
+		if ([[m name] isEqualToString:name])
+			return m;
+	return nil;
+}
+@end
+
+@interface RgfxTestsRenderReflection11 : NSObject {
+	uint64_t _flags;
+	NSArray *_vertexBuiltInArguments;
+	NSUInteger _postVertexDumpStride;
+	NSArray *_postVertexDumpOutputs;
+	NSArray *_inferredInputs;
+	NSArray *_vertexArguments;
+	NSArray *_fragmentArguments;
+	NSArray *_tileArguments;
+	NSArray *_tileBuiltInArguments;
+	id _imageBlockDataReturn;
+	NSDictionary *_performanceStatistics;
+	uint32_t _traceBufferIndex;
+	NSData *_vertexPluginReturnData;
+	NSData *_fragmentPluginReturnData;
+	NSArray *_constantSamplerUniqueIdentifiers;
+	NSArray *_constantSamplerDescriptors;
+	NSDictionary *_vertexResourceBindingIndexRemappingTable;
+	NSDictionary *_fragmentResourceBindingIndexRemappingTable;
+}
+@end
+
+@implementation RgfxTestsRenderReflection11
+- (NSArray *)vertexArguments
+{
+	return _vertexArguments;
+}
+- (NSArray *)fragmentArguments
+{
+	return _fragmentArguments;
+}
+- (NSArray *)vertexBuiltInArguments
+{
+	return _vertexBuiltInArguments;
+}
+- (NSData *)vertexPluginReturnData
+{
+	return _vertexPluginReturnData;
+}
+- (NSData *)fragmentPluginReturnData
+{
+	return _fragmentPluginReturnData;
+}
+- (NSUInteger)postVertexDumpStride
+{
+	return _postVertexDumpStride;
+}
+- (uint32_t)traceBufferIndex
+{
+	return _traceBufferIndex;
+}
+@end
+
+@interface RgfxTestsComputeReflection11 : NSObject {
+	NSArray *_arguments;
+	NSArray *_builtInArguments;
+	NSDictionary *_performanceStatistics;
+	uint64_t _flags;
+	uint32_t _traceBufferIndex;
+	NSData *_pluginReturnData;
+	NSArray *_constantSamplerUniqueIdentifiers;
+	NSArray *_constantSamplerDescriptors;
+	NSDictionary *_computeResourceBindingIndexRemappingTable;
+}
+@end
+
+@implementation RgfxTestsComputeReflection11
+- (NSArray *)arguments
+{
+	return _arguments;
+}
+- (NSArray *)builtInArguments
+{
+	return _builtInArguments;
+}
+- (NSData *)pluginReturnData
+{
+	return _pluginReturnData;
+}
+- (uint32_t)traceBufferIndex
+{
+	return _traceBufferIndex;
+}
+@end
+
+namespace {
+
+// Before macOS 13, whose Metal has no binding classes, a pipeline's reflection is made of the
+// classes its release has (RgfxPipelineReflection.h). With the stand-ins above in place of Metal's,
+// as macOS 11.7.11 has them, and as macOS 12.7.6 has them (its struct type Metal's own, of a type
+// name), over test_pipeline_reflection_from_air's library: every binding is an argument of the
+// release's argument class of its kind (a buffer's, a texture's, threadgroup memory's, and
+// MTLArgumentInternal for a sampler and the others), of the binding's name, type, access, index,
+// use and array length, its type object the binding's own (a buffer's pointer type, a texture's
+// texture type, none for a sampler), and it answers its kind's getters, so none that fails there is
+// asked: a vertex descriptor's buffer answers the bufferDataType the GL renderer asks it; built-ins
+// and an argument buffer's constants are of the release's classes; no binding list is set; the
+// stages' plugin return data are kept; and a mesh pipeline, which Metal before macOS 13 has not,
+// answers none. Over a library built for macOS 11 (tests/air_arguments_11.metal), whose AIR names
+// no buffer's address space, a kernel's device and constant buffers and its threadgroup memory are
+// each of its kind. Metal's own classes answer again after.
+void test_pipeline_reflection_before_macos13()
+{
+	Fixture fx(0x80000); // the libraries' bytes fit
+	const char *path = getenv("RGFX_ORACLE_REFLECTION");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	const char *path11 = getenv("RGFX_AIR_ARGUMENTS_11");
+	CHECK(path11 != nullptr);
+	if (path11 == nullptr)
+		return;
+	NSData *bytes11 = [NSData dataWithContentsOfFile:@(path11)];
+	RgfxLibrary *lib11 = [RgfxLibrary libraryWithData:bytes11.bytes
+	                                           length:bytes11.length
+	                                              key:nullptr
+	                                           device:nil
+	                                       serializer:&fx.ser
+	                                           status:&status];
+	CHECK(lib11 != nil);
+	[lib11 rgfxSetSource:dispatch_data_create(bytes11.bytes, bytes11.length, nil, ^{
+		       (void)bytes11;
+	       })
+	         shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		         return nil;
+	         }];
+	auto ask = [](id object, NSString *member) -> id {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto number = [](id object, NSString *member) {
+		return ((NSUInteger(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	auto flag = [](id object, NSString *member) {
+		return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+	};
+	// Each argument's name, its type and whether it is active, in order; empty where one is not of
+	// the release's argument class.
+	auto shape = [&](NSArray *arguments) {
+		std::string out;
+		for (id a in arguments) {
+			if (![a isKindOfClass:[RgfxTestsArgument11 class]])
+				return std::string("(not an argument of the release's)");
+			out += std::string([ask(a, @"name") UTF8String]) + ":" + std::to_string(number(a, @"type")) +
+			       (flag(a, @"isActive") ? "" : "-") + " ";
+		}
+		return out;
+	};
+	auto fn = [&](NSString *name) { return [lib newFunctionWithName:name]; };
+	const MTLPipelineOption both = MTLPipelineOptionBindingInfo | MTLPipelineOptionBufferTypeInfo;
+	NSNull *none = [NSNull null];
+
+	for (int release : {11, 12}) {
+		NSMutableDictionary *standIns = [@{
+			@"MTLBindingInternal" : none,
+			@"MTLBufferBindingInternal" : none,
+			@"MTLTextureBindingInternal" : none,
+			@"MTLThreadgroupMemoryBindingInternal" : none,
+			@"MTLObjectPayloadBindingInternal" : none,
+			@"MTLBuiltInMeshArgument" : none,
+			@"MTLArgumentInternal" : [RgfxTestsArgument11 class],
+			@"MTLBufferArgument" : [RgfxTestsBufferArgument11 class],
+			@"MTLTextureArgument" : [RgfxTestsTextureArgument11 class],
+			@"MTLThreadgroupMemoryArgument" : [RgfxTestsThreadgroupArgument11 class],
+			@"MTLBuiltInArgument" : [RgfxTestsBuiltInArgument11 class],
+			@"MTLIndirectConstantArgument" : [RgfxTestsIndirectConstant11 class],
+			@"MTLStructTypeInternal" : [RgfxTestsStructType11 class],
+			@"MTLRenderPipelineReflectionInternal" : [RgfxTestsRenderReflection11 class],
+			@"MTLComputePipelineReflectionInternal" : [RgfxTestsComputeReflection11 class],
+		} mutableCopy];
+		if (release == 12)
+			[standIns removeObjectForKey:@"MTLStructTypeInternal"];
+		Class structClass = release == 11 ? [RgfxTestsStructType11 class] : NSClassFromString(@"MTLStructTypeInternal");
+		RgfxPipelineReflectionUseClassesForTests(standIns);
+		gKindGettersFailed11 = 0;
+		Class buffer = [RgfxTestsBufferArgument11 class], texture = [RgfxTestsTextureArgument11 class],
+		      threadgroup = [RgfxTestsThreadgroupArgument11 class], other = [RgfxTestsArgument11 class];
+		// Each argument's class, in order: B a buffer's, T a texture's, G threadgroup memory's, A
+		// MTLArgumentInternal itself, ? another.
+		auto classes = [&](NSArray *arguments) {
+			std::string out;
+			for (id a in arguments)
+				out += [a class] == buffer ? "B" : [a class] == texture ? "T" : [a class] == threadgroup ? "G"
+				                                                     : [a class] == other ? "A" : "?";
+			return out;
+		};
+
+		// A kernel's: its buffers', textures', sampler's and threadgroup memory's arguments.
+		id basic = RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, both);
+		CHECK([basic class] == [RgfxTestsComputeReflection11 class]);
+		NSArray *arguments = ask(basic, @"arguments");
+		CHECK(shape(arguments) == "out:0 params:0 in:0 r:2 s:2 w:2 rw:2 smp:3 tg:1 ");
+		CHECK(classes(arguments) == "BBBTTTTAG");
+		if (arguments.count == 9) {
+			// Each answers its kind's getters, as Metal's own of the release does.
+			CHECK(number(arguments[1], @"bufferDataType") == MTLDataTypeStruct &&
+			      number(arguments[1], @"bufferDataSize") == 192 && number(arguments[1], @"bufferAlignment") == 32 &&
+			      ask(arguments[1], @"bufferPointerType") == ask(arguments[1], @"dataTypeDescription") &&
+			      [ask(arguments[1], @"bufferStructType") class] == structClass);
+			CHECK(number(arguments[0], @"bufferDataType") == MTLDataTypeFloat &&
+			      ask(arguments[0], @"bufferStructType") == nil);
+			CHECK(number(arguments[6], @"textureType") == MTLTextureType2D &&
+			      number(arguments[6], @"textureDataType") == MTLDataTypeHalf);
+			CHECK(number(arguments[8], @"threadgroupMemoryDataSize") == 4 &&
+			      number(arguments[8], @"threadgroupMemoryAlignment") == 4);
+			id params = ask(arguments[1], @"dataTypeDescription");
+			CHECK([NSStringFromClass([params class]) isEqualToString:@"MTLPointerTypeInternal"] &&
+			      number(params, @"alignment") == 32 && number(params, @"dataSize") == 192 &&
+			      number(params, @"elementType") == MTLDataTypeStruct && number(arguments[1], @"index") == 1 &&
+			      number(arguments[1], @"arrayLength") == 1);
+			id members = ask(ask(params, @"elementStructType"), @"members");
+			CHECK([ask(params, @"elementStructType") class] == structClass && [members count] == 12);
+			if ([members count] == 12) {
+				MTLStructMember *counts = members[6], *inner = members[7];
+				CHECK([counts.name isEqualToString:@"counts"] && counts.arrayType.arrayLength == 3 &&
+				      [inner.structType class] == structClass);
+			}
+			CHECK(number(arguments[0], @"access") == MTLArgumentAccessReadWrite &&
+			      number(ask(arguments[0], @"dataTypeDescription"), @"alignment") == 4);
+			id rw = ask(arguments[6], @"dataTypeDescription");
+			CHECK(number(arguments[5], @"access") == MTLArgumentAccessWriteOnly && number(arguments[6], @"index") == 3 &&
+			      [NSStringFromClass([rw class]) isEqualToString:@"MTLTextureReferenceTypeInternal"] &&
+			      number(rw, @"textureType") == MTLTextureType2D && number(rw, @"textureDataType") == MTLDataTypeHalf);
+			CHECK(ask(arguments[7], @"dataTypeDescription") == nil);
+			id tg = ask(arguments[8], @"dataTypeDescription");
+			CHECK(number(tg, @"dataSize") == 4 && number(tg, @"alignment") == 4);
+		}
+		NSArray *builtIns = ask(basic, @"builtInArguments");
+		CHECK(builtIns.count == 2);
+		if (builtIns.count == 2)
+			CHECK([builtIns[0] class] == [RgfxTestsBuiltInArgument11 class] && number(builtIns[0], @"type") == 15 &&
+			      number(builtIns[0], @"builtInType") == 5 &&
+			      number(builtIns[0], @"builtInDataType") == MTLDataTypeUInt2 && number(builtIns[1], @"builtInType") == 8);
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_unused"), nil, both), @"arguments")) ==
+		      "used:0 unused:0- unusedConstant:0- unusedTexture:2- unusedSampler:3- unusedMemory:1- ");
+		CHECK(shape(ask(RgfxComputePipelineReflectionOf(fn(@"k_tables"), nil, both), @"arguments")) ==
+		      "table:24 intersections:27 primitives:25 instances:26 out:0 ");
+		// An argument buffer: its struct an argument buffer's, its constant the release's.
+		id ab = ask(
+		    [ask(RgfxComputePipelineReflectionOf(fn(@"k_argument_buffer"), nil, both), @"arguments") firstObject],
+		    @"dataTypeDescription");
+		id abStruct = ask(ab, @"elementStructType");
+		CHECK(flag(ab, @"elementIsArgumentBuffer") && [abStruct class] == structClass &&
+		      flag(abStruct, @"isIndirectArgumentBuffer"));
+		NSArray *abMembers = ask(abStruct, @"members");
+		CHECK(abMembers.count == 7);
+		if (abMembers.count == 7) {
+			id constant = ask(abMembers[3], @"indirectArgumentType");
+			CHECK([constant class] == [RgfxTestsIndirectConstant11 class] && number(constant, @"type") == 4 &&
+			      number(constant, @"indirectConstantDataSize") == 4);
+		}
+
+		// A render pipeline's: each stage's arguments, the descriptor's buffers first.
+		id buffers = RgfxRenderPipelineReflectionOf(fn(@"v_buffers"), nil, fn(@"f_textures"), both);
+		CHECK([buffers class] == [RgfxTestsRenderReflection11 class]);
+		CHECK(shape(ask(buffers, @"vertexArguments")) == "uniforms:0 positions:0 unusedUV:0- heights:2 ");
+		NSArray *fragmentArguments = ask(buffers, @"fragmentArguments");
+		CHECK(shape(fragmentArguments) ==
+		      "color:2 unusedTexture:2- shadow:2 smp:3 unusedSampler:3- tint:0 unusedBuffer:0- ");
+		if (fragmentArguments.count == 7)
+			CHECK(flag(ask(fragmentArguments[2], @"dataTypeDescription"), @"isDepthTexture") &&
+			      !flag(ask(fragmentArguments[0], @"dataTypeDescription"), @"isDepthTexture"));
+		NSArray *vertexBuiltIns = ask(buffers, @"vertexBuiltInArguments");
+		CHECK(vertexBuiltIns.count == 2 && [vertexBuiltIns[0] class] == [RgfxTestsBuiltInArgument11 class]);
+		MTLVertexDescriptor *vd = [MTLVertexDescriptor vertexDescriptor];
+		vd.attributes[0].format = MTLVertexFormatFloat4;
+		vd.attributes[1].format = MTLVertexFormatFloat2;
+		vd.attributes[1].bufferIndex = 1;
+		vd.attributes[2].format = MTLVertexFormatFloat4;
+		vd.attributes[2].offset = 16;
+		vd.attributes[5].format = MTLVertexFormatFloat;
+		vd.attributes[5].bufferIndex = 2;
+		vd.layouts[0].stride = 32;
+		vd.layouts[1].stride = 8;
+		vd.layouts[2].stride = 4;
+		id stageIn = RgfxRenderPipelineReflectionOf(fn(@"v_stage_in"), vd, fn(@"f_plain"), both);
+		NSArray *vertex = ask(stageIn, @"vertexArguments");
+		CHECK(shape(vertex) == "vertexBuffer.0:0 vertexBuffer.1:0 vertexBuffer.2:0- mvp:0 ");
+		CHECK(classes(vertex) == "BBBB");
+		// What the GL renderer asks of a stage's vertex descriptor buffer.
+		if (vertex.count == 4)
+			CHECK(number(vertex[0], @"bufferDataType") == MTLDataTypeStruct && flag(vertex[0], @"isVertexDescriptorBuffer") &&
+			      number(vertex[0], @"bufferDataSize") == 32);
+		if (vertex.count == 4)
+			CHECK(number(ask(vertex[0], @"dataTypeDescription"), @"dataSize") == 32 &&
+			      number(ask(vertex[0], @"dataTypeDescription"), @"alignment") == 4 && number(vertex[2], @"index") == 2 &&
+			      number(ask(vertex[3], @"dataTypeDescription"), @"alignment") == 32);
+		CHECK(ask(stageIn, @"fragmentArguments") == nil && number(stageIn, @"postVertexDumpStride") == 36 &&
+		      number(stageIn, @"traceBufferIndex") == 0xFFFFFFFF);
+
+		// A GL variant's return data, each stage's and a kernel's.
+		NSData *vertexData = [@"vertex" dataUsingEncoding:NSUTF8StringEncoding];
+		NSData *fragmentData = [@"fragment" dataUsingEncoding:NSUTF8StringEncoding];
+		RgfxStageReflection v, f, k;
+		v.pluginReturnData = vertexData;
+		f.pluginReturnData = fragmentData;
+		k.pluginReturnData = fragmentData;
+		NSString *why = nil;
+		id gl = RgfxRenderPipelineReflectionMake(&v, &f, nullptr, nullptr, &why);
+		CHECK([gl class] == [RgfxTestsRenderReflection11 class] &&
+		      [ask(gl, @"vertexPluginReturnData") isEqualToData:vertexData] &&
+		      [ask(gl, @"fragmentPluginReturnData") isEqualToData:fragmentData]);
+		CHECK([ask(RgfxComputePipelineReflectionMake(k, &why), @"pluginReturnData") isEqualToData:fragmentData]);
+
+		// No mesh pipeline's.
+		CHECK(RgfxMeshPipelineReflectionOf(fn(@"o_payload"), fn(@"m_payload"), fn(@"f_mesh"), both) == nil);
+
+		// A kernel built for macOS 11, whose AIR names no buffer's address space.
+		id k11 = RgfxComputePipelineReflectionOf([lib11 newFunctionWithName:@"k_11"], nil, both);
+		NSArray *arguments11 = ask(k11, @"arguments");
+		CHECK(shape(arguments11) == "out:0 params:0 tg:1 tex:2 smp:3 " && classes(arguments11) == "BBGTA");
+		if (arguments11.count == 5)
+			CHECK(number(arguments11[1], @"bufferDataType") == MTLDataTypeStruct &&
+			      number(arguments11[1], @"bufferAlignment") == 32 && number(arguments11[2], @"index") == 0 &&
+			      number(arguments11[2], @"threadgroupMemoryDataSize") == 4 &&
+			      number(arguments11[0], @"access") == MTLArgumentAccessReadWrite);
+		id v11 = RgfxRenderPipelineReflectionOf([lib11 newFunctionWithName:@"v_11"], nil,
+		                                        [lib11 newFunctionWithName:@"f_11"], both);
+		CHECK(shape(ask(v11, @"vertexArguments")) == "mvp:0 " && shape(ask(v11, @"fragmentArguments")) == "color:2 smp:3 tint:0 " &&
+		      classes(ask(v11, @"fragmentArguments")) == "TAB");
+
+		// No getter that fails on the release was asked.
+		CHECK(gKindGettersFailed11 == 0);
+	}
+	RgfxPipelineReflectionUseClassesForTests(nil);
+	id own = RgfxComputePipelineReflectionOf(fn(@"k_basic"), nil, both);
+	CHECK([NSStringFromClass([own class]) isEqualToString:@"MTLComputePipelineReflectionInternal"] &&
+	      [ask(own, @"bindings") count] == 9);
 }
 
 // A visible function answers its reflection from its signature in its AIR module
@@ -4853,7 +8623,37 @@ void test_function_members_from_shadow()
 		                        dispatch_data_get_size((dispatch_data_t)metalAir));
 		CHECK([fn rgfxShadow] != nil && ![(id)[fn rgfxShadow] isKindOfClass:[RgfxFunction class]]);
 		CHECK(ask(fn, @"pluginData") == nil);
+		// What Metal's own function reads from its library for its tools, as it answers.
+		for (NSString *member in @[ @"filePath", @"unpackedFilePath", @"debugInstrumentationData",
+		                            @"importedSymbols" ]) {
+			id ours = ask(fn, member), metals = ask(theirs, member);
+			CHECK((ours == nil) == (metals == nil) && (ours == nil || [ours isEqual:metals]));
+		}
+		auto number = [](id object, NSString *member) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(member));
+		};
+		CHECK(number(fn, @"lineNumber") == number(theirs, @"lineNumber"));
+		CHECK(number(fn, @"renderTargetArrayIndexType") == number(theirs, @"renderTargetArrayIndexType"));
+		// The relocations a link applies: nil until set, then the array set itself.
+		CHECK(ask(fn, @"relocations") == nil);
+		NSArray *relocations = @[ @"relocation" ];
+		((void (*)(id, SEL, id))objc_msgSend)(fn, NSSelectorFromString(@"setRelocations:"), relocations);
+		CHECK(ask(fn, @"relocations") == relocations);
 	}
+
+	// What the library keeps for Metal's tools: no identifier, and the triple (a copy) and the
+	// validation switch as set.
+	CHECK(ask(lib, @"libraryIdentifier") == nil && ask(lib, @"overrideTriple") == nil);
+	NSMutableString *triple = [NSMutableString stringWithString:@"air64-apple-macosx14.0.0"];
+	((void (*)(id, SEL, id))objc_msgSend)(lib, NSSelectorFromString(@"setOverrideTriple:"), triple);
+	[triple appendString:@"-changed"];
+	CHECK([ask(lib, @"overrideTriple") isEqualToString:@"air64-apple-macosx14.0.0"]);
+	((void (*)(id, SEL, id))objc_msgSend)(lib, NSSelectorFromString(@"setOverrideTriple:"), nil);
+	CHECK(ask(lib, @"overrideTriple") == nil);
+	SEL validation = NSSelectorFromString(@"shaderValidationEnabled");
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(lib, validation));
+	((void (*)(id, SEL, BOOL))objc_msgSend)(lib, NSSelectorFromString(@"setShaderValidationEnabled:"), YES);
+	CHECK(((BOOL (*)(id, SEL))objc_msgSend)(lib, validation));
 	CHECK(((NSArray *)ask([lib newFunctionWithName:@"stitch_add"], @"arguments")).count == 2);
 	CHECK(ask([lib newFunctionWithName:@"stitch_add"], @"returnType") != nil);
 	CHECK(ask([lib newFunctionWithName:@"stitch_caller"], @"returnType") == nil);
@@ -5050,13 +8850,113 @@ void test_constants_without_cnst_resolve_from_air()
 	}
 }
 
+// A function whose metadata names no constants (no CNST tag) and whose module's constants do not
+// read (here every_constant's, its CNST tag renamed and its kSteps constant's type spoilt to one no
+// reader knows) carries every value it is given, none dropped: those set by index as set, and one
+// set by name at the index its module's `air.function_constants` gives the name. A compute
+// pipeline of it that links private functions of its library (visible functions, as MPS's
+// convolution kernels link their prefix and postfix functions) carries the kernel's values, and
+// its linked functions none.
+void test_constants_carried_where_air_constants_do_not_read()
+{
+	Fixture fx(0x80000); // the library's bytes fit
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSMutableData *bytes = [[NSData dataWithContentsOfFile:@(path)] mutableCopy];
+	uint8_t *p = static_cast<uint8_t *>(bytes.mutableBytes);
+	size_t renamed = 0, spoilt = 0;
+	for (size_t i = 0; i + 15 <= bytes.length; i++) {
+		// every_constant's CNST tag, the one that lists kTint first of its five constants (tinted's
+		// lists kTint alone): a 4-byte name, a u16 size, a u16 count, then the first constant's name.
+		if (std::memcmp(p + i, "CNST", 4) == 0 && p[i + 6] == 5 && p[i + 7] == 0 &&
+		    std::memcmp(p + i + 8, "kTint", 6) == 0) {
+			std::memcpy(p + i, "XNST", 4);
+			renamed++;
+		}
+		// The type of kSteps (`ushort2`), a string of its module's metadata.
+		if (std::memcmp(p + i, "ushort2", 7) == 0) {
+			p[i + 5] = 'Z';
+			spoilt++;
+		}
+	}
+	CHECK(renamed == 1 && spoilt > 0);
+	uint32_t status = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:bytes.bytes
+	                                         length:bytes.length
+	                                            key:nullptr
+	                                         device:nil
+	                                     serializer:&fx.ser
+	                                         status:&status];
+	CHECK(lib != nil);
+	[lib rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		     (void)bytes;
+	     })
+	       shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		       return nil;
+	       }];
+	const float tint[4] = {1.0f, 2.0f, 3.0f, 4.0f};
+	const uint16_t steps[2] = {7, 9};
+	const bool mask[3] = {true, false, true};
+	const uint16_t gain = 0x3c00; // 1.0 as a half
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	[values setConstantValue:tint type:MTLDataTypeFloat4 atIndex:20];
+	[values setConstantValue:steps type:MTLDataTypeUShort2 withName:@"kSteps"];
+	[values setConstantValue:mask type:MTLDataTypeBool3 atIndex:22];
+	[values setConstantValue:&gain type:MTLDataTypeHalf atIndex:23];
+	NSError *err = nil;
+	id<MTLFunction> kernel = [lib newFunctionWithName:@"every_constant" constantValues:values error:&err];
+	CHECK(kernel != nil && err == nil && [(RgfxFunction *)kernel rgfxConstantCount] == 4);
+	const RgfxFunctionConstant *t = constantAt(kernel, 20), *st = constantAt(kernel, 21), *m = constantAt(kernel, 22),
+	                           *g = constantAt(kernel, 23);
+	CHECK(t != nullptr && t->data_type == MTLDataTypeFloat4 && std::memcmp(t->value, tint, sizeof tint) == 0);
+	CHECK(st != nullptr && st->data_type == MTLDataTypeUShort2 && std::memcmp(st->value, steps, sizeof steps) == 0);
+	CHECK(m != nullptr && m->data_type == MTLDataTypeBool3 && std::memcmp(m->value, mask, sizeof mask) == 0);
+	CHECK(g != nullptr && g->data_type == MTLDataTypeHalf && std::memcmp(g->value, &gain, sizeof gain) == 0);
+	CHECK(constantAt(kernel, 24) == nullptr); // kOptional: given no value
+
+	std::vector<uint8_t> drain;
+	RgfxMsgHeader h;
+	while (fx.ring.next(&h, &drain)) {
+	}
+	MTLComputePipelineDescriptor *desc = [[MTLComputePipelineDescriptor alloc] init];
+	desc.computeFunction = kernel;
+	MTLLinkedFunctions *linked = [MTLLinkedFunctions linkedFunctions];
+	linked.privateFunctions = @[ [lib newFunctionWithName:@"doubled"], [lib newFunctionWithName:@"sig_void"] ];
+	desc.linkedFunctions = linked;
+	RgfxComputePipelineState *cs = [RgfxComputePipelineState computePipelineStateWithDescriptor:desc
+	                                                                                     device:nil
+	                                                                                 serializer:&fx.ser
+	                                                                                      error:&err];
+	CHECK(cs != nil);
+	auto create = nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	RgfxComputePipelineCreate head;
+	std::memcpy(&head, create.data(), sizeof(head));
+	CHECK(head.constant_count == 4 && head.linked_count == 2);
+	for (uint32_t i = 0; i < head.constant_count && i < 4; i++) {
+		RgfxFunctionConstant c;
+		std::memcpy(&c, create.data() + head.constants_offset + i * sizeof(c), sizeof(c));
+		const RgfxFunctionConstant *given = constantAt(kernel, c.index);
+		CHECK(given != nullptr && c.data_type == given->data_type &&
+		      std::memcmp(c.value, given->value, sizeof(c.value)) == 0);
+	}
+	for (uint32_t i = 0; i < head.linked_count && i < 2; i++) {
+		RgfxLinkedFunction r;
+		std::memcpy(&r, create.data() + head.linked_offset + i * sizeof(r), sizeof(r));
+		CHECK(r.list == RGFX_LINKED_PRIVATE_FUNCTIONS && r.constant_count == 0);
+	}
+	while (fx.ring.next(&h, &drain)) {
+	}
+}
+
 // A library made from bytes answers nil for its bitcode, as Metal's, and is written by its shadow
 // as the bytes it was made from, with Foundation's error for a URL it cannot write; one made from
 // a URL is refused with Metal's error, and one with no shadow is refused, logged. (Metal's answers
 // measured on macOS 27, M3 Max.)
 void test_library_members_as_metal()
 {
-	Fixture fx;
+	Fixture fx(0x10000); // two libraries of the stitchable bytes fit
 	const char *path = getenv("RGFX_STITCHABLE");
 	CHECK(path != nullptr);
 	if (path == nullptr)
@@ -5208,6 +9108,242 @@ void test_library_type_and_install_name()
 static std::vector<uint8_t> exportedFunctionMetallib()
 {
 	return metallibOf({ { "rgfx_exported", 3, {} } });
+}
+
+// What making a function of tools/oracle/oracle_overlap.metal's answers, for each value of its
+// constants that put two present arguments of one argument table at overlapping locations or not,
+// by every way of making a specialised function: values set by index, by name, by range and a copy
+// of them, a descriptor and a copy of it, one naming a specialized name, and each completion
+// handler form. Each answer, the function or nil and the error's domain, code and words, is Metal's
+// own for the same bytes on this Mac, and the x86 Macs' (measured: oracle_overlap on the AMD Radeon
+// Pro 5300M and the Intel UHD Graphics 630, macOS 26.7.1, and the M3 Max, macOS 27.0.1, the same
+// answers): the bundle refuses such a function where Metal does, with no call to the host.
+void test_overlapping_arguments_refused_as_metal()
+{
+	Fixture fx(0x20000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_OVERLAP");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(ours != nil);
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	// Its bytes, which the device keeps for a library it makes of them, and which its functions'
+	// AIR is read from.
+	[ours rgfxSetSource:data
+	        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		        return nil;
+	        }];
+	id<MTLLibrary> theirs = [MTLCreateSystemDefaultDevice() newLibraryWithData:data error:nil];
+	CHECK(theirs != nil);
+	if (ours == nil || theirs == nil)
+		return;
+	auto values = [](bool a, bool b, uint32_t idx, int how) {
+		MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
+		short w = 3;
+		__fp16 h = idx != 0 ? 0.5 : 2.0;
+		if (how == 1) {
+			[v setConstantValue:&a type:MTLDataTypeBool withName:@"useA"];
+			[v setConstantValue:&b type:MTLDataTypeBool withName:@"useB"];
+			[v setConstantValue:&w type:MTLDataTypeShort withName:@"kW"];
+			[v setConstantValue:&idx type:MTLDataTypeUInt withName:@"kIdx"];
+			[v setConstantValue:&h type:MTLDataTypeHalf withName:@"kH"];
+			return v;
+		}
+		if (how == 2) {
+			const bool both[2] = {a, b};
+			[v setConstantValues:both type:MTLDataTypeBool withRange:NSMakeRange(0, 2)];
+		} else {
+			[v setConstantValue:&a type:MTLDataTypeBool atIndex:0];
+			[v setConstantValue:&b type:MTLDataTypeBool atIndex:1];
+		}
+		[v setConstantValue:&w type:MTLDataTypeShort atIndex:2];
+		[v setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+		[v setConstantValue:&h type:MTLDataTypeHalf atIndex:4];
+		return v;
+	};
+	// The function `name` of `lib`, by way `way`, and the error with it.
+	auto make = [&](id<MTLLibrary> lib, NSString *name, bool a, bool b, uint32_t idx, int way,
+	                NSError *__strong *error) -> id<MTLFunction> {
+		*error = nil;
+		MTLFunctionDescriptor *fd = [MTLFunctionDescriptor functionDescriptor];
+		fd.name = name;
+		fd.constantValues = values(a, b, idx, 0);
+		__block id<MTLFunction> got = nil;
+		__block NSError *gotError = nil;
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		NSError *e = nil;
+		id<MTLFunction> made = nil;
+		if (way <= 2)
+			made = [lib newFunctionWithName:name constantValues:values(a, b, idx, way) error:&e];
+		else if (way == 3)
+			made = [lib newFunctionWithName:name constantValues:[values(a, b, idx, 0) copy] error:&e];
+		else if (way == 4)
+			made = [lib newFunctionWithDescriptor:fd error:&e];
+		else if (way == 5)
+			made = [lib newFunctionWithDescriptor:[fd copy] error:&e];
+		else if (way == 6) {
+			fd.specializedName = [name stringByAppendingString:@"_spec"];
+			made = [lib newFunctionWithDescriptor:fd error:&e];
+		}
+		if (way <= 6) {
+			*error = e;
+			return made;
+		}
+		if (way == 7)
+			[lib newFunctionWithName:name
+			          constantValues:values(a, b, idx, 0)
+			       completionHandler:^(id<MTLFunction> f, NSError *err) {
+				       got = f;
+				       gotError = err;
+				       dispatch_semaphore_signal(done);
+			       }];
+		else
+			[lib newFunctionWithDescriptor:fd
+			             completionHandler:^(id<MTLFunction> f, NSError *err) {
+				             got = f;
+				             gotError = err;
+				             dispatch_semaphore_signal(done);
+			             }];
+		dispatch_semaphore_wait(done, DISPATCH_TIME_FOREVER);
+		*error = gotError;
+		return got;
+	};
+	static const char *const kWays[] = {"values", "names", "range", "copy", "descriptor",
+	                                    "desc-copy", "specialized", "async", "async-desc"};
+	NSArray *functions = @[
+		@"k_overlap", @"k_tex", @"k_texarr", @"k_smp", @"k_tg", @"k_derived", @"k_idx", @"k_bufconst",
+		@"k_unused", @"k_dead", @"k_argbuf", @"k_three", @"v_overlap", @"f_overlap", @"k_halfpred",
+		@"k_halfidx", @"k_fidx", @"k_sidx", @"k_vft", @"k_ift", @"k_pas", @"k_ias"
+	];
+	const bool cases[4][2] = {{false, false}, {true, false}, {false, true}, {true, true}};
+	int refused = 0;
+	for (NSString *name in functions) {
+		const bool twoIdx = [name isEqual:@"k_idx"] || [name isEqual:@"k_halfpred"] ||
+		                    [name isEqual:@"k_halfidx"] || [name isEqual:@"k_fidx"] || [name isEqual:@"k_sidx"];
+		for (int c = 0; c < 4; c++) {
+			for (uint32_t idx = 0; idx < (twoIdx ? 2u : 1u); idx++) {
+				for (int way = 0; way < 9; way++) {
+					const bool a = cases[c][0], b = cases[c][1];
+					NSError *ourError = nil, *theirError = nil;
+					id<MTLFunction> f = make(ours, name, a, b, idx, way, &ourError);
+					id<MTLFunction> g = make(theirs, name, a, b, idx, way, &theirError);
+					const bool same = (f == nil) == (g == nil) && (ourError == nil) == (theirError == nil) &&
+					                  (ourError == nil || ([ourError.domain isEqual:theirError.domain] &&
+					                                       ourError.code == theirError.code &&
+					                                       [ourError.localizedDescription
+					                                           isEqual:theirError.localizedDescription]));
+					if (!same)
+						NSLog(@"FAIL detail: %@ a=%d b=%d idx=%u %s: ours %@ %@, Metal's %@ %@", name, a, b, idx,
+						      kWays[way], f ? @"fn" : @"nil", ourError, g ? @"fn" : @"nil", theirError);
+					CHECK(same);
+					refused += f == nil;
+				}
+			}
+		}
+	}
+	// The x86 Macs' words, which this Mac's Metal gives too.
+	NSError *e = nil;
+	CHECK(make(ours, @"k_overlap", true, true, 0, 0, &e) == nil && [e.domain isEqual:MTLLibraryErrorDomain] &&
+	      e.code == MTLLibraryErrorCompileFailure &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_overlap\n"]);
+	CHECK(make(ours, @"k_texarr", true, true, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: texture argument t has invalid location (<1,1>) in k_texarr\n"]);
+	CHECK(make(ours, @"k_smp", true, true, 0, 4, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: sampler argument t has invalid location (<0,1>) in k_smp\n"]);
+	CHECK(make(ours, @"k_tg", true, true, 0, 1, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_tg\n"]);
+	CHECK(make(ours, @"k_three", true, true, 0, 6, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument c has invalid location (<0,1>) in k_three\n"
+	                                      @"error: buffer argument d has invalid location (<1,1>) in k_three\n"]);
+	CHECK(make(ours, @"k_derived", true, true, 0, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_idx", false, false, 1, 0, &e) != nil && e == nil);
+	// The words of the 5300M and the 630 too: a half constant's predicate and index, and function
+	// tables and acceleration structures, in the buffers' table.
+	CHECK(make(ours, @"k_halfpred", true, false, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_halfpred\n"]);
+	CHECK(make(ours, @"k_halfpred", true, true, 1, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_halfidx", true, false, 1, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_halfidx\n"]);
+	CHECK(make(ours, @"k_halfidx", true, false, 0, 0, &e) != nil && e == nil);
+	// Indices through Metal's conversions (air.convert), truncated toward zero.
+	CHECK(make(ours, @"k_fidx", true, false, 0, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_fidx\n"]);
+	CHECK(make(ours, @"k_fidx", true, false, 1, 0, &e) != nil && e == nil);
+	CHECK(make(ours, @"k_sidx", true, false, 1, 0, &e) == nil &&
+	      [e.localizedDescription isEqual:@"error: buffer argument b has invalid location (<0,1>) in k_sidx\n"]);
+	CHECK(make(ours, @"k_sidx", true, false, 0, 0, &e) != nil && e == nil);
+	for (NSString *name in @[ @"k_vft", @"k_ift", @"k_pas", @"k_ias" ]) {
+		NSString *arg = [name isEqual:@"k_vft"] || [name isEqual:@"k_ift"] ? @"t" : @"s";
+		NSString *line = [NSString
+		    stringWithFormat:@"error: buffer argument %@ has invalid location (<0,1>) in %@\n", arg, name];
+		CHECK(make(ours, name, true, true, 0, 0, &e) == nil && [e.localizedDescription isEqual:line]);
+	}
+	CHECK(refused > 0);
+}
+
+// Making a function with constant values answers whether they put its arguments at overlapping
+// locations (RgfxOverlappingArgumentError) from its module's initialisers alone, and follows no
+// entry point's body, which costs many times them (rgfxAirConstantGlobals): sixteen makes each of
+// oracle_overlap's k_idx, made, and k_overlap, refused, with the same values follow none, and run
+// the initialisers at most twice a make.
+void test_function_constants_make_follows_no_body()
+{
+	Fixture fx(0x20000); // the library's bytes fit
+	const char *path = getenv("RGFX_ORACLE_OVERLAP");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	NSData *bytes = [NSData dataWithContentsOfFile:@(path)];
+	CHECK(bytes.length > 0);
+	uint32_t status = 0;
+	RgfxLibrary *ours = [RgfxLibrary libraryWithData:bytes.bytes
+	                                          length:bytes.length
+	                                             key:nullptr
+	                                          device:nil
+	                                      serializer:&fx.ser
+	                                          status:&status];
+	CHECK(ours != nil);
+	if (ours == nil)
+		return;
+	dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+		(void)bytes;
+	});
+	[ours rgfxSetSource:data
+	        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+		        return nil;
+	        }];
+	MTLFunctionConstantValues *values = [MTLFunctionConstantValues new];
+	const bool a = true, b = true;
+	const short w = 3;
+	const uint32_t idx = 1;
+	[values setConstantValue:&a type:MTLDataTypeBool atIndex:0];
+	[values setConstantValue:&b type:MTLDataTypeBool atIndex:1];
+	[values setConstantValue:&w type:MTLDataTypeShort atIndex:2];
+	[values setConstantValue:&idx type:MTLDataTypeUInt atIndex:3];
+	const uint64_t initialisers = rgfxAirInitialisersRun(), bodies = rgfxAirBodiesFollowed();
+	constexpr uint64_t kMakes = 16;
+	uint64_t made = 0, refused = 0;
+	for (uint64_t k = 0; k < kMakes; k++) {
+		NSError *e = nil;
+		made += [ours newFunctionWithName:@"k_idx" constantValues:values error:&e] != nil && e == nil;
+		e = nil;
+		refused += [ours newFunctionWithName:@"k_overlap" constantValues:values error:&e] == nil && e != nil;
+	}
+	CHECK(made == kMakes && refused == kMakes);
+	CHECK(rgfxAirBodiesFollowed() == bodies);
+	const uint64_t ran = rgfxAirInitialisersRun() - initialisers;
+	CHECK(ran > 0 && ran <= 2 * 2 * kMakes);
 }
 
 // A post-tessellation vertex function answers its [[patch]]'s type and control point count, from
@@ -7153,6 +11289,170 @@ static std::vector<std::pair<uint16_t, std::vector<uint8_t>>> postedOps(TestRing
 	return ops;
 }
 
+// The SPI the system's GL renderer sends that Metal's x86 devices answer (measured: macOS 26.7.1,
+// an AMD 5300M and an Intel 630): a texture's swizzleKey packs its swizzle, red lowest, for the
+// texture and each view of it; a render encoder's setDepthCleared and setStencilCleared post
+// nothing; a buffer's commitAndHold commits it, posting what commit posts.
+void test_gl_renderer_spi()
+{
+	QueueFixture f;
+	@autoreleasepool {
+		int calls = 0;
+		f.ids.setResourceIdSource(&oneChunk, &calls);
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		td.usage = MTLTextureUsageRenderTarget | MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+		RgfxTexture *target = [RgfxTexture textureWithDescriptor:td
+		                                                    heap:RGFX_OBJ_NONE
+		                                              heapOffset:0
+		                                                  device:nil
+		                                              serializer:&f.ser];
+		CHECK(target != nil && [target swizzleKey] == 0x05040302u);
+		RgfxTexture *rrr1 = (RgfxTexture *)[target
+		    newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                      textureType:MTLTextureType2D
+		                           levels:NSMakeRange(0, 1)
+		                           slices:NSMakeRange(0, 1)
+		                          swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleRed, MTLTextureSwizzleRed,
+		                                                                MTLTextureSwizzleRed, MTLTextureSwizzleOne)];
+		RgfxTexture *bgra = (RgfxTexture *)[target
+		    newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                      textureType:MTLTextureType2D
+		                           levels:NSMakeRange(0, 1)
+		                           slices:NSMakeRange(0, 1)
+		                          swizzle:MTLTextureSwizzleChannelsMake(MTLTextureSwizzleBlue, MTLTextureSwizzleGreen,
+		                                                                MTLTextureSwizzleRed, MTLTextureSwizzleAlpha)];
+		RgfxTexture *plain = (RgfxTexture *)[target newTextureViewWithPixelFormat:MTLPixelFormatRGBA8Unorm];
+		CHECK(rrr1 != nil && [rrr1 swizzleKey] == 0x01020202u);
+		CHECK(bgra != nil && [bgra swizzleKey] == 0x05020304u);
+		CHECK(plain != nil && [plain swizzleKey] == 0x05040302u);
+		drainRing(f.control);
+		// The same pass with and without the marks, committed the two ways: the same ops. Its
+		// target is a stand-in, as other encoder tests'.
+		auto pass = [&](bool marks, bool hold) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = handle(42);
+			id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+			RgfxRenderCommandEncoder *e = (RgfxRenderCommandEncoder *)[cb renderCommandEncoderWithDescriptor:rp];
+			[e setRenderPipelineState:handle(7)];
+			if (marks) {
+				[e setDepthCleared];
+				[e setStencilCleared];
+			}
+			[e drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+			[e endEncoding];
+			if (hold)
+				[(RgfxCmdBuffer *)cb commitAndHold];
+			else
+				[cb commit];
+			CHECK(cb.status >= MTLCommandBufferStatusCommitted);
+			drainRing(f.control);
+			return postedOps(f.submit);
+		};
+		// Each pass's encoder takes the queue's next barrier fence, which its ENCODER_BEGIN_RENDER
+		// and its fence ops name; every other op's bytes, and the ops' tags and sizes, are
+		// compared whole.
+		auto shape = [](std::vector<std::pair<uint16_t, std::vector<uint8_t>>> ops) {
+			for (auto &op : ops)
+				if (op.first == RGFX_OP_ENCODER_BEGIN_RENDER || op.first == RGFX_OP_RENDER_UPDATE_FENCE ||
+				    op.first == RGFX_OP_RENDER_WAIT_FOR_FENCE)
+					op.second.assign(op.second.size(), 0);
+			return ops;
+		};
+		// Where two differ, the first op that does is printed.
+		auto same = [](const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> &a,
+		               const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> &b) {
+			for (size_t i = 0; i < a.size() && i < b.size(); i++)
+				if (a[i] != b[i]) {
+					fprintf(stderr, "op %zu differs: tag 0x%x, %zu and %zu bytes\n", i, a[i].first,
+					        a[i].second.size(), b[i].second.size());
+					break;
+				}
+			return a == b;
+		};
+		const auto plainOps = shape(pass(false, false));
+		CHECK(!plainOps.empty());
+		CHECK(same(shape(pass(true, false)), plainOps));
+		CHECK(same(shape(pass(false, true)), plainOps));
+		// A depth/stencil state answers YES to the renderer's four queries, a state that tests
+		// and writes nothing among them.
+		MTLDepthStencilDescriptor *none = [MTLDepthStencilDescriptor new];
+		MTLDepthStencilDescriptor *both = [MTLDepthStencilDescriptor new];
+		both.depthCompareFunction = MTLCompareFunctionLess;
+		both.depthWriteEnabled = YES;
+		both.frontFaceStencil.stencilCompareFunction = MTLCompareFunctionEqual;
+		both.frontFaceStencil.depthStencilPassOperation = MTLStencilOperationReplace;
+		for (MTLDepthStencilDescriptor *d in @[ none, both ]) {
+			RgfxDepthStencilState *ds = [RgfxDepthStencilState depthStencilStateWithDescriptor:d
+			                                                                            device:nil
+			                                                                        serializer:&f.ser];
+			CHECK(ds != nil && [ds readsDepth] && [ds writesDepth] && [ds readsStencil] && [ds writesStencil]);
+		}
+		// On an Apple GPU each answers what the descriptor reads and writes, as the M3 Max's states
+		// do (oracle_bundle Apple ds.queries and ds.grid, macOS 27.0.1): the descriptor, then
+		// readsDepth, writesDepth, readsStencil and writesStencil.
+		auto face = [](MTLCompareFunction c, MTLStencilOperation sf, MTLStencilOperation df, MTLStencilOperation p,
+		               uint32_t rm, uint32_t wm) {
+			MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+			s.stencilCompareFunction = c;
+			s.stencilFailureOperation = sf;
+			s.depthFailureOperation = df;
+			s.depthStencilPassOperation = p;
+			s.readMask = rm;
+			s.writeMask = wm;
+			return s;
+		};
+		auto depth = [](MTLCompareFunction c, BOOL write) {
+			MTLDepthStencilDescriptor *d = [MTLDepthStencilDescriptor new];
+			d.depthCompareFunction = c;
+			d.depthWriteEnabled = write;
+			return d;
+		};
+		const MTLStencilOperation keep = MTLStencilOperationKeep, replace = MTLStencilOperationReplace;
+		MTLDepthStencilDescriptor *never = depth(MTLCompareFunctionNever, NO);
+		MTLDepthStencilDescriptor *neverWrites = depth(MTLCompareFunctionNever, YES);
+		MTLDepthStencilDescriptor *alwaysWrites = depth(MTLCompareFunctionAlways, YES);
+		MTLDepthStencilDescriptor *less = depth(MTLCompareFunctionLess, NO);
+		MTLDepthStencilDescriptor *equal = depth(MTLCompareFunctionAlways, NO);
+		equal.frontFaceStencil = face(MTLCompareFunctionEqual, keep, keep, keep, 0xff, 0xff);
+		MTLDepthStencilDescriptor *equalNoReads = depth(MTLCompareFunctionAlways, NO);
+		equalNoReads.frontFaceStencil = face(MTLCompareFunctionEqual, keep, keep, keep, 0, 0xff);
+		MTLDepthStencilDescriptor *alwaysReplaces = depth(MTLCompareFunctionAlways, NO);
+		alwaysReplaces.backFaceStencil = face(MTLCompareFunctionAlways, keep, keep, replace, 0xff, 0xff);
+		MTLDepthStencilDescriptor *replacesNothing = depth(MTLCompareFunctionAlways, NO);
+		replacesNothing.frontFaceStencil = face(MTLCompareFunctionAlways, keep, keep, replace, 0xff, 0);
+		MTLDepthStencilDescriptor *neverFails = depth(MTLCompareFunctionAlways, NO);
+		neverFails.frontFaceStencil = face(MTLCompareFunctionNever, replace, keep, keep, 0xff, 0x0f);
+		const struct {
+			MTLDepthStencilDescriptor *d;
+			BOOL rd, wd, rs, ws;
+		} kApple[] = {
+		    {none, NO, NO, NO, NO},           {both, YES, YES, YES, YES},
+		    {never, NO, NO, NO, NO},          {neverWrites, YES, YES, NO, NO},
+		    {alwaysWrites, YES, YES, NO, NO}, {less, YES, NO, NO, NO},
+		    {equal, NO, NO, YES, NO},         {equalNoReads, NO, NO, NO, NO},
+		    {alwaysReplaces, NO, NO, YES, YES}, {replacesNothing, NO, NO, NO, NO},
+		    {neverFails, NO, NO, YES, YES},
+		};
+		id apple = [RgfxAppleFamilyDevice new]; // held: a state keeps its device weakly
+		for (const auto &k : kApple) {
+			RgfxDepthStencilState *ds = [RgfxDepthStencilState depthStencilStateWithDescriptor:k.d
+			                                                                            device:(id<MTLDevice>)apple
+			                                                                        serializer:&f.ser];
+			CHECK(ds != nil && [ds readsDepth] == k.rd && [ds writesDepth] == k.wd && [ds readsStencil] == k.rs &&
+			      [ds writesStencil] == k.ws);
+			// An x86 guest's device answers YES to each, whatever the descriptor.
+			RgfxDepthStencilState *x86 = [RgfxDepthStencilState depthStencilStateWithDescriptor:k.d
+			                                                                             device:nil
+			                                                                         serializer:&f.ser];
+			CHECK(x86 != nil && [x86 readsDepth] && [x86 writesDepth] && [x86 readsStencil] && [x86 writesStencil]);
+		}
+	}
+}
+
 // A render encoder sends the object and mesh stages' commands and the mesh draws where the host
 // makes mesh pipelines, and drops them elsewhere (an encoder of no device, a unit test's, makes
 // none until told).
@@ -7253,6 +11553,8 @@ void test_parallel_sub_encoders_start_from_defaults()
 		[a setDepthStencilState:handle(8)];
 		[a setVisibilityResultMode:MTLVisibilityResultModeBoolean offset:64];
 		[a setTessellationFactorScale:2];
+		((void (*)(id, SEL, BOOL, NSUInteger))objc_msgSend)(a, @selector(setPrimitiveRestartEnabled:index:), YES, 3);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(a, @selector(setProvokingVertexMode:), 1);
 		[a drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
 		[a endEncoding];
 		[b setRenderPipelineState:handle(7)];
@@ -7294,6 +11596,9 @@ void test_parallel_sub_encoders_start_from_defaults()
 		RgfxOpSetTessellationFactorScale scale = {};
 		const float fone = 1;
 		std::memcpy(&scale, &fone, 4);
+		RgfxOpSetPrimitiveRestartEnabled restart = {};
+		restart.index = 0xffffffffu; // kRgfxRestartAtAllOnes: as before any call
+		RgfxOpSetProvokingVertexMode provoking = {};
 		const std::vector<std::pair<uint16_t, std::vector<uint8_t>>> defaults = {
 		    {RGFX_OP_RENDER_SET_CULL_MODE, bytesOf(cull)},
 		    {RGFX_OP_RENDER_SET_FRONT_FACING_WINDING, bytesOf(winding)},
@@ -7307,6 +11612,8 @@ void test_parallel_sub_encoders_start_from_defaults()
 		    {RGFX_OP_RENDER_SET_DEPTH_STENCIL_STATE, bytesOf(depthStencil)},
 		    {RGFX_OP_RENDER_SET_VISIBILITY_RESULT_MODE, bytesOf(visibility)},
 		    {RGFX_OP_RENDER_SET_TESSELLATION_FACTOR_SCALE, bytesOf(scale)},
+		    {RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, bytesOf(restart)},
+		    {RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, bytesOf(provoking)},
 		};
 		CHECK(ops.size() >= at + 1 + defaults.size() + 4);
 		bool same = true;
@@ -7696,6 +12003,219 @@ void test_present_drawable()
 	}
 }
 
+// The seqno of the next command buffer `f`'s queue posts, waiting up to `ms` for it (past the
+// other messages of its ring); 0 where none comes.
+uint64_t postedWithin(QueueFixture &f, int ms)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	for (int i = 0; i <= ms;) {
+		if (!f.submit.next(&h, &bytes)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			i++;
+		} else if (h.type == RGFX_CMD_COMMAND_BUFFER) {
+			return h.seqno;
+		}
+	}
+	return 0;
+}
+
+// A buffer that presents a drawable holds back its queue's later buffers until the drawable
+// reports its present scheduled, as Metal's queue does on the AMD 5300M and the Intel 630
+// (PRESENT HOLD, RgfxCommandObjects.mm): the later buffers' commits return, and they stay
+// Committed and unposted through the presenting buffer's scheduling and its present, then go in
+// their order once the report comes. Each variant of presentDrawable: holds so. A report that
+// comes before the presenting buffer is posted (a drawable with no layer on screen) holds nothing;
+// one at the present holds the later buffers until the presenting one is scheduled. A presenting
+// buffer the host fails still presents, and holds the later buffers until the report.
+void test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	FakeKext *kext = new FakeKext();
+	RgfxCompletionThread thread(&FakeKext::wait, kext);
+	CHECK(thread.start());
+	thread.add([f.queue sharedReplyReader]);
+	auto objId = [](id<MTLCommandBuffer> cb) { return ((RgfxResource *)cb).rgfxObjId; };
+	auto schedule = [&](uint64_t seqno, id<MTLCommandBuffer> cb) {
+		RgfxCbScheduled scheduled = cbScheduled(seqno, objId(cb));
+		hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		[cb waitUntilScheduled];
+	};
+	auto complete = [&](uint64_t seqno, id<MTLCommandBuffer> cb, uint32_t status) {
+		RgfxCbComplete done = cbComplete(seqno, objId(cb));
+		done.status = status;
+		hostPost(f.completion, *kext, &done, sizeof(done));
+		[cb waitUntilCompleted];
+	};
+
+	for (int variant = 0; variant < 3; variant++) {
+		TestDrawable *d = [TestDrawable new];
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		if (variant == 0)
+			[a presentDrawable:d];
+		else if (variant == 1)
+			[a presentDrawable:d atTime:12.5];
+		else
+			[a presentDrawable:d afterMinimumDuration:0.25];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		CHECK(sa != 0);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		id<MTLCommandBuffer> c = [f.queue commandBuffer];
+		auto start = std::chrono::steady_clock::now();
+		[b commit];
+		[c commit];
+		CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(500));
+		CHECK(b.status == MTLCommandBufferStatusCommitted && c.status == MTLCommandBufferStatusCommitted);
+		CHECK(postedWithin(f, 20) == 0);
+		schedule(sa, a);
+		CHECK(d.seen.count == 1);
+		CHECK(postedWithin(f, 20) == 0); // presented, not yet reported
+		[d reportPresentScheduled];
+		uint64_t sb = postedWithin(f, 1000), sc = postedWithin(f, 1000);
+		CHECK(sb == sa + 1 && sc == sb + 1);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+		complete(sc, c, RGFX_CB_OK);
+	}
+
+	// Reported before the presenting buffer is posted: nothing is held.
+	{
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtAdd;
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		uint64_t sa = postedWithin(f, 1000), sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		schedule(sa, a);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+	}
+
+	// Reported at the present: the later buffer goes once the presenting one is scheduled.
+	{
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtPresent;
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		CHECK(postedWithin(f, 20) == 0);
+		schedule(sa, a);
+		uint64_t sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		complete(sa, a, RGFX_CB_OK);
+		complete(sb, b, RGFX_CB_OK);
+	}
+
+	// The host fails the presenting buffer without scheduling it: its scheduled handlers run at its
+	// completion, before its error is known, so it presents, and the later buffer waits for the
+	// report.
+	{
+		TestDrawable *d = [TestDrawable new];
+		id<MTLCommandBuffer> a = [f.queue commandBuffer];
+		[a presentDrawable:d];
+		[a commit];
+		uint64_t sa = postedWithin(f, 1000);
+		id<MTLCommandBuffer> b = [f.queue commandBuffer];
+		[b commit];
+		CHECK(postedWithin(f, 20) == 0);
+		complete(sa, a, RGFX_CB_INTERNAL);
+		CHECK(a.status == MTLCommandBufferStatusError);
+		CHECK(d.seen.count == 1);
+		CHECK(postedWithin(f, 20) == 0);
+		[d reportPresentScheduled];
+		uint64_t sb = postedWithin(f, 1000);
+		CHECK(sa != 0 && sb == sa + 1);
+		complete(sb, b, RGFX_CB_OK);
+	}
+	kext->close();
+	CHECK(eventually([&] { return !thread.running(); }));
+	}
+}
+
+// The next command buffer message `f`'s queue posts, waiting up to `ms` for it (past the other
+// messages of its ring): its seqno and how many RGFX_OP_SUBMITTED ops it holds; 0 and -1 where
+// none comes.
+std::pair<uint64_t, int> postedAsks(QueueFixture &f, int ms)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	for (int i = 0; i <= ms;) {
+		if (!f.submit.next(&h, &bytes)) {
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			i++;
+		} else if (h.type == RGFX_CMD_COMMAND_BUFFER) {
+			return {h.seqno, submittedOps(bytes)};
+		}
+	}
+	return {0, -1};
+}
+
+// Once a buffer of a queue presents a drawable, that buffer and every buffer the queue commits
+// after it ask for their submission (RGFX_OP_SUBMITTED, once each) where the device answers it,
+// so the host schedules them at their take where they wait for nothing, as Metal schedules such a
+// buffer at its commit (PRESENT HOLD, RgfxCommandObjects.mm). A buffer the queue committed before
+// asks nothing, and no buffer of a queue whose device does not answer it asks. One that asks and
+// gets no CB_SUBMITTED is submitted at its CB_SCHEDULED, which runs its present.
+void test_a_queue_that_presents_asks_for_its_buffers_submission()
+{
+	@autoreleasepool {
+	for (int answers = 0; answers < 2; answers++) {
+		QueueFixture f;
+		f.queue.asksSubmitted = answers == 1;
+		FakeKext *kext = new FakeKext();
+		RgfxCompletionThread thread(&FakeKext::wait, kext);
+		CHECK(thread.start());
+		thread.add([f.queue sharedReplyReader]);
+		auto finish = [&](uint64_t seqno, id<MTLCommandBuffer> cb) {
+			uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+			RgfxCbScheduled scheduled = cbScheduled(seqno, cbObjId);
+			hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+			[cb waitUntilScheduled];
+			CHECK(cb.status == MTLCommandBufferStatusScheduled);
+			RgfxCbComplete done = cbComplete(seqno, cbObjId);
+			hostPost(f.completion, *kext, &done, sizeof(done));
+			[cb waitUntilCompleted];
+			CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		};
+
+		id<MTLCommandBuffer> before = [f.queue commandBuffer];
+		[before commit];
+		std::pair<uint64_t, int> first = postedAsks(f, 1000);
+		CHECK(first.first != 0 && first.second == 0);
+		finish(first.first, before);
+
+		TestDrawable *d = [TestDrawable new];
+		d.reports = TestDrawableReportsAtAdd; // reported before the post: holds nothing
+		id<MTLCommandBuffer> presenting = [f.queue commandBuffer];
+		[presenting presentDrawable:d];
+		[presenting commit];
+		std::pair<uint64_t, int> posted = postedAsks(f, 1000);
+		CHECK(posted.first > first.first && posted.second == answers);
+		finish(posted.first, presenting);
+		CHECK(d.seen.count == 1);
+
+		for (int i = 0; i < 2; i++) {
+			id<MTLCommandBuffer> later = [f.queue commandBuffer];
+			[later commit];
+			std::pair<uint64_t, int> next = postedAsks(f, 1000);
+			CHECK(next.first > posted.first && next.second == answers);
+			finish(next.first, later);
+			posted = next;
+		}
+		kext->close();
+		CHECK(eventually([&] { return !thread.running(); }));
+	}
+	}
+}
+
 // The host's side of a commitAndWaitUntilSubmitted: takes the buffer's message off `ring`,
 // counts its RGFX_OP_SUBMITTED ops into `asked`, and after 30 ms posts `type`'s record for it
 // (CB_SUBMITTED or CB_SCHEDULED) on `completion`. `seqno` gets the buffer's seqno.
@@ -7827,16 +12347,96 @@ void test_submitted_before_scheduled()
 	}
 }
 
+// A queue whose device answers RGFX_CMD_SCHEDULED_ASK: a thread's waitUntilScheduled of a
+// committed buffer posts one ask on the queue's ring after the buffer's message, naming its id and
+// seqno, and returns at the CB_SCHEDULED the host posts for it, the buffer Scheduled. A second wait,
+// and a wait of a buffer already scheduled, ask nothing more; nor does a wait of a buffer
+// committed by commitAndWaitUntilSubmitted, whose records the host posts at its take where it
+// may. A queue whose device does not answer the ask asks nothing.
+void test_waiting_asks_for_its_scheduling()
+{
+	for (bool answers : {true, false}) {
+		@autoreleasepool {
+		QueueFixture f;
+		f.queue.asksScheduled = answers;
+		f.queue.asksSubmitted = YES;
+		FakeKext *kext = new FakeKext();
+		RgfxCompletionThread thread(&FakeKext::wait, kext);
+		CHECK(thread.start());
+		thread.add([f.queue sharedReplyReader]);
+
+		id<MTLCommandBuffer> cb = [f.queue commandBuffer];
+		const uint64_t cbObjId = ((RgfxResource *)cb).rgfxObjId;
+		[cb commit];
+		const uint64_t seqno = f.nextSeqno();
+		// The host's side: the ask, then the record; or, with no ask, the record after 30 ms.
+		std::atomic<int> asks{0};
+		std::thread host([&] {
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			for (int i = 0; i < (answers ? 5000 : 30) && !f.submit.next(&h, &bytes); i++)
+				std::this_thread::sleep_for(std::chrono::milliseconds(1));
+			if (h.type == RGFX_CMD_SCHEDULED_ASK) {
+				asks.fetch_add(1);
+				RgfxScheduledAsk ask = {};
+				CHECK(bytes.size() == sizeof(ask));
+				memcpy(&ask, bytes.data(), sizeof(ask));
+				CHECK(ask.cb_obj_id == cbObjId && ask.cb_seqno == seqno);
+				CHECK(h.seqno > seqno);
+			}
+			RgfxCbScheduled scheduled = cbScheduled(seqno, cbObjId);
+			hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		});
+		[cb waitUntilScheduled];
+		host.join();
+		CHECK(cb.status == MTLCommandBufferStatusScheduled);
+		CHECK(asks.load() == (answers ? 1 : 0));
+		[cb waitUntilScheduled];
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(!f.submit.next(&h, &bytes));
+		RgfxCbComplete done = cbComplete(seqno, cbObjId);
+		hostPost(f.completion, *kext, &done, sizeof(done));
+		[cb waitUntilCompleted];
+		[cb waitUntilScheduled];
+		CHECK(!f.submit.next(&h, &bytes));
+
+		// One committed by commitAndWaitUntilSubmitted asks for its submission alone.
+		id<MTLCommandBuffer> asking = [f.queue commandBuffer];
+		const uint64_t askingId = ((RgfxResource *)asking).rgfxObjId;
+		std::atomic<uint64_t> taken{0};
+		std::atomic<int> asked{-1};
+		std::thread answer = hostAnswers(&f.submit, &f.completion, kext, askingId,
+		                                 RGFX_EVT_CB_SUBMITTED, &taken, &asked);
+		CHECK([(id<MTLCommandBufferSPI>)asking commitAndWaitUntilSubmitted]);
+		answer.join();
+		CHECK(asked.load() == 1);
+		RgfxCbScheduled scheduled = cbScheduled(taken.load(), askingId);
+		hostPost(f.completion, *kext, &scheduled, sizeof(scheduled));
+		[asking waitUntilScheduled];
+		CHECK(!f.submit.next(&h, &bytes));
+		RgfxCbComplete askingDone = cbComplete(taken.load(), askingId);
+		hostPost(f.completion, *kext, &askingDone, sizeof(askingDone));
+		[asking waitUntilCompleted];
+		kext->close();
+		CHECK(eventually([&] { return !thread.running(); }));
+		}
+	}
+}
+
 // A host that answers on the doorbell's thread: the doorbell write takes the buffer off the
 // submission ring and posts its CB_SUBMITTED before it returns, as the host's post does (the
 // record published, `armed` read and cleared), but the vector's wake of the completion thread
-// comes only `lateMs` later, from a thread of its own, as an interrupt still on its way.
+// comes only once the test lets it go (`letGo`), from a thread of its own, as an interrupt still
+// on its way; `woke` says it came. A wake not let go comes after 5 s, so a call that waits for it
+// still returns.
 struct DoorbellAnswer {
 	TestRing *submit = nullptr;
 	TestRing *completion = nullptr;
 	FakeKext *kext = nullptr;
 	uint64_t cbObjId = 0;
-	int lateMs = 0;
+	dispatch_semaphore_t letGo = dispatch_semaphore_create(0);
+	std::atomic<bool> woke{false};
 	std::atomic<uint64_t> seqno{0};
 	std::atomic<int> answered{0};
 	std::thread late;
@@ -7860,9 +12460,11 @@ struct DoorbellAnswer {
 		const bool raise = __atomic_exchange_n(armed, 0u, __ATOMIC_SEQ_CST) == 1;
 		d->answered.fetch_add(1);
 		FakeKext *kext = d->kext;
-		const int ms = d->lateMs;
-		d->late = std::thread([kext, ms, raise] {
-			std::this_thread::sleep_for(std::chrono::milliseconds(ms));
+		dispatch_semaphore_t letGo = d->letGo;
+		std::atomic<bool> *woke = &d->woke;
+		d->late = std::thread([kext, letGo, woke, raise] {
+			dispatch_semaphore_wait(letGo, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC));
+			woke->store(true);
 			if (raise)
 				kext->wake();
 		});
@@ -7871,10 +12473,10 @@ struct DoorbellAnswer {
 
 // A buffer the host answered on its doorbell's thread: commitAndWaitUntilSubmitted finds its
 // CB_SUBMITTED on the ring after its post and returns, the buffer submitted and still Committed,
-// without waiting for the completion thread's wake, which comes 400 ms later; the record is
-// still on the ring at the return. The completion thread then takes it, and the buffer's
-// scheduling and completion run as before. A buffer the doorbell does not answer waits for the
-// thread as before.
+// without waiting for the completion thread's wake, which comes only once the test lets it go
+// after the return; the record is still on the ring at the return. The completion thread then
+// takes it, and the buffer's scheduling and completion run as before. A buffer the doorbell does
+// not answer waits for the thread as before.
 void test_submitted_at_the_doorbell_wakes_no_thread()
 {
 	@autoreleasepool {
@@ -7884,7 +12486,6 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	FakeKext *kext = new FakeKext();
 	door->completion = &f.completion;
 	door->kext = kext;
-	door->lateMs = 400;
 	RgfxCompletionThread thread(&FakeKext::wait, kext);
 	CHECK(thread.start());
 	std::shared_ptr<RgfxReplyReader> reader = [f.queue sharedReplyReader];
@@ -7894,17 +12495,16 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	id<MTLCommandBuffer> cb = [f.queue commandBuffer];
 	door->cbObjId = ((RgfxResource *)cb).rgfxObjId;
 	door->submit = &f.submit;
-	auto start = std::chrono::steady_clock::now();
 	CHECK([(id<MTLCommandBufferSPI>)cb commitAndWaitUntilSubmitted]);
-	auto took = std::chrono::steady_clock::now() - start;
 	const uint64_t seqno = door->seqno.load();
 	CHECK(door->answered.load() == 1);
 	CHECK(seqno != 0);
-	CHECK(took < std::chrono::milliseconds(200));
+	CHECK(!door->woke.load()); // returned before the wake, which waits for the test
 	// Returned with the record still on the ring, untaken: the completion thread is asleep.
 	CHECK(reader->awaitingSubmitted(seqno));
 	CHECK(cb.status == MTLCommandBufferStatusCommitted);
 	// The late wake: the thread takes the record, which finds the buffer submitted.
+	dispatch_semaphore_signal(door->letGo);
 	door->late.join();
 	CHECK(eventually([&] { return !reader->awaitingSubmitted(seqno); }));
 	RgfxCbScheduled scheduled = cbScheduled(seqno, door->cbObjId);
@@ -7925,7 +12525,7 @@ void test_submitted_at_the_doorbell_wakes_no_thread()
 	std::atomic<int> asked{-1};
 	std::thread host = hostAnswers(&f.submit, &f.completion, kext, secondId, RGFX_EVT_CB_SUBMITTED,
 	                               &taken, &asked);
-	start = std::chrono::steady_clock::now();
+	const auto start = std::chrono::steady_clock::now();
 	CHECK([(id<MTLCommandBufferSPI>)second commitAndWaitUntilSubmitted]);
 	CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(25));
 	host.join();
@@ -8149,9 +12749,9 @@ void test_command_buffer_out_of_line()
 	CHECK(h.size == sizeof(RgfxCommandBufferInRegion));
 	RgfxCommandBufferInRegion ref = {};
 	std::memcpy(&ref, bytes.data(), sizeof(ref));
-	// Built in the block once it outgrew the ring, after the room a commit's surface uses take.
-	CHECK(blocks.allocated.size() == 1 && ref.region_offset > blocks.allocated[0] &&
-	      ref.region_offset + ref.byte_length <= blocks.allocated[0] + RgfxBodyPool::kGranule);
+	// Copied into the block at the commit, from its start.
+	CHECK(blocks.allocated.size() == 1 && ref.region_offset == blocks.allocated[0] &&
+	      ref.byte_length <= RgfxBodyPool::kGranule);
 	CHECK(ref.byte_length > 2048 && ref.byte_length % 8 == 0 && ref.region_offset % 8 == 0);
 
 	// The block holds the whole message: a COMMAND_BUFFER of that length, seqno 0, its ops.
@@ -8459,7 +13059,7 @@ void test_uncompleted_buffer_releases()
 
 } // namespace
 
-// The layout of a Managed texture's CPU copy, for the cases crates/reims-graphics/src/managed.rs
+// The layout of a Managed texture's CPU copy, for the cases crates/reims-vgpu-graphics/src/managed.rs
 // holds too: a 2D RGBA8 texture with three levels, a BC1 one whose sides are no multiple of its
 // blocks, a cube array, and a 3D one; and the blocks of a few formats.
 void test_managed_layout()
@@ -8685,6 +13285,80 @@ void test_buffer_texture_replace_region_tells_the_host()
 		    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
 		CHECK(range.obj_id == noCopy.rgfxObjId && range.location == first && range.length == span);
 		CHECK(ringEmpty(fx.ring));
+	}
+	drainRing(fx.ring);
+}
+
+// replaceRegion: of a texture over a Managed buffer whose rows run past the buffer's length tells
+// the host the span of its rows up to the length (BUFFER_DID_MODIFY_RANGE), so the bytes inside the
+// length reach the GPU's copy, where a range past the buffer the host refuses whole: a texture
+// buffer of 4 RGBA32Float texels from 32 bytes short of the length, and a 2D texture whose rows
+// written cross it. Its texels past the length lie in the host's tail of the texture, which no
+// range of the buffer names: one wholly past the length tells nothing.
+void test_buffer_texture_replace_region_past_the_length_tells_the_length()
+{
+	Fixture fx;
+	std::vector<uint8_t> mem(0x800000, 0); // past the region's reserved head
+	RgfxRegion region(mem.data(), mem.size());
+	const NSUInteger length = 0x1000;
+	@autoreleasepool {
+		// The block runs on past the buffer; the rows' bytes past the length are the device's
+		// tail's, which its blit reaches (test_buffer_texture_copies_past_the_length_reach_the_tail;
+		// no device here), not the block's.
+		RgfxRegion::Block block = region.allocate(2 * length);
+		CHECK(block.ok);
+		uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+		std::memset(bytes, 0, 2 * length);
+		RgfxBuffer *managed = [RgfxBuffer bufferOverHostMemoryWithContents:bytes
+		                                                      regionOffset:block.offset
+		                                                            length:length
+		                                                           options:MTLResourceStorageModeManaged
+		                                                       deallocator:nil
+		                                                            device:nil
+		                                                        serializer:&fx.ser];
+		CHECK(managed != nil);
+		drainRing(fx.ring);
+		uint8_t in[64];
+		for (size_t i = 0; i < sizeof in; i++)
+			in[i] = static_cast<uint8_t>(0xa0 + i);
+		auto told = [&](uint64_t location, uint64_t span) {
+			auto range =
+			    expectMessage<RgfxBufferDidModifyRange>(fx.ring, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+			CHECK(range.obj_id == managed.rgfxObjId && range.location == location &&
+			      range.length == span);
+			CHECK(ringEmpty(fx.ring));
+		};
+		MTLTextureDescriptor *texels =
+		    [MTLTextureDescriptor textureBufferDescriptorWithPixelFormat:MTLPixelFormatRGBA32Float
+		                                                           width:4
+		                                                 resourceOptions:MTLResourceStorageModeManaged
+		                                                           usage:MTLTextureUsageShaderRead];
+		id<MTLTexture> across = [managed newTextureWithDescriptor:texels offset:length - 32 bytesPerRow:64];
+		CHECK(across != nil);
+		drainRing(fx.ring);
+		[across replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(std::memcmp(bytes + length - 32, in, 32) == 0);
+		told(length - 32, 32);
+		id<MTLTexture> past = [managed newTextureWithDescriptor:texels offset:length bytesPerRow:64];
+		CHECK(past != nil);
+		drainRing(fx.ring);
+		[past replaceRegion:MTLRegionMake1D(0, 4) mipmapLevel:0 withBytes:in bytesPerRow:64];
+		CHECK(ringEmpty(fx.ring));
+		// A 2D texture of 8 x 4 BGRA8Unorm, rows 0x100 apart from 0x200 short of the length: its
+		// rows 1 and 2, texels 2 to 4, from 0xf08 to 0x1014, told to the length.
+		MTLTextureDescriptor *rows =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:4
+		                                                   mipmapped:NO];
+		rows.storageMode = MTLStorageModeManaged;
+		rows.usage = MTLTextureUsageShaderRead;
+		id<MTLTexture> plane = [managed newTextureWithDescriptor:rows offset:length - 0x200 bytesPerRow:0x100];
+		CHECK(plane != nil);
+		drainRing(fx.ring);
+		[plane replaceRegion:MTLRegionMake2D(2, 1, 3, 2) mipmapLevel:0 withBytes:in bytesPerRow:12];
+		CHECK(std::memcmp(bytes + length - 0x100 + 8, in, 12) == 0);
+		told(length - 0x100 + 8, 0x100 - 8);
 	}
 	drainRing(fx.ring);
 }
@@ -9323,7 +13997,7 @@ void drainRing(TestRing &ring)
 // 0x100, 1920-byte rows) writes through it. The deallocator gets the pointer and length once the
 // host has dropped the buffer. Metal's refusals are nil: a length of 0, Private storage, a range
 // not wholly mapped. A null pointer is contents of the buffer's own; bytes in the region are
-// used in place.
+// used in place. The buffer stays NonVolatile whatever purgeable state it is told, as Metal's.
 void test_no_copy_buffers()
 {
 	@autoreleasepool {
@@ -9367,6 +14041,12 @@ void test_no_copy_buffers()
 		                                       serializer:&f.ser];
 		CHECK(b != nil && [b contents] == p && b.length == 0x14000 && [b rgfxShadow] != nullptr);
 		CHECK(b.allocatedSize == 0x14000); // the pages its bytes meet, as the x86 Macs answer
+		// It stays NonVolatile whatever it is told, as Metal's (oracle_bundle purgeable.kinds).
+		CHECK([b setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
+		CHECK([b setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+		CHECK(!b.rgfxIsPurgeable);
 		// Its GPU copy is a range of a slab: a heap over a block, the buffer placed in it.
 		auto heap =
 		    expectMessage<RgfxHeapOverHostMemory>(f.control, RGFX_CMD_HEAP_OVER_HOST_MEMORY);
@@ -9523,11 +14203,17 @@ void test_no_copy_buffers()
 // (RgfxBuffer.h): the buffer lies over the app's own pages, no block or shadow of its own, its
 // create a BUFFER_OVER_PAGES over the block the kext gave for exactly the app's bytes, at the
 // pointer's offset in its page, which its GPU address keeps. Its block goes back once the host
-// has dropped it, before the deallocator. Writable Managed memory lies there too, one copy: the
-// host's buffer a Shared one, the buffer still Managed, its didModifyRange: and a blit's
-// synchronize of it, or of a texture over it, sending nothing, where a Managed buffer's shadow
-// sends both. Read-only memory, a null pointer and bytes in the region never ask for a block, and
-// a block not given, or one the region does not hold, falls back to the shadow.
+// has dropped it, before the deallocator. Writable Managed memory lies there too, where the device
+// makes a Managed buffer over a Shared one (MANAGED_BUFFER_SLABS): its CPU copy the BUFFER_OVER_PAGES
+// buffer, Shared, and the buffer a MANAGED_BUFFER_CREATE over it at an address of its own that
+// keeps the pointer's offset in its page. Its didModifyRange:, a texture's write over it, and a
+// blit's synchronize of it or of a texture over it go to the host, as a Managed buffer's shadow's
+// do; at its release the buffer's destroy goes first, then its CPU copy's, then the block. Where
+// the device makes none, Managed memory takes the shadow. Shared memory the process maps
+// read-only asks for a read-only block and lies over it, made with Metal's private bit 24, sent to
+// the host alone; read-only Managed memory, a null pointer and bytes in the region never ask for
+// a block, and a block not given (for read-only memory, by a kext without READ_ONLY_PAGES), or
+// one the region does not hold, falls back to the shadow.
 void test_no_copy_buffers_in_place()
 {
 	@autoreleasepool {
@@ -9537,8 +14223,10 @@ void test_no_copy_buffers_in_place()
 	RgfxRegion region(mem.data(), mem.size());
 	BlockLog blocks;
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
-	RgfxRegionSlabSource slabSource(region, f.ser);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
 	RgfxSlabs slabs(slabSource);
+	RgfxRegionSlabSource plainSource(region, f.ser);
+	RgfxSlabs plainSlabs(plainSource);
 	struct Pages {
 		std::vector<std::tuple<const void *, uint64_t, bool>> asked;
 		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x100000;
@@ -9607,7 +14295,7 @@ void test_no_copy_buffers_in_place()
 		                              serializer:&f.ser];
 	};
 	@autoreleasepool {
-		// Managed, writable: in place, one copy.
+		// Managed, writable: in place, a Managed buffer over a Shared one over the pages.
 		pages.asked.clear();
 		const MTLResourceOptions managedOptions =
 		    MTLResourceStorageModeManaged | MTLResourceCPUCacheModeWriteCombined;
@@ -9618,9 +14306,18 @@ void test_no_copy_buffers_in_place()
 		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == p &&
 		      std::get<2>(pages.asked[0]));
 		auto over = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
-		CHECK(over.obj_id == managed.rgfxObjId && over.length == 0x2000 && over.offset == 0x123);
+		CHECK(over.obj_id != managed.rgfxObjId && over.length == 0x2000 && over.offset == 0x123);
+		CHECK(over.block_offset == pages.offset && over.block_size == pages.size);
 		CHECK((over.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared &&
 		      (over.options & MTLResourceCPUCacheModeMask) == MTLResourceCPUCacheModeWriteCombined);
+		auto made =
+		    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+		CHECK(made.obj_id == managed.rgfxObjId && made.cpu_buffer_obj_id == over.obj_id &&
+		      made.length == 0x2000);
+		CHECK((made.options & MTLResourceStorageModeMask) == MTLResourceStorageModeManaged &&
+		      (made.options & MTLResourceCPUCacheModeMask) == MTLResourceCPUCacheModeWriteCombined);
+		CHECK(made.gpu_address == managed.gpuAddress && managed.gpuAddress % 0x1000 == 0x123 &&
+		      managed.gpuAddress != over.gpu_address);
 		MTLTextureDescriptor *td =
 		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
 		                                                       width:16
@@ -9632,13 +14329,20 @@ void test_no_copy_buffers_in_place()
 		CHECK(overManaged != nil && overManaged.storageMode == MTLStorageModeManaged);
 		drainRing(f.control);
 		[managed didModifyRange:NSMakeRange(0, 0x100)];
+		auto modified =
+		    expectMessage<RgfxBufferDidModifyRange>(f.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(modified.obj_id == managed.rgfxObjId && modified.location == 0 &&
+		      modified.length == 0x100);
 		uint32_t px[4] = {1, 2, 3, 4};
 		[overManaged replaceRegion:MTLRegionMake2D(0, 1, 4, 1) mipmapLevel:0 withBytes:px
 		               bytesPerRow:16];
 		CHECK(std::memcmp(p + 256, px, sizeof px) == 0);
+		auto row =
+		    expectMessage<RgfxBufferDidModifyRange>(f.control, RGFX_CMD_BUFFER_DID_MODIFY_RANGE);
+		CHECK(row.obj_id == managed.rgfxObjId && row.location == 256 && row.length == 16);
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> sent;
-		CHECK(!f.control.next(&h, &sent)); // no BUFFER_DID_MODIFY_RANGE: one copy
+		CHECK(!f.control.next(&h, &sent));
 		// Read-only Managed memory keeps its shadow, a Managed buffer of two copies, whose
 		// didModifyRange: and synchronize the host carries.
 		uint8_t *roManaged = reinterpret_cast<uint8_t *>(app) + 0x38000;
@@ -9663,7 +14367,7 @@ void test_no_copy_buffers_in_place()
 		RgfxCommandBuffer cbh = {};
 		std::memcpy(&cbh, sent.data(), sizeof(cbh));
 		OpWalk walk(sent.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cbh.op_bytes);
-		std::vector<uint64_t> synced;
+		std::vector<uint64_t> synced, slices;
 		while (!walk.done()) {
 			uint16_t tag = 0;
 			uint32_t len = 0;
@@ -9674,10 +14378,16 @@ void test_no_copy_buffers_in_place()
 				RgfxBlitOpSynchronizeResource m = {};
 				std::memcpy(&m, body, std::min(bodyLength, sizeof m));
 				synced.push_back(m.resource_obj_id);
+			} else if (tag == RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE) {
+				RgfxBlitOpSynchronizeTexture m = {};
+				std::memcpy(&m, body, std::min(bodyLength, sizeof m));
+				slices.push_back(m.texture_obj_id);
 			}
-			CHECK(tag != RGFX_OP_BLIT_SYNCHRONIZE_TEXTURE);
 		}
-		CHECK(synced.size() == 1 && synced[0] == twoCopies.rgfxObjId);
+		const uint64_t overManagedId = ((RgfxResource *)overManaged).rgfxObjId;
+		CHECK(synced.size() == 3 && synced[0] == managed.rgfxObjId &&
+		      synced[1] == overManagedId && synced[2] == twoCopies.rgfxObjId);
+		CHECK(slices.size() == 1 && slices[0] == overManagedId);
 		RgfxCbComplete done = cbComplete(h.seqno, ((RgfxResource *)cb).rgfxObjId);
 		CHECK(f.completion.postFromHost(&done, sizeof(done)));
 		[cb waitUntilCompleted];
@@ -9685,22 +14395,94 @@ void test_no_copy_buffers_in_place()
 		drainRing(f.control);
 	}
 	drainRing(f.control);
+	{
+		// The Managed buffer's destroy first, then its CPU copy's, then the block, then the
+		// deallocator.
+		pages.asked.clear();
+		std::atomic<int> goneState{0};
+		std::atomic<int> *gone = &goneState;
+		const size_t released = blocks.released.size();
+		uint64_t buffer = 0, copy = 0;
+		@autoreleasepool {
+			RgfxBuffer *m = [RgfxBuffer bufferWithBytesNoCopy:p
+			                                           length:0x1000
+			                                          options:MTLResourceStorageModeManaged
+			                                      deallocator:^(void *, NSUInteger) {
+				                                      gone->fetch_add(1);
+			                                      }
+			                                           region:&region
+			                                            slabs:&slabs
+			                                           device:nil
+			                                       serializer:&f.ser];
+			CHECK(m != nil && pages.asked.size() == 1);
+			copy = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES).obj_id;
+			auto mm =
+			    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+			CHECK(mm.obj_id == m.rgfxObjId && mm.cpu_buffer_obj_id == copy);
+			buffer = m.rgfxObjId;
+		}
+		CHECK(eventually([&] { return goneState.load() == 1; }));
+		CHECK(blocks.released.size() == released + 1 && blocks.released.back() == pages.offset);
+		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == buffer);
+		CHECK(expectMessage<RgfxObjectDestroy>(f.control, RGFX_CMD_OBJECT_DESTROY).obj_id == copy);
+		drainRing(f.control);
+		// Where the device makes no Managed buffer over a Shared one: the shadow, no block asked.
+		@autoreleasepool {
+			RgfxBuffer *shadowed = [RgfxBuffer bufferWithBytesNoCopy:p
+			                                                  length:0x1000
+			                                                 options:MTLResourceStorageModeManaged
+			                                             deallocator:nil
+			                                                  region:&region
+			                                                   slabs:&plainSlabs
+			                                                  device:nil
+			                                              serializer:&f.ser];
+			CHECK(shadowed != nil && [shadowed rgfxShadow] != nullptr && pages.asked.size() == 1);
+			drainRing(f.control);
+		}
+		drainRing(f.control);
+	}
 	@autoreleasepool {
-		// Never asked: a null pointer, bytes in the region, read-only memory.
+		// Never asked: a null pointer, bytes in the region.
 		pages.asked.clear();
 		RgfxBuffer *own = noCopy(nullptr, 0x1000, shared);
 		CHECK(own != nil && [own rgfxShadow] == nullptr);
 		RgfxRegion::Block inRegion = region.allocate(0x1000);
 		RgfxBuffer *placed = noCopy(const_cast<uint8_t *>(inRegion.ptr), 0x1000, shared);
 		CHECK(placed != nil && [placed rgfxShadow] == nullptr);
+		CHECK(pages.asked.empty());
+		drainRing(f.control);
+
+		// Read-only Shared memory: a read-only block of exactly its bytes, and a BUFFER_OVER_PAGES
+		// over it at the pointer's offset in its page, made with bit 24, which the host takes as
+		// memory whose GPU writes it drops; the buffer answers the app's options, without the bit,
+		// as Metal's does, and the rest as a writable one's.
 		uint8_t *ro = reinterpret_cast<uint8_t *>(app) + 0x30000;
 		CHECK(vm_protect(mach_task_self(), reinterpret_cast<vm_address_t>(ro), 0x4000, false,
 		                 VM_PROT_READ) == KERN_SUCCESS);
-		RgfxBuffer *readOnly = noCopy(ro, 0x4000, shared);
-		CHECK(readOnly != nil && [readOnly rgfxShadow] != nullptr);
-		CHECK(pages.asked.empty());
+		const MTLResourceOptions roOptions = shared | MTLResourceCPUCacheModeWriteCombined;
+		RgfxBuffer *readOnly = noCopy(ro + 0x40, 0x2000, roOptions);
+		CHECK(readOnly != nil && [readOnly rgfxShadow] == nullptr && [readOnly contents] == ro + 0x40);
+		CHECK(pages.asked.size() == 1 && std::get<0>(pages.asked[0]) == ro + 0x40 &&
+		      std::get<1>(pages.asked[0]) == 0x2000 && !std::get<2>(pages.asked[0]));
+		auto over = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(over.obj_id == readOnly.rgfxObjId && over.length == 0x2000 && over.offset == 0x40);
+		CHECK(over.block_offset == pages.offset && over.gpu_address == readOnly.gpuAddress);
+		CHECK(over.options == (roOptions | (1u << 24)));
+		CHECK(readOnly.storageMode == MTLStorageModeShared &&
+		      readOnly.cpuCacheMode == MTLCPUCacheModeWriteCombined &&
+		      ([(id<RgfxMetalResourceInternals>)readOnly unfilteredResourceOptions] & (1u << 24)) == 0);
+		CHECK(readOnly.gpuAddress % 0x1000 == 0x40 && readOnly.allocatedSize == 0x3000);
+		// Read-only Managed memory keeps its shadow (above), and where the kext gives no
+		// read-only block, as on a host without READ_ONLY_PAGES, Shared memory takes one too.
+		pages.gives = false;
+		RgfxBuffer *copied = noCopy(ro + 0x3000, 0x1000, shared);
+		CHECK(copied != nil && [copied rgfxShadow] != nullptr && ![copied rgfxShadow]->writable());
+		CHECK(pages.asked.size() == 2 && !std::get<2>(pages.asked[1]));
+		pages.gives = true;
+		drainRing(f.control);
 
 		// Asked, and no block given, or one the region does not hold: a shadow.
+		pages.asked.clear();
 		pages.gives = false;
 		RgfxBuffer *refused = noCopy(p, 0x1000, shared);
 		CHECK(refused != nil && [refused rgfxShadow] != nullptr && pages.asked.size() == 1);
@@ -9718,10 +14500,277 @@ void test_no_copy_buffers_in_place()
 	CHECK(!RgfxMemoryShadow::anyLive());
 }
 
+// Two no-copy buffers over the same writable bytes of the app's (Apple's OpenCL makes a Shared one
+// over its staging pages at each write; here a Shared and a Managed one) lie over one pages
+// block (RgfxRegion::acquirePages): the kext asked once, and two BUFFER_OVER_PAGES naming that
+// block, each with an object and a GPU address of its own (the Managed one's the CPU copy a
+// MANAGED_BUFFER_CREATE lies over), so the host makes one view of the pages and one copy of them
+// where it copies them. The block goes back once the host has dropped
+// both, not at the first. One of bit 24, or over other bytes, takes a block of its own, and once
+// both have gone for the app the same bytes take a new block.
+void test_no_copy_buffers_over_the_same_bytes_share_a_block()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
+	struct Pages {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			p->next += 0x10000;
+			return true;
+		}
+	} pages;
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	// Written, so its pages are there, as the kext's wire of a block faults them in.
+	std::memset(p, 0x5a, 0x10000);
+	auto noCopy = [&](void *ptr, NSUInteger length, MTLResourceOptions options) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:options
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t joined = pages.next;
+	auto heldJoined = [&] {
+		return std::find(blocks.released.begin(), blocks.released.end(), joined) ==
+		       blocks.released.end();
+	};
+	@autoreleasepool {
+		RgfxBuffer *shared = noCopy(p, 0x4000, 0x100000 | MTLResourceStorageModeShared);
+		CHECK(shared != nil && [shared contents] == p && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		@autoreleasepool {
+			RgfxBuffer *managed = noCopy(p, 0x4000, 0x100000 | MTLResourceStorageModeManaged);
+			CHECK(managed != nil && [managed contents] == p && pages.asked == 1);
+			auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			auto over =
+			    expectMessage<RgfxManagedBufferCreate>(f.control, RGFX_CMD_MANAGED_BUFFER_CREATE);
+			CHECK(one.block_offset == joined && two.block_offset == joined);
+			CHECK(one.block_size == 0x5000 && two.block_size == 0x5000);
+			CHECK(one.obj_id == shared.rgfxObjId && over.obj_id == managed.rgfxObjId &&
+			      over.cpu_buffer_obj_id == two.obj_id);
+			CHECK(one.obj_id != two.obj_id && shared.gpuAddress != managed.gpuAddress);
+			CHECK((two.options & MTLResourceStorageModeMask) == MTLResourceStorageModeShared);
+			// Bit 24, and fewer bytes: blocks of their own.
+			RgfxBuffer *bit24 = noCopy(p, 0x4000, MTLResourceStorageModeShared | (1u << 24));
+			auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			RgfxBuffer *fewer = noCopy(p, 0x2000, MTLResourceStorageModeShared);
+			auto four = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			CHECK(bit24 != nil && fewer != nil && pages.asked == 3);
+			CHECK(three.block_offset != joined && four.block_offset != joined &&
+			      three.block_offset != four.block_offset);
+		}
+		// The Managed one, the bit 24 one and the shorter one gone: theirs back, the joined
+		// block still under the Shared one.
+		CHECK(eventually([&] { return blocks.released.size() == 2; }));
+		CHECK(heldJoined());
+		drainRing(f.control);
+		// Joinable still while the Shared one lives.
+		@autoreleasepool {
+			RgfxBuffer *again = noCopy(p, 0x4000, MTLResourceStorageModeShared);
+			CHECK(again != nil && pages.asked == 3);
+			auto five = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+			CHECK(five.block_offset == joined);
+		}
+		drainRing(f.control);
+		CHECK(heldJoined());
+	}
+	CHECK(eventually([&] { return !heldJoined(); }));
+	CHECK(blocks.released.size() == 3);
+	drainRing(f.control);
+	// Both gone for the app: the same bytes take a new block.
+	@autoreleasepool {
+		RgfxBuffer *later = noCopy(p, 0x4000, MTLResourceStorageModeShared);
+		CHECK(later != nil && pages.asked == 4);
+		auto six = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(six.block_offset != joined);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 4; }));
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
+
+// The references the VM object under `address` has, mapping and memory entries alike
+// (vm_region_recurse_64's ref_count), or 0 where nothing is mapped there.
+static unsigned objectReferences(const void *address)
+{
+	const vm_address_t at = reinterpret_cast<vm_address_t>(address);
+	natural_t depth = 0;
+	for (;;) {
+		vm_address_t base = at;
+		vm_size_t size = 0;
+		vm_region_submap_info_data_64_t info = {};
+		mach_msg_type_number_t count = VM_REGION_SUBMAP_INFO_COUNT_64;
+		if (vm_region_recurse_64(mach_task_self(), &base, &size, &depth,
+		                         reinterpret_cast<vm_region_recurse_info_t>(&info),
+		                         &count) != KERN_SUCCESS ||
+		    base > at)
+			return 0;
+		if (!info.is_submap)
+			return info.ref_count;
+		depth++;
+	}
+}
+
+// A no-copy buffer over other memory the app mapped at the address and length a live one's lies
+// over takes a pages block of its own (RgfxRegion::acquirePages): WindowServer maps one layer's
+// image where another's was while a buffer over the other still lives, and a buffer joined to the
+// other's block would have the GPU read the other's pages, its old contents, where the app wrote
+// the new (System Settings' labels showed the pane before's strings). The kext is asked again,
+// BUFFER_OVER_PAGES names the new block, a third buffer over the new memory joins it, and each
+// block goes back once the host has dropped the buffers over it.
+void test_no_copy_buffer_over_remapped_memory_takes_its_own_block()
+{
+	@autoreleasepool {
+	QueueFixture f;
+	(void)expectQueueCreate(f.control);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x200000, 0xff);
+	RgfxRegion region(mem.data(), mem.size());
+	// The kext's pages blocks, each holding the memory under its bytes from its making to its
+	// release, as the kext's wiring does in the guest: its prepared IOMemoryDescriptor's UPL
+	// keeps the memory's VM object from being freed while the block lives
+	// (vm_object_iopl_request begins an activity on the object, and the object's termination
+	// waits for it to end). A memory entry of the bytes holds the object here. Freed, the
+	// object's id (object_id_full) can come back as a new object's, and the region would tell
+	// new memory at the same bytes for the old: the check below that the kext is asked again
+	// failed in one of two runs of the same tree on the M3 Max, 2026-11-12, with a fake that
+	// held nothing.
+	struct Pages {
+		BlockLog blocks;
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x100000;
+		std::mutex lock;
+		std::map<uint64_t, mach_port_t> held; // each live pages block's memory entry
+		static bool block(void *c, const void *address, uint64_t length, bool writable,
+		                  uint64_t *offset, uint64_t *size)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			const vm_address_t at = reinterpret_cast<vm_address_t>(address);
+			const vm_address_t base = trunc_page(at);
+			memory_object_size_t bytes = round_page(at + length) - base;
+			mach_port_t entry = MACH_PORT_NULL;
+			if (mach_make_memory_entry_64(mach_task_self(), &bytes, base,
+			                              writable ? VM_PROT_READ | VM_PROT_WRITE
+			                                       : VM_PROT_READ,
+			                              &entry, MACH_PORT_NULL) != KERN_SUCCESS)
+				return false;
+			std::lock_guard<std::mutex> guard(p->lock);
+			p->asked++;
+			*offset = p->next;
+			*size = 0x5000;
+			p->next += 0x10000;
+			p->held[*offset] = entry;
+			return true;
+		}
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return BlockLog::alloc(&static_cast<Pages *>(c)->blocks, size, align, offset);
+		}
+		// A block back: its memory let go of, as the kext unwires it.
+		static void release(void *c, uint64_t offset)
+		{
+			Pages *p = static_cast<Pages *>(c);
+			std::lock_guard<std::mutex> guard(p->lock);
+			auto it = p->held.find(offset);
+			if (it != p->held.end()) {
+				mach_port_deallocate(mach_task_self(), it->second);
+				p->held.erase(it);
+			}
+			BlockLog::release(&p->blocks, offset);
+		}
+		size_t holding()
+		{
+			std::lock_guard<std::mutex> guard(lock);
+			return held.size();
+		}
+	} pages;
+	BlockLog &blocks = pages.blocks;
+	region.setBlockSource(&Pages::alloc, &Pages::release, &pages);
+	RgfxRegionSlabSource slabSource(region, f.ser, false, true);
+	RgfxSlabs slabs(slabSource);
+	region.setPagesBlockSource(&Pages::block, &pages);
+	vm_address_t app = 0;
+	CHECK(vm_allocate(mach_task_self(), &app, 0x10000, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *p = reinterpret_cast<uint8_t *>(app);
+	std::memset(p, 0x11, 0x10000);
+	auto noCopy = [&](void *ptr, NSUInteger length) {
+		return [RgfxBuffer bufferWithBytesNoCopy:ptr
+		                                  length:length
+		                                 options:MTLResourceStorageModeShared
+		                             deallocator:nil
+		                                  region:&region
+		                                   slabs:&slabs
+		                                  device:nil
+		                              serializer:&f.ser];
+	};
+	const uint64_t first = pages.next;
+	@autoreleasepool {
+		RgfxBuffer *old = noCopy(p, 0x4000);
+		CHECK(old != nil && pages.asked == 1);
+		auto one = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(one.block_offset == first);
+		// The old memory's VM object has a reference past the app's mapping, its block's, so
+		// the overwrite below leaves it alive, and no new object can take its id: with a fake
+		// that holds nothing it has the mapping's alone, in every run, and the overwrite frees
+		// it.
+		std::vector<uint64_t> oldIdentity;
+		CHECK(rgfxPagesIdentity(p, 0x4000, &oldIdentity));
+		CHECK(objectReferences(p) >= 2);
+		CHECK(pages.holding() == 1);
+		// Other memory at the same address, with other contents, while the buffer lives.
+		vm_address_t again = app;
+		CHECK(vm_allocate(mach_task_self(), &again, 0x10000,
+		                  VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) == KERN_SUCCESS);
+		CHECK(again == app);
+		std::memset(p, 0x22, 0x10000);
+		std::vector<uint64_t> newIdentity;
+		CHECK(rgfxPagesIdentity(p, 0x4000, &newIdentity) && newIdentity[0] != oldIdentity[0]);
+		RgfxBuffer *fresh = noCopy(p, 0x4000);
+		CHECK(fresh != nil && [fresh contents] == p && pages.asked == 2);
+		auto two = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(two.block_offset != first && two.obj_id == fresh.rgfxObjId);
+		CHECK(region.pagesRejoinsRefused() == 1);
+		RgfxBuffer *third = noCopy(p, 0x4000);
+		CHECK(third != nil && pages.asked == 2);
+		auto three = expectMessage<RgfxBufferOverPages>(f.control, RGFX_CMD_BUFFER_OVER_PAGES);
+		CHECK(three.block_offset == two.block_offset && region.pagesRejoinsRefused() == 1);
+	}
+	CHECK(eventually([&] { return blocks.released.size() == 2; }));
+	CHECK(std::find(blocks.released.begin(), blocks.released.end(), first) !=
+	      blocks.released.end());
+	CHECK(pages.holding() == 0);
+	drainRing(f.control);
+	vm_deallocate(mach_task_self(), app, 0x10000);
+	}
+	CHECK(!RgfxMemoryShadow::anyLive());
+}
+
 
 // A no-copy buffer's GPU copy (its shadow) is a range of a slab of its options, as a device
-// buffer's is (RgfxBuffer.h): with the process's superpages as the slabs' first source, the
-// copies of read-only memory, Shared and Managed, lie in them, seeded from the memory, eight 4 KiB
+// buffer's is (RgfxBuffer.h): with the process's own pages as the slabs' first source, the
+// copies of read-only memory, Shared and Managed, where the kext makes no block of it (a host
+// without READ_ONLY_PAGES), lie in them, seeded from the memory, eight 4 KiB
 // copies a page apart in one heap over one pages block, and the region gives none of them a block
 // of its own (each took one before: the region held every app-sized copy).
 void test_no_copy_shadows_lie_in_slabs()
@@ -9733,13 +14782,13 @@ void test_no_copy_shadows_lie_in_slabs()
 	RgfxRegion region(mem.data(), mem.size());
 	BlockLog blocks;
 	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
-	// The kernel's superpages, zeroed, and the kext's pages blocks of them, each a block of the
-	// region's a page long.
+	// The kernel's plain pages, zero-filled, and the kext's pages blocks of them, each a block of
+	// the region's a page long.
 	struct Vm {
 		std::map<uint8_t *, std::unique_ptr<uint8_t[]>> held;
 		std::vector<const void *> wired;
 		BlockLog *blocks = nullptr;
-		static int superpages(void *c, uint64_t size, uint8_t **bytes)
+		static int pages(void *c, uint64_t size, uint8_t **bytes)
 		{
 			std::unique_ptr<uint8_t[]> memory(new uint8_t[size]());
 			*bytes = memory.get();
@@ -9747,9 +14796,12 @@ void test_no_copy_shadows_lie_in_slabs()
 			return KERN_SUCCESS;
 		}
 		static void unmap(void *c, uint8_t *bytes, uint64_t) { static_cast<Vm *>(c)->held.erase(bytes); }
-		static bool block(void *c, const void *address, uint64_t, bool, uint64_t *offset,
+		static bool block(void *c, const void *address, uint64_t, bool writable, uint64_t *offset,
 		                  uint64_t *size)
 		{
+			// No block of read-only memory, as a kext on a host without READ_ONLY_PAGES.
+			if (!writable)
+				return false;
 			Vm *vm = static_cast<Vm *>(c);
 			vm->wired.push_back(address);
 			*size = 0x1000;
@@ -9760,7 +14812,7 @@ void test_no_copy_shadows_lie_in_slabs()
 	region.setPagesBlockSource(&Vm::block, &vm);
 	RgfxPagesMemory calls;
 	calls.context = &vm;
-	calls.superpages = &Vm::superpages;
+	calls.pages = &Vm::pages;
 	calls.unmap = &Vm::unmap;
 	// As a device that took MANAGED_AT_OFFSET and HEAP_OVER_PAGES makes them.
 	RgfxRegionSlabSource regionSource(region, f.ser, true);
@@ -9792,16 +14844,16 @@ void test_no_copy_shadows_lie_in_slabs()
 			[held addObject:b];
 		}
 		CHECK(vm.held.size() == 1 && vm.wired.size() == 1 && blocks.allocated.size() == 1);
-		uint8_t *superpage = vm.held.begin()->first;
+		uint8_t *slab = vm.held.begin()->first;
 		auto heap = expectMessage<RgfxHeapOverPages>(f.control, RGFX_CMD_HEAP_OVER_PAGES);
 		CHECK(heap.block_offset == blocks.allocated[0] && heap.size_bytes == 2ull << 20);
 		for (int i = 0; i < 8; i++) {
 			auto at = expectMessage<RgfxBufferAtOffset>(f.control, RGFX_CMD_BUFFER_AT_OFFSET);
 			CHECK(at.obj_id == held[i].rgfxObjId && at.heap_obj_id == heap.obj_id &&
 			      at.offset == static_cast<uint64_t>(i) * 0x1000 && at.length == 0x1000);
-			CHECK(std::memcmp(superpage + at.offset, p + i * 0x1000, 0x1000) == 0);
+			CHECK(std::memcmp(slab + at.offset, p + i * 0x1000, 0x1000) == 0);
 		}
-		// A Managed one's CPU copy lies in a superpage of its own class, placed in its heap.
+		// A Managed one's CPU copy lies in a slab of its own class, placed in its heap.
 		RgfxBuffer *managed = noCopy(p + 0x8000, 0x2000, MTLResourceStorageModeManaged);
 		CHECK(managed != nil && [managed rgfxShadow] != nullptr &&
 		      ![managed rgfxShadow]->writable());
@@ -9813,7 +14865,7 @@ void test_no_copy_shadows_lie_in_slabs()
 		      mat.offset == 0 && mat.length == 0x2000);
 		uint8_t *copy = nullptr;
 		for (auto &h : vm.held)
-			if (h.first != superpage)
+			if (h.first != slab)
 				copy = h.first;
 		CHECK(copy != nullptr && std::memcmp(copy, p + 0x8000, 0x2000) == 0);
 		// The region's only blocks are the two pages blocks.
@@ -10217,6 +15269,259 @@ bool askTextureSize(void *, const void *, uint32_t, void *reply, uint32_t capaci
 	std::memcpy(reply, &answer, sizeof(answer));
 	*reply_size = sizeof(answer);
 	return true;
+}
+
+// The device's answers to the function pointer creates, and what it was last asked.
+struct FunctionPointerDevice {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<FunctionPointerDevice *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxFunctionPointerState answer = {};
+		answer.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(answer), 9};
+		answer.status = self->status;
+		answer.gpu_resource_id = 3;
+		answer.allocated_size = 4096;
+		answer.resource_options = MTLResourceStorageModeManaged |
+		                          MTLResourceHazardTrackingModeTracked;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A compute pipeline's handles and tables are the host's, where the host makes them: a handle of
+// a function asks the host once and is the same object each time after; a function the kernel
+// does not link (the host's not found) is nil, asked once too. A table answers the host's
+// resource id, size and options; its sets go on the ring (FUNCTION_TABLE_SET), a nil handle as
+// 0, and a range past its entries sets none. A handle's gpuResourceID and the pipeline's
+// functionHandleWithName: raise an unrecognized selector, as the AMD 5300M's do, but on an Apple GPU
+// a handle's gpuResourceID is 0, as the M3 Max's. A table stays NonVolatile whatever purgeable
+// state it is told, as the M3 Max's and the Intel 630's do. Where the host makes none, each is nil
+// and asks nothing.
+void test_function_pointers()
+{
+	Fixture fx;
+	FunctionPointerDevice device;
+	fx.ser.setAsker(&FunctionPointerDevice::ask, &device);
+	@autoreleasepool {
+	const uint8_t libBytes[] = {9, 9, 9};
+	uint32_t libStatus = 0;
+	RgfxLibrary *lib = [RgfxLibrary libraryWithData:libBytes
+	                                        length:sizeof(libBytes)
+	                                           key:nullptr
+	                                        device:nil
+	                                    serializer:&fx.ser
+	                                        status:&libStatus];
+	(void)nextMessage(fx.ring, RGFX_CMD_LIBRARY_CREATE);
+	id<MTLFunction> add1 = [lib newFunctionWithName:@"fp_add1"];
+	id<MTLFunction> neg = [lib newFunctionWithName:@"fp_neg"];
+	NSError *err = nil;
+	RgfxComputePipelineState *cs =
+	    [RgfxComputePipelineState computePipelineStateWithFunction:[lib newFunctionWithName:@"fp_kernel"]
+	                                                       device:nil
+	                                                   serializer:&fx.ser
+	                                                        error:&err];
+	CHECK(cs != nil);
+	if (cs == nil)
+		return;
+	(void)nextMessage(fx.ring, RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	MTLVisibleFunctionTableDescriptor *td = [MTLVisibleFunctionTableDescriptor new];
+	td.functionCount = 3;
+	CHECK([cs functionHandleWithFunction:add1] == nil);
+	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 0);
+
+	fx.ser.setCarriesFunctionPointers(true);
+	id<MTLFunctionHandle> h = [cs functionHandleWithFunction:add1];
+	CHECK(h != nil && device.calls == 1);
+	if (h == nil)
+		return;
+	CHECK([h.name isEqualToString:@"fp_add1"] && h.functionType == add1.functionType);
+	RgfxFunctionHandleCreate create = {};
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_FUNCTION_HANDLE_CREATE);
+	CHECK(create.obj_id == ((RgfxFunctionHandle *)h).rgfxObjId &&
+	      create.pipeline_obj_id == cs.rgfxObjId);
+	CHECK(create.function.library_obj_id == lib.rgfxObjId &&
+	      create.function.list == RGFX_LINKED_FUNCTIONS && create.function.name_len == 7);
+	CHECK([cs functionHandleWithFunction:add1] == h && device.calls == 1);
+	device.status = RGFX_STATUS_NOT_FOUND;
+	CHECK([cs functionHandleWithFunction:neg] == nil && device.calls == 2);
+	CHECK([cs functionHandleWithFunction:neg] == nil && device.calls == 2);
+	id<MTLFunction> noFunction = nil;
+	CHECK([cs functionHandleWithFunction:noFunction] == nil && device.calls == 2);
+	bool raised = false;
+	@try {
+		(void)h.gpuResourceID;
+	} @catch (NSException *e) {
+		raised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raised);
+	raised = false;
+	CHECK([cs respondsToSelector:@selector(functionHandleWithName:)]);
+	@try {
+		(void)[cs functionHandleWithName:@"fp_add1"];
+	} @catch (NSException *e) {
+		raised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raised && device.calls == 2);
+
+	device.status = RGFX_STATUS_OK;
+	id<MTLVisibleFunctionTable> t = [cs newVisibleFunctionTableWithDescriptor:td];
+	CHECK(t != nil && device.calls == 3);
+	if (t == nil)
+		return;
+	RgfxFunctionTableCreate tc = {};
+	std::memcpy(&tc, device.asked.data(), sizeof(tc));
+	CHECK(tc.header.type == RGFX_CMD_FUNCTION_TABLE_CREATE && tc.pipeline_obj_id == cs.rgfxObjId);
+	CHECK(tc.obj_id == ((RgfxVisibleFunctionTable *)t).rgfxObjId && tc.function_count == 3);
+	CHECK(t.gpuResourceID._impl == 3 && t.allocatedSize == 4096);
+	CHECK(t.resourceOptions == (MTLResourceStorageModeManaged | MTLResourceHazardTrackingModeTracked));
+	CHECK(t.storageMode == MTLStorageModeManaged && t.cpuCacheMode == MTLCPUCacheModeDefaultCache &&
+	      t.hazardTrackingMode == MTLHazardTrackingModeTracked);
+	CHECK(t.heap == nil && !t.isAliasable && t.label == nil);
+	// NonVolatile whatever it is told, as the M3 Max's and the Intel 630's tables answer.
+	CHECK([t setPurgeableState:MTLPurgeableStateVolatile] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateEmpty] == MTLPurgeableStateNonVolatile);
+	CHECK([t setPurgeableState:MTLPurgeableStateKeepCurrent] == MTLPurgeableStateNonVolatile);
+
+	[t setFunction:h atIndex:2];
+	auto bytes = nextMessage(fx.ring, RGFX_CMD_FUNCTION_TABLE_SET);
+	RgfxFunctionTableSet set = {};
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.obj_id == tc.obj_id && set.first == 2 && set.count == 1);
+	CHECK(bytes.size() == sizeof(set) + 8);
+	RgfxObjId ids[2] = {};
+	std::memcpy(ids, bytes.data() + sizeof(set), 8);
+	CHECK(ids[0] == create.obj_id);
+	const id<MTLFunctionHandle> two[2] = {nil, h};
+	[t setFunctions:two withRange:NSMakeRange(0, 2)];
+	bytes = nextMessage(fx.ring, RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 0 && set.count == 2 && bytes.size() == sizeof(set) + 16);
+	std::memcpy(ids, bytes.data() + sizeof(set), 16);
+	CHECK(ids[0] == 0 && ids[1] == create.obj_id);
+	[t setFunction:h atIndex:3];
+	[t setFunctions:two withRange:NSMakeRange(2, 2)];
+	[t setFunctions:two withRange:NSMakeRange(1, 0)];
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	CHECK(!fx.ring.next(&none, &noneBytes));
+
+	// A refused table is nil.
+	device.status = RGFX_STATUS_REFUSED;
+	CHECK([cs newVisibleFunctionTableWithDescriptor:td] == nil && device.calls == 4);
+
+	// On an Apple GPU (rgfxAppleGPU) a handle's gpuResourceID is 0, as the M3 Max's handles answer
+	// (oracle_fnptr Apple, macOS 27.0.1); an x86 guest's still raises (above).
+	device.status = RGFX_STATUS_OK;
+	id apple = [RgfxAppleFamilyDevice new]; // held: a handle keeps its device weakly
+	RgfxFunctionHandle *appleHandle = [RgfxFunctionHandle handleOfFunction:add1
+	                                                              pipeline:cs.rgfxObjId
+	                                                                device:(id<MTLDevice>)apple
+	                                                            serializer:&fx.ser];
+	CHECK(appleHandle != nil && device.calls == 5);
+	raised = false;
+	@try {
+		CHECK(appleHandle.gpuResourceID._impl == 0);
+	} @catch (NSException *e) {
+		(void)e;
+		raised = true;
+	}
+	CHECK(!raised);
+	} // @autoreleasepool
+}
+
+// A rate map is the host's: made where the host makes maps, from the state the host answers its
+// create with (its screen size, granularity, layers and parameter size), labelled with its
+// descriptor's label; each answer that takes an argument asks the host, and a copy into a Shared
+// buffer of ours names the buffer, where the host writes the bytes in place; a reset asks again
+// and the map answers its new state. Where the host makes none, or refuses, no map.
+void test_rasterization_rate_map()
+{
+	Fixture fx;
+	RateMapDevice device;
+	fx.ser.setAsker(&RateMapDevice::ask, &device);
+	@autoreleasepool {
+	CHECK([RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                               device:nil
+	                                           serializer:&fx.ser] == nil);
+	CHECK(device.calls == 0);
+	fx.ser.setCarriesRateMaps(true);
+	RgfxRasterizationRateMap *map = [RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                                                         device:nil
+	                                                                     serializer:&fx.ser];
+	CHECK(map != nil && device.calls == 1);
+	if (map == nil)
+		return;
+	RgfxRateMapCreate create = {};
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_CREATE && create.obj_id == [map rgfxObjId]);
+	CHECK(create.layer_count == 1 && create.screen_width == 256 && create.screen_height == 128);
+	// The descriptor's private mutability, which Metal's descriptor (of its private subclass)
+	// answers, Immutable until set.
+	CHECK((create.flags & RGFX_RATE_MAP_MUTABILITY_SET) != 0 && create.mutability == 2);
+	MTLRasterizationRateMapDescriptor *mutableOne = rateMapDescriptor();
+	CHECK([mutableOne respondsToSelector:@selector(setMutability:)]);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(mutableOne, @selector(setMutability:),
+	                                             (NSUInteger)MTLMutabilityMutable);
+	// Held to the end: its release posts its destroy on the ring.
+	RgfxRasterizationRateMap *mutableMap =
+	    [RgfxRasterizationRateMap rateMapWithDescriptor:mutableOne device:nil serializer:&fx.ser];
+	CHECK(mutableMap != nil);
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK((create.flags & RGFX_RATE_MAP_MUTABILITY_SET) != 0 && create.mutability == 1);
+	CHECK(map.screenSize.width == 256 && map.screenSize.height == 128 && map.screenSize.depth == 0);
+	CHECK(map.physicalGranularity.width == 32 && map.physicalGranularity.depth == 1);
+	CHECK(map.layerCount == 1 && map.parameterBufferSizeAndAlign.size == 24624);
+	CHECK(map.parameterBufferSizeAndAlign.align == 4 && map.mutability == MTLMutabilityImmutable);
+	CHECK([map.label isEqualToString:@"probe"] && map.minFactor == 0.0f);
+	CHECK([[map formattedDescription:0] containsString:@"\n    layerCount = 1 \n"]);
+
+	(void)[map physicalSizeForLayer:1];
+	CHECK(device.query().query == RGFX_RATE_MAP_QUERY_PHYSICAL_SIZE && device.query().at == 1);
+	MTLCoordinate2D p = [map mapScreenToPhysicalCoordinates:MTLCoordinate2DMake(10.5f, 3.25f)
+	                                               forLayer:0];
+	CHECK(p.x == 1.5f && p.y == 2.5f);
+	RgfxRateMapQuery q = device.query();
+	float x = 0;
+	std::memcpy(&x, &q.x_bits, 4);
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL && q.obj_id == [map rgfxObjId] && x == 10.5f);
+	p = [map mapPhysicalToScreenCoordinates:MTLCoordinate2DMake(1, 1) forLayer:0];
+	CHECK(device.query().query == RGFX_RATE_MAP_QUERY_PHYSICAL_TO_SCREEN && p.y == 2.5f);
+
+	RgfxBuffer *shared = [[RgfxBuffer alloc] initWithObjId:0x90
+	                                            gpuAddress:0
+	                                                length:0x8000
+	                                               options:MTLResourceStorageModeShared
+	                                                device:nil
+	                                            serializer:nullptr];
+	[map copyParameterDataToBuffer:shared offset:4];
+	q = device.query();
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA && q.buffer_obj_id == 0x90 && q.at == 4);
+
+	device.layers = 2;
+	const uint32_t calls = device.calls;
+	[map resetUsingDescriptor:rateMapDescriptor()];
+	std::memcpy(&create, device.asked.data(), sizeof(create));
+	CHECK(device.calls == calls + 1 && create.header.type == RGFX_CMD_RATE_MAP_RESET);
+	CHECK(create.obj_id == [map rgfxObjId] && map.layerCount == 2);
+
+	device.status = RGFX_STATUS_REFUSED;
+	CHECK([RgfxRasterizationRateMap rateMapWithDescriptor:rateMapDescriptor()
+	                                               device:nil
+	                                           serializer:&fx.ser] == nil);
+	CHECK(ringEmpty(fx.ring));
+	CHECK([mutableMap rgfxObjId] != 0);
+	} // @autoreleasepool
 }
 
 // An Automatic heap places what it makes as Metal's does, in the sequence measured on the M3
@@ -10713,6 +16018,102 @@ void test_texture_unknown_usage()
 	}
 }
 
+// A texture answers the usage it was made with but ShaderAtomic and 0x8, which Metal's textures
+// leave out of theirs, over an IOSurface and over none, in each storage mode, and its views too,
+// while its create carries the usage given, atomic bit and all (measured on the M3 Max under
+// macOS 27.0.1, the AMD 5300M and the Intel UHD 630 under 26.7.1: oracle_surftex's sixth and
+// seventh rounds).
+void test_texture_usage_leaves_out_atomic()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	const struct {
+		uint64_t asked, answered;
+	} kUsages[] = {
+	    {0x23, 0x3}, {0x20, 0x0}, {0x21, 0x1},       {0x33, 0x13},      {0x37, 0x17},     {0x29, 0x1},
+	    {0x9, 0x1},  {0x8, 0x0},  {0x4001, 0x4001}, {0x8001, 0x8001}, {0x10001, 0x10001},
+	};
+	for (MTLStorageMode storage :
+	     {MTLStorageModePrivate, MTLStorageModeShared, MTLStorageModeManaged}) {
+		for (const auto &u : kUsages) {
+			@autoreleasepool {
+				MTLTextureDescriptor *desc =
+				    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+				                                                       width:16
+				                                                      height:16
+				                                                   mipmapped:NO];
+				desc.usage = static_cast<MTLTextureUsage>(u.asked);
+				desc.storageMode = storage;
+				RgfxTexture *tex = [RgfxTexture textureWithDescriptor:desc
+				                                                 heap:RGFX_OBJ_NONE
+				                                           heapOffset:0
+				                                               device:nil
+				                                           serializer:&fx.ser];
+				CHECK(tex != nil && tex.usage == u.answered);
+				id<MTLTexture> view = [tex newTextureViewWithPixelFormat:MTLPixelFormatR32Uint];
+				CHECK(view != nil && view.usage == u.answered);
+				RgfxMsgHeader h = {};
+				std::vector<uint8_t> bytes;
+				bool created = false;
+				while (fx.ring.next(&h, &bytes)) {
+					RgfxTextureCreate made = {};
+					if (h.type == RGFX_CMD_TEXTURE_CREATE && bytes.size() >= sizeof(made)) {
+						std::memcpy(&made, bytes.data(), sizeof(made));
+						created = made.obj_id == tex.rgfxObjId && made.desc.usage == u.asked;
+					}
+				}
+				CHECK(created);
+			}
+			drainRing(fx.ring);
+		}
+	}
+	// Over an IOSurface, its create carrying the usage given.
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	for (const auto &u : kUsages) {
+		@autoreleasepool {
+			MTLTextureDescriptor *td =
+			    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatR32Uint
+			                                                       width:16
+			                                                      height:16
+			                                                   mipmapped:NO];
+			td.usage = static_cast<MTLTextureUsage>(u.asked);
+			RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:td
+			                                                            iosurface:surface
+			                                                                plane:0
+			                                                               region:&region
+			                                                               device:nil
+			                                                           serializer:&fx.ser];
+			CHECK(t != nil && t.usage == u.answered);
+			CHECK([t newTextureViewWithPixelFormat:MTLPixelFormatR32Uint].usage == u.answered);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			bool created = false;
+			while (fx.ring.next(&h, &bytes)) {
+				RgfxTextureFromIOSurface made = {};
+				if (h.type == RGFX_CMD_TEXTURE_FROM_IOSURFACE && bytes.size() >= sizeof(made)) {
+					std::memcpy(&made, bytes.data(), sizeof(made));
+					created = made.obj_id == t.rgfxObjId && made.desc.usage == u.asked;
+				}
+			}
+			CHECK(created);
+		}
+		drainRing(fx.ring);
+	}
+	CFRelease(surface);
+}
+
 // A texture's views (RGFX_CMD_TEXTURE_VIEW): each form posts its view of the texture with the
 // fields it names, and the view answers its own shape and its texture's memory, as Metal's do
 // (measured on the M3 Max under macOS 27.0.1). A view Metal makes none of, or asserts at,
@@ -11011,8 +16412,9 @@ void test_region_memory_given_back_after_destroy()
 }
 
 // The bytes of a surface's shared-block header (RgfxIOSurface.mm's RgfxSurfaceHeader), which
-// the writers follow: a copy's seed and serial, and a cached block's CPU generation at 16.
-constexpr uint64_t kSurfaceHeader = 24;
+// the writers follow: a copy's seed and serial, a cached block's CPU generation at 16, and at 24
+// and 28 the unlock seed a copy was synced at and whether a CPU write lock was held then.
+constexpr uint64_t kSurfaceHeader = 32;
 
 // An IOSurface texture's copy goes as the texture goes: the texture, then the copy's buffer,
 // from the host, and only then the copy's block back to the region.
@@ -11231,6 +16633,186 @@ void test_iosurface_shared_block()
 	drainRing(fx.ring); // the textures' and buffers' destroys
 	for (IOSurfaceRef s : {first, second, third, fourth})
 		CFRelease(s);
+}
+
+// Two holders of one surface's copy, this process and another, which the test plays: its CPU
+// writes the surface under a read-write lock, and its GPU writes the shared block (RgfxIOSurface.h).
+// - A commit while the other holder's CPU holds its write lock copies the pages as they are, half
+//   written, and the next commit after the unlock copies them again: IOSurface moves the lock
+//   seed at the lock and the unlock seed at the unlock, and the copy waits for the two to meet.
+//   Once they have, a commit copies nothing and asks the kext nothing.
+// - The other holder's GPU write, named (the kext moves both seeds) and recorded in the header,
+//   is not copied over by this holder's commit before its write-back reaches the pages.
+// - A block of the process's own takes the same rules from its own record.
+// The kext's seeds are played as IOSurface keeps them: the unlock seed is the lock seed less the
+// write locks held.
+void test_iosurface_copy_waits_for_the_cpu_unlock()
+{
+	Fixture fx;
+	int calls = 0;
+	fx.ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	struct Source {
+		uint64_t offset = RGFX_ALLOCATIONS_OFFSET + 0x40000;
+		uint64_t serial = 0;
+		bool give = true;
+		static bool acquire(void *c, const void *, uint64_t, uint64_t, uint64_t *offset,
+		                    uint64_t *serial, bool *fresh)
+		{
+			Source *src = static_cast<Source *>(c);
+			*offset = src->offset;
+			*serial = src->serial;
+			*fresh = true;
+			return src->give;
+		}
+		static void release(void *, uint64_t) {}
+	} src;
+	region.setSurfaceSource(&Source::acquire, &Source::release, &src);
+	struct Seeds {
+		IOSurfaceRef surface = nullptr;
+		uint32_t held = 0; // the other holder's write locks
+		int asked = 0;
+		static bool seeds(void *c, uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed)
+		{
+			Seeds *k = static_cast<Seeds *>(c);
+			k->asked++;
+			if (k->surface == nullptr || IOSurfaceGetID(k->surface) != surfaceId)
+				return false;
+			*lockSeed = IOSurfaceGetSeed(k->surface);
+			*unlockSeed = *lockSeed - k->held;
+			return true;
+		}
+	} kext;
+	region.setSurfaceSeedsSource(&Seeds::seeds, &kext);
+	// 16 x 16 BGRA: rows 256 bytes apart in the block, its header at 4096.
+	const uint64_t kPitch = 256, kHeader = 4096;
+	auto rowsOf = [](IOSurfaceRef s, int from, int to, uint32_t v) {
+		auto *base = static_cast<uint8_t *>(IOSurfaceGetBaseAddress(s));
+		for (int y = from; y < to; y++)
+			for (int x = 0; x < 16; x++)
+				reinterpret_cast<uint32_t *>(base + y * IOSurfaceGetBytesPerRow(s))[x] = v;
+	};
+	// The other holder's CPU: its write lock, the rows it writes under it, and its unlock.
+	auto otherLock = [&](IOSurfaceRef s) {
+		CHECK(IOSurfaceLock(s, 0, nullptr) == kIOReturnSuccess);
+		kext.held++;
+	};
+	auto otherUnlock = [&](IOSurfaceRef s) {
+		IOSurfaceUnlock(s, 0, nullptr);
+		kext.held--;
+	};
+	auto made = [&](uint32_t v) {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef s = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		otherLock(s);
+		rowsOf(s, 0, 16, v);
+		otherUnlock(s);
+		kext.surface = s;
+		return s;
+	};
+	auto texture = [&](IOSurfaceRef s) {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:s
+		                                            plane:0
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&fx.ser];
+	};
+	for (bool shared : {true, false}) {
+		src.give = shared;
+		src.serial++;
+		IOSurfaceRef s = made(0x11111111);
+		@autoreleasepool {
+			RgfxIOSurfaceTexture *t = texture(s);
+			CHECK(t != nil);
+			uint8_t *block = mem.data() + (shared ? src.offset : blocks.allocated.back());
+			auto rowsAre = [&](int from, int to, uint32_t v) {
+				for (int y = from; y < to; y++)
+					for (int x = 0; x < 16; x++)
+						if (reinterpret_cast<uint32_t *>(block + y * kPitch)[x] != v)
+							return false;
+				return true;
+			};
+			auto blockIs = [&](uint32_t v) { return rowsAre(0, 16, v); };
+			CHECK(blockIs(0x11111111));
+			// Made after the other holder's unlock: a commit copies nothing, and asks nothing.
+			kext.asked = 0;
+			std::memset(block, 0xaa, 16 * kPitch);
+			syncAsCommitted({t});
+			CHECK(blockIs(0xaaaaaaaa) && kext.asked == 0);
+			std::memset(block, 0x11, 16 * kPitch);
+
+			// The other holder writes half the rows under its lock, and this holder commits.
+			otherLock(s);
+			rowsOf(s, 0, 8, 0x22222222);
+			syncAsCommitted({t});
+			CHECK(rowsAre(0, 8, 0x22222222) && rowsAre(8, 16, 0x11111111));
+			// It writes the rest and unlocks: the next commit copies the whole write.
+			rowsOf(s, 8, 16, 0x22222222);
+			syncAsCommitted({t});
+			CHECK(rowsAre(0, 8, 0x22222222) && rowsAre(8, 16, 0x11111111));
+			otherUnlock(s);
+			syncAsCommitted({t});
+			CHECK(blockIs(0x22222222));
+			// Synced after the unlock: no commit copies again or asks the kext.
+			kext.asked = 0;
+			std::memset(block, 0xaa, 16 * kPitch);
+			syncAsCommitted({t});
+			syncAsCommitted({t});
+			CHECK(blockIs(0xaaaaaaaa) && kext.asked == 0);
+			std::memset(block, 0x22, 16 * kPitch);
+
+			if (shared) {
+				// The other holder's GPU writes the block, and its commit names the write: the
+				// kext moves both seeds (played as a lock and its unlock), and the holder records
+				// the new seed in the header. Its write-back has not reached the pages yet: this
+				// holder's commit leaves the GPU's write in the block.
+				std::memset(block, 0x33, 16 * kPitch);
+				otherLock(s);
+				otherUnlock(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 8) = IOSurfaceGetSeed(s);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x33333333));
+				// Its write-back, under no lock, moves no seed: still nothing is copied.
+				rowsOf(s, 0, 16, 0x33333333);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x33333333));
+				// A GPU write named while the other holder's CPU holds its lock supersedes the
+				// write the lock is for, as the seed the write leaves does: no commit copies the
+				// pages over it, nor after the CPU's unlock.
+				otherLock(s);
+				rowsOf(s, 0, 16, 0x44444444);
+				std::memset(block, 0x55, 16 * kPitch);
+				otherLock(s);
+				otherUnlock(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 8) = IOSurfaceGetSeed(s);
+				*reinterpret_cast<uint32_t *>(block + kHeader + 24) = 0;
+				*reinterpret_cast<uint32_t *>(block + kHeader + 28) = 0;
+				syncAsCommitted({t});
+				CHECK(blockIs(0x55555555));
+				otherUnlock(s);
+				syncAsCommitted({t});
+				CHECK(blockIs(0x55555555));
+			}
+			drainRing(fx.ring);
+		}
+		kext.surface = nullptr;
+		drainRing(fx.ring); // the texture's and buffer's destroys
+		CFRelease(s);
+	}
 }
 
 // A surface with planes has one copy holding every plane (RgfxIOSurface.h): each plane's rows in
@@ -11461,6 +17043,89 @@ void test_iosurface_planes()
 	drainRing(fx.ring);
 	CFRelease(surface);
 	CFRelease(plain);
+}
+
+// Two threads make textures over one surface at once, as ImageIO's do over the tiles of one
+// decoded picture: the second finds the view the first is still making, waits until the first
+// has made its buffer, and names that buffer too. It names no buffer at all (0, which the host
+// answers as a bad reference) if it takes the view before the buffer is made. The second texture
+// is asked while the first's buffer create rings the doorbell, before that create returns.
+void test_iosurface_texture_waits_for_a_view_being_made()
+{
+	struct Bell {
+		std::atomic<int> rings{0};
+		std::function<void()> first;
+		static void ring(void *c, uint32_t)
+		{
+			Bell *b = static_cast<Bell *>(c);
+			if (b->rings.fetch_add(1) == 0 && b->first)
+				b->first();
+		}
+	} bell;
+	// As Fixture's, with this test's doorbell; never freed, as Fixture's are not.
+	TestRing &ring = *new TestRing(0x8000);
+	RgfxRingWriter &writer = *new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
+	                                             &Bell::ring, &bell);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(writer, ids);
+	ring.setConsumerIdle(1); // host idle, so each post rings the doorbell
+	int calls = 0;
+	ids.setResourceIdSource(&oneChunk, &calls);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	BlockLog blocks;
+	region.setBlockSource(&BlockLog::alloc, &BlockLog::release, &blocks);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @16,
+		(id)kIOSurfaceHeight : @16,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+	};
+	IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	CHECK(surface != nullptr);
+	auto texture = [&]() {
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:8
+		                                                      height:8
+		                                                   mipmapped:NO];
+		return [RgfxIOSurfaceTexture textureWithDescriptor:td
+		                                        iosurface:surface
+		                                            plane:0
+		                                           origin:MTLOriginMake(8, 8, 0)
+		                                           region:&region
+		                                           device:nil
+		                                       serializer:&ser];
+	};
+	@autoreleasepool {
+		RgfxIOSurfaceTexture *second = nil;
+		std::atomic<bool> secondMade{false};
+		std::thread other;
+		bell.first = [&] {
+			other = std::thread([&] {
+				@autoreleasepool {
+					second = texture();
+				}
+				secondMade = true;
+			});
+			// Time for the second to reach the view and post its texture, were it not to wait.
+			std::this_thread::sleep_for(std::chrono::milliseconds(50));
+			CHECK(!secondMade);
+		};
+		RgfxIOSurfaceTexture *first = texture();
+		other.join();
+		CHECK(first != nil && second != nil && bell.rings == 3);
+		auto buffer = expectMessage<RgfxBufferOverHostMemory>(ring, RGFX_CMD_BUFFER_OVER_HOST_MEMORY);
+		CHECK(buffer.obj_id != 0);
+		for (int i = 0; i < 2; i++) {
+			auto m = expectMessage<RgfxSurfaceTextureMessage>(ring, RGFX_CMD_TEXTURE_FROM_IOSURFACE);
+			CHECK(m.texture.buffer_obj_id == buffer.obj_id && m.texture.offset == 8 * 256 + 8 * 4);
+		}
+		CHECK(ringEmpty(ring));
+		bell.first = nullptr;
+	}
+	drainRing(ring); // the textures' and the buffer's destroys
+	CFRelease(surface);
 }
 
 // The shared copy block a texture over a surface takes in these tests, at `offset` in the region.
@@ -11822,6 +17487,91 @@ void test_iosurface_writers()
 	CFRelease(surface);
 }
 
+// The guest's times (RGFX_OP_GUEST_TIMES): a queue that stamps them (stampsGuestTimes, where the
+// device's word holds RGFX_FEATURE_GUEST_TIMES) starts each buffer's stream with them, before its
+// commit order and every other op: made at -commandBuffer, committed at -commit's entry and
+// posted as it went on its ring, in that order, within the calls; a queue that does not stamps
+// none.
+void test_guest_times_where_the_queue_stamps()
+{
+	// Never freed, as Fixture's: the queues and their buffers may go after the test.
+	TestRing &control = *new TestRing(0x8000);
+	control.setConsumerIdle(1);
+	RgfxRingWriter &controlWriter = *new RgfxRingWriter(
+	    control.base(), control.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	int &calls = *new int(0);
+	ids.setResourceIdSource(&oneChunk, &calls);
+	RgfxSerializer &ser = *new RgfxSerializer(controlWriter, ids);
+	TestRing &submit = *new TestRing(0x8000);
+	submit.setConsumerIdle(1);
+	RgfxRingWriter &submitWriter =
+	    *new RgfxRingWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	auto order = std::make_shared<RgfxCommitOrder>();
+	auto queueMade = [&](bool stamps) {
+		drainRing(control);
+		RgfxCommandQueue *q = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+		                                              submitOffset:0
+		                                            completeOffset:0
+		                                          completeDataSize:0
+		                                                       ids:&ids
+		                                                  maxCount:0
+		                                                    device:nil
+		                                                serializer:&ser];
+		CHECK(q != nil);
+		(void)expectQueueCreate(control);
+		[q rgfxJoinCommitOrder:order];
+		q.stampsGuestTimes = stamps ? YES : NO;
+		return q;
+	};
+	// The tags of a buffer's stream as it went on the ring, and its times where it starts with
+	// them.
+	struct Posted {
+		std::vector<uint16_t> tags;
+		RgfxOpGuestTimes times = {};
+		uint64_t made = 0, committing = 0, committed = 0;
+	};
+	auto commit = [&](RgfxCommandQueue *q) {
+		Posted out;
+		out.made = rgfxGuestClockNs();
+		id<MTLCommandBuffer> cb = [q commandBuffer];
+		out.committing = rgfxGuestClockNs();
+		[cb commit];
+		out.committed = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		size_t at = RGFX_COMMAND_BUFFER_OPS_OFFSET;
+		while (at + sizeof(RgfxOpHeader) <= bytes.size()) {
+			RgfxOpHeader op = {};
+			std::memcpy(&op, bytes.data() + at, sizeof(op));
+			CHECK(op.len >= RGFX_OP_BODY_OFFSET && at + op.len <= bytes.size());
+			if (op.tag == RGFX_OP_GUEST_TIMES) {
+				CHECK(op.len == RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes));
+				std::memcpy(&out.times, bytes.data() + at + RGFX_OP_BODY_OFFSET, sizeof(out.times));
+			}
+			out.tags.push_back(op.tag);
+			at += op.len;
+		}
+		drainRing(control);
+		return out;
+	};
+	@autoreleasepool {
+		RgfxCommandQueue *plain = queueMade(false), *stamped = queueMade(true);
+		const Posted first = commit(plain);
+		CHECK(first.tags.empty());
+		// The stamped queue's buffer names the plain queue's (its commit order) after its times.
+		const Posted p = commit(stamped);
+		CHECK((p.tags == std::vector<uint16_t>{RGFX_OP_GUEST_TIMES, RGFX_OP_COMMIT_ORDER}));
+		CHECK(p.made <= p.times.began_ns && p.times.began_ns <= p.committing);
+		CHECK(p.committing <= p.times.committed_ns && p.times.committed_ns <= p.times.posted_ns);
+		CHECK(p.times.posted_ns <= p.committed);
+		// And the plain queue's next buffer, which names the stamped one's, still carries none.
+		const Posted again = commit(plain);
+		CHECK((again.tags == std::vector<uint16_t>{RGFX_OP_COMMIT_ORDER}));
+	}
+}
+
 // A process's commit order (RgfxCommitOrder.hpp; design.md, "Commit order"): a queue that takes
 // part names, before its buffer goes on its ring, once and before its first other op
 // (RGFX_OP_COMMIT_ORDER), the latest buffer each other queue that takes part put on its ring since
@@ -11936,49 +17686,65 @@ void test_commit_order()
 // Two queues posting at once never name each other's buffers both ways: a post reads the other
 // queue's latest before its buffer goes on its ring and raises its own after, so where one waits
 // for the other, the other was on its ring before the read, and its own read came before this
-// one's raise.
+// one's raise. Only a run whose posts interleave, each queue naming the other, checks that: the
+// two threads start together, and a run where one finished before the other started, naming
+// nothing, runs again, up to 50 runs.
 void test_commit_order_names_no_cycle()
 {
-	RgfxCommitOrder order;
 	constexpr int kPosts = 20000;
 	struct Post {
 		uint64_t seqno;
 		uint64_t named; // the other queue's seqno it names, 0 for none
 	};
-	std::vector<Post> posts[2];
-	auto run = [&](int me) {
-		const size_t slot = order.join(0x100 + static_cast<uint64_t>(me));
-		CHECK(slot != RgfxCommitOrder::kNoSlot);
-		RgfxCommitNamed named;
-		uint64_t last = 0;
-		for (int i = 1; i <= kPosts; i++) {
-			std::vector<RgfxSurfaceOrderWait> waits;
-			order.name(slot, named, waits);
-			CHECK(waits.size() <= 1);
-			// What it names is cumulative: the latest named stands for every one before it.
-			if (!waits.empty())
-				last = waits[0].seqno;
-			posts[me].push_back({static_cast<uint64_t>(i), last});
-			order.posted(slot, static_cast<uint64_t>(i));
+	bool interleaved = false;
+	for (int attempt = 0; attempt < 50 && !interleaved; attempt++) {
+		RgfxCommitOrder order;
+		std::vector<Post> posts[2];
+		std::atomic<int> ready{0};
+		auto run = [&](int me) {
+			const size_t slot = order.join(0x100 + static_cast<uint64_t>(me));
+			CHECK(slot != RgfxCommitOrder::kNoSlot);
+			ready++;
+			while (ready.load() < 2)
+				std::this_thread::yield();
+			RgfxCommitNamed named;
+			uint64_t last = 0;
+			for (int i = 1; i <= kPosts; i++) {
+				std::vector<RgfxSurfaceOrderWait> waits;
+				order.name(slot, named, waits);
+				CHECK(waits.size() <= 1);
+				// What it names is cumulative: the latest named stands for every one before it.
+				if (!waits.empty())
+					last = waits[0].seqno;
+				posts[me].push_back({static_cast<uint64_t>(i), last});
+				order.posted(slot, static_cast<uint64_t>(i));
+			}
+		};
+		std::thread t0(run, 0), t1(run, 1);
+		t0.join();
+		t1.join();
+		bool names[2] = {false, false};
+		for (int q = 0; q < 2; q++)
+			for (const Post &p : posts[q])
+				names[q] = names[q] || p.named != 0;
+		interleaved = names[0] && names[1];
+		// Post p of queue 0 waits for queue 1 through p.named; post q of queue 1 waits for queue
+		// 0 through q.named. A cycle: q.seqno <= p.named and p.seqno <= q.named.
+		size_t j = 0;
+		for (const Post &p : posts[0]) {
+			// The posts of queue 1 that p waits for are 1..p.named; any of them that waits for p
+			// names queue 0 at p.seqno or past. The named seqnos only rise, so the first of them
+			// that can is the one to check: queue 1's posts up to p.named, the last of which
+			// names most.
+			if (p.named == 0)
+				continue;
+			while (j + 1 < posts[1].size() && posts[1][j + 1].seqno <= p.named)
+				j++;
+			CHECK(posts[1][j].seqno <= p.named);
+			CHECK(posts[1][j].named < p.seqno);
 		}
-	};
-	std::thread t0(run, 0), t1(run, 1);
-	t0.join();
-	t1.join();
-	// Post p of queue 0 waits for queue 1 through p.named; post q of queue 1 waits for queue 0
-	// through q.named. A cycle: q.seqno <= p.named and p.seqno <= q.named.
-	size_t j = 0;
-	for (const Post &p : posts[0]) {
-		// The posts of queue 1 that p waits for are 1..p.named; any of them that waits for p
-		// names queue 0 at p.seqno or past. The named seqnos only rise, so the first of them that
-		// can is the one to check: queue 1's posts up to p.named, the last of which names most.
-		if (p.named == 0)
-			continue;
-		while (j + 1 < posts[1].size() && posts[1][j + 1].seqno <= p.named)
-			j++;
-		CHECK(posts[1][j].seqno <= p.named);
-		CHECK(posts[1][j].named < p.seqno);
 	}
+	CHECK(interleaved);
 }
 
 // A process that names its command buffers' order (rgfxIOSurfaceSetOrder; RgfxIOSurface.h): the
@@ -13533,16 +19299,21 @@ void test_iosurface_in_place()
 		uint64_t length = 0, size = 0;
 		uint32_t surfaceId = 0;
 		bool cacheable = false;
+		bool laidOut = false;
+		RgfxSurfacePagesLayout layout = {};
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
 		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *layout,
 		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
 		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
 			src->surfaceId = surfaceId;
 			src->cacheable = cacheable;
+			src->laidOut = layout != nullptr;
+			src->layout = layout != nullptr ? *layout : RgfxSurfacePagesLayout{};
 			*cached = false;
 			src->base = base;
 			src->length = length;
@@ -13619,8 +19390,14 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *t = overPlane(flat, MTLPixelFormatBGRA8Unorm, 16, 16, 0);
 		CHECK(t != nil && src.asked == 1 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == pixels && src.length == allocBytes(flat) && src.size == 0x1000);
-		// One plane, no YCbCr: asked cached, by its IOSurfaceID.
+		// One plane, no YCbCr: asked cached, by its IOSurfaceID, with its one plane's layout:
+		// 16 rows of 64 bytes of texels, its rows apart as IOSurface laid them.
 		CHECK(src.surfaceId == IOSurfaceGetID(flat) && src.cacheable);
+		CHECK(src.laidOut && src.layout.plane_count == 1 && src.layout.reserved_04 == 0);
+		CHECK(src.layout.planes[0].offset == 0 && src.layout.planes[0].bytes_per_row == rowBytes &&
+		      src.layout.planes[0].row_bytes == 64 && src.layout.planes[0].rows == 16);
+		CHECK(src.layout.planes[1].offset == 0 && src.layout.planes[1].bytes_per_row == 0 &&
+		      src.layout.planes[1].row_bytes == 0 && src.layout.planes[1].rows == 0);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.obj_id != 0 && buffer.block_offset == src.offset &&
@@ -13705,8 +19482,14 @@ void test_iosurface_in_place()
 		RgfxIOSurfaceTexture *luma = overPlane(surface, MTLPixelFormatR16Unorm, 64, 48, 0);
 		CHECK(luma != nil && src.asked == 2 && src.copies == 0 && blocks.allocated.empty());
 		CHECK(src.base == base && src.length == allocBytes(surface) && src.size == 0x1000);
-		// Two planes: asked cached, as every surface is.
+		// Two planes: asked cached, as every surface is, with each plane's layout: luma's 48
+		// rows of 64 two-byte elements, chroma's 24 rows of 32 four-byte ones, both 128 apart.
 		CHECK(src.surfaceId == IOSurfaceGetID(surface) && src.cacheable);
+		const RgfxSurfacePlaneLayout &y = src.layout.planes[0], &c = src.layout.planes[1];
+		CHECK(src.laidOut && src.layout.plane_count == 2);
+		CHECK(y.offset == 0 && y.bytes_per_row == 128 && y.row_bytes == 128 && y.rows == 48);
+		CHECK(c.offset == kChroma && c.bytes_per_row == 128 && c.row_bytes == 128 &&
+		      c.rows == 24);
 		auto buffer =
 		    expectMessage<RgfxBufferOverSurfacePages>(fx.ring, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES);
 		CHECK(buffer.block_offset == src.offset && buffer.length == allocBytes(surface));
@@ -13787,8 +19570,9 @@ void test_iosurface_keep()
 		size_t roomAt = 0;
 		int noRoom = 0;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *offset, uint64_t *serial,
-		                                     bool *fresh, bool *cached)
+		                                     bool, const RgfxSurfacePagesLayout *,
+		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
+		                                     bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
 			if (src->full && src->released.size() < src->roomAt) {
@@ -14068,7 +19852,8 @@ void test_iosurface_in_place_fallback()
 		int asked = 0, copies = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
+		                                     bool, const RgfxSurfacePagesLayout *, uint64_t *,
+		                                     uint64_t *, bool *, bool *)
 		{
 			Source *src = static_cast<Source *>(c);
 			src->asked++;
@@ -14179,6 +19964,7 @@ void test_iosurface_in_place_core_image_set()
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *base, uint64_t length,
 		                                     uint64_t size, uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *,
 		                                     uint64_t *offset, uint64_t *serial, bool *fresh,
 		                                     bool *cached)
 		{
@@ -14372,7 +20158,8 @@ void test_iosurface_cached()
 		uint64_t revive = 0;
 		std::vector<uint64_t> released;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t size,
-		                                     uint32_t surfaceId, bool cacheable, uint64_t *offset,
+		                                     uint32_t surfaceId, bool cacheable,
+		                                     const RgfxSurfacePagesLayout *, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
@@ -14664,7 +20451,8 @@ void test_iosurface_nil_is_logged()
 	RgfxRegion region(mem.data(), mem.size());
 	struct Source {
 		static RgfxRegion::PagesAnswer pages(void *, const void *, uint64_t, uint64_t, uint32_t,
-		                                     bool, uint64_t *, uint64_t *, bool *, bool *)
+		                                     bool, const RgfxSurfacePagesLayout *, uint64_t *,
+		                                     uint64_t *, bool *, bool *)
 		{
 			return RgfxRegion::kPagesUnsupported;
 		}
@@ -14843,6 +20631,46 @@ void test_objects_outlive_an_uncommitted_buffer()
 	}
 }
 
+// The reader writes the ring's header, uncached memory to the guest, only where something
+// changed: a ring armed by an armAndCheck that found nothing is not armed again while the host
+// publishes nothing (it clears `armed` only as it publishes), and a pump that takes nothing
+// leaves `consumer` as it was. A record the host publishes is still seen at once, and the ring
+// is armed again after its take.
+void test_reply_reader_arms_once()
+{
+	TestRing ring(0x1000);
+	RgfxReplyReader reader(ring.base(), ring.dataSize);
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+	// Marks the header's words where the reader would write them: a write would show.
+	auto setArmed = [&](uint32_t v) {
+		__atomic_store_n(reinterpret_cast<uint32_t *>(ring.mem.data() +
+		                                              __builtin_offsetof(RgfxRingHeader, armed)),
+		                 v, __ATOMIC_SEQ_CST);
+	};
+	setArmed(7);
+	ring.setConsumer(5);
+	CHECK(reader.pump() == 0);
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 7 && ring.consumerCount() == 5);
+	ring.setConsumer(0);
+	setArmed(1);
+	// The host publishes and clears `armed` (ring.rs Producer::post): seen at once.
+	int fired = 0;
+	reader.expectCompletion(7, [&](const RgfxCbComplete &) { fired++; });
+	RgfxCbComplete done = cbComplete(7, 1);
+	CHECK(ring.postFromHost(&done, sizeof(done)));
+	setArmed(0);
+	CHECK(reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+	CHECK(reader.pump() == 1 && fired == 1);
+	CHECK(ring.consumerCount() == ring.produced);
+	setArmed(0);
+	// Taken since it was armed: armed again before the reader sleeps.
+	CHECK(!reader.armAndCheck());
+	CHECK(ringArmed(ring) == 1);
+}
+
 // A closed reader takes nothing more off its ring: no handler runs, the consumer stays, and
 // the ring is not armed.
 void test_reply_reader_close()
@@ -14865,10 +20693,14 @@ void rgfxArchiveTests();
 void rgfxResourceTests();
 void rgfxQueueTests(const char *self);
 int rgfxQueueDiesCase(const char *name);
+void rgfxResidencyTests(const char *self);
+int rgfxResidencyDiesCase(const char *name);
 int rgfxQueueTimings(int rounds);
 void rgfxCreateTests();
 void rgfxKnownPipelineTests();
 void rgfxIcbTests();
+void rgfxGLTests();
+void rgfxClModeTests();
 
 // A block's arguments come from its own signature, and a creation's completion handler is called
 // with the arguments its shape takes: (object, error), or (object, nil reflection, error); a
@@ -14926,6 +20758,8 @@ int main(int argc, char **argv)
 		return dies_case(argv[2]);
 	if (argc == 3 && std::strcmp(argv[1], "--queue-dies") == 0)
 		return rgfxQueueDiesCase(argv[2]);
+	if (argc == 3 && std::strcmp(argv[1], "--residency-dies") == 0)
+		return rgfxResidencyDiesCase(argv[2]);
 	// A measurement, run by hand: the guest's share of a buffer's scheduling and completion
 	// (tests/queue_tests.mm).
 	if (argc >= 2 && std::strcmp(argv[1], "--queue-timing") == 0)
@@ -14937,7 +20771,10 @@ int main(int argc, char **argv)
 		test_device_buffers_take_pages_of_slabs();
 		test_managed_buffers_place_their_cpu_copies_in_heaps();
 		test_device_heaps_answer_as_metal();
+		test_textures_past_max_buffer_length_are_nil();
 		test_shared_heaps_and_cpu_depth_textures_end_the_process();
+		test_shared_heaps_on_an_apple_gpu();
+		test_depth_buffer_textures_as_an_apple_gpu();
 		test_second_buffer_is_monotonic();
 		test_wrapper_guards_and_base();
 		test_event_routing();
@@ -14950,16 +20787,25 @@ int main(int argc, char **argv)
 		test_mipmapped_buffer_texture_ends_the_process();
 		test_buffer_texture_types_end_the_process();
 		test_compressed_buffer_textures_answer_nil();
+		test_buffer_texture_buffers();
+		test_textures_past_a_buffers_allocation_answer_nil();
+		test_apple_textures_past_a_buffers_allocation_answer_nil();
+		test_buffer_texture_copies_past_the_length_reach_the_tail();
 		test_invalid_texture_descriptors_end_the_process();
 		test_texture_descriptor_validation_as_the_x86_macs();
+		test_texture_descriptor_validation_as_an_apple_gpu();
 		test_invalid_surface_textures_end_the_process();
+		test_surface_textures_as_an_apple_gpu();
 		test_unalignable_linear_formats_end_the_process();
+		test_linear_alignment_as_an_apple_gpu();
 		test_memoryless_icb_ends_the_process();
 		test_texture_views();
 		test_metal_ended_views_end_the_process();
+		test_views_as_an_apple_gpu();
 		test_function_encoder_of_no_buffer_ends_the_process();
 		test_texture_framebuffer_only();
 		test_texture_unknown_usage();
+		test_texture_usage_leaves_out_atomic();
 		test_view_keeps_its_texture();
 		test_texture_resource_ids();
 		test_sampler_routing();
@@ -14969,29 +20815,42 @@ int main(int argc, char **argv)
 		test_library_and_function_routing();
 		test_libraries_of_one_key_share_their_function_table();
 		test_render_pipeline_routing();
+		test_render_pipeline_private_state();
 		test_mesh_pipeline_routing();
 		test_mesh_pipeline_refusals();
 		test_invalid_mesh_descriptors_end_the_process();
+		test_compute_threadgroup_fields_as_metal();
+		test_compute_threadgroup_fields_end_the_process();
+		test_compute_threadgroup_fields_over_air();
 		test_compute_pipeline_routing();
+		test_metallib_linkage();
+		test_dynamic_library_routing();
+		test_compute_pipeline_libraries();
 		test_function_constants_resolve_as_metal();
 		test_async_creators_return_before_their_handlers();
 		test_async_creates_keep_what_they_use();
 		test_linked_function_specialised_on_the_wire();
 		test_core_image_extern_functions();
 		test_function_patch_answers();
+		test_overlapping_arguments_refused_as_metal();
+		test_function_constants_make_follows_no_body();
 		test_stitched_library_over_shadows();
+		test_stitch_over_specialised_functions();
 		test_stitched_dag_over_shadows();
 		test_library_air_arguments();
 		test_libraries_over_equal_bytes_share_their_air_reads();
 		test_source_compiles_through_metals_frontend();
 		test_function_array_library_holds_the_functions();
+		test_library_file_urls_as_metal();
 		test_package_libraries_answer_metals_refusals();
 		test_stitched_libraries_in_archives();
 		test_function_members_from_shadow();
 		test_unread_function_list_answers_from_shadow();
 		test_constants_without_cnst_resolve_from_air();
+		test_constants_carried_where_air_constants_do_not_read();
 		test_stitchable_reflection_from_air();
 		test_pipeline_reflection_from_air();
+		test_pipeline_reflection_before_macos13();
 		test_library_members_as_metal();
 		test_library_type_and_install_name();
 		test_command_graph();
@@ -15007,17 +20866,22 @@ int main(int argc, char **argv)
 		test_command_buffer_event_ops();
 		test_message_reserve();
 		test_parallel_sub_encoders_start_from_defaults();
+		test_gl_renderer_spi();
 		test_mesh_commands_follow_the_host();
 		test_parallel_sub_encoders_on_threads();
 		test_command_buffer_keeps_once();
 		test_resource_ids();
 		test_reply_reader_arm();
+		test_reply_reader_arms_once();
 		test_reply_reader_holds_submitted();
 		test_completion_thread_runs_handlers();
 		test_wait_with_the_completion_thread();
 		test_scheduled_before_completion();
 		test_present_drawable();
+		test_a_present_holds_the_queue_s_later_buffers_until_it_is_scheduled();
+		test_a_queue_that_presents_asks_for_its_buffers_submission();
 		test_submitted_before_scheduled();
+		test_waiting_asks_for_its_scheduling();
 		test_submitted_at_the_doorbell_wakes_no_thread();
 		test_wait_until_scheduled_pumps();
 		test_completion_thread_stops();
@@ -15030,6 +20894,7 @@ int main(int argc, char **argv)
 		test_managed_layout();
 		test_managed_buffer_range();
 		test_buffer_texture_replace_region_tells_the_host();
+		test_buffer_texture_replace_region_past_the_length_tells_the_length();
 		test_buffer_texture_slices();
 		test_buffer_texture_did_modify_data_tells_the_host();
 		test_buffer_texture_linear_alignment();
@@ -15042,7 +20907,9 @@ int main(int argc, char **argv)
 		test_region_memory_given_back_after_destroy();
 		test_iosurface_copy_block_after_destroys();
 		test_iosurface_shared_block();
+		test_iosurface_copy_waits_for_the_cpu_unlock();
 		test_iosurface_planes();
+		test_iosurface_texture_waits_for_a_view_being_made();
 		test_iosurface_cpu_access_in_the_texture_s_format();
 		test_iosurface_block_compressed_textures_are_made();
 		test_iosurface_writers();
@@ -15051,6 +20918,7 @@ int main(int argc, char **argv)
 		test_iosurface_full_records_take_this_process_s_slots();
 		test_iosurface_held_buffer_names_at_scheduling();
 		test_commit_order();
+		test_guest_times_where_the_queue_stamps();
 		test_commit_order_names_no_cycle();
 		test_iosurface_writes_named();
 		test_iosurface_writes_by_function();
@@ -15069,10 +20937,15 @@ int main(int argc, char **argv)
 		test_queue_ring_carries_only_command_buffers();
 		test_shared_heap_buffers_alias_its_bytes();
 		test_automatic_heap_places_as_metal();
+		test_rasterization_rate_map();
+		test_function_pointers();
+		test_rasterization_rate_map_deaths();
 		test_automatic_shared_heap_buffers_are_its_bytes();
 		test_managed_texture_copy_block_after_destroys();
 		test_no_copy_buffers();
 		test_no_copy_buffers_in_place();
+		test_no_copy_buffers_over_the_same_bytes_share_a_block();
+		test_no_copy_buffer_over_remapped_memory_takes_its_own_block();
 		test_no_copy_shadows_lie_in_slabs();
 		test_binds_note_shadow_writes();
 		test_block_call();
@@ -15080,10 +20953,14 @@ int main(int argc, char **argv)
 		rgfxArchiveTests();  // tests/archive_tests.mm
 		rgfxResourceTests(); // tests/resource_tests.mm
 		rgfxQueueTests(argv[0]); // tests/queue_tests.mm
+		rgfxResidencyTests(argv[0]); // tests/residency_tests.mm
 		rgfxCreateTests();        // tests/create_tests.mm
 		rgfxKnownPipelineTests(); // tests/known_pipeline_tests.mm
 		rgfxIcbTests();           // tests/icb_tests.mm
+		rgfxGLTests();            // tests/gl_tests.mm
+		rgfxClModeTests();        // tests/cl_mode_tests.mm
+		test_gl_function_encoder_ends_the_process();
 	}
-	std::printf("shell_tests: OK (%d checks)\n", g_checks);
+	std::printf("shell_tests: OK (%d checks)\n", g_checks.load());
 	return 0;
 }

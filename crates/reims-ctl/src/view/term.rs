@@ -5,7 +5,10 @@
 //! answers are read until the primary device attributes' (DA1), which every terminal answers and
 //! answers last, since terminals answer in order. A query the terminal does not know goes
 //! unanswered. Over SSH the queries reach the terminal itself; inside tmux they reach tmux, which
-//! answers for itself, so its sixel or half blocks are chosen there.
+//! answers for itself, so its sixel or half blocks are chosen there. On Windows the console
+//! answers some queries itself and passes the rest on to the terminal, and gives the answers as
+//! they were sent only while asked to (`os::terminal_answers`), which crossterm, reading the
+//! console's key records, is not.
 
 use std::io::Write;
 use std::time::{Duration, Instant};
@@ -67,6 +70,7 @@ const QUERIES: &[u8] = b"\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\\
 /// Asks the terminal, on stdout, and reads its answers from stdin, which must be the terminal
 /// in raw mode, for at most `timeout`.
 pub fn query(timeout: Duration) -> Caps {
+    let _answers = crate::os::terminal_answers();
     let mut out = std::io::stdout();
     if out.write_all(QUERIES).and_then(|_| out.flush()).is_err() {
         return Caps::default();
@@ -78,26 +82,14 @@ pub fn query(timeout: Duration) -> Caps {
         if left.is_zero() {
             break;
         }
-        let mut pfd = libc::pollfd {
-            fd: 0,
-            events: libc::POLLIN,
-            revents: 0,
-        };
-        // SAFETY: one pollfd, for stdin.
-        let n = unsafe { libc::poll(&mut pfd, 1, left.as_millis().max(1) as libc::c_int) };
-        if n <= 0 {
-            if n < 0 && std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                continue;
-            }
-            break;
-        }
         let mut chunk = [0u8; 1024];
-        // SAFETY: chunk holds its length in bytes.
-        let r = unsafe { libc::read(0, chunk.as_mut_ptr().cast(), chunk.len()) };
-        if r <= 0 {
-            break;
-        }
-        buf.extend_from_slice(&chunk[..r as usize]);
+        let r = match crate::os::read_terminal(&mut chunk, left) {
+            Ok(0) => break,
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        };
+        buf.extend_from_slice(&chunk[..r]);
         if parse(&buf).answered {
             break;
         }

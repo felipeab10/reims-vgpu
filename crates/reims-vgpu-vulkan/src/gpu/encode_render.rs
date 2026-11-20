@@ -206,11 +206,8 @@
 //!   draw takes nothing else here. A draw of an object or mesh threadgroup larger than the
 //!   state's maximum for its stage, or of another size than the one the state requires, dies at
 //!   the draw: Metal's validation stops it, and plain Metal's draw there is not measured
-//!   ([`threads_held`]). What a mesh draw may write through the buffers and textures bound to its
-//!   object and mesh stages is accounted for as a vertex or tile draw's is ([`Reach`]), a store
-//!   into a buffer on a surface whose GPU writes never reach its memory as a tile function's,
-//!   which nothing measured. `useHeaps:count:` and `useResources:count:usage:` reach the vertex
-//!   and fragment stages only, as below: what they reach of a mesh draw's stages on Metal is not
+//!   ([`threads_held`]). `useHeaps:count:` and `useResources:count:usage:` reach the vertex and
+//!   fragment stages only, as below: what they reach of a mesh draw's stages on Metal is not
 //!   measured.
 //! - **Executing an indirect command buffer** runs its draws, with the encoder's render state, as
 //!   their records stand when the command buffer is committed, or, for a buffer the GPU may have
@@ -239,10 +236,9 @@
 //!   fixed-point ones: a draw and an execution of indirect commands that is not empty relay it
 //!   there, and so does a tile dispatch, each dying in strict mode. A pass over a map made of a
 //!   `Mutable` descriptor, reset or not, that no draw of the guest's took the place of ends with
-//!   a draw of no vertices the guest did not encode, as the Metal platform's does, without which
-//!   the runtime fails the command buffer of one that nothing drew in as a GPU hang, as Metal's
-//!   GPU does ([`crate::gpu::rate_map::no_draw`]). A draw takes its place where the Metal
-//!   platform's does: one of at least one whole triangle of a triangle list or strip (3 vertices
+//!   a draw of no vertices the guest did not encode, without which the runtime fails the command
+//!   buffer of one that nothing drew in as a GPU hang, as Metal's GPU does
+//!   ([`crate::gpu::rate_map::no_draw`]). A draw takes its place: one of at least one whole triangle of a triangle list or strip (3 vertices
 //!   or more), once or more, that the runtime took, which it counts as the pass's draw call
 //!   ([`VulkanRenderEncoder::drew`]).
 //! - **What the runtime has no form for dies**: an index or a count past `u32`, a raw value no
@@ -252,38 +248,31 @@
 //!   ([`crate::gpu::resource::TextureObject::texels`]), and so are its refusals.
 
 use std::cell::{RefCell, RefMut};
-use std::collections::BTreeMap;
 use std::ops::Range;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
+use crate::core::platform::resource::RenderPipeline as _;
+use crate::core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::{Mutex, ReentrantMutex};
 use metal2vulkan::metal::{
     BarrierScope, CullMode, DepthClipMode, IndexType, PixelFormat, PrimitiveTopologyClass,
     PrimitiveType, RenderStages, ResourceUsage, TextureType, TriangleFillMode, Winding,
 };
 use metal2vulkan::pipeline::ColorAttachmentDescriptor;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder, VertexDraw, encode_each};
-use reims_vgpu_core::platform::resource::RenderPipeline as _;
-use reims_vgpu_core::platform::types::{MtlScissorRect, MtlSize, MtlViewport, NsRange};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
-use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 use crate::answer::{Policy, decide, get, metal_aborts, plain, plain_at, refused, unrepresentable};
 use crate::gpu::command::VulkanCommandBuffer;
 use crate::gpu::command::executions::{Execution, Points};
 use crate::gpu::desc::{Over, Source, Sources, VulkanRenderPassDescriptor};
 use crate::gpu::encode_blit::EncoderObject;
-use crate::gpu::icb::{Inherits, VulkanIcb};
+use crate::gpu::icb::VulkanIcb;
 use crate::gpu::rate_map::Class;
 use crate::gpu::resource::{MeshAnswers, RenderDescriptor, VulkanBuffer, VulkanTexture};
-use crate::gpu::writes::{
-    Bound, DRAWING_STAGES, FRAGMENT, Kept, MESH, OBJECT, RENDER_STAGES, Reflected, Reflection,
-    Slot, TILE, VERTEX, Whether,
-};
 use crate::gpu::{listed, metal_value, region, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -410,21 +399,23 @@ pub struct RenderEncoderObject {
     /// holds it ([`RenderEncoder::encoding`]), so each command's take inside the run is this
     /// thread's again, which no atomic operation takes.
     drawing: ReentrantMutex<RefCell<Drawing>>,
-    /// The pass the runtime's encoder was made of: the descriptor as core set it, with the rate
-    /// map [`open`] took, without the colour resolves [`untouched_resolves`] dropped and the
-    /// unused depth and stencil resolve textures [`without_unused_resolves`] removes. Its
-    /// attachments' store actions and resolve textures decide what a late setter does.
-    pass: rt::RenderPassDescriptor,
+    /// What a late setter reads of the pass the runtime's encoder was made of ([`PassStores`]).
+    pass: PassStores,
     /// The colour attachments whose resolves [`untouched_resolves`] dropped: a late resolve
     /// setter of one dies, and a late store action is compared with the descriptor's own; where
     /// there is one, a late depth or stencil resolve texture that may resolve dies
     /// ([`VulkanRenderEncoder::resolves_beside_dropped`]).
     dropped: Vec<Dropped>,
     /// The attachments whose store action the descriptor left `Unknown` and no late setter has
-    /// decided yet, each with why a resolve into the resolve texture it names now, the
-    /// descriptor's or a late resolve setter's, is never sent ([`Unsent`]): a late store action
-    /// that resolves into such a one dies ([`VulkanRenderEncoder::late_store`]).
-    undecided: Mutex<Vec<(Attachment, Option<Unsent>)>>,
+    /// decided yet, each with whether the resolve texture it names now, the descriptor's or a
+    /// late resolve setter's, lies over read-only memory the runtime copies
+    /// ([`crate::gpu::writes::texture_kept`]): a late store action that resolves into such a one
+    /// faults the command buffer, or dies ([`VulkanRenderEncoder::late_store`]).
+    undecided: Mutex<Vec<(Attachment, bool)>>,
+    /// The attachments of [`Self::undecided`] whose texture lies over read-only memory the
+    /// runtime copies: a late store action that keeps such a one ([`faults_over`]) fails the
+    /// command buffer as Metal's GPU faults it ([`VulkanRenderEncoder::read_only_stores`]).
+    read_only_undecided: Mutex<Vec<Attachment>>,
     /// The store action a late setter gave each attachment whose store action the descriptor
     /// left `Unknown`, the last one set: whether a late depth or stencil resolve texture beside a
     /// dropped colour resolve may resolve ([`VulkanRenderEncoder::resolves_beside_dropped`]).
@@ -442,13 +433,53 @@ pub struct RenderEncoderObject {
     /// ([`crate::gpu::rate_map::no_draw`]): set where the pass's rate map was made of a `Mutable`
     /// descriptor, until a draw of the guest's takes its place ([`VulkanRenderEncoder::drew`]).
     undrawn: AtomicBool,
-    /// Whether the reach of `drawing` holds nothing a draw asks of ([`Reach::quiet`]), so a draw, a tile
-    /// dispatch or an execution asks nothing of it ([`VulkanRenderEncoder::issues`]): set at
-    /// each bind.
-    quiet: AtomicBool,
     /// The pass's bfloat colour attachment it loads and stores, where it has one: a draw, an
     /// execution of render commands or a tile dispatch in the pass dies ([`bfloat_loaded`]).
     bfloat_loaded: Option<String>,
+}
+
+/// What the late setters of an encoder read of the pass it was made of, the descriptor as core
+/// set it, with the rate map [`open`] took, without the colour resolves [`untouched_resolves`]
+/// dropped and the unused depth and stencil resolve textures [`without_unused_resolves`]
+/// removes: each attachment's store action and options where it has a texture
+/// ([`VulkanRenderEncoder::stored`]), and whether each colour attachment has a resolve texture.
+/// The encoder holds no copy of the descriptor: the runtime's encoder holds its own, and with it
+/// the attachments' textures.
+#[derive(Debug, Clone, Copy)]
+struct PassStores {
+    /// The colour attachments' store actions and options, `None` for one without a texture.
+    color: [Option<(rt::StoreAction, rt::StoreActionOptions)>; rt::MAX_COLOR_ATTACHMENTS],
+    /// The depth attachment's.
+    depth: Option<(rt::StoreAction, rt::StoreActionOptions)>,
+    /// The stencil attachment's.
+    stencil: Option<(rt::StoreAction, rt::StoreActionOptions)>,
+    /// Whether each colour attachment has a resolve texture.
+    color_resolves: [bool; rt::MAX_COLOR_ATTACHMENTS],
+}
+
+impl PassStores {
+    /// What `d`'s late setters read.
+    fn of(d: &rt::RenderPassDescriptor) -> PassStores {
+        let stores =
+            |t: &Option<rt::Texture>, action, options| t.as_ref().map(|_| (action, options));
+        PassStores {
+            color: std::array::from_fn(|i| {
+                let c = &d.color_attachments[i];
+                stores(&c.texture, c.store_action, c.store_action_options)
+            }),
+            depth: {
+                let a = &d.depth_attachment;
+                stores(&a.texture, a.store_action, a.store_action_options)
+            },
+            stencil: {
+                let a = &d.stencil_attachment;
+                stores(&a.texture, a.store_action, a.store_action_options)
+            },
+            color_resolves: std::array::from_fn(|i| {
+                d.color_attachments[i].resolve_texture.is_some()
+            }),
+        }
+    }
 }
 
 /// What a render pipeline state tells the encoder that sets it of how its draws draw, read from
@@ -457,13 +488,6 @@ pub struct RenderEncoderObject {
 /// set reads none of it again.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct StateFacts {
-    /// Whether its vertex function writes any memory, its fragment, tile and object functions
-    /// write textures, and its mesh function writes any memory (the runtime's
-    /// `vertex_writes_memory`, `fragment_writes_textures`, `tile_writes_textures`,
-    /// `object_writes_textures`, and `vertex_writes_memory` again, which answers a mesh render
-    /// pipeline state's mesh function's), in [`VERTEX`] to [`MESH`] order ([`Reach::set`]). A
-    /// stage the state has no function of writes nothing.
-    writes: [bool; RENDER_STAGES],
     /// [`Marks::points_sized`].
     points_sized: bool,
     /// Whether it can encode indirect commands (the runtime's `can_encode_indirect_commands`).
@@ -478,23 +502,14 @@ impl StateFacts {
     /// What `state` tells.
     fn of(state: &crate::gpu::resource::RenderPipelineObject) -> StateFacts {
         let raw = &state.raw;
-        let colors = match state.reflection.descriptor() {
-            Some(Reflected::Render(RenderDescriptor::Render(d))) => Some(&d.color_attachments),
-            Some(Reflected::Render(RenderDescriptor::Mesh(m))) => {
-                Some(&m.descriptor.color_attachments)
-            }
+        let colors = match &state.descriptor {
+            Some(RenderDescriptor::Render(d)) => Some(&d.color_attachments),
+            Some(RenderDescriptor::Mesh(m)) => Some(&m.descriptor.color_attachments),
             _ => None,
         };
         let apart = colors.and_then(|c| half_apart(c, &plain(|| raw.fragment_color_outputs())));
         let mesh = state.mesh_answers().copied();
         plain(|| StateFacts {
-            writes: [
-                mesh.is_none() && raw.vertex_writes_memory(),
-                raw.fragment_writes_textures(),
-                raw.tile_writes_textures(),
-                raw.object_writes_textures(),
-                mesh.is_some() && raw.vertex_writes_memory(),
-            ],
             points_sized: raw.writes_point_size()
                 || state.input_primitive_topology == PrimitiveTopologyClass::Point,
             encodes: raw.can_encode_indirect_commands(),
@@ -529,8 +544,6 @@ struct Drawing {
     nil_pipeline: bool,
     /// What Metal's encoder holds of how its draws draw ([`Marks`]).
     marks: Marks,
-    /// What its draws may write through what it binds ([`Reach`]).
-    reach: Reach,
 }
 
 /// What the private setters left of how the encoder's draws draw, and what of the pipeline state
@@ -600,7 +613,7 @@ fn may_resolve(store: rt::StoreAction) -> bool {
     )
 }
 
-/// `d` without the depth and stencil resolve textures of an attachment without a texture whose
+/// Takes from `d` the depth and stencil resolve textures of an attachment without a texture whose
 /// store action leaves them unused: Metal resolves nothing into them (`render_pass_memoryless`'s
 /// unused resolve textures on depth and stencil), where the runtime refuses a resolve texture of
 /// an attachment without a texture as unmeasured. One beside a texture goes to the runtime,
@@ -608,7 +621,7 @@ fn may_resolve(store: rt::StoreAction) -> bool {
 /// (`unused_depth_and_stencil_resolves_leave_their_textures`), and so does a colour
 /// attachment's. Nothing else of the pass reads them: what Metal aborts at reads a depth or
 /// stencil resolve texture only under a store action that resolves ([`metal_aborts_at`]).
-fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDescriptor {
+fn without_unused_resolves(d: &mut rt::RenderPassDescriptor) {
     let unused = |a: &Option<rt::Texture>, store| a.is_none() && !may_resolve(store);
     if unused(&d.depth_attachment.texture, d.depth_attachment.store_action) {
         d.depth_attachment.resolve_texture = None;
@@ -619,7 +632,6 @@ fn without_unused_resolves(mut d: rt::RenderPassDescriptor) -> rt::RenderPassDes
     ) {
         d.stencil_attachment.resolve_texture = None;
     }
-    d
 }
 
 /// Whether the colour resolve of an attachment of `from` into a texture of `into` is the
@@ -662,7 +674,13 @@ fn runtime_resolves(from: PixelFormat, into: PixelFormat) -> bool {
 /// [`unmeasured_shape`] states; into `RGB10A2Unorm`, `BGR10A2Unorm`, `BGRA10_XR` or
 /// `BGRA10_XR_sRGB` it writes into the texture, measured from a Private 2D multisample texture of
 /// its own into a Shared single-level 2D texture of its own, both 16 by 16. `None` for any other
-/// pair.
+/// pair. The x86 Macs' GPUs write a resolve into `RGBA16Float` in every shape `oracle_surfresolve`
+/// asks, of its own or over an IOSurface (docs/graphics-kext/dgpu-oracle.md Q41: the Radeon Pro
+/// 5300M and the UHD Graphics 630, macOS 26.7.1), and make no texture of `BGR10_XR` or its
+/// `_sRGB` twin, at whose descriptor Metal's validation ends the process: where the M3 Max leaves
+/// the texture untouched the GPUs differ, and its answer, the drop ([`untouched_resolves`]), lies
+/// inside what Metal's GPUs do and costs nothing, as the runtime resolves into no other format
+/// (`ResolveFormat`).
 fn measured_pair(t: &rt::Texture, r: &rt::Texture) -> Option<Pair> {
     use PixelFormat as P;
     if !matches!(t.pixel_format(), P::BGRA8Unorm | P::BGRA8UnormSRGB) || t.sample_count() != 4 {
@@ -710,7 +728,16 @@ enum Pair {
 ///   not) of usage `ShaderRead` and `RenderTarget` (Shared and Private ones also of
 ///   `RenderTarget` alone, and with `ShaderWrite`, `PixelFormatView` or both), a Private
 ///   shareable one or one opened from its handle, or one over an IOSurface without planes
-///   (Shared or Managed, each also presented as a framebuffer-only drawable);
+///   (Shared or Managed, each also presented as a framebuffer-only drawable); and, 16 by 16,
+///   loaded by `Load` and drawn, one of its own or over an IOSurface without planes, over plane
+///   0 of a 128 by 16 `420v` surface or over plane 1 of a 128 by 32 one, each Shared, Managed or
+///   Private (`oracle_surfresolve`, docs/graphics-kext/dgpu-oracle.md Q41: m3-max-29682 and
+///   m3-max-29690, macOS 27.0.1). The guest's surfaces reach this platform as buffers that stand
+///   for them, a texture over a surface's plane made over its buffer
+///   (`new_texture_over_surface_plane`) in the storage mode the device picks, Private over a
+///   device cache, whatever the guest asked: the drop takes such a texture, over a surface
+///   without planes or a plane of one with planes ([`Over::Surface`], [`Over::Plane`]), of any
+///   of those storage modes. Any other texture over a buffer is a shape not measured;
 /// - in a pass beside no other attachment, a depth one (`Depth32Float`, memoryless and not
 ///   stored or Private and stored; `Depth32Float_Stencil8` as both depth and stencil attachment,
 ///   memoryless, or Private cleared or not loaded, and not stored), or another 4-sample colour
@@ -805,9 +832,8 @@ fn unmeasured_shape(
         ));
     }
     match (resolve.over(), r.storage_mode()) {
-        (Some(Over::Own), S::Shared | S::Managed | S::Private)
-        | (Some(Over::Shareable), S::Private)
-        | (Some(Over::Surface), S::Shared | S::Managed) => {}
+        (Some(Over::Own | Over::Surface | Over::Plane), S::Shared | S::Managed | S::Private)
+        | (Some(Over::Shareable), S::Private) => {}
         (over, storage) => {
             return Some(format!(
                 "the resolve texture is {} of storage mode {storage:?}",
@@ -953,24 +979,23 @@ struct Dropped {
     into: PixelFormat,
 }
 
-/// `d` without the colour resolves plain Metal leaves untouched ([`Fate::Dropped`], `sources`
+/// Takes from `d` the colour resolves plain Metal leaves untouched ([`Fate::Dropped`], `sources`
 /// holding the textures as core set them and `mapped` being the rate map the pass takes), and
-/// those attachments: each stores as its action does without the resolve, as plain Metal was
-/// measured to (`MultisampleResolve` as `DontCare`, which leaves the samples as they were, the
-/// pass drawn or not, and `StoreAndMultisampleResolve` as `Store`), and the resolve texture
-/// keeps its texels ([`unmeasured_shape`]). A late resolve setter of such an attachment dies, a
-/// late store action is compared with the descriptor's own ([`Dropped`]), and a late depth or
-/// stencil resolve texture of the pass that may resolve dies
+/// answers those attachments: each stores as its action does without the resolve, as plain
+/// Metal was measured to (`MultisampleResolve` as `DontCare`, which leaves the samples as they
+/// were, the pass drawn or not, and `StoreAndMultisampleResolve` as `Store`), and the resolve
+/// texture keeps its texels ([`unmeasured_shape`]). A late resolve setter of such an attachment
+/// dies, a late store action is compared with the descriptor's own ([`Dropped`]), and a late
+/// depth or stencil resolve texture of the pass that may resolve dies
 /// ([`VulkanRenderEncoder::resolves_beside_dropped`]). Each attachment's fate is decided on `d`
 /// as it is given, before any resolve is dropped.
 fn untouched_resolves(
-    mut d: rt::RenderPassDescriptor,
+    d: &mut rt::RenderPassDescriptor,
     sources: &Sources,
     mapped: PassMap,
-) -> (rt::RenderPassDescriptor, Vec<Dropped>) {
-    let drops: Vec<bool> = (0..d.color_attachments.len())
-        .map(|i| matches!(fate(&d, i, sources, mapped), Fate::Dropped))
-        .collect();
+) -> Vec<Dropped> {
+    let drops: [bool; rt::MAX_COLOR_ATTACHMENTS] =
+        std::array::from_fn(|i| matches!(fate(d, i, sources, mapped), Fate::Dropped));
     let mut dropped = Vec::new();
     for ((index, a), drop) in (0u32..).zip(&mut d.color_attachments).zip(drops) {
         if !drop {
@@ -989,7 +1014,7 @@ fn untouched_resolves(
             _ => rt::StoreAction::DontCare,
         };
     }
-    (d, dropped)
+    dropped
 }
 
 /// The first colour resolve of the pass `d` that dies ([`Fate::Dies`]), named, if any, `sources`
@@ -1005,87 +1030,141 @@ fn refused_resolve_format(
     })
 }
 
-/// The attachments of `d` with a texture whose store action is `Unknown`, each with `None`,
-/// which [`VulkanRenderEncoder::undecided_dropped`] sets where a resolve into its resolve texture
-/// is never sent ([`Unsent`]).
-fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, Option<Unsent>)> {
+/// The attachments of `d` with a texture whose store action is `Unknown`, each with `false`,
+/// which [`VulkanRenderEncoder::undecided_dropped`] sets where its resolve texture lies over
+/// read-only memory the runtime copies.
+fn undecided(d: &rt::RenderPassDescriptor) -> Vec<(Attachment, bool)> {
     let unknown = |t: &Option<rt::Texture>, store| t.is_some() && store == rt::StoreAction::Unknown;
     let colors = (0u32..).zip(&d.color_attachments);
     let mut out: Vec<_> = colors
         .filter(|(_, c)| unknown(&c.texture, c.store_action))
-        .map(|(i, _)| (Attachment::Color(i), None))
+        .map(|(i, _)| (Attachment::Color(i), false))
         .collect();
     if unknown(&d.depth_attachment.texture, d.depth_attachment.store_action) {
-        out.push((Attachment::Depth, None));
+        out.push((Attachment::Depth, false));
     }
     if unknown(
         &d.stencil_attachment.texture,
         d.stencil_attachment.store_action,
     ) {
-        out.push((Attachment::Stencil, None));
+        out.push((Attachment::Stencil, false));
     }
     out
 }
 
-/// Why a pass's write into a texture is never sent: the runtime imports its memory through a
-/// writable twin of read-only pages, where the write would land
-/// ([`crate::gpu::writes::kept_write`]), or it lies on a surface whose GPU writes never reach its
-/// memory ([`crate::os::dropped_write`]).
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Unsent {
-    /// Over memory the runtime imports through a writable twin of read-only pages.
-    Kept,
-    /// On a surface whose GPU writes never reach its memory.
-    Dropped,
-}
-
-impl Unsent {
-    /// Why a write into `t` is never sent, if it is not: the twin first, which the write would
-    /// reach.
-    fn of(t: &VulkanTexture) -> Option<Unsent> {
-        if crate::gpu::writes::texture_kept(t) {
-            Some(Unsent::Kept)
-        } else if t.gpu_read_only() {
-            Some(Unsent::Dropped)
-        } else {
-            None
-        }
-    }
-
-    /// Dies at `sel`, `what` naming a write into a texture, which the death names it lies in.
-    fn dies(self, sel: &'static str, what: &str) -> ! {
-        match self {
-            Unsent::Kept => crate::gpu::writes::kept_write(sel, &format!("{what} over")),
-            Unsent::Dropped => crate::os::dropped_write(sel, &format!("{what} on")),
-        }
-    }
-}
-
-/// What a pass of `d` may write in memory the runtime imports through a writable twin of
-/// read-only pages ([`crate::gpu::writes::kept_write`]), as `sources` says of its attachments: an
-/// attachment's texture, whatever the pass's load and store actions, as the runtime's GPU may
-/// write the texels of one it loads and stores unchanged, or whose store it does not care for,
-/// which Vulkan leaves undefined; or a resolve texture its known store action resolves into.
-/// `None` for none. A resolve texture of an attachment whose store action is `Unknown` is written
-/// only where a late store action resolves into it ([`VulkanRenderEncoder::late_store`]), and a
-/// visibility result buffer only where a mode is set ([`Reach::visibility`]).
+/// What a pass of `d` may write in read-only memory whose writes this platform does not answer
+/// as Metal's GPU does ([`crate::gpu::writes::kept_write`]), as `sources` says of its
+/// attachments: a depth attachment's `StoreAndMultisampleResolve` into a resolve texture over
+/// read-only memory the runtime copies beside a stencil attachment that resolves, or may yet
+/// ([`stencil_may_resolve`]), which the runtime faults where nothing measured Metal's GPU.
+/// `None` for none. Alone, that depth attachment is sent: the runtime stores it and drops its
+/// resolve, the resolve texture unchanged, as Metal's GPU completes it ([`faults_into`]).
+/// Another attachment over memory the runtime copies, and another resolve into such a texture,
+/// are answered by the store action, which may fault the command buffer as Metal's GPU does
+/// ([`faults_over`], [`faults_into`], [`VulkanRenderEncoder::read_only_stores`]). A colour or
+/// stencil attachment that the descriptor keeps by `CustomSampleDepthStore`, over any memory,
+/// goes to the runtime, which refuses it, so the pass dies at its making, as plain Metal ends the
+/// process in its descriptor's validation ("storeAction is not a valid MTLStoreAction",
+/// `abort()`), with bit 24 or without, on the M3 Max under macOS 27.0.1 and the Radeon Pro 5300M
+/// and UHD Graphics 630 under macOS 26.7.1 (m3-max-29292, m3-max-29293, m3-max-29294). A resolve
+/// texture of an attachment whose store action is `Unknown` is written only where a late store
+/// action resolves into it ([`VulkanRenderEncoder::late_store`]).
 fn kept_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'static str> {
     let (depth, stencil) = (&d.depth_attachment, &d.stencil_attachment);
-    let colors = d.color_attachments.iter().map(|a| a.store_action);
-    let stores = colors.chain([depth.store_action, stencil.store_action]);
+    let colors = (0u32..).zip(&d.color_attachments);
+    let colors = colors.map(|(i, a)| (Attachment::Color(i), a.store_action));
+    let stores = colors.chain([
+        (Attachment::Depth, depth.store_action),
+        (Attachment::Stencil, stencil.store_action),
+    ]);
     let held = (sources.color.iter()).chain([&sources.depth, &sources.stencil]);
-    for (store, [texture, resolve]) in stores.zip(held) {
-        if texture.writes_kept() {
-            return Some(
-                "a pass, which the runtime's GPU may write whatever its load and store actions, \
-                 whose attachment lies over",
-            );
-        }
-        if store.resolves() && resolve.writes_kept() {
-            return Some("a pass that resolves into a texture over");
+    let paired = stencil.texture.is_some() && stencil_may_resolve(stencil.store_action, None);
+    for ((attachment, store), [_, resolve]) in stores.zip(held) {
+        if paired && store.resolves() && resolve.writes_kept() && !faults_into(attachment, store) {
+            return Some(DEPTH_BESIDE_STENCIL);
         }
     }
     None
+}
+
+/// What [`crate::gpu::writes::kept_write`] says of a depth attachment's
+/// `StoreAndMultisampleResolve` into a texture over read-only memory beside a stencil attachment
+/// that resolves, or may yet ([`stencil_may_resolve`]).
+const DEPTH_BESIDE_STENCIL: &str = "a depth attachment's StoreAndMultisampleResolve, beside a \
+     stencil attachment that resolves or may yet, which nothing measured and the runtime faults, \
+     resolving into a texture over";
+
+/// Whether a stencil attachment of the store action `store`, or `late` where a late setter set
+/// it over `Unknown`, resolves or may yet ([`may_resolve`]). Beside it the runtime faults a depth
+/// attachment's `StoreAndMultisampleResolve` into read-only memory it copies, whose resolve it
+/// drops beside one that resolves nothing (the runtime's `store_out.rs`): a pairing nothing
+/// measured on Metal, as the stencil's resolve may pick its samples by the depth's, which dies
+/// ([`kept_attachment`], [`VulkanRenderEncoder::late_store`],
+/// [`VulkanRenderEncoder::late_resolve`]).
+fn stencil_may_resolve(store: rt::StoreAction, late: Option<rt::StoreAction>) -> bool {
+    match (store, late) {
+        (rt::StoreAction::Unknown, Some(late)) => may_resolve(late),
+        _ => may_resolve(store),
+    }
+}
+
+/// Whether a pass's store action `store` keeps an attachment's texels in its memory: `Store`, and
+/// `StoreAndMultisampleResolve`, which keeps a multisample primary, at which Metal's GPU faults
+/// the command buffer where the memory is read-only (`crate::gpu::writes`'s measurements).
+fn stores_out(store: rt::StoreAction) -> bool {
+    matches!(
+        store,
+        rt::StoreAction::Store | rt::StoreAction::StoreAndMultisampleResolve
+    )
+}
+
+/// Whether `attachment`'s store action `store` keeps its texels in its texture's memory where
+/// Metal's GPU faults the command buffer if that memory is read-only: [`stores_out`]'s actions,
+/// and a depth attachment's `CustomSampleDepthStore` (measured on the M3 Max, macOS 27.0.1, plain
+/// Metal, m3-max-28796 and m3-max-28797: a depth attachment in a heap of bit 24, by the
+/// descriptor's action or one the encoder set; the runtime's `store_out.rs`). A colour or stencil
+/// attachment's `CustomSampleDepthStore` keeps nothing: the descriptor's dies at the runtime's
+/// refusal, as plain Metal aborts there ([`kept_attachment`]), and a late one stores nothing, as
+/// the runtime and Metal's GPU take it as `DontCare` (m3-max-29292: the M3 Max completes it over a
+/// bit-24 buffer or heap, writing nothing; [`VulkanRenderEncoder::late_store`]).
+fn faults_over(attachment: Attachment, store: rt::StoreAction) -> bool {
+    stores_out(store)
+        || (attachment == Attachment::Depth && store == rt::StoreAction::CustomSampleDepthStore)
+}
+
+/// Whether `attachment`'s store action `store` resolves its texels into its resolve texture where
+/// Metal's GPU faults the command buffer if that texture's memory is read-only: a colour or
+/// stencil attachment's `MultisampleResolve` and `StoreAndMultisampleResolve`, and a depth
+/// attachment's `MultisampleResolve`, by the descriptor's action or a late one, into the
+/// descriptor's resolve texture or one a late resolve setter named (the setter's SPI, measured on
+/// the M3 Max for colour and depth). Measured on the M3 Max, macOS 27.0.1, plain Metal, a 4x
+/// multisample attachment resolving into a texture over a buffer of bit 24 (colour) or in a heap
+/// of bit 24 (depth and stencil), and the same over pages the process maps read-only without the
+/// bit: each fails the command buffer with `MTLCommandBufferErrorPageFault`, its signal firing and
+/// the pages unchanged, every run (m3-max-28796, m3-max-28797, m3-max-29292, m3-max-29309; the
+/// runtime's `store_out.rs`), as the runtime faults it itself. A depth attachment's
+/// `StoreAndMultisampleResolve` there does not fault: the M3 Max completes it (4 runs of 6, the
+/// other 2 failing with code 1, `kIOGPUCommandBufferCallbackErrorInnocentVictim`), the resolve
+/// texture unchanged, and the Radeon Pro 5300M and UHD Graphics 630 (macOS 26.7.1) complete it,
+/// writing it, 4 runs of 4 each (m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311); the
+/// runtime stores the attachment and drops the resolve, the texture unchanged, as the M3 Max
+/// leaves it, for every guest, so the pass is sent and completes, but beside a stencil attachment
+/// that resolves, where it dies ([`stencil_may_resolve`]). On those two x86 GPUs bit 24 changes
+/// nothing: every resolve writes the texture and completes.
+fn faults_into(attachment: Attachment, store: rt::StoreAction) -> bool {
+    use rt::StoreAction::{MultisampleResolve, StoreAndMultisampleResolve};
+    match attachment {
+        Attachment::Depth => store == MultisampleResolve,
+        Attachment::Color(_) | Attachment::Stencil => {
+            matches!(store, MultisampleResolve | StoreAndMultisampleResolve)
+        }
+    }
+}
+
+/// Whether `texture`, an attachment's, lies in read-only memory the runtime copies, dropping the
+/// GPU's writes ([`crate::gpu::writes::Kept::Copied`]).
+fn over_read_only_copy(texture: &Source) -> bool {
+    texture.writes_kept()
 }
 
 /// What [`metal_aborts`] says of a pass without attachments whose `defaultRasterSampleCount` is
@@ -1111,14 +1190,12 @@ fn stopped_default_samples(count: u64) -> String {
 /// `render_pass_memoryless_stencil_resolve`), and more programmable sample positions than a
 /// multisampled pass's samples (`render_pass_msaa`: 8 on a 4-sample pass).
 fn metal_aborts_at(d: &rt::RenderPassDescriptor) -> Option<&'static str> {
-    let textures: Vec<&rt::Texture> = d
-        .color_attachments
-        .iter()
+    let first = (d.color_attachments.iter())
         .filter_map(|c| c.texture.as_ref())
         .chain(d.depth_attachment.texture.as_ref())
         .chain(d.stencil_attachment.texture.as_ref())
-        .collect();
-    if textures.is_empty()
+        .next();
+    if first.is_none()
         && d.render_target_width != 0
         && d.render_target_height != 0
         && d.default_raster_sample_count == 0
@@ -1147,39 +1224,12 @@ fn metal_aborts_at(d: &rt::RenderPassDescriptor) -> Option<&'static str> {
             "a memoryless depth or stencil attachment resolving at one sample with no resolve texture",
         );
     }
-    let samples = textures
-        .first()
-        .map_or(d.default_raster_sample_count, |t| t.sample_count());
+    let samples = first.map_or(d.default_raster_sample_count, |t| t.sample_count());
     let positions = u64::try_from(d.sample_positions.len()).unwrap_or(u64::MAX);
     if samples > 1 && positions > samples {
         return Some("more programmable sample positions than the pass's samples");
     }
     None
-}
-
-/// What a pass of `d` writes in the memory of a surface whose GPU writes never reach it
-/// ([`crate::os::dropped_write`]), as `sources` says of its attachments: an attachment's
-/// texture, a resolve texture its known store action resolves into, or its visibility result
-/// buffer; `None` for none. A resolve texture of an attachment whose store action is `Unknown`
-/// is written only where a late store action resolves into it
-/// ([`VulkanRenderEncoder::late_store`]).
-fn dropped_attachment(d: &rt::RenderPassDescriptor, sources: &Sources) -> Option<&'static str> {
-    let (depth, stencil) = (&d.depth_attachment, &d.stencil_attachment);
-    let colors = d.color_attachments.iter().map(|a| a.store_action);
-    let stores = colors.chain([depth.store_action, stencil.store_action]);
-    let held = (sources.color.iter()).chain([&sources.depth, &sources.stencil]);
-    for (store, [texture, resolve]) in stores.zip(held) {
-        if texture.gpu_read_only() {
-            return Some("a pass whose attachment lies on");
-        }
-        if store.resolves() && resolve.gpu_read_only() {
-            return Some("a pass that resolves into a texture on");
-        }
-    }
-    let visibility = sources.visibility.as_ref();
-    visibility
-        .is_some_and(|b| b.gpu_read_only())
-        .then_some("a pass whose visibility result buffer lies on")
 }
 
 /// `id<MTLRenderCommandEncoder>`.
@@ -1199,22 +1249,20 @@ pub type VulkanRenderEncoder = Obj<RenderEncoderObject>;
 /// for the 32 by 32 tiles that none of the draws reach of a pass that loads a texture of
 /// rotation 4 and draws, which Metal keeps in place and the runtime lands mirrored as the others
 /// (`rotated-load-tiles`, [`crate::gpu::desc`]), so such a pass dies at `endEncoding`, naming
-/// the kind; a pass that draws nothing is Metal's. One whose attachment or resolve texture lies
-/// over memory the runtime imports through a writable twin of read-only pages dies first
-/// ([`kept_attachment`]).
-/// One whose attachment, resolve texture or visibility result buffer lies on a surface whose GPU
-/// writes never reach its memory dies ([`crate::os::dropped_write`]): Metal faults the command
-/// buffer of such a pass that stores what it cleared or drew, and completes one that stores
-/// nothing, or draws nothing. A clear to a NaN is the runtime's, which stores Metal's bits, and
-/// so is its resolve (`rgbx`'s `nan_clears_are_metals`).
-/// A colour attachment that resolves into a texture of another format the runtime refuses is
-/// made without the resolve where plain Metal was measured to leave the texture untouched, in
-/// the shapes measured ([`untouched_resolves`]), and dies naming both formats and what plain
-/// Metal was measured to do otherwise ([`refused_resolve_format`]), both decided by the rate map
-/// the pass takes, as it takes it; the pairs the runtime decides itself are its own
-/// ([`runtime_resolves`]). A resolve texture on
-/// a surface whose GPU writes never reach its memory dies as a dropped write before that, as no
-/// such pass was measured.
+/// the kind; a pass that draws nothing is Metal's. One whose depth attachment's
+/// `StoreAndMultisampleResolve` resolves into a texture over read-only memory the runtime copies
+/// beside a stencil attachment that resolves dies first ([`kept_attachment`]); alone, the runtime
+/// drops that resolve as Metal's GPU leaves the texture ([`faults_into`]). A resolve that Metal's
+/// GPU faults ([`faults_into`]), and one that stores an attachment over
+/// read-only memory the runtime copies (a depth attachment's `CustomSampleDepthStore` among
+/// them), fail the command buffer as Metal's GPU faults it
+/// ([`VulkanRenderEncoder::read_only_stores`]). A clear to a NaN is the runtime's, which stores
+/// Metal's bits, and so is its resolve (`rgbx`'s `nan_clears_are_metals`). A colour attachment that
+/// resolves into a texture of another format the runtime refuses is made without the resolve where
+/// plain Metal was measured to leave the texture untouched, in the shapes measured
+/// ([`untouched_resolves`]), and dies naming both formats and what plain Metal was measured to do
+/// otherwise ([`refused_resolve_format`]), both decided by the rate map the pass takes, as it takes
+/// it; the pairs the runtime decides itself are its own ([`runtime_resolves`]).
 pub(crate) fn open(
     command_buffer: &VulkanCommandBuffer,
     _on: OnFault,
@@ -1230,28 +1278,25 @@ pub(crate) fn open(
             ),
         );
     }
-    let (d, map) = descriptor.pass();
+    let (mut d, map) = descriptor.pass();
     let sources = descriptor.sources();
-    if crate::os::TWINS_READ_ONLY
+    if crate::os::COPIES_READ_ONLY
         && let Some(what) = kept_attachment(&d, &sources)
     {
         crate::gpu::writes::kept_write("renderCommandEncoderWithDescriptor:", what);
     }
-    if let Some(what) = dropped_attachment(&d, &sources) {
-        crate::os::dropped_write("renderCommandEncoderWithDescriptor:", what);
-    }
     // The colour resolves into a texture of another format, decided by the rate map the pass
     // takes, as it takes it.
-    let settled = |d: rt::RenderPassDescriptor, mapped: PassMap| {
-        if let Some(what) = refused_resolve_format(&d, &sources, mapped) {
+    let settled = |d: &mut rt::RenderPassDescriptor, mapped: PassMap| {
+        if let Some(what) = refused_resolve_format(d, &sources, mapped) {
             unrepresentable("renderCommandEncoderWithDescriptor:", &what);
         }
         untouched_resolves(d, &sources, mapped)
     };
     let made = match map {
         None => {
-            let (d, dropped) = settled(d, PassMap::Unmapped);
-            make(command_buffer, d, dropped, Taken::UNMAPPED)
+            let dropped = settled(&mut d, PassMap::Unmapped);
+            make(command_buffer, &mut d, dropped, Taken::UNMAPPED)
         }
         Some(map) => map.for_pass(command_buffer, |raw, class| {
             let mapped = match class {
@@ -1259,20 +1304,18 @@ pub(crate) fn open(
                 Class::NoLayers | Class::Identity => PassMap::Identity,
                 Class::Varying => PassMap::Varying,
             };
-            let (mut d, dropped) = settled(d, mapped);
+            let dropped = settled(&mut d, mapped);
             d.rasterization_rate_map = Some(raw);
             let taken = Taken {
                 class: Some(class),
                 mutable: map.is_mutable(),
             };
-            make(command_buffer, d, dropped, taken)
+            make(command_buffer, &mut d, dropped, taken)
         }),
     };
     if let Ok(Some(e)) = &made {
         e.undecided_dropped(&sources);
-        let visibility = (sources.visibility.as_ref())
-            .map_or(Kept::No, |b| crate::gpu::writes::buffer_bound(b).kept);
-        plain(|| e.drawing.lock().borrow_mut().reach.visibility = visibility);
+        e.read_only_stores(&sources);
     }
     made
 }
@@ -1319,345 +1362,6 @@ fn answers_nil(d: &rt::RenderPassDescriptor) -> bool {
         && (d.render_target_width == 0 || d.render_target_height == 0)
 }
 
-/// What a render command binds or makes resident, by the host memory of each object it names,
-/// which a draw may write through ([`Reach`]): a slot's object read as it is bound
-/// ([`crate::gpu::writes::buffer_bind`], [`crate::gpu::writes::texture_bind`]).
-enum Bind<'a> {
-    /// A buffer bound to a stage ([`VERTEX`] to [`MESH`]) at a slot.
-    Buffer(usize, u64, Option<&'a VulkanBuffer>),
-    /// A texture bound to a stage at a slot.
-    Texture(usize, u64, Option<&'a VulkanTexture>),
-    /// Buffers bound to a stage from a slot.
-    Buffers(usize, u64, &'a [Option<&'a VulkanBuffer>]),
-    /// Textures bound to a stage from a slot.
-    Textures(usize, u64, &'a [Option<&'a VulkanTexture>]),
-    /// The textures among resources made resident, the buffers among them, and whether they
-    /// were made resident with write usage, with any of them lying in any memory.
-    Used(Vec<Bound>, Vec<Bound>, bool),
-}
-
-/// What `cmd` binds or makes resident ([`Bind`]); `None` for any other command.
-fn binds<'a>(cmd: &RenderCmd<'a, VulkanPlatform>) -> Option<Bind<'a>> {
-    use crate::gpu::writes::{buffer_bound, texture_bound};
-    Some(match *cmd {
-        RenderCmd::SetFragmentBuffer {
-            buffer: b, index, ..
-        } => Bind::Buffer(FRAGMENT, index, b),
-        RenderCmd::SetVertexBuffer {
-            buffer: b, index, ..
-        } => Bind::Buffer(VERTEX, index, b),
-        RenderCmd::SetFragmentBuffers {
-            buffers: list,
-            range,
-            ..
-        } => Bind::Buffers(FRAGMENT, range.location, list),
-        RenderCmd::SetObjectBuffers {
-            buffers: list,
-            range,
-            ..
-        } => Bind::Buffers(OBJECT, range.location, list),
-        RenderCmd::SetMeshBuffers {
-            buffers: list,
-            range,
-            ..
-        } => Bind::Buffers(MESH, range.location, list),
-        RenderCmd::SetTileBuffers {
-            buffers: list,
-            range,
-            ..
-        } => Bind::Buffers(TILE, range.location, list),
-        RenderCmd::SetVertexBuffers {
-            buffers: list,
-            range,
-            ..
-        }
-        | RenderCmd::SetVertexBuffersAttributeStrides {
-            buffers: list,
-            range,
-            ..
-        } => Bind::Buffers(VERTEX, range.location, list),
-        RenderCmd::SetFragmentTexture { texture: t, index } => Bind::Texture(FRAGMENT, index, t),
-        RenderCmd::SetFragmentTextures {
-            textures: list,
-            range,
-        } => Bind::Textures(FRAGMENT, range.location, list),
-        RenderCmd::SetObjectTextures {
-            textures: list,
-            range,
-        } => Bind::Textures(OBJECT, range.location, list),
-        RenderCmd::SetMeshTextures {
-            textures: list,
-            range,
-        } => Bind::Textures(MESH, range.location, list),
-        RenderCmd::SetTileTextures {
-            textures: list,
-            range,
-        } => Bind::Textures(TILE, range.location, list),
-        RenderCmd::SetVertexTextures {
-            textures: list,
-            range,
-        } => Bind::Textures(VERTEX, range.location, list),
-        RenderCmd::UseResources { resources, usage }
-        | RenderCmd::UseResourcesStages {
-            resources, usage, ..
-        } => {
-            let write = usage & u64::from(ResourceUsage::WRITE.as_raw()) != 0;
-            let textures: Vec<_> = (resources.iter().flatten())
-                .filter_map(|r| match r {
-                    ResourceRef::Texture(t) => Some(texture_bound(t)),
-                    _ => None,
-                })
-                .collect();
-            let buffers: Vec<_> = (resources.iter().flatten())
-                .filter_map(|r| match r {
-                    ResourceRef::Buffer(b) => Some(buffer_bound(b)),
-                    _ => None,
-                })
-                .collect();
-            let any = textures.iter().chain(&buffers).any(|m| m.meets);
-            Bind::Used(textures, buffers, write && any)
-        }
-        _ => return None,
-    })
-}
-
-/// What a pass's draws may write through what it binds and made resident: the host memory of
-/// the buffers and textures bound at each stage's slots, of the textures made resident with
-/// write usage, and the pipeline state's facts of which slots its functions write. A draw, a
-/// tile dispatch or an execution reads it ([`Reach::unsent`]). It holds only the binds that can
-/// decide what a draw asks ([`matters`]), each distinct one made resident once, so a draw asks
-/// nothing of the objects of plain memory every pass binds, and a pass that makes the same
-/// resources resident before each draw holds them once.
-#[derive(Debug, Default)]
-struct Reach {
-    /// Each stage's buffers by slot, in [`VERTEX`] to [`MESH`] order.
-    buffers: [BTreeMap<u64, Bound>; RENDER_STAGES],
-    /// Each stage's textures by slot.
-    textures: [BTreeMap<u64, Bound>; RENDER_STAGES],
-    /// The textures made resident with write usage, each distinct one once, in the order first
-    /// made resident.
-    used_textures: Vec<Bound>,
-    /// The buffers made resident with write usage, likewise.
-    used_buffers: Vec<Bound>,
-    /// Whether the pass's visibility result buffer lies over memory the runtime imports through
-    /// a writable twin of read-only pages: a mode other than `Disabled` dies, as the pass writes
-    /// a result at its offset, a draw after it or not ([`crate::gpu::writes::kept_write`]).
-    visibility: Kept,
-    /// The reflection of the pipeline state set, which this holds as Metal's encoder holds the
-    /// state, and whether its functions write textures, which tells which texture slots they
-    /// may write where its slot writes cannot: the vertex and mesh functions' where they write
-    /// any memory, and the fragment, tile and object functions' where they write textures.
-    pipeline: Option<(Arc<Reflection>, [bool; RENDER_STAGES])>,
-}
-
-/// Whether a bind's `m` can decide what a draw asks of it ([`Reach::kept`], [`Reach::unsent`]):
-/// it lies over memory the runtime imports through a writable twin of read-only pages, on a
-/// surface whose GPU writes never reach its memory, or is a texture whose writes the runtime
-/// refuses. A draw asks nothing of any other.
-fn matters(m: &Bound) -> bool {
-    !matches!(m.kept, Kept::No) || m.dropped || m.refused.is_some()
-}
-
-/// Whether a slot's bind of `m` is held by the reach ([`Reach::bind_one`]): it lies in memory
-/// and decides something ([`matters`]). A slot bound to anything else is empty.
-fn slot_decides(m: &Bound) -> bool {
-    m.meets && matters(m)
-}
-
-/// Whether `bind` decides something in a reach that holds nothing ([`Reach::quiet`]): an object
-/// it binds at a slot does ([`slot_decides`]), or it makes resident for writing one that matters
-/// ([`matters`]). A buffer [`buffer_bind`] reads nothing of decides nothing, and its default
-/// [`Bound`] is not made.
-///
-/// [`buffer_bind`]: crate::gpu::writes::buffer_bind
-fn quiet_bind_decides(bind: &Bind<'_>) -> bool {
-    use crate::gpu::writes::{buffer_bind_reads, buffer_bound, texture_bind};
-    let buffer = |b: Option<&VulkanBuffer>| {
-        b.is_some_and(|b| buffer_bind_reads(b) && slot_decides(&buffer_bound(b)))
-    };
-    let texture = |t: Option<&VulkanTexture>| t.is_some_and(|t| slot_decides(&texture_bind(t)));
-    match bind {
-        Bind::Buffer(_, _, b) => buffer(*b),
-        Bind::Texture(_, _, t) => texture(*t),
-        Bind::Buffers(_, _, list) => list.iter().any(|&b| buffer(b)),
-        Bind::Textures(_, _, list) => list.iter().any(|&t| texture(t)),
-        Bind::Used(textures, buffers, write) => {
-            *write && textures.iter().chain(buffers).any(matters)
-        }
-    }
-}
-
-/// Whether a draw's write through `m` is never sent where it lies on a surface whose GPU writes
-/// never reach its memory, or into a texture whose writes the runtime refuses
-/// ([`VulkanRenderEncoder::issues`]).
-fn unsendable(m: &Bound) -> bool {
-    m.dropped || m.refused.is_some()
-}
-
-impl Reach {
-    /// `m`, of one object, bound to `stage`'s buffer slot (`buffers`) or texture slot `slot`. A
-    /// slot that holds an equal `m` already is left as it is, as each draw binds its objects anew;
-    /// one of no memory, or that decides nothing ([`matters`]), empties the slot.
-    fn bind_one(&mut self, stage: usize, buffers: bool, slot: u64, m: Bound) {
-        let slots = if buffers {
-            &mut self.buffers[stage]
-        } else {
-            &mut self.textures[stage]
-        };
-        if !slot_decides(&m) {
-            slots.remove(&slot);
-        } else if slots.get(&slot) != Some(&m) {
-            slots.insert(slot, m);
-        }
-    }
-
-    /// `textures` and `buffers` made resident with write usage: those that decide something
-    /// ([`matters`]), each not held already.
-    fn used(&mut self, textures: Vec<Bound>, buffers: Vec<Bound>) {
-        for (list, held) in [
-            (textures, &mut self.used_textures),
-            (buffers, &mut self.used_buffers),
-        ] {
-            for m in list.into_iter().filter(matters) {
-                if !held.contains(&m) {
-                    held.push(m);
-                }
-            }
-        }
-    }
-
-    /// The pipeline state of `reflection` set, whose functions write as `writes` says
-    /// ([`StateFacts::writes`]).
-    fn set(&mut self, reflection: &Arc<Reflection>, writes: [bool; RENDER_STAGES]) {
-        self.pipeline = Some((Arc::clone(reflection), writes));
-    }
-
-    /// Whether it holds nothing a draw asks of: no bind at a slot and nothing made resident that
-    /// decides anything ([`matters`]), so [`Self::kept`] and [`Self::unsent_dropped`] find
-    /// nothing, whatever the pipeline state. Most passes bind only plain memory, and stay so.
-    fn quiet(&self) -> bool {
-        (self.buffers.iter().chain(&self.textures)).all(BTreeMap::is_empty)
-            && self.used_textures.is_empty()
-            && self.used_buffers.is_empty()
-    }
-
-    /// Whether a texture bound or made resident for writing, or a buffer bound to the tile,
-    /// object or mesh stage, lies on a surface whose GPU writes never reach its memory
-    /// ([`crate::os::gpu_read_only`]), or is a texture whose writes the runtime refuses. A vertex
-    /// or fragment function's stores into a buffer on one are dropped, as on Metal, and are sent
-    /// ([`crate::os::dropped_write`]); an object or mesh function's, which nothing measured, are
-    /// not, as a tile function's.
-    fn unsent_dropped(&self) -> bool {
-        let unsent_buffers = [TILE, OBJECT, MESH].map(|stage| &self.buffers[stage]);
-        let bound = (self.textures.iter().chain(unsent_buffers)).flat_map(BTreeMap::values);
-        bound.chain(&self.used_textures).any(unsendable)
-    }
-
-    /// What a draw, a tile dispatch, or an execution whose commands take `inherits` of the
-    /// encoder, may write that is never sent where it lies on a surface whose GPU writes never
-    /// reach its memory, or into a texture whose writes the runtime refuses ([`unsendable`],
-    /// [`VulkanRenderEncoder::issues`]): the textures made resident with write usage, then the
-    /// textures bound at the slots the pipeline state's functions write, and, but for an
-    /// execution, whose commands run no tile, object or mesh function, the buffers bound at the
-    /// slots those functions write.
-    fn unsent(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
-        let used = (self.used_textures.iter()).filter(|m| unsendable(m));
-        let mut written: Vec<_> = used.map(|m| (Whether::Writes, m.clone())).collect();
-        let own = inherits.is_none();
-        let buffers = [false, false, own, own, own];
-        written.extend(self.at_slots(inherits, buffers, unsendable));
-        written
-    }
-
-    /// How a draw, a tile dispatch, or an execution whose commands take `inherits` of the encoder,
-    /// writes through an object over memory the runtime imports through a writable twin of
-    /// read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture or buffer
-    /// made resident with write usage, and, as [`Self::at_slots`] reads them, a texture bound at
-    /// a slot a function writes and a buffer bound at one, of every stage, but for an execution,
-    /// whose commands run no tile, object or mesh function and take the encoder's buffers only
-    /// where they inherit them. `None` where it writes none.
-    fn kept(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        let mut used = (self.used_textures.iter()).chain(&self.used_buffers);
-        if used.any(|m| m.kept.holds()) {
-            return Some(Whether::Writes);
-        }
-        let (buffers, own) = (inherits.is_none_or(|i| i.buffers), inherits.is_none());
-        let slots = self.at_slots(inherits, [buffers, buffers, own, own, own], |m| {
-            m.kept.holds()
-        });
-        slots.into_iter().map(|(w, _)| w).find(Whether::holds)
-    }
-
-    /// What a draw, or an execution whose commands take `inherits` of the encoder, may write at the
-    /// stages' slots of the objects `wanted` picks, one entry an object, with whether it does: the
-    /// textures bound at the slots the pipeline state's functions may store through, by its slot
-    /// writes, and the buffers too at the stages `buffers` names, in [`VERTEX`] to [`MESH`] order,
-    /// of the stages the state has functions of ([`Reflection::stages`]: a mesh render pipeline
-    /// state's object, mesh and fragment stages, any other's vertex, fragment and tile stages).
-    /// Only a slot they answer the function cannot store through is unwritten: a read-only buffer's
-    /// bind at one draws, whatever else the function declares. Where they cannot tell, for the
-    /// state or for a slot an undetermined argument may cover, a function may write the buffer
-    /// slot, as a kernel may, a vertex or mesh function that writes memory the texture slot, and a
-    /// fragment, tile or object function that writes textures the texture slot. A vertex or mesh
-    /// function that writes no memory, by the runtime's translation of it (its
-    /// `vertex_writes_memory`), writes no slot of its stage, whatever its slot writes answer of an
-    /// argument: they answer that a `device` pointer that is not `const` may be stored through,
-    /// stored through or not. An execution whose commands run pipeline states of their own, which
-    /// no reflection here tells, writes every bound buffer it takes, and no bound texture: Metal
-    /// makes no state that supports indirect command buffers of a function with a texture argument,
-    /// and such commands reach a texture only through an argument buffer, whose textures are made
-    /// resident. Measured on the M3 Max (macOS 26.7): `supportIndirectCommandBuffers` with a
-    /// vertex, fragment or kernel function taking a texture to read, sample or write answers no
-    /// state ("Fragment shader cannot be used with indirect command buffers"), with one taking
-    /// buffers or an argument buffer of a texture a state; an execution that inherits a state made
-    /// without it, of such a function, faults its command buffer (`PageFault`), the texture bound
-    /// unwritten.
-    fn at_slots(
-        &self,
-        inherits: Option<Inherits>,
-        buffers: [bool; RENDER_STAGES],
-        wanted: fn(&Bound) -> bool,
-    ) -> Vec<(Whether, Bound)> {
-        let mut written = Vec::new();
-        let state = match inherits {
-            Some(i) if !i.pipeline => None,
-            _ => match &self.pipeline {
-                Some(p) => Some(p),
-                // No state for the draw, which the runtime refuses.
-                None => return written,
-            },
-        };
-        let stages = state.map_or(DRAWING_STAGES, |(reflection, _)| reflection.stages());
-        for &stage in stages {
-            if matches!(stage, VERTEX | MESH) && state.is_some_and(|(_, facts)| !facts[stage]) {
-                continue;
-            }
-            let at = |texture: bool, slot: u64| match state {
-                Some((reflection, facts)) => Whether::Slot(
-                    Arc::clone(reflection),
-                    Slot {
-                        stage,
-                        texture,
-                        slot,
-                        untold: !texture || facts[stage],
-                    },
-                ),
-                None => Whether::Writes,
-            };
-            let held = [
-                (false, &self.buffers[stage], buffers[stage]),
-                (true, &self.textures[stage], state.is_some()),
-            ];
-            for (texture, slots, _) in held.into_iter().filter(|&(.., on)| on) {
-                for (&slot, m) in slots.iter().filter(|(_, m)| wanted(m)) {
-                    written.push((at(texture, slot), m.clone()));
-                }
-            }
-        }
-        written
-    }
-}
-
 /// What a pass took of its rate map as [`open`] took it ([`crate::gpu::rate_map::Class`]).
 #[derive(Debug, Clone, Copy)]
 struct Taken {
@@ -1680,13 +1384,14 @@ impl Taken {
 /// work for Metal's tiler ([`crate::gpu::command::CommandBufferObject::tiler_work`]).
 fn make(
     command_buffer: &VulkanCommandBuffer,
-    d: rt::RenderPassDescriptor,
+    d: &mut rt::RenderPassDescriptor,
     dropped: Vec<Dropped>,
     taken: Taken,
 ) -> RaiseResult<Option<VulkanRenderEncoder>> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let d = without_unused_resolves(d);
-    match plain_at(sel, || command_buffer.raw.render_command_encoder(&d)) {
+    without_unused_resolves(d);
+    let d = &*d;
+    match plain_at(sel, || command_buffer.raw.render_command_encoder(d)) {
         Ok(raw) => {
             command_buffer.tiler_work(sel, crate::gpu::metal_space::FirstUse::RenderEncoder);
             opened(command_buffer, raw, (d, dropped), taken).map(Some)
@@ -1694,14 +1399,14 @@ fn make(
         Err(rt::Error::Nil(n))
             if n.problem == rt::Problem::RenderPass(rt::RenderPassProblem::NoTargets) =>
         {
-            debug_assert!(answers_nil(&d), "a nil pass answers_nil missed");
+            debug_assert!(answers_nil(d), "a nil pass answers_nil missed");
             Ok(None)
         }
         Err(rt::Error::Invalid(i)) if i.problem == rt::Problem::EncoderOpen => metal_aborts(
             sel,
             "a command buffer with an open encoder (\"with uncommitted encoder\")",
         ),
-        Err(e) => match metal_aborts_at(&d) {
+        Err(e) => match metal_aborts_at(d) {
             Some(what) => metal_aborts(sel, what),
             None => match e {
                 // What plain Metal answers its encoder nil for: a tile size, per-sample storage,
@@ -1740,7 +1445,7 @@ fn make(
                 }
                 e => {
                     if crate::gpu::desc::is_format_refusal(&e) {
-                        crate::gpu::ycbcr::pass_refused(sel, &d, &e);
+                        crate::gpu::ycbcr::pass_refused(sel, d, &e);
                     }
                     decide(sel, Policy::Dies, e)
                 }
@@ -1751,31 +1456,29 @@ fn make(
 
 /// The encoder of the runtime's `raw`, just made on `command_buffer` of the pass `d`, without its
 /// unused resolves ([`without_unused_resolves`]) and the colour resolves `dropped` lists
-/// ([`untouched_resolves`]). It is in its handle before anything can
-/// stop this thread: a thread of an isolated task that ended stops at the next send with the
-/// encoder open, as Metal's is left, where the runtime's encoder dropped as it unwinds would
-/// abandon the command buffer. What Metal aborts at in the pass dies then.
+/// ([`untouched_resolves`]). What Metal aborts at in the pass dies then.
 fn opened(
     command_buffer: &VulkanCommandBuffer,
     raw: rt::RenderCommandEncoder,
-    (d, dropped): (rt::RenderPassDescriptor, Vec<Dropped>),
+    (d, dropped): (&rt::RenderPassDescriptor, Vec<Dropped>),
     taken: Taken,
 ) -> RaiseResult<VulkanRenderEncoder> {
     let sel = "renderCommandEncoderWithDescriptor:";
-    let aborts = metal_aborts_at(&d);
+    let aborts = metal_aborts_at(d);
+    let pass = PassStores::of(d);
     let e = Obj::new(RenderEncoderObject {
         encoder: EncoderObject::new(raw, command_buffer),
         drawing: ReentrantMutex::new(RefCell::new(Drawing::default())),
-        undecided: Mutex::new(undecided(&d)),
+        undecided: Mutex::new(undecided(d)),
+        read_only_undecided: Mutex::new(Vec::new()),
         late_stores: Mutex::new(Vec::new()),
         no_layers: taken.class == Some(Class::NoLayers),
         dropped,
         rasterizes: taken.class != Some(Class::Unset),
         varying_rates: taken.class == Some(Class::Varying),
         undrawn: AtomicBool::new(taken.mutable),
-        quiet: AtomicBool::new(true),
-        bfloat_loaded: bfloat_loaded(&d),
-        pass: d,
+        bfloat_loaded: bfloat_loaded(d),
+        pass,
     });
     if let Some(what) = aborts {
         metal_aborts(sel, what);
@@ -2024,98 +1727,6 @@ fn draw_primitives(
 }
 
 impl VulkanRenderEncoder {
-    /// `bind`, of a command: what a draw may write through what it binds or makes resident is
-    /// read at the draw ([`Reach`]).
-    fn bound(&self, bind: Bind<'_>) {
-        // A bind into a reach that holds nothing ([`Reach::quiet`]) of objects that decide
-        // nothing there leaves it as it is: `bind_one` would empty slots already empty, and
-        // `used` keeps none of them. Most binds are such, of plain memory, a draw's among them,
-        // and they take no lock. The check reaches the runtime only through `buffer_bind` and
-        // `texture_bind`'s own calls, as the bind does, after the task's end is checked where
-        // `plain` checked it; one whose objects decide something binds as before.
-        stop_if_task_ended();
-        if self.quiet.load(Ordering::Acquire) && !quiet_bind_decides(&bind) {
-            return;
-        }
-        self.bind_reach(bind);
-    }
-
-    /// `bind` into the reach, the rest of [`Self::bound`]: out of line, as most binds end
-    /// before it.
-    #[inline(never)]
-    fn bind_reach(&self, bind: Bind<'_>) {
-        use crate::gpu::writes::{buffer_bind, texture_bind};
-        let buffer = |b: Option<&VulkanBuffer>| b.map(|b| buffer_bind(b)).unwrap_or_default();
-        let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bind(t)).unwrap_or_default();
-        plain(|| {
-            let locked = self.drawing.lock();
-            let mut drawing = locked.borrow_mut();
-            let reach = &mut drawing.reach;
-            match bind {
-                Bind::Buffer(stage, slot, b) => reach.bind_one(stage, true, slot, buffer(b)),
-                Bind::Texture(stage, slot, t) => reach.bind_one(stage, false, slot, texture(t)),
-                // A list binds from `first` to the last slot a `u64` names: a slot past `u32`,
-                // which the runtime cannot hold, dies at the command's selector after it
-                // ([`small`]).
-                Bind::Buffers(stage, first, list) => {
-                    for (slot, &b) in (first..=u64::MAX).zip(list) {
-                        reach.bind_one(stage, true, slot, buffer(b));
-                    }
-                }
-                Bind::Textures(stage, first, list) => {
-                    for (slot, &t) in (first..=u64::MAX).zip(list) {
-                        reach.bind_one(stage, false, slot, texture(t));
-                    }
-                }
-                Bind::Used(textures, buffers, true) => reach.used(textures, buffers),
-                Bind::Used(_, _, false) => {}
-            }
-            self.quiet.store(reach.quiet(), Ordering::Release);
-        });
-    }
-
-    /// Dies at `sel`, a draw, a tile dispatch or an execution the encoder issues, `inherits` what
-    /// its commands take of the encoder, where it may write the memory of a surface whose GPU
-    /// writes never reach it through a texture, one the pass binds at a slot a function writes,
-    /// by its slot writes, or one made resident for writing, or through a buffer the tile function
-    /// writes, which nothing measured ([`Reach::unsent`], [`crate::os::dropped_write`]), naming
-    /// how ([`Whether::through`]). A vertex or fragment function's stores into a buffer on such a
-    /// surface are sent, and dropped as on Metal. Before that, it dies where it may write through
-    /// an object over memory the runtime imports through a writable twin of read-only pages,
-    /// whose pages the write would reach ([`Reach::kept`], [`crate::gpu::writes::kept_write`]).
-    /// One that issues nothing, which Metal writes nothing of, is not asked. A pass that holds
-    /// nothing a draw asks of ([`Reach::quiet`]) finds nothing, so its draws only check the
-    /// task's end, where the lookup would have.
-    fn issues(&self, sel: &'static str, inherits: Option<Inherits>) {
-        if self.quiet.load(Ordering::Acquire) {
-            stop_if_task_ended();
-            return;
-        }
-        let (kept, written) = plain(|| {
-            let locked = self.drawing.lock();
-            let drawing = locked.borrow();
-            let reach = &drawing.reach;
-            let kept = (crate::os::TWINS_READ_ONLY)
-                .then(|| reach.kept(inherits))
-                .flatten();
-            let written =
-                (kept.is_none() && reach.unsent_dropped()).then(|| reach.unsent(inherits));
-            (kept, written)
-        });
-        if let Some(whether) = kept {
-            let what = format!("a draw's write through {}, into", whether.through());
-            crate::gpu::writes::kept_write(sel, &what);
-        }
-        let hit = (written.iter().flatten()).find(|(w, m)| unsendable(m) && w.holds());
-        if let Some((whether, m)) = hit {
-            let what = format!("a draw's write through {}", whether.through());
-            match m.refused.filter(|_| !m.dropped) {
-                None => crate::os::dropped_write(sel, &format!("{what}, on")),
-                Some(pf) => crate::gpu::ycbcr::refused_write(sel, &format!("{what}, into"), pf),
-            }
-        }
-    }
-
     /// Runs `call` on the open encoder for `sel`: a refusal dies at the send, naming the
     /// runtime's error, as Metal raises at none of these commands.
     fn run(&self, sel: &'static str, call: Call<'_>) -> RaiseResult<()> {
@@ -2173,17 +1784,15 @@ impl VulkanRenderEncoder {
     /// drawing, which encodes nothing.
     ///
     /// What the draw asks of the encoder's state ([`Held`]) is read once, at its start: none of
-    /// its checks changes it. Each check that read it alone checks the task's end still, where it
-    /// did, so a thread of an isolated task that ended stops at the same places.
+    /// its checks changes it.
     fn draw<K: Copy>(
         &self,
         sel: &'static str,
         (drawn, empty): (Option<(Shape, K)>, bool),
         mut call: impl FnMut(&mut rt::RenderCommandEncoder, K) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
-        // Reading the encoder's state reaches no runtime, so the task's end is checked where
-        // `plain` checked it, and nothing the runtime announces can fall inside it.
-        stop_if_task_ended();
+        // Reading the encoder's state reaches no runtime, so nothing the runtime announces can
+        // fall inside it.
         let held = self.held();
         nil_pipeline_drawn(sel, held.nil_pipeline);
         crate::gpu::timing::count_draw();
@@ -2191,7 +1800,6 @@ impl VulkanRenderEncoder {
             Some((shape, k)) => {
                 self.drawn(sel, shape, empty, &held);
                 if !empty {
-                    stop_if_task_ended();
                     marked_by(sel, held.marks);
                 }
                 self.binds(sel, &mut |e| call(e, k))
@@ -2200,8 +1808,7 @@ impl VulkanRenderEncoder {
         }
     }
 
-    /// `setVertexBuffer:offset:atIndex:`, as [`Self::encode`] runs a bind: what the draws may
-    /// reach through the buffer first ([`Self::bound`]), then the command.
+    /// `setVertexBuffer:offset:atIndex:`, as [`Self::encode`] runs a bind.
     fn vertex_buffer(
         &self,
         buffer: Option<&VulkanBuffer>,
@@ -2209,9 +1816,6 @@ impl VulkanRenderEncoder {
         index: u64,
     ) -> RaiseResult<()> {
         let sel = SET_VERTEX_BUFFER;
-        if self.encoder.has_command_buffer() {
-            self.bound(Bind::Buffer(VERTEX, index, buffer));
-        }
         let index = small(sel, index);
         self.run(sel, &mut |e| set_vertex_buffer(e, buffer, offset, index))
     }
@@ -2234,18 +1838,15 @@ impl VulkanRenderEncoder {
     /// state ([`Self::pipelined`]): in a pass that loads and stores a bfloat colour attachment,
     /// empty or not ([`Self::bfloat_drawn`]), and unless it is `empty`, of no primitive, patch,
     /// instance or threadgroup, the pass's rate map ([`Self::layered`]), its points ([`sized`]),
-    /// a mesh draw's threadgroups ([`threads_held`]), what it may write ([`Self::issues`]) and
-    /// the indirect commands its state may encode ([`Self::encodes`]). A draw over indices of the
+    /// a mesh draw's threadgroups ([`threads_held`]) and the indirect commands its state may
+    /// encode ([`Self::encodes`]). A draw over indices of the
     /// platform's own asks it too ([`Self::primitives`]).
     fn drawn(&self, sel: &'static str, shape: Shape, empty: bool, held: &Held) {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
-            stop_if_task_ended();
             sized(sel, shape, held.marks);
             threads_held(sel, shape, held.marks);
-            self.issues(sel, None);
-            stop_if_task_ended();
             if held.encodes {
                 self.icbs_written(sel);
             }
@@ -2329,9 +1930,8 @@ impl VulkanRenderEncoder {
     /// An indirect command buffer's execution `sel`, of `icb`'s commands `range` (`None`: a range
     /// a buffer holds): it draws, so it dies as a draw does where the private setters leave it no
     /// exact form ([`Self::marked`]), unless it is `empty`, of no command, and after a nil
-    /// pipeline state where its commands inherit the encoder's ([`Self::pipelined`]). One that is
-    /// not empty dies where it may write a surface whose GPU writes never reach its memory
-    /// ([`Self::issues`]). Where its commands inherit the encoder's state, that state decides
+    /// pipeline state where its commands inherit the encoder's ([`Self::pipelined`]). Where its
+    /// commands inherit the encoder's state, that state decides
     /// what a draw's would ([`Self::encodes`]); its commit reads its commands where they name
     /// their own, or inherit a state whose points Metal sizes none of
     /// ([`crate::gpu::command::executions`]).
@@ -2347,7 +1947,6 @@ impl VulkanRenderEncoder {
         self.bfloat_drawn(sel);
         if !empty {
             self.layered(sel);
-            self.issues(sel, Some(icb.inherits));
         }
         if empty {
             return None;
@@ -2445,7 +2044,6 @@ impl VulkanRenderEncoder {
                 VARYING_RATES_TILES.into()
             });
         }
-        self.issues(sel, None);
         if !self.rasterizes {
             unrepresentable(
                 sel,
@@ -2603,11 +2201,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
         }
         let sel = cmd.selector();
         let encoded = |call: Call<'_>| self.run(sel, call);
-        if let Some(bind) = binds(&cmd)
-            && self.encoder.has_command_buffer()
-        {
-            self.bound(bind);
-        }
         match cmd {
             RenderCmd::DispatchThreadsPerTile { threads_per_tile } => {
                 self.tiled(sel);
@@ -2849,16 +2442,14 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 // native device relays ([`crate::answer::native::NATIVE_RELAYED`]).
                 // A pass over a mutable map that no draw of the guest's took the place of ends
                 // with a draw of no vertices, which keeps the runtime from failing it as a GPU
-                // hang where nothing drew in it, as the Metal platform's draw keeps Metal's GPU
-                // from hanging (`rate_map::no_draw`). It is the pass's last command, so its
+                // hang where nothing drew in it, as Metal's GPU hangs at such a pass
+                // (`rate_map::no_draw`). It is the pass's last command, so its
                 // pipeline is bound for nothing the guest encodes. Its pipeline is made here,
-                // once per device, after the stop a thread of a task that ended takes at the
-                // command; where the command buffer is gone, nothing encoded here runs, and the
-                // pass needs no draw.
+                // once per device; where the command buffer is gone, nothing encoded here runs,
+                // and the pass needs no draw.
                 if self.undrawn.load(Ordering::Acquire)
                     && let Some(cb) = self.encoder.command_buffer()
                 {
-                    stop_if_task_ended();
                     let no_draw = crate::gpu::rate_map::no_draw(sel, &cb.device);
                     self.run(sel, &mut |e| {
                         e.set_render_pipeline_state(&no_draw)?;
@@ -2988,9 +2579,7 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                     });
                     return self.encoder.nothing(sel);
                 }
-                if self.pass.color_attachments[at].resolve_texture.is_none()
-                    || self.resolve_unused(Attachment::Color(index))
-                {
+                if !self.pass.color_resolves[at] || self.resolve_unused(Attachment::Color(index)) {
                     return self.encoder.nothing(sel);
                 }
                 let at = (slice, depth_plane, level);
@@ -3315,7 +2904,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                         let locked = self.drawing.lock();
                         let mut drawing = locked.borrow_mut();
                         drawing.nil_pipeline = false;
-                        drawing.reach.set(&state.reflection, f.writes);
                         let m = &mut drawing.marks;
                         m.pipeline = true;
                         m.points_sized = f.points_sized;
@@ -3566,14 +3154,6 @@ impl RenderEncoder<VulkanPlatform> for VulkanRenderEncoder {
                 let mode = rt::VisibilityResultMode::from_raw(mode).unwrap_or_else(|_| {
                     unrepresentable(sel, &format!("visibility result mode {mode}"))
                 });
-                if mode != rt::VisibilityResultMode::Disabled
-                    && plain(|| self.drawing.lock().borrow().reach.visibility.holds())
-                {
-                    crate::gpu::writes::kept_write(
-                        sel,
-                        "a visibility result mode whose result the pass writes into a buffer over",
-                    );
-                }
                 encoded(&mut |e| e.set_visibility_result_mode(mode, offset))
             }
             RenderCmd::UpdateFence { fence, stages } => {
@@ -3691,22 +3271,15 @@ impl VulkanRenderEncoder {
     /// colour attachment.
     fn stored(&self, attachment: Attachment) -> Option<(rt::StoreAction, rt::StoreActionOptions)> {
         let p = &self.pass;
-        let (texture, action, options) = match attachment {
+        match attachment {
             Attachment::Color(i) => {
-                let c = p.color_attachments.get(usize::try_from(i).ok()?)?;
-                let action = self.dropped_resolve(i).map_or(c.store_action, |d| d.store);
-                (&c.texture, action, c.store_action_options)
+                let (action, options) = (*p.color.get(usize::try_from(i).ok()?)?)?;
+                let action = self.dropped_resolve(i).map_or(action, |d| d.store);
+                Some((action, options))
             }
-            Attachment::Depth => {
-                let a = &p.depth_attachment;
-                (&a.texture, a.store_action, a.store_action_options)
-            }
-            Attachment::Stencil => {
-                let a = &p.stencil_attachment;
-                (&a.texture, a.store_action, a.store_action_options)
-            }
-        };
-        texture.as_ref().map(|_| (action, options))
+            Attachment::Depth => p.depth,
+            Attachment::Stencil => p.stencil,
+        }
     }
 
     /// The colour attachment at `index` whose resolve [`untouched_resolves`] dropped, if it is
@@ -3715,11 +3288,63 @@ impl VulkanRenderEncoder {
         self.dropped.iter().find(|d| d.index == index).copied()
     }
 
-    /// Marks each undecided attachment ([`Self::late_store`]) with why a resolve into its resolve
-    /// texture, as `sources` holds the pass descriptor's, is never sent ([`Unsent`]).
+    /// Tells the command buffer that this pass faults it where the pass keeps an attachment whose
+    /// texture lies over read-only memory the runtime copies ([`over_read_only_copy`],
+    /// [`faults_over`]), or resolves a colour attachment into a resolve texture over such memory
+    /// ([`faults_into`]), as `sources` holds the pass descriptor's: Metal's GPU faults the command
+    /// buffer there from this pass on, as the runtime faults it itself, so its commit dies where
+    /// it fails another way too
+    /// ([`crate::gpu::command::CommandBufferObject::faults_at_read_only_store`]). One whose store
+    /// action is `Unknown` waits for its late store action ([`Self::late_store`]). One that does
+    /// not store into such memory (`DontCare`, and `MultisampleResolve` out of it) is sent, as
+    /// Metal completes it, its writes dropped by the copy. A colour resolve this platform made the
+    /// pass without, as plain Metal leaves a texture of that format untouched ([`Dropped`]), stores
+    /// nothing into its resolve texture, which may lie over such memory (a texture over a
+    /// surface's plane lies over a buffer): the M3 Max completes a pass that resolves into such
+    /// memory in a pair it leaves untouched, the memory unchanged (docs/graphics-kext/dgpu-oracle.md
+    /// Q38).
+    fn read_only_stores(&self, sources: &Sources) {
+        let colors = (0u32..).zip(&sources.color);
+        let attachments = (colors.map(|(i, [t, r])| (Attachment::Color(i), t, r)))
+            .chain([(Attachment::Depth, &sources.depth[0], &sources.depth[1])])
+            .chain([(
+                Attachment::Stencil,
+                &sources.stencil[0],
+                &sources.stencil[1],
+            )]);
+        let mut faults = false;
+        for (attachment, texture, resolve) in attachments {
+            let dropped =
+                matches!(attachment, Attachment::Color(i) if self.dropped_resolve(i).is_some());
+            let (over, into) =
+                plain(|| (over_read_only_copy(texture), over_read_only_copy(resolve)));
+            let into = into && !dropped;
+            if !over && !into {
+                continue;
+            }
+            match self.stored(attachment).map(|(action, _)| action) {
+                Some(rt::StoreAction::Unknown) => {
+                    if over {
+                        plain(|| self.read_only_undecided.lock().push(attachment));
+                    }
+                }
+                Some(action) => {
+                    faults |= (over && faults_over(attachment, action))
+                        || (into && faults_into(attachment, action));
+                }
+                None => {}
+            }
+        }
+        if faults {
+            self.encoder.faults_at_read_only_store();
+        }
+    }
+
+    /// Marks each undecided attachment ([`Self::late_store`]) with whether its resolve texture, as
+    /// `sources` holds the pass descriptor's, lies over read-only memory the runtime copies.
     fn undecided_dropped(&self, sources: &Sources) {
         plain(|| {
-            for (a, unsent) in self.undecided.lock().iter_mut() {
+            for (a, copied) in self.undecided.lock().iter_mut() {
                 let resolve = match *a {
                     Attachment::Color(i) => usize::try_from(i)
                         .ok()
@@ -3728,7 +3353,7 @@ impl VulkanRenderEncoder {
                     Attachment::Depth => Some(&sources.depth[1]),
                     Attachment::Stencil => Some(&sources.stencil[1]),
                 };
-                *unsent = resolve.and_then(Source::texture).and_then(Unsent::of);
+                *copied = resolve.is_some_and(Source::writes_kept);
             }
         });
     }
@@ -3776,6 +3401,17 @@ impl VulkanRenderEncoder {
         });
     }
 
+    /// Whether the pass's stencil attachment resolves, or may yet, by the descriptor's store
+    /// action or a late one ([`stencil_may_resolve`]): none where the pass has none.
+    fn stencil_may_resolve(&self) -> bool {
+        let late = plain(|| {
+            let late = self.late_stores.lock();
+            (late.iter().find(|&&(a, _)| a == Attachment::Stencil)).map(|&(_, action)| action)
+        });
+        (self.stored(Attachment::Stencil))
+            .is_some_and(|(store, _)| stencil_may_resolve(store, late))
+    }
+
     /// Whether `attachment` resolves nowhere whatever its resolve texture: the descriptor knew
     /// its store action, and the action does not resolve, so Metal ignores a late resolve setter
     /// there as it ignores the descriptor's resolve texture ([`without_unused_resolves`]).
@@ -3791,8 +3427,15 @@ impl VulkanRenderEncoder {
     /// descriptor's as core set it, a dropped resolve's too ([`Dropped`]): its resolving action
     /// again encodes nothing, as plain Metal resolves nothing into the texture
     /// (`resolves_into_other_formats_are_metals_or_die_named`). A colour index past the eighth is
-    /// the runtime's to refuse. One that resolves an undecided attachment into a resolve texture
-    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]).
+    /// the runtime's to refuse. A depth attachment's `StoreAndMultisampleResolve` into a resolve
+    /// texture over read-only memory the runtime copies is sent, the runtime dropping the resolve
+    /// as Metal's GPU leaves the texture, but beside a stencil attachment that resolves, where it
+    /// dies ([`stencil_may_resolve`]). Another resolve there, which Metal's GPU faults
+    /// ([`faults_into`]), and one that keeps an undecided attachment
+    /// over read-only memory the runtime copies ([`faults_over`]), fail the command buffer as
+    /// Metal's GPU faults it ([`Self::read_only_stores`]). A colour or stencil attachment's
+    /// `CustomSampleDepthStore` there is sent: the runtime stores it as `DontCare`, and Metal's
+    /// GPU completes it, writing nothing ([`faults_over`]).
     fn late_store(
         &self,
         sel: &'static str,
@@ -3805,17 +3448,21 @@ impl VulkanRenderEncoder {
         }
         match self.stored(attachment) {
             Some((rt::StoreAction::Unknown, _)) => {
-                let named = plain(|| {
+                let copied = plain(|| {
                     let undecided = self.undecided.lock();
-                    undecided
-                        .iter()
-                        .find(|(a, _)| *a == attachment)
-                        .and_then(|&(_, unsent)| unsent)
+                    (undecided.iter()).any(|&(a, copied)| a == attachment && copied)
                 });
-                if let Some(unsent) = named
-                    && action.resolves()
-                {
-                    unsent.dies(sel, "a store action that resolves into a texture");
+                let faults = copied && faults_into(attachment, action);
+                if copied && action.resolves() && !faults && self.stencil_may_resolve() {
+                    crate::gpu::writes::kept_write(sel, DEPTH_BESIDE_STENCIL);
+                }
+                let read_only = plain(|| {
+                    let mut undecided = self.read_only_undecided.lock();
+                    let at = undecided.iter().position(|&a| a == attachment);
+                    at.map(|at| undecided.remove(at)).is_some()
+                });
+                if faults || (read_only && faults_over(attachment, action)) {
+                    self.encoder.faults_at_read_only_store();
                 }
                 self.run(sel, call)?;
                 plain(|| {
@@ -3835,10 +3482,17 @@ impl VulkanRenderEncoder {
     }
 
     /// A late resolve target of `texture` at `at`, its slice, depth plane and level, for
-    /// `attachment`, which `sel` sets. Where the attachment's store action is undecided, whether
-    /// the texture's GPU writes never reach its memory is kept for the late store action that
-    /// decides whether it resolves ([`Self::late_store`]); elsewhere the action resolves, so one
-    /// whose GPU writes never reach its memory dies ([`crate::os::dropped_write`]).
+    /// `attachment`, which `sel` sets. Where the attachment's store action is undecided, why a
+    /// resolve into the texture is never sent as it stands is kept for the late store action that
+    /// decides whether it resolves ([`Self::late_store`]); elsewhere one over read-only memory the
+    /// runtime copies dies, but where the known action resolves into it as Metal's GPU faults
+    /// ([`faults_into`]), that fails the command buffer as Metal's GPU faults it (measured on the
+    /// M3 Max, macOS 27.0.1, with the setter's SPI, a colour attachment's and a depth attachment's
+    /// `MultisampleResolve`, the descriptor naming a resolve texture of Metal's own memory:
+    /// m3-max-29292); a depth attachment's `StoreAndMultisampleResolve` into it is sent, the
+    /// runtime dropping the resolve as Metal's GPU leaves the texture, but beside a stencil
+    /// attachment that resolves, where it dies ([`stencil_may_resolve`]). A known action that does
+    /// not resolve never reaches here ([`Self::resolve_unused`]).
     fn late_resolve(
         &self,
         sel: &'static str,
@@ -3846,16 +3500,23 @@ impl VulkanRenderEncoder {
         texture: Option<&VulkanTexture>,
         at: (u64, u64, u64),
     ) -> Option<rt::ResolveTarget> {
-        let unsent = texture.and_then(Unsent::of);
+        let copied = texture.is_some_and(|t| crate::gpu::writes::texture_kept(t));
         let kept = plain(|| {
             let mut undecided = self.undecided.lock();
             let named = undecided.iter_mut().find(|(a, _)| *a == attachment);
-            named.map(|(_, never)| *never = unsent)
+            named.map(|(_, over)| *over = copied)
         });
-        if kept.is_none()
-            && let Some(unsent) = unsent
-        {
-            unsent.dies(sel, "a resolve into a texture");
+        if kept.is_none() && copied {
+            match self.stored(attachment) {
+                Some((action, _)) if faults_into(attachment, action) => {
+                    self.encoder.faults_at_read_only_store();
+                }
+                Some(_) if self.stencil_may_resolve() => {
+                    crate::gpu::writes::kept_write(sel, DEPTH_BESIDE_STENCIL);
+                }
+                Some(_) => {}
+                None => crate::gpu::writes::kept_write(sel, "a resolve into a texture over"),
+            }
         }
         match kept {
             Some(()) => resolve_target(texture.map(|t| &t.raw), at),
@@ -3915,11 +3576,10 @@ impl VulkanRenderEncoder {
     /// After a guest's draw of `count` vertices of `t`, `instances` times, answered `drawn`: one
     /// of at least one whole triangle of a triangle list or strip (3 vertices or more), once or
     /// more, that the runtime took, takes the place of the platform's draw of no vertices at the
-    /// pass's end ([`crate::gpu::rate_map::no_draw`]), as the Metal platform's does (its
-    /// `gpu::rate_map::drew`). The runtime counts every draw it takes as the pass's draw call
-    /// (`rate_mapped_pass.rs`), so it no longer fails the pass as a GPU hang. Other draws leave
-    /// the platform's in place, as the Metal platform's do: what Metal's GPU takes as the pass's
-    /// draw was measured for this shape alone.
+    /// pass's end ([`crate::gpu::rate_map::no_draw`]). The runtime counts every draw it takes as
+    /// the pass's draw call (`rate_mapped_pass.rs`), so it no longer fails the pass as a GPU hang.
+    /// Other draws leave the platform's in place: what Metal's GPU takes as the pass's draw was
+    /// measured for this shape alone.
     fn drew(
         &self,
         t: rt::DrawPrimitiveType,
@@ -3940,12 +3600,9 @@ impl VulkanRenderEncoder {
     /// can find anything, nor any that reads the thread or the log: no nil pipeline state
     /// ([`nil_pipeline_drawn`]), none that encodes indirect commands ([`Self::icbs_written`]), a
     /// pass that loads no bfloat attachment ([`Self::bfloat_drawn`]) and has no rate map of no
-    /// layers or of varying rates ([`Self::layered`]), a command buffer to bind for
-    /// ([`Self::bound`]), a thread that runs no isolated task's code, whose checks of the task's
-    /// end are then each nothing ([`stop_if_task_ended`]), and no timing lines
+    /// layers or of varying rates ([`Self::layered`]), a command buffer, and no timing lines
     /// ([`crate::gpu::timing::encoder_call`]). A command changes none of them but a pipeline
-    /// state's set, a private setter or the encoder's end, none of which a run of draws holds;
-    /// whether the pass holds anything a draw asks of ([`Reach::quiet`]) is read at each.
+    /// state's set, a private setter or the encoder's end, none of which a run of draws holds.
     fn draws_quietly(&self) -> Option<Held> {
         let held = self.held();
         let quietly = !held.nil_pipeline
@@ -3954,15 +3611,13 @@ impl VulkanRenderEncoder {
             && !self.no_layers
             && !self.varying_rates
             && self.encoder.has_command_buffer()
-            && reims_vgpu_core::tasks::isolation::TaskLife::current().is_none()
             && !crate::gpu::timing::on();
         quietly.then_some(held)
     }
 
     /// `draws`, where [`Self::draws_quietly`] answered `held`: each command does what
     /// [`Self::encode`] does for it, in its order, by what is left of its path once the run's
-    /// answers are known, and takes that path where the pass holds something a draw asks of
-    /// ([`Reach::quiet`]), or where its bind or draw needs more. The run takes the runtime's
+    /// answers are known, and takes that path where its draw needs more. The run takes the runtime's
     /// encoder once, and borrows it for each call ([`EncoderObject::with`]), so a command that
     /// takes its path takes it as it does alone; and this thread's calls into the runtime and the
     /// hearing of the draws are looked up once ([`crate::answer::run`]).
@@ -3983,8 +3638,8 @@ impl VulkanRenderEncoder {
         })
     }
 
-    /// `draw`'s `setVertexBuffer:offset:atIndex:` in [`Self::quiet_draws`]: [`Self::vertex_buffer`]
-    /// where its bind is read ([`Self::bound`]), else its index ([`small`]) and the call.
+    /// `draw`'s `setVertexBuffer:offset:atIndex:` in [`Self::quiet_draws`]: its index ([`small`])
+    /// and the call, as [`Self::vertex_buffer`] runs it.
     fn quiet_vertex_buffer(
         &self,
         run: &crate::answer::Run<'_>,
@@ -3993,10 +3648,6 @@ impl VulkanRenderEncoder {
     ) -> RaiseResult<()> {
         let sel = SET_VERTEX_BUFFER;
         let (buffer, offset) = (draw.buffer, draw.offset);
-        let bind = Bind::Buffer(VERTEX, draw.index, buffer);
-        if !self.quiet.load(Ordering::Acquire) || quiet_bind_decides(&bind) {
-            return self.vertex_buffer(buffer, offset, draw.index);
-        }
         let index = small(sel, draw.index);
         let mut refusal = None;
         run.at(sel, || {
@@ -4008,8 +3659,7 @@ impl VulkanRenderEncoder {
     }
 
     /// `draw`'s `drawPrimitives:vertexStart:vertexCount:` in [`Self::quiet_draws`], under `held`:
-    /// [`Self::primitives`] where the pass holds something a draw asks of and for type 9
-    /// ([`Self::nine`]), else what [`Self::draw`] checks that can find anything there (its points,
+    /// [`Self::primitives`] for type 9 ([`Self::nine`]), else what [`Self::draw`] checks that can find anything there (its points,
     /// [`sized`], and the private setters' marks, [`marked_by`]), the call, the `half` outputs the
     /// runtime announced inside it ([`Self::binds`]), and what it drew ([`Self::drew`]).
     fn quiet_primitives(
@@ -4021,9 +3671,6 @@ impl VulkanRenderEncoder {
     ) -> RaiseResult<()> {
         let sel = DRAW_PRIMITIVES;
         let shape = (draw.vertex_start, draw.vertex_count, 1, 0);
-        if !self.quiet.load(Ordering::Acquire) {
-            return self.primitives(sel, draw.primitive_type, shape);
-        }
         let (start, count) = (small(sel, draw.vertex_start), small(sel, draw.vertex_count));
         let t = draw_type(sel, draw.primitive_type);
         if t == rt::DrawPrimitiveType::Nine {
@@ -4108,6 +3755,19 @@ pub(crate) mod tests {
             vertex_count: 0,
         };
         assert_eq!(draw.selector(), DRAW_PRIMITIVES);
+    }
+
+    /// A render encoder keeps what its late setters read of its pass ([`super::PassStores`]),
+    /// not a copy of the runtime's descriptor, whose bytes every pass's open would move into it
+    /// and whose textures its drop would let go of again.
+    #[test]
+    fn render_encoders_keep_no_copy_of_their_pass() {
+        assert!(
+            size_of::<super::RenderEncoderObject>() < size_of::<rt::RenderPassDescriptor>(),
+            "an encoder of {} bytes, a descriptor of {}",
+            size_of::<super::RenderEncoderObject>(),
+            size_of::<rt::RenderPassDescriptor>()
+        );
     }
 
     /// What a test records of the runtime calls of draws' two commands ([`sent`]).
@@ -4331,19 +3991,19 @@ pub(crate) mod tests {
         }
     }
 
-    use reims_vgpu_core::display::pipeline::{DisplayPipelineCache, PipelineKey};
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer, Texture};
-    use reims_vgpu_core::platform::types::{
+    use crate::core::display::pipeline::{DisplayPipelineCache, PipelineKey};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder};
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer, Texture};
+    use crate::core::platform::types::{
         ClearColor, MtlOrigin, MtlRegion, MtlScissorRect, MtlSize, NsRange,
     };
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
-    use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
+    use crate::core::platform::{Handle, HostRange, Platform};
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -4427,71 +4087,6 @@ pub(crate) mod tests {
     /// `MTLIndexTypeUInt16`.
     const U16: u64 = 0;
 
-    /// A pass holds only the binds that can decide what a draw asks of what it may write
-    /// (`matters`), and each distinct one made resident for writing once, however often it is
-    /// made resident: a draw asks the same of them as of all it bound
-    #[test]
-    fn a_pass_holds_only_the_binds_a_draw_asks_of() {
-        let plain = Bound {
-            meets: true,
-            ..Bound::default()
-        };
-        let dropped = Bound {
-            dropped: true,
-            ..plain.clone()
-        };
-        let kept = Bound {
-            kept: Kept::Always,
-            ..plain.clone()
-        };
-        let mut r = Reach::default();
-        for slot in 0..8 {
-            r.bind_one(FRAGMENT, false, slot, plain.clone());
-        }
-        r.bind_one(VERTEX, true, 3, plain.clone());
-        assert!((r.textures.iter().chain(&r.buffers)).all(BTreeMap::is_empty));
-        assert!(!r.unsent_dropped() && r.kept(None).is_none());
-        for _ in 0..1000 {
-            let textures = vec![plain.clone(), dropped.clone()];
-            r.used(textures, vec![plain.clone(), kept.clone()]);
-        }
-        assert_eq!((r.used_textures.len(), r.used_buffers.len()), (1, 1));
-        assert!(r.unsent_dropped());
-        assert!(matches!(r.kept(None), Some(Whether::Writes)));
-        assert!(matches!(&r.unsent(None)[..], [(Whether::Writes, m)] if *m == dropped));
-        r.bind_one(FRAGMENT, false, 2, dropped.clone());
-        assert_eq!(r.textures[FRAGMENT].get(&2), Some(&dropped));
-        r.bind_one(FRAGMENT, false, 2, plain);
-        assert!(r.textures[FRAGMENT].is_empty());
-    }
-
-    /// A pass is quiet while it holds nothing a draw asks of, as a pass that binds only plain
-    /// memory does: its draws then ask nothing ([`VulkanRenderEncoder::issues`]). A bind or a
-    /// resident use that decides something ends it, and a bind of plain memory in that slot
-    /// brings it back
-    #[test]
-    fn a_pass_is_quiet_while_it_holds_nothing_a_draw_asks_of() {
-        let plain = Bound {
-            meets: true,
-            ..Bound::default()
-        };
-        let dropped = Bound {
-            dropped: true,
-            ..plain.clone()
-        };
-        let mut r = Reach::default();
-        assert!(r.quiet());
-        r.bind_one(FRAGMENT, false, 0, plain.clone());
-        r.bind_one(VERTEX, true, 1, plain.clone());
-        assert!(r.quiet());
-        r.bind_one(FRAGMENT, false, 0, dropped.clone());
-        assert!(!r.quiet() && r.unsent_dropped());
-        r.bind_one(FRAGMENT, false, 0, plain);
-        assert!(r.quiet());
-        r.used(vec![dropped], Vec::new());
-        assert!(!r.quiet() && r.unsent_dropped());
-    }
-
     /// An open encoder on a target, on this platform.
     fn open_encoder() -> (VulkanRenderEncoder, VulkanTexture) {
         let (p, d) = (platform(), dev());
@@ -4562,7 +4157,7 @@ pub(crate) mod tests {
     /// `vertex_ids` and `simd_stages`, the crate's own [`BARYCENTRIC`], [`VERTEX_IDS`] and
     /// [`SIMD_STAGES`].
     fn fixture<P: Platform>(d: &P::Device, function: &str) -> P::Function {
-        use reims_vgpu_core::platform::resource::Library as _;
+        use crate::core::platform::resource::Library as _;
         let (file, name) = function.split_once(':').unwrap_or((function, function));
         let bytes = if file == "barycentric" {
             BARYCENTRIC.to_vec()
@@ -4585,14 +4180,13 @@ pub(crate) mod tests {
         vertex: &str,
         fragment: &str,
     ) -> P::RenderPipeline {
-        use reims_vgpu_core::platform::values::RenderPipelineDesc;
+        use crate::core::platform::values::RenderPipelineDesc;
         let (v, f) = (fixture::<P>(d, vertex), fixture::<P>(d, fragment));
         d.new_render_pipeline_state(&RenderPipelineDesc {
             label: None,
             vertex: &v,
             fragment: &f,
             color0_pixel_format: BGRA8,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -4787,8 +4381,8 @@ pub(crate) mod tests {
     /// commands after the draw in its encoder are taken
     #[test]
     fn a_type_9_draw_fails_its_command_buffer_as_metals_gpu_does() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (dst, pass) = pass_of(&p, &d, (4, 4));
@@ -4854,8 +4448,8 @@ pub(crate) mod tests {
         d: &P::Device,
         fragment: &str,
     ) -> String {
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::render::RenderEncoder as _;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::render::RenderEncoder as _;
 
         /// `MTLResourceStorageModeMemoryless`, and `MTLTextureUsageShaderWrite`.
         const MEMORYLESS: u64 = 0x30;
@@ -4874,7 +4468,7 @@ pub(crate) mod tests {
         });
         let memoryless = d.new_texture(OnFault::Die, &desc).unwrap().unwrap();
         let sampler = d
-            .new_sampler_state(&reims_vgpu_core::platform::values::SamplerDesc::default())
+            .new_sampler_state(&crate::core::platform::values::SamplerDesc::default())
             .unwrap()
             .unwrap();
         let state = fixture_state::<P>(d, "vert:tri_vert", fragment);
@@ -5020,9 +4614,9 @@ pub(crate) mod tests {
     /// however long the other queue's takes to run under load
     #[test]
     fn a_type_9_hang_is_in_flight_as_long_as_metals() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::os::Clock as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::os::Clock as _;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
@@ -5117,9 +4711,9 @@ pub(crate) mod tests {
     /// queue runs meanwhile, as Metal's (the runtime's measurement, `command_buffer/hang.rs`)
     #[test]
     fn a_type_9_fault_is_in_flight_as_long_as_metals() {
-        use reims_vgpu_core::platform::event::EventRef;
-        use reims_vgpu_core::platform::os::Clock as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::event::EventRef;
+        use crate::core::platform::os::Clock as _;
+        use crate::core::platform::types::NsRange;
 
         let (p, d) = (platform(), dev());
         let (_dst, pass) = pass_of(&p, &d, (4, 4));
@@ -5275,129 +4869,9 @@ pub(crate) mod tests {
     }
 
     /// The sweep library, `rounding.metal`, compiled with fast math, the compiler's default.
+    #[cfg(target_os = "macos")]
     pub(crate) const ROUNDING: &[u8] =
         include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
-
-    /// A guest's render state of `textureWriteRoundingMode` `mode` of [`ROUNDING`]'s
-    /// `sweep_vertex` and `fragment`, colour 0 of `RGBA8Unorm`, of `supportIndirectCommandBuffers`
-    /// where `icb`, decoded from a blob as core decodes one: its creator's answer.
-    fn texture_writing_state<P: Platform>(
-        d: &P::Device,
-        mode: u32,
-        fragment: &str,
-        icb: bool,
-    ) -> RaiseResult<Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText>>
-    {
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
-
-        use crate::gpu::serialized::tests::rounded_render_of;
-
-        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let functions = [function("sweep_vertex"), function(fragment)];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
-        let mut entries = vec!["02 04 02000000"];
-        if icb {
-            entries.push("19 04 01000000");
-        }
-        let blob = rounded_render_of(&entries, &[&[(0, 0), (1, 70)]], mode);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-    }
-
-    /// Under a render state of `textureWriteRoundingMode` 2 whose fragment function writes
-    /// texture 0, an indexed draw, an indirect one and one of the private type 7 die at their
-    /// selectors with an `RGBA16Float` texture bound there, as a direct draw does, and are encoded
-    /// with an `RGBA8Unorm` one
-    #[test]
-    fn mode_2_half_float_texture_writes_die_at_every_kind_of_draw() {
-        use crate::gpu::serialized::NEAREST_EVEN;
-
-        let (p, d) = (platform(), dev());
-        let state =
-            texture_writing_state::<VulkanPlatform>(&d, NEAREST_EVEN, "write_fragment", false)
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        let kinds = buffer::<VulkanPlatform>(&d, 4, 0, &0u32.to_le_bytes());
-        let arguments: Vec<u8> = [3u32, 1, 0, 0]
-            .iter()
-            .flat_map(|v| v.to_le_bytes())
-            .collect();
-        let indirect = buffer::<VulkanPlatform>(&d, 16, 0, &arguments);
-        let indices = buffer::<VulkanPlatform>(&d, 6, 0, &u16s(&[0, 1, 2]));
-        let target = texture(&p, &d, 70, READ | TARGET, (16, 16), None);
-        let q = d.new_command_queue().unwrap();
-        let draws = || {
-            [
-                (
-                    three(3, Some(&indices)),
-                    "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:",
-                ),
-                (
-                    RenderCmd::DrawPrimitivesIndirect {
-                        primitive_type: 3,
-                        indirect_buffer: &indirect,
-                        indirect_buffer_offset: 0,
-                    },
-                    "drawPrimitives:indirectBuffer:indirectBufferOffset:",
-                ),
-                (
-                    RenderCmd::DrawPrimitives {
-                        primitive_type: 7,
-                        vertex_start: 0,
-                        vertex_count: 4,
-                    },
-                    "drawPrimitives:vertexStart:vertexCount:",
-                ),
-            ]
-        };
-        for format in [115, 70] {
-            let t = texture(&p, &d, format, READ | 2, (16, 16), None);
-            for (draw, sel) in draws() {
-                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-                let pass = p.render_pass_descriptor();
-                let attachment = ColorAttachmentSet {
-                    texture: Some(Some(&target)),
-                    load_action: Some(CLEAR),
-                    store_action: Some(STORE),
-                    ..ColorAttachmentSet::default()
-                };
-                pass.set_color_attachment(OnFault::Die, 0, &attachment)
-                    .unwrap();
-                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-                send_all(
-                    &e,
-                    vec![
-                        RenderCmd::SetRenderPipelineState {
-                            pipeline_state: Some(&state),
-                        },
-                        RenderCmd::SetFragmentBuffer {
-                            buffer: Some(&kinds),
-                            offset: 0,
-                            index: 0,
-                        },
-                        RenderCmd::SetFragmentTexture {
-                            texture: Some(&t),
-                            index: 0,
-                        },
-                    ],
-                );
-                if format == 115 {
-                    assert_eq!(dies_at(&e, draw), sel);
-                } else {
-                    send_all(&e, vec![draw, RenderCmd::EndEncoding]);
-                }
-            }
-        }
-    }
 
     /// A pass that resolves `RGBA16Float` and one that resolves `RG11B10Float` (92), each at 4
     /// samples, in strict mode, on the platform's device, which resolves by the device's own
@@ -5464,6 +4938,233 @@ pub(crate) mod tests {
         }
     }
 
+    /// `MTLTextureType2DMultisample`, `MTLPixelFormatBGRA8Unorm_sRGB`,
+    /// `MTLStoreActionStoreAndMultisampleResolve` and `MTLResourceStorageModePrivate`.
+    const MULTISAMPLE_2D: u64 = 4;
+    const BGRA8_SRGB: u64 = 81;
+    const STORE_AND_RESOLVE: u64 = 3;
+    const PRIVATE_STORAGE: u64 = 0x20;
+
+    /// A 16 × 16 4-sample `BGRA8Unorm_sRGB` texture of the device's Private memory, a render
+    /// target.
+    fn srgb_samples() -> VulkanTexture {
+        let p = platform();
+        let desc = p.texture_descriptor(&TextureDesc {
+            texture_type: MULTISAMPLE_2D,
+            pixel_format: BGRA8_SRGB,
+            width: 16,
+            height: 16,
+            sample_count: 4,
+            usage: TARGET,
+            resource_options: Some(PRIVATE_STORAGE),
+            ..TextureDesc::default()
+        });
+        dev().new_texture(OnFault::Die, &desc).unwrap().unwrap()
+    }
+
+    /// A pass that clears `samples` and stores them by `store` into `resolve`.
+    fn resolving_into(
+        samples: &VulkanTexture,
+        resolve: &VulkanTexture,
+        store: u64,
+    ) -> VulkanRenderPassDescriptor {
+        let pass = platform().render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(samples)),
+            resolve_texture: Some(Some(resolve)),
+            load_action: Some(CLEAR),
+            store_action: Some(store),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        pass
+    }
+
+    /// A 4-sample `BGRA8Unorm_sRGB` attachment's resolve into a 16 × 16 `RGBA16Float` texture
+    /// over an IOSurface, as the device's surfaces reach this platform (over a buffer that
+    /// stands for the surface, `new_texture_over_surface_plane`), by `MultisampleResolve` or
+    /// `StoreAndMultisampleResolve`, is dropped, as plain Metal leaves such a texture untouched
+    /// ([`untouched_resolves`]: measured on the M3 Max over a surface without planes and over
+    /// planes 0 and 1 of a `420v` surface, Shared, Managed and Private,
+    /// docs/graphics-kext/dgpu-oracle.md Q41): over a surface without planes, of Shared memory
+    /// and over a Private buffer as over a surface's device cache, and over planes 0 and 1 of a
+    /// `420v` surface, the pass is made, its command buffer completes, and the surface keeps its
+    /// bytes. Over a buffer that stands for no surface (no facts) the pass dies at its making,
+    /// named a texture over a buffer, a shape not measured
+    #[test]
+    fn untouched_resolves_into_textures_over_surfaces_are_dropped() {
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::values::SurfacePlane;
+        use crate::gpu::resource::tests::{StandIn, facts_of};
+
+        /// `MTLStoreActionMultisampleResolve`.
+        const RESOLVE: u64 = 2;
+        type P = crate::platform::VulkanPlatform;
+        let (p, d) = (platform(), dev());
+        let samples = srgb_samples();
+        let desc = |options| {
+            p.texture_descriptor(&TextureDesc {
+                pixel_format: RGBA16F,
+                width: 16,
+                height: 16,
+                usage: READ | TARGET,
+                resource_options: Some(options),
+                ..TextureDesc::default()
+            })
+        };
+        // A '420v' surface of 128 by 32: plane 0's 32 rows of 128 bytes, then plane 1's 16.
+        let length = 128 * 32 + 128 * 16;
+        let flat = facts_of(*b"RGhA", (16, 16), &[]);
+        let planes = vec![(0, 128), (128 * 32, 128)];
+        let planar = facts_of(*b"420v", (128, 32), &planes);
+        let cache = d.new_buffer_of_length(OnFault::Die, length, PRIVATE_STORAGE);
+        let cases = [
+            (
+                "a surface without planes",
+                StandIn::<P>::shared(&d, flat, vec![(0, 128)], length),
+                0,
+                0,
+            ),
+            (
+                "a device cache of a surface without planes",
+                StandIn::<P>::over(cache.unwrap().unwrap(), flat, vec![(0, 128)]),
+                0,
+                PRIVATE_STORAGE,
+            ),
+            (
+                "plane 0 of a 420v surface",
+                StandIn::<P>::shared(&d, planar, planes.clone(), length),
+                0,
+                0,
+            ),
+            (
+                "plane 1 of a 420v surface",
+                StandIn::<P>::shared(&d, planar, planes, length),
+                1,
+                0,
+            ),
+        ];
+        let q = d.new_command_queue().unwrap();
+        let mut wrong = Vec::new();
+        for (what, surface, plane, options) in &cases {
+            let target = surface.texture(&desc(*options), *plane).unwrap().unwrap();
+            for store in [RESOLVE, STORE_AND_RESOLVE] {
+                let out = buffer::<P>(&d, length, 0, &[]);
+                let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+                let blit = |cmd| {
+                    let b = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+                    b.encode(OnFault::Die, cmd).unwrap();
+                    b.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+                };
+                blit(BlitCmd::FillBuffer {
+                    buffer: &surface.buffer,
+                    range: NsRange::new(0, length),
+                    value: 0xa5,
+                });
+                let pass = resolving_into(&samples, &target, store);
+                let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+                e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+                blit(BlitCmd::CopyBufferToBuffer {
+                    source_buffer: Some(&surface.buffer),
+                    source_offset: 0,
+                    destination_buffer: Some(&out),
+                    destination_offset: 0,
+                    size: length,
+                });
+                cb.commit(OnFault::Die).unwrap();
+                cb.wait_until_completed(OnFault::Die).unwrap();
+                // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length.to_usize())
+                };
+                let kept = bytes.iter().all(|&b| b == 0xa5);
+                if cb.status().0 != 4 || cb.error().is_some() || !kept {
+                    wrong.push(format!(
+                        "{what}, store {store}: status {}, error {:?}, kept {kept}",
+                        cb.status().0,
+                        cb.error().map(|e| e.code)
+                    ));
+                }
+            }
+        }
+        assert!(wrong.is_empty(), "{wrong:#?}");
+        // A buffer that stands for no surface: a texture over a buffer.
+        let none = &cases[0].1;
+        let plane = SurfacePlane {
+            facts: None,
+            ..none.plane(0)
+        };
+        let target = (none.buffer).new_texture_over_surface_plane(OnFault::Die, &desc(0), plane);
+        let target = target.unwrap().unwrap();
+        let pass = resolving_into(&samples, &target, RESOLVE);
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        *crate::answer::LAST_LINE.lock() = None;
+        let site = catch_death(|| cb.render_encoder(OnFault::Die, &pass)).unwrap_err();
+        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+        assert_eq!(site.file, "renderCommandEncoderWithDescriptor:", "{line}");
+        assert!(
+            line.contains("the resolve texture is a texture over a buffer of storage mode Shared"),
+            "{line}"
+        );
+    }
+
+    /// A 4-sample `BGRA8Unorm_sRGB` attachment's resolve into an `RGBA16Float` texture over a
+    /// surface without planes over a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), by `MultisampleResolve` or
+    /// `StoreAndMultisampleResolve`, is dropped ([`untouched_resolves`]), and its command buffer
+    /// completes with the pages zeros, as the M3 Max completes a resolve into such memory in a pair
+    /// it leaves untouched (docs/graphics-kext/dgpu-oracle.md Q38), where a resolve it writes
+    /// faults the command buffer ([`a_resolve_into_read_only_memory_faults_its_command_buffer`]).
+    /// Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn an_untouched_resolve_into_a_surface_over_read_only_memory_completes() {
+        use crate::core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{StandIn, facts_of, read_only_buffer};
+        use crate::os::PAGE;
+
+        let p = platform();
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: RGBA16F,
+            width: 16,
+            height: 16,
+            usage: READ | TARGET,
+            ..TextureDesc::default()
+        });
+        for store in [MULTISAMPLE_RESOLVE, STORE_AND_RESOLVE] {
+            let (ro, pages) = read_only_buffer(1);
+            let facts = facts_of(*b"RGhA", (16, 16), &[]);
+            let surface = StandIn::<crate::platform::VulkanPlatform>::over(
+                ro.clone_ref(),
+                facts,
+                vec![(0, 128)],
+            );
+            let target = surface.texture(&desc, 0).unwrap().unwrap();
+            let samples = srgb_samples();
+            let pass = resolving_into(&samples, &target, store);
+            let q = dev().new_command_queue().unwrap();
+            let line = pass_line_on(&q, &pass, None, (pages, 16 * 128));
+            assert_eq!(
+                line, "status 4 error None before 0x5a after 0x6b signal true zeros true",
+                "{store}"
+            );
+            drop((pass, samples, target, surface, ro));
+            assert!(
+                crate::remap::VulkanVm::new()
+                    .deallocate(pages, PAGE)
+                    .is_success()
+            );
+        }
+    }
+
     /// An open encoder on a BGRA8 target with the state of the fixtures `vertex` and `fragment`
     /// set, and an index buffer.
     fn drawing_encoder(vertex: &str, fragment: &str) -> (VulkanRenderEncoder, VulkanBuffer) {
@@ -5527,111 +5228,782 @@ pub(crate) mod tests {
             .file
     }
 
-    /// A draw of `read_only_beside_nested_vertex` and `read_only_beside_nested_fragment`
-    /// ([`crate::gpu::writes::tests::PROBE`]), whose argument buffers' type the runtime refuses
-    /// the reflection of, through a buffer over pages mapped read-only bound at both functions'
-    /// buffer slot 1, which they declare `const` and cannot store through, draws, indexed: the
-    /// vertex function writes its words of slot 2 and the fragment function red. Bound at the
-    /// vertex function's slot 2 too, a `device` pointer, the draw dies where it is encoded: on
-    /// Linux the runtime imports a writable twin of the pages, which the write would reach
-    /// ([`crate::gpu::writes::kept_write`]). The pages stay zeros
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_draw_through_read_only_pages_at_slots_it_cannot_write_draws_on_linux() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::platform::values::RenderPipelineDesc;
+    /// `MTLLoadActionDontCare`, `MTLLoadActionLoad`, `MTLStoreActionDontCare`,
+    /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionUnknown`.
+    #[cfg(any(target_os = "linux", windows))]
+    const LOAD_DONT_CARE: u64 = 0;
+    #[cfg(any(target_os = "linux", windows))]
+    const LOAD: u64 = 1;
+    #[cfg(any(target_os = "linux", windows))]
+    const DONT_CARE: u64 = 0;
+    #[cfg(any(target_os = "linux", windows))]
+    const MULTISAMPLE_RESOLVE: u64 = 2;
+    #[cfg(any(target_os = "linux", windows))]
+    const UNKNOWN: u64 = 4;
 
-        use crate::gpu::resource::VulkanRenderPipeline;
-        use crate::gpu::resource::tests::over_read_only_pages;
-        use crate::os::{OsVm, PAGE};
+    /// What a command buffer of `q` shows whose render pass of `pass` draws nothing, `late`
+    /// encoded in it where given (a late store action), a blit before the pass filling a buffer
+    /// with 0x5a and one after it another with 0x6b, then an event signal, committed and
+    /// completed: its status and error, the first byte of each buffer, whether the signal fired,
+    /// and whether the `n` bytes at `pages` stayed zeros.
+    #[cfg(any(target_os = "linux", windows))]
+    fn pass_line_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        pass: &VulkanRenderPassDescriptor,
+        late: Option<RenderCmd<'_, crate::platform::VulkanPlatform>>,
+        (pages, n): (crate::core::host::HostPtr, usize),
+    ) -> String {
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
 
-        /// The state, `nested` at both functions' slot 0, `read_only` at their slot 1 and
-        /// `written` at the vertex function's slot 2, then an indexed triangle of `indices`.
-        fn draw<'a>(
-            state: &'a VulkanRenderPipeline,
-            [nested, read_only, written, indices]: [&'a VulkanBuffer; 4],
-        ) -> Vec<RenderCmd<'a, VulkanPlatform>> {
-            let at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetVertexBuffer {
-                buffer: Some(buffer),
-                offset: 0,
-                index,
+        use crate::gpu::resource::tests::host_bytes_at;
+
+        let d = dev();
+        let blank = || buffer::<crate::platform::VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let (before, after) = (blank(), blank());
+        let event = d.new_shared_event().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let fill = |b, value| {
+            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+            let range = NsRange::new(0, 16);
+            let fill = BlitCmd::FillBuffer {
+                buffer: b,
+                range,
+                value,
             };
-            let fragment_at = |buffer: &'a VulkanBuffer, index| RenderCmd::SetFragmentBuffer {
-                buffer: Some(buffer),
-                offset: 0,
-                index,
-            };
-            vec![
-                RenderCmd::SetRenderPipelineState {
-                    pipeline_state: Some(state),
-                },
-                at(nested, 0),
-                at(read_only, 1),
-                at(written, 2),
-                fragment_at(nested, 0),
-                fragment_at(read_only, 1),
-                three(3, Some(indices)),
-            ]
+            blit.encode(OnFault::Die, fill).unwrap();
+            blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        };
+        fill(&before, 0x5a);
+        let e = cb.render_encoder(OnFault::Die, pass).unwrap().unwrap();
+        if let Some(late) = late {
+            e.encode(OnFault::Die, late).unwrap();
         }
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        fill(&after, 0x6b);
+        cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        let zeros = host_bytes_at(pages, n).iter().all(|&b| b == 0);
+        // SAFETY: Shared buffers' bytes, read after their command buffer completed.
+        let first =
+            |b: &crate::gpu::resource::VulkanBuffer| unsafe { *b.contents().as_ptr::<u8>() };
+        format!(
+            "status {} error {:?} before {:#x} after {:#x} signal {} zeros {zeros}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            first(&before),
+            first(&after),
+            event.wait_until_signaled_value(1, 1),
+        )
+    }
 
+    /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass's colour attachment is
+    /// a 16 × 16 `BGRA8Unorm` texture over a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), loaded by `load` and stored by `store`, or by
+    /// `late`'s store action set in the pass where given; the pages are the buffer's.
+    #[cfg(any(target_os = "linux", windows))]
+    fn read_only_pass_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        load: u64,
+        store: u64,
+        late: Option<u64>,
+    ) -> String {
+        use crate::core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{bgra_over, read_only_buffer};
+        use crate::os::PAGE;
+
+        let p = platform();
+        let (ro, pages) = read_only_buffer(1);
+        let target = bgra_over(&ro, READ | TARGET);
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            load_action: Some(load),
+            store_action: Some(store),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let late = late.map(|store_action| RenderCmd::SetColorStoreAction {
+            store_action,
+            color_attachment_index: 0,
+        });
+        let line = pass_line_on(q, &pass, late, (pages, 16 * 64));
+        drop((pass, target, ro));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
+        line
+    }
+
+    /// [`read_only_pass_on`]'s line of a command buffer whose pass stores the attachment
+    /// (`Store`) into the read-only memory: Metal's GPU faults it
+    /// (`MTLCommandBufferErrorPageFault`, status 5, code 3), the pages staying zeros and every
+    /// event signal firing (measured on the M3 Max, macOS 27.0.1, metal2vulkan's
+    /// `probes/readonly_gpu_writes.m`; the runtime's `store_out.rs`). The pass and every encoder
+    /// after it run nothing and the blit before it runs, as the runtime answers every fault:
+    /// which of them Metal runs is not measured for this fault.
+    #[cfg(any(target_os = "linux", windows))]
+    const FAULTED: &str = "status 5 error Some(3) before 0x5a after 0x0 signal true zeros true";
+
+    /// What a command buffer of `q` shows that fills a new 16-byte buffer with 0x11 in a blit,
+    /// then signals an event, committed and completed: its status and error, the buffer's first
+    /// byte and whether the signal fired.
+    #[cfg(any(target_os = "linux", windows))]
+    fn filled_on(q: &crate::gpu::command::VulkanCommandQueue) -> String {
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+
+        let d = dev();
+        let b = buffer::<crate::platform::VulkanPlatform>(&d, 16, 0, &[0; 16]);
+        let event = d.new_shared_event().unwrap();
+        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+        let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        let fill = BlitCmd::FillBuffer {
+            buffer: &b,
+            range: NsRange::new(0, 16),
+            value: 0x11,
+        };
+        blit.encode(OnFault::Die, fill).unwrap();
+        blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+        cb.encode_signal(Some(EventRef::Shared(&event)), 1).unwrap();
+        cb.commit(OnFault::Die).unwrap();
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let first = unsafe { *b.contents().as_ptr::<u8>() };
+        format!(
+            "status {} error {:?} filled {first:#x} signal {}",
+            cb.status().0,
+            cb.error().map(|e| e.code),
+            event.wait_until_signaled_value(1, 1),
+        )
+    }
+
+    /// [`filled_on`]'s line of a command buffer that runs.
+    #[cfg(any(target_os = "linux", windows))]
+    const FILLED: &str = "status 4 error None filled 0x11 signal true";
+
+    /// A pass that stores a colour attachment over a guest's read-only memory (`Store`) fails its
+    /// command buffer as Metal's GPU faults it ([`FAULTED`]), where the runtime's copy of the pages
+    /// would take the store, and the process goes on: a command buffer committed after it on its
+    /// queue runs, as does one on a new queue, as on Metal (one fault a process, measured on the M3
+    /// Max, macOS 27.0.1, plain Metal: m3-max-29110, the next command buffer of the queue
+    /// `Completed`, twice; m3-max-28796 and m3-max-28797, at once and 100 ms on and on a new
+    /// queue). Linux's and Windows's: on macOS the pass goes to Metal, whose fault this host's GPU
+    /// takes no test of
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_store_into_read_only_memory_fails_its_command_buffer() {
+        let q = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&q), FILLED, "before the fault");
+        assert_eq!(read_only_pass_on(&q, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&q), FILLED, "its queue after it");
+        let other = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&other), FILLED, "a new queue after it");
+    }
+
+    /// A late store action that stores the colour attachment over a guest's read-only memory,
+    /// of a pass that left it `Unknown`, fails the command buffer as `Store` given at once does,
+    /// and its queue runs on (`a_store_into_read_only_memory_fails_its_command_buffer`)
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_late_store_into_read_only_memory_fails_its_command_buffer() {
+        let q = dev().new_command_queue().unwrap();
+        let line = read_only_pass_on(&q, CLEAR, UNKNOWN, Some(STORE));
+        assert_eq!(line, FAULTED);
+        assert_eq!(filled_on(&q), FILLED);
+    }
+
+    /// A queue's second command buffer that a store into read-only memory faulted revokes it, as
+    /// Metal's: every command buffer committed on it after that fails at once with
+    /// `MTLCommandBufferErrorAccessRevoked` (status 5, code 4), running none of its work and
+    /// firing none of its signals, where a new queue runs, and the process goes on (measured on
+    /// the M3 Max, macOS 27.0.1, plain Metal, m3-max-29110: four faulting runs on one queue, every
+    /// command buffer after the queue's second fault failing; the runtime's
+    /// `command_buffer/revocation.rs`). A command buffer that runs between the two faults leaves
+    /// the count as it was, as in m3-max-29110's runs, each a faulting command buffer then one
+    /// that reads back
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn read_only_faults_revoke_queues_as_metals() {
+        let q = dev().new_command_queue().unwrap();
+        assert_eq!(read_only_pass_on(&q, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&q), FILLED, "after the first fault");
+        assert_eq!(read_only_pass_on(&q, LOAD, STORE, None), FAULTED);
+        for later in 0..2 {
+            assert_eq!(
+                filled_on(&q),
+                "status 5 error Some(4) filled 0x0 signal false",
+                "after the second fault, {later}"
+            );
+        }
+        let other = dev().new_command_queue().unwrap();
+        assert_eq!(filled_on(&other), FILLED, "a new queue");
+        assert_eq!(read_only_pass_on(&other, CLEAR, STORE, None), FAULTED);
+        assert_eq!(filled_on(&other), FILLED, "the new queue's first fault");
+    }
+
+    /// A pass over a colour attachment over a guest's read-only memory that does not store it
+    /// completes with no error, as Metal's does, every encoder running and the pages staying
+    /// zeros: `DontCare`, given at once or late, after a clear, a load or no load, and
+    /// `CustomSampleDepthStore` set late, which the runtime stores as `DontCare` and the M3 Max
+    /// completes, writing nothing (plain Metal, macOS 27.0.1, m3-max-29292); and the queue runs
+    /// on
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_pass_that_does_not_store_read_only_memory_completes() {
+        let q = dev().new_command_queue().unwrap();
+        for (load, store, late) in [
+            (CLEAR, DONT_CARE, None),
+            (LOAD, DONT_CARE, None),
+            (LOAD_DONT_CARE, DONT_CARE, None),
+            (CLEAR, UNKNOWN, Some(DONT_CARE)),
+            (CLEAR, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
+        ] {
+            assert_eq!(
+                read_only_pass_on(&q, load, store, late),
+                "status 4 error None before 0x5a after 0x6b signal true zeros true",
+                "{load} {store} {late:?}"
+            );
+        }
+        assert_eq!(filled_on(&q), FILLED);
+    }
+
+    /// `MTLStoreActionStoreAndMultisampleResolve` and `MTLStoreActionCustomSampleDepthStore`.
+    #[cfg(any(target_os = "linux", windows))]
+    const STORE_AND_MULTISAMPLE_RESOLVE: u64 = 3;
+    #[cfg(any(target_os = "linux", windows))]
+    const CUSTOM_SAMPLE_DEPTH_STORE: u64 = 5;
+
+    /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass resolves a 4-sample
+    /// `BGRA8Unorm` colour attachment of the device's memory, cleared, into a 16 × 16 texture over
+    /// a guest's read-only buffer (made with bit 24, `resource::tests::read_only_buffer`), by
+    /// `store`, or by `late`'s store action set in the pass where given; the pages are the
+    /// buffer's. Where `setter`, the descriptor names a resolve texture of the device's memory
+    /// and the pass sets the read-only one late (the setter's SPI). The selector it dies at
+    /// instead, where it dies.
+    #[cfg(any(target_os = "linux", windows))]
+    fn read_only_resolve_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        store: u64,
+        late: Option<u64>,
+        setter: bool,
+    ) -> Result<String, &'static str> {
+        use crate::core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{bgra_over, read_only_buffer};
+        use crate::os::PAGE;
+
+        /// `MTLTextureType2DMultisample`.
+        const MULTISAMPLE: u64 = 4;
         let (p, d) = (platform(), dev());
-        let library = (d.new_library(crate::gpu::writes::tests::PROBE))
-            .unwrap()
+        let (ro, pages) = read_only_buffer(1);
+        let target = bgra_over(&ro, READ | TARGET);
+        let samples = d
+            .new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type: MULTISAMPLE,
+                    pixel_format: BGRA8,
+                    width: 16,
+                    height: 16,
+                    sample_count: 4,
+                    usage: TARGET,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
             .unwrap()
             .unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let (vertex, fragment) = (
-            function("read_only_beside_nested_vertex"),
-            function("read_only_beside_nested_fragment"),
+        let own = texture(&p, &d, BGRA8, READ | TARGET, (16, 16), None);
+        let pass = p.render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&samples)),
+            resolve_texture: Some(Some(if setter { &own } else { &target })),
+            load_action: Some(CLEAR),
+            store_action: Some(store),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let late = late.map(|store_action| RenderCmd::SetColorStoreAction {
+            store_action,
+            color_attachment_index: 0,
+        });
+        let set = setter.then_some(RenderCmd::SetColorResolveTexture {
+            texture: Some(&target),
+            slice: 0,
+            depth_plane: 0,
+            level: 0,
+            y_invert: false,
+            index: 0,
+        });
+        assert!(!(setter && late.is_some()), "one late command");
+        let line = catch_death(|| pass_line_on(q, &pass, late.or(set), (pages, 16 * 64)));
+        drop((pass, samples, own, target, ro));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
         );
-        let state = d
-            .new_render_pipeline_state(&RenderPipelineDesc {
+        line.map_err(|site| site.file)
+    }
+
+    /// A pass that resolves a multisample attachment of the device's memory into a texture over
+    /// a guest's read-only memory by `MultisampleResolve` or `StoreAndMultisampleResolve`, the
+    /// descriptor's action or a late one, fails its command buffer as Metal's GPU faults it
+    /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, m3-max-28796,
+    /// m3-max-28797, m3-max-29292 and m3-max-29309; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and its queue runs on. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_resolve_into_read_only_memory_faults_its_command_buffer() {
+        for (store, late) in [
+            (MULTISAMPLE_RESOLVE, None),
+            (UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            (STORE_AND_MULTISAMPLE_RESOLVE, None),
+            (UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
+        ] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_resolve_on(&q, store, late, false);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{store} {late:?}");
+            assert_eq!(filled_on(&q), FILLED, "{store} {late:?}");
+        }
+    }
+
+    /// What a depth or stencil pass of [`read_only_depth_stencil_on`] takes: the attachment, the
+    /// 16 × 16 texture's format (`Depth32Float`, 252, or `Stencil8`, 253), whether it resolves a
+    /// 4-sample attachment of the device's memory into the heap's texture, which is otherwise the
+    /// attachment, whether the heap's resolve texture is set late (the setter's SPI) over one of
+    /// the device's memory the descriptor names, its store action, or `Unknown` and a late one,
+    /// and whether a depth pass has beside it a 4-sample `Stencil8` attachment of the device's
+    /// memory that resolves into a texture of the device's memory (`MultisampleResolve`).
+    #[cfg(any(target_os = "linux", windows))]
+    #[derive(Clone, Copy, Debug, Default)]
+    struct ReadOnlyDepthStencil {
+        stencil: bool,
+        resolve: bool,
+        setter: bool,
+        store: u64,
+        late: Option<u64>,
+        beside: bool,
+    }
+
+    /// [`pass_line_on`]'s line of a command buffer of `q` whose render pass's depth or stencil
+    /// attachment (`shape`) is a 16 × 16 texture at the start of a heap made with bit 24 over
+    /// pages of the test's own (`resource::tests::guest_pages_of`), as the guest makes a
+    /// read-only heap, or resolves into it, cleared to 0.5 or 0x5a; the pages are the heap's. The
+    /// selector it dies at instead, where it dies.
+    #[cfg(any(target_os = "linux", windows))]
+    fn read_only_depth_stencil_on(
+        q: &crate::gpu::command::VulkanCommandQueue,
+        shape: ReadOnlyDepthStencil,
+    ) -> Result<String, &'static str> {
+        use crate::core::host::HostPtr;
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{
+            DepthAttachmentSet, HeapDesc, OptionSet, StencilAttachmentSet,
+        };
+
+        use crate::gpu::resource::tests::{BIT_24, guest_pages_of, over_pages};
+
+        /// `MTLTextureType2DMultisample`.
+        const MULTISAMPLE: u64 = 4;
+        let ReadOnlyDepthStencil {
+            stencil,
+            resolve,
+            setter,
+            store,
+            late,
+            beside,
+        } = shape;
+        let format = if stencil { 253 } else { 252 };
+        let (p, d) = (platform(), dev());
+        let size = over_pages();
+        let address = guest_pages_of(size);
+        let pages = HostPtr::from_addr(address.to_usize());
+        // SAFETY: pages of the test's, left mapped until the process ends.
+        let bytes = unsafe { HostRange::new(pages, size) };
+        // The runtime makes it over a copy of the pages on Linux, announcing `copied-host-pages`,
+        // which dies in strict mode, so it is made under the default.
+        let heap = crate::answer::relaxed(|| {
+            d.new_heap_over_host_memory(
+                bytes,
+                &HeapDesc {
+                    size,
+                    heap_type: 1,
+                    options: vec![
+                        OptionSet::StorageMode(0),
+                        OptionSet::HazardTrackingMode(0),
+                        OptionSet::ResourceOptionsOr(BIT_24),
+                    ],
+                    pinned_gpu_address: None,
+                },
+            )
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+        let desc = p.texture_descriptor(&TextureDesc {
+            pixel_format: format,
+            width: 16,
+            height: 16,
+            usage: TARGET,
+            resource_options: Some(heap.resource_options() & !BIT_24),
+            ..TextureDesc::default()
+        });
+        // Its image is a shadow of the heap's bytes on Linux, which a device without
+        // `VK_EXT_depth_range_unrestricted` (ANV) copies in clamped: the runtime announces
+        // `restricted-depth-upload` as it makes it, which dies in strict mode, so it is made under
+        // the default too.
+        let in_heap = crate::answer::relaxed(|| heap.new_texture(&desc, 0))
+            .unwrap()
+            .unwrap();
+        let private_of = |pixel_format, texture_type, sample_count| {
+            d.new_texture(
+                OnFault::Die,
+                &p.texture_descriptor(&TextureDesc {
+                    texture_type,
+                    pixel_format,
+                    width: 16,
+                    height: 16,
+                    sample_count,
+                    usage: TARGET,
+                    resource_options: Some(0x20),
+                    ..TextureDesc::default()
+                }),
+            )
+            .unwrap()
+            .unwrap()
+        };
+        let private = |texture_type, sample_count| private_of(format, texture_type, sample_count);
+        let samples = resolve.then(|| private(MULTISAMPLE, 4));
+        let own = setter.then(|| private(2, 1));
+        let paired = beside.then(|| (private_of(253, MULTISAMPLE, 4), private_of(253, 2, 1)));
+        let (texture, resolve_texture) = match (&samples, &own) {
+            (Some(samples), Some(own)) => (samples, Some(Some(own))),
+            (Some(samples), None) => (samples, Some(Some(&in_heap))),
+            (None, _) => (&in_heap, None),
+        };
+        let pass = p.render_pass_descriptor();
+        if stencil {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture,
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_stencil: Some(0x5a),
+                ..StencilAttachmentSet::default()
+            });
+        } else {
+            pass.set_depth_attachment(&DepthAttachmentSet {
+                texture: Some(Some(texture)),
+                resolve_texture,
+                load_action: Some(CLEAR),
+                store_action: Some(store),
+                clear_depth: Some(0.5),
+                ..DepthAttachmentSet::default()
+            });
+        }
+        if let Some((samples, into)) = &paired {
+            pass.set_stencil_attachment(&StencilAttachmentSet {
+                texture: Some(Some(samples)),
+                resolve_texture: Some(Some(into)),
+                load_action: Some(CLEAR),
+                store_action: Some(MULTISAMPLE_RESOLVE),
+                clear_stencil: Some(0x5a),
+                ..StencilAttachmentSet::default()
+            });
+        }
+        let late = late.map(|store_action| match stencil {
+            true => RenderCmd::SetStencilStoreAction { store_action },
+            false => RenderCmd::SetDepthStoreAction { store_action },
+        });
+        let set = setter.then_some(match stencil {
+            true => RenderCmd::SetStencilResolveTexture {
+                texture: Some(&in_heap),
+                slice: 0,
+                depth_plane: 0,
+                level: 0,
+                y_invert: false,
+            },
+            false => RenderCmd::SetDepthResolveTexture {
+                texture: Some(&in_heap),
+                slice: 0,
+                depth_plane: 0,
+                level: 0,
+                y_invert: false,
+            },
+        });
+        assert!(!(setter && late.is_some()), "one late command");
+        let line = catch_death(|| pass_line_on(q, &pass, late.or(set), (pages, size.to_usize())));
+        drop((pass, samples, own, paired, in_heap, heap));
+        line.map_err(|site| site.file)
+    }
+
+    /// A pass that keeps a depth attachment in a guest's read-only heap by `Store` or
+    /// `CustomSampleDepthStore`, the descriptor's action or a late one, and one that keeps a
+    /// stencil attachment there by `Store`, fail their command buffers as Metal's GPU faults them
+    /// ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, a heap of bit 24:
+    /// m3-max-28796, m3-max-28797 and m3-max-29292; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and the queue runs on. One that does not store it completes, as on the M3 Max
+    /// (m3-max-29292): `DontCare`, and a stencil attachment's `CustomSampleDepthStore` set late,
+    /// which the runtime stores as `DontCare`. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_depth_or_stencil_store_into_read_only_memory_faults_its_command_buffer() {
+        let kept = |stencil, store, late| ReadOnlyDepthStencil {
+            stencil,
+            store,
+            late,
+            ..ReadOnlyDepthStencil::default()
+        };
+        for shape in [
+            kept(false, STORE, None),
+            kept(false, CUSTOM_SAMPLE_DEPTH_STORE, None),
+            kept(false, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
+            kept(true, STORE, None),
+            kept(true, UNKNOWN, Some(STORE)),
+        ] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_depth_stencil_on(&q, shape);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{shape:?}");
+            assert_eq!(filled_on(&q), FILLED, "{shape:?}");
+        }
+        let q = dev().new_command_queue().unwrap();
+        for shape in [
+            kept(false, DONT_CARE, None),
+            kept(true, DONT_CARE, None),
+            kept(true, UNKNOWN, Some(CUSTOM_SAMPLE_DEPTH_STORE)),
+        ] {
+            assert_eq!(
+                read_only_depth_stencil_on(&q, shape).as_deref(),
+                Ok("status 4 error None before 0x5a after 0x6b signal true zeros true"),
+                "{shape:?}"
+            );
+        }
+        assert_eq!(filled_on(&q), FILLED);
+    }
+
+    /// A pass that resolves a 4-sample depth attachment of the device's memory into a texture in
+    /// a guest's read-only heap by `MultisampleResolve`, and a stencil one by `MultisampleResolve`
+    /// or `StoreAndMultisampleResolve`, the descriptor's action or a late one, the descriptor's
+    /// resolve texture or one the setter's SPI set late, fails its command buffer as Metal's GPU
+    /// faults it ([`FAULTED`]: measured on the M3 Max, macOS 27.0.1, plain Metal, a heap of bit
+    /// 24, every run: m3-max-29292 and m3-max-29309; the runtime's `store_out.rs`), the pages
+    /// staying zeros, and its queue runs on. A depth attachment's `StoreAndMultisampleResolve`
+    /// there completes, the pages staying zeros, as the M3 Max completes it leaving the texture
+    /// unchanged (the Radeon Pro 5300M and UHD Graphics 630 under macOS 26.7.1 write it): the
+    /// runtime drops the resolve. Beside a stencil attachment that resolves, which the runtime
+    /// faults where nothing measured Metal's GPU, it dies where the pass is made, or at the late
+    /// store action or resolve texture. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_depth_or_stencil_resolve_into_read_only_memory_faults_its_command_buffer() {
+        let resolve = |stencil, store, late| ReadOnlyDepthStencil {
+            stencil,
+            resolve: true,
+            store,
+            late,
+            ..ReadOnlyDepthStencil::default()
+        };
+        let set = |stencil, store| ReadOnlyDepthStencil {
+            setter: true,
+            ..resolve(stencil, store, None)
+        };
+        for shape in [
+            resolve(false, MULTISAMPLE_RESOLVE, None),
+            resolve(false, UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            set(false, MULTISAMPLE_RESOLVE),
+            resolve(true, MULTISAMPLE_RESOLVE, None),
+            resolve(true, UNKNOWN, Some(MULTISAMPLE_RESOLVE)),
+            resolve(true, STORE_AND_MULTISAMPLE_RESOLVE, None),
+            resolve(true, UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
+            set(true, STORE_AND_MULTISAMPLE_RESOLVE),
+        ] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_depth_stencil_on(&q, shape);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{shape:?}");
+            assert_eq!(filled_on(&q), FILLED, "{shape:?}");
+        }
+        let beside = |shape| ReadOnlyDepthStencil {
+            beside: true,
+            ..shape
+        };
+        for (shape, site) in [
+            (
+                resolve(false, STORE_AND_MULTISAMPLE_RESOLVE, None),
+                "renderCommandEncoderWithDescriptor:",
+            ),
+            (
+                resolve(false, UNKNOWN, Some(STORE_AND_MULTISAMPLE_RESOLVE)),
+                "setDepthStoreAction:",
+            ),
+            (
+                set(false, STORE_AND_MULTISAMPLE_RESOLVE),
+                "setDepthResolveTexture:slice:depthPlane:level:yInvert:",
+            ),
+        ] {
+            let q = dev().new_command_queue().unwrap();
+            assert_eq!(
+                read_only_depth_stencil_on(&q, shape).as_deref(),
+                Ok("status 4 error None before 0x5a after 0x6b signal true zeros true"),
+                "{shape:?}"
+            );
+            assert_eq!(filled_on(&q), FILLED, "{shape:?}");
+            assert_eq!(
+                read_only_depth_stencil_on(&q, beside(shape)),
+                Err(site),
+                "{shape:?} beside a stencil resolve"
+            );
+        }
+    }
+
+    /// A colour attachment's resolve texture over a guest's read-only memory set late by the
+    /// setter's SPI, over one of the device's memory the descriptor names, fails the command
+    /// buffer where the known store action resolves (`MultisampleResolve`,
+    /// `StoreAndMultisampleResolve`), as Metal's GPU faults it ([`FAULTED`]: measured on the M3
+    /// Max, macOS 27.0.1, plain Metal, m3-max-29292), and where it does not (`Store`), the setter
+    /// encodes nothing, as Metal resolves nothing there, and the command buffer completes, the
+    /// pages staying zeros. A colour attachment
+    /// the descriptor keeps by `CustomSampleDepthStore` dies where the pass is made, at the
+    /// runtime's refusal, as plain Metal aborts there over any memory (m3-max-29292 to
+    /// m3-max-29294). Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_late_resolve_texture_in_read_only_memory_faults_where_it_resolves() {
+        for store in [MULTISAMPLE_RESOLVE, STORE_AND_MULTISAMPLE_RESOLVE] {
+            let q = dev().new_command_queue().unwrap();
+            let line = read_only_resolve_on(&q, store, None, true);
+            assert_eq!(line.as_deref(), Ok(FAULTED), "{store}");
+            assert_eq!(filled_on(&q), FILLED, "{store}");
+        }
+        let q = dev().new_command_queue().unwrap();
+        assert_eq!(
+            read_only_resolve_on(&q, STORE, None, true).as_deref(),
+            Ok("status 4 error None before 0x5a after 0x6b signal true zeros true")
+        );
+        assert_eq!(
+            read_only_resolve_on(&q, CUSTOM_SAMPLE_DEPTH_STORE, None, false),
+            Err("renderCommandEncoderWithDescriptor:")
+        );
+    }
+
+    /// A draw whose fragment function `write()`s a texture over a guest's read-only memory (a
+    /// buffer made with bit 24, `resource::tests::read_only_buffer`), bound at the slot it
+    /// writes, and a draw that does not write it but makes it resident for writing, complete with
+    /// no error, the writes dropped and the pages staying zeros: the runtime's copy of the pages
+    /// drops them. Metal's GPUs differ at the first: the M3 Max under macOS 27.0.1 faults the
+    /// command buffer, the Radeon Pro 5300M and UHD Graphics 630 under macOS 26.7.1 complete it,
+    /// writing the pages, and this platform takes completing, the cheaper; all three complete
+    /// the second (plain Metal, m3-max-29292 to m3-max-29294, m3-max-29309 to m3-max-29311;
+    /// `crate::gpu::writes`'s docs). The same draw writes a texture over a buffer of the
+    /// device's, which shows the function writes. Linux's and Windows's: on macOS it goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_draws_write_into_read_only_memory_is_dropped() {
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::RenderPipelineDesc;
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+        use crate::os::PAGE;
+
+        /// The sweep library, `rounding.metal`; sweep 1 writes values just over 1, every
+        /// component of a `BGRA8Unorm` texel 0xff.
+        const ROUNDING: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rounding.metallib"));
+        /// `MTLTextureUsageShaderWrite` and `MTLResourceUsageWrite`.
+        const WRITE: u64 = 2;
+        let (p, d) = (platform(), dev());
+        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
+        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+        let state = |fragment| {
+            d.new_render_pipeline_state(&RenderPipelineDesc {
                 label: None,
-                vertex: &vertex,
-                fragment: &fragment,
+                vertex: &function("sweep_vertex"),
+                fragment: &function(fragment),
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()
-            .unwrap();
-        let (read_only, pages) = over_read_only_pages(1);
-        let nested = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
-        let written = buffer::<VulkanPlatform>(&d, 16, 0, &[0; 16]);
-        let indices = buffer::<VulkanPlatform>(&d, 8, 0, &[0, 0, 1, 0, 2, 0, 0, 0]);
-        let pixels = pass_pixels(
-            &p,
-            &d,
-            draw(&state, [&nested, &read_only, &written, &indices]),
-        );
+            .unwrap()
+        };
+        let (writes, draws) = (state("write_fragment"), state("sweep_fragment"));
+        let kind = buffer::<VulkanPlatform>(&d, 16, 0, &[1, 0, 0, 0]);
+        let drawn = |cmds: Vec<RenderCmd<'_, VulkanPlatform>>| {
+            let (_dst, pass) = pass_of(&p, &d, (16, 16));
+            let q = d.new_command_queue().unwrap();
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+            send_all(&e, cmds);
+            send_all(&e, vec![three(3, None), RenderCmd::EndEncoding]);
+            cb.commit(OnFault::Die).unwrap();
+            cb.wait_until_completed(OnFault::Die).unwrap();
+            (cb.status().0, cb.error().map(|e| e.code))
+        };
+        let write = |state, texture| {
+            drawn(vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(state),
+                },
+                RenderCmd::SetFragmentBuffer {
+                    buffer: Some(&kind),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetFragmentTexture {
+                    texture: Some(texture),
+                    index: 0,
+                },
+            ])
+        };
+        let ours = buffer::<VulkanPlatform>(&d, 16 * 64, 0, &[]);
+        let over_ours = bgra_over(&ours, READ | WRITE);
+        assert_eq!(write(&writes, &over_ours), (4, None), "the device's");
+        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
+        let written = unsafe { std::slice::from_raw_parts(ours.contents().as_ptr::<u8>(), 64) };
+        assert!(written.iter().all(|&b| b == 0xff), "{written:?}");
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, READ | WRITE);
+        assert_eq!(write(&writes, &over), (4, None), "write()");
+        let resident = [Some(ResourceRef::Texture(&over))];
+        let used = drawn(vec![
+            RenderCmd::SetRenderPipelineState {
+                pipeline_state: Some(&draws),
+            },
+            RenderCmd::SetFragmentBuffer {
+                buffer: Some(&kind),
+                offset: 0,
+                index: 0,
+            },
+            RenderCmd::UseResources {
+                resources: &resident,
+                usage: WRITE,
+            },
+        ]);
+        assert_eq!(used, (4, None), "resident for writing");
+        assert!(host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0));
+        drop((over, ro, over_ours, ours));
         assert!(
-            pixels.iter().all(|&t| t == [0, 0, 0xff, 0xff]),
-            "{pixels:?}"
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
         );
-        // SAFETY: a Shared buffer's words, read after the draw completed.
-        let words = unsafe { std::slice::from_raw_parts(written.contents().as_ptr::<u32>(), 4) };
-        assert_eq!(words, [1, 1, 1, 0]);
-        let (_dst, pass) = pass_of(&p, &d, (16, 16));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let mut cmds = draw(&state, [&nested, &read_only, &read_only, &indices]);
-        let issue = cmds.pop().unwrap();
-        send_all(&e, cmds);
-        assert_eq!(
-            dies_at(&e, issue),
-            "drawIndexedPrimitives:indexCount:indexType:indexBuffer:indexBufferOffset:"
-        );
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert!(cb.error().is_none(), "{:?}", cb.error());
-        // SAFETY: the page, mapped readable, which no GPU work uses now.
-        let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
-        assert_eq!(first, 0);
-        drop((cb, e, state, read_only));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
     }
 
     /// An indirect strip of 200,000 16- or 32-bit indices that restarts at the setter's index
@@ -5774,9 +6146,10 @@ pub(crate) mod tests {
     }
 
     /// Whether the device's points reach Metal's largest, 511 pixels (its `pointSizeRange`).
-    /// Elsewhere (255 on ANV) every draw of a state that sizes its points dies in strict mode
+    /// Elsewhere (255 on ANV) every draw of points by a state that sizes them dies in strict mode
     /// (`device-point-size`, [`crate::answer::DIES`]), which a draw of [`SIZED`]'s pins here, so
     /// no such state draws a point there, and the test says so
+    /// ([`a_state_that_sizes_its_points_draws_lines_and_triangles_silently`] draws its others)
     fn points_reach_metals() -> bool {
         let reaches = dev().raw.properties().description.limits.max_point_size >= 511;
         if !reaches {
@@ -5788,6 +6161,19 @@ pub(crate) mod tests {
             eprintln!("the device's points end below Metal's 511 pixels: no point is drawn here");
         }
         reaches
+    }
+
+    /// A state that sizes its points ([`SIZED`]) draws lines, line strips, triangles and
+    /// triangle strips, indexed or not, in strict mode, with nothing that dies announced, on every
+    /// device, one whose points end below Metal's 511 pixels too: the runtime announces
+    /// `device-point-size` at a draw of points alone ([`points_reach_metals`])
+    #[test]
+    fn a_state_that_sizes_its_points_draws_lines_and_triangles_silently() {
+        let (e, indices) = drawing_encoder(SIZED.0, SIZED.1);
+        let draws = [1, 2, 3, STRIP].into_iter();
+        let cmds = draws.flat_map(|p| [three(p, None), three(p, Some(&indices))]);
+        send_all(&e, cmds.collect());
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
     /// Whether the runtime draws the last provoking vertex through the device's own
@@ -5919,6 +6305,68 @@ pub(crate) mod tests {
         e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
     }
 
+    /// `setTriangleFillMode:` 2, which no SDK header names and Apple's GL renderer sends for
+    /// `glPolygonMode(GL_POINT)` under its Apple, AMD and Intel settings, draws a triangle's three
+    /// vertices as points of one pixel, as the M3 Max and the Intel UHD Graphics 630 draw them
+    /// (the runtime's `set_triangle_fill_mode`: `VK_POLYGON_MODE_POINT`), under a state whose
+    /// vertex function writes no `[[point_size]]`, where the device draws point polygons
+    /// (`fillModeNonSolid`, and `pointPolygons` on a portability-subset device). Elsewhere,
+    /// MoltenVK among them, the runtime refuses the mode, and the test draws nothing. Every
+    /// vertex is white: which vertex's flat value a point takes is not measured on Metal
+    #[test]
+    fn fill_mode_2_draws_a_triangles_vertices_as_points() {
+        use metal2vulkan::device::{VkExtension, VkFeature};
+        let (p, d) = (platform(), dev());
+        let desc = &d.raw.properties().description;
+        let draws = desc.features.contains(&VkFeature::FillModeNonSolid)
+            && (!desc.extensions.contains(&VkExtension::KhrPortabilitySubset)
+                || desc.features.contains(&VkFeature::PointPolygons));
+        if !draws {
+            return;
+        }
+        // Three pixels of the 16 by 16 target, each vertex at its centre in clip space.
+        let pixels: [(u8, u8); 3] = [(2, 3), (12, 4), (6, 13)];
+        let centre = |(x, y): (u8, u8)| {
+            let at = |v: u8| (f32::from(v) + 0.5) / 8.0 - 1.0;
+            [at(x), -at(y), 0.0, 1.0]
+        };
+        let pos: Vec<f32> = pixels.into_iter().flat_map(centre).collect();
+        let state = fixture_state::<VulkanPlatform>(&d, FLAT.0, FLAT.1);
+        let pos = buffer::<VulkanPlatform>(&d, 48, 0, &bytes(&pos));
+        let white = buffer::<VulkanPlatform>(&d, 48, 0, &bytes(&[1.0; 12]));
+        let drawn = pass_pixels(
+            &p,
+            &d,
+            vec![
+                RenderCmd::SetRenderPipelineState {
+                    pipeline_state: Some(&state),
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&pos),
+                    offset: 0,
+                    index: 0,
+                },
+                RenderCmd::SetVertexBuffer {
+                    buffer: Some(&white),
+                    offset: 0,
+                    index: 1,
+                },
+                RenderCmd::SetTriangleFillMode { fill_mode: 2 },
+                RenderCmd::DrawPrimitivesInstances {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                    instance_count: 1,
+                },
+            ],
+        );
+        let mut want = vec![[0, 0, 0, 0xff]; 256];
+        for (x, y) in pixels {
+            want[usize::from(y) * 16 + usize::from(x)] = [0xff; 4];
+        }
+        assert_eq!(drawn, want);
+    }
+
     /// A draw of no primitive draws nothing whatever the private setters left, as on Metal: of
     /// too few vertices or indices for one, and an execution of no command, after a restart, a
     /// line width of 2, triangles filled as lines and the last vertex provoking under a state
@@ -5929,7 +6377,7 @@ pub(crate) mod tests {
     /// `metal_tests::lines_take_metals_flat_inputs_at_the_last_vertex`)
     #[test]
     fn empty_draws_go_on_after_the_private_setters() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::values::IcbDesc;
 
         let (e, indices) = drawing_encoder(FLAT.0, FLAT.1);
         let icb = dev()
@@ -6028,8 +6476,8 @@ pub(crate) mod tests {
     /// `render_state_misc` sends them
     #[test]
     fn an_amplification_mode_kills_draws_only_where_it_changes_the_count() {
-        use reims_vgpu_core::platform::types::VertexAmplificationViewMapping;
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::types::VertexAmplificationViewMapping;
+        use crate::core::platform::values::IcbDesc;
 
         let (e, _indices) = drawing_encoder("vert:tri_vert", "frag:tri_frag");
         let icb = dev()
@@ -6099,7 +6547,7 @@ pub(crate) mod tests {
         let (e, dst) = open_encoder();
         let d = dev();
         let sampler = d
-            .new_sampler_state(&reims_vgpu_core::platform::values::SamplerDesc::default())
+            .new_sampler_state(&crate::core::platform::values::SamplerDesc::default())
             .unwrap()
             .unwrap();
         let buf = d
@@ -6230,14 +6678,14 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        pass.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+        pass.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
             texture: Some(Some(&depth)),
             resolve_texture: Some(Some(&depth_resolve)),
             load_action: Some(CLEAR),
             store_action: Some(STORE),
             ..Default::default()
         });
-        pass.set_stencil_attachment(&reims_vgpu_core::platform::values::StencilAttachmentSet {
+        pass.set_stencil_attachment(&crate::core::platform::values::StencilAttachmentSet {
             texture: Some(Some(&depth)),
             resolve_texture: Some(Some(&depth_resolve)),
             load_action: Some(CLEAR),
@@ -6324,7 +6772,7 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        pass.set_pass(&reims_vgpu_core::platform::values::PassSet {
+        pass.set_pass(&crate::core::platform::values::PassSet {
             render_target_width: Some(16),
             render_target_height: Some(8),
             default_raster_sample_count: Some(1),
@@ -6369,7 +6817,7 @@ pub(crate) mod tests {
         let r = pass.set_color_attachment(OnFault::Return, 8, &ColorAttachmentSet::default());
         assert!(r.is_err());
         assert!(pass.color_attachment_state(8).is_err());
-        pass.set_pass(&reims_vgpu_core::platform::values::PassSet {
+        pass.set_pass(&crate::core::platform::values::PassSet {
             default_color_sample_count: Some(4),
             ..Default::default()
         });
@@ -6379,7 +6827,7 @@ pub(crate) mod tests {
     /// request the runtime answers its cached state for; every reference answers its handle's
     #[test]
     fn every_render_pipeline_creation_takes_a_new_identifier() {
-        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        use crate::core::platform::resource::RenderPipeline as _;
         let d = dev();
         let key = PipelineKey {
             format: BGRA8,
@@ -6400,7 +6848,7 @@ pub(crate) mod tests {
     /// past it
     #[test]
     fn binds_at_the_last_slot_die_at_their_selector() {
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::raise::death::DeathKind;
 
         let (p, d) = (platform(), dev());
         let b = crate::gpu::resource::tests::shared(64);
@@ -6452,9 +6900,9 @@ pub(crate) mod tests {
     /// (code 1); 1, 4 and 7 complete it
     #[test]
     fn a_pass_without_attachments_answers_metals_default_sample_counts() {
-        use reims_vgpu_core::platform::types::CommandBufferStatus;
-        use reims_vgpu_core::platform::values::PassSet;
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::platform::types::CommandBufferStatus;
+        use crate::core::platform::values::PassSet;
+        use crate::core::raise::death::DeathKind;
 
         let p = platform();
         let q = dev().new_command_queue().unwrap();
@@ -6514,7 +6962,7 @@ pub(crate) mod tests {
     /// pipeline state. The execution of one whose commands set their own is taken
     #[test]
     fn what_runs_the_pipeline_after_a_nil_one_dies() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::values::IcbDesc;
 
         let p = platform();
         let d = dev();
@@ -6586,19 +7034,17 @@ pub(crate) mod tests {
     /// pipeline state draws to RGBA16Float in a pass of a BGRA8 target, which the runtime refuses,
     /// the buffer made resident with `usage`.
     fn execute_a_mismatched_draw(usage: u64) {
+        use crate::core::platform::icb::{
+            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+        };
+        use crate::core::platform::values::IcbDesc;
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::values::IcbDesc;
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -6679,8 +7125,8 @@ pub(crate) mod tests {
     /// still refused, which dies at the execution's selector, as no handler of core's learns of it
     #[test]
     fn refused_icb_records_die_naming_the_execution() {
-        use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-        use reims_vgpu_core::testkit::capture::expect_death;
+        use crate::core::raise::death::{DeathKind, DeathSite};
+        use crate::core::testkit::capture::expect_death;
 
         let site = catch_death(|| execute_a_mismatched_draw(1)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
@@ -6706,10 +7152,8 @@ pub(crate) mod tests {
             TessellationDescriptor,
         };
 
-        const TESS: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/render_tess.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+        const TESS: &[u8] = include_bytes!("../../../../tests/shaders/render_tess.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -6904,19 +7348,17 @@ pub(crate) mod tests {
     /// `device-color-conversion` (`PrecisionNote::DeviceColorConversion`)
     #[test]
     fn a_pass_executes_an_icbs_draws() {
+        use crate::core::platform::icb::{
+            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+        };
+        use crate::core::platform::values::IcbDesc;
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::values::IcbDesc;
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/frag.metallib");
         let p = platform();
         let d = dev();
         let function = |bytes, name| {
@@ -7079,149 +7521,6 @@ pub(crate) mod tests {
         }
     }
 
-    /// An execution whose commands run pipeline states of their own writes no texture bound on
-    /// the encoder ([`Reach::at_slots`]): with a texture on a surface made read-only for the GPU
-    /// bound at fragment texture 0, and made resident for reading, it goes on; with the texture
-    /// made resident for writing, it dies at the execution
-    #[test]
-    fn an_execution_of_states_of_its_own_writes_no_bound_texture() {
-        use metal2vulkan::metal::PixelFormat;
-        use metal2vulkan::pipeline::{
-            ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
-        };
-        use reims_vgpu_core::host::PhysicalMemoryRange;
-        use reims_vgpu_core::platform::icb::{
-            IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-        };
-        use reims_vgpu_core::platform::os::surface::SurfaceSpec;
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
-        use reims_vgpu_core::platform::values::IcbDesc;
-
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/frag.metallib");
-        let p = platform();
-        let d = dev();
-        let function = |bytes, name| {
-            d.raw
-                .new_library_with_data(bytes)
-                .unwrap()
-                .new_function_with_name(name)
-                .unwrap()
-        };
-        let mut desc = RenderPipelineDescriptor::new(StageSource::Function(
-            function(VERT, "tri_vert").function_descriptor(),
-        ));
-        desc.fragment = Some(StageSource::Function(
-            function(FRAG, "tri_frag").function_descriptor(),
-        ));
-        desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
-        desc.support_indirect_command_buffers = true;
-        let pipeline = crate::gpu::resource::render_pipeline(
-            d.raw
-                .new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
-                .unwrap(),
-        );
-        let icb = d
-            .new_indirect_command_buffer(
-                &IcbDesc {
-                    command_types: 1,
-                    ..IcbDesc::default()
-                },
-                1,
-                0,
-            )
-            .unwrap()
-            .unwrap();
-        let c = icb.render_command(0).unwrap().unwrap();
-        for cmd in [
-            IcbRenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(&pipeline),
-            },
-            IcbRenderCmd::DrawPrimitives {
-                primitive_type: 3,
-                vertex_start: 0,
-                vertex_count: 3,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        ] {
-            c.encode(cmd).unwrap();
-        }
-        let vm = crate::os::OsVm::new();
-        let page = vm.page_size();
-        let guest = crate::os::allocate_aliasable(page).unwrap();
-        let spec = SurfaceSpec {
-            pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: page,
-            width: 16,
-            height: 16,
-            bytes_per_element: 4,
-            bytes_per_row: 64,
-            element_width: 1,
-            element_height: 1,
-            client_direction: Some(2),
-            client_address_ranges: Some(vec![PhysicalMemoryRange {
-                physical_address: reims_vgpu_core::num::ToU64::to_u64(guest.addr()),
-                physical_length: page,
-            }]),
-            ..SurfaceSpec::default()
-        };
-        let s = p.surfaces().create(&spec).unwrap();
-        let read = p.texture_descriptor(&TextureDesc {
-            pixel_format: BGRA8,
-            width: 16,
-            height: 16,
-            usage: READ,
-            ..TextureDesc::default()
-        });
-        let t = d
-            .new_texture_on_surface(&read, Some(&s), 0)
-            .unwrap()
-            .unwrap();
-        assert!(t.gpu_read_only());
-        let execute = |usage: u64| {
-            let (_dst, pass) = pass_of(&p, &d, (4, 4));
-            let q = d.new_command_queue().unwrap();
-            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            let (listed, used) = (
-                [Some(ResourceRef::Icb(&icb))],
-                [Some(ResourceRef::Texture(&t))],
-            );
-            for cmd in [
-                RenderCmd::SetFragmentTexture {
-                    texture: Some(&t),
-                    index: 0,
-                },
-                RenderCmd::UseResources {
-                    resources: &listed,
-                    usage: 1,
-                },
-                RenderCmd::UseResources {
-                    resources: &used,
-                    usage,
-                },
-                RenderCmd::ExecuteCommandsInBuffer {
-                    indirect_command_buffer: &icb,
-                    execution_range: NsRange::new(0, 1),
-                },
-                RenderCmd::EndEncoding,
-            ] {
-                e.encode(OnFault::Die, cmd).unwrap();
-            }
-            cb.commit(OnFault::Die).unwrap();
-            cb.wait_until_completed(OnFault::Die).unwrap();
-            cb.status().0
-        };
-        assert_eq!(execute(1), 4);
-        let site = catch_death(|| execute(3)).unwrap_err();
-        assert_eq!(site.file, "executeCommandsInBuffer:withRange:");
-        drop((t, s));
-        assert!(vm.deallocate(guest, page).is_success());
-    }
-
     /// A pass of a mutable rate map not yet reset rasterizes nothing, a scissor rectangle set in
     /// it too: the colour and depth attachments keep their clears and the fragment function's
     /// write does not land, as on Metal; a tile dispatch in it dies. A reset after such a
@@ -7231,21 +7530,19 @@ pub(crate) mod tests {
     /// there
     #[test]
     fn a_pass_of_a_mutable_rate_map_not_yet_reset_rasterizes_nothing() {
+        use crate::core::platform::rate_map::{
+            RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
+        };
+        use crate::core::platform::values::{
+            DepthAttachmentSet, DepthStencilDesc, PassSet, RateMapDesc,
+        };
         use metal2vulkan::metal::PixelFormat;
         use metal2vulkan::pipeline::{
             ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
         };
-        use reims_vgpu_core::platform::rate_map::{
-            RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
-        };
-        use reims_vgpu_core::platform::values::{
-            DepthAttachmentSet, DepthStencilDesc, PassSet, RateMapDesc,
-        };
 
-        const VERT: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/vert.metallib");
-        const FRAG: &[u8] =
-            include_bytes!("../../../../tests/suite/fixtures/shaders/mutdec_fwrite.metallib");
+        const VERT: &[u8] = include_bytes!("../../../../tests/shaders/vert.metallib");
+        const FRAG: &[u8] = include_bytes!("../../../../tests/shaders/mutdec_fwrite.metallib");
         /// `MTLPixelFormatDepth32Float`, `MTLCompareFunctionAlways`.
         const DEPTH32F: u64 = 252;
         const ALWAYS: u64 = 7;
@@ -7434,10 +7731,10 @@ pub(crate) mod tests {
         side: u64,
         mutability: u64,
     ) -> crate::gpu::rate_map::VulkanRateMapDescriptor {
-        use reims_vgpu_core::platform::rate_map::{
+        use crate::core::platform::rate_map::{
             RateMapDescriptor as _, RateMapLayerDescriptor as _,
         };
-        use reims_vgpu_core::platform::values::RateMapDesc;
+        use crate::core::platform::values::RateMapDesc;
 
         let m = p.rate_map_descriptor(&RateMapDesc {
             screen_size: MtlSize::new(side, side, 1),
@@ -7468,11 +7765,11 @@ pub(crate) mod tests {
     fn a_reset_waits_for_a_committed_pass_core_let_go_of() {
         use std::sync::mpsc;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::rate_map::RateMap as _;
-        use reims_vgpu_core::platform::values::PassSet;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::rate_map::RateMap as _;
+        use crate::core::platform::values::PassSet;
 
-        use reims_vgpu_core::platform::values::RateMapDesc;
+        use crate::core::platform::values::RateMapDesc;
 
         let p = platform();
         let d = dev();
@@ -7524,11 +7821,11 @@ pub(crate) mod tests {
     /// creation or a reset, and a draw in a pass over it is taken
     #[test]
     fn draws_over_a_map_of_varying_rates_die() {
-        use reims_vgpu_core::platform::rate_map::{
+        use crate::core::platform::rate_map::{
             RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
         };
-        use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-        use reims_vgpu_core::raise::death::DeathKind;
+        use crate::core::platform::values::{PassSet, RateMapDesc};
+        use crate::core::raise::death::DeathKind;
 
         use crate::gpu::rate_map::{VulkanRateMap, VulkanRateMapDescriptor};
 
@@ -7694,127 +7991,6 @@ pub(crate) mod tests {
         assert_eq!(cb.error(), None);
     }
 
-    /// endEncoding in a thread of an isolated task that has ended stops before it touches the
-    /// encoder, which stays in its handle, its store action left `Unknown` unset, as Metal's is
-    /// left; outside a task the same pass ends, storing nothing for that attachment
-    #[test]
-    fn an_ended_tasks_end_encoding_leaves_the_encoder() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        /// `MTLStoreActionUnknown`.
-        const UNKNOWN: u64 = 4;
-        let p = platform();
-        let d = dev();
-        let (dst, pass) = pass_of(&p, &d, (4, 4));
-        pass.set_color_attachment(
-            OnFault::Die,
-            0,
-            &ColorAttachmentSet {
-                texture: Some(Some(&dst)),
-                store_action: Some(UNKNOWN),
-                ..ColorAttachmentSet::default()
-            },
-        )
-        .unwrap();
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            e.encode(OnFault::Return, RenderCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            e.encoder.raw.lock().borrow().is_some(),
-            "the render encoder was taken"
-        );
-        assert_eq!(e.undecided.lock().len(), 1);
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-        assert!(e.encoder.raw.lock().borrow().is_none());
-        cb.commit(OnFault::Die).unwrap();
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        assert_eq!(cb.error(), None);
-    }
-
-    /// An encoder made in a thread of an isolated task that ended, which stops at the encoder's
-    /// first command, leaves the runtime's encoder in its handle, open, as Metal's is left: the
-    /// command buffer then has an encoder open, not one abandoned
-    #[test]
-    fn an_ended_tasks_encoder_creation_leaves_the_encoder_open() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let p = platform();
-        let d = dev();
-        let (_dst, pass) = pass_of(&p, &d, (4, 4));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let made = without_unused_resolves(pass.descriptor());
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            let e = opened(&cb, raw, (made, Vec::new()), Taken::UNMAPPED).unwrap();
-            let rect = MtlScissorRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            };
-            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
-        });
-        assert!(stopped.is_none());
-        let refused = cb.raw.blit_command_encoder().unwrap_err();
-        assert!(
-            matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
-            "{refused:?}"
-        );
-    }
-
-    /// The encoder of a pass taken as one over a mutable rate map not yet reset is ([`Taken`]),
-    /// the device's first, made in a thread of an isolated task that ended, is to end with the
-    /// platform's draw and stops at the encoder's first command, the runtime's encoder in its
-    /// handle, open, as Metal's is left, not dropped with the command buffer abandoned. The
-    /// device's caps are read first, as core reads them as the device starts, before any task
-    #[test]
-    fn an_ended_tasks_first_encoder_over_a_mutable_map_is_left_open() {
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let p = platform();
-        let d = dev();
-        let (_dst, pass) = pass_of(&p, &d, (4, 4));
-        let q = d.new_command_queue().unwrap();
-        let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-        let made = without_unused_resolves(pass.descriptor());
-        let raw = cb.raw.render_command_encoder(&made).unwrap();
-        let taken = Taken {
-            class: Some(Class::Unset),
-            mutable: true,
-        };
-        d.caps();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            let e = opened(&cb, raw, (made, Vec::new()), taken).unwrap();
-            assert!(e.undrawn.load(Ordering::Acquire));
-            let rect = MtlScissorRect {
-                x: 0,
-                y: 0,
-                width: 1,
-                height: 1,
-            };
-            e.encode(OnFault::Die, RenderCmd::SetScissorRect { rect })
-        });
-        assert!(stopped.is_none());
-        let refused = cb.raw.blit_command_encoder().unwrap_err();
-        assert!(
-            matches!(&refused, rt::Error::Invalid(i) if i.problem == rt::Problem::EncoderOpen),
-            "{refused:?}"
-        );
-    }
-
     /// The platform's no-draw pipeline is made only for a pass over a mutable map that no draw of
     /// the guest's took the place of, at the pass's end, once per device: after passes that draw
     /// 3 vertices of a triangle list and of a strip, once, the next plain state's
@@ -7823,8 +7999,8 @@ pub(crate) mod tests {
     /// reuses it. Every pass completes with no error, none failed as a GPU hang
     #[test]
     fn no_draw_moves_later_plain_identifiers_only_for_a_pass_that_drew_nothing() {
-        use reims_vgpu_core::platform::rate_map::RateMap as _;
-        use reims_vgpu_core::platform::values::PassSet;
+        use crate::core::platform::rate_map::RateMap as _;
+        use crate::core::platform::values::PassSet;
 
         /// `MTLPrimitiveTypeTriangle` and `TriangleStrip`.
         const TRIANGLE: u64 = 3;

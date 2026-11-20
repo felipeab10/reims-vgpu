@@ -1,29 +1,17 @@
 # How cargo-nextest schedules the workspace's tests, `cargo xtask check`'s among them.
 #
-# A Mac's GPU is shared by every process on it. The test that faults it on purpose and the one
-# that holds the most of its memory run first, each with nothing else in flight; the longest
-# tests start next, so the run does not end on one that began late. Why, and what these tests
-# did to the others before, is in docs/lessons.md ("Tools and worktrees", and "The platform and
-# the runtime" for Metal's compiles). Every override but the last two is the Mac's alone; on
-# Linux only the last two apply, and nextest runs the other tests in its own order. A filter that
+# A Mac's GPU is shared by every process on it. The test that holds the most of its memory runs
+# first, with nothing else in flight; the longest tests start next, so the run does not end on one
+# that began late. Why, and what such tests did to the others before, is in docs/lessons.md
+# ("Tools and worktrees", and "The platform and the runtime" for Metal's compiles). Every override but the last three is the Mac's alone; on
+# Linux only the last three apply, and nextest runs the other tests in its own order. A filter that
 # names a package or binary the workspace no longer has fails every nextest run, so a rename
 # updates this file too.
 
-# Writes that fault a Mac's GPU on purpose: opt-in (`#[ignore]`), run only for a change to what
-# they test, with `--run-ignored only`. Each fault is a GPU recovery (84 GPU events in its
-# 1.8 s, measured on the M3 Max, macOS 27.0.1), and every command buffer of another process in
-# flight then fails as its victim ("Discarded (victim of GPU error/recovery)"): the YCbCr
-# sweeps, the extended-range blends (Metal's side then reads zeros), the in-flight detaches, the
-# textures made while a kernel runs.
-[[profile.default.overrides]]
-platform = 'cfg(target_os = "macos")'
-filter = 'binary_id(reims-vgpu-vulkan::client_direction) & test(=metal_drops_small_blits_into_the_texture)'
-threads-required = "num-test-threads"
-priority = 100
-
-# A reservation of 2^31 - 1 resource IDs, opt-in (`#[ignore]`) like the one above: 16 GiB of
-# memory for about a second, six times any other test's peak, where others' command buffers fail with "Insufficient Memory" when the
-# GPU's memory runs out.
+# A reservation of 2^31 - 1 resource IDs, opt-in (`#[ignore]`), run only for a change to what it
+# tests, with `--run-ignored only`: 16 GiB of memory for about a second, six times any other
+# test's peak, where others' command buffers fail with "Insufficient Memory" when the GPU's memory
+# runs out.
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "macos")'
 filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::icb::tests::metal_tests::a_reservation_of_2_31_minus_1_is_metals)'
@@ -52,8 +40,7 @@ filter = '''
       | test(=gpu::encode_render::tests::metal_tests::resolves_into_other_formats_are_metals_or_die_named)
       | test(=gpu::encode_render::tests::metal_tests::indexed_strips_restart_at_the_set_index_as_metals_do)
       | test(=gpu::rgbx::nan_clears_are_metals)
-      | test(=gpu::fill::tests::metal_tests::colors_are_the_metal_platforms_here)))
-  | (binary_id(reims-vgpu-video-conformance) & test(=scaler::tests::the_reference_backend_passes_a_case_of_each_kind))
+      | test(=gpu::fill::tests::metal_tests::colors_are_metals)))
 '''
 priority = 50
 
@@ -66,15 +53,54 @@ priority = 50
 filter = 'binary_id(reims-vgpu-vulkan) & test(=awake::tests::an_exit_amid_touches_ends_with_its_status)'
 priority = 50
 
-# The paging discard tests (`gpu/paging_discard.rs`), on Linux with nothing else in flight. Each
-# makes two imports of host memory while a kernel of half a second holds the paging command
-# buffer in flight, and reads what the runtime holds before the kernel ends. On an RTX 5080
-# Laptop GPU (NVIDIA 615.71.09, measured 2026-10-26) an import of 4 MiB took 0.3 to 0.6 ms alone
-# and beside another process's half-second kernels, and 195 ms once beside 52 test processes
-# making their devices; in the Vulkan crate's whole run one waited in the driver's lock
-# (`os_acquire_rwlock_write`, in an ioctl of `/dev/nvidiactl`) for 455 ms, and the reads ended
-# after the kernel in 6 of 9 runs of the two cases. Alone, the synchronize took 5 and 10 ms.
+# The `vaapi` module's tests of the GPU held (`vaapi::va::spin`, `va::wait::gpu`, `va::wait::held`),
+# opt-in (`#[ignore]`) and run on the VA-API host with `--run-ignored only`, each alone. Each
+# holds the GPU's ring with a spin of its own and times the display's calls against it, so a
+# test made beside another's spin waits for that spin too: run together (nextest's default), a
+# test of the held graphics ring failed 1 of 1 on the Radeon 780M, then passed 6 of 6 alone (jobs
+# m3-max-4299, m3-max-4303, 2026-11-07).
 [[profile.default.overrides]]
 platform = 'cfg(target_os = "linux")'
-filter = 'binary_id(reims-vgpu-vulkan) & test(/^gpu::paging_discard::/)'
+filter = 'binary_id(reims-vgpu-video) & test(/^vaapi::va::(spin|wait::(gpu|held))::/)'
 threads-required = "num-test-threads"
+
+# A device cache's planes over its exported memory: where the device's verdict for that memory
+# did not pass (a record of its driver's check, or this process's check), the test checks that
+# the planes lie on the device's lines alone, and says so; its output shows on a pass too, so a
+# run shows a pass that skipped the check of the planes in place.
+[[profile.default.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=gpu::resource::tests::a_device_cache_lays_its_planes_on_the_devices_lines_from_its_first_planes_byte)'
+success-output = "final"
+
+# The NVIDIA hosts' legs (`--profile nvidia`, AGENTS.md "The video crates' checks"): at most three
+# tests that make a Vulkan device at a time, the keep-awake's exit test, whose 8 children each
+# make one, taking all three. Each test process makes a device of its own, up to 16 at once where
+# a QEMU makes one, and NVIDIA's driver holds what each live device takes. On an RTX 2080 behind a
+# Thunderbolt 3 link, whose BAR1 is 256 MiB (no Resizable BAR), each device maps 67 MiB of it
+# (metal2vulkan's first 64 MiB block of write-combined memory), and a `vkCreateDevice` made while
+# the live ones leave too little is refused with VK_ERROR_INITIALIZATION_FAILED (NVRM:
+# "dmaAllocMapping_GM107: can't alloc VA space for mapping"); its channel heap holds 160 to 190
+# queues' channels too, a device taking 17 of them (NVRM: "Instance block allocation ... failed").
+# Measured 2026-11-11, driver 620.70.06: 6 test processes at once passed and 8 failed 4 to 6 of
+# them; a whole leg at 16 test threads failed 20 tests, a different 20 each run, each passing
+# alone (m3-max-15516, m3-max-15566, m3-max-15797, m3-max-15798). The driver makes the devices
+# of every process one at a time (about 0.45 s each for one of 16 queues), so the bound costs
+# the leg little.
+[test-groups]
+vulkan-devices = { max-threads = 3 }
+
+[[profile.nvidia.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = 'binary_id(reims-vgpu-vulkan) & test(=awake::tests::an_exit_amid_touches_ends_with_its_status)'
+test-group = "vulkan-devices"
+threads-required = 3
+
+[[profile.nvidia.overrides]]
+platform = 'cfg(target_os = "linux")'
+filter = '''
+    (package(reims-vgpu-vulkan) & !(binary_id(reims-vgpu-vulkan) & test(/^core::/)))
+  | (package(reims-vgpu) & test(/on_vulkan/))
+  | package(reims-vgpu-c)
+'''
+test-group = "vulkan-devices"

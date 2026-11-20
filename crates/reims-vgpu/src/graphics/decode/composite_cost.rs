@@ -34,7 +34,7 @@ use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use reims_graphics::ops::render::{
+use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_MEMORY_BARRIER_WITH_SCOPE,
     RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
@@ -42,22 +42,22 @@ use reims_graphics::ops::render::{
     RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetVertexBuffer,
     RgfxSamplerBinding,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
     RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment,
     RgfxRenderPassDesc,
 };
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxCbComplete,
     RgfxMsgHeader, RgfxQueueCreate,
 };
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::values::{FullRenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
-use super::draw_cost::{counts, fixture, spread};
+use super::draw_cost::{counts, fixture, over, spread};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -306,14 +306,14 @@ impl<P: ApiPlatform> Bench<P> {
         let device = platform.metal_device(None).unwrap();
         let chunk = (shape.quads() * QUAD).next_multiple_of(0x4000);
         let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + chunk + RGFX_CURSOR_SPAN;
-        let region = reims_graphics::region::Region::new(region_size as usize).unwrap();
+        let region = crate::platform::test_region(&*platform, region_size as usize);
         for quad in 0..shape.quads() {
             let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + quad * QUAD;
             assert!(region.write(at, quad_positions(shape, quad).as_bytes()));
         }
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
-        let tx = reims_vgpu_core::sync::Mutex::new(tx);
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
         decoder.set_completion_sink(Arc::new(move |m| {
             let _ = tx.lock().send((m, Instant::now()));
         }));
@@ -347,14 +347,14 @@ impl<P: ApiPlatform> Bench<P> {
             ..TextureDesc::default()
         });
         let target = device.new_texture(OnFault::Die, &target).unwrap().unwrap();
+        let (vertex, fragment) = (
+            fixture::<P>(&device, "render_vbuf"),
+            fixture::<P>(&device, "render_ftex"),
+        );
         let pipeline = device
-            .new_render_pipeline_state(&RenderPipelineDesc {
-                label: None,
-                vertex: &fixture::<P>(&device, "render_vbuf"),
-                fragment: &fixture::<P>(&device, "render_ftex"),
-                color0_pixel_format: BGRA8,
-                blend_over: true,
-                resource_index: None,
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: vec![(0, over(BGRA8))],
+                ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
             })
             .unwrap()
             .unwrap();
@@ -406,7 +406,7 @@ impl<P: ApiPlatform> Bench<P> {
 #[allow(clippy::disallowed_methods)] // a measurement: real time is what it measures
 fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let shape = bench.shape;
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     // On a Mac, the thread asks for the performance cores, as a lane's thread is mostly on one.
     #[cfg(target_os = "macos")]
     // SAFETY: sets this thread's own class, which takes no pointer.
@@ -418,6 +418,7 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     let mut latency_us = Vec::new();
     let mut gpu_us = Vec::new();
     let mut after_walk_us = Vec::new();
+    let cut = bench.decoder.parts_cut();
     for n in 0..WARM + shape.frames {
         let cb_obj_id = 0x1000 + n as u64;
         let message = frame(shape, cb_obj_id);
@@ -447,7 +448,8 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
     }
     println!(
         "{name}: {} frames of 1 command buffer of {} passes of {} draws over {} x {}, a draw {} \
-         of the target, every {}th pass reading its target {}, parts walked {} us at least",
+         of the target, every {}th pass reading its target {}, parts walked {} us at least, \
+         {:.2} parts a frame",
         shape.frames,
         shape.passes,
         shape.draws,
@@ -460,7 +462,8 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
         } else {
             "after its draws"
         },
-        (shape.split_us).map_or(super::split::SPLIT_AFTER.as_micros(), u128::from)
+        (shape.split_us).map_or(super::split::SPLIT_AFTER.as_micros(), u128::from),
+        1.0 + (bench.decoder.parts_cut() - cut) as f64 / (WARM + shape.frames) as f64
     );
     for (figure, values) in [
         ("walk us", &mut walk_us),
@@ -483,19 +486,9 @@ fn measure<P: ApiPlatform>(name: &str, mut bench: Bench<P>) {
 }
 
 /// On the Vulkan platform.
-#[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a frame's times"]
 fn on_vulkan_composite_cost() {
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench);
-}
-
-/// On the Metal platform.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a frame's times"]
-fn on_metal_composite_cost() {
-    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new(Shape::chosen());
-    measure("metal", bench);
 }

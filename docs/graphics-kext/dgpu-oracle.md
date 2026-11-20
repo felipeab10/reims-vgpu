@@ -11,8 +11,9 @@ The probes are in `guest/bundle/tools/oracle` ([README](../../guest/bundle/tools
 `oracle_iosurface`, `oracle_storage`, `oracle_passes`, `oracle_cmdbuf`, `oracle_caps`,
 `oracle_errors`, `oracle_source`, `oracle_ycbcr`, `oracle_ca_ycbcr`, `oracle_sampler`,
 `oracle_icb`, `oracle_order`, `oracle_names`, `oracle_surftex`, `oracle_reflection`,
-`oracle_mesh`, `oracle_events`, `oracle_texdesc` and `oracle_nilbind`; the upload costs (Q17)
-are `guest/bundle/tools/upload_probe.m`'s.
+`oracle_mesh`, `oracle_events`, `oracle_texdesc`, `oracle_nilbind`, `oracle_complete`,
+`oracle_residency`, `oracle_threads`, `oracle_overlap`, `oracle_readonly`, `oracle_failways`
+and `oracle_twinwrites`; the upload costs (Q17) are `guest/bundle/tools/upload_probe.m`'s.
 
 **Machines.** Every claim below is measured, on:
 - **AMD**: AMD Radeon Pro 5300M (Navi 14, `amdgpu_gfx1012`, 4 GB; AMDRadeonX6000 on
@@ -168,7 +169,8 @@ x86.
 
 ## Q2: Managed storage
 
-Probe: `oracle_storage DEVICE mbuf 4096|67108864` and `mtex`.
+Probe: `oracle_storage DEVICE mbuf 4096|67108864`, `mtex` and `capture` (11-12, m3-max-22553 on
+the AMD, 22554 on the Intel; not run on the M3).
 
 | | AMD | Intel 630 and M3 |
 |---|---|---|
@@ -177,6 +179,8 @@ Probe: `oracle_storage DEVICE mbuf 4096|67108864` and `mtex`.
 | buffer: GPU write pending (no sync), then CPU [0,256) + `didModifyRange:` of it | only [0,256) uploaded; the GPU's bytes stay elsewhere | (one copy) |
 | buffer: GPU write without `synchronizeResource:` (completion, 200 ms) | never seen by the CPU | seen at once |
 | buffer: `didModifyRange:` after the reading command buffer was encoded, before its commit | seen: the upload happens at commit | seen |
+| buffer: CPU bytes written again after `didModifyRange:`, before the commit (`capture`) | seen, the command buffer encoded before the write or after it | seen |
+| buffer: CPU bytes written again after the commit, 30 ms in, while the command buffer's first kernel holds the GPU (1.27 s on AMD, 637 ms on Intel) | not seen: the kernel reads the bytes of the commit | seen |
 | texture: GPU write without `synchronizeTexture:`, then `getBytes:` | old bytes, also 200 ms later | new |
 | texture: unsynchronized GPU write, then `replaceRegion:` of a 16 x 1 corner | the whole CPU copy is uploaded: the GPU's write is lost outside the corner | corner new, GPU's write kept |
 
@@ -191,6 +195,18 @@ with no synchronize, as on Intel. **Relaxation: none.** AMD is
 looser than Metal in one way that costs us nothing: it uploads more than the named range when the
 GPU copy is clean, so an app with a short `didModifyRange:` works on AMD, where ours uploads the
 range alone.
+
+Ours, by `capture` in an x86-64 macOS 26.7.2 guest on two-copy hosts, 11-12: on the RX 7900 XTX
+(m3-max-22650, metal2vulkan 38ab829481) the five steps read A, B, B, A, B, the 5300M's answers;
+on the RX 550 (m3-max-22791, metal2vulkan 86d01646ae, which takes the range's bytes at the commit)
+the first four read A, B, B, A, and the fifth has no answer: the fourth step's spin held the GPU
+for 2 s there, until the driver recovered the context (`radv/amdgpu: ... guilty of a soft
+recovery`), and the fifth step's command buffer was discarded as its victim. A CPU write
+after the commit, while the command buffer's first kernel runs, is not seen on either, as on the
+5300M; no step writes after the commit while the command buffer waits behind other work, where
+taking the bytes at the commit and at the submission's start would differ. On the XTX the spin
+saw the CPU's write to its Shared flag 140 ms in, which the 5300M's never did (Q3: ours is in
+place).
 
 ## Q3: Shared storage
 
@@ -233,9 +249,10 @@ Probes: `oracle_storage DEVICE shtex`, `lintex shared|managed`, `argenc shared|m
   `didModifyRange:` of all of it (`RgfxTexture.mm`).
 - **A no-copy Managed buffer** (`nocopy`, 11-03) is two copies on AMD: the GPU's copy holds zeros,
   not the pages' bytes, until a `didModifyRange:`, and a CPU write with no call is never seen
-  (also 200 ms later); Intel's is one copy. Ours is one copy, as Intel's, wherever the kext wires
-  the pages (`RgfxBuffer.mm`, bufferOverPagesOf), and two copies over read-only memory and where
-  it wires none, the GPU's copy filled from the pages at the create.
+  (also 200 ms later); Intel's is one copy. Ours is two copies on a discrete host, as AMD's, and
+  one copy on a host whose GPU shares the CPU's memory, the GPU's copy filled from the pages at
+  the create wherever it is one of its own (`RgfxBuffer.mm`, bufferOverPagesOf; over read-only
+  memory and where the kext wires no pages, a shadow).
 - **An argument encoder writing a Managed argument buffer** (`argenc managed`, 11-03):
   `setBuffer:` and `setTexture:` reach the GPU's copy on AMD only at the app's
   `didModifyRange:`; Intel is one copy. A Shared argument buffer's writes are seen at once on
@@ -291,8 +308,9 @@ Probe: `oracle_passes DEVICE features`.
 | `supportsTileShaders`, `supportsImageBlocks` (SPI) | 0, 0 | 0, 0 | 1, 1 |
 
 Our stack: memoryless textures are made (m2v). The lane answers `isFramebufferReadSupported`
-no, as AMD does *(class 2: the Vulkan platform's fetch costs most)*, and `supportsTileShaders`
-and `supportsImageBlocks` no, as both x86 GPUs do (4ee4bcaf0). **Relaxation: none.** With no
+no to an x86-64 guest, as AMD does *(class 2: the Vulkan platform's fetch costs most)*, and the
+host GPU's answer to an arm64 guest, as the M3 does (`device_info.rs`, `lane_flags`). It answers
+`supportsTileShaders` and `supportsImageBlocks` no, as both x86 GPUs do (4ee4bcaf0). **Relaxation: none.** With no
 Apple family claimed, guests should ask for none of these; a guest that makes a memoryless
 texture ends on x86 and goes on with ours.
 
@@ -346,6 +364,33 @@ Probe: `oracle_cmdbuf DEVICE timing`. Times are from commit.
 | `kernelStartTime`/`kernelEndTime` | +0.08 / +0.16 ms | +0.06 / +0.09 ms |
 | async compute and render pipeline creators | return with the handler pending; it runs about 60 ms later on `Device serial queue` | the same |
 
+`oracle_cmdbuf DEVICE gputimes`: what `GPUStartTime` and `GPUEndTime` answer for one long
+buffer, K encoders of about 0.5 ms each in one buffer ("whole") against the same encoders
+committed back to back one buffer each ("apart"), compute (`slow_write`) and render (K passes
+over a 1920 x 1080 BGRA8 target, each clearing it and blending 6 full-target quads), medians of
+7 runs, in ms, on the 5300M and the 630 (macOS 26.7.1):
+
+| | AMD whole span | AMD apart, summed | Intel whole span | Intel apart, summed |
+|---|---|---|---|---|
+| compute, K 1 | 0.555 | 0.555 | 0.585 | 0.586 |
+| compute, K 8 | 1.599 | 1.844 | 4.089 | 4.372 |
+| compute, K 32 | 6.313 | 7.368 | 13.047 | 12.407 |
+| render, K 1 | 0.336 | 0.335 | 3.175 | 3.063 |
+| render, K 8 | 2.690 | 2.715 | 19.020 | 18.199 |
+| render, K 32 | 11.044 | 10.887 | 59.561 | 59.990 |
+| whole: `GPUStartTime` after the commit | 0.08 to 0.15 | | 0.12 to 0.40 | |
+| whole: the completed handler after `GPUEndTime` | 0.015 to 0.14 | | 0.012 to 0.14 | |
+
+So one buffer spans its encoders' GPU time summed, as back-to-back buffers do, within the GPUs'
+clock ramp (both clock up under a sustained load: the AMD's 8 compute encoders took 0.2 ms each
+against 0.56 ms alone) *(class 3)*. The CPU's time encoding a buffer never counts: a buffer of 8
+compute encoders whose CPU slept 1 ms between them spanned 4.52 ms on the AMD and 1.50 ms on the
+Intel, and the AMD, idle through the sleeps, started it 2.58 ms after its commit. Our stack: a
+buffer the host commits in parts as it walks it answers its first part's start, and its parts'
+GPU time summed as its span, never past its last part's end (`decode/split.rs`, "Its GPU times"),
+where the span from its first part's start to its last part's end held the host's walk between
+parts.
+
 `oracle_cmdbuf DEVICE submitted`: a tiny buffer's `commitAndWaitUntilSubmitted`, 20 runs each,
 times from the first commit (medians), on the 5300M, the 630 (both macOS 26.7.1) and the M3 Max
 (macOS 27.0.1):
@@ -368,6 +413,30 @@ So the call returns once the buffer is submitted, which for a buffer waiting on 
 behind one on its queue, is at the signal *(class 3)*; whether the buffer is `Scheduled` by then,
 and its scheduled handlers have run, is a race on all three *(class 2)*, and an idle queue
 returns while it is still `Committed` *(class 3)*.
+
+`oracle_waits DEVICE`: waits against handlers that block (each handler sleeps 20 ms), 20 runs
+each, tiny blit buffers, on the 5300M, the 630 (both macOS 26.7.1) and the M3 Max (macOS 27.0.1).
+Every row was the same in all 20 runs on all three:
+
+| | all three |
+|---|---|
+| `waitUntilCompleted` against a completed handler that blocks | returns after it ends (0.01 to 0.15 ms after) |
+| the same with two completed handlers, the second blocking | returns after the second ends; the first ran before the second |
+| the status read in a completed handler, and once the wait returns | `Completed` |
+| `waitUntilScheduled` against a scheduled handler that blocks | returns after it ends |
+| the buffer's completed handler, its `Completed` status and `waitUntilCompleted` against that scheduled handler | all after it ends |
+| a second buffer of the queue, committed right after one whose completed handler blocks, with no handler or a quick one: its `Completed` status, its handler and its `waitUntilCompleted` | all after the first's handler ends |
+| a second buffer with no handler, committed while the first's completed handler blocks: its `Scheduled` and `Completed` status, `waitUntilScheduled` and `waitUntilCompleted` | all after the first's handler ends (the polling thread never read `Scheduled` in 5 runs on the 630 and 2 on the 5300M, the buffer passing it between two reads) |
+| idle GPU, tiny buffer, commit to `waitUntilCompleted`'s return, no handler / an empty completed handler (median) | AMD 0.50 / 0.50 ms, Intel 0.39 / 0.39 ms, M3 0.72 / 0.89 ms |
+
+So a queue's buffers become `Scheduled` and `Completed`, run their handlers and release their
+waiters in one order, on its completion queue: a buffer's status changes before its handlers of
+the stage run, its waits return only after them, and a handler that blocks holds everything of its
+queue after it, other buffers' statuses and waits included *(class 3)*. Our stack does the same:
+each queue's records run in ring order on its completion queue (design.md, "Who takes the
+completions"), a record's status changes before its handlers and its waiters go after them, and
+a buffer's records run on the thread that took them only while none of its queue's are still to
+run.
 
 The M3 also runs a creator's handler after the creator returns, on the global default-QoS queue
 (`com.apple.root.default-qos`) *(class 3 that it runs after the return; class 2 which queue)*.
@@ -418,7 +487,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | `maxThreadgroupMemoryLength` | 65536 | 65536 | 32768 | 32768 |
 | `maxArgumentBufferSamplerCount` | 2048 | 2048 | 500000 | 0 |
 | `readWriteTextureSupport` | 2 | 1 | 2 | 2 |
-| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 256 (4a329e614) |
+| `minimumLinearTextureAlignmentForPixelFormat:`, `linearTextureAlignmentBytes` | 256 | 256 | 16 | 128, the platform's on the 5080's driver (256 from 4a329e614 to 2026-11-12) |
 | `iosurfaceTextureAlignmentBytes` | 16 | 16 | 16 | |
 | `isDepth24Stencil8PixelFormatSupported` | 1 | 0 | 0 | 0 |
 | `supports32BitMSAA`, `supportsPullModelInterpolation` | 1, 1 | 1, 1 | 1, 1 | the runtime's: 1, 1 on the 5080 (metal2vulkan 7da81ee3d8; 0, 0 before) |
@@ -429,7 +498,7 @@ Probe: `oracle_caps DEVICE`. Where the x86 GPUs' answers differ from the M3's or
 | sparse tile sizes | 0x0x0 | n/r | 64x64 and up | 64x64 and up |
 | families | Mac2, Common1-3, Metal3; no Apple | the same | Apple1-9, Metal4 too | as AMD |
 | `supportsFeatureSet:(10002)` | 1 | 0 | 0 | 0 |
-| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10, the M3's (Q11) |
+| `featureProfile` (SPI) | 10002 | 10002 | 10 | 10002, the x86 Macs' (Q11); 10001 where the guest's Metal lacks the MTLArchitecture class (macOS 11 and 12) |
 | `heapTextureSizeAndAlign` alignment | 65536 | 4096 | 128 | |
 
 Formats (`F` lines): both x86 GPUs make every uncompressed color format but B5G6R5, A1BGR5,
@@ -442,14 +511,21 @@ the M3 asserts for compressed and depth ones. `minimumLinearTextureAlignmentForP
 (`oracle_bundle linalign`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535) answers 256
 for the same 64 values on both, 46 of the SDK's formats and 18 it has no name for, and ends the
 process at every other (compressed, depth and stencil, else MTLPixelFormatInvalid; D24S8 and X24S8
-are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. Our device makes ASTC and the packed formats (m2v),
+are depth on AMD, Invalid on Intel); ours does the same, D24S8 as Intel. The M3 Max answers 175
+values and ends at others; an arm64 guest's device answers as it does (Q34). Our device makes ASTC and the packed formats (m2v),
 which no x86 Mac does; with no Apple family claimed, frameworks should not ask for them.
 
-**Relaxation: none** for performance. Two answers help the host, and the lane gives both, as
-choices inside the envelope *(class 2)*: `minimumLinearTextureAlignmentForPixelFormat:` and the
-SPI linear alignments 256 for every format they answer, as both x86 GPUs answer, which suits the Vulkan
-hosts' linear images (4ee4bcaf0, 4a329e614); and `maxBufferLength` at most three quarters of
+**Relaxation: none** for performance. One answer helps the host, and the lane gives it, as a
+choice inside the envelope *(class 2)*: `maxBufferLength` at most three quarters of
 `recommendedMaxWorkingSetSize`, the rule the 5300M and the M3 answer by (4ee4bcaf0).
+`minimumLinearTextureAlignmentForPixelFormat:` and the SPI linear alignments describe the GPU,
+each Mac answering its own, so the device answers the host GPU's: the platform's, 256 on RADV
+and 128 on NVIDIA's driver (`device_info.rs`). Both x86 GPUs answer one value for every format;
+a host GPU that asks more of larger texels answers each format its own, and the SPI ones the
+largest (a Radeon RX 550: 256 bytes for texels of 1 to 4 bytes, 512 for 8, 1024 for 16). The
+lane answered 256 for every format from 4ee4bcaf0 and 4a329e614, as both x86 GPUs answer, while
+the platform answered Metal's 16 on every host; on NVIDIA's driver, which takes a linear image
+in place only at its own pitch, rows at 256 bytes were shadows wherever that pitch is not one.
 
 ## Q10: runtime source compile
 
@@ -495,18 +571,77 @@ offset:bytesPerRow:`, which asks the buffer it makes for the second.
 | the buffer's tiled SPI | made, with the levels asked, storage Shared; level 0 over the buffer's bytes; levels 1 and up rendered to and read by a blit and a kernel, their pixels nowhere in the buffer | the same | the buffer does not answer the selector |
 | the device's tiled SPI | as the buffer's | the same | an unrecognized-selector exception (the device asks its buffer for the buffer's SPI) |
 
+What such a texture holds was measured later (11-11, a scratch probe written from scratch, not
+kept). The probe made a 256 x 256 texture of 9 levels over rows 1024 bytes apart, RGBA8 and
+BGRA8, with Shared and Managed descriptors, by both tiled forms. Each level was read by a blit:
+
+| step | AMD and Intel 630 |
+|---|---|
+| the texture made over the rows (x, y, 0x80, 0xff), then read | level 0 the rows, (128, 128, 128, 255) on average; levels 1 to 8 generated from them, (127, 127, 128, 255) |
+| made over zero bytes, the rows written by the CPU right after the make or 100 ms after, then the first read | the same: the bytes are taken at the first GPU use, not at the make |
+| after a read, the CPU rewrites every byte to 0x40 | no level changes |
+| then `didModifyData` (SPI) | every level 0x40: level 0 copied again and every level generated again |
+| after a read, the CPU writes the rows, calls `didModifyData`, then writes 0x20 with no call, then a read | every level 0x20: `didModifyData` takes the bytes at the next GPU use, not at the call |
+| a blit writes level 0 | level 0 changes; levels 1 and up and the buffer's bytes do not |
+| `storageMode` | 0 (Shared), from a Managed descriptor too |
+
+So the texture is a copy of the buffer's bytes with every level generated from level 0. The copy
+is taken at the first GPU use after the make, and again after each `didModifyData`, and a GPU
+write stays in the texture *(class 3: both x86 GPUs agree)*. Safari 26's CoreGraphics makes such
+textures for the pictures it draws: 1600 x 1600 of 11 levels and 600 x 400 of 10, RGBA8Unorm,
+packed rows at offset 0. It never writes levels 1 and up, and it samples a picture drawn below
+its size with linear mipmap filtering. It writes the bytes before it makes the texture, and calls
+no `didModifyData` on it (26.7.2 walks 15718 and 15720, 11-11, a probe of the bundle's). The
+host's platform makes the texture as the x86 Macs do (metal2vulkan's
+`Buffer::new_tiled_texture`): a copy of the bytes with every level made from level 0, taken at
+its first use in a command buffer, which no later CPU write reaches and from which no GPU write
+reaches the buffer. A platform that kept level 0 in step with the bytes and left levels 1 and up
+zero drew such a picture black or dark (26.7.2 walks 15511, 15613 and 15614 on a Radeon 780M
+and an RTX 3090, 11-11). The bundle tells the host a mipmapped texture's `didModifyData`
+(`TEXTURE_DID_MODIFY_DATA`), and the copy is taken again at its next use, as on the x86 Macs.
+
+The CPU's calls on such a texture were measured next (11-11, the same probe), 256 x 256 RGBA8 of
+9 levels by both forms, Shared and Managed descriptors. The texture was made over 0x40, read by a
+blit, then each step ran in turn:
+
+| step | AMD | Intel 630 |
+|---|---|---|
+| `getBytes:` of level 0 before any GPU use | the bytes | the process crashes in Metal (a segmentation fault) |
+| `getBytes:` of level 0 after the CPU rewrote the bytes to 0x20 with no call, after a `replaceRegion:` of level 0, and after a blit wrote level 0 | the buffer's bytes as they lie each time, not the copy | the same |
+| `getBytes:` of level 1 at the same points | made from the bytes as they lie: 32, then 96 | what the copy held then, 64 and 64, with a Shared descriptor; 58 and 58 with a Managed one |
+| `replaceRegion:` of level 0 with 0x60 | the buffer's bytes become 0x60, and the next GPU use reads every level 0x60: the copy is taken again with no `didModifyData` | the same |
+| `replaceRegion:` of level 1 with 0x70 | `getBytes:` of level 1 reads 0x70 back; no GPU use sees it, before or after a `didModifyData` (level 1 stays made from level 0) | the same with a Shared descriptor; with a Managed one the process crashes in Metal (a bus error) at it |
+
+So the CPU reaches level 0 in the buffer's bytes, and a `replaceRegion:` of level 0 takes the
+copy again as `didModifyData` does *(class 3: both agree)*. The bundle does both: its `getBytes:`
+and `replaceRegion:` of level 0 address the buffer, and a `replaceRegion:` of level 0 of the
+tiled form also sends `TEXTURE_DID_MODIFY_DATA`. The CPU's level 1 and up differ between the two
+GPUs *(class 2)*; the bundle reads and writes them in the device's copy by a blit, so a
+`replaceRegion:` of level 1 or up reaches the GPU's use until the copy is taken again, which
+neither x86 Mac's does. No app is known to write those levels by the CPU.
+
 *(class 2: the tiled forms are x86's alone.)* WindowServer's tiled backings use the buffer's SPI
 (RgfxBuffer.mm). Our stack: the public form ends the process at more than one level with
-Metal's words *(class 3)*, sending the host nothing; the tiled forms answer nil for one, logged
-once, until the host carries levels 1 and up. With the lane answering `featureProfile` 10002, an x86 Mac's, WindowServer asked
-the lane for a 7-level texture over a buffer, which the host's platform refused, and every later
-command buffer naming it faulted, so its composition stopped (boot ro1-p2, 11-02); answering 10
-it asked for none (ro1-p1 and its control). The x86 answer on that path is not one the host
-keeps cheaply: levels 1 and up live in the GPU's own memory, apart from the buffer's. Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
+Metal's words *(class 3)*, sending the host nothing; the tiled forms make one *(class 3)*:
+`TEXTURE_FROM_BUFFER` carries the levels, and the host's platform makes one image of every
+level, the copy above (metal2vulkan's `Buffer::new_tiled_texture`), the bundle logging the first
+of each process with its levels. Before the host made them, with the lane answering `featureProfile`
+10002, an x86 Mac's, WindowServer asked the lane for a 7-level texture over a buffer, which the
+host's platform refused, and every later command buffer naming it faulted, so its composition
+stopped (boot ro1-p2, 11-02); answering 10 it asked for none (ro1-p1 and its control). Core Image made no texture over a buffer by any of the three forms, under 10 or 10002,
 for blurs, scales and renders to a texture on the AMD and the Intel GPU. WindowServer on the
 oracle cannot be traced, being protected, so which framework reads the profile for it is not
-measured. The lane keeps the host's answer, 10 on every host so far *(class 2: the cheapest)*;
-the frontend makes the same bytes under either (Q10).
+measured. The lane answers the x86 Macs' 10002 on every host *(class 2)*, since the host makes
+the levels; the frontend makes the same bytes under either (Q10).
+
+Rechecked on 26.7.2 over the Vulkan platform (a Radeon 780M, boots 7395 and its control 7407,
+11-07), one variable apart: answering 10002, WindowServer asked for a tiled texture over a buffer
+of 6 mipmap levels, which the device answered nil, and the desktop still composed; answering 10,
+it asked for none. With the host making the levels (boot 7666, 11-08, a 780M), WindowServer's
+6-level texture was made and 26.7.2 composed its desktop under 10002, so the device answers 10002
+where the guest's Metal has the MTLArchitecture class. Where it lacks it (macOS 11 and 12, whose
+Metal ends WindowServer at device creation under 10), the device answers 10001, the profile both
+of 12's x86 GPU drivers answer (RgfxFeatureProfile.hpp).
 
 **Types and arrays over a buffer.** Probes: `oracle_storage DEVICE lintypes FORM:TYPE`, a texture
 of one `MTLTextureType` over a Shared buffer at offset 0, rows 256 bytes apart, 64 x 4 BGRA8 (64
@@ -528,16 +663,92 @@ Validation".
 | linear SPI: 3D, 2 deep; multisample | as by the public form, the SPI's type line | the same | the same |
 | tiled SPI: 1D, 1D array, 2D array, cube, cube array, 3D | made | the same | the buffer does not answer the selector |
 | a texture buffer, 4 rows high, by any form | the descriptor's validation asserts first: 4 rows past its 1 | the same | the same, by the forms it has |
+| public: a texture buffer, 4 RGBA32Float or 16 RGBA8Unorm texels | made over a Shared or Managed buffer at offsets 0, 4, 16, 64, 100 and 256, rows 64 or 4096 bytes apart; a kernel reads the buffer's bytes from the offset | the same | not measured |
+| public: a texture buffer, its texels past the buffer's 4096 bytes (offset 4064) | made | the same | made (metal2vulkan's `probes/texture_buffer_past_length.m`: 64 RGBA8Unorm texels from 3968, 3976 and 4096) |
+| public: a texture buffer of 4 RGBA32Float texels, rows 64, past a buffer of 16 KiB or more: from 16352 and 16576 of 16384 bytes (ending at 16416 and 16640), from 32736 of 20000 bytes (ending at 32800) | made | the same | nil; made ending at the length (from 16320 of 16384), from 19968 of 20000 and from 12288 of 4096 |
+| public: a 2D texture 64 RGBA8Unorm texels wide, rows 256, from 0, past a buffer of 16 KiB or more: 64 x 65 over 16384 bytes (ending at 16640), 64 x 129 over 20000 (ending at 33024); a buffer of 20000 bytes answers `allocatedSize` 20480 | made | the same | nil, a buffer of 20000 bytes answering `allocatedSize` 32768; made 64 x 64 over 16384, 64 x 80 over 20000 and 64 x 17 over 4096 |
+| public: a texture buffer, rows fewer than its texels' 64 bytes | nil at 1; asserts at 0 "Linear texture: bytesPerRow (0) must be greater or equal to (64) bytes" | asserts at 1 and at 0, at 0 with the AMD's words | not measured |
 
 *(class 3 for the type lines the three share; class 2 for the rest.)* Our stack: the public form
 and the linear SPI end the process at each type above they do not make, with the words the three
 share or, at a 3D or multisample type, the M3's, sending nothing, since the host's platform ends
-the host's process at a texture over a buffer it does not make; a texture buffer by the public
-form answers nil, logged once (not measured). The tiled SPI answers nil for every type but 2D,
+the host's process at a texture over a buffer it does not make. A texture buffer by the public
+form is made, at any offset, which the host's platform makes by that form; rows of 0 bytes end the
+process with the words the two say, and fewer than its texels' bytes answer nil, the AMD's answer
+*(class 2)*. One whose texels lie past the buffer's bytes is made, as the three make it *(class
+3)*, and the host's platform makes it, its texels past the length in a tail of the texture's own.
+One past the M3's allocation of a buffer of 16 KiB or more, its length rounded up to 16 KiB,
+answers nil, as the M3's and as the host's platform answers it on every device, where the two x86
+GPUs make it *(class 2)*; so does a 2D texture by the public form or the linear SPI and a 2D array
+by the linear SPI, whose slices metal2vulkan measured the M3's nil for (`rgfxPastAllocation:`)
+(the texture buffer rows and ends: a scratch probe, `tbprobe`, not kept, macOS 26.7.1; past the
+allocation `tbpa`, a scratch probe, jobs m3-max-30900 to 30902, the M3 under macOS 27.0.1). The
+tiled SPI answers nil for every type but 2D,
 logged once, as it does for more than one level: the host does not carry the others. The linear
 SPI makes a 2D array as the M3 does *(class 2)*, its slices where the M3 lays them
 (`rgfxBufferSlicePitch`), and a view of more than one of its slices answers nil, which Metal
 asserts at on the M3 Max and an M4 (`sliceRange.length == 1`, measured by metal2vulkan).
+
+
+**Texels past the buffer's length.** Probe: `oracle_pastlen DEVICE paths` and `oracle_pastlen
+DEVICE limits`, 11-15: the M3 Max under macOS 27.0.1 as arm64 (m3-max-32055, and its bounds
+m3-max-32081, 32093 and 32098) and as x86_64 under Rosetta (m3-max-32056), the AMD 5300M
+(m3-max-32058) and the Intel 630 (m3-max-32057) under macOS 26.7.1. Each `paths` texture is
+R32Uint over a buffer whose words name their offsets, made beside 128 neighbour buffers of 4096
+bytes whose words name theirs, so a texel read names the byte it came from. Each path runs in a
+process of its own: a kernel's `read()`, a blit to a buffer and `getBytes:`, and the writes a
+kernel's `write()`, a blit from a buffer and `replaceRegion:`, each write read back by the three
+reads.
+
+| texels past the length | AMD 5300M | Intel 630 | M3 Max |
+|---|---|---|---|
+| inside the buffer's allocation (the x86 GPUs' `allocatedSize`, the length rounded up to 4 KiB; the M3's `resourceSize`, the bounds below) | one memory: zero at first, and each read sees each write, a Managed buffer's two copies meeting at `synchronizeResource:` | the same | the same; past a 4096-byte buffer, whose `allocatedSize` is 4096, the next buffer's bytes in its pool, 4096 bytes on, which every path reads and writes alike; under Rosetta, where a buffer of 4096 bytes or more lies alone, zero |
+| past the allocation | the CPU's paths reach the next allocation of the process's memory (`contents` + 4096 in a 4096-byte buffer); the GPU's reads see zero, its own writes or a word an earlier process wrote, never the CPU's; a blit of a 2D texture there fails (`kIOAccelCommandBufferCallbackErrorTimeout`), and the queue's later command buffers are ignored, while a texture buffer's blits read and write as its kernels do | the CPU's as the AMD's; the GPU's reach a page every process shares, holding words earlier processes wrote, so a kernel reads a blit's or a kernel's write back, but not `replaceRegion:`'s, and `getBytes:` reads the next allocation, not the GPU's writes | no such texture is made (the bounds below) |
+| a no-copy buffer whose bytes end at the end of the process's mapping (the next page `PROT_NONE`) | the CPU's paths die on SIGBUS; the GPU's as past the allocation | the same | 4096 bytes at a 16 KiB page's end: the CPU's paths die on SIGBUS, and the GPU's read zero and lose their writes; under Rosetta, 4096 bytes at a 4 KiB page's end, the GPU's keep their own writes |
+
+Inside the allocation every GPU keeps one memory *(class 3)*. Past it the x86 Macs keep two that
+disagree, the CPU's another allocation's or a fault and the GPU's a page of their own, and the
+M3 makes no texture *(class 2)*. Past the process's mapping, inside a no-copy buffer's
+allocation, every GPU keeps two, the CPU's a fault *(class 3)*.
+
+| which such textures Metal makes (`limits`) | AMD 5300M | Intel 630 | M3 Max, arm64 | M3 Max, Rosetta |
+|---|---|---|---|---|
+| a texture buffer, a 2D texture by the public form and by the linear SPI, over a buffer of 16 bytes to 256 KiB by `newBufferWithLength:` (Shared, Managed, Private) or `newBufferWithBytes:`, at each position in its pool | made at every end bisected: 16 MiB from the buffer's start for a texture buffer, 4 MiB for a 2D texture | the same | nil past the buffer's `resourceSize` (SPI) from its start: 128 KiB for a buffer under 16 KiB, the length rounded up to 16 KiB for the rest | the same, but 128 KiB for a buffer under 4096 bytes alone, 16 KiB for one of 4096 to 16384 |
+| the same over a Shared heap's buffer, a heap of 4 MiB | no Shared heap ("Shared storage mode disallowed") | the same | nil past the heap's size from the buffer's start, wherever the buffer lies in it | the same |
+| the same over a no-copy buffer, at a page's start or 4096 bytes short of a page's end | made at every end bisected | the same | nil past `resourceSize` from the buffer's start, the size of the 16 KiB pages its bytes meet: 16 KiB for 4096 bytes at a page's end, so a texture over them is made 12 KiB into the next page, and 32 KiB for 4097 bytes there | the same |
+| what the end is | | | a 2D texture's and a texture buffer's last texel, whatever the rows' bytes past it (rows 4096 bytes past a texture buffer's texels; a 2D texture's rows 512 bytes apart from 256); a linear 2D array's last slice's end, each slice its rows' bytes rounded up to 128 apart, its last texel inside the bound or not (2 slices of 64 x 127 R32Uint rows 512 apart from 256 made in a 4096-byte buffer, of 64 x 128 nil) | the same |
+
+The AMD also answers nil for a 2D R32Uint texture 64 wide, rows 512 bytes apart, of 2 rows or more,
+over every buffer, inside its length too, which the Intel makes; that is not about the length,
+and the device makes it, as the Intel does *(class 2)*.
+
+Our stack: the host's platform keeps a texture's bytes past its buffer's length in a tail of the
+texture's own, zero when made, which every GPU path reads and writes (metal2vulkan's
+`linear_plan.rs`, "Length"), while the guest's memory past the buffer is another allocation's or
+none. The bundle's `getBytes:` and `replaceRegion:` copy the bytes inside the length in place,
+and those past it by a blit on the device's copy queue that the call waits for
+(`rgfxCopyRegion`), so every path sees one memory past the length: the M3's answer inside its
+allocation, and inside the envelope past the x86 Macs' allocations, where they differ *(class
+2)*. It costs one round trip to the host for each call whose region has a byte past the length,
+and nothing else. Before it the CPU's copies read and wrote the guest's memory past the buffer,
+another allocation's bytes, which no GPU path saw. A no-copy buffer's bytes past its length are
+the app's own memory, which Metal's CPU paths reach on all three, dying where the app's mapping
+ends *(class 3)*: the bundle copies them in place, as Metal does, and the GPU's paths there use
+the tail, as each GPU's read memory of its own past the app's mapping (the table's last row). Past
+the length inside the app's last page is not measured. Under an Apple GPU's rules (`rgfxAppleGPU`:
+an arm64 guest's device) the bundle answers nil past the M3's bound from arm64, the table's
+`resourceSize` (`rgfxAppleAllocation`), sending nothing; the x86 guest's device makes them, as
+the x86 Macs do, short of the host's platform's own bound above *(class 3 for each guest)*. The
+shell tests check both: `test_buffer_texture_copies_past_the_length_reach_the_tail` and
+`test_apple_textures_past_a_buffers_allocation_answer_nil`. Over a buffer of 16 KiB or more the
+host's platform counts as the M3 does (metal2vulkan's `linear_plan.rs`, "Length"): a 2D
+texture's and a texture buffer's last texel, a 2D array's slices' end, against the length
+rounded up to 16 KiB, or a heap's buffer's heap's size. A buffer over pages, a no-copy buffer's
+or one over the device's region, it counts from the host pointer's offset in its 16 KiB page,
+which the guest does not know; the bundle counts the length rounded up to 16 KiB for those on
+either guest (`rgfxHostAllocation`), never past the host's bound, and so answers nil for a
+no-copy buffer's texture the M3 makes where its bytes start into a page and cross one more page
+than its length alone *(class 2)*.
 
 ## Q12: texture descriptors Metal's validation ends the process at
 
@@ -938,9 +1149,10 @@ storage or of BC1 is made. The M3 makes the same but the Cube, at which its own 
 process ("carriesComplexTexture || numFaces == 1"), and the BC1, for which it answers nil. A plane
 past a planar surface's planes answers nil on all three. All three make the formats of one texel a
 block whose rows fit, a surface of 512-byte rows taking a texture 128 wide, the 4:2:2 formats of
-an even width (an odd height too, as a render target as well), every usage (usage 0 answers 0x17),
-every storage but Memoryless, and every CPU cache and hazard tracking mode and swizzle; and a
-TextureBuffer of one row. The x86 Macs make BC1 and BC7 textures wherever their rows fit, where the
+an even width (an odd height too, as a render target as well), every usage the SDK names (usage 0
+answers 0x17; Q36 has which bits each answers and ends the process at), every storage but
+Memoryless, and every CPU cache and hazard tracking mode and swizzle; and a TextureBuffer of one
+row. The x86 Macs make BC1 and BC7 textures wherever their rows fit, where the
 M3 answers nil, over a surface with planes or without, in Managed or Private storage. The M3
 answers nil for a render target of the 4:2:0 Y'CbCr format 500 of an odd width or height.
 
@@ -948,10 +1160,13 @@ The two x86 GPUs differ only in the words at `Depth24Unorm_Stencil8` in Managed 
 AMD's are the depth formats' storage rule, the Intel's "invalid pixelFormat (255)", as the Intel
 lacks the format.
 
+The M3's answer at each case, measured again on 11-13 with the cases added since, is in Q34, with
+how an arm64 guest's device answers them.
+
 What our stack does:
 - *(class 3)* The device's creator ends the process at every rule the x86 Macs end it at, with
   their words, before it sends the host anything (`rgfxEndAtInvalidSurfaceTexture`,
-  RgfxTexture.h). The bundle had sent each of these to the host, posted, and answered a texture;
+  RgfxTexture.h). An arm64 guest's device ends it and answers nil where the M3 does (Q34). The bundle had sent each of these to the host, posted, and answered a texture;
   the host refused most, and the guest's command buffers naming the texture then failed. That
   includes every two-plane format, which the lane made as the M3 does until 11-05 (Q13).
 - *(class 3)* A BC1 to BC7 texture over a surface is made and posted, as both x86 Macs make it
@@ -961,11 +1176,9 @@ What our stack does:
   (`bc_textures_over_a_surface_s_rows_are_made`). The bundle's own CPU access takes the same rows
   (`test_iosurface_block_compressed_textures_are_made`). Until then the bundle answered nil for
   every block-compressed texture over a surface, as the runtime made none.
-- *(outside the envelope, the host's limit)* The Metal platform answers nil for a BC texture over
-  a surface's plane: it makes the texture over the buffer that stands for the surface, and Metal's
-  buffer creator answers nil for BC1 and BC7, as the M3's own IOSurface creator does
-  (`bc_textures_over_a_surface_s_plane_are_metals`, measured on the M3 under macOS 27). The
-  guest's texture of one is then a refused create there (`refused.rs`).
+- *(outside the envelope, the host's limit)* Metal's buffer creator answers nil for a BC1 or BC7
+  texture over the buffer that stands for a surface's plane, as the M3's own IOSurface creator
+  does (measured on the M3 under macOS 27).
 - What the x86 Macs make, the Vulkan runtime still refuses in places, as its
   `NotImplemented(SurfacePlaneShape)` at stack 34, where the three GPUs lay the texels out no one
   way: over a planar surface's plane, a texture wider than its rows, a mipmapped one, a 2DArray of
@@ -1026,6 +1239,18 @@ alike. AMD and Intel agree on every value but one (below) *(class 3)*:
 - the private `postVertexDumpStride` is the vertex function's outputs' size and 12 on AMD and on
   the M3, and its outputs' size and 8 on Intel *(class 2)*; a mesh pipeline's is 0.
 
+**Post-tessellation vertex functions** (11-12, `pipeline_reflection_check`'s r_patch,
+r_patch_points, r_patch_buffers, r_patch_plain and r_patch_unused, of a descriptor of the control
+points' attributes in buffer 0, stepping per control point, and the patch's attribute in buffer 1,
+stepping per patch; m3-max-22312 on the AMD, 22313 on the Intel, 22314 on the M3): AMD, Intel and
+the M3 agree *(class 3)* that the control points (`patch_control_point<T>`) and the patch's
+attributes are no binding, that the descriptor's buffers are unused (`isUsed` and `isActive` 0)
+though the function reads them, and that `position_in_patch` and `patch_id` are built-ins 14 and
+13 (unused where the function never reads them). `postVertexDumpStride` adds the patch's position
+to the outputs and the GPU's 12 (Intel 8): 12 bytes for a triangle patch and 8 for a quad, whether
+or not the function takes its position. The AMD compiler dies making r_patch_buffers (a quad
+patch of no control points, reading its points from a buffer), which the Intel GPU and the M3 make.
+
 **Ours** (`RgfxPipelineReflection.mm`): the bundle builds the same objects, of Metal's own classes,
 from each function's AIR nodes, and answers them in every creator that takes options, with AMD's
 stride. It answers nil, as before, for a pipeline of a function whose binding index function
@@ -1035,7 +1260,33 @@ constants remove is answered used *(class 4: Metal reflects the specialised code
 `pipeline_reflection_check` (11-05, 80 cases of 433490 values) finds no difference on the AMD
 GPU, and on the Intel GPU only `postVertexDumpStride`, 4 less than ours on each vertex pipeline;
 on both, the one case ours does not make is `c_constants` (`k_constants`), whose binding index
-function constants compute.
+function constants compute. Since 11-12 the reader follows a post-tessellation vertex function's
+control points (`air.patch_control_point_input`), and the patch cases answer as above: no
+difference on the AMD GPU, the Intel GPU's stride 4 less, and on the M3 only its constant buffer
+alignment and `_flags`, as everywhere.
+
+**Deep argument buffers, colour inputs, imageblocks** (11-14, `pipeline_reflection_check`'s
+c_deep_ab, an argument buffer of structs nested 6 deep; r_fetch_group and r_fetch_at, colour
+attachment inputs in a raster order group and at an index a function constant gives; and
+c_imageblock_explicit, c_imageblock_late, c_imageblock_on, c_imageblock_off, r_imageblock_data,
+r_imageblock_master and r_rog_texture: m3-max-31129 and 31135 on the M3, 31132 and 31210 on the
+AMD, 31133 and 31211 on the Intel). The deep argument buffer and the colour inputs answer as the
+rest on all three (the colour inputs listed nowhere). A kernel's explicit imageblock
+(`imageblock<T, imageblock_layout_explicit>`) is a binding in its place on the M3, an
+`MTLImageBlockArgument` of binding type 17 and `imageBlockKind` 1, read-only, at index 0 wherever
+the argument is, of its data's size and its struct's type, of no master struct, aliasing no
+implicit imageblock (`aliasImplicitImageBlockRenderTarget` 0xFFFFFFFF); a false function constant
+leaves it out. Neither x86 GPU makes a pipeline of one (AMD: its compiler's connection drops at
+each try; Intel: "AIR builtin function was called but no definition was found"), and the M3 makes
+none of an implicit one in a kernel (c_imageblock: "Encountered unlowered function call to
+air.load.implicit_imageblock.v4f32"). A fragment function's imageblock data (`[[imageblock_data]]`)
+is a fragment binding on the M3 and the Intel GPU, an `MTLImageBlockDataArgument` of binding type
+16, of the same fields; one that views a master struct (`[[imageblock_data(Master)]]`, its members
+named by their `user(...)` names, as the AIR names them) holds the master as its
+`imageBlockMasterStructMembers`, and the AMD GPU and the Intel GPU make it, where the AMD GPU makes
+no pipeline of plain imageblock data. A texture in a raster order group
+(`[[texture(n), raster_order_group(g)]]`) answers as one in none on the AMD and Intel GPUs. Ours
+answers each so *(class 3)*: AMD no difference, Intel only its stride.
 
 ## Q22: mesh render pipelines and their draws
 
@@ -1199,7 +1450,8 @@ own, with `MTL_DEBUG_LAYER` unset, at the device's `newTextureWithDescriptor:`, 
 Automatic heap's of 256 MiB, and a Shared buffer's `newTextureWithDescriptor:offset:bytesPerRow:`.
 Each case changes one or more things of a 64 x 64 2D BGRA8Unorm texture of one level and sample,
 usage ShaderRead, in Private storage (Shared over the buffer): its size, type, depth, array
-length, levels, samples, format, usage or storage.
+length, levels, samples, format, usage or storage. Its last 13 cases (11-07) are RGBA32Float
+textures of 2 GiB to 8 TiB, at the device's creator.
 
 Every creator runs the descriptor's validation first,
 `-[MTLTextureDescriptorInternal validateWithDevice:]`. Where it fails, one assertion, "Texture
@@ -1207,8 +1459,9 @@ Descriptor Validation", lists every rule the descriptor breaks, a line each, in 
 both x86 Macs *(class 3)*:
 1. A width, height, depth or array length of 0, or past what the type takes ("has height (2)
    greater than the maximum allowed size of 1."): 16384 a side, 2048 for a 3D texture's sides,
-   one row for the 1D types and a TextureBuffer, one slice for every type but 3D, one element
-   for every type but the arrays, and 2048 for an array.
+   268435456 (2^28) elements for a TextureBuffer's width (below), one row for the 1D types and a
+   TextureBuffer, one slice for every type but 3D, one element for every type but the arrays, and
+   2048 for an array.
 2. A format the device lacks, by number ("has invalid pixelFormat (40)."): Invalid, B5G6R5,
    A1BGR5, ABGR4, sRGB R8 and RG8, the XR10 formats, ASTC, ETC2, EAC, PVRTC, Unspecialized
    (263), the two-plane ones (500), and, on the Intel only, Depth24Unorm_Stencil8 and
@@ -1230,6 +1483,19 @@ both x86 Macs *(class 3)*:
 7. Storage: a depth, stencil or multisample texture in Shared or Managed storage; Memoryless
    storage; and a mode Metal has no name for (5), whose line comes twice. Then usage bit 0x80.
 
+The M3 Max under macOS 27.0.1 (11-09, every case but the 2 GiB and larger ones and the
+16384 x 16384 one, at all three creators) lists the rules it shares with the x86 Macs in their
+words and order, and differs in these: it has every format the x86 Macs lack but Invalid,
+Depth24Unorm_Stencil8 (255) and X24_Stencil8 (262), making B5G6R5, A1BGR5, ABGR4, sRGB R8 and RG8,
+BGRA10_XR, BGR10_XR, ASTC, ETC2, EAC and PVRTC, and answering nil at the device's and the heap's
+creators for the two-plane format 500 and Unspecialized; it makes multisample BGR5A1Unorm and
+RGB9E5Float textures, depth, stencil and multisample textures in Shared and Managed storage, and
+Memoryless ones, a Private heap's among them; and it makes 2 and 4 samples but not 8 ("sampleCount
+(8) is not supported by device"). Its heap names its class `IOGPUMetalHeap` in the storage
+assertion. Over a buffer it answers nil for every compressed format, BC1 included. The bundle
+takes the M3's rules where the device answers an Apple family, as it does in an arm64 guest
+(`rgfxAppleGPU`, RgfxTexture.h).
+
 A texture type past TextureBuffer (10) ends the process at every creator with no words. A pixel
 format value no format has (9999) ends it at the descriptor's setter, which is Metal's own in a
 guest too. After the validation, a heap's creator ends the process at a descriptor of another
@@ -1242,7 +1508,84 @@ ends the process at a depth other than 1, 0 included, before the validation, wit
 texture: cannot support depth > 1." (`validateTextureDescriptor`), where the AMD lists the
 validation's depth lines.
 
+The device's creator answers nil, past the validation, for a texture of more bytes than the
+device makes, on all three; creating one that is made commits no memory (the process's footprint
+stays under 3 MB). By the bytes `heapTextureSizeAndAlignWithDescriptor:` answers, which here are
+the texture's own:
+
+| texture | AMD (`maxBufferLength` 3208642560, `recommendedMaxWorkingSetSize` 4278190080) | Intel 630 (2147483648, 1610612736) |
+|---|---|---|
+| 16384 x 8192 (2 GiB) | made | made |
+| 16384 x 8193 (2 GiB and a row) | made | nil |
+| 3 and 4 GiB (2D), 8 and 16 GiB (2DArrays of 16384 x 16384) | made | nil |
+| 20, 24, 28, 32 and 64 GiB; a 2DArray of 2048 slices (8 TiB); a 3D 2048 a side (128 GiB) | nil | nil |
+
+The Intel answers nil past its `maxBufferLength`, as it does a buffer and a heap past it (Q8);
+the AMD makes one of 16 GiB, just over 4 times its working set, and none of 20 GiB. The M3 Max
+under macOS 27.0.1 answers nil for the 8 TiB and the 128 GiB textures (the smaller ones were not
+asked of it, as its memory is the desktop's).
+
+**Texture buffers** (`oracle_texdesc DEVICE CREATOR --texbuf` and `--tbread`, 11-14, the AMD and
+the Intel under macOS 26.7.1 and the M3 Max under 27.0.1, each step in a child process of its
+own; jobs m3-max-31563, 31564 and 31565). The descriptor was
+`textureBufferDescriptorWithPixelFormat:width:resourceOptions:usage:`, as MoltenVK makes a texel
+buffer view's texture, of R8Sint, RG8Unorm, RGBA8Unorm, RG32Float and RGBA32Float (1 to 16 bytes),
+usage ShaderRead. It was Private at the device's creator and a Private heap's (the heap of the
+texture's bytes, at most `maxBufferLength`), and Shared over a Shared buffer by the public form, at
+offset 0. The rows there were the texture's bytes rounded up to 256, over a buffer of those bytes
+(at most `maxBufferLength`) and over one of 4096 bytes. The widths ran from 16384 to 2^33, and
+each format's largest width made and largest width that does not end the process were bisected
+from 1 to 2^36:
+
+| | AMD | Intel 630 | M3 Max |
+|---|---|---|---|
+| `maxTextureBufferWidth` (SPI) | 268435456 | 268435456 | 268435456 |
+| `minimumTextureBufferAlignmentForPixelFormat:` | the format's bytes | the format's bytes | 16 |
+| up to 2^28 elements, every format and creator | made | made, but nil past 2 GiB at the device's and the heap's (16 bytes past 2^27) | made |
+| 2^28 + 1 elements and more, to 2^33, every format and creator | ends the process at the validation | the same | the same |
+| over a 4096-byte buffer, its texels past the buffer's end | made, to 2^28 R8Sint texels | made | nil past 128 KiB (46626 R8Sint made, 46626 RGBA8Unorm nil) |
+| over a buffer, 16-byte texels, rows of 2^32 bytes (2^28 wide) | made | ends the process (SIGFPE), over either buffer | made |
+| a kernel's reads of elements 0, 1, W / 2, W - 2 and W - 1, R8Sint and RGBA32Sint, 46626 and 2^24 wide, every creator | right | right | right |
+
+So the limit counts elements, not bytes, and it is the device's `maxTextureBufferWidth`. One
+element past it, every creator ends the process with the width line every type gives:
+"MTLTextureDescriptor has width (268435457) greater than the maximum allowed size of
+268435456." *(class 3)*. Below it, the bytes decide as they do for any texture: the Intel's
+device's and heap's creators answer nil past its `maxBufferLength`. A texture buffer over a buffer
+is made with its texels past the buffer's end on the x86 Macs, and is nil past its allocation on
+the M3 *(class 2)*. The Intel's death at rows of 2^32 bytes is a third answer there *(class 2)*.
+
+In a guest (macOS 26.7.2 on our device over the Iris Xe of Raptor Lake-P, which answers
+`maxTextureBufferWidth` 268435456, `maxBufferLength` 4294967296 and
+`minimumTextureBufferAlignmentForPixelFormat:` 16 for each of the five formats), the same cases of
+R8Sint and RGBA8Unorm at each creator, with heaps and buffers of at most 256 MiB and 64 KiB
+(`ORACLE_TB_CAP`): development's set before 11-14 (52caf9a57) ended the process one element past
+16384 at every creator, 46626 included, in the 2D words ("MTLTextureDescriptor has width (16385)
+greater than the maximum allowed size of 16384.", job m3-max-31642). The fixed set (5e75bfa39) makes
+them up to 268435456 elements at every creator, the largest width R8Sint makes and the largest it
+lives at, bisected, and ends the process at every width past it, to 2^35, in the measured words, as
+the x86 Macs do. A kernel reads elements 0, 1, W / 2, W - 2 and W - 1 right, R8Sint 46626 and 2^24
+wide and RGBA32Sint 46626 wide, at every creator (job m3-max-31664, no fatal line). RGBA8Unorm 2^27
+and 2^28 wide answer nil at the heap's and the buffer's creators, past the cap: the heap has no
+room, and the bundle answers nil past a buffer's allocation.
+
 What our stack does:
+- *(class 2)* The device's creator answers nil for a texture of more bytes than the device's
+  `maxBufferLength`, every level of every slice and sample, sending nothing
+  (`rgfxTexturePastLength`, RgfxTexture.h), as the Intel does and as the bundle answers a buffer
+  and a heap past it. Until 11-07 the bundle sent it, posted, and answered a texture whose
+  create the host's platform could refuse for its size: a texture the app held, whose command
+  buffers' draws the host would then drop (`refused.rs`).
+- *(class 3)* A texture buffer takes up to `kRgfxMaxTextureBufferWidth` (2^28) elements under the
+  x86 Macs' rules and an Apple GPU's alike, ending the process past it in the measured words. Until
+  11-14 the bundle gave it the 2D limit, 16384, and a guest's MoltenVK died at a texel buffer view
+  46626 elements wide. The host's Vulkan devices take a texel buffer view of at most
+  `maxTexelBufferElements`: 2^29 on RADV (the RX 7900 XTX and both 780Ms, Mesa 26.2.6), 2^28 on
+  NVIDIA's 620.70.06 (the RTX 3090 and 2080) and on the RTX 5080 (metal2vulkan's profile), and 2^27
+  on ANV (the Iris Xe of Raptor Lake-P, Mesa 26.2.6), below Metal's 2^28. On ANV, metal2vulkan
+  refuses a binding of one past 2^27 elements (`TexelBufferTooLarge`), which is metal2vulkan's to
+  carry. Over a buffer, its rules past the buffer's end stay as they were (`rgfxPastAllocation:`,
+  RgfxBuffer.mm), and at rows of 2^32 bytes it takes the AMD's answer, sending the create.
 - *(class 3)* Every texture creator runs one copy of the validation before it sends the host
   anything (`rgfxEndAtInvalidTextureDescriptor`, RgfxTexture.h): the device's, both of a heap's,
   a buffer's public form and its linear and tiled SPI, and the creator over an IOSurface (Q20).
@@ -1289,14 +1632,910 @@ What our stack does with an object whose posted create the host refused (`decode
 - *(class 3, and class 2 the AMD's)* A binding of a buffer, texture or sampler of one binds nil,
   and the encoder's draws and dispatches run, as with nil bound. Nil is the platform's: on the
   Vulkan platform metal2vulkan's neutral image, sampler and zero buffer, which read zero and
-  sample by the default sampler, as the AMD; on the Metal platform, Metal's own. Until 11-05 they
+  sample by the default sampler, as the AMD. Until 11-05 they
   were dropped while such a slot was bound.
 - *(class 4)* A render pass with an attachment of one is skipped whole, where both Macs run it
   without it: an assertion in the host's Metal at a pass with no attachment would end the host's
-  process, and the Metal platform was not measured there. A pipeline state of one is not set, and
+  process, and the host's platform was not measured there. A pipeline state of one is not set, and
   the draws are dropped until another is, and a blit from or to one is dropped, where both Macs
   end the process at nil: the bundle does not know the create was refused, so cannot end it.
 - A use list's entry of one is nil, as the Intel goes on.
+
+## Q26: when a resource is complete, and what orders a read-back across queues
+
+Probe: `oracle_complete DEVICE answers 300` and `... answers 300 sched`, and `oracle_complete
+DEVICE xqueue 200`, 11-11 (m3-max-17599, 17600 and 17601), the M3 Max on macOS 27 among them.
+Each command buffer spins about 300 ms (200 ms for `xqueue`) before it uses the resource.
+
+| asked | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| right after the commit (status Committed), any use | `isComplete` and `isWriteComplete` YES, `waitUntilComplete` returns at once | the same | the same |
+| once `waitUntilScheduled` returns, a render pass, a kernel's write or a blit into the texture, a kernel's write of a buffer | YES, at once | NO and NO; the wait returns as the buffer's GPU work ends (298 to 428 ms), its status then still Scheduled in 7 of 12 cases | NO and NO; the wait returns at 293 to 299 ms, its status then still Scheduled in 8 of 12 cases |
+| the same, a kernel that only reads the texture or the buffer | YES, at once | NO and NO; waits | `isComplete` NO, `isWriteComplete` YES; waits |
+| a buffer not committed | YES, at once | the same | the same |
+| a resource only a completed buffer named, while a buffer of a second queue runs | YES, at once | the same | the same |
+
+Managed and Private storage answer alike. Once the buffer completed, every answer is YES.
+
+`xqueue`: whether queue B's buffer, committed once queue A's is scheduled, completes before A's
+(5 rounds each):
+
+| B's buffer | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| empty | before A | before A | before A |
+| a blit encoder with no command | before A | after A | before A |
+| `synchronizeTexture:` of the texture A clears, or of another | before A | after A | before A |
+| a compute dispatch of one thread | after A | after A | before A |
+| that synchronize after the texture's `waitUntilComplete` | before A (the wait does not wait) | after A | after A |
+
+So `isComplete` is *(class 2)*: the AMD answers YES while the 630 and the M3 answer NO, and
+the M3 tells reads from writes for `isWriteComplete`. Before the buffer is scheduled, and for
+one not committed, all three answer YES at once *(class 3)*. On the M3 only the wait orders a
+second queue's synchronize behind the first queue's buffer; on the AMD nothing does, and the
+630 runs the two queues' buffers in order, an empty one aside.
+
+What our stack does *(class 2, the 630's answer)*: a resource answers NO to both, for any use,
+and `waitUntilComplete` waits, from the buffer's submission (`commitAndWaitUntilSubmitted`'s
+return, or its scheduling) until the bundle takes its completion and has written back what it
+wrote of copies (`RGFX_RESOURCE_SPI`, `RgfxKept`); a view of a texture, and a texture over a
+buffer, count with the memory they lie over. Until 11-11 it answered YES at once, the M3's
+answer right after the commit: Apple's GL renderer on macOS 11.7.11 reads a drawable back with
+the texture's `waitUntilComplete`, then a `synchronizeTexture:` on a queue of its own and
+`getBytes:`, and on a unified-memory host, where the synchronize is a no-op that finished
+before the draw, the read saw the texture as it was before the draw (Safari's WebGL reads,
+about 2.5% of them on a 780M). The M3's `isWriteComplete` YES for a read-only use is not kept:
+arm64 guests see NO, which only waits for readers too.
+
+## Q27: the rows IOSurface works out where none are named
+
+Probe: `oracle_rows DEVICE`, 11-12 (m3-max-21363, 21364 and 21365), the M3 Max on macOS 27.0.1
+among them. Surfaces made by `IOSurfaceCreate` with a width, a height, bytes an element and an
+OSType alone (`kIOSurfacePlaneInfo` with each plane's width, height and bytes an element for
+`420v`), and CVPixelBuffers made with an empty `kCVPixelBufferIOSurfacePropertiesKey`. Rows are
+`IOSurfaceGetBytesPerRow` (of each plane for `420v`), offsets each plane's base from the
+surface's.
+
+| asked | AMD | Intel 630 | M3 |
+|---|---|---|---|
+| `IOSurfaceGetPropertyAlignment` of `kIOSurfaceBytesPerRow` and `kIOSurfacePlaneBytesPerRow` | 64 | 64 | 128 |
+| the same of `kIOSurfaceOffset` and `kIOSurfacePlaneOffset`; of `kIOSurfaceAllocSize` and `kIOSurfacePlaneSize` | 64; 1 | 64; 1 | 16384; 1 |
+| `IOSurfaceAlignProperty(kIOSurfaceBytesPerRow, N)` for N of 1, 8, 64, 144, 192, 384, 1336, 3840, 4004 | 64, 64, 64, 192, 192, 384, 1344, 3840, 4032 | the same | 128, 128, 128, 256, 256, 384, 1408, 3840, 4096 |
+| `'RGhA'` (8 bytes) 1 x 1, 18 x 28, 48 x 48, 85 x 162, 167 x 161, 170 x 134: rows | 64, 192, 384, 704, 1344, 1408 | the same | 128, 256, 384, 768, 1408, 1408 |
+| `'BGRA'` 96, 463, 1001 and 3662 wide: rows | 384, 1856, 4032, 14656 | the same | 384, 1920, 4096, 14720 |
+| `'L008'` 1920 x 1080 and 1001 x 1: rows; size | 1920, 1024; 2073600, 1024 | the same | 1920, 1024; 2080768, 16384 |
+| `420v` 1920 x 1080: each plane's rows; plane 1's offset | 1920, 1920; 2073600 | the same | 1920, 1920; 2080768 |
+| `420v` 18 x 28 | 64, 64; 1792 | the same | 128, 128; 16384 |
+| CVPixelBuffer `420v` 1920 x 1080: rows; the planes' offsets | 1920; 32, 2073632 | the same | 1920; 512, 2074112 |
+| CVPixelBuffer `420v` 18 x 28 | 32; 32, 928 | the same | 64; 512, 2560 |
+| CVPixelBuffer `32BGRA` 96 x 96, `64RGBAHalf` 18 x 28: rows | 384, 160 | the same | 384, 256 |
+| `minimumLinearTextureAlignmentForPixelFormat:` of RGBA16Float, BGRA8Unorm and R8Unorm; `linearTextureAlignmentBytes`, `deviceLinearTextureAlignmentBytes` | 256 | 256 | 16 |
+| `iosurfaceTextureAlignmentBytes`, `iosurfaceReadOnlyTextureAlignmentBytes` | 16 | 16 | 16 |
+
+The rows of a surface with none named are IOSurface's own, byte for byte the same in the
+AMD's process and the 630's: 64-byte rows and offsets, on a MacBook Pro whose AMD and Intel
+accelerators are both loaded and whose GPUs both align a linear texture's rows to 256. Neither
+accelerator raises IOSurface's alignment to its GPU's linear one *(class 2: 64 on x86, 128 and
+16 KiB offsets on the M3)*. CoreVideo names its rows and plane offsets itself (on x86 rows at a
+multiple of 32 bytes and the first plane 32 bytes in, on the M3 the first plane 512 bytes in),
+and IOSurface keeps them. Our kext raises IOSurface's alignment to the host GPU's linear one,
+256 on RADV (`RgfxSurfaceRows.hpp`); the rows a client names, CoreAnimation's and CoreVideo's
+among them, stay as it names them, as on these Macs.
+
+## Q28: rasterization rate maps
+
+Probe: `oracle_ratemap DEVICE`, 11-12 (m3-max-20796), the AMD alone: a map of a 256 x 128 screen
+of one layer (horizontal samples 1, 0.25, 1, vertical 1, 0.5) and of two (a second layer of
+0.5, 1 and 0.25, 1, 0.75), their answers, their parameter data, a full-target triangle drawn
+through each, and the calls that may end the process, each in a child process.
+
+| asked | AMD |
+|---|---|
+| `supportsRasterizationRateMapWithLayerCount:` 0, 1, 2, 3 | YES, YES, YES, NO |
+| a map's class | `GFX10_MtlRasterizationRateMap`, below `AMD_MtlRasterizationRateMap` and Metal's `_MTLRasterizationRateMap` |
+| `physicalGranularity`, `parameterBufferSizeAndAlign` | 32 x 32 x 1; 16,472 bytes aligned to 256, of which the copy changes 144, at offset 0 or 4 |
+| `physicalSizeForLayer:` of each layer, and both coordinate maps | the screen's 256 x 128 x 1, and every coordinate as it was: the map is the identity, whatever its samples |
+| `physicalSizeForLayer:` past the layers | 0 x 0 x 1 at layer 1 of a one-layer map, 256 x 128 x 1 at layer 2 |
+| `mapScreenToPhysicalCoordinates:forLayer:` past the layers | (-1, -1) |
+| `mapPhysicalToScreenCoordinates:forLayer:` past the layers | ends the process (SIGSEGV) |
+| the pass, with and without a viewport of the screen's size | 32,768 fragments, each at its pixel, decoded to the same pixel |
+| a fresh descriptor's `mutability` and `minFactor` (SPI); a map's | 2 (Immutable) and 0; the descriptor's |
+| a `Mutable` map not reset (`setMutability:` on its descriptor) | compiled at its creation: 256 x 128, and its coordinate maps answer |
+| a map of no layers | its creator ends the process (SIGSEGV) |
+| `copyParameterDataToBuffer:offset:` into a Private buffer | ends the process (SIGSEGV) |
+| `formattedDescription:` (SPI) | Metal's base map's: the description, then the label, the screen's width and height, the layer count, the granularity's width and height and the parameter data's size and alignment, a line each |
+
+So the AMD's maps do not vary the rate: a pass over one draws every pixel. The M3 Max and the M4
+compile Apple's map (metal2vulkan's runtime, `rate_map.rs`, measured there): a physical size
+below the screen's where the samples are below 1, 24,624 bytes of parameter data aligned to 4,
+the coordinate maps past the layers reading the last layer, and supporting 1 or 2 layers, not
+0. Both answer what a correct app reads back, so the two families' answers bound the contract
+*(class 1)*.
+
+What our stack does: the host's map, the platform's compile (`RATE_MAP_CREATE`, design.md); the
+layer counts the platform supports, 1 and 2 (the M3's answer, as before, for 0); a map of no
+layers made, as the M3 makes it. The bundle ends the process where every Mac does, at a copy
+into a Private buffer, and where the M3's map does and the AMD's answers nothing the host can
+give: a coordinate map of a map of no layers or of an empty screen, and the physical-to-screen
+map of a `Mutable` map not yet reset.
+
+## Q29: function pointers
+
+Probe: `oracle_fnptr DEVICE`, 11-12 (m3-max-21084 the AMD, m3-max-21086 the Intel, with
+`ORACLE_FNPTR_NO_RENDER`): three compute pipelines linking `fp_add1`, `fp_mul2` and `fp_neg` of
+one library, their handles, visible function tables of 0 to 4096 entries, dispatches calling
+through a table bound at a buffer index, a range, and an argument buffer, and a render
+pipeline's handles and tables.
+
+| asked | AMD | Intel |
+|---|---|---|
+| `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | YES, NO | YES, NO |
+| a handle of a linked function | its name and type 5; `gpuResourceID` raises an unrecognized selector | the same |
+| a handle of an unlinked function, of the kernel | nil, nil | nil, nil |
+| `functionHandleWithName:` | raises an unrecognized selector | the same |
+| a table's `gpuResourceID` | 1 for each, 3 for another pipeline's | 1 to 9, one each |
+| a table's `allocatedSize` for 0, 1, 3, 2016, 2017 and 4096 entries | 4096, 4096, 4096, 16384, 16384, 36864 | 4096, 4096, 4096, 16384, 20480, 36864 |
+| a table's `resourceOptions`, storage mode, `isAliasable` | 528, Managed, NO | 512, Shared, YES |
+| `setPurgeableState:` Volatile, then asked | 2, then 3 | 2, then 2 |
+| dispatches through a table set before and after encoding, bound alone or in a range | each entry's function: 11 22 13 26 15 16, 20 12 13 26 | the same |
+| an argument encoder of a table, its length, alignment and bytes | 8, 8, the table's id | 8, 32, the table's id |
+| a dispatch reading a table through an argument buffer without `useResource:` | the command buffer times out (status 5) | not run |
+| the same with `useResource:` | 20 12 24 14 28 30 | the same |
+| a render pipeline's handle | not measured (the AMD's compiler service failed the pipeline) | ends the process: Metal's base asserts "Driver needs to override this" |
+
+What our stack does (m3-max-21123, a macOS 26.7.2 guest on an Iris Xe, and m3-max-21327 on a
+Radeon 780M): every compute answer above as the two Macs give it, but the tables'
+`allocatedSize` and `resourceOptions`, which are the host's table's (256 bytes and 8 an entry,
+past 16 KiB rounded up to a multiple of it: 256, 264, 280, 16384, 32768 and 49152 for the counts
+above; and 512, Shared), and their `isAliasable`, NO. A render pipeline's handles and tables are
+nil, with Metal's unsupported error, as `supportsFunctionPointersFromRender` answers NO. A table
+read through an argument buffer without `useResource:` is read, where the AMD's command buffer
+times out: inside the envelope, as no Mac's correct use depends on it. A table answers
+`setPurgeableState:` NonVolatile whatever it is told, as the Intel's and the M3 Max's do (Q35).
+
+## Q30: dynamic libraries
+
+Probe: `oracle_fnptr DEVICE`, 11-12 (m3-max-21413 the AMD, m3-max-21414 the Intel, with
+`ORACLE_FNPTR_NO_RENDER`): a dynamic library (`metal -dynamiclib`, install name
+`@executable_path/liboracle_fnptr_dyn.metallib`, exporting `fpd_triple`) made of its library and
+read from its file; a kernel linked against it (`-l`) whose library is read from its file, or made
+of the same bytes with `newLibraryWithData:`, its pipeline preloaded with the dynamic library or
+bare; a kernel linked against a library whose install name names no file; a compile of source with
+the dynamic library in `MTLCompileOptions.libraries`, through a proxy that keeps the messages sent
+to it; and the refusals.
+
+| asked | AMD | Intel |
+|---|---|---|
+| `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | YES, NO | YES, NO |
+| a dynamic library of the library, of its file | `_MTLDynamicLibrary`, its install name, label nil until set | the same |
+| the linked kernel of the file: preloaded, by install name alone | made, 30 33 36 39; made, 30 33 36 39 | the same |
+| the same bytes of no file: bare, preloaded | CompilerError 2, "Error creating compute variant"; the same | CompilerError 2; made, 30 33 36 39 |
+| a kernel whose install name names no file: bare, preloaded | CompilerError 2; CompilerError 2 | CompilerError 2; made, 30 33 36 39 |
+| the compile of source | made; it sends the dynamic library `airData` alone | the same |
+| that kernel: bare, preloaded | CompilerError 2; CompilerError 2 | CompilerError 2; made, 60 63 66 69 |
+| `airData`, asked twice | the file's 3,364 bytes, a new `dispatch_data_t` at each call that the caller owns (one reference past its pool) | the same |
+| `newDynamicLibrary:` of an executable library, `newDynamicLibraryWithURL:` of its file | MTLBinaryArchiveDomain 5, "Expected a library with type MTLLibraryTypeDynamic, found invalid type: null" | the same |
+| `newDynamicLibraryWithURL:` of a missing file | NSCocoaErrorDomain 260 | the same |
+| `serializeToURL:` a new file; a file in a missing directory | YES, 10,080 bytes, read back as the same library; NO, MTLDynamicLibraryDomain 1, "Invalid URL", no file | YES, 24,480 bytes; the same |
+
+So both Macs load the install names of a library read from a file, and of no other: the same
+bytes made into a library, or a compile of source whose library records the same name, link
+nothing by it *(class 3, of the two x86 Macs; the M3 is not measured)*. A preloaded library links
+a kernel on the Intel, and on the AMD only where its install name loads it from a file anyway
+*(class 2)*.
+
+What our stack does (m3-max-21422 on a Radeon 780M and m3-max-21423 on an Iris Xe, macOS 26.7.2
+guests): every answer above as the AMD gives it, but `serializeToURL:`, which writes the library's
+.metallib (3,364 bytes, the offline `metal -dynamiclib` output's bytes, which both Macs read back),
+and `airData`, which answers the same object at each call, with a reference for the caller. A
+preloaded library links only where an install name loads it, as on the AMD, so a kernel links
+only what its install names load from files: the bundle reads each file an install name names in
+the guest's process and sends its library to the host under that name.
+
+## Q31: residency sets
+
+Probe: `oracle_residency DEVICE`, 11-12, the M3 Max alone (m3-max-21721, m3-max-21768 with the
+internal use, and m3-max-21882 with when a queue lets a removed set go; m3-max-21701 stopped at the
+huge capacity): sets of a default descriptor, of one with
+a label and an initial capacity of 16, and of one of 1,048,576; a 4 KiB Shared buffer, a 64 x 64
+texture, a 1 MiB heap, a buffer of the heap and a view of the texture added, removed and committed
+in turn; the sizes of more shapes; residency requests; what holds what; the residency calls of a
+queue, a command buffer and its encoders; a `CAMetalLayer`'s set, with the members a set is sent by
+caller; and the bad inputs, each case in a child process. The x86 Macs make no set:
+`newResidencySetWithDescriptor:error:` answers nil and sets the error out to nil (m3-max-21028 and
+m3-max-21029, the AMD and the Intel, macOS 26.7.1).
+
+| asked | M3 |
+|---|---|
+| a set of each descriptor, and of nil | `AGXG15XFamilyResidencySet`, below `AGXResidencySet`, `IOGPUMetalResidencySet` and `_MTLObjectWithLabel`; the error out set to nil |
+| a query that names the support | none: `supportsFamily:` answers Apple7 to 9, Mac2, Common3, Metal3 and Metal4 YES, and the device's members that name residency sets are its creators (`newResidencySetWithDescriptor:error:`, `allocResidencySet`) and its shader log buffer's set |
+| a fresh set's `device`, `label`, `allocatedSize`, `allocationCount`, `allAllocations` | the device; nil, whatever the descriptor's label; 0; 0; an empty array, the same object at each ask |
+| `setLabel:` | answered: the label is then the one set |
+| an add | in `allocationCount`, `containsAllocation:` and `allAllocations` at once, before any commit; a second add of one held does nothing |
+| a remove | out of `containsAllocation:` and `allAllocations` at once, but counted in `allocationCount` until the commit drops it; an add before that commit keeps it; a remove of an uncommitted add takes the add back; a remove of one never added does nothing |
+| `removeAllAllocations` | a remove of each committed allocation and of each add |
+| the order of `allAllocations` | another in each run |
+| `allocatedSize` | 0 until a commit; then the memory the committed allocations lie in, each block once: a heap's buffer or texture, with the heap or without, the heap's 1,048,576; a view, its texture's 32,768; a texture over a 64 KiB buffer, the buffer's 65,536; a 4 KiB buffer, Shared or Private, 131,072, and two Shared ones together the same (a Shared and a Private one, 262,144); a buffer of 64 KiB, 1 MiB or 1 MiB + 4 KiB, its own size |
+| `requestResidency`, `endResidency` | nothing the set answers changes, in any order, twice, or an end before a request |
+| what holds what | the set holds each allocation it is given until the commit after its remove, and lets it go at that commit; a queue holds a set added until a moment after its last remove (held right after it, gone 100 ms later with no buffer made, as on a thread of the queue's own); a command buffer holds a set it uses until it completes |
+| a queue's add and remove of sets, twice, of one never added, of none, then its command buffers | taken; they complete |
+| a command buffer's use of sets, twice, of an empty set, of a set of uncommitted adds, after its commit | taken; it completes |
+| `useResidencySet:`, `useResidencySets:count:` on a render, compute and blit encoder | answered; a set and nil taken on the render and compute encoders, which complete |
+| a `CAMetalLayer`'s `residencySet` | a set of the device, empty, then holding the texture of each drawable `nextDrawable` answers; QuartzCore sends it `addAllocation:`, `removeAllocation:` and `commit` alone (its commits send `allocatedSize`, `setCurrentGeneration:` and `setExpiredGeneration:`, from IOGPU). QuartzCore makes it when the layer's device is set, labelled "CAMetalLayer.residencySet", and only for a device that answers `supportsFamily:` of Apple6 YES *(read from code: QuartzCore, macOS 27.0.1)* |
+| a nil allocation added or removed, alone or in a list | ends the process (SIGSEGV) |
+| `containsAllocation:` of nil | NO |
+| an allocation of no device (an NSObject adopting `MTLAllocation`) | taken, counted and listed, 0 bytes; the commit ends the process (SIGSEGV) in one run of two |
+| nil to a queue's add or remove, or a command buffer's use (`useInternalResidencySet:` among them) | raises NSInvalidArgumentException, the counted set's "*** -[NSCountedSet addObject:]: attempt to insert nil" (a remove: "removeObject:]: attempt to remove nil") |
+| an object of no device as a set: a queue's add; a command buffer's use | taken, and its buffers complete; the buffer fails, status 5, MTLCommandBufferErrorDomain 1, "Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)" |
+| an initial capacity of NSUIntegerMax | the creator spins without end (stopped at 30 s) |
+
+So Apple silicon's set is bookkeeping a commit applies, its size counts memory, not allocations, and
+its queue and command buffer hold sets as counted sets *(class 3, of the one Apple GPU measured;
+the x86 Macs make none)*.
+
+What our stack does: the arm64 device makes a set of its own (`RgfxResidencySet`), which sends
+nothing to the host, as the device keeps every allocation resident, and answers every answer above,
+but: the label is the descriptor's, as Metal's documentation gives it ("The label specified at
+creation", class 1); `allAllocations` lists the committed allocations in the order they were
+committed, then the adds; a small buffer counts its own pages, its range of a slab, not a block it
+shares; an allocation of no device is held and counts nothing, and a command buffer that uses an
+object of no device as a set completes, inside the envelope, as no correct use depends on either;
+and a capacity of NSUIntegerMax makes a set, as the capacity is a hint the set does not need. Its
+queue and command buffer hold sets as the M3's do, but that the queue lets a set go at its last
+remove, not a moment after, as no correct use can depend on what a moment decides; its render and
+compute encoders give theirs to their command buffer, and its blit encoder answers no residency
+member, as no Metal protocol gives a blit encoder one. A layer's `residencySet` stays nil on the
+arm64 guest, as its device answers `supportsFamily:` of Apple6 NO: the device's family answers
+decide it, not the set. The x86 device answers nil, as before.
+The guest run, `oracle_residency` in the arm64 macOS 27.0.1 guest on the M3 Max under HVF
+(m3-max-21942 at b15191aed, 11-12), answers what the M3 answered, case by case: every
+count, `containsAllocation:` and hold, every queue and command buffer run, and every death. It
+differs only where the paragraph above says it does, and in what only diagnostics show: the
+classes are ours; `retainCount` counts other holds (the set's count of the memory it lies in
+holds a plain buffer once more, and the queue holds a set once, however often it was added); and
+a nil allocation ends the process with SIGABRT and a log line, not SIGSEGV. A first run
+(m3-max-21874) showed a commit keeping the allocations it dropped alive until the caller's pool
+drained, as it listed them in an autoreleased array; the set now lets them go at the commit.
+
+## Q32: compute pipelines' threadgroup fields
+
+Probe: `oracle_threads DEVICE`, 11-12 (m3-max-22216 on the AMD, 22217 on the Intel, 22214 on the
+M3; the same with `MTL_DEBUG_LAYER=1` answers the same), each step a first compile of a salted
+kernel in a child process: `plain`, `max64` of `[[max_total_threads_per_threadgroup(64)]]` and
+`max256`, made of required sizes (`requiredThreadsPerThreadgroup`) and descriptor maxima
+(`maxTotalThreadsPerThreadgroup`) within, at and past the kernel's and the device's 1024, through
+the synchronous creators, the completion handlers and with reflection.
+
+| asked | AMD | Intel | M3 |
+|---|---|---|---|
+| a required size with an axis of 0, of more threads than 1024, or more than the descriptor's maximum | ends the process: `validateWithDevice:1530: failed assertion` "Compute Pipeline Descriptor Validation", a line a failed check | as AMD | as AMD, at `validateWithDevice:1623` |
+| a required size of more threads than the kernel's attribute | refused, CompilerError 2, "error: requested required threads per threadgroup W,H,D but 'NAME' expects max threads per threadgroup N" | as AMD | as AMD, AGXMetalG15X_M1 3 |
+| a descriptor maximum other than what the kernel specifies (the required size's threads, else its attribute) | refused, "max_total_threads_per_threadgroup shader attribute(Metadata) value (S) does not match maxThreadsPerThreadgroup pipeline descriptor value (M)" | refused, "[[max_total_threads_per_threadgroup]] declared in Metal doesn't match [MTLComputePipelineDescriptor maxTotalThreadsPerThreadgroup]" | refused, ": Kernel specified max total threads per threadgroup (S) must match compute pipeline specified max total threads per threadgroup (M)" |
+| a descriptor maximum past 1024 | refused before the kernel's check, "maxThreadsPerThreadgroup pipeline descriptor value (M) exceeds maximum supported (1024)" | made | refused after the kernel's check, ": Specified total max threads per threadgroup (M) exceeds the maximum total threads per threadgroup supported (1024)" |
+| a pipeline made of a required size | answers its threads as `maxTotalThreadsPerThreadgroup` | answers 1024 (448 for one thread) | as AMD |
+| the kernel compiled once before, then a required size past its attribute | made, answering the attribute | made, answering 1024 | as AMD |
+| `forwardProgressUsage` 0, 1, 2; `contentionRelief` 0, 1; `optimizeForPersistentKernel` | no such fields (macOS 26) | as AMD | made; Automatic (0) answers Weak (1), as a pipeline of a function alone does |
+| `forwardProgressUsage` 3 or -1; `contentionRelief` 2 or 3 | none | none | refused, AGXMetalG15X_M1 2, "Compilation failed due to an interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple retries." |
+
+The assertions agree *(class 3)*; the refusals' words and order differ *(class 2)*.
+
+What our stack does: the bundle checks the fields before it posts the create
+(`RgfxComputeThreadsVerdictOf`, `RgfxComputeProgressError`), against the kernel's attribute, which
+its AIR reader reads (`air.max_work_group_size`), and answers each case as above, the x86 guest as
+the AMD GPU and the arm64 guest as the M3, the host sent none of it. A kernel compiled before is
+refused all the same, as a first compile is and as the runtime refuses it. A pipeline of a required
+size answers its threads as its maximum, and the arm64 guest's pipelines answer
+`forwardProgressUsage` Automatic as Weak.
+
+## Q33: function constants that put two arguments at one location
+
+Probe: `oracle_overlap DEVICE`, 11-13 (m3-max-25546 on the AMD, 25547 on the Intel, 25548 on the
+M3), then 11-14 with eight more functions (k_halfpred, k_halfidx, k_fidx, k_sidx, k_vft, k_ift,
+k_pas and k_ias; m3-max-28663 on the AMD, 28662 on the Intel, 28659 on the M3). It covers 22
+functions of `oracle_overlap.metal`: kernels, a vertex function and a fragment function. Each
+has arguments of one argument table that may take overlapping locations, each present under
+function constants. Every value of the two bools that gate them was tried, by
+every way of making a specialised function: values set by index, by name and by range, a copy
+of the values, a descriptor, a copy of it, a descriptor that names a `specializedName`, and each
+completion-handler form.
+
+The three GPUs make and refuse the same functions, line for line, with the same errors. One
+pipeline differs: the 630 refuses the compute pipeline of k_vft wherever its visible function
+table is present and called (useB), with `CompilerError` 1, "Compilation failed due to an
+interrupted connection: XPC_ERROR_CONNECTION_INTERRUPTED. This error occurred after multiple
+retries.", at every way and in each of its 11-14 runs, though it answers
+`supportsFunctionPointers` true; the 5300M and the M3 make it. That is a pipeline's answer, not
+the overlap's, and making it stays inside what the two x86 Macs answer. The answers:
+
+- Where the values put two present arguments of one table at overlapping locations, Metal
+  refuses the function where it makes it. It answers nil with MTLLibraryErrorDomain 3
+  (CompileFailure) and one line per such argument, for example "error: buffer argument b has
+  invalid location (<0,1>) in k_overlap\n".
+- A line names each argument, in parameter order, whose location overlaps the location of an
+  earlier present argument. The line gives that argument's own index and count, and the
+  entry point's name, not the specialized name.
+- The word is `buffer` for buffers, constant buffers, argument buffers and threadgroup memory,
+  `texture` for textures and arrays of them, and `sampler` for samplers.
+- Function tables (visible and intersection) and acceleration structures (primitive and
+  instance) take locations of the buffers' table, and their word is `buffer` too.
+- Threadgroup memory's table is not the buffers' table.
+- An argument counts as present wherever its predicate is true. It counts whether the function
+  uses it or not, and whether its code is dead under the values or not.
+- An index set by a function constant (`[[buffer(kIdx)]]`) counts like a literal one, and so
+  do a predicate and an index computed from a half constant (`kH > 1.0h`, `uint(kH * 0.5h)`)
+  and an index through conversions to a float and back, truncated toward zero
+  (`uint(float(kIdx + 1u) * 0.75f)`, `uint(int(float(kW) * -0.5f) + 2 - int(kIdx))`, where -1.5
+  gives -1).
+- With no overlap, the function and its pipeline are made.
+
+Where this showed: the guest's pipelines tool (`mps.fn`) gives
+`cnnConvArray_32x32_128` every constant 0. Metal refuses that at once with "texture argument
+src has invalid location (<0,1>)". The bundle accepted it, and the host's compile refused the
+pipeline later (`OverlappingArgument`).
+
+What our stack does: the bundle reads each argument's predicate, index and count. It reads them
+from the function's AIR, under the module's initialisers run with the values
+(`rgfxAirConstantGlobals`). It does not follow the entry point's body, which costs many times the
+initialisers at every make of the function. It refuses as above in
+`newFunctionWithName:constantValues:error:`, which every other way reaches, with no call to the
+host (`RgfxOverlappingArgumentError`). For this check, the initialisers' evaluator also folds a
+half constant's value, each half result rounded to the nearest half as LLVM folds one, and the
+compiler's scalar conversions between floats and integers, the calls `air.convert.u.i32.f.f16`
+and the like that its initialisers make (read: the probe's module). Where the AIR does not tell,
+the host's compile refuses the pipeline, as before (read from code):
+
+- a predicate, index or count whose initialiser takes an operation the evaluator does not fold:
+  it folds integer and float arithmetic, comparisons, casts, `air.convert` of scalars, selects,
+  branches and `is_function_constant_defined`, not a vector constant's elements, an array's
+  elements, a conversion of two integers or of vectors, or other calls;
+- an `air.buffer` with no `air.address_space`, whose table (buffers or threadgroup memory) is not
+  known: none of the 22 functions of the 11-14 probe, built with Xcode 27.2 for Metal 3.0, writes
+  one;
+- a function of a library Metal's link made (`newLibraryWithDAG:functions:error:`), which the
+  bundle makes over the linked library's bytes but keeps no source for, so no AIR is read.
+
+A stitched library holds stitched visible functions, which have no argument locations, and a
+library of a function array answers the function given whatever the values (oracle_bundle
+libforms2 and libforms3), as Metal's does: neither has a function to refuse here.
+
+## Q34: what an Apple GPU answers where the x86 Macs' rules differ, and the arm64 guest
+
+An arm64 guest's device takes an Apple GPU's rules (`rgfxAppleGPU`, RgfxTexture.h), as every GPU
+an arm64 Mac has is Apple's: its Metal reference is the M3 Max's, where the x86 guest's is the
+x86 Macs'. This section measures the M3 where the bundle had taken the x86 Macs' answer.
+
+Probes, 11-13, on the M3 Max under macOS 27.0.1 (26A434), each case in a child process of its
+own, with `MTL_DEBUG_LAYER`, `METAL_DEVICE_WRAPPER_TYPE`, `MTL_SHADER_VALIDATION` and
+`METAL_ERROR_MODE` unset (each probe prints them): `oracle_surftex Apple`, 297 cases with its
+fourth and fifth rounds (m3-max-26136, 26149 and 26152); `oracle_bundle Apple` view.*,
+buftex.*, linear.*, linalign, heapbuffers, heap.shared, bit17 to bit19, tiled.responds,
+iosurf.buffer and devtex.* (m3-max-26136 and 26149), and argbuf.ds.* (m3-max-26237 and 26239);
+`oracle_mesh Apple icb` (m3-max-26237); and `oracle_spi_members` (m3-max-26149). Then
+`oracle_bundle Apple` ds.queries, ds.resourceIndex, ds.uniqueIdentifier, tiled.bytes, tiled.buffer,
+functypes.dyn, libforms3, texmem and texaddr, `oracle_icb Apple spi`, `oracle_fnptr Apple`,
+`tools/pipeline_reflection_check Apple` and `tools/reflection_check` (m3-max-26347),
+`oracle_bundle Apple ds.grid` with `pipeline_reflection_check Apple` again (m3-max-26373), and
+`oracle_profile 10 10002` (m3-max-26482).
+Every answer is measured with no validation layer, as a guest's app meets it: every process end
+below is the release Metal's, not the validation layer's.
+
+| call | x86 Macs (Q20, Q24, Q9) | M3 Max, measured | arm64 guest |
+|---|---|---|---|
+| `newTextureWithDescriptor:iosurface:plane:`, a compressed format (BC1, BC7, ASTC 4x4, ETC2 RGB8, EAC R11, PVRTC RGBA 4 bpp) whose rows and height fit, over a surface without planes, a one-plane BGRA surface's plane, or a 420v surface's luma plane, Managed or Private | BC made; the others end the process at the descriptor's validation (formats they lack) | nil; rows or height past the surface's end the process at the third step, in the x86 Macs' words | the M3's (`rgfxSurfaceMakesNoTextureOf`) |
+| the same, a Cube or CubeArray type, 64 or 32 a side, over a one-plane BGRA surface's plane or a 420v surface's luma plane | made | ends the process: `Assertion failed: (carriesComplexTexture \|\| numFaces == 1), function -[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:field:args:argsSize:], file IOGPUMetalTexture.m, line 687.`, a C assertion of the driver's | the M3's (`rgfxEndAtInvalidSurfaceTexture`) |
+| the same, a two-plane format of 4:2:0 or 4:2:2 chroma (500, 502, 505, 506, 508, 509, 520, 522, 525, 526, 528, 529, 540, 541, 543, 544) of an odd width or height (63 x 63, 64 x 63, 63 x 64 over the luma plane; 31 x 31 over the chroma plane; 63 x 63 over a one-plane surface and one without planes), usage RenderTarget or ShaderWrite | ends the process (formats they lack) | nil; of usage ShaderRead alone, or of even sides, made; the 4:4:4 formats (503, 507, 510, 523, 527, 530, 542, 545) and the XR10 ones (550, 551) made at every size and usage asked | the M3's (`rgfxSurfaceMakesNoTextureOf`) |
+| a view in `MTLPixelFormatInvalid` (`view.noformat`) | ends the process | nil | the M3's (`rgfxEndAtViewMetalEnds`) |
+| a view in a format of another class, of levels or slices past the texture's, of a type of another family, or a cube of slices not a multiple of six (`view.class`, `.levels`, `.slices`, `.type`, `.slicecount`) | ends the process | ends the process, in the x86 Macs' words | unchanged |
+| `newHeapWithDescriptor:`, Shared, 4 MiB | ends the process ("Shared storage mode disallowed") | made (`AGXG15XFamilyHeap`); Shared buffers of 1 to 65537 bytes in it, each with contents; a Shared BGRA8Unorm texture in it | the M3's: a heap over a block of the device region (`heapForDeviceWithDescriptor:`) |
+| `minimumLinearTextureAlignmentForPixelFormat:`, every raw value from 0 to 799 and 1000, 1023, 4096 and 65535 | 64 values answered; ends at the rest | 175 values answered, 16 each: those the x86 Macs answer, those they lack but Invalid, D24S8 and X24S8 (B5G6R5, A1BGR5, ABGR4, sRGB R8 and RG8, Unspecialized, the two-plane and XR10 formats), and 26, 44, 66, 116, 501, 504, 521, 524, 546 to 548, 560, 562 to 613 and 615 to 629; ends as at a compressed format at 130 to 135, 140 to 143, 150 to 153, 160 to 167, 170, 172, 174, 176, 178 to 183, 185 to 200, 203 to 218, 221 to 236, 240 and 241; as at a depth or stencil one at 250, 252, 253, 260, 261, 651 and 652; as Invalid at every other | the M3's (`rgfxLinearAlignmentAnswer`); the alignment answered stays the host GPU's |
+| a texture buffer, a 2D texture by the public form or the linear SPI, or a linear 2D array, over a buffer, whose texels end past the buffer's length (`oracle_pastlen Apple limits`, m3-max-32081, 32093 and 32098, 11-15) | made at every end bisected, up to 16 MiB from the buffer's start (Q11) | nil past the buffer's `resourceSize` from its start: 128 KiB for a buffer under 16 KiB, a heap's size for a heap's buffer, the 16 KiB pages a no-copy buffer's bytes meet, and the length rounded up to 16 KiB for the rest (Q11) | the M3's (`rgfxAppleAllocation`, `rgfxPastAllocation:`) |
+| a depth or stencil texture (Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8, X32_Stencil8) in Shared storage over a Shared buffer, by `newTextureWithDescriptor:offset:bytesPerRow:`, and Depth32Float by the linear SPI | ends the process at the descriptor's validation (the storage) | ends the process after the validation, which takes it: `_mtlValidateStrideTextureParameters`, "Linear texture: cannot create compressed, depth, or stencil textures, pixelFormat (...) disallowed" | the M3's (`rgfxEndAtLinearDepthStencil`) |
+| a depth/stencil state's `gpuResourceID`; an argument encoder's `setDepthStencilState:atIndex:` of a state or nil, at a depth/stencil descriptor's index, beside a texture and a pointer, on an encoder of one texture, and on one of a function's argument buffer (`argbuf.ds.*`) | raise an unrecognized selector, though each answers that it responds | `gpuResourceID` 0 for every state; the encoders write nothing and raise nothing | the M3's (`RgfxDepthStencilState`, `RgfxArgumentEncoder`) |
+| a depth/stencil state's `resourceIndex` and `uniqueIdentifier` (SPI; `ds.resourceIndex`, `ds.uniqueIdentifier`) | answer that they respond, and raise an unrecognized selector | the same | unchanged |
+| a depth/stencil state's `readsDepth`, `writesDepth`, `readsStencil` and `writesStencil` (SPI, which Apple's GL renderer asks of each state it binds; `ds.queries`, `ds.grid`: 717 descriptors, every depth compare with and without writes, every stencil compare of either face with each set of operations and read and write masks of 0, 1 and 0xff, under the depth tests Always, Never and Less) | YES to each for every descriptor | what the descriptor does: `writesDepth` the depth write; `readsDepth` that, or a depth compare other than Always and Never; a face writes the stencil where its write mask is not 0 and one of its three operations is not Keep, and reads it where it writes it, or its read mask is not 0 and its compare is neither Always nor Never; each query answers either face's | the M3's (`RgfxDepthStencilState`) |
+| a pipeline's reflection of a constant buffer: its `bufferAlignment` and its pointer type's `alignment` (`pipeline_reflection_check Apple`, 144 cases) | 32 | its pointee's, but at least 4: 16 for a struct of `float4x4` members, 8 for a `half3`, 4 for a `float`, a `half` and a `char`; every other getter of the 144 cases answers as the bundle's reflection does, and only two private flag fields (a function's register spills and memory atomics, which no getter answers) differ | the M3's (`RgfxPipelineReflection`) |
+| a library's reflection of its functions (`reflection_check`, 19 functions) | as the bundle's | the same | unchanged |
+| a function handle's `gpuResourceID` (`oracle_fnptr Apple`), of a compute pipeline's linked functions and a render pipeline's fragment ones | raises an unrecognized selector (Q29) | 0 | the M3's (`RgfxFunctionHandle`) |
+| a compute pipeline's `functionHandleWithName:` of a function it links | raises an unrecognized selector (Q29) | that function's handle | unchanged: an unlinked name's answer is not measured |
+| a kernel linked against a dynamic library whose own library was made of the same bytes as its file (`newLibraryWithData:`), or compiled from source with the dynamic library in its options, bare and preloaded | CompilerError 2, "Error creating compute variant", but the Intel's preloaded (Q30) | made, and they run as the file's (30 33 36 39, 60 63 66 69) | the M3's for an `@executable_path` install name (`pipelineLibraries`); an `@loader_path` one, which no file is the loader of, still refused (not measured) |
+| a kernel whose install name names no file, bare and preloaded | CompilerError 2, "Error creating compute variant" | AGXMetalG15X_M1 2, "Undefined symbols:\n  SYMBOL, referenced from: KERNEL\n" | unchanged: the bundle does not know the symbol |
+| `newDynamicLibrary:` of an executable library, `newDynamicLibraryWithURL:` of its file or of a missing file; `serializeToURL:` into a missing directory | MTLBinaryArchiveDomain 5 (Q30); NSCocoaErrorDomain 260; MTLDynamicLibraryDomain 1, "Invalid URL" | the same, in the same words | unchanged |
+| a function of a dynamic library's exported function (`functypes.dyn`) | ends the process at `validateMTLFunctionType`'s assertion | the same | unchanged |
+| a texture's SPI `virtualAddress` and `gpuAddress`, of each storage mode and shape, in heaps, over buffers, views and over a surface (`texaddr`, `texmem`) | a Shared or Managed texture's CPU address of its memory, in its GPU's layout; NULL for a Private one and one over a surface; a heap's offset in a Placement heap | the same pattern, in the M3's twiddled and compressed layouts | unchanged: as on an x86 guest, a Shared texture answers NULL (`RgfxTexture`) |
+| `featureProfile` (SPI), which Metal reads at device creation; what Metal's base device (`_MTLDevice`) answers under it (`oracle_profile 10 10002`, a subclass of the base that answers the profile alone, m3-max-26482) | 10002 | 10; under 10 the base answers 143 of its getters otherwise than under 10002, 20 of which the device answers itself (families, feature sets, function pointers, image blocks, tile shaders, programmable blending, raster order groups, barycentrics, the linear texture alignment), and 123 it leaves to the base: among them `supportsMemorylessRenderTargets`, `supportsSparseTextures`, `supportsSparseHeaps` and `sparseTexturesSupport` (3), the `supportsMTL4*` queues, encoders, compiler and counters, `supportsMeshShadersInICB`, `supportsBufferWithIOSurface`, `supportsTensors`, `supportsMachineLearningCommandEncoders`, `supportsLossyCompression`, `supportsRasterOrderGroupsColorAttachment`, `supportsVariableRateRasterization`, `supportsPVRTC` and the ASTC and YCbCr format queries, YES under 10 and NO under 10002; `maxTileBuffers`, `maxTileTextures`, `maxTileSamplers`, `maxTileInlineDataSize` and `minTilePixels` (31, 128, 16, 4096 and 256, against 0), `maxInterpolants` (124 against 32), `maxIndirectBuffers` and `maxIndirectTextures` (96 against 64 and 128), `maxFramebufferStorageBits` (512 against 1024) and `minConstantBufferAlignmentBytes` (4 against 32); the base's feature queries (`_MTLDeviceFeatureQueries`) follow the same split | unchanged, 10002: under 10 the base would answer that the device has an Apple GPU's memoryless targets, tile memory, sparse textures, Metal 4 queues and mesh commands in indirect command buffers, which the host's GPU does not; the move waits for the device to answer those members itself. The tiled texture SPI stays as it is with it: the M3's device's `newTiledTextureWithBytesNoCopy:` in both forms raises an unrecognized selector of its buffer's `newTiledTextureWithDescriptor:offset:bytesPerRow:`, which its buffers do not answer, in every storage mode and at 1 and 6 levels (`tiled.bytes`, `tiled.buffer`), while under 10002 WindowServer asks for those textures (Q11) |
+| an indirect render or compute command's read-back SPI (`oracle_icb Apple spi`) | what each command holds | the same; a fresh command's draw arguments are 0x20000000 | unchanged: the device keeps commands where these cannot read them, on either guest (`RgfxIndirectCommandBuffer`) |
+| an indirect command buffer of the mesh command types, and a mesh draw through it (`oracle_mesh Apple icb`) | no mesh pipeline supports indirect command buffers (Q22) | made, 2 commands, `allocatedSize` 16384; both mesh draws through it draw | unchanged: mesh pipelines that support indirect command buffers are a feature the device lacks |
+| a buffer by length (each storage mode) or by bytes (Shared, Managed), or the device's texture, of options holding bit 18 | nil | nil | unchanged (`RgfxMakesNoResourceOf`) |
+| the same of options holding bit 17 or 19 | made | bit 17: buffers made, then a Shared texture of the same process ends it in `IOGPUMetalSuballocatorAllocate` ("Different MTLResourceOptions used for the same heap index, this is not supported"); bit 19: buffers nil, the texture ends it the same | unchanged; not measured one call a process |
+| `newBufferWithIOSurface:` (SPI) over 64 x 64 and 100 x 7 BGRA surfaces and a 420v one | nil | a buffer (`AGXG15XFamilyBuffer`) of the surface's allocation size, options 0x200, contents NULL, `iosurface` the surface, a GPU write through it reaching the surface's pages | unchanged: nil; a buffer over a surface is a feature the device lacks |
+| a buffer's tiled texture SPI, `newTiledTextureWithDescriptor:offset:bytesPerRow:` | answered | not answered by the M3's buffers in any storage mode (the linear SPI is); the device answers `newTiledTextureWithBytesNoCopy:` in both forms | unchanged: the bundle's buffers answer it |
+| the members `tests/protocol_members.txt` gives the x86 Macs' verdicts for (`%spi-both`, `%spi-neither`, `%spi-differ`), by `respondsToSelector:` | the bundle answers each as they do | of the 67 the probe asks, the M3's objects answer 50 (44 selectors) the bundle's do not: 49 of the `%spi-neither` ones (a buffer's backing SPI such as `detachBacking` and `parentGPUAddress`, a command buffer's resource groups and `encodeSignalEventScheduled:value:` (which an arm64 guest's buffers answer since 11-14, Q45), a compute encoder's virtual substreams, a render encoder's resolve textures and tile dispatches, a texture's `compressionMetadata` and `generateMipmapLevel:slice:`), and `copyFromTexture:...options:`, a `%spi-differ` one | unchanged: SPI members, not rules |
+
+The M3 answers the rest of what this section asked as the x86 Macs do (the surface cases of Q20
+it shares with them, the views' rules, a BC1 texture over a buffer's bytes answered nil, rows
+short of a texture's ending the process). Its words name its own classes (`IOGPUMetalTexture`,
+`IOGPUMetalHeap`) where the x86 Macs name `MTLIOAccelTexture` and `MTLIOAccelHeap`; the bundle
+keeps the x86 Macs' names in its words, which are diagnostics.
+
+What our stack does *(class 3 for each guest: each answer is its reference GPU's)*: where the
+device answers an Apple family, and in every arm64 guest, the bundle answers the M3's column
+above, sending the host nothing for what ends the process or answers nil; an x86 guest's answers
+are unchanged. The shell tests check both: `test_surface_textures_as_an_apple_gpu`,
+`test_views_as_an_apple_gpu`, `test_shared_heaps_on_an_apple_gpu`,
+`test_linear_alignment_as_an_apple_gpu`, `test_depth_buffer_textures_as_an_apple_gpu`,
+`test_apple_textures_past_a_buffers_allocation_answer_nil`, `test_gl_renderer_spi`,
+`test_pipeline_reflection_from_air`, `test_function_pointers` and
+`test_compute_pipeline_libraries`, and the protocol tests' `test_argument_encoder_members`, beside
+the x86 Macs' tests they keep.
+
+## Q35: what each kind of resource answers to `setPurgeableState:`
+
+Probe: `oracle_bundle DEVICE purgeable.kinds`, 11-13 (m3-max-26711 the AMD and m3-max-26712 the
+Intel under macOS 26.7.1, m3-max-26713 the M3 Max under macOS 27.0.1): each resource is told
+Volatile, KeepCurrent, Empty, KeepCurrent, NonVolatile and KeepCurrent in turn, and each answer
+is printed (2 NonVolatile, 3 Volatile, 4 Empty).
+
+| resource | AMD, Intel and M3 Max alike |
+|---|---|
+| a Shared or Private buffer by length, a Private texture, a texture over an IOSurface, a heap, an indirect command buffer | the state told before: 2 3 3 4 4 2 |
+| a buffer by `newBufferWithBytesNoCopy:` over the process's pages, a texture view, a texture over a buffer, a heap's buffer or texture | NonVolatile to each: 2 2 2 2 2 2 |
+
+A visible function table (Q29) answers NonVolatile to each on the Intel and the M3 Max, and keeps
+the state told on the AMD.
+
+What our stack does: each answer above, on every guest. A no-copy buffer stays NonVolatile
+(`RgfxBuffer`), as a view, a texture over a buffer and a heap's resource do, and so does a
+visible function table, the Intel's and the M3's answer (`RgfxVisibleFunctionTable`); the rest
+keep the state told (`RgfxResource`). The device purges nothing, whatever the state.
+
+## Q36: which usage bits a texture answers, and which end the process
+
+Probe: `oracle_surftex DEVICE`, its sixth and seventh rounds, 11-13 (m3-max-27149 and 27157 the
+M3 Max under macOS 27.0.1, 27152 and 27156 the AMD 5300M and 27151 and 27155 the Intel UHD 630
+under 26.7.1), each case in a child process of its own with `MTL_DEBUG_LAYER`,
+`METAL_DEVICE_WRAPPER_TYPE`, `MTL_SHADER_VALIDATION` and `METAL_ERROR_MODE` unset. The atomic bit
+with each format over each surface kind and over none (`nosurface.` cases, by
+`newTextureWithDescriptor:`), in Managed, Shared and Private storage, with and without
+PixelFormatView, a view of the texture over the surface, and every usage bit the SDK names none
+for, alone and three at once.
+
+All three Macs answer alike, but where the table says:
+
+| usage asked | AMD, Intel and M3 Max |
+|---|---|
+| ShaderAtomic (0x20) on R32Uint or R32Sint, with any other bits | made; the answer leaves 0x20 out (0x23 answers 0x3, 0x20 answers 0, 0x37 answers 0x17), over an IOSurface or over none, in each storage mode; a view of the texture answers the same |
+| ShaderAtomic on RG32Uint | made, 0x20 left out, on the M3; ends the process on the x86 Macs: `This device does not support ulong texture atomics, so MTLPixelFormatRG32Uint cannot be used with texture atomics` |
+| ShaderAtomic on any other format (BGRA8Unorm, R32Float, RGBA8Uint, R8Uint, R16Uint, RG32Sint, RGBA32Uint, 500) | ends the process at `-[MTLTextureDescriptorInternal validateWithDevice:]`: `MTLPixelFormatBGRA8Unorm is not a valid format to be used with texture atomics.`, before a lacked format's line (500 on the x86 Macs) |
+| 0x8 | made; the answer leaves it out (0x9 answers 0x1, 0x8 answers 0) |
+| 0x4000, 0x8000, 0x10000 | made and answered as asked |
+| 0x40, 0x80, 0x100, 0x200 to 0x2000, 0x20000 to 0x100000, 0x1000000, 0x80000000 | ends the process at the same validation: `MTLTextureUsage has unknown bits 0x40.`, the bits in one line (`0x1c0` for three), before the atomic bit's line |
+
+What our stack does *(class 3, and the M3's column for RG32Uint on an arm64 guest, class 2)*: a
+texture answers the usage it was made with but 0x20 and 0x8 (`rgfxAnsweredUsage`, RgfxTexture.mm),
+on every guest, while its create carries the usage given, so the host's texture keeps the atomic
+bit; and every creator ends the process at the unknown bits and the atomic formats above, in
+Metal's words (`rgfxEndAtInvalidTextureDescriptor`). Until 11-13 a texture answered the bits as
+given, and the bundle ended the process at 0x80 alone. The shell tests'
+`test_texture_usage_leaves_out_atomic` and the `usage.*` and `atomic.*` descriptor cases hold it.
+
+## Q37: what one command buffer's encoders see of each other's writes through two textures over one plane
+
+Probe: `oracle_surftex DEVICE --alias N`, its aliasing cases, 11-13 (m3-max-27359 the M3 Max
+under macOS 27.0.1; m3-max-27356 the AMD 5300M and the Intel UHD 630 under 26.7.1), each case in
+a child process of its own with `MTL_DEBUG_LAYER` unset. An `'L008'` surface 64 x 64 in rows of
+128 bytes; `wide`, an `RG8Unorm` 64 x 64 texture over its plane 0, its rows the surface's whole
+128 bytes, and `narrow`, an `R8Unorm` 64 x 64 one, the plane's own texels. One command buffer's
+first encoder writes through one of them (a blit from a buffer, or a render pass that clears and
+stores) and its second blits the other into a Shared buffer; both textures keep the device's
+hazard tracking, or are Untracked with the writer updating a fence the reader waits for. 16 runs a
+case, the CPU setting every byte of the surface to 0x11 under a lock before each.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 |
+|---|---|---|
+| the second encoder reads the first's writes through the other texture, either way, tracked or behind a fence | every byte, 16 of 16 runs, every case | the same |
+| the surface after the command buffer, under a read-only lock: the plane's texels | the writes, 16 of 16 | the same |
+| the bytes past the plane's texels after the wide texture wrote them | the writes, 16 of 16 | the CPU's 0x11, 16 of 16: the GPU's writes there never reach the CPU |
+| what the wide texture reads past the plane's texels, the CPU having written 0x11 there | 0x11, 16 of 16 | never 0x11 (0 of 16) |
+
+So Metal orders a write through one texture over a plane before the next encoder's read through
+another over it, on all three; the bytes past a plane's texels are the surface's own on the M3
+and the GPU's own on the x86 Macs, which sync only the texels with the CPU. Neither answer is a
+promise of Metal's.
+
+What our stack does *(class 3 for the order; class 2 for the bytes past the texels)*: on a host
+whose device cache lays a plane out at the GPU's pitch, a texture past the plane's texels lies over
+the block's wide home, and each encoder that writes through either it or a texture over the cache is
+followed in its command buffer by a copy of its texel rows into the other side, before the next
+encoder (`decode::surface_cache`, "Wider than the plane"). The home over the block's view of its
+pages gives the M3's bytes past the texels; the stand-in, where the block has no view, gives the x86
+Macs'. Until 11-13 such a texture raised `RowPitch` where it was wider than the cache's pitch
+(`l008.fmt.rg8` on an arm64 macOS 27 guest, MoltenVK), and read the cache's own bytes past the plane
+where it fitted the pitch. On an arm64 macOS 27.0.1 guest on the M3 the eight cases now answer as
+the M3 does natively (before: the wide texture refused, so its writes never landed and the narrow
+texture's never reached it).
+
+## Q38: writes into read-only memory
+
+Probe: `oracle_readonly.sh DEVICE` (`oracle_readonly`), 11-14, every shape in a process of its
+own, against a writable control (`plain`): the M3 Max under macOS 27.0.1 (26A434), m3-max-29292
+(2 runs a shape) and m3-max-29309 (4 runs of the shapes it asked again); the AMD 5300M and the
+Intel UHD 630 under macOS 26.7.1 (25G241), m3-max-29293 and m3-max-29294, then m3-max-29310 and
+m3-max-29311 (2 runs a shape each). Read-only memory is a no-copy buffer over the process's pages
+or a heap made with `MTLResourceOptions` bit 24, Metal's private read-only option, which the
+guest's no-copy buffers over memory its process maps read-only carry (design.md, "No-copy
+buffers"), or a buffer over pages the process maps read-only (`ro-pages-`). Each shape's command
+buffer is sent twice on one queue, with a fill on the same queue and on a new one after each.
+
+**On the x86 Macs bit 24 does nothing.** Every GPU write below lands in the pages (or the heap's
+texture) and completes, as without the bit, on both GPUs. Over pages the process maps read-only,
+every GPU write measured (a pass's store, colour resolve and `StoreAndMultisampleResolve`, a
+fragment or vertex function's and a kernel's `write()`, a blit's copy) completes, the pages
+unchanged. The M3 Max keeps the GPU's writes out under bit 24 and over read-only pages alike.
+
+| what, into read-only memory | M3 Max | AMD 5300M and Intel UHD 630 | class |
+|---|---|---|---|
+| a pass's store-out: a colour `Store`; a colour `MultisampleResolve` or `StoreAndMultisampleResolve` into it, the descriptor's or late, into the descriptor's resolve texture or one the setter's SPI named under a known action; a depth or stencil `Store`; a depth `CustomSampleDepthStore`, the descriptor's or late; a depth `MultisampleResolve` and a stencil `MultisampleResolve` or `StoreAndMultisampleResolve`, the descriptor's or late, a depth one into a late texture too | `PageFault` (3), every first command buffer, the event signalled and the memory unchanged; the next command buffer of the queue and of a new queue run; the second command buffer faults too and revokes the queue (`AccessRevoked`, 4), but for a stencil `StoreAndMultisampleResolve`'s 4 runs of 6, whose second fails with code 1 (`kIOGPUCommandBufferCallbackErrorInnocentVictim`), the queue running on | completes, the memory written | 2 |
+| a depth attachment's `StoreAndMultisampleResolve` into it | completes, 4 runs of 6 (2 failed with code 1, `kIOGPUCommandBufferCallbackErrorInnocentVictim`), the second command buffer 2 of 6 (4 the same victims), never `PageFault`, the queue never revoked; the resolve texture unchanged | completes, 4 of 4 each, the resolve texture written | 3 |
+| a pass that does not store it: `DontCare` of colour, depth or stencil; a colour or stencil `CustomSampleDepthStore` set late; a resolve the pass makes into a texture of a format pair Metal leaves untouched (BGRA8 into RGBA16Float) | completes, the memory unchanged | completes; the untouched pair's resolve written | 3 (the untouched pair: 2) |
+| a colour or stencil attachment the descriptor keeps by `CustomSampleDepthStore` | ends the process in the descriptor's validation (`abort`), with the bit or without | the same | 3 |
+| a fragment or vertex function's `write()` of a texture over it | `PageFault`, every first command buffer; the second faults and revokes the queue, but 2 runs of 12 whose second fails with code 1, the queue running on | completes, the pages written | 2 |
+| a texture over it made resident for writing that no function writes | completes | completes | 3 |
+| a kernel's `write()`; a blit's copy into a texture over it; mipmaps of a heap's texture | completes, the writes dropped (`mipmaps-shared`: level 1 of a Shared heap's texture whose level 0 the CPU wrote stays zeros, written without the bit) | completes, written | 2 |
+| a blit's colour or bytes fill and an invalidation of such a texture (the `fillTexture:` and `invalidateCompressedTexture:` SPI) | completes, the writes dropped | ends the process, with the bit or without: the SPI is not the x86 drivers' | 2 |
+| the CPU's `replaceRegion:` of a texture over a bit-24 buffer of writable pages | the pages take the bytes, which the GPU reads | the same | 3 |
+| the CPU's `replaceRegion:` of a texture in a Shared heap of bit 24 | the texture takes the bytes, which a blit reads back | no Shared heap is made | 3 (the M3 alone) |
+| the CPU's `replaceRegion:` of a texture over pages the process maps read-only | ends the process (`SIGBUS`), with the bit or without | the same | 3 |
+| a late colour resolve texture where the pass named none, under a late resolving action | completes, nothing resolved, with the bit or without | the 5300M ends the process at `endEncoding` (`SIGSEGV`); the 630 fails the command buffer (code 9), with the bit or without | 2 |
+
+What our stack does: on Linux the runtime makes read-only memory over a copy of its pages whose
+GPU writes it drops (accuracy-ledger.md, `read-only-pages-written`). A store-out faults the
+command buffer as the M3 Max's does *(class 2: the runtime's own fault, which costs nothing)*;
+every other GPU write completes with its write dropped *(class 2 or 3: the draw's `write()`,
+which the M3 Max faults, takes the x86 Macs' completion, the cheaper)*; a CPU write writes the
+pages where the process can, and ends the process over pages it maps read-only *(class 3)*. A
+depth attachment's `StoreAndMultisampleResolve` into such memory completes, the attachment
+stored and the resolve dropped, the texture unchanged *(class 2: the M3 Max's answer; the x86
+Macs write the texture)*: the runtime (metal2vulkan 5d33e0c74a) drops the resolve, which it
+faulted until then, when this platform ended the process there. Beside a stencil attachment
+that resolves, which no Mac was asked, the runtime still faults it, and the process ends where
+the pass is made, or at the late store action or resolve texture. On macOS MoltenVK hands Metal
+the pages, or a read-only view of them, and Metal answers.
+
+## Q39: a command buffer failed two ways: a read-only store-out beside protection options
+
+Probe: `oracle_failways.sh DEVICE` (`oracle_failways`), 11-14, every shape in a process of its
+own, against a writable control (`plain`): the M3 Max under macOS 27.0.1 (26A434), m3-max-29535
+(2 runs a shape) and m3-max-29547 (4 runs); the AMD 5300M and the Intel UHD 630 under macOS
+26.7.1 (25G241), m3-max-29536 and m3-max-29537 (2 runs; a probe error lost the shapes of four
+encoders there) and m3-max-29549 and m3-max-29550 (4 runs). A command buffer of compute encoders
+that each write a mark and a render pass that clears and stores a 4 x 4 RGBA8Unorm texture over a
+no-copy buffer made with bit 24 (Q38's store-out), each encoder followed by the signal of an
+event of its own, with `setProtectionOptions:` (the command buffer's SPI) of 2 or 0x10 set before
+the pass, after it, or after every encoder. Type-9 draws, which hang the GPU, are left out on
+every Mac: what one does beside another failure is not measured.
+
+| what | M3 Max | AMD 5300M | Intel UHD 630 | class |
+|---|---|---|---|---|
+| encoders made under options 2 | code 16 ("Protection Violation"); the first encoder made under them and every later one run nothing; the signals encoded before it fire, none after it | the same | code 16; every encoder runs and every signal fires (the error's encoder infos say Pending) | 2 |
+| encoders made under options 0x10 | code 1 ("Invalid Input"); encoders and signals as under 2 | code 16; as under 2 | code 16; as under 2 | 2 (the code: 4 for the x86 lane, below) |
+| options set after every encoder | 2: completes; 0x10: code 1, every encoder running, every signal firing | completes, under both | the same | 2 (0x10: 4 for the x86 lane) |
+| a store-out alone | `PageFault` (3), as Q38; the compute encoder after the pass ran in 11 runs of 18 (here and beside options 2 or 0x10 set after every encoder); every signal fires | completes, the store written | the same | 2 |
+| a store-out, then encoders made under options 2 or 0x10 | the options' failure alone, code 16 or 1, no `PageFault`; the encoders made under them run nothing; the signals encoded before the first of them fire, the pass's among them; the pages unchanged | the same, code 16, the store written | code 16, every encoder running and every signal firing, the store written | 2 |
+| encoders made under the options, the pass among them | the options' failure; the pass runs nothing, so nothing faults | the same, code 16 | code 16, every encoder running | 2 |
+| a store-out, then options 0x10 after every encoder | code 1, no `PageFault`; every signal fires; the encoder after the pass ran in 3 runs of 6 | completes, the store written | the same | 2 |
+| a store-out, then options 2 after every encoder | `PageFault`, as the store-out alone | completes, the store written | the same | 2 |
+
+The next command buffer on the same queue, and one on a new queue, ran after every shape on all
+three Macs.
+
+What our stack does (`crate::gpu::command`): it keeps protection options itself, and fails a
+command buffer of encoders made under them as the M3 Max does: code 16 or 1, the encoders from
+the first made under them running nothing, the signals encoded before it firing and none after
+it *(class 2: the M3 Max's and the 5300M's answer)*. The runtime's injected failure fires every
+signal or none, so the platform sends no signal encoded after such an encoder. Options from 0x10
+set after every encoder fail it with code 1, every encoder running and every signal firing (the
+M3 Max's). A store-out's fault beside such a failure is answered by that failure, as on all
+three Macs *(class 2)*, the encoders from the faulting pass on running nothing, as the M3 Max
+runs nothing there in 7 runs of 18; until 11-14 the platform ended the process at such a commit.
+A type-9 draw's failure beside another way still ends the process there.
+
+Outside the envelope for x86 guests *(class 4, not yet answered)*: the M3 Max's code 1 under
+options from 0x10, and its failure where such options come after every encoder; both x86 Macs
+answer code 16 and complete the latter. The platform answers the M3 Max's for every guest.
+
+## Q40: what Metal stores through the 4:4:4 `_sRGB` two-plane formats
+
+Probe: `oracle_twinwrites.sh DEVICE` (`oracle_twinwrites`), 11-14, one process a format and a
+write: the M3 Max under macOS 27.0.1 (26A434), m3-max-29535; the AMD 5300M and the Intel UHD
+630 under macOS 26.7.1 (25G241), m3-max-29536 and m3-max-29537, which end the process at every
+texture of the four formats, at its creation ("MTLTextureDescriptor has invalid pixelFormat
+(N)", as Q13 and Q20 found): the x86 Macs make none. An 8 x 2 texture of 503, 507 or their
+`_sRGB` twins 523 (YCBCR8_444_2P_sRGB) and 527 (YCBCR10_444_2P_sRGB) over plane 0 of a two-plane
+surface ('444v' for the 8-bit ones, 'x444' for the 10-bit ones; rows of 64 bytes, plane 1 at
+4096, no matrix), each column x written colour x, alpha 1, by a kernel's `write()`, by a fragment
+function's `write()` drawn over a BGRA8Unorm target of its size, and by a render pass a colour
+that clears the texture and stores it.
+
+Every command buffer completed. Both rows hold the same bytes, and a 10-bit sample's code is its
+16-bit word's top 10 bits, its low 6 zero. The codes, as Y, Cb and Cr; the kernel's and the
+fragment function's alike in every case, and the pass's but where named:
+
+| colour | 503 | 523 | 507 | 527 |
+|---|---|---|---|---|
+| black | 16, 128, 128 | 16, 128, 128 | 64, 512, 512 | 64, 512, 512 |
+| white | 235, 128, 128 | 235, 128, 128 | 940, 512, 512 | 940, 512, 512 |
+| grey 0.5 | 126, 128, 128 | 177, 128, 128 | 502, 512, 512 | 708, 512, 512 |
+| red | 81, 90, 240 | 81, 90, 240 | 326, 361, 960 | 326, 361, 960 |
+| green | 145, 54, 34 | 145, 54, 34 | 578, 215, 137 | 578, 215, 137 |
+| blue | 41, 240, 110 | 41, 240, 110 | 164, 960, 439 | 164, 960, 439 |
+| (0.2, 0.6, 0.9) | 129, 177, 78 | 174, 157, 90 | 515, 707, 311 | 696, 630, 360; the pass 697, 630, 360 |
+| (0.9, 0.3, 0.1) | 116, 83, 199 | 162, 88, 174 | 464, 332, 795 | 649, 351, 695 |
+
+Where every channel is 0 or 1 a twin stores its format's codes. Elsewhere its codes are those of
+the colour encoded by the sRGB curve first: grey 0.5 encodes to 0.7354, and 16 + 219 x 0.7354 is
+177.05 and 64 + 876 x 0.7354 is 708.2; (0.2, 0.6, 0.9) encodes to (0.4845, 0.7977, 0.9547),
+whose BT.601 codes at the video range are 174.1, 157.4 and 90.05, and 696.4 for the 10-bit luma
+(arithmetic on these eight colours alone; the 10-bit pass rounds that luma up).
+
+What our stack does: the runtime (metal2vulkan 20f7e82bbe) stores neither twin's writes. It
+refuses a kernel's or a fragment function's write through one at the slot's bind, and a pass
+into one at its creation, so the dispatch, the draw or the pass ends the process, naming the
+refusal; a blit into one from a buffer completes *(class 4: Metal stores them; these bytes went
+to metal2vulkan)*. Through an argument buffer the runtime refuses a write of every two-plane
+YCbCr texture, of 503, 507, 542 and 545, whose slot writes it stores, and of 500, whose slot
+writes it drops as Metal does, among them, ending the process at the dispatch *(class 4: the M3
+Max stores them as through a slot, below; metal2vulkan takes them on)*. Measured on ms01's Iris
+Xe (ANV), m3-max-29517 and m3-max-29593, over
+textures made as the device makes them over a guest's surface plane
+(`gpu::ycbcr::plane_writes`). Only an arm64 guest reaches it: the x86 guests' bundle ends the
+process at a texture of a two-plane format's creation, as the x86 Macs do (Q13; read from code,
+`guest/bundle/src/RgfxTexture.mm`'s descriptor check).
+
+**Through an argument buffer.** `oracle_twinwrites.sh Apple` with `FORMATS="500 503 507 523
+527" OPS="kernel argbuf"`, the M3 Max under macOS 27.0.1 (26A434), m3-max-29643: the kernel
+writes the eight colours through an argument buffer that holds the texture
+(`MTLArgumentEncoder`), made resident with `useResource:usage:` of `MTLResourceUsageWrite`,
+beside the same kernel's write through a slot, one process each. 500 is an 8 x 2 texture over
+plane 0 of a '420v' surface (plane 1 of 4 x 1 Cb, Cr pairs at 4096). Every command buffer
+completed, and both planes hold the same bytes after the write through the argument buffer as
+after the one through the slot, format by format: 503, 507, 523 and 527 store the codes of the
+table above, and 500 stores nothing, both planes keeping their 0xAB bytes. So a write through
+an argument buffer stores what a write through a slot stores *(measured on the M3 Max alone, as
+the x86 Macs make none of these textures)*.
+
+## Q41: a colour resolve into a texture over an IOSurface, in a pair the M3 leaves untouched
+
+Probe: `oracle_surfresolve.sh DEVICE` (`oracle_surfresolve`), 11-14, one process a case: the M3
+Max under macOS 27.0.1 (26A434), m3-max-29682, and m3-max-29690 for plane 1; the AMD 5300M and
+the Intel UHD 630 under macOS 26.7.1 (25G241), m3-max-29684 and m3-max-29683, and m3-max-29691
+and m3-max-29692 for plane 1. A 16 x 16 4-sample `BGRA8Unorm` or `BGRA8Unorm_sRGB` attachment
+(Private, of its own) is cleared and stored, then loaded, drawn over every texel and stored by
+`MultisampleResolve` or `StoreAndMultisampleResolve` into a 16 x 16 texture of usage
+`ShaderRead` and `RenderTarget`, filled with 0xA5 bytes first, of `RGBA16Float`, `BGR10_XR`,
+`BGR10_XR_sRGB`, or the attachment's own format (the control): a texture of its own, one over a
+surface without planes of its size ('RGhA', 'w30r' or 'BGRA'), one over plane 0 of a 128 x 16
+'420v' surface, or one over plane 1 of a 128 x 32 '420v' surface, each Shared, Managed and
+Private. A blit reads the texture back, and a second pass resolves the samples into a texture of
+their format.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 |
+|---|---|---|
+| the resolve into `RGBA16Float`, every texture and storage mode | completes, the texture keeps its bytes | completes, the drawn colour written |
+| the resolve into `BGR10_XR` or `BGR10_XR_sRGB` | completes, the texture keeps its bytes | none: the process ends at the texture's descriptor ("MTLTextureDescriptor has invalid pixelFormat (554)", `abort`) |
+| the resolve into the attachment's own format | the drawn colour written | the same |
+| the samples after `MultisampleResolve` | as before the pass (the earlier clear) | the drawn colour |
+| the samples after `StoreAndMultisampleResolve` | the drawn colour | the same |
+
+Over a surface, without planes or over either plane of one with planes, in every storage mode,
+each GPU answers as for a texture of its own: what decides the resolve is the format pair, not
+the texture's memory *(class 2: the M3 Max leaves the texture untouched where the x86 Macs write
+it)*.
+
+What our stack does: a resolve into a texture of another format that the M3 Max leaves untouched
+is dropped (`gpu::encode_render`'s `untouched_resolves`): the pass is made without it, its
+samples kept as the M3 Max keeps them, and the texture keeps its texels, the M3 Max's answer,
+which costs nothing, as the runtime resolves into no other format. A texture the guest makes
+over a surface's plane, which the device makes over the buffer that stands for the surface
+(`new_texture_over_surface_plane`), Private over a device cache whatever the guest asked, is
+dropped into alike, over a surface without planes or a plane of one with planes, in any storage
+mode, and so is one over read-only memory, whose pass completes with the memory unchanged as the
+M3 Max completes it (Q38). Until 11-14 such a pass ended the process at its making, as a
+resolve into a texture over a buffer, a shape not measured.
+
+## Q42: the device's compiler target, and Metal's archive readers
+
+Probe: `oracle_archtype DEVICE FILE...`, 11-14: the AMD 5300M and the Intel UHD 630 under macOS
+26.7.1 (25G241), m3-max-30048 and m3-max-30049, and the M3 Max under macOS 27.0.1 (26A434),
+m3-max-30050. The files: a `.metallib` of AIR (`oracle.metallib`), a dynamic library of AIR
+(`oracle_bundle_dyn.metallib`), and a binary archive and a dynamic library the device serializes
+itself.
+
+| what | AMD 5300M | Intel UHD 630 | M3 Max |
+|---|---|---|---|
+| `targetDeviceArchitecture` | an `MTLTargetDeviceArchitecture` (Metal's class, of `NSObject`) | the same | the same |
+| its `cpuType`, `subType` | 0x1000014, 0x1773 | 0x1000015, 0x950200 | 0x1000013, 0x1a3 |
+| its `driverVersion`, `versionCombined` | 0x7d4, 0xe0002 | 0x1a0701, 0x1a0701 | 0x30000, 0x30000 |
+| the archive reader, AIR `.metallib`; AIR dynamic library | 1, 1 | 1, 1 | 1, 1 |
+| the dynamic library reader, the same files | 0, 1 | 0, 1 | 0, 1 |
+| the archive reader, the device's own archive; its dynamic library | 2, 1 | 3, 1 | 2, 1 |
+| the dynamic library reader, the device's own archive; its dynamic library | 0, 2 | 1, 1 | 0, 2 |
+
+The class has `cpuType`, `subType`, `driverVersion`, `version` (`{MTLTargetDeviceArchVersion=SCC}`)
+and `versionCombined`, and setters of all but the last. The readers' numbers are the names
+MTLAssetUpgraderD prints for them: the archive reader's 0 Invalid, 1 Legacy, 2 Compatible,
+3 Rebuild, 4 NoVendorSlice, and the dynamic library reader's 0 Invalid, 1 AIROnly, 2 Compatible,
+3 Rebuild, 4 NoVendorSlice.
+
+Every Mac answers an object, and no Mac answers nil *(class 3)*. Its values are each GPU's own
+compiler target and versions: an answer that describes the device, which is the device's own and
+not a pick between the Macs'. What it is read for (read from macOS 27's Metal and MTLAssetUpgraderD):
+- Metal's loader (`+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]`) makes
+  the slice it looks for in a binary archive or a dynamic library of `cpuType` and `subType`, and
+  ends the process where the answer is nil. MTLAssetUpgraderD, told of an app installed, asks
+  Metal's archive and dynamic library readers about each `.metallib` in it, for each device, and
+  queues a rebuild of the file for the device where the archive reader answers 3 or the dynamic
+  library reader 1 or 3.
+- MPS keeps `cpuType << 32 | subType` and gives it to its NDArray kernels' prefix and postfix
+  queries, and Metal's `_MTLUseAIRNTBinaryArchive` answers YES for a `cpuType` of 0x1000013 to
+  0x1000015 alone, where no setting of Metal's decides it.
+
+What our stack does: until 11-14 the device left `targetDeviceArchitecture` to the IOGPU base,
+which answers nil *(class 4)*, and MTLAssetUpgraderD ended with SIGABRT at each app installed in
+the guest. The device now answers an `MTLTargetDeviceArchitecture` of its own target: `cpuType`
+0x01005247, `CPU_ARCH_ABI64` with its PCI device id, which no Metal slice carries, `subType` 0, and
+version 1.0.0 (`versionCombined` 0x10000) with `driverVersion` 0x10000. No Mac's archive holds a
+slice of it, and the device's own archives are of its own format.
+
+## Q43: a command a kernel encodes naming a released state
+
+Probe: `oracle_icb DEVICE freedstate`, 11-14, 2 runs on each Mac: the M3 Max under macOS 27.0.1
+(26A434), m3-max-30466; the AMD 5300M and the Intel UHD 630 under macOS 26.7.1 (25G241),
+m3-max-30464 and m3-max-30465. A kernel writes compute command 0 of an indirect command buffer
+from an argument buffer holding the ID of an `icb_add` state x of indirect command buffer support,
+which the program released (its last reference dropped in an autorelease pool), and the command is
+executed. `out` reads 5 where `icb_add` ran, 6 where an `icb_mul` state y ran, and 2 where nothing
+did.
+
+| shape | M3 Max | AMD 5300M | Intel UHD 630 | class |
+|---|---|---|---|---|
+| x released before the write, no state made since | x runs (5); completes | the command buffer fails with code 2 (`kIOAccelCommandBufferCallbackErrorTimeout`), nothing run (2) | x runs (5); completes | 2 |
+| x released after the write's command buffer completed, before the execute | x runs | the same | the same | 3 |
+| x released before the write, y made since | y took x's ID (7) and runs (6) | the same | y took a new ID (10), and x runs (5) | 3: the ID's last holder runs |
+| the CPU set x, x released, y made, the kernel writes the state | y runs (6) | the same | x runs (5): y took another ID | 3, as above |
+| the CPU set x, x released, y made, the kernel writes the buffers alone | x runs (5) | the same | the same | 3 |
+
+- **Which state runs** *(class 3)*. A record the GPU wrote runs the state that last took the ID it
+  names, released or not, and a command whose state the GPU did not write runs the state the CPU
+  set, whoever took its ID since. Every command buffer but the 5300M's first completes with no
+  error. The M3 Max and the 5300M hand a new state the lowest free ID, the 630 a new one.
+- **A state released before the write, its ID taken by none** *(class 2)*. The M3 Max and the 630
+  run it; the 5300M times the command buffer out.
+
+What our stack does (metal2vulkan d9236a8a11, v0.2.0): a record the GPU wrote runs the program of
+the state that held the ID as the GPU last could write the buffer's records, released since or not:
+the device keeps the program of each freed ID's last holder while an indirect command buffer of it
+lives, and a buffer the GPU may write takes those at its first such write, so the second shape is
+every Mac's. In the first shape x runs and the command buffer completes, the M3 Max's and the 630's
+answer *(class 2)*, unannounced. The record tells a pipeline a kernel wrote from one the CPU set, so
+the fourth shape runs y, the ID's last holder, and the fifth x, every Mac's answer, both
+unannounced. Still relayed (`released-command-state`), the command running nothing, no Mac's answer
+*(class 4)*: a state released while no indirect command buffer of the device lived, or past its
+ID's last four holders. Until 11-14 the process ended there.
+
+## Q44: an indirect command buffer made with `MTLResourceOptions` bit 24
+
+Probe: `oracle_readonly.sh DEVICE` with `SHAPES="icb-cpu icb-gpu icb-gpu-over-cpu"`, 11-14, 2 runs
+a shape and backing, beside Q43's jobs (m3-max-30466, m3-max-30464, m3-max-30465). An indirect
+command buffer of one compute command, made with bit 24 or without it (the control), Shared where
+the CPU encodes and Private where a kernel alone does; its command a dispatch that adds 5 to a word
+of 16, the CPU's (`icb-cpu`), a kernel's (`icb-gpu`), or a kernel's over the CPU's add of 1
+(`icb-gpu-over-cpu`); executed in one command buffer, and again in another.
+
+| what | M3 Max | AMD 5300M and Intel UHD 630 | class |
+|---|---|---|---|
+| the buffer | made; `resourceOptions` without the bit (0x200 Shared, 0x220 Private), as without it | the same | 3 |
+| a command the CPU encoded | runs (21), in both command buffers | the same | 3 |
+| a command a kernel encoded | nothing runs (16): the GPU's write of the record is dropped | runs (21) | 2 |
+| a kernel's command over the CPU's | the CPU's runs (17) | the kernel's runs (21) | 2 |
+
+Every command buffer completes with no error, and the queue runs on, as without the bit.
+
+What our stack does (metal2vulkan ce54ad8b25): the runtime makes such a buffer as without the bit,
+relayed (`private-resource-option`), dying in strict mode: the CPU's commands run, every Mac's
+answer, and a kernel's records land, the x86 Macs' *(class 2)*. The M3 Max's drop of the GPU's
+writes is the runtime's to build, for an arm64 guest's frameworks.
+
+## Q45: a command buffer's scheduled signal, `encodeSignalEventScheduled:value:`
+
+Probe: `oracle_cmdbuf Apple schedsig` and its child cases `schedsig_open`, `schedsig_late`,
+`schedsig_nil`, `schedsig_nil_unretained`, `schedsig_plain` and `schedsig_plain_unretained`, 11-14,
+on the M3 Max under macOS 27.0.1 (26A434): m3-max-30621 and m3-max-30629. The x86 Macs' buffers
+do not answer the member (`%spi-neither`, Q34), so it is the M3's alone. Its command buffer
+(`AGXG15XFamilyCommandBuffer`) answers it from `IOGPUMetalCommandBuffer`, retaining its
+references or not. Times are ms from the commit, medians of 5 runs; a kernel ran 92 ms.
+
+| what | M3 Max |
+|---|---|
+| on an idle queue, the signal of 1 encoded before a kernel: `signaledValue` reads 1 (a polling thread); a listener's block for 1; the scheduled handler; `GPUStartTime` | 0.044; 0.061; 0.114; 0.638. The scheduled handler reads 1 in 5 of 5 |
+| the same, the signal encoded after the kernel | 0.090; 0.104; 0.109; 0.606. The handler reads 1 in 5 of 5, the listener's block before it in 2 of 5: the signal waits for none of the buffer's GPU work |
+| behind a 185 ms buffer of its queue: the value read; the buffer's scheduled handler; its `GPUStartTime`; a buffer of a second queue that waits for the value completes | 0.092; 0.138; 19.97; 20.45, before the first buffer's `GPUEndTime` (184.98) in 5 of 5 |
+| an event at 5: a scheduled signal of 3; of 7; of 6 then 8; of 8 then 6; against a GPU signal of 3 and a CPU set of 3 | 5; 7; 8; 8; 5 and 5: the value only rises, as a GPU signal and a CPU set leave it |
+| a kernel, a GPU signal of 2, a scheduled signal of 1 | 1 at 0.117 (the scheduled handler reads 1), 2 at 46.78, as the kernel ends (`GPUEndTime` 46.66) |
+| a scheduled signal of 2, a kernel, a GPU signal of 1 | 2 at 0.062, a listener for 1 at 0.059; 2 at the end |
+| a wait for another shared event W at 1, then the signal; the CPU sets W at 200 ms (3 runs) | the buffer Committed at 200 ms; the value reads 1 0.04 ms after the set, the scheduled handler 0.1 ms later |
+| the signal, then the wait for W | the value reads 1 at 0.03 to 0.07 ms, while the buffer stays Committed until W is set |
+| a kernel, the wait for W, the signal | the value reads 1 0.04 ms after the set |
+| the signal, a kernel, the wait for W | at 0.03 to 0.04 ms |
+| behind an earlier buffer of its queue that waits for W | 0.06 to 0.17 ms after the set |
+| a wait for 1 on its own event, then the signal of 1, nothing else setting it | the value stays 0; the buffer fails at 5.0 s with Metal's timeout (`MTLCommandBufferErrorDomain` 2, "Caused GPU Timeout Error (00000002:kIOGPUCommandBufferCallbackErrorTimeout)") |
+| the signal of 1, then a wait for 1 on its own event | the buffer completes (10.7 ms) |
+| a listener's block, a default listener and one of a queue of its own | on the listener's queue (`MTLSharedEventListener`, and its own) |
+| with an encoder open | ends the process: "-[IOGPUMetalCommandBuffer encodeSignalEventScheduled:value:]:468: failed assertion `encodeSignalEventScheduled:value: with uncommitted encoder'" |
+| after the commit | returns; the event keeps its value, and the buffer completes |
+| a nil event, on a buffer that retains its references | raises `NSInvalidArgumentException`, "*** -[__NSArrayM insertObject:atIndex:]: object cannot be nil" |
+| a nil event, on one that retains none | returns; the buffer fails: `MTLCommandBufferErrorDomain` 1, "Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)" |
+| a plain event (`newEvent`), either buffer | logs "MTLEvent passed to API expecting MTLSharedEvent" and ends the process (SIGABRT) |
+
+So the call writes a command into the buffer's stream for the kernel, which sets the shared event
+as its queue's submission reaches it: in the stream's order, behind every wait before it on the
+queue, the buffer's own and an earlier buffer's, and ahead of the buffer's GPU work, its
+scheduling and any wait after it (read from code: macOS 27.0.1's IOGPU, which reserves a kernel
+command for it in the buffer's storage, where a wait is one too).
+
+Who sends it (read from code, macOS 27.0.1's shared cache): MPSGraph, from one place,
+`GPU::ANERegionCallOpHandler::encodeAsynchronousWithSharedEvents`, the op that runs a graph's
+region on the Neural Engine, with no `respondsToSelector:` check. An arm64 guest has no Neural
+Engine (docs/qemu.md, "arm64 guests: the Neural Engine"), so no recorded run reached it. CMImaging
+and PhotosensitivityProcessing carry the member only in their copies of the `MTLCommandBufferSPI`
+protocol: neither has a call site of it.
+
+What our stack does *(class 3, the arm64 guest's reference GPU's)*: an x86 guest's buffers answer
+no such member, as the x86 Macs' do. An arm64 guest's buffers answer it, and the bundle sets the
+event as the CPU's set does (the host first, `SHARED_EVENT_SET_VALUE`, then the process's
+listeners and waits): at the buffer's post, where no buffer of its queue is held at a wait and
+every wait the buffer encoded before the call is met as the process knows it; else at the
+buffer's scheduling, before its scheduled handlers. Later than Metal's *(class 2)*: a signal
+behind a wait met on the host before the process knows it, and one held that a wait after it on
+its buffer holds too, as Metal's is not; a buffer that holds a signal behind an earlier buffer's
+wait and then waits for that signal's value never runs, where Metal's does. The plain event's
+end, the nil event's exception and its failed buffer, and the call after the commit are the
+M3's. The open encoder's end is not carried: the bundle keeps no record of an open encoder for any
+command-buffer call. The tests are `test_a_scheduled_signal_is_set_as_its_queue_submits_it`,
+`test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling` and
+`test_a_scheduled_signal_takes_only_a_shared_event` (tests/queue_tests.mm, arm64).
+
+## Q46: an argument encoder's reflection, and a function array's names
+
+Probes, 11-14: `oracle_bundle DEVICE` argbuf.reflection, argbuf.binding, argbuf.binding.lib,
+libforms3 and libforms.order, on the M3 Max under macOS 27.0.1 (m3-max-31079) and on the AMD
+Radeon Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1 (m3-max-31082 and 31083), as
+on 11-05 for argbuf.* (the x86 Macs) and 11-13 for libforms3 (the M3).
+
+**An argument encoder's reflection.** `newArgumentEncoderWithBufferIndex:reflection:` of a
+kernel's argument buffer answers, in its out-parameter, the buffer's binding as the function's
+pipelines' reflection answers it: of the argument buffer's members, a `metal::array` of textures
+of stride 0. A library's reflection of the same function (`reflectionForFunctionWithName:`)
+answers that array's stride as its element's size, 8. AMD, Intel and the M3 agree *(class 3)*.
+Ours (`RgfxFunction.mm`, `rgfxArgumentOfBufferAtIndex:`) answers the pipelines' binding
+(`RgfxStageReflectionOf`), and the library's reflection where that makes none
+(`test_pipeline_reflection_from_air`'s encoder binding, tests/shell_tests.mm).
+
+**A function array's names.** A library made of functions (`newLibraryWithFunctions:` and the
+stitched forms, libforms3) answers `functionNames` in an order of its own, which follows the order
+the functions were given without reversing it, alike on AMD, Intel and the M3 *(class 3)*:
+libforms.order's 6 orders of div_kernel, div_visible and div_stitchable and 4 orders of five
+(adding div_vertex and div_fragment), and a probe's 60 orders of two, three and four of
+div_visible, div_stitchable, div_vertex and div_fragment (m3-max-31122 on the M3, 31123 and 31124
+on AMD and Intel, the same 60 answers). Given div_visible first, the three answer div_kernel,
+div_stitchable, div_visible whatever follows; given div_stitchable first, div_kernel, div_visible,
+div_stitchable; given div_kernel first, div_stitchable, div_visible, div_kernel. The given order
+reversed is the answer for 3 of libforms.order's 6 orders of three and 2 of its 4 of five, and for
+28 of the probe's 60: all 12 of two, 12 of the 24 of three and 4 of the 24 of four. No container
+of the names gives it: `NSMutableDictionary` (with and without a capacity), `NSDictionary`,
+`NSMutableSet`, `NSMapTable` and `CFMutableDictionary`, filled in the given order or reversed and
+read by their keys, matched at best 10 of the 60 (m3-max-31104 and the probe above), and libc++'s
+`std::unordered_map` and `std::unordered_set` of the names 44 of 70 orders (m3-max-31128): it is
+a hash structure of Metal's own. Ours (`RgfxLibrary.mm`, `functionNames`) answers the given order
+reversed *(class 2: Metal's for every array of two and for some longer ones)*.
 
 ## Not measured
 

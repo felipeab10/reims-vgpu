@@ -7,7 +7,7 @@
 // DRIVER_FEATURES_LO and _HI after its reset and before DRIVER_READY with the bits the kext and its
 // bundle carry out, masked by the offer, and reads back the ones the host took. A host older than
 // the registers reads them as 0, so nothing from bit 3 is taken there. Of those bits the kext and
-// its bundle carry out fifteen:
+// its bundle carry out these:
 //  - PAGES_BUFFERS (bit 7): the kext makes pages blocks over a process's own memory
 //    (kRgfxAccelMethodPagesBlock), and the bundle lays its no-copy buffers over them
 //    (BUFFER_OVER_PAGES);
@@ -24,8 +24,8 @@
 //  - MANAGED_AT_OFFSET (bit 14): the bundle places its Managed buffers' CPU copies in heaps over
 //    its blocks (BUFFER_MANAGED_AT_OFFSET, which Submit posts as it posts BUFFER_AT_OFFSET), which
 //    needs nothing more of the kext;
-//  - HEAP_OVER_PAGES (bit 15): the bundle makes its slabs' heaps over pages blocks of one run, its
-//    superpages (HEAP_OVER_PAGES, which Submit checks names a block of the process's, as it does
+//  - HEAP_OVER_PAGES (bit 15): the bundle makes its slabs' heaps over pages blocks of its own pages
+//    (HEAP_OVER_PAGES, which Submit checks names a block of the process's, as it does
 //    BUFFER_OVER_PAGES);
 //  - SUBMIT_ROOM (bit 16): a post that finds a submission ring full sets the ring's
 //    producer_waiting and waits for the host's SUBMIT_ROOM record: the framebuffer's on ring 0,
@@ -66,7 +66,85 @@
 //  - SHARED_EVENT_NAMES (bit 26): a process hands its shared event to another through a port of
 //    the kext's (RgfxSharedEventUserClient.hpp), for which the kext posts SHARED_EVENT_NAME,
 //    SHARED_EVENT_IMPORT and SHARED_EVENT_UNNAME, and the bundle's events take the values other
-//    holders give them on a queue of their own.
+//    holders give them on a queue of their own;
+//  - OPENCL_MODE (bit 27): the bundle makes the GL renderer's OpenCL kernels' pipelines of OpenCL
+//    mode (RGFX_COMPUTE_PIPELINE_OPENCL_MODE), which needs nothing of the kext;
+//  - PRIVATE_RENDER_STATE (bit 28): the bundle's render pipeline creates carry their descriptors'
+//    private state (RGFX_RENDER_PIPELINE_PRIVATE_STATE), which needs nothing of the kext;
+//  - SURFACE_CACHE_REFUSED (bit 29), which a host whose GPU shares the CPU's memory offers: the
+//    kext asks the host, at a new cacheable block in place, whether its surface needs a device
+//    cache (RGFX_SURFACE_PAGES_ASK_CACHE, with the layout the bundle gives with its ask), and
+//    makes the block cached where the host answers RGFX_STATUS_CACHE, its cached blocks then kept
+//    as SURFACE_CACHE's are (RgfxSurfaceCaches.hpp);
+//  - SURFACE_DEFERRED_CARRY (bit 32), meaningful only with SURFACE_DEFERRED: the bundle lists, at
+//    its ask of a cacheable block in place, the few resident pages of its surface it finds in its
+//    mapping, and the kext defers a surface fresh but for those, carrying them in the deferral's
+//    runs once its read of the surface proves them (RgfxDeferCarry.hpp);
+//  - SCHEDULED_ASK (bit 33): a thread of the bundle's that waits for a command buffer to be
+//    scheduled (waitUntilScheduled) posts RGFX_CMD_SCHEDULED_ASK on the buffer's queue's ring,
+//    which the bundle writes itself, so it needs nothing of the kext;
+//  - PAGES_16K (bit 34), the arm64e kext alone (RGFX_GUEST_ARM64): its runs of guest RAM are whole
+//    16 KiB pages, as its kernel's pages are. A host whose page is 16 KiB shows its features over
+//    guest RAM (SURFACE_PAGES, PAGES_BUFFERS, HEAP_OVER_PAGES and those that go with them) only
+//    once the guest took it (design.md, "Negotiated features"), so the framebuffer first writes
+//    DRIVER_FEATURES_HI with it where offered (rgfxDriverFeaturesFirst), reads the offer again,
+//    and then writes both halves from that offer. The x86-64 kext never takes it, and reads the
+//    offer once, as before the bit;
+//  - DISPLAY_SCALE (bit 35): the device's DISPLAYS answer carries, after each display's record,
+//    the scale of the host screen that shows it (RgfxDisplayScale), which the framebuffer gives
+//    the OS as the display's density (RgfxDisplayIdentity.hpp: the x86-64 framebuffer's EDID and
+//    HiDPI modes, the arm64e framebuffer's DisplayAttributes and dot pitch), which needs nothing
+//    of the bundle;
+//  - TEXTURE_DID_MODIFY_DATA (bit 36): the bundle tells the host a texture's didModifyData
+//    (RGFX_CMD_TEXTURE_DID_MODIFY_DATA), whose message the kext admits as it does a Managed
+//    range's (RgfxSubmitGate.hpp), so a mipmapped texture over a buffer takes the bytes again;
+//  - DISPLAY_POWER (bit 37), the x86-64 kext alone: the framebuffer tells the host, with
+//    SET_DISPLAY_POWER, as the display's panel goes dark at the display's sleep and lights at its
+//    wake, from the display wrangler's power messages (RgfxDisplayPower.hpp), which needs nothing
+//    of the bundle; an arm64 guest has no display wrangler;
+//  - RATE_MAPS (bit 38): the bundle makes, resets and asks rasterization rate maps
+//    (RGFX_CMD_RATE_MAP_CREATE, _RESET and _QUERY), whose messages the kext admits as any create
+//    or query of the client's own objects (RgfxSubmitGate.hpp), waiting for their RATE_MAP_STATE
+//    or RATE_MAP_ANSWER, and names a map in a render pass's begin;
+//  - FUNCTION_POINTERS (bit 39): the bundle makes a compute pipeline's function handles and
+//    visible function tables (RGFX_CMD_FUNCTION_HANDLE_CREATE and _TABLE_CREATE), waiting for
+//    their FUNCTION_POINTER_STATE, and sets a table's entries (RGFX_CMD_FUNCTION_TABLE_SET,
+//    unanswered), which the kext admits as any create or write of the client's own objects
+//    (RgfxSubmitGate.hpp), and binds tables in a compute pass's ops;
+//  - DYNAMIC_LIBRARIES (bit 40): the bundle makes dynamic libraries of its libraries
+//    (RGFX_CMD_DYNAMIC_LIBRARY_CREATE), which the kext admits as any create of the client's own
+//    objects (RgfxSubmitGate.hpp), waiting for its COMPLETE, and names them at the end of a
+//    compute pipeline's create;
+//  - PIPELINE_KEYS (bit 41): the bundle asks each render and compute pipeline create's answer
+//    with its pipeline key, and the kext keeps the answers that carry one for every process
+//    (RgfxSharedPipelines.hpp), so an equal create of another process need not wait;
+//  - ICB_SLOTS_IN_PAGES (bit 42): the bundle writes an indirect command buffer's slots in a
+//    chunked pages block of the kext's (PagesChunked), cached memory of the process's own, and
+//    names them in RGFX_CMD_ICB_SLOTS_IN_PAGES, which the kext admits as it does ICB_SLOTS, a
+//    write into the client's own objects (RgfxSubmitGate.hpp);
+//  - DOORBELL_ASKS (bit 43): the bundle rings a queue's doorbell for a command buffer that asks
+//    for its CB_SUBMITTED with the ring's id and RGFX_DOORBELL_ASKS, and for anything else with
+//    the id alone (RgfxRingWriter::setDoorbellAsks), so the host may take the plain ones with no
+//    exit to its process; the kext writes what the bundle hands its doorbell call, so it needs
+//    nothing of the kext;
+//  - GUEST_TIMES (bit 44), meaningful only with HOST_TIME: the bundle starts each command buffer's
+//    stream with RGFX_OP_GUEST_TIMES, the guest's clock as the buffer was made, committed and put
+//    on its ring, and the framebuffer writes, after each VBLANK's reading of the host's clock, the
+//    reading's offset and bound in ring 0's header (RgfxVblankClock::offsetAt), for the host to
+//    split the time before it takes each buffer: a diagnostic;
+//  - READ_ONLY_PAGES (bit 45), meaningful only with PAGES_BUFFERS: the kext makes pages blocks of
+//    memory the process maps read-only too, wired for reading alone and marked so in their
+//    SURFACE_PAGES (RGFX_SURFACE_PAGES_READ_ONLY, rgfxPagesWiring), for the host to keep every
+//    object over them from writing their pages, and the bundle lays its no-copy buffers over
+//    read-only memory there with MTLResourceOptions bit 24, whose GPU writes the host drops;
+//  - DOORBELL_PAGES (bit 46): the accelerator binds a doorbell page of BAR 4 to each context it
+//    opens for a bundle that asks for one (RgfxDoorbellPages.hpp) and maps it into the context's
+//    process, where the bundle writes its queues' ring ids with no call into the kext, and the
+//    kext's own publish of a queue's ring (RgfxQueuePublish.hpp) rings there too;
+//  - PIPELINE_ANSWERS (bit 47), meaningful only with PIPELINE_KEYS: the framebuffer's start
+//    seeds the answers it keeps for every process (RgfxSharedPipelines.hpp) with those the device
+//    kept of keyed creates of its earlier runs (RGFX_CMD_PIPELINE_ANSWERS), so a create of a key
+//    an earlier boot made need not wait either.
 //
 // The accelerator answers the bundle's Features call with the feature word (rgfxFeatureWord), and
 // grants a queue's flags (kRgfxAccelMethodQueueCreate's seventh input) only where their feature
@@ -82,6 +160,10 @@
 
 #include "reims_graphics_wire.h"
 
+#ifndef RGFX_GUEST_ARM64
+#define RGFX_GUEST_ARM64 0
+#endif
+
 // The bits the host acts on as it offers them, with no write: bits 0 to 2.
 constexpr uint64_t kRgfxOfferedFeatures =
     RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_CB_SUBMITTED;
@@ -95,12 +177,28 @@ constexpr uint64_t kRgfxCarriedFeatures =
     RGFX_FEATURE_ICB_SLOTS | RGFX_FEATURE_COMMIT_ORDER | RGFX_FEATURE_SURFACE_DEFERRED |
     RGFX_FEATURE_HOST_TIME | RGFX_FEATURE_MANAGED_TEXTURE_SLABS |
     RGFX_FEATURE_MANAGED_BUFFER_SLABS | RGFX_FEATURE_SMALL_ID_CHUNKS | RGFX_FEATURE_DISPLAY_COLOR |
-    RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES;
+    RGFX_FEATURE_MESH_PIPELINES | RGFX_FEATURE_SHARED_EVENT_NAMES | RGFX_FEATURE_OPENCL_MODE |
+    RGFX_FEATURE_PRIVATE_RENDER_STATE | RGFX_FEATURE_SURFACE_CACHE_REFUSED |
+    RGFX_FEATURE_SURFACE_DEFERRED_ASK | RGFX_FEATURE_SURFACE_DEFERRED_CARRY |
+    RGFX_FEATURE_SCHEDULED_ASK | RGFX_FEATURE_DISPLAY_SCALE |
+    RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA | RGFX_FEATURE_RATE_MAPS |
+    RGFX_FEATURE_FUNCTION_POINTERS | RGFX_FEATURE_DYNAMIC_LIBRARIES | RGFX_FEATURE_PIPELINE_KEYS |
+    RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_DOORBELL_ASKS | RGFX_FEATURE_GUEST_TIMES |
+    RGFX_FEATURE_READ_ONLY_PAGES | RGFX_FEATURE_DOORBELL_PAGES | RGFX_FEATURE_PIPELINE_ANSWERS |
+    (RGFX_GUEST_ARM64 ? RGFX_FEATURE_PAGES_16K : RGFX_FEATURE_DISPLAY_POWER);
 
 // What the framebuffer writes to DRIVER_FEATURES, given the host's offer.
 inline uint64_t rgfxDriverFeatures(uint64_t offered)
 {
 	return offered & kRgfxCarriedFeatures;
+}
+
+// What the framebuffer writes to DRIVER_FEATURES_HI before it reads the offer again, given the
+// host's first offer: PAGES_16K where the kext carries it (the arm64e kext) and the host offers
+// it, else nothing, and the offer is read once.
+inline uint64_t rgfxDriverFeaturesFirst(uint64_t offered)
+{
+	return offered & kRgfxCarriedFeatures & RGFX_FEATURE_PAGES_16K;
 }
 
 // The feature word the bundle works by: bits 0 to 2 as offered, and from bit 3 the ones the host

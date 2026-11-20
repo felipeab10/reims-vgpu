@@ -1,10 +1,16 @@
 // What the kext's user clients answer, word for word, built natively: the display pipe's VBL and
-// completion notifications (RgfxPipeNotifications.hpp), the replies to the IOGPU base's device
+// completion notifications and the completions' count (RgfxPipeNotifications.hpp), the replies to the IOGPU base's device
 // calls and which calls it answers (RgfxIOGPUReplies.hpp), and the user-client protocol the
-// bundle shares (RgfxUserClientABI.hpp): its type, its context selectors without a gap, and the
-// features call with the kext's own feature bits.
+// bundle shares (RgfxUserClientABI.hpp): its type, its selectors, each a number every WebKit
+// web-content sandbox allows, the bundle's calls of them, and the features call with the kext's
+// own feature bits.
+#include <cctype>
 #include <cstdio>
 #include <cstring>
+#include <dirent.h>
+#include <fstream>
+#include <iterator>
+#include <string>
 
 #include "RgfxIOGPUReplies.hpp"
 #include "RgfxPipeNotifications.hpp"
@@ -43,23 +49,41 @@ static void vbl()
 	CHECK(w[6] == 0xa5a5a5a5a5a5a5a5); // nothing past the answer
 }
 
-// A completion: every one of its words written, the cookie, the id in word 1's high half, the
-// time and the action, the rest 0.
+// A completion of each count: every one of its words written, the cookie, the id in word 1's
+// high half, the time and, from nine words, the action, the rest 0, and nothing past its count.
 static void completion()
 {
-	uint64_t w[kRgfxPipeCompletionWords + 1];
-	for (uint64_t &x : w)
-		x = 0xa5a5a5a5a5a5a5a5;
-	rgfxPipeCompletionWords(w, 0x6000002de3a0, 4461, 0x0000001234567890);
-	CHECK(kRgfxPipeCompletionWords == 11);
-	CHECK(w[0] == 0x6000002de3a0);
-	CHECK(w[1] == (uint64_t(4461) << 32));
-	CHECK(w[3] == 0x0000001234567890);
-	CHECK(w[8] == 1);
-	const int zero[] = {2, 4, 5, 6, 7, 9, 10};
-	for (int i : zero)
-		CHECK(w[i] == 0);
-	CHECK(w[11] == 0xa5a5a5a5a5a5a5a5);
+	CHECK(kRgfxPipeCompletionWordsMax == 11);
+	const uint32_t counts[] = {8, 9, 11};
+	for (uint32_t count : counts) {
+		uint64_t w[kRgfxPipeCompletionWordsMax + 1];
+		for (uint64_t &x : w)
+			x = 0xa5a5a5a5a5a5a5a5;
+		rgfxPipeCompletionWords(w, count, 0x6000002de3a0, 4461, 0x0000001234567890);
+		CHECK(w[0] == 0x6000002de3a0);
+		CHECK(w[1] == (uint64_t(4461) << 32));
+		CHECK(w[3] == 0x0000001234567890);
+		const uint32_t zero[] = {2, 4, 5, 6, 7, 9, 10};
+		for (uint32_t i : zero)
+			if (i < count)
+				CHECK(w[i] == 0);
+		if (count > 8)
+			CHECK(w[8] == 1);
+		for (uint32_t i = count; i <= kRgfxPipeCompletionWordsMax; i++)
+			CHECK(w[i] == 0xa5a5a5a5a5a5a5a5);
+	}
+}
+
+// The count a client's completions take: 8 after a 0x108-byte transaction (macOS 11), and after a
+// 0x118-byte one, 11 where the family exports the assigned length (macOS 13 on) and 9 where it
+// does not (macOS 12).
+static void completionCount()
+{
+	CHECK(kRgfxPipeTransactionBytes == 0x118 && kRgfxPipeTransactionBytesShort == 0x108);
+	CHECK(rgfxPipeCompletionCount(0x108, false) == 8);
+	CHECK(rgfxPipeCompletionCount(0x108, true) == 8);
+	CHECK(rgfxPipeCompletionCount(0x118, false) == 9);
+	CHECK(rgfxPipeCompletionCount(0x118, true) == 11);
 }
 
 // The IOGPU base's two device calls are answered at their exact shapes only, and the replies
@@ -96,45 +120,182 @@ static void iogpu()
 	CHECK(reply[kRgfxIOGPUDeviceInfoSize] == 0xa5);
 }
 
-// The protocol both sides build from: 'RGFX', the doorbell below the context selectors, and
-// those from the first to the last with no gap, the range the kext routes to its context.
+// Every selector of ours, by its name in RgfxUserClientABI.hpp, and the client type it is
+// called on: the bundle names them so, and the source check below finds them by name.
+struct Selector {
+	const char *name;
+	unsigned number;
+	bool port; // on a shared event's port ('RGSE'), else on the accelerator's 'RGFX' client
+};
+static const Selector kSelectors[] = {
+	{"kRgfxAccelMethodDoorbell", kRgfxAccelMethodDoorbell, false},
+	{"kRgfxAccelMethodFeatures", kRgfxAccelMethodFeatures, false},
+	{"kRgfxAccelMethodPagesBlock", kRgfxAccelMethodPagesBlock, false},
+	{"kRgfxAccelMethodSubmitBatch", kRgfxAccelMethodSubmitBatch, false},
+	{"kRgfxAccelMethodPagesChunked", kRgfxAccelMethodPagesChunked, false},
+	{"kRgfxAccelMethodSurfaceSeeds", kRgfxAccelMethodSurfaceSeeds, false},
+	{"kRgfxAccelMethodTakeAnswers", kRgfxAccelMethodTakeAnswers, false},
+	{"kRgfxAccelMethodSurfaceBlockRelease", kRgfxAccelMethodSurfaceBlockRelease, false},
+	{"kRgfxAccelMethodSurfaceRetire", kRgfxAccelMethodSurfaceRetire, false},
+	{"kRgfxAccelMethodOpenContext", kRgfxAccelMethodOpenContext, false},
+	{"kRgfxAccelMethodAlloc", kRgfxAccelMethodAlloc, false},
+	{"kRgfxAccelMethodFree", kRgfxAccelMethodFree, false},
+	{"kRgfxAccelMethodQueueCreate", kRgfxAccelMethodQueueCreate, false},
+	{"kRgfxAccelMethodQueueDestroy", kRgfxAccelMethodQueueDestroy, false},
+	{"kRgfxAccelMethodSubmit", kRgfxAccelMethodSubmit, false},
+	{"kRgfxAccelMethodResourceIds", kRgfxAccelMethodResourceIds, false},
+	{"kRgfxAccelMethodWaitCompletions", kRgfxAccelMethodWaitCompletions, false},
+	{"kRgfxAccelMethodSurfaceScanout", kRgfxAccelMethodSurfaceScanout, false},
+	{"kRgfxAccelMethodSurfaceBlock", kRgfxAccelMethodSurfaceBlock, false},
+	{"kRgfxAccelMethodDeviceInfo", kRgfxAccelMethodDeviceInfo, false},
+	{"kRgfxAccelMethodSurfaceWrites", kRgfxAccelMethodSurfaceWrites, false},
+	{"kRgfxSharedEventMethodExport", kRgfxSharedEventMethodExport, true},
+	{"kRgfxSharedEventMethodImport", kRgfxSharedEventMethodImport, true},
+};
+static const unsigned kSelectorCount = sizeof(kSelectors) / sizeof(kSelectors[0]);
+// The numbers kept for calls not yet carried out: Consumed and WakeCompletions.
+static const unsigned kKept[] = {1, 6};
+
+// The external-method numbers every WebKit web-content sandbox lets its process call on an
+// IOAccelerator connection, on every release from macOS 11 to 26. WebKit's web-content profile
+// (com.apple.WebProcess.sb, its IOAcceleratorMessageFilter) lists numbers on macOS 12 alone, and
+// refuses any other there before the kext sees it: these are the ones every list from Safari 15.1
+// (WebKit 612.2) to 17.6 (WebKit 7618.3) holds, read from WebKit's source at each release branch
+// and on a macOS 12.7.6 guest (Safari 17.6's, which adds 41, 43, 46, 49, 266, 269 and 513). On
+// macOS 11 (Safari 14 to 16) and from 13 on it lists none, allowing every number; from Safari 18.4
+// (WebKit 7622) on, no release lists any. Its asynchronous methods (0 and 47) and traps the bundle
+// makes none of.
+static bool sandboxAllows(unsigned n)
+{
+	static const unsigned kAllowed[] = {0,   1,   2,   3,   4,   5,   6,   7,   8,   9,   10,
+	                                    11,  12,  13,  15,  16,  17,  18,  22,  23,  24,  28,
+	                                    29,  30,  31,  40,  42,  48,  256, 257, 258, 259, 260,
+	                                    261, 262, 263, 264, 265, 267, 268, 512};
+	for (unsigned a : kAllowed)
+		if (a == n)
+			return true;
+	return false;
+}
+
+// The protocol both sides build from: 'RGFX'; every selector, and every number kept, in the
+// sandbox's numbers; no two of a client's selectors, or of the numbers kept, alike; and the kext's
+// routing: every selector of 'RGFX' but the doorbell goes to its context methods, and no number
+// kept, no port selector and no number of the map before this one (0x10a, 0x10d to 0x114, which
+// a bundle of that map may still call) does.
 static void protocol()
 {
 	CHECK(kRgfxAccelUserClientType == 0x52474658);
 	CHECK(kRgfxAccelMethodDoorbell == 0);
-	const unsigned context[] = {
-		kRgfxAccelMethodOpenContext,
-		kRgfxAccelMethodAlloc,
-		kRgfxAccelMethodFree,
-		kRgfxAccelMethodQueueCreate,
-		kRgfxAccelMethodQueueDestroy,
-		kRgfxAccelMethodSubmit,
-		kRgfxAccelMethodResourceIds,
-		kRgfxAccelMethodWaitCompletions,
-		kRgfxAccelMethodSurfaceScanout,
-		kRgfxAccelMethodSurfaceBlock,
-		kRgfxAccelMethodSurfaceBlockRelease,
-		kRgfxAccelMethodDeviceInfo,
-		kRgfxAccelMethodSurfaceWrites,
-		kRgfxAccelMethodSurfaceRetire,
-		kRgfxAccelMethodPagesBlock,
-	};
-	CHECK(context[0] == kRgfxAccelMethodContextFirst && context[0] == 0x100);
-	for (unsigned i = 1; i < sizeof(context) / sizeof(context[0]); i++)
-		CHECK(context[i] == context[i - 1] + 1);
-	CHECK(context[sizeof(context) / sizeof(context[0]) - 1] == kRgfxAccelMethodContextLast);
+	CHECK(kRgfxSelectorMap == 1);
+	for (unsigned i = 0; i < kSelectorCount; i++) {
+		const Selector &s = kSelectors[i];
+		if (!sandboxAllows(s.number))
+			std::fprintf(stderr, "%s, %u, is not a number the sandbox allows\n", s.name,
+			             s.number);
+		CHECK(sandboxAllows(s.number));
+		CHECK(rgfxAccelContextSelector(s.number) ==
+		      (!s.port && s.number != kRgfxAccelMethodDoorbell));
+		for (unsigned j = 0; j < i; j++)
+			CHECK(kSelectors[j].number != s.number);
+		for (unsigned k : kKept)
+			CHECK(k != s.number);
+	}
+	for (unsigned k : kKept) {
+		CHECK(sandboxAllows(k));
+		CHECK(!rgfxAccelContextSelector(k));
+	}
+	CHECK(!rgfxAccelContextSelector(2));
+	for (unsigned n : {0x10au, 0x10du, 0x10eu, 0x10fu, 0x110u, 0x111u, 0x112u, 0x113u, 0x114u})
+		CHECK(!rgfxAccelContextSelector(n));
 	CHECK(kRgfxSurfaceCpuGenOffset == 16);
 	CHECK(kRgfxSurfaceClientsOffset == 12);
 }
 
+// Every IOKit call the bundle's sources make names a selector of the table above, so that each
+// lies in the sandbox's numbers: the second argument of each IOConnectCall*Method, by name. A
+// literal number, or a name the table lacks, fails here. The bundle makes no asynchronous call and
+// no trap. Run from guest/kext, as `make test` runs it.
+static std::string secondArgument(const std::string &text, size_t open)
+{
+	int depth = 0;
+	size_t i = open, from = std::string::npos;
+	for (; i < text.size(); i++) {
+		const char c = text[i];
+		if (c == '(' || c == '[' || c == '{')
+			depth++;
+		else if (c == ')' || c == ']' || c == '}') {
+			if (--depth == 0)
+				break;
+		} else if (c == ',' && depth == 1) {
+			if (from != std::string::npos)
+				break;
+			from = i + 1;
+		}
+	}
+	if (from == std::string::npos)
+		return "";
+	std::string arg = text.substr(from, i - from);
+	const size_t a = arg.find_first_not_of(" \t\n");
+	const size_t b = arg.find_last_not_of(" \t\n");
+	return a == std::string::npos ? "" : arg.substr(a, b - a + 1);
+}
+
+static void bundleCalls()
+{
+	const char *dir = "../bundle/src";
+	DIR *d = opendir(dir);
+	CHECK(d != nullptr);
+	if (!d)
+		return;
+	unsigned calls = 0;
+	while (struct dirent *e = readdir(d)) {
+		const std::string name = e->d_name;
+		const size_t dot = name.rfind('.');
+		const std::string ext = dot == std::string::npos ? "" : name.substr(dot);
+		if (ext != ".mm" && ext != ".cpp" && ext != ".hpp" && ext != ".h" && ext != ".m")
+			continue;
+		std::ifstream in(std::string(dir) + "/" + name);
+		const std::string text((std::istreambuf_iterator<char>(in)),
+		                       std::istreambuf_iterator<char>());
+		for (const char *banned : {"IOConnectCallAsync", "IOConnectTrap"}) {
+			if (text.find(banned) != std::string::npos)
+				std::fprintf(stderr, "%s: calls %s\n", name.c_str(), banned);
+			CHECK(text.find(banned) == std::string::npos);
+		}
+		for (size_t at = text.find("IOConnectCall"); at != std::string::npos;
+		     at = text.find("IOConnectCall", at + 1)) {
+			size_t end = at;
+			while (end < text.size() && (std::isalnum(static_cast<unsigned char>(text[end])) ||
+			                             text[end] == '_'))
+				end++;
+			const std::string fn = text.substr(at, end - at);
+			const size_t open = text.find_first_not_of(" \t\n", end);
+			if (fn.size() < 6 || fn.compare(fn.size() - 6, 6, "Method") != 0 ||
+			    open == std::string::npos || text[open] != '(')
+				continue;
+			const std::string selector = secondArgument(text, open);
+			bool known = false;
+			for (const Selector &s : kSelectors)
+				known = known || selector == s.name;
+			if (!known)
+				std::fprintf(stderr, "%s: %s calls selector '%s', which is not one of ours\n",
+				             name.c_str(), fn.c_str(), selector.c_str());
+			CHECK(known);
+			calls++;
+		}
+	}
+	closedir(d);
+	// The device's setup, its blocks, queues, submits and shared events: tens of calls.
+	CHECK(calls >= 20);
+}
+
 // The features call and the kext's own feature bits, as design.md's registry gives them out:
-// Features at 0x10f, past PagesBlock at 0x10e, and one bit for each call or flag a kext may lack,
-// none shared.
+// Features at 3, answered by every map at that number, and one bit for each call or flag a kext
+// may lack, none shared.
 static void features()
 {
-	CHECK(kRgfxAccelMethodPagesBlock == 0x10e);
-	CHECK(kRgfxAccelMethodFeatures == 0x10f);
-	CHECK(kRgfxAccelMethodFeatures == kRgfxAccelMethodContextLast + 1);
+	CHECK(kRgfxAccelMethodFeatures == 3);
+	CHECK(kRgfxAccelMethodPagesBlock == 4);
 	const uint64_t bits[] = {
 		kRgfxKextFeaturePagesBlock,
 		kRgfxKextFeatureSubmitBatch,
@@ -143,27 +304,46 @@ static void features()
 		kRgfxKextFeatureDeferredAnswers,
 		kRgfxKextFeatureContextSpan,
 		kRgfxKextFeatureSharedEvents,
+		kRgfxKextFeatureWriteCombined,
+		kRgfxKextFeaturePagesChunked,
+		kRgfxKextFeatureSharedPipelines,
+		kRgfxKextFeatureSurfaceSeeds,
+		kRgfxKextFeatureQueuePublish,
+		kRgfxKextFeatureDoorbellPage,
 	};
 	for (unsigned i = 0; i < sizeof(bits) / sizeof(bits[0]); i++)
 		CHECK(bits[i] == uint64_t(1) << i);
-	// TakeAnswers past the numbers SubmitBatch and WakeCompletions keep, and Submit's one flag.
-	CHECK(kRgfxAccelMethodTakeAnswers == 0x112);
-	CHECK(kRgfxAccelMethodTakeAnswers == kRgfxAccelMethodFeatures + 3);
+	// SubmitBatch at the number design.md's registry kept for it, its struct in an inline one;
+	// TakeAnswers past it and the number WakeCompletions keeps, and Submit's flags: a shared
+	// create's key takes four scalars after them.
+	CHECK(kRgfxAccelMethodSubmitBatch == 5);
+	CHECK(kRgfxSubmitBatchBytes == 4096);
+	CHECK(kRgfxAccelMethodTakeAnswers == 7);
 	CHECK(kRgfxSubmitDeferred == 1);
-	// A shared event's port: 'RGSE', its two selectors past TakeAnswers, so a call on a
-	// connection of another type finds no selector of the accelerator's of that number.
+	CHECK(kRgfxSubmitShared == 2);
+	CHECK(kRgfxSubmitKeyWords * sizeof(uint64_t) == 32);
+	CHECK(kRgfxAccelMethodSurfaceBlockRelease == 8);
+	CHECK(kRgfxAccelMethodSurfaceRetire == 9);
+	// A shared event's port: 'RGSE', its two selectors past the accelerator's low ones, so a call
+	// on a connection of another type finds no selector of the accelerator's of that number.
 	CHECK(kRgfxSharedEventUserClientType == 0x52475345);
-	CHECK(kRgfxSharedEventMethodExport == 0x113);
-	CHECK(kRgfxSharedEventMethodImport == 0x114);
-	CHECK(kRgfxSharedEventMethodExport == kRgfxAccelMethodTakeAnswers + 1);
+	CHECK(kRgfxSharedEventMethodExport == 10);
+	CHECK(kRgfxSharedEventMethodImport == 11);
+	// The chunked pages block past the port's numbers, its chunk 64 KiB.
+	CHECK(kRgfxAccelMethodPagesChunked == 12);
+	CHECK(kRgfxPagesChunk == 0x10000 && kRgfxPagesChunkedMaxBytes % kRgfxPagesChunk == 0);
+	// A surface's seeds at the last of the low numbers.
+	CHECK(kRgfxAccelMethodSurfaceSeeds == 13);
 }
 
 int main()
 {
 	vbl();
 	completion();
+	completionCount();
 	iogpu();
 	protocol();
+	bundleCalls();
 	features();
 	if (g_failed) {
 		std::fprintf(stderr, "user_client_words_test: %d of %d checks failed\n", g_failed,

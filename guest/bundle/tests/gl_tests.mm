@@ -1,0 +1,1749 @@
+// The GL functions' checks (tests/shell_tests.mm's main calls rgfxGLTests()):
+//   - the .metallib writer (src/RgfxMetallibWriter.*): each function of the library Apple's Metal
+//     compiler builds from tests/air_arguments.metal (RGFX_AIR_ARGUMENTS), written again from its
+//     bitcode, is a library this Mac's Metal loads, with the one function of that name and stage,
+//     whose bitcode the bundle's reader finds as it was and reads to the same entry points; its
+//     header, tags and hash are the layout's; the same function gives the same bytes; the bitcode
+//     unwrapper takes LLVM's wrapper off, and leaves other bytes as they are; all of them written
+//     into one library are what this Mac's Metal loads too, each in its place as `metal` places a
+//     library's functions;
+//   - the .metallib of the kernels in the container Metal's compiler answers for OpenCL C source,
+//     over a container written here in the measured layout from that library's kernels, and over
+//     this Mac's own where its Metal compiles OpenCL C; other bytes, and a container that does not
+//     read whole, give none;
+//   - a function of GL IR (src/RgfxGLFunction.*): what it answers, as Metal's own function of GL IR
+//     does (measured: macOS 26.7.1), the IR it keeps, and the variants' return data;
+//   - the pipeline reflection (src/RgfxPipelineReflection.mm): a GL variant's return data is what
+//     the render reflection answers for its stage;
+//   - the stage metadata's normalization (src/RgfxGLLowering.*), over modules' text written here
+//     in the generator's shape: an integer user() varying named unsigned, a node without a type
+//     name given its signature's name and a name, and every other line as it was;
+//   - a tessellated draw's kernel made one under a stage input descriptor (src/RgfxGLLowering.*),
+//     over kernels' text written here in the generator's shape, and on this Mac's GPU against its
+//     own [[stage_in]] kernels (tests/stage_in_oracle.metal), bit for bit, for every format.
+// A variant is not lowered here: the GL code generator lowers the IR the renderer gives a device,
+// which only a GL context makes; tools/gl_probe.m, tools/gl_inject.mm and tools/gl_cases.m check
+// that on a device.
+#import <Foundation/Foundation.h>
+#import <Metal/Metal.h>
+#include <objc/message.h>
+#include <objc/runtime.h>
+
+#include <CommonCrypto/CommonDigest.h>
+
+#include <cstdint>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <fstream>
+#include <iterator>
+#include <string>
+#include <vector>
+
+#import "RgfxGLFunction.h"
+#import "RgfxUnsupported.h"
+#import "RgfxLibrary.h"
+#import "RgfxPipelineReflection.h"
+
+#include "RgfxAirArguments.hpp"
+#include "RgfxGLLowering.hpp"
+#include "RgfxLibraryKey.hpp"
+#include "RgfxMetallibWriter.hpp"
+#include "rgfx_test_ring.hpp" // CHECK, g_checks
+#include "RgfxSerializer.hpp"
+
+void drainRing(TestRing &ring); // shell_tests.mm
+
+// The library's reader of an entry point's arguments (RgfxLibrary.mm), as shell_tests.mm names it.
+@interface RgfxLibrary (GLTestsAirReads)
+- (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name;
+@end
+
+// A function's reflection by itself, Metal's MTLFunction SPI (RgfxFunction.mm).
+@protocol RgfxGLTestsFunctionReflection
+- (id)reflectionWithOptions:(NSUInteger)options;
+@end
+
+void rgfxGLTests();
+
+namespace {
+
+uint64_t le64(const uint8_t *p)
+{
+	uint64_t v = 0;
+	std::memcpy(&v, p, sizeof v);
+	return v;
+}
+
+uint32_t le32(const uint8_t *p)
+{
+	uint32_t v = 0;
+	std::memcpy(&v, p, sizeof v);
+	return v;
+}
+
+// One function of a .metallib's list: its tags' data by name.
+struct Listed {
+	std::string name;
+	uint8_t type = 0xff;
+	std::vector<uint8_t> vers, hash, offt, mdsz;
+};
+
+std::vector<Listed> functionsOf(const std::vector<uint8_t> &lib)
+{
+	std::vector<Listed> out;
+	if (lib.size() < 0x58 || std::memcmp(lib.data(), "MTLB", 4) != 0)
+		return out;
+	const uint8_t *p = lib.data();
+	const uint64_t list = le64(p + 0x18);
+	const uint32_t count = le32(p + list);
+	uint64_t q = list + 4;
+	for (uint32_t i = 0; i < count; i++) {
+		const uint32_t group = le32(p + q);
+		Listed f;
+		for (uint64_t t = q + 4; t + 6 <= q + group && std::memcmp(p + t, "ENDT", 4) != 0;) {
+			const uint16_t n = static_cast<uint16_t>(p[t + 4] | p[t + 5] << 8);
+			const uint8_t *d = p + t + 6;
+			if (std::memcmp(p + t, "NAME", 4) == 0)
+				f.name.assign(reinterpret_cast<const char *>(d), strnlen(reinterpret_cast<const char *>(d), n));
+			else if (std::memcmp(p + t, "TYPE", 4) == 0)
+				f.type = d[0];
+			else if (std::memcmp(p + t, "VERS", 4) == 0)
+				f.vers.assign(d, d + n);
+			else if (std::memcmp(p + t, "HASH", 4) == 0)
+				f.hash.assign(d, d + n);
+			else if (std::memcmp(p + t, "OFFT", 4) == 0)
+				f.offt.assign(d, d + n);
+			else if (std::memcmp(p + t, "MDSZ", 4) == 0)
+				f.mdsz.assign(d, d + n);
+			t += 6 + n;
+		}
+		out.push_back(f);
+		q += group;
+	}
+	return out;
+}
+
+std::vector<uint8_t> readFile(const char *path)
+{
+	std::ifstream f(path, std::ios::binary);
+	return std::vector<uint8_t>(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
+}
+
+MTLFunctionType metalTypeOf(uint8_t type)
+{
+	return type == 0 ? MTLFunctionTypeVertex : type == 1 ? MTLFunctionTypeFragment : MTLFunctionTypeKernel;
+}
+
+void test_metallib_writer()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	const std::vector<uint8_t> lib = readFile(path);
+	const std::vector<Listed> listed = functionsOf(lib);
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	size_t written = 0;
+	for (const Listed &f : listed) {
+		// Its stages only: a stitchable or visible function's TYPE is none of the three.
+		if (f.type > 2)
+			continue;
+		const uint8_t *slice = nullptr;
+		size_t sliceSize = 0;
+		CHECK(rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &slice, &sliceSize));
+		size_t bcSize = sliceSize;
+		const uint8_t *bc = RgfxUnwrapBitcode(slice, &bcSize);
+		CHECK(bc != slice && bcSize < sliceSize);
+		RgfxMetallibFunction w;
+		w.name = f.name;
+		w.stage = static_cast<RgfxMetallibStage>(f.type);
+		CHECK(f.vers.size() == 8);
+		std::memcpy(&w.airMajor, f.vers.data(), 2);
+		std::memcpy(&w.airMinor, f.vers.data() + 2, 2);
+		std::memcpy(&w.languageMajor, f.vers.data() + 4, 2);
+		std::memcpy(&w.languageMinor, f.vers.data() + 6, 2);
+		w.bitcode = bc;
+		w.bitcodeLength = bcSize;
+		const std::vector<uint8_t> out = RgfxWriteMetallib(w);
+		CHECK(RgfxWriteMetallib(w) == out);
+
+		// The header: its size, the list after it, the section at its end, 16-byte padded.
+		CHECK(le64(out.data() + 0x10) == out.size());
+		CHECK(le64(out.data() + 0x18) == 0x58);
+		const uint64_t section = le64(out.data() + 0x48), sectionSize = le64(out.data() + 0x50);
+		CHECK(section + sectionSize == out.size() && sectionSize % 16 == 0);
+		const std::vector<Listed> back = functionsOf(out);
+		CHECK(back.size() == 1);
+		if (back.size() != 1)
+			continue;
+		CHECK(back[0].name == f.name && back[0].type == f.type && back[0].vers == f.vers);
+		uint8_t hash[CC_SHA256_DIGEST_LENGTH];
+		CC_SHA256(out.data() + section, static_cast<CC_LONG>(sectionSize), hash);
+		CHECK(back[0].hash == std::vector<uint8_t>(hash, hash + sizeof hash));
+		CHECK(back[0].offt == std::vector<uint8_t>(24, 0));
+		CHECK(back[0].mdsz.size() == 8 && le64(back[0].mdsz.data()) == sectionSize);
+		uint8_t key[32];
+		CHECK(rgfxLibraryKey(out.data(), out.size(), key));
+
+		// The bundle's reader finds the same bitcode and reads the same entry points from it.
+		const uint8_t *again = nullptr;
+		size_t againSize = 0;
+		CHECK(rgfxMetallibBitcode(out.data(), out.size(), f.name, &again, &againSize));
+		size_t inner = againSize;
+		const uint8_t *innerAt = RgfxUnwrapBitcode(again, &inner);
+		CHECK(inner == bcSize && std::memcmp(innerAt, bc, bcSize) == 0);
+		std::vector<RgfxAirFunction> was, now;
+		const bool read = rgfxReadAirFunctions(slice, sliceSize, was);
+		CHECK(rgfxReadAirFunctions(again, againSize, now) == read);
+		CHECK(was.size() == now.size());
+		for (size_t i = 0; i < was.size() && i < now.size(); i++)
+			CHECK(was[i].name == now[i].name && was[i].arguments.size() == now[i].arguments.size());
+
+		// This Mac's Metal loads it: one function, of the name and the stage.
+		NSData *bytes = [NSData dataWithBytes:out.data() length:out.size()];
+		dispatch_data_t data = dispatch_data_create(bytes.bytes, bytes.length, nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+		NSError *error = nil;
+		id<MTLLibrary> loaded = [metal newLibraryWithData:data error:&error];
+		if (loaded == nil)
+			fprintf(stderr, "gl_tests: %s: %s\n", f.name.c_str(), error.localizedDescription.UTF8String);
+		CHECK(loaded != nil);
+		CHECK([loaded.functionNames isEqualToArray:@[ @(f.name.c_str()) ]]);
+		id<MTLFunction> fn = [loaded newFunctionWithName:@(f.name.c_str())];
+		CHECK(fn != nil && fn.functionType == metalTypeOf(f.type));
+		written++;
+	}
+	CHECK(written >= 8);
+
+	// The unwrapper: bytes with no wrapper, or a wrapper naming bytes past its buffer, stay.
+	const uint8_t raw[24] = {'B', 'C', 0xc0, 0xde};
+	size_t n = sizeof raw;
+	CHECK(RgfxUnwrapBitcode(raw, &n) == raw && n == sizeof raw);
+	uint8_t wrapped[40] = {};
+	const uint32_t header[5] = {0x0B17C0DE, 0, 20, 30, 0xffffffffu};
+	std::memcpy(wrapped, header, sizeof header);
+	n = sizeof wrapped;
+	CHECK(RgfxUnwrapBitcode(wrapped, &n) == wrapped && n == sizeof wrapped);
+	const uint32_t fits[5] = {0x0B17C0DE, 0, 20, 12, 0xffffffffu};
+	std::memcpy(wrapped, fits, sizeof fits);
+	n = sizeof wrapped;
+	CHECK(RgfxUnwrapBitcode(wrapped, &n) == wrapped + 20 && n == 12);
+	n = 8;
+	CHECK(RgfxUnwrapBitcode(wrapped, &n) == wrapped && n == 8);
+}
+
+// The stage functions of the RGFX_AIR_ARGUMENTS library, their bitcode unwrapped, as
+// RgfxWriteMetallib takes them; `lib` holds the bytes they point into.
+std::vector<RgfxMetallibFunction> stageFunctions(const std::vector<uint8_t> &lib)
+{
+	std::vector<RgfxMetallibFunction> out;
+	for (const Listed &f : functionsOf(lib)) {
+		const uint8_t *slice = nullptr;
+		size_t sliceSize = 0;
+		if (f.type > 2 || f.vers.size() != 8 ||
+		    !rgfxMetallibBitcode(lib.data(), lib.size(), f.name, &slice, &sliceSize))
+			continue;
+		RgfxMetallibFunction w;
+		w.name = f.name;
+		w.stage = static_cast<RgfxMetallibStage>(f.type);
+		std::memcpy(&w.airMajor, f.vers.data(), 2);
+		std::memcpy(&w.airMinor, f.vers.data() + 2, 2);
+		std::memcpy(&w.languageMajor, f.vers.data() + 4, 2);
+		std::memcpy(&w.languageMinor, f.vers.data() + 6, 2);
+		size_t n = sliceSize;
+		w.bitcode = RgfxUnwrapBitcode(slice, &n);
+		w.bitcodeLength = n;
+		out.push_back(w);
+	}
+	return out;
+}
+
+// What this Mac's Metal makes of `out`: its function names, sorted, with each one's type checked
+// against `fs`; empty where it does not load.
+NSArray<NSString *> *metalLoads(id<MTLDevice> metal, const std::vector<uint8_t> &out,
+                                const std::vector<RgfxMetallibFunction> &fs)
+{
+	dispatch_data_t data = dispatch_data_create(out.data(), out.size(), nullptr, DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	NSError *error = nil;
+	id<MTLLibrary> loaded = [metal newLibraryWithData:data error:&error];
+	if (loaded == nil) {
+		fprintf(stderr, "gl_tests: %s\n", error.localizedDescription.UTF8String);
+		return @[];
+	}
+	for (const RgfxMetallibFunction &f : fs) {
+		id<MTLFunction> fn = [loaded newFunctionWithName:@(f.name.c_str())];
+		CHECK(fn != nil && fn.functionType == metalTypeOf(static_cast<uint8_t>(f.stage)));
+	}
+	return [loaded.functionNames sortedArrayUsingSelector:@selector(compare:)];
+}
+
+NSArray<NSString *> *namesOf(const std::vector<RgfxMetallibFunction> &fs)
+{
+	NSMutableArray<NSString *> *names = [NSMutableArray array];
+	for (const RgfxMetallibFunction &f : fs)
+		[names addObject:@(f.name.c_str())];
+	return [names sortedArrayUsingSelector:@selector(compare:)];
+}
+
+// Each of `fs` in `out` in its place: its tags, its bitcode where its OFFT and MDSZ say, and the
+// bitcode the bundle's reader finds by its name.
+void checkPlaced(const std::vector<uint8_t> &out, const std::vector<RgfxMetallibFunction> &fs)
+{
+	const uint8_t *p = out.data();
+	CHECK(le64(p + 0x10) == out.size() && le64(p + 0x18) == 0x58);
+	const uint64_t section = le64(p + 0x48), sectionSize = le64(p + 0x50);
+	CHECK(section + sectionSize == out.size() && sectionSize % 16 == 0);
+	// The metadata: 8 bytes a function, each; the public after the list, UUID and ENDT.
+	CHECK(le64(p + 0x30) == 8 * fs.size() && le64(p + 0x40) == 8 * fs.size());
+	CHECK(le64(p + 0x18) + 4 + le64(p + 0x20) + 26 == le64(p + 0x28));
+	CHECK(le64(p + 0x38) == le64(p + 0x28) + 8 * fs.size() && section == le64(p + 0x38) + 8 * fs.size());
+	const std::vector<Listed> back = functionsOf(out);
+	CHECK(back.size() == fs.size());
+	uint64_t at = 0;
+	for (size_t i = 0; i < back.size() && i < fs.size(); i++) {
+		CHECK(back[i].name == fs[i].name && back[i].type == static_cast<uint8_t>(fs[i].stage));
+		CHECK(back[i].offt.size() == 24 && back[i].mdsz.size() == 8);
+		if (back[i].offt.size() != 24 || back[i].mdsz.size() != 8)
+			continue;
+		CHECK(le64(back[i].offt.data()) == 8 * i && le64(back[i].offt.data() + 8) == 8 * i);
+		CHECK(le64(back[i].offt.data() + 16) == at);
+		const uint64_t size = le64(back[i].mdsz.data());
+		CHECK(size % 16 == 0 && at + size <= sectionSize);
+		uint8_t hash[CC_SHA256_DIGEST_LENGTH];
+		CC_SHA256(p + section + at, static_cast<CC_LONG>(size), hash);
+		CHECK(back[i].hash == std::vector<uint8_t>(hash, hash + sizeof hash));
+		size_t n = static_cast<size_t>(size);
+		const uint8_t *bc = RgfxUnwrapBitcode(p + section + at, &n);
+		CHECK(n == fs[i].bitcodeLength && std::memcmp(bc, fs[i].bitcode, n) == 0);
+		const uint8_t *found = nullptr;
+		size_t foundSize = 0;
+		CHECK(rgfxMetallibBitcode(p, out.size(), fs[i].name, &found, &foundSize));
+		CHECK(found == p + section + at);
+		at += size;
+	}
+	CHECK(at == sectionSize);
+}
+
+void test_metallib_writer_several()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	const std::vector<RgfxMetallibFunction> fs = stageFunctions(lib);
+	CHECK(fs.size() >= 8);
+	const std::vector<uint8_t> out = RgfxWriteMetallib(fs);
+	CHECK(RgfxWriteMetallib(fs) == out);
+	checkPlaced(out, fs);
+	uint8_t key[32];
+	CHECK(rgfxLibraryKey(out.data(), out.size(), key));
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK([metalLoads(metal, out, fs) isEqualToArray:namesOf(fs)]);
+	// One function in a list is the library of that function alone.
+	CHECK(RgfxWriteMetallib(std::vector<RgfxMetallibFunction>{fs[0]}) == RgfxWriteMetallib(fs[0]));
+}
+
+void put32(std::vector<uint8_t> &d, uint32_t v)
+{
+	for (int i = 0; i < 4; i++)
+		d.push_back(static_cast<uint8_t>(v >> (8 * i)));
+}
+
+void set32(std::vector<uint8_t> &d, size_t at, uint32_t v)
+{
+	for (int i = 0; i < 4; i++)
+		d[at + i] = static_cast<uint8_t>(v >> (8 * i));
+}
+
+// A container in the layout RgfxMetallibOfClLibrary reads, as Metal's compiler answers it for
+// OpenCL C source (measured: macOS 26.7.1), of `fs`' modules under their names.
+std::vector<uint8_t> clContainer(const std::vector<RgfxMetallibFunction> &fs)
+{
+	std::vector<uint8_t> table = {8, 0, 2, 0, 1, 0, 1, 0};
+	put32(table, static_cast<uint32_t>(fs.size()));
+	std::vector<uint8_t> modules, names;
+	put32(names, static_cast<uint32_t>(fs.size()));
+	for (size_t i = 0; i < fs.size(); i++) {
+		const uint32_t entry[7] = {2, 0, static_cast<uint32_t>(8 * i), 0, static_cast<uint32_t>(modules.size()), 0, 0xfc};
+		for (uint32_t w : entry)
+			put32(table, w);
+		table.insert(table.end(), fs[i].name.begin(), fs[i].name.end());
+		table.push_back(0);
+		names.insert(names.end(), fs[i].name.begin(), fs[i].name.end());
+		names.push_back(0);
+		put32(modules, static_cast<uint32_t>(20 + fs[i].bitcodeLength));
+		const uint32_t wrapper[5] = {0x0B17C0DE, 0, 20, static_cast<uint32_t>(fs[i].bitcodeLength), 0xffffffffu};
+		for (uint32_t w : wrapper)
+			put32(modules, w);
+		modules.insert(modules.end(), fs[i].bitcode, fs[i].bitcode + fs[i].bitcodeLength);
+	}
+	const std::string defaultName("default.metallib");
+	std::vector<std::vector<uint8_t>> sections = {table,
+	                                              std::vector<uint8_t>(8 * fs.size(), 0),
+	                                              {},
+	                                              modules,
+	                                              {},
+	                                              std::vector<uint8_t>(defaultName.begin(), defaultName.end()),
+	                                              names,
+	                                              {0, 0, 0, 0},
+	                                              {0, 0, 0, 0},
+	                                              {0, 0, 0, 0}};
+	sections[5].push_back(0);
+	std::vector<uint8_t> out(0x68, 0);
+	out[0] = 1;
+	for (size_t i = 0; i < sections.size(); i++) {
+		const bool empty = sections[i].empty() && i == 4;
+		set32(out, 0x10 + 8 * i, empty ? 0 : static_cast<uint32_t>(out.size()));
+		set32(out, 0x14 + 8 * i, static_cast<uint32_t>(sections[i].size()));
+		out.insert(out.end(), sections[i].begin(), sections[i].end());
+	}
+	return out;
+}
+
+// `c`, a container of clContainer's, as Metal's compiler answers it where the compile warned
+// (measured: macOS 26.7.1, the Intel 630 and the AMD 5300M alike; Geekbench 7's programs on
+// macOS 26.6.1): the warnings' text, NUL-terminated, at 0x68, placed by the pair at 8, and every
+// other section after it.
+std::vector<uint8_t> withWarnings(const std::vector<uint8_t> &c, const std::string &text)
+{
+	std::vector<uint8_t> out(c.begin(), c.begin() + 0x68);
+	out.insert(out.end(), text.begin(), text.end());
+	out.push_back(0);
+	const uint32_t shift = static_cast<uint32_t>(text.size() + 1);
+	out.insert(out.end(), c.begin() + 0x68, c.end());
+	for (size_t at = 0x10; at < 0x60; at += 8)
+		if (le32(out.data() + at) >= 0x68)
+			set32(out, at, le32(out.data() + at) + shift);
+	set32(out, 8, 0x68);
+	set32(out, 12, shift);
+	return out;
+}
+
+} // namespace
+
+// Metal's compiler over OpenCL C source, as the GL renderer's cl2Metal compiles a compute program
+// (MTLCompileOptions' languageVersion 0x20002, sourceLanguage 1 and its additional arguments,
+// read from its code): the library's bytes, or none where this Mac's Metal makes none. Shared
+// with tests/cl_mode_tests.mm.
+NSData *clLibraryBytes(id<MTLDevice> metal, NSString *source, NSArray<NSString *> **names)
+{
+	MTLCompileOptions *o = [MTLCompileOptions new];
+	SEL language = sel_registerName("setSourceLanguage:"), arguments = sel_registerName("setAdditionalCompilerArguments:");
+	if (![o respondsToSelector:language] || ![o respondsToSelector:arguments])
+		return nil;
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(o, sel_registerName("setLanguageVersion:"), 0x20002);
+	((void (*)(id, SEL, NSInteger))objc_msgSend)(o, language, 1);
+	((void (*)(id, SEL, id))objc_msgSend)(o, arguments,
+	                                      @"-cl-single-precision-constant -fapplecl-lax-vector-conversions "
+	                                      @"-fapplecl-functional-casts -fapplecl-inline-definitions -cl-std=CL1.2");
+	NSError *error = nil;
+	id<MTLLibrary> lib = [metal newLibraryWithSource:source options:o error:&error];
+	SEL contents = sel_registerName("libraryDataContents");
+	if (lib == nil || ![(id)lib respondsToSelector:contents])
+		return nil;
+	*names = [lib.functionNames sortedArrayUsingSelector:@selector(compare:)];
+	return ((id(*)(id, SEL))objc_msgSend)(lib, contents);
+}
+
+namespace {
+
+void test_cl_library()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	std::vector<RgfxMetallibFunction> kernels;
+	for (RgfxMetallibFunction &f : stageFunctions(lib))
+		if (f.stage == RgfxMetallibStage::Kernel && kernels.size() < 2)
+			kernels.push_back(f);
+	CHECK(kernels.size() == 2);
+	if (kernels.size() != 2)
+		return;
+	kernels[0].name = "__entry_first";
+	kernels[1].name = "__entry_second";
+	const std::vector<uint8_t> container = clContainer(kernels);
+	std::vector<uint8_t> out;
+	CHECK(RgfxMetallibOfClLibrary(container.data(), container.size(), out));
+	// The writer's VERS: the container states none.
+	for (RgfxMetallibFunction &f : kernels) {
+		const RgfxMetallibFunction defaults;
+		f.airMajor = defaults.airMajor;
+		f.airMinor = defaults.airMinor;
+		f.languageMajor = defaults.languageMajor;
+		f.languageMinor = defaults.languageMinor;
+	}
+	CHECK(out == RgfxWriteMetallib(kernels));
+	checkPlaced(out, kernels);
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK([metalLoads(metal, out, kernels) isEqualToArray:namesOf(kernels)]);
+
+	// Bytes that are not the container, or a container that does not read whole, give none.
+	std::vector<uint8_t> none = {7};
+	CHECK(!RgfxMetallibOfClLibrary(lib.data(), lib.size(), none) && none == std::vector<uint8_t>{7});
+	CHECK(!RgfxMetallibOfClLibrary(container.data(), 0x60, none));
+	const auto broken = [&](size_t at, uint32_t value) {
+		std::vector<uint8_t> c = container;
+		set32(c, at, value);
+		return !RgfxMetallibOfClLibrary(c.data(), c.size(), none);
+	};
+	const size_t table = le32(container.data() + 0x10), modules = le32(container.data() + 0x28);
+	CHECK(broken(0, 2));                                   // the leading 1
+	CHECK(broken(0x10, static_cast<uint32_t>(container.size()))); // the table past the end
+	CHECK(broken(table, 0x00030008));                      // the table's head
+	CHECK(broken(table + 8, 0));                           // no functions
+	CHECK(broken(table + 12, 3));                          // a stage past a kernel
+	CHECK(broken(table + 12 + 16, 0x7fffffff));            // a module past the section
+	CHECK(broken(modules, 0x7fffffff));                    // a module's size past the section
+	CHECK(broken(modules + 4, 0x12345678));                // no wrapper
+	CHECK(broken(0x14, 12 + 28 + 5));                      // a table that ends inside a name
+	CHECK(none == std::vector<uint8_t>{7});
+	// The table's first u16 is a release's own (macOS 27's 9).
+	std::vector<uint8_t> c9 = container, out9;
+	set32(c9, table, 0x00020009);
+	CHECK(RgfxMetallibOfClLibrary(c9.data(), c9.size(), out9) && out9 == out);
+	// macOS 11's container: the head 3, then 2, 3 and 2, read alike.
+	std::vector<uint8_t> c11 = container, out11;
+	set32(c11, table, 0x00020003);
+	set32(c11, table + 4, 0x00020003);
+	CHECK(RgfxMetallibOfClLibrary(c11.data(), c11.size(), out11) && out11 == out);
+	// Another head after the first u16 stays refused.
+	CHECK(broken(table + 4, 0x00020001));
+	// A compile that warned: its warnings' text ahead of the other sections, read past alike; a
+	// pair at 8 outside the bytes, or of a size at no offset, is refused.
+	const std::vector<uint8_t> cw =
+	    withWarnings(container, "program_source:2:35: warning: comparison of integers of different signs");
+	std::vector<uint8_t> outw;
+	CHECK(RgfxMetallibOfClLibrary(cw.data(), cw.size(), outw) && outw == out);
+	const auto brokenW = [&](size_t at, uint32_t value) {
+		std::vector<uint8_t> c = cw;
+		set32(c, at, value);
+		return !RgfxMetallibOfClLibrary(c.data(), c.size(), none);
+	};
+	CHECK(brokenW(8, static_cast<uint32_t>(cw.size()) + 1));  // the warnings past the end
+	CHECK(brokenW(12, static_cast<uint32_t>(cw.size())));     // the warnings running past the end
+	CHECK(brokenW(8, 0));                                     // a size at no offset
+	CHECK(none == std::vector<uint8_t>{7});
+	// A vertex and a fragment stage (macOS 11's render functions) carry into the .metallib's TYPE.
+	std::vector<uint8_t> cs = container, outs;
+	set32(cs, table + 12, 0);
+	set32(cs, table + 12 + 28 + kernels[0].name.size() + 1, 1);
+	std::vector<RgfxMetallibFunction> staged = kernels;
+	staged[0].stage = RgfxMetallibStage::Vertex;
+	staged[1].stage = RgfxMetallibStage::Fragment;
+	CHECK(RgfxMetallibOfClLibrary(cs.data(), cs.size(), outs) && outs == RgfxWriteMetallib(staged));
+
+	// This Mac's own container, where its Metal compiles OpenCL C (two kernels, one program).
+	NSArray<NSString *> *names = nil;
+	NSData *bytes = clLibraryBytes(metal,
+	                               @"__kernel void add(__global const float *a, __global float *b) {\n"
+	                               @"  b[get_global_id(0)] += a[get_global_id(0)];\n}\n"
+	                               @"__kernel void twice(__global float *b) { b[get_global_id(0)] *= 2.0f; }\n",
+	                               &names);
+	if (bytes.length < 4 || le32(static_cast<const uint8_t *>(bytes.bytes)) != 1) {
+		fprintf(stderr, "gl_tests: this Mac's Metal answers no OpenCL container (%lu bytes): the written one only\n",
+		        (unsigned long)bytes.length);
+		return;
+	}
+	out.clear();
+	CHECK(RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, out));
+	CHECK([metalLoads(metal, out, {}) isEqualToArray:names]);
+	CHECK(names.count == 2);
+	// And of a program its compiler warns of (a signed and an unsigned integer compared).
+	bytes = clLibraryBytes(metal,
+	                       @"__kernel void clip(__global float *a, uint n) {\n"
+	                       @"  int i = get_global_id(0); if (i >= n) return; a[i] *= 2.0f; }\n",
+	                       &names);
+	CHECK(bytes.length > 0x68);
+	if (bytes.length > 0x68 && le32(static_cast<const uint8_t *>(bytes.bytes) + 8) == 0)
+		fprintf(stderr, "gl_tests: this Mac's Metal gave no warnings for the program that warns\n");
+	out.clear();
+	CHECK(RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, out));
+	CHECK([metalLoads(metal, out, {}) isEqualToArray:names]);
+	CHECK(names.count == 1);
+}
+
+// A library made from an OpenCL container's kernels keeps the container as the bytes it was
+// given (newLibraryWithData:, for its shadow), and its entry points' arguments read from the
+// kernels' bitcode in it, as from a library kept over the kernels' .metallib: where they did not,
+// the GL renderer's OpenCL kernels had no arguments (m3-max-3947).
+void test_cl_library_arguments()
+{
+	const char *path = getenv("RGFX_AIR_ARGUMENTS");
+	if (path == nullptr)
+		return; // test_metallib_writer says so
+	const std::vector<uint8_t> lib = readFile(path);
+	std::vector<RgfxMetallibFunction> kernels;
+	for (RgfxMetallibFunction &f : stageFunctions(lib))
+		if (f.stage == RgfxMetallibStage::Kernel && kernels.size() < 2)
+			kernels.push_back(f);
+	CHECK(kernels.size() == 2);
+	if (kernels.size() != 2)
+		return;
+	const std::vector<uint8_t> container = clContainer(kernels);
+	std::vector<uint8_t> metallib;
+	CHECK(RgfxMetallibOfClLibrary(container.data(), container.size(), metallib));
+	// The transport is never freed, as the shell tests' fixture's: a library may dealloc later.
+	TestRing &ring = *new TestRing(0x40000);
+	RgfxRingWriter &writer =
+	    *new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell, nullptr);
+	RgfxIdSpace &ids = *new RgfxIdSpace();
+	RgfxSerializer &ser = *new RgfxSerializer(writer, ids);
+	ring.setConsumerIdle(1);
+	auto keptOver = [&](const std::vector<uint8_t> &kept) {
+		uint32_t status = 0;
+		RgfxLibrary *made = [RgfxLibrary libraryWithData:metallib.data()
+		                                          length:metallib.size()
+		                                             key:nullptr
+		                                          device:nil
+		                                      serializer:&ser
+		                                          status:&status];
+		NSData *bytes = [NSData dataWithBytes:kept.data() length:kept.size()];
+		[made rgfxSetSource:dispatch_data_create(bytes.bytes, bytes.length, nil, ^{
+			      (void)bytes;
+		      })
+		        shadowMaker:^id<MTLLibrary>(dispatch_data_t) {
+			        return nil;
+		        }];
+		drainRing(ring);
+		return made;
+	};
+	RgfxLibrary *overContainer = keptOver(container);
+	RgfxLibrary *overMetallib = keptOver(metallib);
+	CHECK(overContainer != nil && overMetallib != nil);
+	for (const RgfxMetallibFunction &f : kernels) {
+		std::shared_ptr<const RgfxAirFunction> a = [overContainer rgfxAirFunctionNamed:f.name];
+		std::shared_ptr<const RgfxAirFunction> b = [overMetallib rgfxAirFunctionNamed:f.name];
+		CHECK(a != nullptr && b != nullptr);
+		if (a != nullptr && b != nullptr)
+			CHECK(a->name == f.name && a->arguments.size() == b->arguments.size());
+		// The function's own reflection, which the GL renderer asks of each kernel it builds: Metal's
+		// class, listing the arguments a compute pipeline's reflection of the function lists.
+		id<MTLFunction> fn = [overContainer newFunctionWithName:@(f.name.c_str())];
+		id own = [(id<RgfxGLTestsFunctionReflection>)fn reflectionWithOptions:3];
+		id pipeline = RgfxComputePipelineReflectionOf(fn, nil, MTLPipelineOptionArgumentInfo | MTLPipelineOptionBufferTypeInfo);
+		CHECK((own != nil) == (pipeline != nil));
+		if (own == nil || pipeline == nil)
+			continue;
+		CHECK(strcmp(object_getClassName(own), "MTLFunctionReflectionInternal") == 0);
+		NSArray *ownArguments = [own valueForKey:@"arguments"], *pipelineArguments = [pipeline valueForKey:@"arguments"];
+		CHECK([[ownArguments valueForKey:@"name"] isEqualToArray:[pipelineArguments valueForKey:@"name"]]);
+		CHECK([[own valueForKey:@"bindings"] count] == ownArguments.count);
+	}
+
+	// A kernel's arguments passed by value, as this Mac's Metal compiles OpenCL C for the GL
+	// renderer: type 22, of the value's type and size, with a pointer type that is no constant
+	// buffer, as the x86 Macs answer (measured: macOS 26.7.1, the AMD 5300M and the Intel 630).
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	NSArray<NSString *> *names = nil;
+	NSData *bytes = clLibraryBytes(metal,
+	                               @"__kernel void scale(__global float *b, float k, uint n) {\n"
+	                               @"  if (get_global_id(0) < n) b[get_global_id(0)] *= k;\n}\n",
+	                               &names);
+	std::vector<uint8_t> scale;
+	if (bytes.length < 4 ||
+	    !RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, scale)) {
+		fprintf(stderr, "gl_tests: this Mac's Metal answers no OpenCL container: no value arguments checked\n");
+		drainRing(ring);
+		return;
+	}
+	metallib = scale;
+	std::vector<uint8_t> kept(static_cast<const uint8_t *>(bytes.bytes),
+	                          static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	RgfxLibrary *values = keptOver(kept);
+	CHECK(values != nil && [values.functionNames isEqualToArray:@[ @"__entry_scale" ]]);
+	id reflection = [(id<RgfxGLTestsFunctionReflection>)[values newFunctionWithName:@"__entry_scale"]
+	    reflectionWithOptions:3];
+	NSArray *arguments = [reflection valueForKey:@"arguments"];
+	CHECK(arguments.count == 3);
+	if (arguments.count == 3) {
+		const struct {
+			const char *name;
+			NSUInteger type, index, dataType, size;
+		} want[] = {{"b", 0, 0, 3, 4}, {"k", 22, 1, 3, 4}, {"n", 22, 2, 33, 4}};
+		for (NSUInteger i = 0; i < 3; i++) {
+			MTLArgument *a = arguments[i];
+			CHECK(strcmp(a.name.UTF8String, want[i].name) == 0 && a.type == want[i].type && a.index == want[i].index);
+			CHECK(a.bufferDataType == want[i].dataType && a.bufferDataSize == want[i].size && a.bufferAlignment == 4);
+			id type = [a valueForKey:@"dataTypeDescription"];
+			CHECK([type isKindOfClass:[MTLPointerType class]] && ![[type valueForKey:@"isConstantBuffer"] boolValue]);
+			// The written buffer is read-write, as the Macs answer a kernel's written global one.
+			CHECK(a.access == (i == 0 ? MTLArgumentAccessReadWrite : MTLArgumentAccessReadOnly));
+		}
+	}
+
+	// A struct passed by value: of MTLDataTypeStruct, its size and alignment (a float and an int:
+	// 8 bytes, aligned to 4), as the x86 Macs' pipelines of OpenCL mode answer it.
+	bytes = clLibraryBytes(metal,
+	                       @"typedef struct { float a; int b; } S;\n"
+	                       @"__kernel void st(__global float *o, S s) { o[get_global_id(0)] = s.a + (float)s.b; }\n",
+	                       &names);
+	std::vector<uint8_t> structKernels;
+	CHECK(bytes.length >= 4 &&
+	      RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes.bytes), bytes.length, structKernels));
+	metallib = structKernels;
+	const std::vector<uint8_t> structKept(static_cast<const uint8_t *>(bytes.bytes),
+	                                      static_cast<const uint8_t *>(bytes.bytes) + bytes.length);
+	RgfxLibrary *structs = structKernels.empty() ? nil : keptOver(structKept);
+	CHECK(structs != nil && [structs.functionNames isEqualToArray:@[ @"__entry_st" ]]);
+	id structReflection = [(id<RgfxGLTestsFunctionReflection>)[structs newFunctionWithName:@"__entry_st"]
+	    reflectionWithOptions:3];
+	NSArray *structArguments = [structReflection valueForKey:@"arguments"];
+	CHECK(structArguments.count == 2);
+	if (structArguments.count == 2) {
+		MTLArgument *o = structArguments[0], *v = structArguments[1];
+		CHECK(strcmp(o.name.UTF8String, "o") == 0 && o.type == 0 && o.index == 0);
+		CHECK(strcmp(v.name.UTF8String, "s") == 0 && v.type == 22 && v.index == 1);
+		CHECK(v.bufferDataType == MTLDataTypeStruct && v.bufferDataSize == 8 && v.bufferAlignment == 4);
+		CHECK(v.access == MTLArgumentAccessReadOnly);
+		id type = [v valueForKey:@"dataTypeDescription"];
+		CHECK([type isKindOfClass:[MTLPointerType class]] && ![[type valueForKey:@"isConstantBuffer"] boolValue]);
+		CHECK([[type valueForKey:@"elementStructType"] isKindOfClass:[MTLStructType class]]);
+	}
+	drainRing(ring);
+}
+
+void test_gl_function_answers()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK([[RgfxGLFunction alloc] initWithIR:nullptr functionType:MTLFunctionTypeVertex inputsDescription:nil
+	                                  device:metal] == nil);
+	uint8_t ir[4 + 6] = {6, 0, 0, 0, 3, 0, 0, 0, 0x81, 0};
+	NSObject *inputs = [NSObject new];
+	RgfxGLFunction *f = [[RgfxGLFunction alloc] initWithIR:ir
+	                                          functionType:MTLFunctionTypeFragment
+	                                     inputsDescription:inputs
+	                                                device:metal];
+	CHECK(f != nil);
+	ir[8] = 0; // the function keeps a copy
+	CHECK(f.rgfxIR.length == sizeof ir && static_cast<const uint8_t *>(f.rgfxIR.bytes)[8] == 0x81);
+	CHECK(f.rgfxInputsDescription == inputs);
+	CHECK([f.name isEqualToString:@"__main"]);
+	CHECK(f.device == metal);
+	CHECK(f.functionType == MTLFunctionTypeFragment);
+	CHECK(f.patchType == MTLPatchTypeNone && f.patchControlPointCount == 0);
+	CHECK(f.vertexAttributes == nil && f.stageInputAttributes == nil);
+	CHECK(f.functionConstantsDictionary.count == 0 && f.options == MTLFunctionOptionNone);
+	CHECK(f.label == nil);
+	f.label = @"shader";
+	CHECK([f.label isEqualToString:@"shader"]);
+	RgfxGLFunction *v = [[RgfxGLFunction alloc] initWithIR:ir
+	                                          functionType:MTLFunctionTypeVertex
+	                                     inputsDescription:nil
+	                                                device:metal];
+	CHECK(v.functionType == MTLFunctionTypeVertex && v.rgfxInputsDescription == nil);
+
+	// Metal's function SPI, as Metal's function of GL IR answers it: no arguments, bindings,
+	// return type, debug data, file, line, imports or render target array index type; its
+	// relocations as set; the IR after its length word as its bitcode; a hash of the IR, the same
+	// for the same IR and another for other IR; no reflection, logged.
+	auto obj = [](id object, NSString *name) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	auto u64 = [](id object, NSString *name) {
+		return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	for (NSString *member in @[ @"arguments", @"bindings", @"returnType", @"debugInstrumentationData",
+	                            @"filePath", @"unpackedFilePath", @"importedLibraries", @"importedSymbols",
+	                            @"relocations" ])
+		CHECK(obj(f, member) == nil);
+	CHECK(u64(f, @"lineNumber") == 0 && u64(f, @"renderTargetArrayIndexType") == 0);
+	NSArray *relocations = @[ @1 ];
+	((void (*)(id, SEL, id))objc_msgSend)(f, NSSelectorFromString(@"setRelocations:"), relocations);
+	CHECK(obj(f, @"relocations") == relocations);
+	NSData *bitcode = (NSData *)obj(f, @"bitcodeData");
+	const uint8_t payload[6] = {3, 0, 0, 0, 0x81, 0};
+	CHECK(bitcode.length == 6 && memcmp(bitcode.bytes, payload, 6) == 0);
+	auto hash = [](id object) {
+		return ((const uint8_t *(*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(@"bitCodeHash"));
+	};
+	CHECK(hash(f) != nullptr && hash(v) != nullptr && memcmp(hash(f), hash(v), 32) != 0); // ir[8] changed
+	RgfxGLFunction *same = [[RgfxGLFunction alloc] initWithIR:ir
+	                                             functionType:MTLFunctionTypeVertex
+	                                        inputsDescription:nil
+	                                                   device:metal];
+	CHECK(memcmp(hash(same), hash(v), 32) == 0);
+	CHECK(((id (*)(id, SEL, NSUInteger))objc_msgSend)(f, NSSelectorFromString(@"reflectionWithOptions:"), 0) == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxGLFunction class], NSSelectorFromString(@"reflectionWithOptions:")));
+
+	// The return data a variant keeps.
+	CHECK(RgfxGLPluginReturnData(f) == nil && RgfxGLPluginReturnData(nil) == nil);
+	NSData *ret = [@"bplist00" dataUsingEncoding:NSUTF8StringEncoding];
+	RgfxGLSetPluginReturnData(f, ret);
+	CHECK([RgfxGLPluginReturnData(f) isEqualToData:ret]);
+	RgfxGLSetPluginReturnData(f, nil);
+	CHECK(RgfxGLPluginReturnData(f) == nil);
+}
+
+void test_reflection_answers_return_data()
+{
+	NSData *vertexData = [@"vertex" dataUsingEncoding:NSUTF8StringEncoding];
+	NSData *fragmentData = [@"fragment" dataUsingEncoding:NSUTF8StringEncoding];
+	RgfxStageReflection vertex, fragment;
+	vertex.pluginReturnData = vertexData;
+	fragment.pluginReturnData = fragmentData;
+	NSString *why = nil;
+	id r = RgfxRenderPipelineReflectionMake(&vertex, &fragment, nullptr, nullptr, &why);
+	CHECK(r != nil);
+	CHECK([[r valueForKey:@"vertexPluginReturnData"] isEqualToData:vertexData]);
+	CHECK([[r valueForKey:@"fragmentPluginReturnData"] isEqualToData:fragmentData]);
+	RgfxStageReflection plain;
+	id none = RgfxRenderPipelineReflectionMake(&plain, &plain, nullptr, nullptr, &why);
+	CHECK(none != nil && [none valueForKey:@"vertexPluginReturnData"] == nil &&
+	      [none valueForKey:@"fragmentPluginReturnData"] == nil);
+	// A kernel's: where Metal's class keeps none (macOS 27), the reflection is still made.
+	RgfxStageReflection kernel;
+	kernel.pluginReturnData = vertexData;
+	CHECK(RgfxComputePipelineReflectionMake(kernel, &why) != nil);
+}
+
+// A fragment stage in the shape the GL code generator writes one (measured: macOS 26.7.1, a
+// GLSL shader writing gl_FragDepth and reading gl_FragCoord and a flat int): our own text.
+const char kFragmentText[] = R"AIR(; ModuleID = 'fragment'
+define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
+  ret { float, <4 x float> } undef
+}
+
+!air.fragment = !{!0}
+!air.version = !{!7, !12}
+!air.language_version = !{!9, !13}
+!air.compile_options = !{!10, !11, !14, !10, !19, !15}
+!llvm.module.flags = !{!16, !17, !18}
+!gld.data = !{!8}
+
+!0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.depth", !"air.depth_qualifier", !"air.any"}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4"}
+!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.center", !"air.flat", !"air.arg_type_name", !"int", !"air.arg_name", !"user(slot8)"}
+!7 = !{i32 2, i32 3, i32 0}
+!8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+!9 = !{!"OpenGL GLSL", i32 1, i32 0, i32 0}
+!10 = !{!"air.compile.fast_math_enable"}
+!11 = !{!"air.compile.native_double_disable"}
+!12 = !{i32 2, i32 8, i32 0}
+!13 = !{!"Metal", i32 4, i32 0, i32 0}
+!14 = !{!"air.compile.framebuffer_fetch_disable"}
+!15 = !{!"air.compile.framebuffer_fetch_enable"}
+!16 = !{i32 7, !"air.max_textures", i32 128}
+!17 = !{i32 1, !"wchar_size", i32 4}
+!18 = !{i32 7, !"air.max_textures", i32 16}
+!19 = !{!"air.compile.fast_math_disable"}
+)AIR";
+
+// kFragmentText as the rules make it: the generator's list gone; one version, the module's own,
+// its language Metal's; the module's own compile options and module flags, once each; the flat
+// input without its sampling key, and named unsigned; the depth output named.
+const char kFragmentNormalized[] = R"AIR(; ModuleID = 'fragment'
+define { float, <4 x float> } @__main(<4 x float> %0, i32 %1) {
+  ret { float, <4 x float> } undef
+}
+
+!air.fragment = !{!0}
+!air.version = !{!7}
+!air.language_version = !{!9}
+!air.compile_options = !{!10, !14}
+!llvm.module.flags = !{!16, !17}
+
+!0 = !{{ float, <4 x float> } (<4 x float>, i32)* @__main, !1, !4}
+!1 = !{!2, !3}
+!2 = !{!"air.depth", !"air.depth_qualifier", !"air.any", !"air.arg_type_name", !"float", !"air.arg_name", !"#air_depth"}
+!3 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4"}
+!4 = !{!5, !6}
+!5 = !{i32 0, !"air.position", !"air.center", !"air.perspective", !"air.arg_type_name", !"float4"}
+!6 = !{i32 1, !"air.fragment_input", !"user(slot8)", !"air.flat", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!7 = !{i32 2, i32 3, i32 0}
+!8 = !{!"gld.text", !"a, {b} \22(c)\22"}
+!9 = !{!"Metal", i32 2, i32 3, i32 0}
+!10 = !{!"air.compile.fast_math_enable"}
+!11 = !{!"air.compile.native_double_disable"}
+!12 = !{i32 2, i32 8, i32 0}
+!13 = !{!"Metal", i32 4, i32 0, i32 0}
+!14 = !{!"air.compile.framebuffer_fetch_disable"}
+!15 = !{!"air.compile.framebuffer_fetch_enable"}
+!16 = !{i32 7, !"air.max_textures", i32 128}
+!17 = !{i32 1, !"wchar_size", i32 4}
+!18 = !{i32 7, !"air.max_textures", i32 16}
+!19 = !{!"air.compile.fast_math_disable"}
+)AIR";
+
+// A vertex stage: integer varyings named signed (the rule makes them unsigned) and unsigned, a
+// float varying, an integer attribute (not a varying: its type name is left as it is, its bare
+// attribute name dropped), and outputs and inputs without type names, one a distinct node.
+const char kVertexText[] = R"AIR(!air.vertex = !{!10}
+!10 = !{{ <4 x float>, <2 x i32>, i32, <4 x float>, i32 } (<2 x float>, i32, i16)* @__main, !11, !17}
+!11 = !{!12, !13, !14, !15, !16}
+!12 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"#air_position"}
+!13 = !{!"air.vertex_output", !"user(slot9)", !"air.arg_type_name", !"int2", !"air.arg_name", !"user(slot9)"}
+!14 = !{!"air.vertex_output", !"user(slot8)", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!15 = !{!"air.vertex_output", !"user(slot10)", !"air.arg_type_name", !"float4", !"air.arg_name", !"user(slot10)"}
+!16 = distinct !{!"air.render_target", i32 1, i32 0}
+!17 = !{!18, !19, !20}
+!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"attrib_0", !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
+!19 = !{i32 1, !"air.vertex_id"}
+!20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance"})AIR";
+
+const char kVertexNormalized[] = R"AIR(!air.vertex = !{!10}
+!10 = !{{ <4 x float>, <2 x i32>, i32, <4 x float>, i32 } (<2 x float>, i32, i16)* @__main, !11, !17}
+!11 = !{!12, !13, !14, !15, !16}
+!12 = !{!"air.position", !"air.arg_type_name", !"float4", !"air.arg_name", !"#air_position"}
+!13 = !{!"air.vertex_output", !"user(slot9)", !"air.arg_type_name", !"uint2", !"air.arg_name", !"user(slot9)"}
+!14 = !{!"air.vertex_output", !"user(slot8)", !"air.arg_type_name", !"uint", !"air.arg_name", !"user(slot8)"}
+!15 = !{!"air.vertex_output", !"user(slot10)", !"air.arg_type_name", !"float4", !"air.arg_name", !"user(slot10)"}
+!16 = distinct !{!"air.render_target", i32 1, i32 0, !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_render_target_1"}
+!17 = !{!18, !19, !20}
+!18 = !{i32 0, !"air.vertex_input", !"air.location_index", i32 0, i32 1, !"air.arg_type_name", !"int2", !"air.arg_name", !"attrib_0"}
+!19 = !{i32 1, !"air.vertex_id", !"air.arg_type_name", !"uint", !"air.arg_name", !"#air_vertex_id"}
+!20 = !{i32 2, !"air.instance_id", !"air.arg_name", !"instance", !"air.arg_type_name", !"ushort"})AIR";
+
+// A fragment stage's buffers in the shapes the generator writes them (measured: macOS 26.7.1, the
+// uniform buffers of gl_cases' shaders): no air.address_space; a uniform block of a known size
+// whose <4 x float> pointer is named "uchar", with no pointee size either. Beside them, a sized
+// i8 buffer, a float3 array and a struct pointee (no size is added for the struct), and a
+// texture. Our own text.
+const char kBufferText[] = R"AIR(!air.fragment = !{!0}
+!0 = !{{ <4 x float> } (i8 addrspace(2)*, <4 x float> addrspace(2)*, %struct._texture_2d_t addrspace(1)*, i8 addrspace(1)*, [3 x <3 x float>] addrspace(2)*, %struct.S addrspace(1)*)* @__main, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!3 = !{!4, !5, !6, !7, !8, !9}
+!4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_uniform_buffer"}
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_ubo_0"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}
+!7 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
+!8 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 48, !"air.location_index", i32 3, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"a"}
+!9 = !{i32 5, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.arg_type_name", !"uchar", !"air.arg_name", !"s"})AIR";
+
+// kBufferText as the rules make it: each buffer's address space from its parameter's pointer, and
+// the pointee size and alignment of the sized ones from the pointer's pointee (16 for the block,
+// 1 for the i8, 48 aligned 16 for the array), the type name as it was; the struct's buffer with
+// its address space alone; the texture as it was.
+const char kBufferNormalized[] = R"AIR(!air.fragment = !{!0}
+!0 = !{{ <4 x float> } (i8 addrspace(2)*, <4 x float> addrspace(2)*, %struct._texture_2d_t addrspace(1)*, i8 addrspace(1)*, [3 x <3 x float>] addrspace(2)*, %struct.S addrspace(1)*)* @__main, !1, !3}
+!1 = !{!2}
+!2 = !{!"air.render_target", i32 0, i32 0, !"air.arg_type_name", !"float4", !"air.arg_name", !"out"}
+!3 = !{!4, !5, !6, !7, !8, !9}
+!4 = !{i32 0, !"air.buffer", !"air.location_index", i32 0, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_uniform_buffer"}
+!5 = !{i32 1, !"air.buffer", !"air.buffer_size", i32 32, !"air.location_index", i32 1, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 16, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uchar", !"air.arg_name", !"fs_ubo_0"}
+!6 = !{i32 2, !"air.texture", !"air.location_index", i32 0, i32 1, !"air.sample", !"air.arg_type_name", !"texture2d<float, sample>", !"air.arg_name", !"t"}
+!7 = !{i32 3, !"air.buffer", !"air.buffer_size", i32 16, !"air.location_index", i32 2, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_size", i32 1, !"air.arg_type_align_size", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"u"}
+!8 = !{i32 4, !"air.buffer", !"air.buffer_size", i32 48, !"air.location_index", i32 3, i32 1, !"air.read", !"air.address_space", i32 2, !"air.arg_type_size", i32 48, !"air.arg_type_align_size", i32 16, !"air.arg_type_name", !"uchar", !"air.arg_name", !"a"}
+!9 = !{i32 5, !"air.buffer", !"air.location_index", i32 4, i32 1, !"air.read", !"air.address_space", i32 1, !"air.arg_type_name", !"uchar", !"air.arg_name", !"s"})AIR";
+
+void test_stage_metadata_normalized()
+{
+	{
+		RgfxGLSignature buffers;
+		buffers.outputs = {"float4"};
+		buffers.parameters = {"", "", "", "", "", ""};
+		std::string text = kBufferText;
+		CHECK(RgfxGLNormalizeStageText(text, buffers));
+		CHECK(text == kBufferNormalized);
+		CHECK(!RgfxGLNormalizeStageText(text, buffers));
+	}
+	RgfxGLSignature fragment;
+	fragment.outputs = {"float", "float4"};
+	fragment.parameters = {"float4", "uint"};
+	std::string text = kFragmentText;
+	CHECK(RgfxGLNormalizeStageText(text, fragment));
+	CHECK(text == kFragmentNormalized);
+	// Normalized text stays as it is.
+	CHECK(!RgfxGLNormalizeStageText(text, fragment));
+	CHECK(text == kFragmentNormalized);
+	// Where the signature names no type, a node without a type name is left as it is; the
+	// varying is still made unsigned.
+	RgfxGLSignature unnamed;
+	unnamed.parameters = {"float4", "uint"};
+	text = kFragmentText;
+	CHECK(RgfxGLNormalizeStageText(text, unnamed));
+	CHECK(text.find("!2 = !{!\"air.depth\", !\"air.depth_qualifier\", !\"air.any\"}\n") != std::string::npos);
+	CHECK(text.find("!\"air.arg_type_name\", !\"uint\", !\"air.arg_name\", !\"user(slot8)\"}") != std::string::npos);
+
+	RgfxGLSignature vertex;
+	vertex.outputs = {"float4", "uint2", "uint", "float4", "uint"};
+	vertex.parameters = {"float2", "uint", "ushort"};
+	text = kVertexText;
+	CHECK(RgfxGLNormalizeStageText(text, vertex));
+	CHECK(text == kVertexNormalized);
+
+	// A kernel's module whose one input node has no parameter index, which the input rules leave
+	// as it is.
+	const std::string kernel = "!air.kernel = !{!0}\n!0 = !{void ()* @__main, !1, !2}\n!1 = !{}\n!2 = "
+	                           "!{!3}\n!3 = !{!\"air.depth\"}\n";
+	text = kernel;
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == kernel);
+	// The module's rules hold for a kernel too: the generator's lists go.
+	text = kernel + "!gld.plugin_info = !{!1}\n";
+	CHECK(RgfxGLNormalizeStageText(text, vertex) && text == kernel);
+	// So do the input rules: a kernel's input loses a bare attribute name after its location, and
+	// its buffer gets the address space of its parameter's pointer. Our own text: the inputs as
+	// `metal` writes a stage_in kernel's, a bare name added and the buffer's address space taken
+	// out.
+	{
+		const std::string inputs = "!air.kernel = !{!0}\n"
+		                           "!0 = !{void (<2 x float>, float addrspace(1)*, i32)* @__main, !1, !2}\n"
+		                           "!1 = !{}\n"
+		                           "!2 = !{!3, !4, !5}\n";
+		const std::string thread = "!5 = !{i32 2, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", "
+		                           "!\"uint\", !\"air.arg_name\", !\"i\"}\n";
+		const std::string generated =
+		    inputs +
+		    "!3 = !{i32 0, !\"air.stage_in\", !\"air.location_index\", i32 0, i32 1, !\"attrib_0\", "
+		    "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"attrib_0\"}\n"
+		    "!4 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", "
+		    "!\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", i32 4, !\"air.arg_type_name\", "
+		    "!\"float\", !\"air.arg_name\", !\"b\"}\n" +
+		    thread;
+		const std::string normalized =
+		    inputs +
+		    "!3 = !{i32 0, !\"air.stage_in\", !\"air.location_index\", i32 0, i32 1, "
+		    "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"attrib_0\"}\n"
+		    "!4 = !{i32 1, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", "
+		    "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 4, !\"air.arg_type_align_size\", "
+		    "i32 4, !\"air.arg_type_name\", !\"float\", !\"air.arg_name\", !\"b\"}\n" +
+		    thread;
+		RgfxGLSignature compute;
+		compute.parameters = {"float2", "float", "uint"};
+		text = generated;
+		CHECK(RgfxGLNormalizeStageText(text, compute) && text == normalized);
+		CHECK(!RgfxGLNormalizeStageText(text, compute) && text == normalized);
+	}
+	// A patch control point input's fields as the generator writes them in the kernel of a
+	// tessellated draw (measured: macOS 27.0.1 arm64, m3-max-30158): a bare attribute name after
+	// the location, and the key air.arg_type_name where the type name goes. Each field loses the
+	// name and gets its member's type name from the control point function's result, in order, in
+	// a kernel and in a post-tessellation vertex function alike (three fields, an integer's name
+	// unsigned). Our own text.
+	{
+		const std::string kernelHead = "!air.kernel = !{!0}\n"
+		                               "!0 = !{void (i8*, <2 x i32>)* @__main, !1, !2, !6}\n"
+		                               "!1 = !{}\n"
+		                               "!2 = !{!3, !5}\n"
+		                               "!3 = !{i32 0, !\"air.patch_control_point_input\", !4, !7}\n"
+		                               "!4 = !{!\"air.patch_control_point_function\", { <2 x float> } (i32, i8*)* @cpf}\n"
+		                               "!5 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", "
+		                               "!\"uint2\", !\"air.arg_name\", !\"i\"}\n"
+		                               "!6 = !{!\"air.max_work_group_size\", i32 32}\n";
+		RgfxGLSignature compute;
+		compute.parameters = {"", "uint2"};
+		text = kernelHead +
+		       "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"attrib_0\", !\"air.arg_type_name\", "
+		       "!\"air.arg_type_name\", !\"air.arg_name\", !\"attrib_0\"}\n";
+		const std::string kernelFields = kernelHead + "!7 = !{!\"air.location_index\", i32 0, i32 1, "
+		                                              "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		                                              "!\"attrib_0\"}\n";
+		CHECK(RgfxGLNormalizeStageText(text, compute) && text == kernelFields);
+		CHECK(!RgfxGLNormalizeStageText(text, compute) && text == kernelFields);
+
+		const std::string vertexHead =
+		    "!air.vertex = !{!0}\n"
+		    "!0 = !{<4 x float> (i8*, <2 x float>)* @__main, !1, !3, !9}\n"
+		    "!1 = !{!2}\n"
+		    "!2 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", !\"#air_position\"}\n"
+		    "!3 = !{!4, !8}\n"
+		    "!4 = !{i32 0, !\"air.patch_control_point_input\", !5, !6, !7, !10}\n"
+		    "!5 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float>, i32 } (i32, i8*)* @cpf}\n";
+		const std::string vertexTail =
+		    "!8 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"uv\"}\n"
+		    "!9 = !{!\"air.patch\", !\"quad\", !\"air.patch_control_point\", i32 4}\n";
+		auto field = [](unsigned node, unsigned location, const char *type, bool generated) {
+			const std::string name = "attrib_" + std::to_string(location);
+			return "!" + std::to_string(node) + " = !{!\"air.location_index\", i32 " + std::to_string(location) +
+			       ", i32 1, " + (generated ? "!\"" + name + "\", " : std::string()) + "!\"air.arg_type_name\", !\"" +
+			       type + "\", !\"air.arg_name\", !\"" + name + "\"}\n";
+		};
+		RgfxGLSignature patch;
+		patch.outputs = {"float4"};
+		patch.parameters = {"", "float2"};
+		text = vertexHead + field(6, 3, "air.arg_type_name", true) + field(7, 0, "air.arg_type_name", true) +
+		       vertexTail + field(10, 1, "air.arg_type_name", true);
+		const std::string vertexFields = vertexHead + field(6, 3, "float4", false) + field(7, 0, "float2", false) +
+		                                 vertexTail + field(10, 1, "uint", false);
+		CHECK(RgfxGLNormalizeStageText(text, patch) && text == vertexFields);
+		// A field that carries the control points' gl_Position: the generator writes the key
+		// air.position after its location (measured: macOS 27.0.1 arm64, the post-tessellation
+		// vertex function of a quad patch's draw, m3-max-30334), which goes as the name does.
+		const std::string positionField = "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"air.position\", "
+		                                  "!\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", !\"air.position\"}\n";
+		text = vertexHead + field(6, 3, "float4", false) + positionField + vertexTail + field(10, 1, "uint", false);
+		CHECK(RgfxGLNormalizeStageText(text, patch));
+		CHECK(text == vertexHead + field(6, 3, "float4", false) +
+		                  "!7 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float2\", "
+		                  "!\"air.arg_name\", !\"air.position\"}\n" +
+		                  vertexTail + field(10, 1, "uint", false));
+
+		// The same input as `metal` writes it (an integer field named "int", the function's
+		// parameter its opaque pointer, the position output without air.arg_name) comes through
+		// unchanged, byte for byte.
+		const std::string metal =
+		    "!air.vertex = !{!9}\n"
+		    "!9 = !{<4 x float> (%struct._patch_control_point_t*, <2 x float>)* @v, !10, !12, !19}\n"
+		    "!10 = !{!11}\n"
+		    "!11 = !{!\"air.position\", !\"air.arg_type_name\", !\"float4\"}\n"
+		    "!12 = !{!13, !18}\n"
+		    "!13 = !{i32 0, !\"air.patch_control_point_input\", !14, !15, !16, !17}\n"
+		    "!14 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float>, i32 } (i32, "
+		    "%struct._patch_control_point_t*)* @cp}\n"
+		    "!15 = !{!\"air.location_index\", i32 3, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+		    "!\"c\"}\n"
+		    "!16 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"p\"}\n"
+		    "!17 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", "
+		    "!\"k\"}\n"
+		    "!18 = !{i32 1, !\"air.position_in_patch\", !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+		    "!\"uv\"}\n"
+		    "!19 = !{!\"air.patch\", !\"quad\", !\"air.patch_control_point\", i32 4}\n";
+		text = metal;
+		CHECK(!RgfxGLNormalizeStageText(text, patch) && text == metal);
+	}
+	text = "";
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text.empty());
+	// An entry node naming nodes the text lacks.
+	const std::string dangling = "!air.vertex = !{!0}\n!0 = !{void ()* @__main, !5, !6}\n";
+	text = dangling;
+	CHECK(!RgfxGLNormalizeStageText(text, vertex) && text == dangling);
+}
+
+// The head of a kernel module, as tests/gl_tests.mm's stage input fixtures write it.
+const char kStageInModuleHead[] =
+    "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-"
+    "v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-"
+    "v512:512:512-v1024:1024:1024-n8:16:32\"\n"
+    "target triple = \"air64_v23-apple-macosx11.0.0\"\n\n";
+
+// A tessellated draw's kernel in the generator's shape (our own text): its control point input at
+// argument 0, of two fields (float4 at attribute 0, float2 at attribute 1), the region's origin
+// and size and the thread builtins after it, then its buffers at indices 0 and 4; `indexed`, the
+// renderer's indexed variant, takes its index buffer at index 19 too, before them.
+std::string tessKernel(bool indexed)
+{
+	const std::string buffers = indexed ? "i8 addrspace(1)*, i8 addrspace(1)*, i8 addrspace(1)*"
+	                                    : "i8 addrspace(1)*, i8 addrspace(1)*";
+	const std::string index = indexed ? "i8 addrspace(1)* %index, " : "";
+	const unsigned b = indexed ? 7 : 6; // the first of the buffers 0 and 4
+	auto buffer = [](unsigned node, unsigned arg, unsigned location, const char *access, const char *name) {
+		return "!" + std::to_string(node) + " = !{i32 " + std::to_string(arg) +
+		       ", !\"air.buffer\", !\"air.location_index\", i32 " + std::to_string(location) + ", i32 1, !\"" +
+		       access + "\", !\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, " +
+		       "!\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"" +
+		       name + "\"}\n";
+	};
+	auto builtin = [](unsigned node, unsigned arg, const char *kind, const char *name) {
+		return "!" + std::to_string(node) + " = !{i32 " + std::to_string(arg) + ", !\"" + kind +
+		       "\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", !\"" + name + "\"}\n";
+	};
+	std::string t = kStageInModuleHead;
+	t += "define void @__main(i8* %cp, <2 x i32> %origin, <2 x i32> %size, <2 x i32> %group, <2 x i32> %thread, "
+	     "<2 x i32> %local, " +
+	     index +
+	     "i8 addrspace(1)* %out, i8 addrspace(1)* %uniforms) {\n"
+	     "entry:\n"
+	     "  %x = extractelement <2 x i32> %thread, i32 0\n"
+	     "  %r = call { <4 x float>, <2 x float> } @gld.cs_cpf(i32 %x, i8* %cp)\n"
+	     "  %p = extractvalue { <4 x float>, <2 x float> } %r, 0\n"
+	     "  %q = bitcast i8 addrspace(1)* %out to <4 x float> addrspace(1)*\n"
+	     "  store <4 x float> %p, <4 x float> addrspace(1)* %q, align 16\n"
+	     "  ret void\n"
+	     "}\n\n"
+	     "declare { <4 x float>, <2 x float> } @gld.cs_cpf(i32, i8*)\n\n"
+	     "!air.kernel = !{!0}\n"
+	     "!air.version = !{!15}\n"
+	     "!air.language_version = !{!16}\n"
+	     "!0 = !{void (i8*, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, " +
+	     buffers + ")* @__main, !1, !2, !17}\n" + "!1 = !{}\n" +
+	     (indexed ? "!2 = !{!3, !7, !8, !9, !10, !11, !12, !13, !14}\n" : "!2 = !{!3, !7, !8, !9, !10, !11, !13, !14}\n") +
+	     "!3 = !{i32 0, !\"air.patch_control_point_input\", !4, !5, !6}\n"
+	     "!4 = !{!\"air.patch_control_point_function\", { <4 x float>, <2 x float> } (i32, i8*)* @gld.cs_cpf}\n"
+	     "!5 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+	     "!\"attrib_0\"}\n"
+	     "!6 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+	     "!\"attrib_1\"}\n" +
+	     builtin(7, 1, "air.stage_in_grid_origin", "origin") + builtin(8, 2, "air.stage_in_grid_size", "size") +
+	     builtin(9, 3, "air.threadgroup_position_in_grid", "group") +
+	     builtin(10, 4, "air.thread_position_in_grid", "thread") +
+	     builtin(11, 5, "air.thread_position_in_threadgroup", "local") +
+	     (indexed ? buffer(12, 6, 19, "air.read", "index") : std::string("!12 = !{}\n")) +
+	     buffer(13, b, 0, "air.read_write", "out") + buffer(14, b + 1, 4, "air.read_write", "uniforms") +
+	     "!15 = !{i32 2, i32 3, i32 0}\n"
+	     "!16 = !{!\"Metal\", i32 2, i32 3, i32 0}\n"
+	     "!17 = !{!\"air.max_work_group_size\", i32 32}\n";
+	return t;
+}
+
+// A tessellated draw's kernel of Heaven's shape (our own text): its control point input at argument
+// 4, after the thread position, the region's size and two buffers (indices 0 and 1), of four
+// fields of mixed types: float4, float3, float2 and int at attributes 0 to 3; a buffer at index 2
+// after it.
+std::string heavenKernel()
+{
+	std::string t = kStageInModuleHead;
+	t += "define void @__main(<2 x i32> %thread, <2 x i32> %size, i8 addrspace(1)* %u0, i8 addrspace(1)* %u1, "
+	     "i8* %cp, i8 addrspace(1)* %out) {\n"
+	     "entry:\n"
+	     "  %x = extractelement <2 x i32> %thread, i32 0\n"
+	     "  %r = call { <4 x float>, <3 x float>, <2 x float>, i32 } @gld.cs_cpf(i32 %x, i8* %cp)\n"
+	     "  %k = extractvalue { <4 x float>, <3 x float>, <2 x float>, i32 } %r, 3\n"
+	     "  %q = bitcast i8 addrspace(1)* %out to i32 addrspace(1)*\n"
+	     "  store i32 %k, i32 addrspace(1)* %q, align 4\n"
+	     "  ret void\n"
+	     "}\n\n"
+	     "declare { <4 x float>, <3 x float>, <2 x float>, i32 } @gld.cs_cpf(i32, i8*)\n\n"
+	     "!air.kernel = !{!0}\n"
+	     "!air.version = !{!15}\n"
+	     "!air.language_version = !{!16}\n"
+	     "!0 = !{void (<2 x i32>, <2 x i32>, i8 addrspace(1)*, i8 addrspace(1)*, i8*, i8 addrspace(1)*)* @__main, "
+	     "!1, !2}\n"
+	     "!1 = !{}\n"
+	     "!2 = !{!3, !4, !5, !6, !7, !14}\n"
+	     "!3 = !{i32 0, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	     "!\"thread\"}\n"
+	     "!4 = !{i32 1, !\"air.stage_in_grid_size\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	     "!\"size\"}\n"
+	     "!5 = !{i32 2, !\"air.buffer\", !\"air.location_index\", i32 0, i32 1, !\"air.read\", !\"air.address_space\", "
+	     "i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", "
+	     "!\"uchar\", !\"air.arg_name\", !\"u0\"}\n"
+	     "!6 = !{i32 3, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read\", !\"air.address_space\", "
+	     "i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", "
+	     "!\"uchar\", !\"air.arg_name\", !\"u1\"}\n"
+	     "!7 = !{i32 4, !\"air.patch_control_point_input\", !8, !9, !10, !11, !12}\n"
+	     "!8 = !{!\"air.patch_control_point_function\", { <4 x float>, <3 x float>, <2 x float>, i32 } (i32, i8*)* "
+	     "@gld.cs_cpf}\n"
+	     "!9 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"float4\", !\"air.arg_name\", "
+	     "!\"attrib_0\"}\n"
+	     "!10 = !{!\"air.location_index\", i32 1, i32 1, !\"air.arg_type_name\", !\"float3\", !\"air.arg_name\", "
+	     "!\"attrib_1\"}\n"
+	     "!11 = !{!\"air.location_index\", i32 2, i32 1, !\"air.arg_type_name\", !\"float2\", !\"air.arg_name\", "
+	     "!\"attrib_2\"}\n"
+	     "!12 = !{!\"air.location_index\", i32 3, i32 1, !\"air.arg_type_name\", !\"int\", !\"air.arg_name\", "
+	     "!\"attrib_3\"}\n"
+	     "!14 = !{i32 5, !\"air.buffer\", !\"air.location_index\", i32 2, i32 1, !\"air.read_write\", "
+	     "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, "
+	     "!\"air.arg_type_name\", !\"uchar\", !\"air.arg_name\", !\"out\"}\n"
+	     "!15 = !{i32 2, i32 3, i32 0}\n"
+	     "!16 = !{!\"Metal\", i32 2, i32 3, i32 0}\n";
+	return t;
+}
+
+// A kernel module in the GL generator's shape, written here: its one control point input, at
+// argument 2 between a buffer and the grid builtins, of one field of LLVM type `type` (its MSL
+// name `typeName`) at attribute 0, read at i = the thread's x and stored at
+// out + 16 * (x + y * width), as tests/stage_in_oracle.metal's kernels store their stage input.
+std::string controlPointKernel(const std::string &type, const std::string &typeName)
+{
+	const std::string result = "{ " + type + " }";
+	return "target datalayout = \"e-p:64:64:64-i1:8:8-i8:8:8-i16:16:16-i32:32:32-i64:64:64-f32:32:32-f64:64:64-"
+	       "v16:16:16-v24:32:32-v32:32:32-v48:64:64-v64:64:64-v96:128:128-v128:128:128-v192:256:256-v256:256:256-"
+	       "v512:512:512-v1024:1024:1024-n8:16:32\"\n"
+	       "target triple = \"air64_v23-apple-macosx11.0.0\"\n"
+	       "\n"
+	       "define void @k(i8 addrspace(1)* %out, <2 x i32> %i, i8* %h, <2 x i32> %g) {\n"
+	       "entry:\n"
+	       "  %x = extractelement <2 x i32> %i, i32 0\n"
+	       "  %y = extractelement <2 x i32> %i, i32 1\n"
+	       "  %w = extractelement <2 x i32> %g, i32 0\n"
+	       "  %r = call " +
+	       result + " @gld.cs_cpf(i32 %x, i8* %h)\n" + "  %v = extractvalue " + result +
+	       " %r, 0\n"
+	       "  %yw = mul i32 %y, %w\n"
+	       "  %e = add i32 %yw, %x\n"
+	       "  %o = mul i32 %e, 16\n"
+	       "  %z = zext i32 %o to i64\n"
+	       "  %p = getelementptr inbounds i8, i8 addrspace(1)* %out, i64 %z\n"
+	       "  %q = bitcast i8 addrspace(1)* %p to " +
+	       type + " addrspace(1)*\n" + "  store " + type + " %v, " + type +
+	       " addrspace(1)* %q, align 4\n"
+	       "  ret void\n"
+	       "}\n"
+	       "\n"
+	       "declare " +
+	       result +
+	       " @gld.cs_cpf(i32, i8*)\n"
+	       "\n"
+	       "!air.kernel = !{!0}\n"
+	       "!air.version = !{!8}\n"
+	       "!air.language_version = !{!9}\n"
+	       "!air.compile_options = !{!10, !11}\n"
+	       "!0 = !{void (i8 addrspace(1)*, <2 x i32>, i8*, <2 x i32>)* @k, !1, !2}\n"
+	       "!1 = !{}\n"
+	       "!2 = !{!3, !4, !5, !7}\n"
+	       "!3 = !{i32 0, !\"air.buffer\", !\"air.location_index\", i32 1, i32 1, !\"air.read_write\", "
+	       "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, !\"air.arg_type_align_size\", i32 1, "
+	       "!\"air.arg_type_name\", !\"char\", !\"air.arg_name\", !\"out\"}\n"
+	       "!4 = !{i32 1, !\"air.thread_position_in_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	       "!\"i\"}\n"
+	       "!5 = !{i32 2, !\"air.patch_control_point_input\", !6, !12}\n"
+	       "!6 = !{!\"air.patch_control_point_function\", " +
+	       result +
+	       " (i32, i8*)* @gld.cs_cpf}\n"
+	       "!7 = !{i32 3, !\"air.threads_per_grid\", !\"air.arg_type_name\", !\"uint2\", !\"air.arg_name\", "
+	       "!\"g\"}\n"
+	       "!8 = !{i32 2, i32 3, i32 0}\n"
+	       "!9 = !{!\"Metal\", i32 2, i32 3, i32 0}\n"
+	       "!10 = !{!\"air.compile.fast_math_enable\"}\n"
+	       "!11 = !{!\"air.compile.denorms_disable\"}\n"
+	       "!12 = !{!\"air.location_index\", i32 0, i32 1, !\"air.arg_type_name\", !\"" +
+	       typeName + "\", !\"air.arg_name\", !\"a\"}\n";
+}
+
+// One case of the oracle: attribute 0 of `format` at `offset` in layout 0 (`stride`, `step`,
+// `rate`), read into a field of `type`; the grid `width` by `height`, its region's origin `origin`;
+// an index buffer of `indexType` at index 2 where the layout steps by index.
+struct StageInCase {
+	MTLAttributeFormat format;
+	const char *type, *typeName, *oracle;
+	unsigned lanes;
+	uint32_t offset = 0, stride = 16;
+	MTLStepFunction step = MTLStepFunctionThreadPositionInGridX;
+	uint32_t rate = 1;
+	unsigned width = 1024, height = 1;
+	MTLIndexType indexType = MTLIndexTypeUInt16;
+};
+
+uint32_t nextRandom(uint32_t &s)
+{
+	s ^= s << 13;
+	s ^= s >> 17;
+	s ^= s << 5;
+	return s;
+}
+
+// What `c` stores, in `out`, run on `metal` once as `pipeline` (the oracle's [[stage_in]] kernel
+// under the descriptor, `stageIn` true) or as the specialized kernel with no descriptor.
+void runStageInCase(id<MTLDevice> metal, id<MTLCommandQueue> queue, id<MTLComputePipelineState> pipeline,
+                    const StageInCase &c, const std::vector<uint8_t> &data, const std::vector<uint8_t> &indices,
+                    std::vector<uint8_t> &out)
+{
+	id<MTLBuffer> in = [metal newBufferWithBytes:data.data() length:data.size() options:MTLResourceStorageModeShared];
+	id<MTLBuffer> index = [metal newBufferWithBytes:indices.data()
+	                                         length:indices.size()
+	                                        options:MTLResourceStorageModeShared];
+	const size_t outLength = 16 * c.width * c.height;
+	id<MTLBuffer> result = [metal newBufferWithLength:outLength options:MTLResourceStorageModeShared];
+	std::memset(result.contents, 0xa5, outLength);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+	[enc setComputePipelineState:pipeline];
+	[enc setBuffer:in offset:0 atIndex:0];
+	[enc setBuffer:result offset:0 atIndex:1];
+	[enc setBuffer:index offset:0 atIndex:2];
+	[enc setStageInRegion:MTLRegionMake2D(0, 0, c.width, c.height)];
+	[enc dispatchThreads:MTLSizeMake(c.width, c.height, 1) threadsPerThreadgroup:MTLSizeMake(1, 1, 1)];
+	[enc endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	const uint8_t *bytes = static_cast<const uint8_t *>(result.contents);
+	out.assign(bytes, bytes + outLength);
+}
+
+// A GL kernel's control point input, specialized under a stage input descriptor
+// (RgfxGLSpecializeStageIn), fetches what Metal's own [[stage_in]] kernel fetches under the same
+// descriptor on this Mac's GPU, bit for bit: every MTLAttributeFormat into a field of four
+// components of its kind (float for the normalized, half and float formats, int or uint for the
+// integer ones), fields of fewer components and an integer scalar, an attribute offset, and the
+// layouts that step by thread position in X, by index in X (both index types), by position in Y
+// at a step rate, and constant. The oracle's kernels are tests/stage_in_oracle.metal's
+// (RGFX_STAGE_IN_ORACLE).
+void test_stage_in_matches_metal()
+{
+	const char *path = getenv("RGFX_STAGE_IN_ORACLE");
+	CHECK(path != nullptr);
+	if (path == nullptr)
+		return;
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	if (metal == nil)
+		return;
+	NSError *error = nil;
+	id<MTLLibrary> oracle = [metal newLibraryWithURL:[NSURL fileURLWithPath:@(path)] error:&error];
+	CHECK(oracle != nil);
+	if (oracle == nil)
+		return;
+	id<MTLCommandQueue> queue = [metal newCommandQueue];
+
+	std::vector<StageInCase> cases;
+	auto add = [&cases](MTLAttributeFormat format, const char *type, const char *typeName, const char *kernel,
+	                    unsigned lanes) {
+		StageInCase c = {};
+		c.format = format;
+		c.type = type;
+		c.typeName = typeName;
+		c.oracle = kernel;
+		c.lanes = lanes;
+		cases.push_back(c);
+		return &cases.back();
+	};
+	for (uint32_t f = 1; f <= 55; f++) {
+		if (f == 43 || f == 44)
+			continue;
+		const bool isInteger = (f >= 1 && f <= 6) || (f >= 13 && f <= 18) || (f >= 32 && f <= 39) || f == 45 ||
+		                       f == 46 || f == 49 || f == 50;
+		const bool isSigned = (f >= 4 && f <= 6) || (f >= 16 && f <= 18) || (f >= 32 && f <= 35) || f == 46 || f == 50;
+		if (!isInteger)
+			add(static_cast<MTLAttributeFormat>(f), "<4 x float>", "float4", "f4", 4);
+		else if (isSigned)
+			add(static_cast<MTLAttributeFormat>(f), "<4 x i32>", "int4", "i4", 4);
+		else
+			add(static_cast<MTLAttributeFormat>(f), "<4 x i32>", "uint4", "u4", 4);
+	}
+	add(MTLAttributeFormatFloat4, "float", "float", "f1", 1);
+	add(MTLAttributeFormatFloat4, "<2 x float>", "float2", "f2", 2);
+	add(MTLAttributeFormatFloat3, "<3 x float>", "float3", "f3", 3);
+	add(MTLAttributeFormatUChar4Normalized, "<2 x float>", "float2", "f2", 2);
+	add(MTLAttributeFormatHalf2, "<3 x float>", "float3", "f3", 3);
+	add(MTLAttributeFormatInt, "i32", "int", "i1", 1);
+	add(MTLAttributeFormatShort2, "i32", "int", "i1", 1);
+	add(MTLAttributeFormatFloat2, "<4 x float>", "float4", "f4", 4)->offset = 8;
+	add(MTLAttributeFormatUShort4Normalized, "<4 x float>", "float4", "f4", 4)->step =
+	    MTLStepFunctionThreadPositionInGridXIndexed;
+	{
+		StageInCase *c = add(MTLAttributeFormatFloat4, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionThreadPositionInGridXIndexed;
+		c->indexType = MTLIndexTypeUInt32;
+	}
+	{
+		StageInCase *c = add(MTLAttributeFormatFloat4, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionThreadPositionInGridY;
+		c->rate = 3;
+		c->width = 4;
+		c->height = 16;
+	}
+	{
+		// Metal takes a constant layout's step rate only as 0.
+		StageInCase *c = add(MTLAttributeFormatChar4Normalized, "<4 x float>", "float4", "f4", 4);
+		c->step = MTLStepFunctionConstant;
+		c->rate = 0;
+	}
+
+	for (const StageInCase &c : cases) {
+		MTLStageInputOutputDescriptor *descriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+		descriptor.attributes[0].format = c.format;
+		descriptor.attributes[0].offset = c.offset;
+		descriptor.attributes[0].bufferIndex = 0;
+		descriptor.layouts[0].stride = c.stride;
+		descriptor.layouts[0].stepFunction = c.step;
+		descriptor.layouts[0].stepRate = c.rate;
+		descriptor.indexType = c.indexType;
+		descriptor.indexBufferIndex = 2;
+		MTLComputePipelineDescriptor *reference = [MTLComputePipelineDescriptor new];
+		reference.computeFunction = [oracle newFunctionWithName:@(c.oracle)];
+		reference.stageInputDescriptor = descriptor;
+		id<MTLComputePipelineState> metalPipeline = [metal newComputePipelineStateWithDescriptor:reference
+		                                                                                 options:0
+		                                                                              reflection:nil
+		                                                                                   error:&error];
+		CHECK(metalPipeline != nil);
+
+		RgfxGLStageIn in;
+		in.attributes[0] = {static_cast<uint32_t>(c.format), c.offset, 0};
+		in.layouts[0] = {c.stride, static_cast<uint32_t>(c.step), c.rate};
+		in.indexType = static_cast<uint32_t>(c.indexType);
+		in.indexBufferIndex = 2;
+		RgfxGLLowered lowered;
+		std::string why;
+		const bool specialized = RgfxGLSpecializeStageIn(controlPointKernel(c.type, c.typeName), in, lowered, why);
+		CHECK(specialized && lowered.entry == "k" && lowered.stage == RgfxMetallibStage::Kernel);
+		if (!specialized) {
+			fprintf(stderr, "stage input oracle: format %lu: %s\n", static_cast<unsigned long>(c.format), why.c_str());
+			continue;
+		}
+		dispatch_data_t bytes = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
+		                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+		id<MTLLibrary> library = [metal newLibraryWithData:bytes error:&error];
+		CHECK(library != nil);
+		MTLComputePipelineDescriptor *ours = [MTLComputePipelineDescriptor new];
+		ours.computeFunction = [library newFunctionWithName:@"k"];
+		id<MTLComputePipelineState> ourPipeline = [metal newComputePipelineStateWithDescriptor:ours
+		                                                                               options:0
+		                                                                            reflection:nil
+		                                                                                 error:&error];
+		CHECK(ourPipeline != nil);
+		if (metalPipeline == nil || ourPipeline == nil) {
+			fprintf(stderr, "stage input oracle: format %lu: no pipeline: %s\n", static_cast<unsigned long>(c.format),
+			        error.localizedDescription.UTF8String);
+			continue;
+		}
+
+		// Every byte pattern's chance: random elements, and indices into them.
+		uint32_t seed = 0x9e3779b9u ^ (static_cast<uint32_t>(c.format) * 2654435761u) ^ c.offset ^
+		                (static_cast<uint32_t>(c.step) << 8);
+		const unsigned elements = 1024;
+		std::vector<uint8_t> data(elements * c.stride + 16);
+		for (uint8_t &b : data)
+			b = static_cast<uint8_t>(nextRandom(seed) >> 24);
+		std::vector<uint8_t> indices(4 * c.width * c.height);
+		for (unsigned i = 0; i < c.width * c.height; i++) {
+			const uint32_t k = nextRandom(seed) % elements;
+			if (c.indexType == MTLIndexTypeUInt32)
+				std::memcpy(&indices[4 * i], &k, 4);
+			else {
+				const uint16_t k16 = static_cast<uint16_t>(k);
+				std::memcpy(&indices[2 * i], &k16, 2);
+			}
+		}
+		std::vector<uint8_t> expected, got;
+		runStageInCase(metal, queue, metalPipeline, c, data, indices, expected);
+		runStageInCase(metal, queue, ourPipeline, c, data, indices, got);
+		unsigned wrong = 0;
+		for (unsigned t = 0; t < c.width * c.height; t++)
+			if (std::memcmp(&expected[16 * t], &got[16 * t], 4 * c.lanes) != 0) {
+				if (wrong++ < 3) {
+					uint32_t e[4] = {}, g[4] = {};
+					std::memcpy(e, &expected[16 * t], 4 * c.lanes);
+					std::memcpy(g, &got[16 * t], 4 * c.lanes);
+					fprintf(stderr,
+					        "stage input oracle: format %lu field %s step %lu: thread %u: Metal %08x %08x %08x %08x, "
+					        "ours %08x %08x %08x %08x\n",
+					        static_cast<unsigned long>(c.format), c.typeName, static_cast<unsigned long>(c.step), t,
+					        e[0], e[1], e[2], e[3], g[0], g[1], g[2], g[3]);
+				}
+			}
+		CHECK(wrong == 0);
+	}
+}
+
+// Whether this Mac's Metal makes a compute pipeline of `lowered`'s kernel, with no stage input
+// descriptor.
+bool metalMakesKernel(id<MTLDevice> metal, const RgfxGLLowered &lowered)
+{
+	dispatch_data_t bytes = dispatch_data_create(lowered.metallib.data(), lowered.metallib.size(), nullptr,
+	                                             DISPATCH_DATA_DESTRUCTOR_DEFAULT);
+	NSError *error = nil;
+	id<MTLLibrary> library = [metal newLibraryWithData:bytes error:&error];
+	id<MTLFunction> kernel = [library newFunctionWithName:@(lowered.entry.c_str())];
+	if (kernel == nil)
+		return false;
+	return [metal newComputePipelineStateWithFunction:kernel error:&error] != nil;
+}
+
+bool has(const std::string &text, const std::string &part)
+{
+	return text.find(part) != std::string::npos;
+}
+
+// A GL kernel's patch control point input made a kernel under a stage input descriptor
+// (RgfxGLSpecializeStageIn), over modules written here in the generator's shape: the wrapper
+// takes the kernel's arguments but the input, then a buffer at each index the fields read that the
+// kernel has none at, then the region's origin where the kernel takes none; the input nodes are
+// numbered as its arguments, and the new ones follow; the kernel is internal under its name and
+// .rgfx_gl, called with the record in the input's place; the fetch defines the control point
+// function and reads each field at its element; the system's LLVM parses the text, and this Mac's
+// Metal makes a pipeline of the kernel. A field Metal fetches no format of, a layout no compute
+// stage input steps by and a module without the input are refused, the text as it was; the cache
+// key differs in each field; and a function RgfxGLFunction did not make is not specialized.
+void test_stage_in_specialized()
+{
+	id<MTLDevice> metal = MTLCreateSystemDefaultDevice();
+	CHECK(metal != nil);
+	RgfxGLStageIn tess;
+	tess.attributes[0] = {MTLAttributeFormatFloat4, 0, 5};
+	tess.attributes[1] = {MTLAttributeFormatFloat2, 0, 6};
+	tess.layouts[5] = {16, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.layouts[6] = {8, MTLStepFunctionThreadPositionInGridX, 1};
+	tess.indexType = MTLIndexTypeUInt16;
+	tess.indexBufferIndex = 19;
+	std::string why;
+	{
+		std::string text = tessKernel(false);
+		CHECK(RgfxGLSpecializeStageInText(text, tess, why));
+		CHECK(has(text, "define internal void @__main.rgfx_gl(i8* %cp, <2 x i32> %origin, "));
+		CHECK(has(text, "define void @__main(<2 x i32> %rgfx.a1, <2 x i32> %rgfx.a2, <2 x i32> %rgfx.a3, "
+		                "<2 x i32> %rgfx.a4, <2 x i32> %rgfx.a5, i8 addrspace(1)* %rgfx.a6, i8 addrspace(1)* "
+		                "%rgfx.a7, i8 addrspace(1)* %rgfx.b5, i8 addrspace(1)* %rgfx.b6) {\n"));
+		CHECK(has(text, "  call void @__main.rgfx_gl(i8* %rgfx.7, <2 x i32> %rgfx.a1, "));
+		CHECK(has(text, "!0 = !{void (<2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, <2 x i32>, i8 addrspace(1)*, "
+		                "i8 addrspace(1)*, i8 addrspace(1)*, i8 addrspace(1)*)* @__main, !1, !20, !17}\n"));
+		CHECK(has(text, "!7 = !{i32 0, !\"air.stage_in_grid_origin\""));
+		CHECK(has(text, "!14 = !{i32 6, !\"air.buffer\", !\"air.location_index\", i32 4, "));
+		CHECK(has(text, "!18 = !{i32 7, !\"air.buffer\", !\"air.location_index\", i32 5, i32 1, !\"air.read\", "
+		                "!\"air.address_space\", i32 1, !\"air.arg_type_size\", i32 1, "
+		                "!\"air.arg_type_align_size\", i32 1, !\"air.arg_type_name\", !\"uchar\", "
+		                "!\"air.arg_name\", !\"rgfx_stage_in_buffer_5\"}\n"));
+		CHECK(has(text, "!19 = !{i32 8, !\"air.buffer\", !\"air.location_index\", i32 6, "));
+		CHECK(has(text, "!20 = !{!7, !8, !9, !10, !11, !13, !14, !18, !19}\n"));
+		CHECK(!has(text, "declare { <4 x float>, <2 x float> } @gld.cs_cpf"));
+		CHECK(has(text, "define internal { <4 x float>, <2 x float> } @gld.cs_cpf(i32 %rgfx.i, i8* %rgfx.h) "
+		                "alwaysinline {\n"));
+		// Each field at the origin's x plus i, times its layout's stride, plus its offset.
+		CHECK(has(text, "  %rgfx.5 = add i32 %rgfx.i, %rgfx.2\n  %rgfx.6 = mul i32 %rgfx.5, 16\n"));
+		CHECK(has(text, "  %rgfx.28 = mul i32 %rgfx.5, 8\n"));
+		CHECK(has(text, "  ret { <4 x float>, <2 x float> } %rgfx.41\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(false), tess, lowered, why));
+		CHECK(lowered.entry == "__main" && lowered.stage == RgfxMetallibStage::Kernel && !lowered.metallib.empty());
+		CHECK(metalMakesKernel(metal, lowered));
+	}
+	{
+		// Indexed: the kernel's own index buffer at index 19 serves, read as UInt16.
+		RgfxGLStageIn indexed = tess;
+		indexed.layouts[5].stepFunction = indexed.layouts[6].stepFunction = MTLStepFunctionThreadPositionInGridXIndexed;
+		std::string text = tessKernel(true);
+		CHECK(RgfxGLSpecializeStageInText(text, indexed, why));
+		CHECK(!has(text, "%rgfx.b19"));
+		CHECK(has(text, "i8 addrspace(1)* %rgfx.a8, i8 addrspace(1)* %rgfx.b5, i8 addrspace(1)* %rgfx.b6) {\n"));
+		CHECK(has(text, "  store i8 addrspace(1)* %rgfx.a6, i8 addrspace(1)** %rgfx.3, align 8\n"));
+		CHECK(has(text, "  %rgfx.11 = load i16, i16 addrspace(1)* %rgfx.10, align 2\n"
+		                "  %rgfx.12 = zext i16 %rgfx.11 to i32\n"
+		                "  %rgfx.13 = add i32 %rgfx.12, %rgfx.2\n"));
+		CHECK(has(text, "!20 = !{!7, !8, !9, !10, !11, !12, !13, !14, !18, !19}\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(true), indexed, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+	{
+		// By Y: the thread position's y over each layout's step rate.
+		RgfxGLStageIn byY = tess;
+		byY.layouts[5].stepFunction = byY.layouts[6].stepFunction = MTLStepFunctionThreadPositionInGridY;
+		byY.layouts[6].stepRate = 2;
+		std::string text = tessKernel(false);
+		CHECK(RgfxGLSpecializeStageInText(text, byY, why));
+		CHECK(has(text, "  %rgfx.5 = extractelement <2 x i32> %rgfx.a4, i32 1\n"));
+		CHECK(has(text, "  %rgfx.6 = udiv i32 %rgfx.4, 1\n") && has(text, "  %rgfx.29 = udiv i32 %rgfx.4, 2\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(tessKernel(false), byY, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+
+	// Heaven's shape: the input at argument 4; attributes 0 and 1 share layout 7 at offsets 0 and 16;
+	// a half2 into the float2 and an int into the int; no origin, which the wrapper takes last.
+	RgfxGLStageIn heaven;
+	heaven.attributes[0] = {MTLAttributeFormatFloat4, 0, 7};
+	heaven.attributes[1] = {MTLAttributeFormatFloat3, 16, 7};
+	heaven.attributes[2] = {MTLAttributeFormatHalf2, 0, 8};
+	heaven.attributes[3] = {MTLAttributeFormatInt, 0, 9};
+	heaven.layouts[7] = {28, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.layouts[8] = {4, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.layouts[9] = {4, MTLStepFunctionThreadPositionInGridX, 1};
+	heaven.indexType = MTLIndexTypeUInt32;
+	heaven.indexBufferIndex = 10;
+	{
+		std::string text = heavenKernel();
+		CHECK(RgfxGLSpecializeStageInText(text, heaven, why));
+		CHECK(has(text, "define void @__main(<2 x i32> %rgfx.a0, <2 x i32> %rgfx.a1, i8 addrspace(1)* %rgfx.a2, "
+		                "i8 addrspace(1)* %rgfx.a3, i8 addrspace(1)* %rgfx.a5, i8 addrspace(1)* %rgfx.b7, "
+		                "i8 addrspace(1)* %rgfx.b8, i8 addrspace(1)* %rgfx.b9, <2 x i32> %rgfx.origin) {\n"));
+		CHECK(has(text, "  call void @__main.rgfx_gl(<2 x i32> %rgfx.a0, <2 x i32> %rgfx.a1, i8 addrspace(1)* "
+		                "%rgfx.a2, i8 addrspace(1)* %rgfx.a3, i8* %rgfx.8, i8 addrspace(1)* %rgfx.a5)\n"));
+		CHECK(has(text, "!14 = !{i32 4, !\"air.buffer\", !\"air.location_index\", i32 2, "));
+		CHECK(has(text, "!20 = !{i32 8, !\"air.stage_in_grid_origin\", !\"air.arg_type_name\", !\"uint2\", "
+		                "!\"air.arg_name\", !\"rgfx_grid_origin\"}\n"));
+		CHECK(has(text, "!21 = !{!3, !4, !5, !6, !14, !17, !18, !19, !20}\n"));
+		CHECK(has(text, "  %rgfx.6 = mul i32 %rgfx.5, 28\n  %rgfx.7 = add i32 %rgfx.6, 0\n"));
+		CHECK(has(text, "  %rgfx.28 = mul i32 %rgfx.5, 28\n  %rgfx.29 = add i32 %rgfx.28, 16\n"));
+		CHECK(has(text, "  %rgfx.59 = fpext half %rgfx.54 to float\n"));
+		CHECK(has(text, "  %rgfx.72 = insertvalue { <4 x float>, <3 x float>, <2 x float>, i32 } %rgfx.63, i32 "
+		                "%rgfx.71, 3\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(heavenKernel(), heaven, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+	{
+		// Indexed, its UInt32 index buffer at index 10, which the kernel lacks.
+		RgfxGLStageIn indexed = heaven;
+		for (unsigned b = 7; b <= 9; b++)
+			indexed.layouts[b].stepFunction = MTLStepFunctionThreadPositionInGridXIndexed;
+		std::string text = heavenKernel();
+		CHECK(RgfxGLSpecializeStageInText(text, indexed, why));
+		CHECK(has(text, "i8 addrspace(1)* %rgfx.b9, i8 addrspace(1)* %rgfx.b10, <2 x i32> %rgfx.origin) {\n"));
+		CHECK(has(text, "  %rgfx.11 = load i32, i32 addrspace(1)* %rgfx.10, align 4\n"
+		                "  %rgfx.12 = add i32 %rgfx.11, %rgfx.2\n"));
+		CHECK(has(text, "!20 = !{i32 8, !\"air.buffer\", !\"air.location_index\", i32 10, "));
+		CHECK(has(text, "!22 = !{!3, !4, !5, !6, !14, !17, !18, !19, !20, !21}\n"));
+		RgfxGLLowered lowered;
+		CHECK(RgfxGLSpecializeStageIn(heavenKernel(), indexed, lowered, why) && metalMakesKernel(metal, lowered));
+	}
+
+	// Refusals, the text as it was.
+	{
+		RgfxGLStageIn none = heaven;
+		none.attributes[2].format = MTLAttributeFormatInvalid;
+		const std::string original = heavenKernel();
+		std::string text = original;
+		CHECK(!RgfxGLSpecializeStageInText(text, none, why) && text == original);
+		CHECK(why == "the stage input descriptor's attribute 2 has no format the fetch reads (0)");
+		RgfxGLStageIn perVertex = heaven;
+		perVertex.layouts[8].stepFunction = MTLStepFunctionPerVertex;
+		CHECK(!RgfxGLSpecializeStageInText(text, perVertex, why) && text == original);
+		CHECK(why == "the stage input descriptor's layout 8 steps by function 1, which no compute stage input takes");
+		text = controlPointKernel("<4 x float>", "float4");
+		const size_t input = text.find("!\"air.patch_control_point_input\"");
+		text.replace(input, std::strlen("!\"air.patch_control_point_input\""), "!\"air.stage_in\"");
+		const std::string withoutInput = text;
+		CHECK(!RgfxGLSpecializeStageInText(text, heaven, why) && text == withoutInput);
+		CHECK(why == "the kernel takes no patch control point input");
+	}
+	// The cache key: equal for equal descriptors, and different where any field differs.
+	{
+		CHECK(RgfxGLStageIn().key() == RgfxGLStageIn().key() && heaven.key() == RgfxGLStageIn(heaven).key());
+		std::vector<RgfxGLStageIn> changed(8, heaven);
+		changed[0].attributes[30].format = 1;
+		changed[1].attributes[30].offset = 4;
+		changed[2].attributes[30].bufferIndex = 1;
+		changed[3].layouts[30].stride = 4;
+		changed[4].layouts[30].stepFunction = 5;
+		changed[5].layouts[30].stepRate = 2;
+		changed[6].indexType = 0;
+		changed[7].indexBufferIndex = 11;
+		for (const RgfxGLStageIn &c : changed)
+			CHECK(c.key() != heaven.key());
+	}
+	// The kernel's reflection lists its stage input region's built-ins as Metal does (measured:
+	// built-in types 15 and 16, of uint2, on the M3 Max under macOS 27.0.1 and the AMD Radeon Pro
+	// 5300M and the Intel UHD Graphics 630 under macOS 26.7.1; m3-max-30339 to 30341).
+	{
+		auto builtIn = [](uint32_t position, const char *kind, const char *name) {
+			RgfxAirNode n;
+			n.hasPosition = true;
+			n.position = position;
+			n.kind = kind;
+			n.typeName = "uint2";
+			n.name = name;
+			return n;
+		};
+		RgfxAirEntries module;
+		RgfxAirEntry entry;
+		entry.name = "__main";
+		entry.stage = RgfxAirEntryStage::Kernel;
+		entry.arguments = {builtIn(0, "air.stage_in_grid_origin", "grid_origin"),
+		                   builtIn(1, "air.stage_in_grid_size", "grid_size"),
+		                   builtIn(2, "air.thread_position_in_grid", "thread_position_in_grid")};
+		module.entries = {entry};
+		RgfxStageReflection stage;
+		NSString *reason = nil;
+		CHECK(RgfxStageReflectionOfEntry(module, module.entries[0], nullptr, 0, @"stageInBuffer", {}, stage, &reason,
+		                                 true));
+		NSArray *builtIns = [RgfxComputePipelineReflectionMake(stage, &reason) valueForKey:@"builtInArguments"];
+		CHECK(builtIns.count == 3);
+		if (builtIns.count == 3) {
+			const NSUInteger kTypes[] = {15, 16, 5};
+			for (NSUInteger i = 0; i < 3; i++)
+				CHECK([[builtIns[i] valueForKey:@"builtInType"] unsignedIntegerValue] == kTypes[i] &&
+				      [[builtIns[i] valueForKey:@"builtInDataType"] unsignedIntegerValue] == MTLDataTypeUInt2);
+		}
+	}
+	// A function RgfxGLFunction made no control point kernel of.
+	{
+		id<MTLFunction> kernel = (id<MTLFunction>)[NSNull null];
+		NSError *error = nil;
+		MTLStageInputOutputDescriptor *descriptor = [MTLStageInputOutputDescriptor stageInputOutputDescriptor];
+		CHECK(!RgfxGLStageInKernel(nil, descriptor, &kernel, &error) && kernel == (id)[NSNull null]);
+		CHECK(!RgfxGLStageInKernel((id<MTLFunction>)[NSObject new], descriptor, &kernel, &error) &&
+		      kernel == (id)[NSNull null] && error == nil);
+	}
+}
+
+} // namespace
+
+void rgfxGLTests()
+{
+	@autoreleasepool {
+		test_metallib_writer();
+		test_metallib_writer_several();
+		test_cl_library();
+		test_cl_library_arguments();
+		test_gl_function_answers();
+		test_reflection_answers_return_data();
+		test_stage_metadata_normalized();
+		test_stage_in_specialized();
+		test_stage_in_matches_metal();
+	}
+}

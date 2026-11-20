@@ -23,6 +23,11 @@
  * ordinary one: letting it go at the close (closeWindow) frees the whole range, every span in it
  * with it, before the context's blocks are freed.
  *
+ * The context's doorbell page (openDoorbellPage) lies apart from the window, mapped anywhere in
+ * the process, uncached: one page of BAR 4, not of the region, which holds nothing but the
+ * context's own doorbell (RgfxDoorbellPages.hpp). It goes at the release with the window, and is
+ * unbound before another context is given it.
+ *
  * Every failure fails the asking op with an IOReturn: nothing here panics or stops the device.
  *
  * Our own code; it names only SDK-public IOKit calls.
@@ -105,11 +110,46 @@ void RgfxAcceleratorUserClient::closeWindow()
 		      context, n, ns / 1000, r, rns / 1000);
 }
 
-IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length)
+void RgfxAcceleratorUserClient::openDoorbellPage()
+{
+	IOMemoryMap *map = nullptr;
+	const UInt32 page = owner ? owner->openDoorbellPage(context, task, &map) : kRgfxNoDoorbellPage;
+	IOLockLock(listLock);
+	doorbellPage = page;
+	doorbellMap = map;
+	doorbellAddress = map ? map->getAddress() : 0;
+	IOLockUnlock(listLock);
+}
+
+void RgfxAcceleratorUserClient::closeDoorbellPage()
+{
+	if (!listLock)
+		return;
+	IOLockLock(listLock);
+	const UInt32 page = doorbellPage;
+	IOMemoryMap *map = doorbellMap;
+	doorbellPage = kRgfxNoDoorbellPage;
+	doorbellMap = nullptr;
+	doorbellAddress = 0;
+	IOLockUnlock(listLock);
+	// Out of the process first; then unbound, and given back to the next context's open.
+	OSSafeReleaseNULL(map);
+	if (page != kRgfxNoDoorbellPage && owner)
+		owner->closeDoorbellPage(page);
+}
+
+IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length, bool writeCombined)
 {
 	if (!windowLock)
 		return kIOReturnNotReady;
-	IODeviceMemory *region = owner ? owner->copyRegion() : nullptr;
+	// A write-combined span from the region's descriptor of its own, and every other span from
+	// the region's (RgfxAccelerator::copyWriteCombinedRegion says why); where the first is
+	// missing, as on arm64 (RgfxRegionMapping.hpp), the span is mapped write-back.
+	IODeviceMemory *region =
+	    owner && writeCombined ? owner->copyWriteCombinedRegion() : nullptr;
+	const bool combined = region != nullptr;
+	if (!region)
+		region = owner ? owner->copyRegion() : nullptr;
 	if (!region)
 		return kIOReturnNotReady;
 	IOReturn r = kIOReturnSuccess;
@@ -120,10 +160,12 @@ IOReturn RgfxAcceleratorUserClient::mapSpan(UInt64 offset, UInt64 length)
 		r = kIOReturnBadArgument;
 	} else {
 		const UInt64 start = mach_absolute_time();
-		// The region's bytes, write-back as the kernel maps them, over the window's.
+		// The region's bytes over the window's: write-back as asked, which xnu's x86-64 pmap
+		// maps uncached for a page it does not manage (PCD, the guest PAT's UC-) and its arm64
+		// pmap maps Normal write-back, or write-combined (PCD and PAT, the guest PAT's WC).
+		const IOOptionBits cache = combined ? kIOMapWriteCombineCache : kIOMapCopybackCache;
 		IOMemoryMap *map = region->createMappingInTask(task, windowBase + offset,
-		                                               kIOMapOverwrite | kIOMapCopybackCache,
-		                                               offset, length);
+		                                               kIOMapOverwrite | cache, offset, length);
 		if (map) {
 			// The mapping stays: an overwrite mapping is never taken down by its release.
 			map->release();

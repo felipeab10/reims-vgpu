@@ -40,6 +40,7 @@
  */
 
 #import "RgfxCommandObjects.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxBuffer.h"
 #import "RgfxComputePipelineState.h"
 #import "RgfxEvent.h"
@@ -49,7 +50,9 @@
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
+#import "RgfxMetalPrivate.h"
 #import "RgfxRenderPipelineState.h"
+#import "RgfxResidencySet.h"
 #import "RgfxUnsupported.h"
 #import "RgfxUploads.h"
 
@@ -63,6 +66,7 @@
 #include <vector>
 
 #include "RgfxCommitOrder.hpp"
+#include "RgfxCompletionThread.hpp"
 #include "RgfxEncoder.hpp"
 #include "RgfxMemoryShadow.hpp"
 #include "RgfxObjectModel.hpp"
@@ -109,12 +113,12 @@ namespace {
 // no mesh pipeline can be made, so it draws nothing.
 constexpr const char *kNoMeshes = "mesh shading (the host makes no mesh pipeline)";
 
-/// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first 16, then
-/// every power of two, so a frame loop's stays visible without flooding the log.
+/// Whether the `n`th (from 0) occurrence of a repeated log line is logged: the first alone, as
+/// for every degradation (docs/conventions.md); `count` counts them all.
 bool logEventOp(std::atomic<uint64_t> &count, uint64_t *n)
 {
 	*n = count.fetch_add(1, std::memory_order_relaxed);
-	return *n < 16 || (*n & (*n - 1)) == 0;
+	return *n == 0;
 }
 
 std::atomic<uint64_t> g_foreignEvents{0};
@@ -124,17 +128,17 @@ std::atomic<uint64_t> g_bytesDropped{0};
 /// chunks (RgfxUploads.h), answering the buffer and offset they lie at to bind; false, said in
 /// the log, where no chunk could be had (the region has no room): the binding is not made, and
 /// the command buffer fails with MTLCommandBufferErrorOutOfMemory when it completes.
-bool rgfxPutBytes(RgfxUploadArena *uploads, const void *bytes, NSUInteger length,
-                  __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
+bool rgfxPutBytes(RgfxUploadArena *uploads, RgfxUploadCursor &cursor, const void *bytes,
+                  NSUInteger length, __unsafe_unretained id<MTLBuffer> *buffer, uint64_t *offset)
 {
-	if (uploads != nullptr && uploads->put(bytes, length, buffer, offset)) {
+	if (uploads != nullptr && uploads->put(cursor, bytes, length, buffer, offset)) {
 		return true;
 	}
 	uint64_t n = 0;
 	if (logEventOp(g_bytesDropped, &n)) {
 		NSLog(@"RGFX: %lu inline bytes have no upload chunk (no region room): their binding is "
-		      @"not made, and the command buffer fails (so far: %llu)",
-		      (unsigned long)length, (unsigned long long)(n + 1));
+		      @"not made, and the command buffer fails",
+		      (unsigned long)length);
 	}
 	return false;
 }
@@ -161,13 +165,52 @@ void rgfxNoteShadowUse(RgfxEncoder *enc, __unsafe_unretained id obj, bool writes
 /// The objects a command buffer keeps from its encode until it completes or goes
 /// (RgfxEncoder::setKeeper): locked, as a parallel pass's sub-encoders keep on their own threads.
 /// Each object comes once a command buffer (its keep stamp), so the lock is taken once an object.
+/// The resources among them are in flight from the buffer's submission (begin) until its
+/// results land where the CPU sees them (land): the resource SPI's isComplete answers NO and its
+/// waitUntilComplete waits meanwhile (RGFX_RESOURCE_SPI).
 struct RgfxKept {
 	os_unfair_lock lock = OS_UNFAIR_LOCK_INIT;
 	std::vector<id> objects;
+	// The objects counted in flight at begin, the first of `objects`; whether begin and land ran.
+	size_t inFlight = 0;
+	bool begun = false;
+	bool landed = false;
 
-	/// Lets every object go, outside the lock (a dealloc may run).
+	/// Counts the resources kept so far in flight (RgfxInFlightBegin), once, and only before
+	/// land: the buffer is submitted.
+	void begin()
+	{
+		os_unfair_lock_lock(&lock);
+		if (!begun && !landed) {
+			for (__unsafe_unretained id object : objects) {
+				if (RgfxIsResource(object))
+					RgfxInFlightBegin((RgfxResource *)object);
+			}
+			inFlight = objects.size();
+			begun = true;
+		}
+		os_unfair_lock_unlock(&lock);
+	}
+
+	/// Counts the resources begin counted out of flight (RgfxInFlightEnd), once: the buffer's
+	/// results are where the CPU sees them, or it goes without them.
+	void land()
+	{
+		os_unfair_lock_lock(&lock);
+		if (begun && !landed) {
+			for (size_t i = 0; i < inFlight; i++) {
+				if (RgfxIsResource(objects[i]))
+					RgfxInFlightEnd((RgfxResource *)objects[i]);
+			}
+		}
+		landed = true;
+		os_unfair_lock_unlock(&lock);
+	}
+
+	/// Lets every object go, outside the lock (a dealloc may run), landed first.
 	void clear()
 	{
+		land();
 		std::vector<id> gone;
 		os_unfair_lock_lock(&lock);
 		gone.swap(objects);
@@ -315,16 +358,9 @@ void rgfxNoteIcbFlush(const RgfxIcbFlush &flush)
 	}
 }
 
-/// Whether `res` is a Managed buffer of one copy, or a texture over one (RgfxBuffer's
-/// rgfxOneCopy), whose synchronize has nothing to bring over.
-bool rgfxOfOneCopy(id<MTLResource> res)
-{
-	if ([res isKindOfClass:[RgfxBuffer class]])
-		return [(RgfxBuffer *)res rgfxOneCopy];
-	return [res isKindOfClass:[RgfxTexture class]] && [(RgfxTexture *)res rgfxOverOneCopy];
-}
-
-/// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops.
+/// The RGFX_RESOURCE_KIND_* of a Metal resource, for the resource-reference ops. A visible
+/// function table is none: the host makes nothing resident, and its table is read through its
+/// gpuResourceID, so a useResource: of one only keeps it while the command buffer runs.
 uint32_t rgfxResourceKind(id<MTLResource> res)
 {
 	if ([res conformsToProtocol:@protocol(MTLBuffer)])
@@ -473,6 +509,18 @@ bool fillVisibility(RgfxEncoder *enc, MTLRenderPassDescriptor *d, RgfxRenderPass
 	return true;
 }
 
+/// The rasterization rate map of pass `d` (rasterizationRateMap), named on `enc` so the command
+/// buffer keeps it until it completes; false where the pass has none of ours, so it carries none.
+bool fillRateMap(RgfxEncoder *enc, MTLRenderPassDescriptor *d, RgfxRenderPassRateMap *out)
+{
+	*out = {};
+	id<MTLRasterizationRateMap> map = d.rasterizationRateMap;
+	if (map == nil)
+		return false;
+	out->map_obj_id = rgfxNamed(enc, map);
+	return out->map_obj_id != 0;
+}
+
 /// The size of the target of pass `d`, which Metal's default viewport and scissor rectangle
 /// cover: the smallest of its attachments (ours, RgfxTexture) at their levels, else its
 /// renderTargetWidth and renderTargetHeight where it has none.
@@ -590,10 +638,16 @@ uint32_t fillRenderPass(MTLRenderPassDescriptor *d, RgfxRenderPassDesc *desc,
 /// Posts its message on the queue's submission ring: its queue's poster calls it in enqueue
 /// order (rgfxPostReady).
 - (void)rgfxPost;
+/// How many drawables it presents (presentDrawable: and its variants): the present-scheduled
+/// signals its queue waits for once it is posted, before it posts a later buffer (PRESENT HOLD).
+- (uint32_t)rgfxPresentWaits;
 @end
 
 /// How many barrier fences a queue has (QUEUE BARRIERS, above).
 constexpr uint32_t kRgfxBarrierFences = 8;
+
+/// The quality of service of a queue no descriptor names (qosLevel).
+constexpr NSUInteger kRgfxDefaultQosLevel = 2;
 
 /// An encoder's place among its queue's barrier fences: the fences, the one it takes, and how
 /// many of them encoders before it took. All fences 0 where the queue has none (no route).
@@ -633,11 +687,24 @@ struct RgfxBarrierSlot {
 - (BOOL)rgfxEnqueue:(RgfxCmdBuffer *)cb;
 /// Posts the buffers at the front of the enqueue order that are ready, in that order.
 - (void)rgfxPostReady;
+/// A drawable a posted buffer presents reports its present scheduled, or the buffer failed before
+/// presenting it: one signal of the present hold (PRESENT HOLD), which posts what it held.
+- (void)rgfxPresentScheduled;
+/// A buffer of the queue presents a drawable: from then on every buffer the queue commits asks
+/// for its submission where the device answers it (PRESENT HOLD).
+- (void)rgfxNotePresents;
+/// Whether a buffer of the queue has presented a drawable (rgfxNotePresents).
+- (BOOL)rgfxPresents;
 /// Before a buffer of the queue goes on its ring: the buffers of the process's other queues it
 /// is to be committed after (RgfxCommitOrder::name), none where the queue takes no part.
 - (std::vector<RgfxSurfaceOrderWait>)rgfxNameCommitOrder;
 /// A buffer of the queue went on its ring at `seqno` (RgfxCommitOrder::posted).
 - (void)rgfxNotePosted:(uint64_t)seqno;
+/// The group finish waits on: a buffer committed with a reader enters it, and leaves it once it
+/// has completed and run its handlers.
+- (dispatch_group_t)rgfxCommittedGroup;
+/// Whether its command buffers profile from their start (setProfilingEnabled:, MTLCommandQueueSPI).
+- (BOOL)isProfilingEnabled;
 @end
 
 @implementation RgfxCommandQueue {
@@ -692,12 +759,43 @@ struct RgfxBarrierSlot {
 	std::mutex _orderLock;
 	std::deque<RgfxCmdBuffer *> _order;
 	bool _postingFront;
+	// The present hold (PRESENT HOLD, below), under `_orderLock`: the present-scheduled signals the
+	// buffers posted so far owe, and those their drawables (or their failures) gave.
+	uint64_t _presentsOwed;
+	uint64_t _presentsSignalled;
+	// A buffer of the queue has presented a drawable (rgfxNotePresents).
+	std::atomic<bool> _presents;
 	std::recursive_mutex _postLock;
 	// Its process's commit order (rgfxJoinCommitOrder:), its slot there, and what its posts named
 	// last, which only its posts read and write, one at a time (`_postLock`).
 	std::shared_ptr<RgfxCommitOrder> _commitOrder;
 	size_t _commitSlot;
 	RgfxCommitNamed _commitNamed;
+	// What Metal's base queue keeps for its SPI (MTLCommandQueueSPI, below): what its descriptor
+	// named (rgfxTakeDescriptor:), its switches, and the statistics' and counters' settings.
+	NSUInteger _qosLevel;
+	dispatch_queue_t _commitQueue;
+	BOOL _commitSynchronously;
+	BOOL _commitsWithQoS;
+	BOOL _disableCrossQueueHazardTracking;
+	BOOL _openGLQueue;
+	int _backgroundTrackingPID;
+	BOOL _executionEnabled;
+	BOOL _skipRender;
+	BOOL _profilingEnabled;
+	BOOL _statEnabled;
+	NSUInteger _statOptions;
+	NSUInteger _statLocations;
+	NSUInteger _numRequestedCounters;
+	NSUInteger _numInternalSampleCounters;
+	std::mutex _counterInfoLock;
+	NSMutableDictionary *_counterInfo; // under `_counterInfoLock`, as Metal's property is atomic
+	// finish's: each command buffer committed to it with a reader is in it until it has
+	// completed (RgfxCmdBuffer's commit and rgfxDeliverCompletion:).
+	dispatch_group_t _committedGroup;
+	// The residency sets it is given, each as many times as it was added (RESIDENCY SETS, below),
+	// under @synchronized(self): made with the queue on the arm64 device, none on the x86 one.
+	NSCountedSet *_residencySets;
 }
 
 + (instancetype)queueWithSubmitRing:(RgfxRingWriter *)submitRing
@@ -737,6 +835,9 @@ struct RgfxBarrierSlot {
 		// completion queue is set: Metal's has this label and user-interactive QoS, one queue's
 		// handlers run one at a time and two queues' at once (measured on the M3 Max, an AMD
 		// 5300M and an Intel 630).
+#if RgfxMakesResidencySets
+		q->_residencySets = [NSCountedSet set];
+#endif
 		q->_ownCompletionQueue = dispatch_queue_create(
 		    "com.Metal.CompletionQueueDispatch",
 		    dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INTERACTIVE,
@@ -750,6 +851,14 @@ struct RgfxBarrierSlot {
 			[fences addObject:f];
 		}
 		q->_barrierFences = fences.count == kRgfxBarrierFences ? fences : @[];
+		// As Metal's base queue starts (read from code, _MTLCommandQueue, macOS 27.0.1): its
+		// process tracked for background work, its buffers run, and the quality of service of
+		// a queue no descriptor names, 2 (measured: the AMD 5300M's and the Intel 630's queues
+		// of newCommandQueue, macOS 26.7.1).
+		q->_qosLevel = kRgfxDefaultQosLevel;
+		q->_backgroundTrackingPID = getpid();
+		q->_executionEnabled = YES;
+		q->_committedGroup = dispatch_group_create();
 	}
 	return q;
 }
@@ -916,7 +1025,7 @@ struct RgfxBarrierSlot {
 	@synchronized(self) {
 		if (_uploadPool == nullptr) {
 			_uploadPool = std::make_shared<RgfxUploadPool>(self.region, [self serializer],
-			                                               self.device);
+			                                               self.device, self.slabs);
 		}
 		return _uploadPool;
 	}
@@ -966,6 +1075,9 @@ struct RgfxBarrierSlot {
 			// outer loop posts the rest after it.
 			if (_postingFront || _order.empty() || ![_order.front() rgfxReadyToPost])
 				return;
+			// Behind a posted present not yet scheduled (PRESENT HOLD, below).
+			if (_presentsOwed > _presentsSignalled)
+				return;
 			next = _order.front();
 			_postingFront = true;
 		}
@@ -974,8 +1086,58 @@ struct RgfxBarrierSlot {
 			std::lock_guard<std::mutex> hold(_orderLock);
 			_order.pop_front();
 			_postingFront = false;
+			_presentsOwed += [next rgfxPresentWaits];
 		}
 	}
+}
+
+// PRESENT HOLD. A buffer that presents drawables holds back the queue's later buffers until each
+// of its drawables reports its present scheduled, as Metal's base queue does on the AMD 5300M and
+// the Intel 630 (measured, macOS 26.7.1: with the report 200 ms after the present, a buffer
+// committed right behind it was scheduled at 200.7 to 210.5 ms against 0.3 to 1.3 ms, and both
+// commits returned in 0.03 ms). Metal's queue submits up to and including such a buffer, then
+// waits on a semaphore of the queue's once for each of its presents before it submits more
+// (-[_MTLCommandQueue _submitAvailableCommandBuffers], read from code): the signals count, so a
+// report that comes before the buffer is posted holds nothing. The held buffers stay Committed and
+// unposted, as behind a buffer not yet committed (ENQUEUE ORDER, above); the commits return. A
+// CAMetalDrawable reports once the layer's image queue has taken the present, which WindowServer
+// paces, so a GPU-bound app's frames reach the GPU as WindowServer takes them, not as fast as its
+// queue holds them. The post goes on another thread: a drawable may report inside the app's
+// nextDrawable, under the layer's lock.
+//
+// The hold makes the next frame wait for the report, and the report comes after the presenting
+// buffer is scheduled, where its scheduled handler presents. Metal schedules a buffer that waits
+// for nothing within a fraction of a millisecond of its commit, whatever its queue runs on the GPU
+// before it; the host schedules a buffer that does not ask for its submission at its platform's
+// submission, which can wait for the queue's earlier work on the GPU (measured on an RTX 3090 host,
+// the Modern Rendering sample: the presenting buffer behind the frame's 89 ms pass was scheduled
+// at the pass's end, 88.6 ms after its commit, and the GPU then stood idle 19 to 22 ms a frame
+// until the next frame came). So once a buffer of the queue presents, every buffer the queue
+// commits asks for its submission (RGFX_OP_SUBMITTED), and the host schedules each at its take
+// where it waits for nothing and none before it on its queue owes its scheduling.
+- (void)rgfxPresentScheduled
+{
+	{
+		std::lock_guard<std::mutex> hold(_orderLock);
+		_presentsSignalled++;
+		// Still held, or nothing waits: a later commit posts it.
+		if (_presentsOwed > _presentsSignalled || _order.empty())
+			return;
+	}
+	RgfxCommandQueue *queue = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+		[queue rgfxPostReady];
+	});
+}
+
+- (void)rgfxNotePresents
+{
+	_presents.store(true, std::memory_order_release);
+}
+
+- (BOOL)rgfxPresents
+{
+	return _presents.load(std::memory_order_acquire);
 }
 
 - (RgfxCmdBuffer *)rgfxCommandBufferRetained:(BOOL)retained
@@ -1033,29 +1195,65 @@ struct RgfxBarrierSlot {
 {
 }
 
-// --- unsupported: the device makes no residency set (newResidencySetWithDescriptor:error:) ---
+// --- RESIDENCY SETS ---------------------------------------------------------------------------
+// The arm64 device's queue holds the sets it is given, each as many times as it was added, and
+// lets one go once it is removed as many times, as Metal's queue counts them in an NSCountedSet
+// (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's queue, retain and hold
+// cases): the device keeps every allocation resident, so holding them is all a queue does. The
+// M3's queue lets a set go a moment after its last removal, on a thread of its own (held right
+// after it, gone 100 ms later, with no buffer made); this one lets it go at that removal, as no
+// correct use can depend on what a moment decides. A nil set
+// raises the counted set's NSInvalidArgumentException, as Metal's queue does; a set never added
+// is removed with nothing done. The x86 device makes no set (RgfxMakesResidencySets), and its
+// queue logs one it is given.
 
 - (void)addResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		[_residencySets addObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)addResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets addObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)removeResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		[_residencySets removeObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)removeResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                       count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets removeObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 // --- dispatch queues and priority (MTLCommandQueue SPI WindowServer sets) -----------
@@ -1179,20 +1377,243 @@ struct RgfxBarrierSlot {
 	return -1;
 }
 
-// Statistics: Metal takes the settings and answers nothing back; on is logged here, as its
-// statistics, whatever they are, are not gathered.
+// Statistics: Metal keeps the settings, which its getters answer back (MTLCommandQueueSPI,
+// below); on is logged here, as its statistics, whatever they are, are not gathered.
 - (void)setStatEnabled:(BOOL)enabled
 {
 	if (enabled)
 		RGFX_UNSUPPORTED("command statistics");
+	_statEnabled = enabled;
 }
 - (void)setStatLocations:(NSUInteger)locations
 {
-	(void)locations;
+	_statLocations = locations;
 }
 - (void)setStatOptions:(NSUInteger)options
 {
-	(void)options;
+	_statOptions = options;
+}
+
+// --- MTLCommandQueueSPI ----------------------------------------------------------------------
+// The members of Metal's command-queue SPI that the AMD 5300M's and the Intel 630's queues both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// answered as Metal's base queue, _MTLCommandQueue, answers them (read from code, macOS 27.0.1);
+// the getters of a fresh queue answer what those two GPUs' queues answer (measured:
+// oracle_spi_members answers).
+
+// What the descriptor the queue was made with names, as Metal's base queue takes it at its start:
+// its quality of service, commit and completion queues, and switches. A guest's descriptor that
+// lacks one of them leaves the queue's default.
+- (void)rgfxTakeDescriptor:(MTLCommandQueueDescriptor *)descriptor
+{
+	id<RgfxMetalQueueDescriptorInternals> spi = (id<RgfxMetalQueueDescriptorInternals>)descriptor;
+	if ([spi respondsToSelector:@selector(qosLevel)])
+		_qosLevel = [spi qosLevel];
+	if ([spi respondsToSelector:@selector(commitQueue)])
+		_commitQueue = [spi commitQueue];
+	if ([spi respondsToSelector:@selector(commitSynchronously)])
+		_commitSynchronously = [spi commitSynchronously];
+	if ([spi respondsToSelector:@selector(commitsWithQoS)])
+		_commitsWithQoS = [spi commitsWithQoS];
+	if ([spi respondsToSelector:@selector(disableCrossQueueHazardTracking)])
+		_disableCrossQueueHazardTracking = [spi disableCrossQueueHazardTracking];
+	if ([spi respondsToSelector:@selector(isOpenGLQueue)])
+		_openGLQueue = [spi isOpenGLQueue];
+	if ([spi respondsToSelector:@selector(completionQueue)]) {
+		dispatch_queue_t completion = [spi completionQueue];
+		if (completion != nil)
+			[self setCompletionQueue:completion];
+	}
+}
+
+- (NSUInteger)qosLevel
+{
+	return _qosLevel;
+}
+
+// The queue the descriptor named for Metal's commits, nil where none: the device's buffers post
+// on the thread that commits them, which the guest's results do not see.
+- (dispatch_queue_t)commitQueue
+{
+	return _commitQueue;
+}
+
+- (BOOL)commitSynchronously
+{
+	return _commitSynchronously;
+}
+
+- (BOOL)commitsWithQoS
+{
+	return _commitsWithQoS;
+}
+
+// Whether the descriptor asked for no tracking of hazards between queues: the device orders its
+// queues' buffers by their commits either way (RgfxCommitOrder.hpp), which Metal's tracking does
+// at most.
+- (BOOL)disableCrossQueueHazardTracking
+{
+	return _disableCrossQueueHazardTracking;
+}
+
+- (BOOL)isOpenGLQueue
+{
+	return _openGLQueue;
+}
+
+- (int)backgroundTrackingPID
+{
+	return _backgroundTrackingPID;
+}
+
+- (void)setBackgroundTrackingPID:(int)pid
+{
+	_backgroundTrackingPID = pid;
+}
+
+- (BOOL)executionEnabled
+{
+	return _executionEnabled;
+}
+
+// Metal's queue completes the buffers committed while execution is off without running them;
+// the device runs them.
+- (void)setExecutionEnabled:(BOOL)enabled
+{
+	if (!enabled)
+		RGFX_UNSUPPORTED("completing a queue's command buffers without running them");
+	_executionEnabled = enabled;
+}
+
+- (BOOL)skipRender
+{
+	return _skipRender;
+}
+
+// Metal's buffers take the switch from their queue as they are made; the device's render
+// passes run.
+- (void)setSkipRender:(BOOL)skip
+{
+	if (skip)
+		RGFX_UNSUPPORTED("skipping a queue's render work (setSkipRender:)");
+	_skipRender = skip;
+}
+
+- (BOOL)isProfilingEnabled
+{
+	return _profilingEnabled;
+}
+
+// Its command buffers made from now on profile (RgfxCmdBuffer's profilingResults), as Metal's
+// take the switch from their queue as they are made.
+- (void)setProfilingEnabled:(BOOL)enabled
+{
+	_profilingEnabled = enabled;
+}
+
+- (BOOL)isStatEnabled
+{
+	return _statEnabled;
+}
+
+- (NSUInteger)StatOptions
+{
+	return _statOptions;
+}
+
+- (NSUInteger)getStatOptions
+{
+	return _statOptions;
+}
+
+- (NSUInteger)StatLocations
+{
+	return _statLocations;
+}
+
+- (NSUInteger)getStatLocations
+{
+	return _statLocations;
+}
+
+- (NSUInteger)numRequestedCounters
+{
+	return _numRequestedCounters;
+}
+
+- (void)setNumRequestedCounters:(NSUInteger)count
+{
+	_numRequestedCounters = count;
+}
+
+- (NSUInteger)numInternalSampleCounters
+{
+	return _numInternalSampleCounters;
+}
+
+- (void)setNumInternalSampleCounters:(NSUInteger)count
+{
+	_numInternalSampleCounters = count;
+}
+
+- (NSMutableDictionary *)counterInfo
+{
+	std::lock_guard<std::mutex> hold(_counterInfoLock);
+	return _counterInfo;
+}
+
+- (void)setCounterInfo:(NSMutableDictionary *)info
+{
+	std::lock_guard<std::mutex> hold(_counterInfoLock);
+	_counterInfo = info;
+}
+
+// The counters the queue's statistics can gather: the device gathers none (setStatEnabled: YES
+// is unsupported) and samples none, where the AMD 5300M's and the Intel 630's queues list their
+// GPUs' own (measured).
+- (NSArray *)availableCounters
+{
+	return @[];
+}
+
+// The counters requested, none where none were: nil, as both GPUs' queues answer (measured).
+- (NSArray *)getRequestedCounters
+{
+	return nil;
+}
+
+// -1, as requestCounters:withIndex: answers for every list tried (measured: M3 Max, macOS 27):
+// the device samples no counters.
+- (int)requestCounters:(NSArray *)counters
+{
+	(void)counters;
+	return -1;
+}
+
+// The list in a list of its own, as Metal's base queue answers.
+- (NSArray *)subdivideCounterList:(NSArray *)list
+{
+	NSMutableArray *lists = [[NSMutableArray alloc] init];
+	[lists addObject:list];
+	return lists;
+}
+
+// Metal's base queue delivers its notifications as they come, and does nothing here; so does
+// this queue (rgfxDeliver:here:).
+- (void)dispatchAvailableCompletionNotifications
+{
+}
+
+// Returns once every command buffer committed to the queue before the call has completed and
+// run its completed handlers, as Metal's waits on its buffers' group.
+- (void)finish
+{
+	dispatch_group_wait(_committedGroup, DISPATCH_TIME_FOREVER);
+}
+
+- (dispatch_group_t)rgfxCommittedGroup
+{
+	return _committedGroup;
 }
 
 @end
@@ -1210,6 +1631,8 @@ struct RgfxBarrierSlot {
 - (void)rgfxWriteBackCopies;
 - (void)rgfxReachScheduled;
 - (void)rgfxReachSubmitted;
+- (void)rgfxAskScheduled;
+- (void)rgfxPostScheduledAsk;
 - (void)rgfxWaitFor:(dispatch_group_t)group reached:(const std::atomic<bool> *)reached;
 @end
 
@@ -1269,6 +1692,20 @@ constexpr uint64_t kRgfxBarrierRenderStages = MTLRenderStageVertex | MTLRenderSt
 constexpr uint32_t kRgfxSlotsNamed = 1, kRgfxSlotsFinished = 2, kRgfxSlotsHeld = 4,
                    kRgfxSlotsScheduled = 8;
 
+#if defined(__arm64__)
+// A scheduled signal of a command buffer (encodeSignalEventScheduled:value:): the shared event,
+// the value it takes, and how many of the buffer's waits were encoded before it.
+struct RgfxScheduledSignal {
+	RgfxSharedEvent *event;
+	uint64_t value;
+	size_t waitsBefore;
+};
+#endif
+
+// A waiting thread's ask of a command buffer's scheduling (RgfxCmdBuffer's _scheduledAsk): a
+// thread waits for it to be scheduled; its message is on its ring, held by nothing.
+constexpr uint32_t kRgfxAskWanted = 1, kRgfxAskPosted = 2;
+
 // The fences a barrier in the encoder of `b` waits for: every one but its own that an earlier
 // encoder took, calling `wait` with each.
 template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &b, Wait wait)
@@ -1281,25 +1718,50 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 
 } // namespace
 
+// The stages profilingResults times, in the order of its keys (MTLCommandBufferSPI, below).
+enum RgfxStage : unsigned {
+	kRgfxStageCreation,
+	kRgfxStageEnqueue,
+	kRgfxStageCommit,
+	kRgfxStageSubmitToKernel,
+	kRgfxStageKernelScheduled,
+	kRgfxStageSubmitToHW,
+	kRgfxStageCompletionInterrupt,
+	kRgfxStageKernelComplete,
+	kRgfxStageCompletionHandlerEnqueue,
+	kRgfxStageCompletionHandlerExecution,
+	kRgfxStageCount,
+};
+
 @implementation RgfxCmdBuffer {
 	RgfxCommandQueue *_queue; // kept alive, as Metal's command buffers keep their queue
 	RgfxEncoder *_encoder; // owned: built incrementally, posted on commit
 	BOOL _retained;
 	BOOL _committed;
 	// Committed by commitAndWaitUntilSubmitted, so it asks for its submission where the host
-	// answers it.
+	// answers it, as a buffer of a queue that presents does (PRESENT HOLD).
 	BOOL _waitsSubmitted;
 	// It asks the host for its submission (RGFX_OP_SUBMITTED), so its post expects CB_SUBMITTED.
 	BOOL _asksSubmitted;
+	// Its queue's submission ring, which its message and a waiting thread's ask of its scheduling
+	// go on; and where that ask is (kRgfxAsk*: a thread waits, the message is on the ring), so the
+	// one of the two that comes second posts it, once (rgfxAskScheduled).
+	RgfxRingWriter *_ring;
+	std::atomic<uint32_t> _scheduledAsk;
 	// In its queue's enqueue order (under the queue's order lock), and committed and ready to
 	// post once every buffer before it is.
 	BOOL _enqueued;
 	std::atomic<bool> _readyToPost;
+	// The drawables it presents (rgfxPresentWaits), counted before the commit.
+	std::atomic<uint32_t> _presentWaits;
 	uint64_t _seqno;
 	// Written by the thread that delivers the completion, read by any: atomic.
 	std::atomic<MTLCommandBufferStatus> _status;
 	NSString *_cbLabel;
 	NSMutableDictionary *_userDictionary; // userDictionary, made when first asked
+	// The residency sets it uses, each as many times as it was used, under @synchronized(self):
+	// made at the first use, let go once it completes (useResidencySet:).
+	NSCountedSet *_residencySets;
 	// What the client asked of the buffer's content protection (setProtectionOptions:).
 	uint64_t _protectionOptions;
 	// The error options its descriptor asked for (commandBufferWithDescriptor:).
@@ -1328,6 +1790,8 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// says it was left, so a buffer whose completion never came leaves it at dealloc.
 	dispatch_group_t _done;
 	std::atomic<bool> _left;
+	// Its queue's group finish waits on (rgfxCommittedGroup), entered and left with `_done`.
+	dispatch_group_t _queueCommitted;
 	// Entered at commit with a reader, as `_done` is: `_submitted` is left once the buffer is
 	// submitted, `_scheduled` once its scheduled handlers have run, which is what
 	// commitAndWaitUntilSubmitted and waitUntilScheduled wait on. The buffer is submitted at its
@@ -1394,6 +1858,16 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// finish of the buffer raises each plain event's value as this process knows it.
 	std::vector<std::pair<id, uint64_t>> _eventWaits;
 	std::vector<std::pair<RgfxEvent *, uint64_t>> _plainSignals;
+#if defined(__arm64__)
+	// Its scheduled signals (encodeSignalEventScheduled:value:), in the order encoded, and how
+	// many of them are set: at its post, those its queue's submission reaches there, the rest at
+	// its scheduling (rgfxSetScheduledSignalsAtPost, rgfxReachScheduled).
+	std::vector<RgfxScheduledSignal> _scheduledSignals;
+	size_t _scheduledSignalsSet;
+	// A scheduled signal of a nil event on a buffer that retains no references: it fails, as
+	// Metal's does (encodeSignalEventScheduled:value:).
+	bool _invalidInput;
+#endif
 	// Signalled once the queue's write-back queue has written its copies back and retired its
 	// writes, where its take left them to it (rgfxHostDone:); nil otherwise.
 	dispatch_semaphore_t _writtenBack;
@@ -1413,6 +1887,25 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	std::shared_ptr<RgfxUploadArena> _uploads;
 	bool _uploadsFailed;
 	uint64_t _traceId; // globalTraceObjectID
+	// What Metal's base command buffer keeps for its SPI (MTLCommandBufferSPI, below): the
+	// private data and its offset, a logging buffer it does not retain, the profiling and
+	// shared-indirection-table switches, and the logs it was given.
+	id _privateData;
+	NSUInteger _privateDataOffset;
+	__unsafe_unretained id _privateLoggingBuffer;
+	std::atomic<bool> _profilingEnabled;
+	BOOL _sharedIndirectionTable;
+	id _logs;
+	// The blocks __waitUntilScheduledAsync: and __waitUntilCompletedAsync: were given, run once
+	// the scheduled or the completed handlers have; each `*Done` says they have, so a block
+	// given later runs at once. Under `_handlersLock`.
+	NSMutableArray *_scheduledWaiters;
+	NSMutableArray *_completedWaiters;
+	bool _scheduledWaitersDone;
+	bool _completedWaitersDone;
+	// When it reached each stage, in mach_absolute_time's units, for profilingResults: its
+	// creation always, the rest where profiling is enabled then (rgfxNoteStage:).
+	std::atomic<uint64_t> _stageTimes[kRgfxStageCount];
 }
 
 + (instancetype)commandBufferForQueue:(RgfxCommandQueue *)queue
@@ -1429,13 +1922,22 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		cb->_traceId = RgfxNextTraceObjectId();
 		cb->_queue = queue;
 		cb->_retained = retained;
+		cb->_ring = ring;
 		cb->_status.store(MTLCommandBufferStatusNotEnqueued);
 		cb->_completedHandlers = [NSMutableArray array];
 		cb->_scheduledHandlers = [NSMutableArray array];
+		cb->_completedWaiters = [NSMutableArray array];
+		cb->_scheduledWaiters = [NSMutableArray array];
+		cb->_stageTimes[kRgfxStageCreation].store(mach_absolute_time());
+		// It profiles from its start where its queue does, as Metal's buffer takes the switch.
+		cb->_profilingEnabled.store([queue isProfilingEnabled]);
 		const uint32_t reserve = queue.rgfxMessageReserve;
 		cb->_encoder = new RgfxEncoder(*ring, queue.rgfxObjId, cbObjId, reserve);
-		// Past its ring, the message is built in a block of the queue's pool, the size of the
-		// queue's recent largest first.
+		// Its stream starts with the guest's times where the device takes them: made now.
+		if (queue.stampsGuestTimes)
+			cb->_encoder->stampGuestTimes(rgfxGuestClockNs());
+		// Past its ring, the message grows to the size of the queue's recent largest at once, and
+		// goes into a block of the queue's pool at the commit.
 		cb->_encoder->setMessageBlocks([queue rgfxBodyPool], reserve);
 		// One with unretained references keeps them too, though it answers retainedReferences
 		// NO: the host must not drop an object before a buffer that names it has run.
@@ -1449,14 +1951,17 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 {
 	// A group released while entered ends the process: one whose completion never came
 	// (its reader went first) is left here.
-	if (_done != nil && !_left.exchange(true))
+	if (_done != nil && !_left.exchange(true)) {
 		dispatch_group_leave(_done);
+		dispatch_group_leave(_queueCommitted);
+	}
 	if (_submitted != nil && !_submittedLeft.exchange(true))
 		dispatch_group_leave(_submitted);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
 	// A buffer never committed, or whose completion never came, gives its slot back, and lets
-	// what it kept go with it.
+	// what it kept go with it, out of flight.
+	_kept.land();
 	[self rgfxGiveSlotBack];
 	// And the block its message lay in, as its completion would have: a buffer posted with a
 	// completion to come is kept until it comes (the reader holds it), so the host has read the
@@ -1495,8 +2000,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	RgfxRenderPassVisibility visibility;
 	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
+	RgfxRenderPassRateMap rateMap;
+	const bool mapped = fillRateMap(_encoder, renderPassDescriptor, &rateMap);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr,
+	                          mapped ? &rateMap : nullptr);
 	RgfxRenderCommandEncoder *enc = [[RgfxRenderCommandEncoder alloc] initWithEncoder:_encoder
 	                                                                          emitEnd:YES
 	                                                                           device:self.device];
@@ -1546,6 +2054,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
                        ofBytes:(uint64_t)bytes
                           luma:(id<MTLTexture>)luma
                         chroma:(id<MTLTexture>)chroma
+                    outputRows:(uint32_t)outputRows
 {
 	_encoder->beginVideoPass(session);
 	const uint64_t bitstreamId = rgfxReads(_encoder, bitstream);
@@ -1559,6 +2068,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		b.bitstream_size = bytes;
 		b.luma_texture_obj_id = lumaId;
 		b.chroma_texture_obj_id = chromaId;
+		b.output_rows = outputRows;
 		_encoder->videoDecodeH265(b, parameterSets, size);
 	} else {
 		RgfxVideoOpDecodeH264 b = {};
@@ -1566,6 +2076,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		b.bitstream_size = bytes;
 		b.luma_texture_obj_id = lumaId;
 		b.chroma_texture_obj_id = chromaId;
+		b.output_rows = outputRows;
 		_encoder->videoDecodeH264(b, parameterSets, size);
 	}
 	_encoder->endEncoder();
@@ -1602,8 +2113,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	noteRenderPassWrites(_encoder, renderPassDescriptor);
 	RgfxRenderPassVisibility visibility;
 	const bool visible = fillVisibility(_encoder, renderPassDescriptor, &visibility);
+	RgfxRenderPassRateMap rateMap;
+	const bool mapped = fillRateMap(_encoder, renderPassDescriptor, &rateMap);
 	_encoder->beginRenderPass(desc, colors.empty() ? nullptr : colors.data(), count,
-	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr);
+	                          programmed ? &positions : nullptr, visible ? &visibility : nullptr,
+	                          mapped ? &rateMap : nullptr);
 	RgfxParallelRenderCommandEncoder *enc =
 	    [[RgfxParallelRenderCommandEncoder alloc] initWithEncoder:_encoder device:self.device];
 	[enc rgfxSetCommandBuffer:self];
@@ -1633,6 +2147,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	_enqueued = YES;
 	MTLCommandBufferStatus expected = MTLCommandBufferStatusNotEnqueued;
 	_status.compare_exchange_strong(expected, MTLCommandBufferStatusEnqueued);
+	[self rgfxNoteStage:kRgfxStageEnqueue];
 	return YES;
 }
 
@@ -1641,8 +2156,21 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	return _readyToPost.load(std::memory_order_acquire);
 }
 
+- (uint32_t)rgfxPresentWaits
+{
+	return _presentWaits.load(std::memory_order_acquire);
+}
+
+- (void)commitAndHold
+{
+	[self commit];
+}
+
 - (void)commit
 {
+	// Its commit's time, where its stream carries the guest's times: on entry.
+	if (_encoder->stampsGuestTimes())
+		_encoder->noteCommitted(rgfxGuestClockNs());
 	// Commit is once: a second, or a commitAndWaitUntilSubmitted after it, ends the process with
 	// Metal's words, as Metal does on the M3 Max, an AMD 5300M and an Intel 630 (measured; the
 	// Intel's assertion is its completed handler's).
@@ -1656,6 +2184,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// Not enqueued before, it is now, behind every buffer enqueued before it.
 	[_queue rgfxEnqueue:self];
 	_kernelStart.store(rgfxHostTime());
+	[self rgfxNoteStage:kRgfxStageCommit];
 	// The IOSurface copies the CPU changed since they last synced take the surfaces'
 	// pages before the GPU reads them; the copies this buffer writes go back at its
 	// completion.
@@ -1709,6 +2238,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		_readerHold = [queue sharedReplyReader];
 		_done = dispatch_group_create();
 		dispatch_group_enter(_done);
+		// In its queue's group, which finish waits on, until it has completed (`_left`).
+		_queueCommitted = [queue rgfxCommittedGroup];
+		dispatch_group_enter(_queueCommitted);
 		_submitted = dispatch_group_create();
 		dispatch_group_enter(_submitted);
 		_scheduled = dispatch_group_create();
@@ -1716,8 +2248,9 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 		// One commitAndWaitUntilSubmitted commits asks for its submission where the host
 		// answers it: the call then returns as the host takes it, or at the signal it or a
 		// buffer before it on its queue waits for, as Metal's does, not at its scheduling.
-		// Nothing else waits for a submission, so no other buffer asks.
-		_asksSubmitted = _waitsSubmitted && queue.asksSubmitted;
+		// So does every buffer of a queue that presents, so the host schedules it at its take
+		// where it waits for nothing, as Metal schedules it at its commit (PRESENT HOLD).
+		_asksSubmitted = (_waitsSubmitted || [queue rgfxPresents]) && queue.asksSubmitted;
 		if (_asksSubmitted)
 			_encoder->appendSubmitted();
 	}
@@ -1732,6 +2265,7 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 // commit that made it the oldest ready buffer of the queue (rgfxPostReady).
 - (void)rgfxPost
 {
+	[self rgfxNoteStage:kRgfxStageSubmitToKernel];
 	RgfxCommandQueue *queue = _queue;
 	// Where the process names its buffers' order, the buffers of other queues it runs after, as
 	// the surfaces' blocks name them now, as it goes on its ring: a Mac orders a buffer's
@@ -1748,6 +2282,11 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	RgfxRegion *writesRegion = _surfaceWritesRegion;
 	std::function<void(uint64_t)> expect;
 	std::function<void()> whileWaiting;
+#if defined(__arm64__)
+	// The scheduled signals its queue's submission reaches now, before it goes on its ring and
+	// before a wait of it on the same event is looked at.
+	[self rgfxSetScheduledSignalsAtPost];
+#endif
 	if (_reader != nullptr) {
 		RgfxCmdBuffer *strongSelf = self;
 		RgfxReplyReader *reader = _reader;
@@ -1809,12 +2348,25 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// host carries out before any later command buffer of the process: the buffer sees every
 	// encode made before its commit, as on every Mac.
 	// So do the destroys the kext refused before (RgfxSerializer::destroy), which free what their
-	// objects lay over once posted.
+	// objects lay over once posted, and the messages held to go together before them
+	// (RgfxSerializer::postHeldCreates): the buffer may name an object one of them makes, which
+	// the host has only where the kext took it, so a buffer behind a create it never took fails
+	// here, unposted, as Metal's work fails at commit on a GPU that is gone.
+	// Where the kext takes it (RgfxSerializer::publishVia), the held go in the call that publishes
+	// the buffer, before it, as one call where two were made; a buffer behind a create the kext
+	// never took is then taken off its ring unseen, and fails here as below (`via.refused`).
+	bool heldPosted = true;
+	RgfxPublishVia via;
 	if (RgfxSerializer *serializer = [queue serializer]) {
-		const RgfxIcbFlush flush = serializer->flushIcbWrites();
-		if (flush.messages != 0)
-			rgfxNoteIcbFlush(flush);
-		serializer->postWaitingDestroys();
+		via.control = serializer->publishVia();
+		via.queue = queue.rgfxObjId;
+		if (via.control == nullptr) {
+			heldPosted = serializer->postHeldCreates();
+			const RgfxIcbFlush flush = serializer->flushIcbWrites();
+			if (flush.messages != 0)
+				rgfxNoteIcbFlush(flush);
+			serializer->postWaitingDestroys();
+		}
 	}
 	// Held: it waits on an event not at its value as far as this process knows, or is posted
 	// behind a held buffer of its queue. Metal submits such a buffer only once it is scheduled,
@@ -1825,7 +2377,23 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	const bool held = [queue rgfxHeldBuffers] > 0 || ![self rgfxWaitsMet];
 	if (held)
 		[queue rgfxNoteHeld];
-	const bool posted = _encoder->finish(&_seqno, whileWaiting, expect, outOfLine ? &_body : nullptr);
+	// The seqno the buffer's completion was expected at, forgotten where it never went.
+	uint64_t expectedAt = 0;
+	std::function<void(uint64_t)> expectAt = expect;
+	if (expect && via.control != nullptr)
+		expectAt = [&expect, &expectedAt](uint64_t seqno) {
+			expectedAt = seqno;
+			expect(seqno);
+		};
+	const bool posted =
+	    heldPosted && _encoder->finish(&_seqno, whileWaiting, expectAt,
+	                                   outOfLine ? &_body : nullptr,
+	                                   via.control != nullptr ? &via : nullptr);
+	if (via.refused) {
+		heldPosted = false;
+		if (expectedAt != 0 && _reader != nullptr)
+			_reader->forget(expectedAt);
+	}
 	// On its ring: the posts of other queues from here name it (RgfxCommitOrder::posted).
 	if (posted)
 		[queue rgfxNotePosted:_seqno];
@@ -1859,17 +2427,32 @@ template <typename Wait> void rgfxWaitForEarlierEncoders(const RgfxBarrierSlot &
 	// the record then finds the buffer submitted already.
 	if (posted && _asksSubmitted && _reader != nullptr && _reader->holdsSubmitted(_seqno))
 		[self rgfxReachSubmitted];
+	// On its ring, and held by nothing as far as this process knows: a thread that waits for it
+	// to be scheduled may ask for its record now, and one that already waits is asked for here
+	// (rgfxAskScheduled). A held buffer is scheduled past its waits, so no ask is posted for it.
+	if (posted && !held && _reader != nullptr &&
+	    (_scheduledAsk.fetch_or(kRgfxAskPosted, std::memory_order_acq_rel) & kRgfxAskWanted) != 0)
+		[self rgfxPostScheduledAsk];
 	if (!posted) {
-		// No block for it: the buffer fails as Metal's does when memory runs out, and its
-		// handlers run off the committing thread.
-		NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
-		      @"with MTLCommandBufferErrorOutOfMemory",
-		      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
+		// No block for it: the buffer fails as Metal's does when memory runs out. Behind a
+		// create the kext never took (its control ring stayed full, or the device stopped): it
+		// fails as a GPU recovery's victim does. Either way its handlers run off the committing
+		// thread.
+		static char site, heldSite;
+		if (!heldPosted && rgfxLogFirst(&heldSite))
+			NSLog(@"RGFX: command buffer 0x%llx: an object made before it never reached the "
+			      @"device: it fails with MTLCommandBufferErrorInternal",
+			      (unsigned long long)[self rgfxObjId]);
+		else if (heldPosted && rgfxLogFirst(&site))
+			NSLog(@"RGFX: command buffer 0x%llx: no region block for its %llu bytes: it fails "
+			      @"with MTLCommandBufferErrorOutOfMemory",
+			      (unsigned long long)[self rgfxObjId], (unsigned long long)messageBytes);
 		RgfxCbComplete failed = {};
 		failed.header.type = RGFX_EVT_CB_COMPLETE;
 		failed.cb_obj_id = [self rgfxObjId];
 		failed.status = RGFX_CB_INTERNAL;
-		failed.error_code = MTLCommandBufferErrorOutOfMemory;
+		failed.error_code =
+		    heldPosted ? MTLCommandBufferErrorOutOfMemory : MTLCommandBufferErrorInternal;
 		RgfxCmdBuffer *strongSelf = self;
 		[self rgfxHostDone:&failed];
 		[queue rgfxDeliver:^{
@@ -1929,6 +2512,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	return [NSError errorWithDomain:MTLCommandBufferErrorDomain code:code userInfo:nil];
 }
 
+#if defined(__arm64__)
+// The NSError Metal gives a command buffer that retains no references, one of whose scheduled
+// signals names no event: its description, under the code it carries (measured on the M3 Max,
+// macOS 27.0.1, oracle_cmdbuf schedsig_nil_unretained; an underlying error is not measured).
+static NSError *rgfxInvalidInputError()
+{
+	return [NSError
+	    errorWithDomain:MTLCommandBufferErrorDomain
+	               code:MTLCommandBufferErrorInternal
+	           userInfo:@{
+		           NSLocalizedDescriptionKey :
+		               @"Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)"
+	           }];
+}
+#endif
+
 // What the host is done with at the buffer's completion, on the thread that took it off the
 // ring, before its record goes to the queue's completion queue: it is submitted where it was
 // not yet (its CB_COMPLETE stands for both); its writes of surfaces all in place retire; the
@@ -1951,6 +2550,58 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	}
 	return YES;
 }
+
+#if defined(__arm64__)
+// Whether the first `count` events it waits on are at their values, as rgfxWaitsMet reads them.
+- (BOOL)rgfxWaitsMetBefore:(size_t)count
+{
+	for (size_t i = 0; i < count && i < _eventWaits.size(); i++) {
+		const auto &wait = _eventWaits[i];
+		uint64_t now = 0;
+		if ([wait.first isKindOfClass:[RgfxSharedEvent class]])
+			now = [(RgfxSharedEvent *)wait.first signaledValue];
+		else if ([wait.first isKindOfClass:[RgfxEvent class]])
+			now = [(RgfxEvent *)wait.first rgfxSignalledValue];
+		if (now < wait.second)
+			return NO;
+	}
+	return YES;
+}
+
+// At its post, the scheduled signals its queue's submission reaches there, in the order
+// encoded: where no buffer posted before it on its queue is held, each whose waits encoded before
+// it are met as this process knows them (rgfxWaitsMetBefore:). The rest are set at its
+// scheduling, which then runs on its queue's completion queue, as a scheduled handler's does.
+// Metal's queue submits a buffer's stream in order: a scheduled signal takes its value as the
+// submission reaches it, behind every wait before it on the queue, its buffer's own and an
+// earlier buffer's, and ahead of the buffer's GPU work and of a wait encoded after it (measured
+// on the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: 0.04 to 0.1 ms after the commit, before
+// GPUStartTime and the scheduled handler, behind a 190 ms buffer of its queue too; behind a wait,
+// 0.04 to 0.15 ms after the CPU set its event; with a wait on its own event after it, the
+// buffer runs). One held at its post is set later than Metal's, at its buffer's scheduling,
+// where a wait after it on the buffer is not yet met.
+- (void)rgfxSetScheduledSignalsAtPost
+{
+	if (_scheduledSignals.empty())
+		return;
+	if ([_queue rgfxHeldBuffers] == 0) {
+		while (_scheduledSignalsSet < _scheduledSignals.size() &&
+		       [self rgfxWaitsMetBefore:_scheduledSignals[_scheduledSignalsSet].waitsBefore])
+			[self rgfxSetScheduledSignal:_scheduledSignals[_scheduledSignalsSet++]];
+	}
+	if (_scheduledSignalsSet < _scheduledSignals.size()) {
+		_schedulesWhereSeen = false;
+		_deliversWhereSeen = false;
+	}
+}
+
+// Sets a scheduled signal's event to its value, as the CPU's set does: the host first, then
+// this process's listeners and waits; a lower value leaves the event, as Metal's does.
+- (void)rgfxSetScheduledSignal:(const RgfxScheduledSignal &)signal
+{
+	[signal.event setSignaledValue:signal.value];
+}
+#endif
 
 // Names its surface accesses, once: its queue among the writers of each view it writes and the
 // readers of each it only reads, so a present of the surface waits for it and a buffer of
@@ -1990,6 +2641,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 
 - (void)rgfxHostDone:(const RgfxCbComplete *)msg
 {
+	[self rgfxNoteStage:kRgfxStageCompletionInterrupt];
+	[self rgfxNoteStage:kRgfxStageKernelComplete];
 	[self rgfxReachSubmitted];
 	// The slots of its surfaces that still name it are free: a buffer that named it would wait
 	// for nothing. Where its accesses are yet to be named, they are emptied once they are.
@@ -2051,6 +2704,11 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 			dispatch_semaphore_signal(writtenBack);
 		});
 	}
+	// With no copy to write back, its results are where the CPU sees them: the resources it
+	// kept are out of flight here, as Metal's are once the GPU is done, not behind the queue's
+	// earlier handlers; else once the copies are written back (rgfxWriteBackCopies).
+	if (_writtenBack == nil)
+		_kept.land();
 	[self rgfxGiveSlotBack];
 	[self rgfxNoteGPUTimes:msg];
 }
@@ -2080,7 +2738,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 }
 
 // Writes back what this buffer wrote of its copies, on its queue's write-back queue: its
-// surfaces' copies, then the app memory under its no-copy buffers.
+// surfaces' copies, then the app memory under its no-copy buffers; the resources it kept are
+// then out of flight.
 - (void)rgfxWriteBackCopies
 {
 	rgfxIOSurfaceWriteBack(_surfaceWrites);
@@ -2088,6 +2747,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();
 	_shadowWrites.clear();
+	_kept.land();
 }
 
 // Delivers the host's completion for this command buffer, on its queue's completion queue (or on
@@ -2121,11 +2781,23 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	for (const std::shared_ptr<RgfxMemoryShadow> &shadow : _shadowWrites)
 		shadow->writeBack();
 	_shadowWrites.clear();
-	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails.
+	// The resources it kept are out of flight before it is seen complete, where its take did
+	// not do it.
+	_kept.land();
+	// A buffer some of whose inline bytes found no chunk ran without those bindings, so it fails;
+	// so does one with a scheduled signal of a nil event, as Metal's does.
+#if defined(__arm64__)
+	if (msg->status == RGFX_CB_OK && _invalidInput) {
+		_cbError = rgfxInvalidInputError();
+		_status.store(MTLCommandBufferStatusError);
+	} else
+#endif
 	if (msg->status == RGFX_CB_OK && _uploadsFailed) {
 		// It ran without some of its bindings, so it fails as Metal's does when memory runs out.
-		NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
-		      @"device's memory; it fails as out of memory");
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: a command buffer's inline bytes (set*Bytes:) found no room in the "
+			      @"device's memory; it fails as out of memory");
 		_cbError = rgfxCommandBufferError(MTLCommandBufferErrorOutOfMemory);
 		_status.store(MTLCommandBufferStatusError);
 	} else if (msg->status == RGFX_CB_OK) {
@@ -2136,15 +2808,24 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		_cbError = rgfxCommandBufferError(static_cast<NSInteger>(msg->error_code));
 		_status.store(MTLCommandBufferStatusError);
 	}
+	[self rgfxNoteStage:kRgfxStageCompletionHandlerEnqueue];
+	[self rgfxNoteStage:kRgfxStageCompletionHandlerExecution];
 	for (MTLCommandBufferHandler block in _completedHandlers) {
 		block(self);
 	}
 	[_completedHandlers removeAllObjects];
 	// What it kept goes after its handlers, which may still name it, and before its waiters
-	// wake, as Metal's buffer lets its retained references go.
+	// wake, as Metal's buffer lets its retained references go; the blocks
+	// __waitUntilCompletedAsync: was given run between the two, as Metal's do. The destroys
+	// those releases hold arm their timer once the waiters are let go (RgfxRingLaterArms).
+	RgfxRingLaterArms arms;
 	_kept.clear();
-	if (_done != nil && !_left.exchange(true))
+	[self rgfxLetResidencySetsGo];
+	[self rgfxRunWaiters:_completedWaiters done:&_completedWaitersDone];
+	if (_done != nil && !_left.exchange(true)) {
 		dispatch_group_leave(_done);
+		dispatch_group_leave(_queueCommitted);
+	}
 }
 
 // The buffer is scheduled (its CB_SCHEDULED, or its completion where none came first), once:
@@ -2164,12 +2845,19 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 		return;
 	[self rgfxReachSubmitted];
 	[self rgfxScheduledNamesAccesses];
+#if defined(__arm64__)
+	// Its scheduled signals its post did not set, before its scheduled handlers run.
+	while (_scheduledSignalsSet < _scheduledSignals.size())
+		[self rgfxSetScheduledSignal:_scheduledSignals[_scheduledSignalsSet++]];
+#endif
 	MTLCommandBufferStatus committed = MTLCommandBufferStatusCommitted;
 	_status.compare_exchange_strong(committed, MTLCommandBufferStatusScheduled);
+	[self rgfxNoteStage:kRgfxStageSubmitToHW];
 	for (MTLCommandBufferHandler block in _scheduledHandlers) {
 		block(self);
 	}
 	[_scheduledHandlers removeAllObjects];
+	[self rgfxRunWaiters:_scheduledWaiters done:&_scheduledWaitersDone];
 	_scheduledRan.store(true);
 	if (_scheduled != nil && !_scheduledLeft.exchange(true))
 		dispatch_group_leave(_scheduled);
@@ -2178,10 +2866,15 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // The buffer is submitted (its CB_SUBMITTED, or its scheduling where none came first), once:
 // commitAndWaitUntilSubmitted returns. Its status stays Committed until it is scheduled, as
 // Metal's may at that return (measured on the M3 Max, an AMD 5300M and an Intel 630,
-// docs/graphics-kext/dgpu-oracle.md, Q7).
+// docs/graphics-kext/dgpu-oracle.md, Q7). The resources it keeps are in flight from here
+// (RgfxKept::begin), counted before anyone sees it submitted: a caller that finds it not yet
+// submitted waits, in begin, for one counting them.
 - (void)rgfxReachSubmitted
 {
-	_submittedReached.store(true);
+	if (!_submittedReached.load(std::memory_order_acquire)) {
+		_kept.begin();
+		_submittedReached.store(true, std::memory_order_release);
+	}
 	if (_submitted != nil && !_submittedLeft.exchange(true))
 		dispatch_group_leave(_submitted);
 }
@@ -2254,8 +2947,42 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 - (void)waitUntilScheduled
 {
 	// Blocks until the buffer is scheduled and its scheduled handlers have run
-	// (rgfxReachScheduled), as Metal's does.
+	// (rgfxReachScheduled), as Metal's does, asking the host for its scheduling first.
+	[self rgfxAskScheduled];
 	[self rgfxWaitFor:_scheduled reached:&_scheduledRan];
+}
+
+// A thread waits for the committed buffer to be scheduled: where its queue's device answers
+// RGFX_CMD_SCHEDULED_ASK (asksScheduled), and the buffer did not ask for its submission, whose
+// records the host posts at its take where it may, and is not yet scheduled, the host is asked
+// for its CB_SCHEDULED, once, after its message: here where the message is on its ring, else by
+// its post (rgfxPost), whichever comes second. Metal makes a buffer that waits for nothing
+// Scheduled within a fraction of a millisecond of its commit (measured on the M3 Max, an AMD
+// 5300M and Apple's paravirtualized device: 0.05 to 0.2 ms, behind a 120 ms buffer too); the host
+// posts the record at the ask where the buffer waits for nothing, not once its platform has
+// submitted the buffer's work, which took 1.3 to 1.5 ms of each of the GPU process's waits during
+// a window's resize on a 780M host (11-09).
+- (void)rgfxAskScheduled
+{
+	if (_reader == nullptr || _asksSubmitted || !_queue.asksScheduled || _scheduledReached.load())
+		return;
+	const uint32_t prior = _scheduledAsk.fetch_or(kRgfxAskWanted, std::memory_order_acq_rel);
+	if ((prior & (kRgfxAskWanted | kRgfxAskPosted)) == kRgfxAskPosted)
+		[self rgfxPostScheduledAsk];
+}
+
+// Posts the buffer's RGFX_CMD_SCHEDULED_ASK on its queue's ring, after its message, waiting for
+// room as a commit does.
+- (void)rgfxPostScheduledAsk
+{
+	RgfxScheduledAsk ask = {};
+	ask.cb_obj_id = [self rgfxObjId];
+	ask.cb_seqno = _seqno;
+	RgfxReplyReader *reader = _reader;
+	std::function<void()> whileWaiting;
+	if (!reader->driven())
+		whileWaiting = [reader] { reader->pump(); };
+	_ring->post(RGFX_CMD_SCHEDULED_ASK, &ask, sizeof(ask), nullptr, whileWaiting);
 }
 
 - (void)waitUntilCompleted
@@ -2303,9 +3030,8 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	uint64_t n = 0;
 	if (logEventOp(g_foreignEvents, &n)) {
 		NSLog(@"RGFX: command buffer 0x%llx: %s an event %@ that no device of ours made, value "
-		      @"%llu: not carried (so far: %llu)",
-		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value,
-		      (unsigned long long)(n + 1));
+		      @"%llu: not carried",
+		      (unsigned long long)[self rgfxObjId], op, event, (unsigned long long)value);
 	}
 	return 0;
 }
@@ -2341,13 +3067,29 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // CAMetalLayer's) is then the layer's next frame: its presented handlers report the refresh that
 // showed it, or 0 where a later frame took its place, and the layer gives it back to
 // nextDrawable once the display is done with it. The block keeps the drawable until it runs.
+// As Metal's base buffer does (read from code, macOS 27 Metal.framework), the buffer then owes
+// its queue one present-scheduled signal, which the drawable gives once its present is scheduled
+// (addPresentScheduledHandler:, asked of every drawable as Metal asks it): the queue posts
+// nothing after the buffer until then, and the buffer, as each the queue commits from now on, asks
+// for its submission (PRESENT HOLD). Where the buffer has failed by its
+// scheduling, the scheduled handler gives the signal instead, as Metal's does; the bundle's
+// buffers learn a failure at their completion, after their scheduled handlers, so they present.
 - (void)rgfxPresent:(id<MTLDrawable>)drawable with:(void (^)(id<MTLDrawable>))present
 {
 	if (drawable == nil)
 		return;
+	RgfxCommandQueue *queue = _queue;
+	[queue rgfxNotePresents];
 	[self addScheduledHandler:^(id<MTLCommandBuffer> cb) {
 		if (cb.error == nil)
 			present(drawable);
+		else
+			[queue rgfxPresentScheduled];
+	}];
+	_presentWaits.fetch_add(1, std::memory_order_acq_rel);
+	[(id<RgfxDrawablePresentScheduled>)drawable addPresentScheduledHandler:^(id<MTLDrawable> d) {
+		(void)d;
+		[queue rgfxPresentScheduled];
 	}];
 }
 
@@ -2401,9 +3143,10 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 {
 	_errorOptions = options;
 }
+// What setLogs: gave, else an empty container.
 - (id<MTLLogContainer>)logs
 {
-	return [[RgfxLogContainer alloc] init];
+	return _logs != nil ? _logs : [[RgfxLogContainer alloc] init];
 }
 // The times (rgfxNoteGPUTimes:), 0 until the buffer has them.
 - (CFTimeInterval)kernelStartTime
@@ -2490,17 +3233,50 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	RGFX_UNSUPPORTED("sparse textures");
 	return nil;
 }
-// The device makes no residency set (newResidencySetWithDescriptor:error:).
+// The arm64 device's buffer holds the residency sets it uses, each as many times as it was used,
+// from the use until it completes, as Metal's buffer counts them in an NSCountedSet and lets
+// them go at its completion (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency's
+// cb, retain and hold cases): the device keeps every allocation resident, so holding them is all
+// a buffer does. A nil set raises the counted set's NSInvalidArgumentException, as Metal's
+// buffer does, and a use after the commit is taken. The x86 device makes no set
+// (RgfxMakesResidencySets), and its buffer logs one it is given.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		if (_residencySets == nil)
+			_residencySets = [NSCountedSet set];
+		[_residencySets addObject:residencySet];
+	}
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	@synchronized(self) {
+		if (_residencySets == nil)
+			_residencySets = [NSCountedSet set];
+		for (NSUInteger i = 0; i < count; i++)
+			[_residencySets addObject:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
+}
+
+// At its completion: the residency sets it used go, after the lock.
+- (void)rgfxLetResidencySetsGo
+{
+	NS_VALID_UNTIL_END_OF_SCOPE NSCountedSet *used = nil;
+	@synchronized(self) {
+		used = _residencySets;
+		_residencySets = nil;
+	}
 }
 
 // --- what Core Image and MPS send a command buffer beyond MTLCommandBuffer ------------
@@ -2524,6 +3300,43 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	[self encodeSignalEvent:event value:value];
 }
 
+#if defined(__arm64__)
+// An Apple GPU's command buffer's SPI, which MPSGraph's Neural Engine region op sends with no
+// respondsToSelector: check (read from code, macOS 27.0.1; dgpu-oracle.md, Q45); neither x86
+// Mac's buffers answer it (%spi-neither), so an x86-64 guest's do not. The shared event takes `value` as its queue's submission reaches the
+// call, where its GPU work has not begun (rgfxSetScheduledSignalsAtPost), and its value only
+// rises, as Metal's (measured on the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: an event at 5
+// stays 5 after a scheduled signal of 3; of two, 6 and 8 in either order, 8). After the commit
+// the call sets nothing. A plain event ends the process with Metal's words, as Metal does; a nil
+// event raises Metal's exception on a buffer that retains its references, and fails a buffer
+// that retains none with Metal's error (measured, schedsig_plain, schedsig_late, schedsig_nil,
+// schedsig_nil_unretained). An event no device of ours made is not carried (rgfxEventOf:).
+- (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value
+{
+	if ([(id)event isKindOfClass:[RgfxEvent class]]) {
+		NSLog(@"MTLEvent passed to API expecting MTLSharedEvent");
+		abort();
+	}
+	if (event == nil && _retained)
+		@throw [NSException
+		    exceptionWithName:NSInvalidArgumentException
+		               reason:@"*** -[__NSArrayM insertObject:atIndex:]: object cannot be nil"
+		             userInfo:nil];
+	std::lock_guard<std::mutex> hold(_handlersLock);
+	if (_committed)
+		return;
+	if (event == nil) {
+		_invalidInput = true;
+		return;
+	}
+	if (![(id)event isKindOfClass:[RgfxSharedEvent class]]) {
+		[self rgfxEventOf:event op:"encodeSignalEventScheduled" value:value];
+		return;
+	}
+	_scheduledSignals.push_back({(RgfxSharedEvent *)event, value, _eventWaits.size()});
+}
+#endif
+
 // Statistics, as the queue's.
 - (void)setStatEnabled:(BOOL)enabled
 {
@@ -2542,6 +3355,372 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 // Returns with nothing changed, before commit and after completion.
 - (void)validate
 {
+}
+
+// --- MTLCommandBufferSPI ---------------------------------------------------------------------
+// The members of Metal's command-buffer SPI that the AMD 5300M's and the Intel 630's buffers both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// answered as Metal's base command buffer answers them (read from code: _MTLCommandBuffer and
+// MTLIOAccelCommandBuffer, macOS 27.0.1); the getters of a fresh buffer answer what those two
+// GPUs' buffers answer (measured: oracle_spi_members answers).
+
+// When the buffer reached `stage`: profilingResults' times, kept while profiling is enabled.
+- (void)rgfxNoteStage:(RgfxStage)stage
+{
+	if (_profilingEnabled.load(std::memory_order_relaxed))
+		_stageTimes[stage].store(mach_absolute_time(), std::memory_order_relaxed);
+}
+
+// Runs the blocks `waiters` holds with the buffer, after its handlers of the stage, as Metal
+// runs its Swift waiters after its callbacks and before its waits return, and marks them run, so
+// a block given later runs at once (__waitUntilScheduledAsync:, __waitUntilCompletedAsync:). A record runs on the
+// completion thread only where it runs nothing of the app's (rgfxDeliver:here:), so there the
+// blocks go to the queue's completion queue instead.
+- (void)rgfxRunWaiters:(NSMutableArray *)waiters done:(bool *)done
+{
+	NSArray *blocks = nil;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		*done = true;
+		if (waiters.count == 0)
+			return;
+		blocks = [waiters copy];
+		[waiters removeAllObjects];
+	}
+	RgfxCmdBuffer *buffer = self;
+	dispatch_block_t run = ^{
+		for (void (^block)(id<MTLCommandBuffer>) in blocks)
+			block(buffer);
+	};
+	if (RgfxCompletionThread::onCurrentThread())
+		[_queue rgfxDeliver:run here:NO];
+	else
+		run();
+}
+
+// The wait Metal's Swift overlay awaits (scheduled()): `block` runs with the buffer once it is
+// scheduled and its scheduled handlers have run, at once where they have.
+- (void)__waitUntilScheduledAsync:(void (^)(id<MTLCommandBuffer>))block
+{
+	if (block == nil)
+		return;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		if (!_scheduledWaitersDone) {
+			[_scheduledWaiters addObject:[block copy]];
+			return;
+		}
+	}
+	block(self);
+}
+
+// The same, once it has completed and its completed handlers have run (completed()).
+- (void)__waitUntilCompletedAsync:(void (^)(id<MTLCommandBuffer>))block
+{
+	if (block == nil)
+		return;
+	{
+		std::lock_guard<std::mutex> hold(_handlersLock);
+		if (!_completedWaitersDone) {
+			[_completedWaiters addObject:[block copy]];
+			return;
+		}
+	}
+	block(self);
+}
+
+// Metal's IOAccel buffer hands the resources and heaps named here to its kernel to purge as the
+// buffer runs; the device has no such command.
+- (void)addPurgedResource:(id)resource
+{
+	(void)resource;
+	RGFX_UNSUPPORTED("purging a resource as a command buffer runs");
+}
+
+- (void)addPurgedHeap:(id)heap
+{
+	(void)heap;
+	RGFX_UNSUPPORTED("purging a heap as a command buffer runs");
+}
+
+// Metal's base buffer raises an unrecognized selector for a commit with a deadline (it sends
+// itself doesNotRecognizeSelector:), and so does its wait for the submission, which commits so.
+- (void)commitWithDeadline:(uint64_t)deadline
+{
+	(void)deadline;
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+- (BOOL)commitAndWaitUntilSubmittedWithDeadline:(uint64_t)deadline
+{
+	[self commitWithDeadline:deadline];
+	return NO;
+}
+
+// Metal takes only the descriptor's log state here, and a descriptor of the device's has none:
+// the device makes no log state (newLogStateWithDescriptor:error:).
+- (void)configWithCommandBufferDescriptor:(MTLCommandBufferDescriptor *)descriptor
+{
+	(void)descriptor;
+}
+
+- (id)deadlineProfile
+{
+	return nil;
+}
+
+// No debug buffer: Metal's base answers none, of length 0.
+- (void *)debugBufferContentsWithLength:(NSUInteger *)length
+{
+	if (length != nullptr)
+		*length = 0;
+	return nullptr;
+}
+
+// A tool's hook that corrupts the buffer's kernel commands on purpose.
+- (void)doCorruptCBSPI:(NSUInteger)how
+{
+	(void)how;
+	RGFX_UNSUPPORTED("corrupting a command buffer on purpose");
+}
+
+// Metal's IOAccel buffer encodes a kernel command that aborts it where the event is signalled.
+- (void)encodeConditionalAbortEvent:(id<MTLEvent>)event
+{
+	(void)event;
+	RGFX_UNSUPPORTED("aborting a command buffer on an event");
+}
+
+// Resource-group dashboards: Metal's base buffer fails each as unsupported on the device, with
+// its words.
+- (void)encodeDashboardTagForResourceGroup:(id)group
+{
+	(void)group;
+	RgfxMetalAssertionFailed("-[_MTLCommandBuffer encodeDashboardTagForResourceGroup:]",
+	                         @"-[_MTLCommandBuffer encodeDashboardTagForResourceGroup:] not "
+	                         @"supported on this device");
+}
+
+- (void)encodeDashboardFinalizeForResourceGroup:(id)group
+                                      dashboard:(NSUInteger)dashboard
+                                          value:(uint64_t)value
+                                       forIndex:(NSUInteger)index
+{
+	(void)group;
+	(void)dashboard;
+	(void)value;
+	(void)index;
+	RgfxMetalAssertionFailed(
+	    "-[_MTLCommandBuffer encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex:]",
+	    @"-[_MTLCommandBuffer encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex:] "
+	    @"not supported on this device");
+}
+
+- (void)encodeDashboardFinalizeForResourceGroup:(id)group
+                                      dashboard:(NSUInteger)dashboard
+                                         values:(const uint64_t *)values
+                                        indices:(const NSUInteger *)indices
+                                          count:(NSUInteger)count
+{
+	(void)group;
+	(void)dashboard;
+	(void)values;
+	(void)indices;
+	(void)count;
+	RgfxMetalAssertionFailed("-[_MTLCommandBuffer "
+	                         "encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count:]",
+	                         @"-[_MTLCommandBuffer "
+	                         @"encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count:] "
+	                         @"not supported on this device");
+}
+
+- (NSUInteger)getListIndex
+{
+	return 0;
+}
+
+- (BOOL)isProfilingEnabled
+{
+	return _profilingEnabled.load();
+}
+
+- (void)setProfilingEnabled:(BOOL)enabled
+{
+	_profilingEnabled.store(enabled);
+}
+
+// With profiling enabled, when the buffer reached each stage, in mach_absolute_time's units under
+// Metal's keys, 0 for one it has not reached; nil without. The device's stages: its creation,
+// enqueue and commit; its post to the device (submitted to the kernel, and done scheduling
+// there); its scheduling (submitted to the hardware); the completion's record taken off the ring
+// (the interrupt, and the kernel's completion); its delivery (its handlers' enqueue and run).
+- (NSDictionary *)profilingResults
+{
+	if (!_profilingEnabled.load())
+		return nil;
+	static NSString *const keys[kRgfxStageCount] = {
+	    @"MTLCommandBufferCreationTime",
+	    @"MTLCommandBufferEnqueueTime",
+	    @"MTLCommandBufferCommitTime",
+	    @"MTLCommandBufferSubmitToKernelTime",
+	    @"MTLCommandBufferKernelScheduledTime",
+	    @"MTLCommandBufferSubmitToHWTime",
+	    @"MTLCommandBufferCompletionInterruptTime",
+	    @"MTLCommandBufferKernelCompleteTime",
+	    @"MTLCommandBufferCompletionHandlerEnqueueTime",
+	    @"MTLCommandBufferCompletionHandlerExecutionTime",
+	};
+	NSMutableDictionary *results = [NSMutableDictionary dictionaryWithCapacity:kRgfxStageCount];
+	for (unsigned i = 0; i < kRgfxStageCount; i++) {
+		uint64_t at = _stageTimes[i].load(std::memory_order_relaxed);
+		if (i == kRgfxStageKernelScheduled)
+			at = _stageTimes[kRgfxStageSubmitToKernel].load(std::memory_order_relaxed);
+		results[keys[i]] = @(at);
+	}
+	return [results copy];
+}
+
+- (id)privateData
+{
+	return _privateData;
+}
+
+- (void)setPrivateData:(id)privateData
+{
+	_privateData = privateData;
+}
+
+- (NSUInteger)privateDataOffset
+{
+	return _privateDataOffset;
+}
+
+- (void)setPrivateDataOffset:(NSUInteger)offset
+{
+	_privateDataOffset = offset;
+}
+
+// Not retained, as Metal's base keeps it.
+- (id)privateLoggingBuffer
+{
+	return _privateLoggingBuffer;
+}
+
+- (void)setPrivateLoggingBuffer:(id)buffer
+{
+	_privateLoggingBuffer = buffer;
+}
+
+- (void)setLogs:(id)logs
+{
+	_logs = logs;
+}
+
+// Which tasks the buffer's work is for, which Metal's IOAccel buffer takes and does nothing with.
+- (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count
+{
+	(void)taskIDs;
+	(void)count;
+}
+
+- (BOOL)sharedIndirectionTable
+{
+	return _sharedIndirectionTable;
+}
+
+- (void)setSharedIndirectionTable:(BOOL)shared
+{
+	_sharedIndirectionTable = shared;
+}
+
+// Encoders that sample counters into a program-info buffer: Metal's base buffer answers nil for
+// each, and the device samples no counters.
+- (id)sampledBlitCommandEncoder:(uintptr_t)programInfoBuffer capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledBlitCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                            programInfoBuffer:(uintptr_t)programInfoBuffer
+                                     capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithProgramInfoBuffer:(uintptr_t)programInfoBuffer
+                                               capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                               programInfoBuffer:(uintptr_t)programInfoBuffer
+                                        capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledComputeCommandEncoderWithDispatchType:(NSUInteger)dispatchType
+                                 programInfoBuffer:(uintptr_t)programInfoBuffer
+                                          capacity:(NSUInteger)capacity
+{
+	(void)dispatchType;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledRenderCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                              programInfoBuffer:(uintptr_t)programInfoBuffer
+                                       capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledAccelerationStructureCommandEncoder:(uintptr_t)programInfoBuffer
+                                        capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+- (id)sampledAccelerationStructureCommandEncoderWithDescriptor:(uintptr_t)descriptor
+                                             programInfoBuffer:(uintptr_t)programInfoBuffer
+                                                      capacity:(NSUInteger)capacity
+{
+	(void)descriptor;
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+// A residency set of Metal's own: Metal's base buffer uses it as one of the caller's
+// (useResidencySet:, useResidencySets:count:; read from code, _MTLCommandBuffer, macOS 27.0.1),
+// which both x86 Macs' buffers answer (measured with respondsToSelector:, macOS 26.7.1,
+// tools/oracle/oracle_spi_members.m ask), and so does this.
+- (void)useInternalResidencySet:(id<MTLResidencySet>)residencySet
+{
+	[self useResidencySet:residencySet];
+}
+
+- (void)useInternalResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
+                           count:(NSUInteger)count
+{
+	[self useResidencySets:residencySets count:count];
 }
 
 @end
@@ -2571,6 +3750,7 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	RgfxUploadCursor _uploadCursor;              // the run of it this encoder fills
 	NSUInteger _tileWidth, _tileHeight;          // the pass descriptor's tile size
 	RgfxBarrierSlot _barrier;                    // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;                         // a barrier has waited for the earlier encoders
@@ -2578,21 +3758,22 @@ static NSError *rgfxCommandBufferError(NSInteger code)
 	RgfxSurfaceBindings _fragmentSurfaces;
 	RgfxSurfaceBindings _objectSurfaces;
 	RgfxSurfaceBindings _meshSurfaces;
-	// The pipeline's functions' arguments, by stage.
-	std::shared_ptr<const RgfxAirFunction> _vertexAir;
-	std::shared_ptr<const RgfxAirFunction> _fragmentAir;
-	std::shared_ptr<const RgfxAirFunction> _objectAir;
-	std::shared_ptr<const RgfxAirFunction> _meshAir;
+	// The pipeline's functions' arguments, by stage, borrowed from `_pipeline`, which holds them.
+	RgfxStageArguments _air;
 	// Whether the host makes mesh pipelines, so the object and mesh stages' commands are sent.
 	BOOL _meshes;
+	// The index the encoder's indexed strips restart at since setPrimitiveRestartEnabled:YES
+	// index:, where `_restartSet` (else their index type's all-ones index, as before any call).
+	BOOL _restartSet;
+	NSUInteger _restartIndex;
 }
 
 - (void)rgfxNoteDrawWrites
 {
-	_vertexSurfaces.noteWrites(_enc, _vertexAir.get());
-	_fragmentSurfaces.noteWrites(_enc, _fragmentAir.get());
-	_objectSurfaces.noteWrites(_enc, _objectAir.get());
-	_meshSurfaces.noteWrites(_enc, _meshAir.get());
+	_vertexSurfaces.noteWrites(_enc, _air.vertex);
+	_fragmentSurfaces.noteWrites(_enc, _air.fragment);
+	_objectSurfaces.noteWrites(_enc, _air.object);
+	_meshSurfaces.noteWrites(_enc, _air.mesh);
 }
 
 - (void)rgfxSetUploads:(std::shared_ptr<RgfxUploadArena>)uploads
@@ -2697,6 +3878,9 @@ RGFX_LOG_UNRECOGNIZED
 	_fragmentSurfaces.clear();
 	_objectSurfaces.clear();
 	_meshSurfaces.clear();
+	// What is left of its run of the inline bytes' chunk, for the buffer's next encoder.
+	if (_uploads != nullptr)
+		_uploads->release(_uploadCursor);
 	// Last: the buffer may go with it, and its RgfxEncoder with it.
 	_commandBufferHold = nil;
 }
@@ -2707,18 +3891,10 @@ RGFX_LOG_UNRECOGNIZED
 {
 	if (pipelineState != _pipeline) {
 		_pipeline = pipelineState;
-		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]]) {
-			RgfxRenderPipelineState *state = (RgfxRenderPipelineState *)pipelineState;
-			_vertexAir = [state rgfxVertexAirFunction];
-			_fragmentAir = [state rgfxFragmentAirFunction];
-			_objectAir = [state rgfxObjectAirFunction];
-			_meshAir = [state rgfxMeshAirFunction];
-		} else {
-			_vertexAir = nullptr;
-			_fragmentAir = nullptr;
-			_objectAir = nullptr;
-			_meshAir = nullptr;
-		}
+		if ([(id)pipelineState isKindOfClass:[RgfxRenderPipelineState class]])
+			_air = [(RgfxRenderPipelineState *)pipelineState rgfxStageArguments];
+		else
+			_air = {};
 		_vertexSurfaces.pipelineChanged();
 		_fragmentSurfaces.pipelineChanged();
 		_objectSurfaces.pipelineChanged();
@@ -2771,6 +3947,12 @@ RGFX_LOG_UNRECOGNIZED
 - (void)setFrontFacingWinding:(MTLWinding)frontFacingWinding
 {
 	_enc->renderSetFrontFacingWinding(static_cast<uint64_t>(frontFacingWinding));
+}
+- (void)setDepthCleared
+{
+}
+- (void)setStencilCleared
+{
 }
 - (void)setTriangleFillMode:(MTLTriangleFillMode)fillMode
 {
@@ -3420,7 +4602,7 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		_enc->renderSetVertexBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setVertexBytes:(const void *)bytes
@@ -3430,21 +4612,21 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setVertexBuffer:buffer offset:offset attributeStride:stride atIndex:index];
 }
 - (void)setFragmentBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		_enc->renderSetFragmentBuffer(rgfxBinds(_enc, buffer), offset, index);
 }
 - (void)setTileBytes:(const void *)bytes length:(NSUInteger)length atIndex:(NSUInteger)index
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setTileBuffer:buffer offset:offset atIndex:index];
 }
 
@@ -3639,7 +4821,7 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setObjectBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setObjectSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
@@ -3776,7 +4958,7 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setMeshBuffer:buffer offset:offset atIndex:index];
 }
 - (void)setMeshSamplerState:(nullable id<MTLSamplerState>)sampler atIndex:(NSUInteger)index
@@ -3982,6 +5164,132 @@ RGFX_LOG_UNRECOGNIZED
 		RGFX_UNSUPPORTED("function pointers");
 }
 
+// --- MTLRenderCommandEncoderSPI -----------------------------------------------------------
+// The members of Metal's render-encoder SPI that the AMD 5300M's and the Intel 630's encoders both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// The object and mesh stages' acceleration structures and function tables, as the vertex,
+// fragment and tile stages' (above): none bound is nothing to carry out.
+- (void)setObjectAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                         atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                             atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                            withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setObjectVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                        atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setObjectVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                       withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setMeshAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
+                       atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (accelerationStructure != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshIntersectionFunctionTable:
+            (nullable id<MTLIntersectionFunctionTable>)intersectionFunctionTable
+                           atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (intersectionFunctionTable != nil)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshIntersectionFunctionTables:
+            (const id<MTLIntersectionFunctionTable> __nullable[__nonnull])intersectionFunctionTables
+                          withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("ray tracing");
+}
+- (void)setMeshVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)functionTable
+                      atBufferIndex:(NSUInteger)bufferIndex
+{
+	if (functionTable != nil)
+		RGFX_UNSUPPORTED("function pointers");
+}
+- (void)setMeshVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])functionTables
+                     withBufferRange:(NSRange)range
+{
+	if (range.length != 0)
+		RGFX_UNSUPPORTED("function pointers");
+}
+
+// The depth clip mode, as setDepthClipMode: sets it: Metal's IOAccel encoder sends itself that
+// (read from code, MTLIOAccelRenderCommandEncoder, macOS 27.0.1).
+- (void)setDepthClipModeSPI:(MTLDepthClipMode)depthClipMode
+{
+	[self setDepthClipMode:depthClipMode];
+}
+
+// NO, as Metal's IOAccel encoder answers (read from code, MTLIOAccelRenderCommandEncoder, macOS
+// 27.0.1).
+- (BOOL)isMemorylessRender
+{
+	return NO;
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder and MTLIOAccelRenderCommandEncoder,
+// macOS 27.0.1), and so does this.
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer
+                          atIndex:(NSUInteger)index
+                           stages:(NSUInteger)stages
+{
+	(void)buffer;
+	(void)index;
+	(void)stages;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// A mode of vertex amplification beyond setVertexAmplificationCount:viewMappings:'s: none on the
+// wire, so it is refused, and the draws amplify as that set them.
+- (void)setVertexAmplificationMode:(NSUInteger)mode value:(NSUInteger)value
+{
+	(void)mode;
+	(void)value;
+	RGFX_UNSUPPORTED("a vertex amplification mode");
+}
+
+// A handler to call where the encoder's pass is split into several on the GPU: the device sends
+// the pass to the host whole, so it reports no split and never calls one.
+- (void)addSplitHandler:(void (^)(void))handler
+{
+	(void)handler;
+}
+
 // --- what QuartzCore, SkyLight and MPS send a render encoder beyond its protocol -----
 
 // A fragment texture and its sampler, set together.
@@ -4002,6 +5310,39 @@ RGFX_LOG_UNRECOGNIZED
 	_enc->renderSetLineWidth(width);
 }
 
+// --- what the GL renderer (AppleMetalOpenGLRenderer) sends a render encoder beyond its protocol
+
+// The index the encoder's indexed line and triangle strips restart at, as the Intel UHD 630's
+// encoder answers it (measured, macOS 26.7.1; the AMD Radeon Pro 5300M's answers neither this nor
+// setProvokingVertexMode:). Enabled, a strip drawn after it restarts at `index` alone, 16- and
+// 32-bit alike, and draws its index type's all-ones index as a vertex; not enabled, at that
+// all-ones index again, as with no call, whatever `index` is. The host draws the index the op
+// carries in either case, so a call that is not enabled carries the all-ones index, and only where
+// an enabled one came before it. The GL renderer sends this before its draws, not enabled on the
+// 630 whatever GL's restart state, and restarts GL's strips itself; where an encoder answers
+// neither, it writes "setPrimitiveRestartEnabled:index: unsupported!" to stderr once a process.
+- (void)setPrimitiveRestartEnabled:(BOOL)enabled index:(NSUInteger)index
+{
+	if (enabled) {
+		if (_restartSet && _restartIndex == index)
+			return;
+		_enc->renderSetPrimitiveRestartEnabled(index, true);
+		_restartSet = YES;
+		_restartIndex = index;
+	} else if (_restartSet) {
+		_enc->renderSetPrimitiveRestartEnabled(kRgfxRestartAtAllOnes, false);
+		_restartSet = NO;
+	}
+}
+
+// The vertex a primitive's flat inputs come from, which the host's encoder draws: mode 0 the
+// first, as without a call, 1 the last (a triangle's third, strip triangle i's vertex i + 2, a
+// line's second), as the Intel UHD 630's encoder answers it (measured, macOS 26.7.1).
+- (void)setProvokingVertexMode:(NSUInteger)mode
+{
+	_enc->renderSetProvokingVertexMode(mode);
+}
+
 // A tile dispatch over part of the tiles: none on the wire (nor any tile pipeline to run).
 - (void)dispatchThreadsPerTile:(MTLSize)threadsPerTile inRegion:(MTLRegion)region
 {
@@ -4010,18 +5351,33 @@ RGFX_LOG_UNRECOGNIZED
 	RGFX_UNSUPPORTED("tile dispatches over a region");
 }
 
-// Metal takes nil and its own sets; the device makes no residency set
-// (newResidencySetWithDescriptor:error:), so nil is the only one this can be sent.
+// Metal's render and compute encoders take a residency set and nil (measured: the M3 Max, macOS
+// 27.0.1, tools/oracle/oracle_residency's render-use and compute-use cases). The arm64 device's
+// encoder has its command buffer hold a set it is given until the buffer completes (useResidencySet:
+// there), which is all the device needs, as it keeps every allocation resident, and passes over
+// nil. The x86 device makes no set (RgfxMakesResidencySets), and its encoder logs one it is given.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	if (residencySet != nil)
+		[_commandBuffer useResidencySet:residencySet];
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	for (NSUInteger i = 0; i < count; i++) {
+		if (residencySets[i] != nil)
+			[_commandBuffer useResidencySet:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 @end
@@ -4041,6 +5397,7 @@ RGFX_LOG_UNRECOGNIZED
 	uint64_t _traceId;
 	NSString *_encLabel;
 	std::shared_ptr<RgfxUploadArena> _uploads; // the command buffer's, for inline bytes
+	RgfxUploadCursor _uploadCursor;             // the run of it this encoder fills
 	MTLDispatchType _dispatchType;              // the pass's; Serial, Metal's default, unless set
 	RgfxBarrierSlot _barrier;                   // its queue barrier fence (QUEUE BARRIERS)
 	BOOL _barrierWaited;
@@ -4133,6 +5490,9 @@ RGFX_LOG_UNRECOGNIZED
 		_enc->computeUpdateFence(_barrier.fences[_barrier.slot]);
 	_enc->endEncoder();
 	_surfaces.clear();
+	// What is left of its run of the inline bytes' chunk, for the buffer's next encoder.
+	if (_uploads != nullptr)
+		_uploads->release(_uploadCursor);
 	// Last: the buffer may go with it, and its RgfxEncoder with it.
 	_commandBufferHold = nil;
 }
@@ -4384,8 +5744,12 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
-		[self setBuffer:buffer offset:offset atIndex:index];
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset)) {
+		RgfxComputeBufferBinding e = {};
+		e.buffer_obj_id = rgfxBinds(_enc, buffer);
+		e.offset = offset;
+		_enc->computeSetBuffers(index, &e, 1);
+	}
 }
 - (void)setBytes:(const void *)bytes
              length:(NSUInteger)length
@@ -4394,12 +5758,13 @@ RGFX_LOG_UNRECOGNIZED
 {
 	__unsafe_unretained id<MTLBuffer> buffer = nil;
 	uint64_t offset = 0;
-	if (rgfxPutBytes(_uploads.get(), bytes, length, &buffer, &offset))
+	if (rgfxPutBytes(_uploads.get(), _uploadCursor, bytes, length, &buffer, &offset))
 		[self setBuffer:buffer offset:offset attributeStride:stride atIndex:index];
 }
 
 // --- unsupported: the device answers NO for these features -----------------------
-// The device makes no acceleration structure or function table, so only nil reaches these.
+// The device makes no acceleration structure or intersection function table, so only nil
+// reaches these.
 
 - (void)setAccelerationStructure:(nullable id<MTLAccelerationStructure>)accelerationStructure
                    atBufferIndex:(NSUInteger)bufferIndex
@@ -4420,17 +5785,26 @@ RGFX_LOG_UNRECOGNIZED
 	if (range.length != 0)
 		RGFX_UNSUPPORTED("ray tracing");
 }
+
+// --- function pointers ---------------------------------------------------------------
+// A table of the pipeline's (RgfxVisibleFunctionTable) at a buffer index, which the command
+// buffer keeps while it runs; nil unbinds the index. The host's table is read as the dispatch
+// runs, so its entries are those set before the command buffer's commit.
 - (void)setVisibleFunctionTable:(nullable id<MTLVisibleFunctionTable>)visibleFunctionTable
                   atBufferIndex:(NSUInteger)bufferIndex
 {
-	if (visibleFunctionTable != nil)
-		RGFX_UNSUPPORTED("function pointers");
+	_enc->computeSetVisibleFunctionTable(rgfxNamed(_enc, visibleFunctionTable), bufferIndex);
 }
 - (void)setVisibleFunctionTables:(const id<MTLVisibleFunctionTable> __nullable[__nonnull])visibleFunctionTables
                  withBufferRange:(NSRange)range
 {
-	if (range.length != 0)
-		RGFX_UNSUPPORTED("function pointers");
+	if (range.length == 0)
+		return;
+	std::vector<RgfxComputeVisibleFunctionTableBinding> t(range.length);
+	for (NSUInteger i = 0; i < range.length; i++)
+		t[i].table_obj_id = rgfxNamed(_enc, visibleFunctionTables[i]);
+	_enc->computeSetVisibleFunctionTables(range.location, t.data(),
+	                                      static_cast<uint32_t>(range.length));
 }
 - (void)sampleCountersInBuffer:(id<MTLCounterSampleBuffer>)sampleBuffer
                  atSampleIndex:(NSUInteger)sampleIndex
@@ -4449,18 +5823,29 @@ RGFX_LOG_UNRECOGNIZED
 
 // --- what MPS sends a compute encoder beyond its protocol ----------------------------
 
-// Metal takes nil (and its own sets); the device makes no residency set, as the render
-// encoder's.
+// As the render encoder's.
 - (void)useResidencySet:(id<MTLResidencySet>)residencySet
 {
+#if RgfxMakesResidencySets
+	if (residencySet != nil)
+		[_commandBuffer useResidencySet:residencySet];
+#else
 	if (residencySet != nil)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 - (void)useResidencySets:(const id<MTLResidencySet> _Nonnull[_Nonnull])residencySets
                    count:(NSUInteger)count
 {
+#if RgfxMakesResidencySets
+	for (NSUInteger i = 0; i < count; i++) {
+		if (residencySets[i] != nil)
+			[_commandBuffer useResidencySet:residencySets[i]];
+	}
+#else
 	if (count != 0)
 		RGFX_UNSUPPORTED("residency sets");
+#endif
 }
 
 // A loop the GPU runs while a value in `buffer` compares true: none on the wire, so it is
@@ -4484,11 +5869,108 @@ RGFX_LOG_UNRECOGNIZED
 	return NO;
 }
 
+// --- MTLComputeCommandEncoderSPI ----------------------------------------------------------
+// The members of Metal's compute-encoder SPI that the AMD 5300M's and the Intel 630's encoders
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A conditional the GPU evaluates on a value in `buffer`, and a loop that runs again while one
+// compares true: none on the wire, so they are refused, as encodeStartWhile: is; the work of both
+// branches runs, and a loop's once.
+- (void)encodeStartIf:(id<MTLBuffer>)buffer
+                offset:(NSUInteger)offset
+            comparison:(MTLCompareFunction)comparison
+        referenceValue:(uint32_t)referenceValue
+{
+	(void)buffer;
+	(void)offset;
+	(void)comparison;
+	(void)referenceValue;
+	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+}
+- (void)encodeStartElse
+{
+	RGFX_UNSUPPORTED("GPU-side conditionals (none on the wire)");
+}
+- (void)encodeStartDoWhile
+{
+	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+}
+- (BOOL)encodeEndDoWhile:(id<MTLBuffer>)buffer
+                  offset:(NSUInteger)offset
+              comparison:(MTLCompareFunction)comparison
+          referenceValue:(uint32_t)referenceValue
+{
+	(void)buffer;
+	(void)offset;
+	(void)comparison;
+	(void)referenceValue;
+	RGFX_UNSUPPORTED("GPU-side loops (none on the wire)");
+	return NO;
+}
+// NO, as for encodeEndWhile: no conditional is ever open here.
+- (BOOL)encodeEndIf
+{
+	return NO;
+}
+
+// How the GPU spreads a dispatch's threadgroups over its cores: Metal's base encoder does
+// nothing with either (read from code, _MTLCommandEncoder, macOS 27.0.1), and nor does this; the
+// host's GPU spreads them.
+- (void)setThreadgroupDistributionMode:(NSInteger)mode
+{
+	(void)mode;
+}
+- (void)setThreadgroupDistributionModeWithClusterGroupIndex:(uint32_t)index
+{
+	(void)index;
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder and MTLIOAccelComputeCommandEncoder,
+// macOS 27.0.1), and so does this.
+- (void)setThreadgroupPackingDisabled:(BOOL)disabled
+{
+	(void)disabled;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer atIndex:(NSUInteger)index
+{
+	(void)buffer;
+	(void)index;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// The debug info of the encoder's kernels: the device keeps none, so it answers nil.
+- (nullable id)newKernelDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
+}
+
 @end
 
 // =============================================================================
 // RgfxBlitCommandEncoder
 // =============================================================================
+
+// Metal's tensor slice (MTLBlitCommandEncoderSPI's copyFromTensor:sourceSlice:toTensor:
+// destinationSlice:), which the device never reads: two objects, by its type encoding.
+struct RgfxTensorSlice {
+	__unsafe_unretained id field_00;
+	__unsafe_unretained id field_08;
+};
 
 @implementation RgfxBlitCommandEncoder {
 	RgfxEncoder *_enc;
@@ -4768,21 +6250,13 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 	_enc->blitOptimizeIndirectCommandBuffer(rgfxNamed(_enc, indirectCommandBuffer), range.location,
 	                                        range.length);
 }
-// A Managed buffer of one copy, or a texture over one, has nothing to bring over (RgfxBuffer's
-// rgfxOneCopy): it is named as written, and nothing is sent.
 - (void)synchronizeResource:(id<MTLResource>)resource
 {
-	const uint64_t name = rgfxWrites(_enc, resource);
-	if (rgfxOfOneCopy(resource))
-		return;
-	_enc->blitSynchronizeResource(name, rgfxResourceKind(resource));
+	_enc->blitSynchronizeResource(rgfxWrites(_enc, resource), rgfxResourceKind(resource));
 }
 - (void)synchronizeTexture:(id<MTLTexture>)texture slice:(NSUInteger)slice level:(NSUInteger)level
 {
-	const uint64_t name = rgfxWrites(_enc, texture);
-	if (rgfxOfOneCopy(texture))
-		return;
-	_enc->blitSynchronizeTexture(name, slice, level);
+	_enc->blitSynchronizeTexture(rgfxWrites(_enc, texture), slice, level);
 }
 
 // --- unsupported: the device answers NO for these features -----------------------
@@ -4828,6 +6302,126 @@ destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 		return;
 	_barrierWaited = YES;
 	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) { _enc->blitWaitForFence(fence); });
+}
+
+// --- MTLBlitCommandEncoderSPI -------------------------------------------------------------
+// The members of Metal's blit-encoder SPI that the AMD 5300M's and the Intel 630's encoders both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A copy between slices of tensors: the device makes no tensor, as for the copies above.
+- (void)copyFromTensor:(id)sourceTensor
+           sourceSlice:(RgfxTensorSlice)sourceSlice
+              toTensor:(id)destinationTensor
+      destinationSlice:(RgfxTensorSlice)destinationSlice
+{
+	(void)sourceTensor;
+	(void)sourceSlice;
+	(void)destinationTensor;
+	(void)destinationSlice;
+	RGFX_UNSUPPORTED("tensors");
+}
+
+// Metal's base encoder raises an unrecognized selector for these (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLCommandEncoder, macOS 27.0.1), and so does this.
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+{
+	(void)texture;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+                              slice:(NSUInteger)slice
+                              level:(NSUInteger)level
+{
+	(void)texture;
+	(void)slice;
+	(void)level;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+{
+	(void)texture;
+	(void)readAccessPattern;
+	(void)readAccessor;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+                             slice:(NSUInteger)slice
+                             level:(NSUInteger)level
+{
+	(void)texture;
+	(void)readAccessPattern;
+	(void)readAccessor;
+	(void)slice;
+	(void)level;
+	[self doesNotRecognizeSelector:_cmd];
+}
+// The fills of Metal's IOAccel blit encoder, which both x86 Macs' encoders are (read from code,
+// MTLIOAccelBlitCommandEncoder, macOS 27.0.1): a buffer's and a texture's from bytes raise an
+// unrecognized selector (it sends itself doesNotRecognizeSelector:), and a texture's from a color
+// fills it from the color packed in the texture's own format, or in `pixelFormat`, which then
+// raises. So do these; the bytes passed on are never read.
+- (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range pattern4:(uint32_t)pattern
+{
+	(void)buffer;
+	(void)range;
+	(void)pattern;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              bytes:(const void *)bytes
+             length:(NSUInteger)length
+{
+	(void)texture;
+	(void)level;
+	(void)slice;
+	(void)region;
+	(void)bytes;
+	(void)length;
+	[self doesNotRecognizeSelector:_cmd];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+{
+	[self fillTexture:texture
+	            level:level
+	            slice:slice
+	           region:region
+	            color:color
+	      pixelFormat:texture.pixelFormat];
+}
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+        pixelFormat:(MTLPixelFormat)pixelFormat
+{
+	(void)color;
+	(void)pixelFormat;
+	const uint8_t packed[16] = {};
+	[self fillTexture:texture level:level slice:slice region:region bytes:packed length:sizeof packed];
+}
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// Ends the encoding and answers no program address table, as Metal's base encoder does (read
+// from code, _MTLCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
 }
 
 @end
@@ -5028,6 +6622,50 @@ RGFX_LOG_UNRECOGNIZED
 	rgfxWaitForEarlierEncoders(_barrier, [&](RgfxObjId fence) {
 		_enc->renderWaitForFence(fence, kRgfxBarrierRenderStages);
 	});
+}
+
+// --- MTLParallelRenderCommandEncoderSPI ---------------------------------------------------
+// The members of Metal's parallel-encoder SPI that the AMD 5300M's and the Intel 630's encoders
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// A sub-encoder that samples the GPU's counters into `programInfoBuffer`: Metal's base parallel
+// encoder asks its command buffer's sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:
+// capacity: for it (read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1), which
+// answers nil on the device, which samples no counters; so does this.
+- (nullable id)sampledRenderCommandEncoderWithProgramInfoBuffer:(void *)programInfoBuffer
+                                                        capacity:(NSUInteger)capacity
+{
+	(void)programInfoBuffer;
+	(void)capacity;
+	return nil;
+}
+
+// Whether each sub-encoder's work is committed on its own: NO, and a set does nothing, as Metal's
+// IOAccel parallel encoder answers (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS
+// 27.0.1). The sub-encoders' work goes to the host in the command buffer's.
+- (BOOL)separateCommits
+{
+	return NO;
+}
+- (void)setSeparateCommits:(BOOL)separateCommits
+{
+	(void)separateCommits;
+}
+
+// Metal's base parallel encoder raises an unrecognized selector for this (it sends itself
+// doesNotRecognizeSelector:; read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1), and
+// so does this.
+- (void)insertSplit
+{
+	[self doesNotRecognizeSelector:_cmd];
+}
+
+// Ends the encoding and answers no program address table, as Metal's base parallel encoder does
+// (read from code, _MTLParallelRenderCommandEncoder, macOS 27.0.1).
+- (nullable id)endEncodingAndRetrieveProgramAddressTable
+{
+	[self endEncoding];
+	return nil;
 }
 
 @end

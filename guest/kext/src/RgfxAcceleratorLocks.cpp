@@ -40,14 +40,37 @@
  * control function until then.
  *
  * A deferred block's surface (RgfxSurfaceBlocks.hpp) has its cache made at its ask, before the
- * block is posted, and the ask reads the surface's seed and its resident pages only once the
- * control function is set, under a read-only lockSurface, which waits out any lock calling the
+ * block is posted, and the ask reads the surface's seed and its pages' counts (resident, and
+ * compressed or paged out: rgfxSurfaceLocksPageCounts) only once the control function is set,
+ * under a read-only lockSurface, which waits out any lock calling the
  * control functions (RgfxIOSurfaceKPI.hpp): a read-write lock begun before it has moved the seed,
  * and one after it calls the control function, which waits for the host's answer to the
  * deferral, then names the block's pages before it goes on (SURFACE_PAGES with ATTACH), one lock
  * at a time and under no lock of the contexts'. Its release names them first where the GPU wrote
  * it and its surface lives on (rgfxSurfaceCacheReleaseAttach), on the naming worker, never the
  * release thread, which goes on with the other releases meanwhile (RgfxReleaseTable.hpp).
+ *
+ * A count of a surface's pages maps its memory into the kernel, walks the mapping's regions and
+ * removes the mapping (rgfxSurfaceLocksPageCounts). Each ask that may defer a block counts
+ * (rgfxSurfaceLocksFresh), out of the contexts' lock, and so does the deferral's read under the
+ * surface's lock. Measured with every count's time logged (a scratch build of this code, the log
+ * after the timed span), on a Radeon 780M Linux host, over a cold boot, Safari's scroll and
+ * Mission Control:
+ *  - 26.7.2 (25G332): 3695 counts, median 9.8 us, 99th percentile 68 us, 70.7 ms in all;
+ *  - 11.7.11 (20G1443): 1516 counts, median 13.3 us, 99th percentile 65 us, 29.3 ms in all.
+ * In medians, the mapping's making takes 4-8 us and its removal about 1 us, whatever the size;
+ * the walk grows with it: about 1 us at 64 KiB or less, 6-8 us for Safari's 7296 KiB tiles (the
+ * whole count 14-18 us), 21-27 us at 16-32 MiB, 46-53 us at 53-63 MiB. A walk over resident
+ * pages is slower: 46 us for a 7296 KiB tile holding some. Every mapping lay in one of IOKit's
+ * pageable maps, in one region, and every count counted; no page was compressed or paged out in
+ * these runs. The longest counts, 1-9 ms, 0.2% of them, waited mostly in the mapping's making:
+ * on 26.7.2 the longest, 9.1 ms, was for a 4 KiB surface. A later cold boot of 26.7.2 on a Radeon
+ * 780M (Hawk Point) Linux host, its counts' times summed and their longest kept, met one of 81.8 ms
+ * before the desktop settled, the longest of its 4649 counts over the boot, Safari's scroll and
+ * Mission Control, 8 of which took 1 ms or more. Under the contexts' lock, which every process's
+ * block allocations, surface asks and releases, and context opens and closes take, such a count
+ * held all of them that long: an ask counts out of it (RgfxAcceleratorContexts.cpp,
+ * acquireSurfaceBlock).
  *
  * Our own code; it names SDK-public IOKit calls and IOSurface's interface (RgfxIOSurfaceKPI.hpp).
  */
@@ -57,11 +80,16 @@
 #include "RgfxIOSurfaceKPI.hpp"
 #include "RgfxSurfaceCaches.hpp"
 #include "RgfxSurfaceLocks.hpp"
+#include "RgfxTrace.hpp"
 
+#include <IOKit/IOBufferMemoryDescriptor.h>
 #include <IOKit/IOLib.h>
 #include <kern/clock.h>
 #include <libkern/OSAtomic.h>
+#include <libkern/OSKextLib.h>
 #include <libkern/libkern.h>
+#include <mach/mach_vm.h>
+#include <mach/vm_region.h>
 #include <sys/proc.h>
 
 namespace {
@@ -82,19 +110,23 @@ constexpr UInt32 kMaxCached = kRgfxCachedMaxSurfaces;
 // How many device caches made are logged, with what IOSurface answered, and how many writes
 // named of surfaces the kext cannot follow.
 constexpr UInt32 kCachesLogged = 4;
-constexpr UInt32 kSkipsLogged = 8;
-// How many surfaces left uncached for want of room are logged one by one; the dormancy line
-// counts them all.
-constexpr UInt32 kNoRoomLogged = 4;
+constexpr UInt32 kSkipsLogged = 1;
+// How many surfaces left uncached for want of room are logged one by one: one a boot, as for
+// every degradation (docs/conventions.md); the dormancy line counts them all.
+constexpr UInt32 kNoRoomLogged = 1;
 
 // One initialised object (it lands in __DATA,__data, as the contexts' state does), made at the
 // first write named and kept for the kernel's life.
 struct LockState {
-	// Under `lock`: the pending writes. The waiting locks sleep on `table`.
+	// Under `lock`: the pending writes. The waiting locks sleep on `table`. The control function
+	// takes `lock` holding IOSurface's own locks, and a thread holding the contexts' lock may take
+	// it: so nothing calls into IOSurface under it but IOSurface's getters, which take no lock,
+	// and nothing takes the contexts' lock under it (the lock order, ContextState in
+	// RgfxAcceleratorContexts.cpp).
 	IOLock *lock;
 	RgfxLockTable table;
-	// Under the contexts' lock (RgfxAccelerator::surfaceDeviceCache): IOSurfaceRoot, retained,
-	// and the accelerator ID it gave this accelerator.
+	// Set once (startRoot), under no lock: IOSurfaceRoot, retained, and the accelerator ID it
+	// gave this accelerator. Atomic: the device caches made, the first kCachesLogged logged.
 	OSObject *root;
 	uint32_t acceleratorId;
 	uint32_t cachesMade;
@@ -107,16 +139,18 @@ struct LockState {
 	// sleep on `table` for these too.
 	RgfxCacheTable caches;
 	// Under `lock`: surfaces left uncached as the table had no room, the first kNoRoomLogged
-	// logged.
+	// logged one by one.
 	uint64_t noRoom;
 	// Under `lock`: the releases posted unheld (RGFX_BLOCK_RELEASE_UNHELD) whose surface a
 	// process took again before their answer (rgfxCacheRetaken), counted at the answer.
 	uint64_t retaken;
 	// Under `lock`: the waiting locks' wakes so far (wakeLocked).
 	uint64_t wakes;
+	// Under `lock`: how the deferrals whose asks listed resident pages ended (RgfxCarryOutcome).
+	uint64_t carries[kRgfxCarryOutcomes];
 };
 LockState state = {nullptr, {nullptr, 0, kMaxUses, nullptr, 0, kMaxQueues}, nullptr, 0, 0, 0,
-                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0};
+                   kWaitMs, 0, {nullptr, 0, kMaxCached}, 0, 0, 0, {}};
 
 bool startLocks()
 {
@@ -197,21 +231,35 @@ bool isSurface(const OSObject *surface)
 	return meta && strcmp(meta->getClassName(), "IOSurface") == 0;
 }
 
-// IOSurfaceRoot, retained, and the accelerator ID it gives `accel`, found at the first call.
-// Under the contexts' lock.
+// Whether a caller of startRoot is finding IOSurfaceRoot, or found it.
+bool rootStarting = false;
+
+// IOSurfaceRoot, retained, and the accelerator ID it gives `accel`, found at the first call and
+// kept. Under no lock of the kext's, as the ID is IOSurface's to give (the lock order,
+// ContextState in RgfxAcceleratorContexts.cpp): one caller finds them, and the others wait for
+// it to publish them, or to find no root, which the next call looks for again.
 bool startRoot(RgfxAccelerator *accel)
 {
-	if (state.root)
+	if (__atomic_load_n(&state.root, __ATOMIC_ACQUIRE))
 		return true;
+	bool expected = false;
+	if (!__atomic_compare_exchange_n(&rootStarting, &expected, true, false, __ATOMIC_ACQ_REL,
+	                                 __ATOMIC_ACQUIRE)) {
+		while (!__atomic_load_n(&state.root, __ATOMIC_ACQUIRE) &&
+		       __atomic_load_n(&rootStarting, __ATOMIC_ACQUIRE))
+			IOSleep(1);
+		return __atomic_load_n(&state.root, __ATOMIC_ACQUIRE) != nullptr;
+	}
 	OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
 	IOService *root = matching ? IOService::copyMatchingService(matching) : nullptr;
 	OSSafeReleaseNULL(matching);
 	if (!root) {
 		IOLog("RgfxAccelerator: no IOSurfaceRoot: CPU locks of surfaces wait for no GPU write\n");
+		__atomic_store_n(&rootStarting, false, __ATOMIC_RELEASE);
 		return false;
 	}
-	state.root = root;
 	state.acceleratorId = rgfxIOSurfaceRootAcceleratorID(root, accel);
+	__atomic_store_n(&state.root, root, __ATOMIC_RELEASE);
 	IOLog("RgfxAccelerator: IOSurface accelerator ID %u\n", state.acceleratorId);
 	return true;
 }
@@ -249,11 +297,19 @@ bool attachLocked(RgfxAccelerator *accel, uint64_t key, bool logged)
 	           : kRgfxPagesNotNamed;
 	const bool ok = naming == kRgfxPagesNamed;
 	IOLockLock(state.lock);
-	void *map = nullptr, *wire = nullptr, *surface = nullptr;
+	void *map = nullptr, *wire = nullptr, *surface = nullptr, *carried = nullptr;
 	bool keepWired = false;
-	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(
-	    rgfxCacheAttached(state.caches, key, naming, &map, &wire, &surface, &keepWired)));
+	OSObject *cache = reinterpret_cast<OSObject *>(static_cast<uintptr_t>(rgfxCacheAttached(
+	    state.caches, key, naming, &map, &wire, &surface, &keepWired, &carried)));
+	// Its pages named, the host reads them from now on, not those its deferral carried.
+	if (!cache && ok)
+		carried = rgfxCacheTakeCarried(state.caches, key);
 	wakeLocked();
+	if (carried) {
+		IOLockUnlock(state.lock);
+		letGoMemory(carried, true);
+		IOLockLock(state.lock);
+	}
 	if (cache) {
 		// Its block went meanwhile (rgfxCacheLetGo): the let-go is this attach's, out of the
 		// lock. IOSurface holds the cache for the lock calling this, and the lock's process the
@@ -334,6 +390,11 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 			const RgfxCachedSurface *c = rgfxCacheFind(state.caches, key);
 			if (c != nullptr && c->object != nullptr) {
 				const auto *surface = static_cast<const OSObject *>(c->object);
+				// IOSurface's getter under state.lock, kept there on purpose: it loads a field and
+				// takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5
+				// calls it holding IOSurface's own lock at each client's release, which a getter
+				// taking that lock could not do (the lock order, ContextState in
+				// RgfxAcceleratorContexts.cpp).
 				clients = rgfxIOSurfaceClientCount(surface);
 				rgfxCacheNoteClients(state.caches, key, clients);
 			}
@@ -457,8 +518,10 @@ void surfaceControl(void *accelerator, RgfxDeviceCache *cache, uint32_t op, uint
 		}
 	}
 	IOLockUnlock(state.lock);
-	if (waitedFor) {
-		// How long the lock waited, whatever it waited for.
+	// How long the lock waited, whatever it waited for: once a boot per what it waited for
+	// (docs/conventions.md).
+	static char wentOn;
+	if (waitedFor && rgfxFirstCalls(&wentOn, rgfxKeyOf(waitedFor), 1)) {
 		const uint64_t waitedMs = msSince(start);
 		char name[64] = {};
 		proc_selfname(name, sizeof(name));
@@ -481,29 +544,34 @@ bool rgfxSurfaceLocksAttach(RgfxAccelerator *accel, task_t task, uint32_t surfac
 	if (!startRoot(accel))
 		return false;
 	OSObject *surface = rgfxIOSurfaceRootLookupSurface(state.root, surfaceId, task);
+	// Each refusal below is logged once a boot (docs/conventions.md).
+	static char refused;
 	if (!surface) {
-		IOLog("RgfxAccelerator: IOSurface %u is not the naming process's: its locks wait for no "
-		      "GPU write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u is not the naming process's: its locks wait for "
+			      "no GPU write\n",
+			      surfaceId);
 		return false;
 	}
 	if (!isSurface(surface) || !surfaceHolds(surface, phys)) {
-		IOLog("RgfxAccelerator: IOSurface %u is not its shared block's surface: its locks wait "
-		      "for no GPU write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 1, 1))
+			IOLog("RgfxAccelerator: IOSurface %u is not its shared block's surface: its locks "
+			      "wait for no GPU write\n",
+			      surfaceId);
 		surface->release();
 		return false;
 	}
 	RgfxDeviceCache *cache = rgfxIOSurfaceDeviceCache(surface, accel, state.acceleratorId, 0);
 	if (!cache) {
-		IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its locks wait for no GPU "
-		      "write\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&refused, 2, 1))
+			IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its locks wait for no "
+			      "GPU write\n",
+			      surfaceId);
 		surface->release();
 		return false;
 	}
 	rgfxDeviceCacheSetControl(cache, accel, &surfaceControl);
-	if (state.cachesMade++ < kCachesLogged)
+	if (__atomic_fetch_add(&state.cachesMade, 1, __ATOMIC_RELAXED) < kCachesLogged)
 		IOLog("RgfxAccelerator: IOSurface %u's device cache %p, retain count %d\n", surfaceId,
 		      cache, reinterpret_cast<OSObject *>(cache)->getRetainCount());
 	*surfaceOut = surface;
@@ -519,6 +587,28 @@ OSObject *rgfxSurfaceLocksLookup(RgfxAccelerator *accel, task_t task, uint32_t s
 	if (surface && !isSurface(surface))
 		OSSafeReleaseNULL(surface);
 	return surface;
+}
+
+bool rgfxSurfaceUnlockSeedExported()
+{
+	return &rgfxIOSurfaceUnlockSeed != nullptr && OSKextSymbolIsResolved(rgfxIOSurfaceUnlockSeed);
+}
+
+IOReturn rgfxSurfaceLocksSeeds(RgfxAccelerator *accel, task_t task, uint32_t surfaceId,
+                               uint32_t *lockSeed, uint32_t *unlockSeed)
+{
+	if (!rgfxSurfaceUnlockSeedExported())
+		return kIOReturnUnsupported;
+	OSObject *surface = rgfxSurfaceLocksLookup(accel, task, surfaceId);
+	if (!surface)
+		return kIOReturnNotFound;
+	// IOSurface's getters load a field each and take no lock (read from its x86_64 code in macOS
+	// 26.7.1's KDK): a lock or an unlock between the two loads leaves them a step apart, which
+	// the next ask reads again.
+	*lockSeed = rgfxIOSurfaceLockSeed(surface);
+	*unlockSeed = rgfxIOSurfaceUnlockSeed(surface);
+	surface->release();
+	return kIOReturnSuccess;
 }
 
 bool rgfxSurfaceLocksMapsAt(OSObject *surface, task_t task, UInt64 address, UInt64 length)
@@ -568,31 +658,229 @@ bool rgfxSurfaceLocksStartsAt(OSObject *surface, const RgfxPageRun *runs, UInt32
 	return rgfxSurfaceRunsSame(walk);
 }
 
-bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length)
+// The kernel's map, exported in com.apple.kpi.unsupported, and IOKit's walk of its pageable maps,
+// exported in com.apple.kpi.iokit, which no SDK header declares.
+extern "C" vm_map_t kernel_map;
+using RgfxPageableMapsCallback = kern_return_t (*)(vm_map_t map, void *ref);
+extern "C" kern_return_t IOIteratePageableMaps(vm_size_t size, RgfxPageableMapsCallback callback,
+                                               void *ref);
+
+namespace {
+// The most regions of a surface's mapping a count walks: more, and it is not counted.
+constexpr uint32_t kMaxCountRegions = 8;
+// Surfaces of this many bytes or more have each count's time logged, the first few of them.
+constexpr uint64_t kCountLoggedBytes = 16ull << 20;
+constexpr uint32_t kCountsLogged = 16;
+} // namespace
+
+// The regions of `map` from `start` on, as many as `room`, up to `start + length`: how many it
+// found. A failed call ends the walk short of the end, which rgfxRegionPageCounts refuses.
+static uint32_t walkRegions(vm_map_t map, uint64_t start, uint64_t length, RgfxPageRegion *regions,
+                            uint32_t room)
 {
-	if (rgfxIOSurfaceLockSeed(surface) != 0)
-		return false;
-	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
-	IOByteCount resident = 0, dirty = 0;
-	return md && length <= md->getLength() &&
-	       md->getPageCounts(&resident, &dirty) == kIOReturnSuccess && resident == 0;
+	uint32_t found = 0;
+	mach_vm_address_t at = start;
+	while (found < room && at < start + length) {
+		mach_vm_address_t address = at;
+		mach_vm_size_t size = 0;
+		vm_region_extended_info_data_t info = {};
+		mach_msg_type_number_t infoCount = VM_REGION_EXTENDED_INFO_COUNT;
+		mach_port_t object = MACH_PORT_NULL;
+		if (mach_vm_region(map, &address, &size, VM_REGION_EXTENDED_INFO,
+		                   reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+		                   &object) != KERN_SUCCESS)
+			break;
+		regions[found++] = {address, size, info.pages_resident, info.pages_swapped_out,
+		                    info.external_pager != 0, info.share_mode == SM_EMPTY};
+		if (address + size <= address)
+			break;
+		at = address + size;
+	}
+	return found;
 }
+
+namespace {
+// The pageable map that holds an address, as IOIteratePageableMaps' callback finds it.
+struct PageableMapFind {
+	uint64_t address;
+	vm_map_t map;
+};
+} // namespace
+
+// IOIteratePageableMaps' callback: success, which ends the walk, for the map with a region that
+// holds the address; failure otherwise, which neither ends the walk nor, at its end, has IOKit
+// make a map (it makes one only where the last answer is KERN_NO_SPACE).
+static kern_return_t pageableMapHolds(vm_map_t map, void *ref)
+{
+	PageableMapFind *find = static_cast<PageableMapFind *>(ref);
+	mach_vm_address_t address = find->address;
+	mach_vm_size_t size = 0;
+	vm_region_basic_info_data_64_t info = {};
+	mach_msg_type_number_t infoCount = VM_REGION_BASIC_INFO_COUNT_64;
+	mach_port_t object = MACH_PORT_NULL;
+	if (map && mach_vm_region(map, &address, &size, VM_REGION_BASIC_INFO_64,
+	                          reinterpret_cast<vm_region_info_t>(&info), &infoCount,
+	                          &object) == KERN_SUCCESS &&
+	    address <= find->address && find->address - address < size) {
+		find->map = map;
+		return KERN_SUCCESS;
+	}
+	return KERN_FAILURE;
+}
+
+// What a count of a surface's pages took, logged where it is the longest yet by a quarter or
+// more, or where the surface is large, for the first kCountsLogged of those.
+static void noteCountTime(uint64_t bytes, uint64_t ns, const RgfxSurfacePageCounts &counts)
+{
+	static uint64_t longest = 0;
+	static uint32_t largeLogged = 0;
+	uint64_t was = __atomic_load_n(&longest, __ATOMIC_RELAXED);
+	bool longer = false;
+	while (ns > was + was / 4 && !longer)
+		longer = __atomic_compare_exchange_n(&longest, &was, ns, false, __ATOMIC_RELAXED,
+		                                     __ATOMIC_RELAXED);
+	const bool large = bytes >= kCountLoggedBytes &&
+	                   __atomic_fetch_add(&largeLogged, 1, __ATOMIC_RELAXED) < kCountsLogged;
+	if (longer || large)
+		IOLog("RgfxAccelerator: counting an IOSurface's %llu KiB of pages took %llu us%s: %s, "
+		      "%llu resident, %llu compressed or paged out\n",
+		      bytes >> 10, ns / 1000, longer ? ", the longest yet" : "",
+		      counts.counted ? "counted" : "not counted", counts.counted ? counts.resident : 0,
+		      counts.counted ? counts.swapped : 0);
+}
+
+// The counts come from the regions of a mapping of the surface's memory in the kernel's own map,
+// made for the count (read-only, unique, faulting nothing in) and gone after it: mach_vm_region's
+// VM_REGION_EXTENDED_INFO walks the memory's object page by page and counts each page resident,
+// or compressed or paged out (pages_swapped_out), measured on 11.7.11 (20G1443) for an IOSurface
+// whose pages a child's allocations pushed into the compressor and on to swap: its counts equal
+// each page's disposition, resident, compressed or mixed. mach_vm_region and kernel_map are in
+// com.apple.kpi.unsupported, kernel_task in com.apple.kpi.mach and IOIteratePageableMaps in
+// com.apple.kpi.iokit, in the symbol sets of every release kernel checked (x86_64 11.7.10 to
+// 26.7.2, arm64 13 to 26; each kernel's __LINKINFO,__symbolsets): strong imports, bound by every
+// linker, OpenCore's included. A pageable buffer's mapping lies inside one of IOKit's pageable
+// maps, where the walk finds its regions (walkRegions, pageableMapHolds). The
+// walk costs about a microsecond per 1-16 pages (measured from user space on 11.7.11: 0.13 ms
+// for 16384 resident pages, 1.3 ms for the same compressed), plus the mapping's making and
+// removal; what whole counts take in the kernel is at the top of this file.
+RgfxSurfacePageCounts rgfxSurfaceLocksPageCounts(OSObject *surface)
+{
+	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull};
+	static bool memoryNoted = false, mapNoted = false;
+	// An IOBufferMemoryDescriptor allocates its memory itself, pageable or wired, from the
+	// kernel's anonymous allocators, never over a file (xnu's IOBufferMemoryDescriptor.cpp; not
+	// re-read for this change): a page of it neither resident nor compressed nor paged out was
+	// never written. A descriptor over other memory, a client's own, may be a file's, whose
+	// pages not resident hold the file's bytes, which no count shows: it is not counted. The
+	// walk says so too (external_pager), and a region of a pager's is not counted either.
+	IOMemoryDescriptor *memory = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	if (!memory)
+		return counts;
+	if (!OSDynamicCast(IOBufferMemoryDescriptor, memory)) {
+		if (!__atomic_exchange_n(&memoryNoted, true, __ATOMIC_RELAXED))
+			IOLog("RgfxAccelerator: an IOSurface's memory is a %s, not a buffer the kernel "
+			      "allocated: its block, and any such, is not deferred\n",
+			      memory->getMetaClass()->getClassName());
+		return counts;
+	}
+	const uint64_t began = mach_absolute_time();
+	IOMemoryMap *map =
+	    memory->createMappingInTask(kernel_task, 0, kIOMapAnywhere | kIOMapReadOnly | kIOMapUnique);
+	if (!map) {
+		if (!__atomic_exchange_n(&mapNoted, true, __ATOMIC_RELAXED))
+			IOLog("RgfxAccelerator: an IOSurface's memory could not be mapped to count its "
+			      "pages: its block, and any such, is not deferred\n");
+		return counts;
+	}
+	const uint64_t start = map->getAddress(), length = map->getLength();
+	RgfxPageRegion regions[kMaxCountRegions] = {};
+	uint32_t found = walkRegions(kernel_map, start, length, regions, kMaxCountRegions);
+	// IOKit maps a pageable buffer into the kernel inside one of its pageable maps, a submap of
+	// the kernel's, whose one region in the kernel's map has nothing to count (SM_EMPTY) and
+	// reaches past the mapping: measured on 11.7.11 (20G1443), a 512 MiB region in the kernel's
+	// map, and in the pageable map one region that is the mapping exactly. The walk then goes on
+	// in that pageable map, found by IOKit's own walk of them.
+	if (found == 1 && regions[0].empty && regions[0].start <= start &&
+	    start + length - regions[0].start <= regions[0].size) {
+		PageableMapFind find = {start, nullptr};
+		if (IOIteratePageableMaps(PAGE_SIZE, &pageableMapHolds, &find) == KERN_SUCCESS &&
+		    find.map)
+			found = walkRegions(find.map, start, length, regions, kMaxCountRegions);
+	}
+	counts = rgfxRegionPageCounts(regions, found, start, length);
+	map->release();
+	uint64_t ns = 0;
+	absolutetime_to_nanoseconds(mach_absolute_time() - began, &ns);
+	noteCountTime(length, ns, counts);
+	return counts;
+}
+
+bool rgfxSurfaceLocksFresh(OSObject *surface, UInt64 length, uint64_t listed)
+{
+	// Called out of the contexts' lock (acquireSurfaceBlock), whose holder would hold every
+	// process's block allocations and surface asks for the count, which took up to 81.8 ms
+	// (above). It takes no lock of the kext's: IOSurface's getters here load a field and
+	// take no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and the count maps and
+	// walks the surface's memory through IOKit and the VM, never IOSurface.
+	const uint32_t seed = rgfxIOSurfaceLockSeed(surface);
+	IOMemoryDescriptor *md = OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
+	return md && length <= md->getLength() &&
+	       rgfxDeferRead(true, seed, rgfxSurfaceLocksPageCounts(surface), listed) !=
+	           kRgfxDeferReadStale;
+}
+
+namespace {
+// The device's page, of which SURFACE_PAGES' runs are whole ones: a kernel page is whole ones too.
+constexpr UInt64 kPage = 0x1000;
+// A kernel's page, 4 KiB on x86-64 and 16 KiB on arm64 (PAGE_SIZE, which an arm64 kext reads at
+// run time), is whole device pages, PAGE_MAX_SIZE at most.
+static_assert(PAGE_MIN_SIZE % kPage == 0, "a kernel page is whole device pages");
+
+// A wire of the `resident` pages the ask listed of the surface `task` maps at `address`, made
+// but not prepared: one descriptor over their runs, in the surface's order. Null where it is not
+// made.
+IOMemoryDescriptor *carryWire(task_t task, UInt64 address, const RgfxSurfaceResident &resident)
+{
+	IOAddressRange ranges[kRgfxCarryPagesMost] = {};
+	for (uint32_t i = 0; i < resident.count; i++)
+		ranges[i] = {address + resident.runs[i].offset, resident.runs[i].length};
+	return IOMemoryDescriptor::withAddressRanges(ranges, resident.count, kIODirectionOutIn, task);
+}
+
+// The guest physical address of each page of `wire`, prepared, in its order, `pages` of them:
+// false where one is not a page's.
+bool carryAddresses(IOMemoryDescriptor *wire, uint64_t pages, uint64_t *addresses)
+{
+	for (uint64_t p = 0; p < pages; p++) {
+		IOByteCount segment = 0;
+		addresses[p] = wire->getPhysicalSegment(p * kPage, &segment, kIOMemoryMapperNone);
+		if (!addresses[p] || addresses[p] % kPage || segment < kPage)
+			return false;
+	}
+	return true;
+}
+} // namespace
 
 RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
                                       uint32_t surfaceId, UInt64 offset, UInt64 size,
                                       UInt64 length, UInt32 context, IOMemoryMap *header,
-                                      void **cacheOut)
+                                      task_t task, UInt64 address,
+                                      const RgfxSurfaceResident *resident, RgfxPageRun *runs,
+                                      UInt32 room, UInt32 *runCount, void **cacheOut)
 {
 	*cacheOut = nullptr;
+	*runCount = 0;
 	IOMemoryDescriptor *memory =
 	    OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(surface));
 	if (!memory || !startLocks())
 		return kRgfxDeferNoCache;
 	RgfxDeviceCache *cache = rgfxIOSurfaceDeviceCache(surface, accel, state.acceleratorId, 0);
+	static char notDeferred;
 	if (!cache) {
-		IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its block is not deferred, "
-		      "nor cached\n",
-		      surfaceId);
+		if (rgfxFirstCalls(&notDeferred, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u gave no device cache: its block is not "
+			      "deferred, nor cached\n",
+			      surfaceId);
 		return kRgfxDeferNoCache;
 	}
 	// The surface's memory, retained, not wired: its pages are named only where a lock needs them.
@@ -622,39 +910,88 @@ RgfxDeferAnswer rgfxSurfaceLocksDefer(RgfxAccelerator *accel, OSObject *surface,
 		c->context = context;
 		c->size = size;
 		c->length = length;
+		// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field
+		// and takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls
+		// it holding IOSurface's own lock at each client's release, which a getter taking that lock
+		// could not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 		rgfxCacheNoteClients(state.caches, key, rgfxIOSurfaceClientCount(surface));
 	} else if (!previous) {
 		state.noRoom++;
 	}
 	IOLockUnlock(state.lock);
 	if (!c) {
-		IOLog("RgfxAccelerator: IOSurface %u: %s: its block is not deferred, nor cached\n",
-		      surfaceId,
-		      previous ? "its previous block is cached still, its release unanswered"
-		               : "no room for its device cache's state");
+		if (rgfxFirstCalls(&notDeferred, previous ? 1 : 2, 1))
+			IOLog("RgfxAccelerator: IOSurface %u: %s: its block is not deferred, nor cached\n",
+			      surfaceId,
+			      previous ? "its previous block is cached still, its release unanswered"
+			               : "no room for its device cache's state");
 		memory->release();
 		reinterpret_cast<OSObject *>(cache)->release();
 		return kRgfxDeferNoCache;
 	}
+	// The pages the ask listed resident, the kernel's, as rgfxSurfaceLocksPageCounts counts them,
+	// where it listed any of the surface the asker maps where it asks: their wire, made now, is
+	// prepared only under the read.
+	const uint64_t listed = resident ? rgfxResidentPages(*resident, length, PAGE_SIZE) : 0;
+	IOMemoryDescriptor *carry = listed && rgfxSurfaceLocksMapsAt(surface, task, address, length)
+	                                ? carryWire(task, address, *resident)
+	                                : nullptr;
 	// The control function first, then the read: a read-write lock either moved the seed before
-	// the read-only lock below returned, or calls the control function.
+	// the read-only lock below returned, or calls the control function. A surface fresh but for
+	// the listed pages carries them where their wire, with no fault, proves them its resident
+	// pages (RgfxDeferCarry.hpp).
 	rgfxDeviceCacheSetControl(cache, accel, &surfaceControl);
 	uint32_t seed = ~0u;
-	IOByteCount resident = ~0ull, dirty = 0;
+	RgfxSurfacePageCounts counts = {false, ~0ull, ~0ull}, after = counts;
+	bool wired = false;
 	const IOReturn locked = rgfxIOSurfaceLock(surface, kRgfxIOSurfaceLockReadOnly, &seed);
 	if (locked == kIOReturnSuccess) {
-		if (memory->getPageCounts(&resident, &dirty) != kIOReturnSuccess)
-			resident = ~0ull;
+		counts = rgfxSurfaceLocksPageCounts(surface);
+		if (rgfxDeferRead(true, seed, counts, carry ? listed : 0) == kRgfxDeferReadCarry) {
+			wired = carry->prepare(kIODirectionOutIn | kIODirectionPrepareNoFault) ==
+			        kIOReturnSuccess;
+			if (wired)
+				after = rgfxSurfaceLocksPageCounts(surface);
+		}
 		rgfxIOSurfaceUnlock(surface, kRgfxIOSurfaceLockReadOnly, nullptr);
 	}
-	const bool fresh = locked == kIOReturnSuccess && seed == 0 && resident == 0;
+	// The deferral's runs: each device page of the listed pages at its guest address, the rest
+	// zeros.
+	if (rgfxDeferCarried(wired, seed, after, listed)) {
+		uint64_t addresses[kRgfxCarryPagesMost * (PAGE_MAX_SIZE / kPage)] = {};
+		if (carryAddresses(carry, listed * (PAGE_SIZE / kPage), addresses))
+			*runCount = rgfxCarryRuns(*resident, addresses, length, kPage, runs, room);
+	}
+	const bool isLocked = locked == kIOReturnSuccess;
+	const RgfxCarryOutcome outcome =
+	    rgfxCarryOutcome(isLocked, seed, counts, carry ? listed : 0, wired, after, *runCount);
+	const bool fresh = outcome == kRgfxCarryTaken || outcome == kRgfxCarryNone;
+	IOLockLock(state.lock);
+	if (carry)
+		state.carries[outcome]++;
 	if (fresh) {
-		IOLockLock(state.lock);
 		rgfxCacheGated(state.caches, key);
-		IOLockUnlock(state.lock);
+		RgfxCachedSurface *gated = rgfxCacheFind(state.caches, key);
+		if (gated != nullptr && outcome == kRgfxCarryTaken)
+			gated->carried = carry;
+	}
+	IOLockUnlock(state.lock);
+	if (outcome != kRgfxCarryTaken) {
+		letGoMemory(carry, wired);
+		*runCount = 0;
 	}
 	*cacheOut = cache;
 	return fresh ? kRgfxDeferFresh : kRgfxDeferStale;
+}
+
+void rgfxSurfaceLocksRefusedCarry(void *cache)
+{
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	void *carried = rgfxCacheRefusedCarried(state.caches, reinterpret_cast<uintptr_t>(cache));
+	IOLockUnlock(state.lock);
+	letGoMemory(carried, true);
 }
 
 void rgfxSurfaceCacheSettle(void *cache, bool deferred)
@@ -665,6 +1002,28 @@ void rgfxSurfaceCacheSettle(void *cache, bool deferred)
 	rgfxCacheSettled(state.caches, reinterpret_cast<uintptr_t>(cache), deferred);
 	wakeLocked();
 	IOLockUnlock(state.lock);
+}
+
+void rgfxSurfaceLocksUngate(void *cache)
+{
+	if (!cache || !__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	void *map = nullptr, *wire = nullptr, *carried = nullptr;
+	IOLockLock(state.lock);
+	const bool gone = rgfxCacheUngated(state.caches, reinterpret_cast<uintptr_t>(cache), &map,
+	                                   &wire, &carried);
+	wakeLocked();
+	IOLockUnlock(state.lock);
+	if (!gone)
+		return;
+	letGoMemory(carried, true);
+	// The entry's references, as rgfxSurfaceLocksDefer took them: its header's mapping, the
+	// surface's memory retained and never prepared for it, and the cache.
+	if (map)
+		static_cast<IOMemoryMap *>(map)->release();
+	if (wire)
+		static_cast<IOMemoryDescriptor *>(wire)->release();
+	reinterpret_cast<OSObject *>(cache)->release();
 }
 
 RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 offset,
@@ -706,7 +1065,8 @@ RgfxReleaseAttach rgfxSurfaceCacheReleaseAttach(RgfxAccelerator *accel, UInt64 o
 			if (!named && !hostPages && c != nullptr && attachBackoff(++tries, deadline))
 				continue;
 			did = hostPages ? kRgfxReleaseAttached : kRgfxReleaseUnattached;
-			if (!named && !hostPages)
+			static char unnamed;
+			if (!named && !hostPages && rgfxFirstCalls(&unnamed, 0, 1))
 				IOLog("RGFX: WARN: the release of IOSurface %u's deferred block 0x%llx goes on "
 				      "after %u ms with its pages not named: what the GPU wrote is not copied "
 				      "into them\n",
@@ -743,9 +1103,11 @@ IOMemoryDescriptor *rgfxSurfaceCacheHostPages(void *cache, UInt64 offset)
 		memory->retain();
 	IOLockUnlock(state.lock);
 	if (memory && memory->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
-		IOLog("RgfxAccelerator: the deferred block 0x%llx's pages could not be wired for its "
-		      "block\n",
-		      offset);
+		static char unwired;
+		if (rgfxFirstCalls(&unwired, 0, 1))
+			IOLog("RgfxAccelerator: the deferred block 0x%llx's pages could not be wired for "
+			      "its block\n",
+			      offset);
 		OSSafeReleaseNULL(memory);
 	}
 	return memory;
@@ -759,12 +1121,12 @@ void unwireSurface(void *wire)
 }
 } // namespace
 
-void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
+bool rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool releasing,
                             bool blockWired, void **wireOut)
 {
 	if (wireOut)
 		*wireOut = nullptr;
-	void *map = nullptr, *wire = nullptr;
+	void *map = nullptr, *wire = nullptr, *carried = nullptr;
 	bool kept = false, wired = true;
 	if (cache && __atomic_load_n(&state.lock, __ATOMIC_ACQUIRE)) {
 		IOLockLock(state.lock);
@@ -781,28 +1143,27 @@ void rgfxSurfaceLocksForget(void *cache, void *surface, UInt64 offset, bool rele
 		wired = c == nullptr || rgfxCacheWired(*c);
 		// The cached entry is the cached block's alone: another block of the surface leaves it.
 		kept = !rgfxCacheBlockLetGo(state.caches, key, offset, releasing, surface, &map, &wire,
-		                            blockWired);
+		                            blockWired, &carried);
 		if (wake)
 			wakeLocked();
 		IOLockUnlock(state.lock);
 	}
 	if (map)
 		static_cast<IOMemoryMap *>(map)->release();
+	letGoMemory(carried, true);
 	if (kept)
-		return;
-	// The references rgfxSurfaceLocksAttach took, out of every lock, the cache's first: IOSurface
-	// frees a cache released to none (RgfxIOSurfaceKPI.hpp), while its surface lives. Then the
-	// surface's memory is unwired, or its wiring handed to the caller, who keeps it while the
-	// device may map the memory: the wiring holds the memory, whatever becomes of the surface. A
-	// deferred block's memory never wired, whose pages the device never had, is only released.
-	if (cache)
-		reinterpret_cast<OSObject *>(cache)->release();
-	if (surface)
-		static_cast<OSObject *>(surface)->release();
+		return false;
+	// The references rgfxSurfaceLocksAttach took are the caller's to release, out of every lock,
+	// the cache's first: IOSurface frees a cache released to none (RgfxIOSurfaceKPI.hpp), while
+	// its surface lives. The surface's memory is unwired, or its wiring handed to the caller, who
+	// keeps it while the device may map the memory: the wiring holds the memory, whatever becomes
+	// of the surface. A deferred block's memory never wired, whose pages the device never had, is
+	// only released.
 	if (wireOut && wired)
 		*wireOut = wire;
 	else
 		letGoMemory(wire, wired);
+	return true;
 }
 
 bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t surfaceId,
@@ -816,8 +1177,11 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	IOMemoryDescriptor *wire =
 	    OSDynamicCast(IOMemoryDescriptor, rgfxIOSurfaceMemory(static_cast<OSObject *>(surface)));
 	if (!wire || wire->prepare(kIODirectionOutIn) != kIOReturnSuccess) {
-		IOLog("RgfxAccelerator: IOSurface %u: its memory could not be wired: it is not cached\n",
-		      surfaceId);
+		static char unwired;
+		if (rgfxFirstCalls(&unwired, 0, 1))
+			IOLog("RgfxAccelerator: IOSurface %u: its memory could not be wired: it is not "
+			      "cached\n",
+			      surfaceId);
 		return false;
 	}
 	wire->retain();
@@ -838,8 +1202,10 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 	const char *why = nullptr;
 	RgfxCachedSurface *c = nullptr;
 	bool logged = true;
+	static char previousCached;
 	if (rgfxCacheFind(state.caches, key)) {
 		why = "its previous block is cached still, its release unanswered";
+		logged = rgfxFirstCalls(&previousCached, 0, 1);
 	} else if (!(c = rgfxCacheAdd(state.caches, key, offset, surfaceId))) {
 		why = "no room for its device cache's state";
 		logged = ++state.noRoom <= kNoRoomLogged;
@@ -851,6 +1217,10 @@ bool rgfxSurfaceCacheAdd(void *cache, void *surface, UInt64 offset, uint32_t sur
 		c->clientsAt = reinterpret_cast<volatile uint32_t *>(header->getVirtualAddress() +
 		                                                     kRgfxSurfaceClientsOffset);
 		c->object = surface;
+		// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field
+		// and takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls
+		// it holding IOSurface's own lock at each client's release, which a getter taking that lock
+		// could not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 		rgfxCacheNoteClients(state.caches, key,
 		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(surface)));
 	}
@@ -891,6 +1261,10 @@ void rgfxSurfaceCacheNoteClients(UInt64 offset)
 		return;
 	IOLockLock(state.lock);
 	RgfxCachedSurface *c = rgfxCacheAtBlock(state.caches, offset);
+	// IOSurface's getter, as in op 5, under state.lock, kept there on purpose: it loads a field and
+	// takes no lock (read from IOSurface's x86_64 code in macOS 26.6's KDK), and op 5 calls it
+	// holding IOSurface's own lock at each client's release, which a getter taking that lock could
+	// not do (the lock order, ContextState in RgfxAcceleratorContexts.cpp).
 	if (c != nullptr && c->object != nullptr)
 		rgfxCacheNoteClients(state.caches, c->key,
 		                     rgfxIOSurfaceClientCount(static_cast<const OSObject *>(c->object)));
@@ -905,6 +1279,18 @@ UInt64 rgfxSurfaceCacheNoRoom()
 	const UInt64 n = state.noRoom;
 	IOLockUnlock(state.lock);
 	return n;
+}
+
+void rgfxSurfaceCacheCarries(UInt64 counts[kRgfxCarryOutcomes])
+{
+	for (uint32_t i = 0; i < kRgfxCarryOutcomes; i++)
+		counts[i] = 0;
+	if (!__atomic_load_n(&state.lock, __ATOMIC_ACQUIRE))
+		return;
+	IOLockLock(state.lock);
+	for (uint32_t i = 0; i < kRgfxCarryOutcomes; i++)
+		counts[i] = state.carries[i];
+	IOLockUnlock(state.lock);
 }
 
 UInt64 rgfxSurfaceCacheRetaken()
@@ -946,8 +1332,8 @@ void rgfxSurfaceCacheReleased(UInt64 offset, RgfxReleasedSurface *gone)
 	if (c != nullptr && c->releasing && c->unheld && c->retaken)
 		state.retaken++;
 	// One cached surface at most has the block: its offset is reused only past this release.
-	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(
-	    rgfxCacheReleased(state.caches, offset, &gone->map, &gone->wire, &gone->surface)));
+	gone->cache = reinterpret_cast<void *>(static_cast<uintptr_t>(rgfxCacheReleased(
+	    state.caches, offset, &gone->map, &gone->wire, &gone->surface, &gone->carried)));
 	if (gone->cache)
 		wakeLocked();
 	IOLockUnlock(state.lock);
@@ -964,6 +1350,7 @@ void rgfxSurfaceCacheLetGo(const RgfxReleasedSurface &gone)
 	if (gone.surface)
 		static_cast<OSObject *>(gone.surface)->release();
 	letGoMemory(gone.wire, gone.wired);
+	letGoMemory(gone.carried, true);
 }
 
 OSObject *rgfxSurfaceCacheReleasingSurface(UInt64 offset, bool *written)

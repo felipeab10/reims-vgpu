@@ -13,12 +13,30 @@
 //     or an argument or return value of another size.
 // A listed selector this macOS's base classes lack is reported, not failed: the guest's macOS can
 // differ.
+// It also checks the device's targetDeviceArchitecture, Metal's MTLTargetDeviceArchitecture naming
+// the device's own compiler target (checkTargetDeviceArchitecture); the x86 device's answer to
+// newResidencySetWithDescriptor:error:: nil, its error
+// out set to nil from an error it held, as the x86 Macs answer (measured: macOS 26.7.1, the AMD
+// Radeon Pro 5300M and the Intel UHD 630); the refusals Metal answers at a URL before it reads it
+// (checkUrlRefusals); and that each call Metal's device ends the process at for its argument
+// ends it, in a process of its own (`inherited_tests --dies CASE BUNDLE`), with SIGABRT and
+// Metal's words on stderr.
 #import <Foundation/Foundation.h>
 
 #include <dlfcn.h>
+#include <mach-o/dyld.h>
+#include <objc/message.h>
 #include <objc/runtime.h>
+#include <signal.h>
+#include <spawn.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <unistd.h>
+
+#include <string>
+
+extern char **environ;
 
 namespace {
 
@@ -38,6 +56,10 @@ constexpr const char *kDynamicLoads =
     "the dynamic libraries of a pipeline's functions, which Metal's own pipeline routes load "
     "(measured on the M3 Max: Core Image's and a source library's pipelines); the device's "
     "functions name none";
+constexpr const char *kGLDrawables =
+    "a GL window's drawable: the base's opens user client type 7 on the accelerator, which the "
+    "kext serves over the window's surface (guest/kext/src/RgfxGLUserClients.hpp); a kext "
+    "without it refuses the open, and the base answers nil";
 constexpr const char *kSubAllocation =
     "sub-allocations of Metal's own command buffers' memory (measured on the M3 Max: Core Image "
     "asks the device); the device's command buffers are its own";
@@ -71,6 +93,7 @@ constexpr Left kLeftToTheBase[] = {
     {"newTranslatedDriverCompilerOptions:compilerOptionsSize:", kValues},
     {"newDagStringWithGraphs:", kValues},
     {"newDynamicLibraryError:message:", kValues},
+    {"newGLDrawable", kGLDrawables},
     {"loadDynamicLibrariesForComputeDescriptor:error:", kDynamicLoads},
     {"loadDynamicLibrariesForComputeDescriptor:options:error:", kDynamicLoads},
     {"loadDynamicLibrariesForFunction:insertLibraries:error:", kDynamicLoads},
@@ -160,11 +183,174 @@ NSString *signatureDifference(Method ours, Method base)
 	return nil;
 }
 
+// The device's newResidencySetWithDescriptor:error: answers nil and sets its error out to nil,
+// though it held an error. The member reads none of the device's state, so it is called with the
+// class as `self`, with no device made.
+void checkResidencySetAnswer(Class device)
+{
+	SEL sel = sel_registerName("newResidencySetWithDescriptor:error:");
+	Method m = class_getInstanceMethod(device, sel);
+	if (m == nullptr) {
+		fail(@"the device does not answer newResidencySetWithDescriptor:error:");
+		return;
+	}
+	NSError *sentinel = [NSError errorWithDomain:@"inherited_tests" code:1 userInfo:nil];
+	NSError *error = sentinel;
+	id set = ((id(*)(id, SEL, id, NSError **))method_getImplementation(m))((id)device, sel, nil, &error);
+	if (set != nil || error != nil)
+		fail([NSString stringWithFormat:@"newResidencySetWithDescriptor:error: answers %@, error %@ (want nil, "
+		                                @"the error out set to nil)",
+		                                set, error == sentinel ? @"untouched" : error]);
+}
+
+// The device's compiler target (src/RgfxMetalDevice.mm says why): an object of Metal's own
+// MTLTargetDeviceArchitecture, as each Mac's device answers, never the IOGPU base's nil, at which
+// Metal's loader ends the process; cpuType 0x01005247, subType 0, driverVersion 0x10000, and
+// versionCombined 0x10000, which Metal works out from the version the device sets (1.0.0). The
+// member reads no device state, so it is called with the class as `self`.
+void checkTargetDeviceArchitecture(Class device)
+{
+	SEL sel = sel_registerName("targetDeviceArchitecture");
+	Method m = class_getInstanceMethod(device, sel), base = class_getInstanceMethod(class_getSuperclass(device), sel);
+	if (m == nullptr || (base != nullptr && method_getImplementation(m) == method_getImplementation(base))) {
+		fail(@"the device does not answer targetDeviceArchitecture itself");
+		return;
+	}
+	id a = ((id(*)(id, SEL))method_getImplementation(m))((id)device, sel);
+	if (a == nil || strcmp(object_getClassName(a), "MTLTargetDeviceArchitecture") != 0) {
+		fail([NSString stringWithFormat:@"targetDeviceArchitecture answers %@, not an MTLTargetDeviceArchitecture", a]);
+		return;
+	}
+	const uint32_t cpuType = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("cpuType"));
+	const uint32_t subType = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("subType"));
+	const uint64_t driver = ((uint64_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("driverVersion"));
+	const uint32_t combined = ((uint32_t(*)(id, SEL))objc_msgSend)(a, sel_registerName("versionCombined"));
+	if (cpuType != 0x01005247 || subType != 0 || driver != 0x10000 || combined != 0x10000)
+		fail([NSString stringWithFormat:@"targetDeviceArchitecture answers cpuType 0x%x subType 0x%x driverVersion "
+		                                @"0x%llx versionCombined 0x%x (want 0x1005247 0 0x10000 0x10000)",
+		                                cpuType, subType, (unsigned long long)driver, combined]);
+}
+
+// The device's refusals at a URL that Metal answers before it reads the URL: newArchiveWithURL:error:
+// a device without Metal 4's, and newBinaryLibraryWithOptions:url:error: of no option, "At least one
+// option must be set.", each at every URL, nil among them (measured: macOS 26.7.1, the AMD Radeon
+// Pro 5300M and the Intel UHD 630, and, of the binary library, macOS 27.0.1, the M3 Max). Neither
+// member reads the device's state, so each is called with the class as `self`.
+void checkUrlRefusals(Class device)
+{
+	NSURL *urls[] = {nil, [NSURL fileURLWithPath:@"/no/such/archive.bin"], [NSURL URLWithString:@"/no/such/archive.bin"],
+	                 [NSURL URLWithString:@"http://127.0.0.1:9/archive.bin"]};
+	SEL archive = sel_registerName("newArchiveWithURL:error:"),
+	    binary = sel_registerName("newBinaryLibraryWithOptions:url:error:");
+	Method am = class_getInstanceMethod(device, archive), bm = class_getInstanceMethod(device, binary);
+	if (am == nullptr || bm == nullptr) {
+		fail(@"the device does not answer newArchiveWithURL:error: or newBinaryLibraryWithOptions:url:error:");
+		return;
+	}
+	for (NSURL *url : urls) {
+		NSError *error = nil;
+		id made = ((id(*)(id, SEL, NSURL *, NSError **))method_getImplementation(am))((id)device, archive, url, &error);
+		if (made != nil || ![error.domain isEqualToString:@"MTLDeviceErrorDomain"] || error.code != 1 ||
+		    ![error.localizedDescription isEqualToString:@"Device does not support Metal 4."])
+			fail([NSString stringWithFormat:@"newArchiveWithURL:%@ answers %@, error %@ (want nil, "
+			                                @"MTLDeviceErrorDomain 1, \"Device does not support Metal 4.\")",
+			                                url, made, error]);
+		error = nil;
+		made = ((id(*)(id, SEL, NSUInteger, NSURL *, NSError **))method_getImplementation(bm))((id)device, binary, 0,
+		                                                                                         url, &error);
+		if (made != nil || ![error.domain isEqualToString:@"MTLBinaryArchiveDomain"] || error.code != 2 ||
+		    ![error.localizedDescription isEqualToString:@"At least one option must be set."])
+			fail([NSString stringWithFormat:@"newBinaryLibraryWithOptions:0 url:%@ answers %@, error %@ (want nil, "
+			                                @"MTLBinaryArchiveDomain 2, \"At least one option must be set.\")",
+			                                url, made, error]);
+	}
+}
+
+// The exit status of a death case that raised SIGABRT: its handler exits with it, so the death
+// writes no crash report.
+constexpr int kAborted = 128 + SIGABRT;
+
+// A call Metal's device ends the process at, with Metal's words on stderr: its name, and the
+// member called with the class as `self` (it ends the process before it reads any of the
+// device's state).
+struct Death {
+	const char *name;
+	const char *words;
+	void (*call)(Class device);
+};
+
+const Death kDeaths[] = {
+    // newLibraryWithURL:error: of nil (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the
+    // Intel UHD 630, and macOS 27.0.1, the M3 Max: "failed assertion `url must not be nil.'").
+    {"library-of-nil-url", "-[_MTLDevice newLibraryWithURL:error:]: failed assertion `url must not be nil.'",
+     [](Class device) {
+	     SEL sel = sel_registerName("newLibraryWithURL:error:");
+	     NSError *error = nil;
+	     ((id(*)(id, SEL, NSURL *, NSError **))method_getImplementation(class_getInstanceMethod(device, sel)))(
+	         (id)device, sel, nil, &error);
+     }},
+    // newLibraryWithFile:error: of nil (measured alike: "failed assertion `filepath must not be
+    // nil.'").
+    {"library-of-nil-path", "newLibraryWithFile: failed assertion `filepath must not be nil.'",
+     [](Class device) {
+	     SEL sel = sel_registerName("newLibraryWithFile:error:");
+	     NSError *error = nil;
+	     ((id(*)(id, SEL, NSString *, NSError **))method_getImplementation(class_getInstanceMethod(device, sel)))(
+	         (id)device, sel, nil, &error);
+     }},
+};
+
+// Runs the death case `d` in a process of its own; fails where it does not end with SIGABRT and
+// its words on stderr.
+void checkDies(const Death &d, const char *bundle)
+{
+	char self[4096];
+	uint32_t size = sizeof self;
+	int fds[2];
+	if (_NSGetExecutablePath(self, &size) != 0 || pipe(fds) != 0) {
+		fail(@"cannot run a death case");
+		return;
+	}
+	posix_spawn_file_actions_t fa;
+	posix_spawn_file_actions_init(&fa);
+	posix_spawn_file_actions_adddup2(&fa, fds[1], 2);
+	posix_spawn_file_actions_addclose(&fa, fds[0]);
+	char *args[] = {self, const_cast<char *>("--dies"), const_cast<char *>(d.name), const_cast<char *>(bundle),
+	                nullptr};
+	pid_t pid = 0;
+	const int spawned = posix_spawn(&pid, self, &fa, nullptr, args, environ);
+	posix_spawn_file_actions_destroy(&fa);
+	close(fds[1]);
+	std::string err;
+	char chunk[512];
+	ssize_t n;
+	while ((n = read(fds[0], chunk, sizeof chunk)) > 0)
+		err.append(chunk, static_cast<size_t>(n));
+	close(fds[0]);
+	int status = 0;
+	if (spawned != 0 || waitpid(pid, &status, 0) != pid) {
+		fail([NSString stringWithFormat:@"--dies %s did not run", d.name]);
+		return;
+	}
+	const bool aborted = WIFEXITED(status) && WEXITSTATUS(status) == kAborted;
+	if (!aborted || err.find(d.words) == std::string::npos)
+		fail([NSString stringWithFormat:@"--dies %s ended with status %d, not SIGABRT with \"%s\":\n%s", d.name,
+		                                status, d.words, err.c_str()]);
+}
+
 } // namespace
 
 int main(int argc, char **argv)
 {
 	@autoreleasepool {
+		if (argc == 4 && strcmp(argv[1], "--dies") == 0) {
+			signal(SIGABRT, [](int) { _exit(kAborted); });
+			Class device = dlopen(argv[3], RTLD_NOW) != nullptr ? objc_getClass("RgfxMetalDevice") : Nil;
+			for (const Death &d : kDeaths)
+				if (device != Nil && strcmp(argv[2], d.name) == 0)
+					d.call(device);
+			return 0; // it went on: the check fails
+		}
 		if (argc != 2) {
 			fprintf(stderr, "usage: inherited_tests BUNDLE\n");
 			return 2;
@@ -180,6 +366,11 @@ int main(int argc, char **argv)
 			printf("FAIL: RgfxMetalDevice is not a subclass of IOGPUMetalDevice, of _MTLDevice\n");
 			return 1;
 		}
+		checkTargetDeviceArchitecture(device);
+		checkResidencySetAnswer(device);
+		checkUrlRefusals(device);
+		for (const Death &d : kDeaths)
+			checkDies(d, argv[1]);
 		NSDictionary<NSString *, NSValue *> *ours = ownMethods(device);
 		NSMutableSet<NSString *> *inBase = [NSMutableSet set];
 		NSUInteger creators = 0, answered = 0, left = 0;

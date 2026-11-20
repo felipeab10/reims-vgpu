@@ -11,14 +11,48 @@
 //! - what Metal autoreleases on the host's thread (a `+0` result, such as a frame's command
 //!   buffer) goes at the pool's pop, so no uncommitted buffer outlives the call and holds one of
 //!   its queue's 64 slots.
+//!
+//! An entry is also a step of the exit gate ([`reims_vgpu_vulkan::exit_gate`]), since any may
+//! call the GPU's driver: the C API's calls, the device's callbacks on its threads and on the
+//! host's, and the jobs of its lanes, compile threads and surface workers, which run inside one.
+//! The process's exit waits for the entries in progress, and an entry begun after it began on any
+//! thread but the exiting one parks its thread for good before its body runs, so no work of the
+//! library's runs beside the driver's destructors. An entry inside another is part of it.
 
-use reims_vgpu_core::rt::{Held, Hold, Pool, enter_ours};
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::rt::{Held, Hold, Pool, enter_ours};
+
+/// A raise that reaches an entry point: nothing catches it there, so it ends the process.
+pub(crate) fn no_catch<T>(r: RaiseResult<T>) -> T {
+    r.unwrap_or_else(|raised| raised.fatal())
+}
 
 /// Runs one entry's `body` marked as ours, inside a real pool and with a holder; `body` gets a
 /// hold of that holder. The holder releases what it holds when `body` returns, then the pool pops
 /// (module doc). An entry reached inside another (a release of the last reference inside a call)
-/// makes its own.
+/// makes its own. Once the process's exit began, an entry on any thread but the exiting one
+/// parks its thread for good instead (module doc).
 pub(crate) fn run<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
+    let Some(_step) = reims_vgpu_vulkan::exit_gate::step() else {
+        reims_vgpu_vulkan::exit_gate::stay()
+    };
+    let _ours = enter_ours();
+    let pool = Pool::here();
+    let held = Held::new();
+    let r = body(Hold::of(&held));
+    drop(held);
+    drop(pool);
+    r
+}
+
+/// Runs `body` on this thread as a part of an entry in progress on another, which waits for it
+/// to end (a helper's walk of a range of the command buffer a lane's job walks,
+/// `graphics/decode/helpers.rs`): marked as ours, inside a real pool and with a holder, as
+/// [`run`] does, but no step of the exit gate of its own. The entry it is part of holds one
+/// until `body` ends, so no work of `body`'s runs beside the driver's destructors; one of its
+/// own, begun once the process's exit began, would park this thread for good, and the entry
+/// waiting for it, and so the exit, would never end.
+pub(crate) fn run_within<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
     let _ours = enter_ours();
     let pool = Pool::here();
     let held = Held::new();
@@ -32,8 +66,8 @@ pub(crate) fn run<T>(body: impl for<'u> FnOnce(Hold<'u>) -> T) -> T {
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::rt::is_our_thread;
-    use reims_vgpu_core::sync::Mutex;
+    use reims_vgpu_vulkan::core::rt::is_our_thread;
+    use reims_vgpu_vulkan::core::sync::Mutex;
 
     use super::*;
 
@@ -61,6 +95,22 @@ mod tests {
         assert_eq!(got, 7);
         assert!(!is_our_thread());
         assert_eq!(*log.lock(), ["body", "release second", "release first"]);
+    }
+
+    /// Work within another entry runs marked as ours, and what it holds to its holder is released
+    /// before it returns, as in an entry.
+    #[test]
+    fn work_within_an_entry_releases_what_it_holds_before_it_returns() {
+        let log = Arc::new(Mutex::new(Vec::new()));
+        let got = run_within(|hold| {
+            assert!(is_our_thread());
+            hold.keep(Rel("held", log.clone()));
+            log.lock().push("body".into());
+            3
+        });
+        assert_eq!(got, 3);
+        assert!(!is_our_thread());
+        assert_eq!(*log.lock(), ["body", "release held"]);
     }
 
     /// With the real pool: what the body autoreleases goes when the pool pops, after the holder
@@ -104,7 +154,7 @@ mod tests {
             );
             return;
         }
-        reims_vgpu_metal::os::autorelease::install();
+        reims_vgpu_vulkan::os::install_process_services();
         let object = NSObject::new();
         let seen = Arc::new(Mutex::new(Vec::new()));
         let alone = retain_count(&object);

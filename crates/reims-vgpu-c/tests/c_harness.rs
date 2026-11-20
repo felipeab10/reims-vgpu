@@ -1,12 +1,14 @@
 //! Builds `tests/c/harness.c` against the committed `include/reims_vgpu.h`, links it to this
 //! crate's dynamic library, and runs it. The harness uses the platform the library is built on, as
-//! a C host does: `MetalPlatform`, or `VulkanPlatform` with the `vulkan` feature.
+//! a C host does: `VulkanPlatform`, over MoltenVK on macOS. On Windows it links the DLL's import
+//! library.
 
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Output};
+
+use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
 #[path = "support/cdylib.rs"]
 mod cdylib;
@@ -19,22 +21,28 @@ fn crate_dir() -> PathBuf {
         .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest")
 }
 
+/// The C compiler: `cc`, and on Windows `clang`, MSYS2 CLANG64's, the toolchain the library is
+/// built with there.
+const CC: &str = if cfg!(windows) { "clang" } else { "cc" };
+
 /// Compiles `source` into `out`; panics with the compiler's output.
 fn compile(source: &Path, out: &Path) {
     let deps = cdylib::dir();
-    let status = Command::new("cc")
-        .args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"])
+    let mut cc = Command::new(CC);
+    cc.args(["-std=c11", "-Wall", "-Wextra", "-Werror", "-pedantic"])
         .arg("-I")
         .arg(crate_dir().join("include"))
-        .arg(source)
-        .arg("-L")
-        .arg(&deps)
-        .arg("-lreims_vgpu_c")
-        .arg(format!("-Wl,-rpath,{}", deps.display()))
-        .arg("-o")
-        .arg(out)
-        .output()
-        .unwrap();
+        .arg(source);
+    if cfg!(windows) {
+        // The DLL's import library, beside it; the harness finds the DLL on its PATH (`run`).
+        cc.arg(deps.join("libreims_vgpu_c.dll.a"));
+    } else {
+        cc.arg("-L")
+            .arg(&deps)
+            .arg("-lreims_vgpu_c")
+            .arg(format!("-Wl,-rpath,{}", deps.display()));
+    }
+    let status = cc.arg("-o").arg(out).output().unwrap();
     assert!(
         status.status.success(),
         "cc failed:\n{}",
@@ -61,16 +69,29 @@ fn harness(name: &str) -> Harness {
     let dir = std::env::temp_dir().join(format!("rvg-api-harness-{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&dir);
     std::fs::create_dir_all(&dir).unwrap();
-    let bin = dir.join("harness");
+    let bin = dir.join(format!("harness{}", std::env::consts::EXE_SUFFIX));
     compile(&crate_dir().join("tests/c/harness.c"), &bin);
     Harness { dir, bin }
+}
+
+/// Runs the harness with `args`. Windows has no rpath: the DLL's directory leads the harness's
+/// PATH, where the loader looks for it.
+fn run(h: &Harness, args: &[&str]) -> Output {
+    let mut command = Command::new(&h.bin);
+    command.args(args);
+    if cfg!(windows) {
+        let path = std::env::var_os("PATH").unwrap_or_default();
+        let dirs = std::iter::once(cdylib::dir()).chain(std::env::split_paths(&path));
+        command.env("PATH", std::env::join_paths(dirs).unwrap());
+    }
+    command.output().unwrap()
 }
 
 /// The C API from C, end to end on the library's platform — every check of tests/c/harness.c passes
 #[test]
 fn c_harness_passes() {
     let h = harness("run");
-    let out = Command::new(&h.bin).output().unwrap();
+    let out = run(&h, &[]);
     assert!(
         out.status.success(),
         "{}\n{}",
@@ -80,12 +101,42 @@ fn c_harness_passes() {
     assert!(String::from_utf8_lossy(&out.stdout).contains("harness: ok"));
 }
 
-/// A NULL handle given to a function without a status ends the process (SIGABRT)
+/// On macOS the dylib's install name is `@rpath/libreims_vgpu_c.dylib`, and the harness links it
+/// by that name, so the harness finds the library through its rpath, not through the path of the
+/// build that first linked it (`build.rs`)
+#[cfg(target_os = "macos")]
+#[test]
+fn the_dylib_is_found_by_rpath() {
+    let otool = |flag: &str, file: &Path| {
+        let out = Command::new("otool").arg(flag).arg(file).output().unwrap();
+        assert!(out.status.success(), "otool {flag}: {out:?}");
+        String::from_utf8(out.stdout).unwrap()
+    };
+    let install_name = format!("@rpath/{}", cdylib::file_name());
+    let dylib = cdylib::dir().join(cdylib::file_name());
+    let id = otool("-D", &dylib);
+    assert_eq!(
+        id.lines().nth(1).map(str::trim),
+        Some(install_name.as_str()),
+        "{id}"
+    );
+    let h = harness("rpath");
+    let linked = otool("-L", &h.bin);
+    assert!(
+        linked
+            .lines()
+            .any(|l| l.trim().starts_with(&format!("{install_name} ("))),
+        "{linked}"
+    );
+}
+
+/// A NULL handle given to a function without a status ends the process (SIGABRT; on Windows the
+/// fast fail an abort is)
 #[test]
 fn c_harness_null_handle_aborts() {
     let h = harness("die");
-    let out = Command::new(&h.bin).arg("die-null").output().unwrap();
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    let out = run(&h, &["die-null"]);
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     assert!(!String::from_utf8_lossy(&out.stdout).contains("survived"));
 }
 
@@ -94,7 +145,7 @@ fn c_harness_null_handle_aborts() {
 fn c_harness_calls_every_function() {
     let header = std::fs::read_to_string(crate_dir().join("include/reims_vgpu.h")).unwrap();
     let harness = std::fs::read_to_string(crate_dir().join("tests/c/harness.c")).unwrap();
-    let declared: Vec<&str> = header
+    let mut declared: Vec<&str> = header
         .lines()
         .filter(|l| !l.starts_with("//") && !l.starts_with(' '))
         .filter_map(|l| {
@@ -104,7 +155,10 @@ fn c_harness_calls_every_function() {
             Some(&rest[..end])
         })
         .collect();
-    assert_eq!(declared.len(), 57, "{declared:?}");
+    // A function with a form of each OS's (Windows's under `#if defined(_WIN32)`, the others'
+    // under `#if !defined(_WIN32)`) is declared once per form, one after the other.
+    declared.dedup();
+    assert_eq!(declared.len(), 13, "{declared:?}");
     let missing: Vec<&str> = declared
         .iter()
         .copied()
@@ -119,7 +173,7 @@ fn header_compiles_as_cxx_and_objc() {
     let include = crate_dir().join("include");
     let objc = cfg!(target_os = "macos").then_some(("objective-c", "-std=c11"));
     for (lang, std) in std::iter::once(("c++", "-std=c++17")).chain(objc) {
-        let out = Command::new("cc")
+        let out = Command::new(CC)
             .args(["-x", lang, std, "-fsyntax-only", "-Wall", "-Werror", "-I"])
             .arg(&include)
             .arg("-")
@@ -130,7 +184,7 @@ fn header_compiles_as_cxx_and_objc() {
             .and_then(|mut c| {
                 use std::io::Write as _;
                 c.stdin.take().unwrap().write_all(
-                    b"#include \"reims_vgpu.h\"\nint main(void) { return RVG_MAX_DISPLAY_PORTS == 8 ? 0 : 1; }\n",
+                    b"#include \"reims_vgpu.h\"\nint main(void) { return RVG_GRAPHICS_MSIX_VECTORS == 1 ? 0 : 1; }\n",
                 )?;
                 c.wait_with_output()
             })

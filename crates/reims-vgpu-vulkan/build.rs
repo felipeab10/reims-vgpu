@@ -1,4 +1,4 @@
-//! Compiles the library's own shaders, the metal crate's `src/gpu/shaders.metal`, into
+//! Compiles the library's own shaders, `src/gpu/shaders.metal`, into
 //! `$OUT_DIR/shaders.metallib` with Apple's tools, which `src/gpu/shaders.rs` includes, and the
 //! command predication's step kernel, `src/gpu/predication.metal`, into
 //! `$OUT_DIR/predication.metallib`, which `src/gpu/predication.rs` includes, the vertex function
@@ -10,15 +10,13 @@
 //! `$OUT_DIR/vertex_ids.metallib`, the kernel that reaches a buffer through an address it loads,
 //! `src/gpu/reach.metal`, into `$OUT_DIR/reach.metallib`, and those that write a sweep of values
 //! through textures, `src/gpu/rounding.metal`, into `$OUT_DIR/rounding.metallib`, and again
-//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the scaler
-//! device's kernel, the metal crate's `src/gpu/scaler.metal`, with fast math off into
-//! `$OUT_DIR/scaler.metallib`, which `src/gpu/scaler.rs` includes, the tests'
+//! with fast math off (`-fno-fast-math`) into `$OUT_DIR/rounding_safe.metallib`, the tests'
 //! kernels that read YCbCr textures, `src/gpu/ycbcr_probe.metal`, into
 //! `$OUT_DIR/ycbcr_probe.metallib`, the tests' functions Metal's compiler refuses,
 //! `src/gpu/refused.metal`, into `$OUT_DIR/refused.metallib`, those that use SIMD-group
 //! operations in each stage, `src/gpu/simd_stages.metal`, into `$OUT_DIR/simd_stages.metallib`,
-//! the tests' render functions for Metal's private render keys, `src/gpu/spi_keys.metal`, into
-//! `$OUT_DIR/spi_keys.metallib`, the tests' kernels that write a slice of an imageblock into a
+//! the depth-denormal test's render functions, `src/gpu/depth_denormals.metal`, into
+//! `$OUT_DIR/depth_denormals.metallib`, the tests' kernels that write a slice of an imageblock into a
 //! texture, `src/gpu/slice_write_repro.metal`, into `$OUT_DIR/slice_write_repro.metallib`, the
 //! tests' vertex function that returns nothing, `src/gpu/unrasterized.metal`, into
 //! `$OUT_DIR/unrasterized.metallib`, the tests' fragment function that writes colour 1 alone,
@@ -28,12 +26,13 @@
 //! constexpr samplers, `src/gpu/five_samplers.metal`, into `$OUT_DIR/five_samplers.metallib`,
 //! the tests' kernel that keeps the GPU busy, `src/gpu/spin.metal`, into
 //! `$OUT_DIR/spin.metallib`, the tests' kernels that read, sample and write textures of Apple's
-//! RGBX formats, `src/gpu/rgbx.metal`, into `$OUT_DIR/rgbx.metallib`, the tests' tile functions
-//! that read and write a colour attachment's imageblock cells, `src/gpu/tile_edges.metal`, into
-//! `$OUT_DIR/tile_edges.metallib`, the tests' Core Image kernel, `src/gpu/ci_kernel.metal`,
+//! RGBX formats, `src/gpu/rgbx.metal`, into `$OUT_DIR/rgbx.metallib`, the tests' Core Image
+//! kernel, `src/gpu/ci_kernel.metal`,
 //! compiled as Core Image compiles one (`-fcikernel`, then `metallib -cikernel`) into
 //! `$OUT_DIR/ci_kernel.metallib`, the tests' mesh render pipelines' functions,
-//! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, and those that import a symbol from a
+//! `src/gpu/mesh.metal`, into `$OUT_DIR/mesh.metallib`, the tests' kernel of a function constant
+//! it reads only where defined, `src/gpu/optional_constant.metal`, into
+//! `$OUT_DIR/optional_constant.metallib`, and those that import a symbol from a
 //! dynamic library, `src/gpu/refused_import.metal`, linked into three metallibs ([`imports`]), and
 //! the shell tests' stitchable functions, `guest/bundle/tests/stitchable.metal`, into
 //! `$OUT_DIR/stitchable.metallib`, with the library Metal's stitcher makes of them into
@@ -43,6 +42,12 @@
 //! same source with: a new `MTLCompileOptions` reads `languageVersion` Metal 4.0 and `mathMode`
 //! Fast (measured on an M3 Max, macOS 26.7, 25G229). A Mac needs Xcode's Metal toolchain
 //! (`xcrun -sdk macosx metal`); a `MACOSX_DEPLOYMENT_TARGET` changes no byte of the output.
+//! **Measured** with Metal 32023.922 on an M3 Max (2026-11-07): a compile in another directory
+//! writes the same metallib (the AIR names the source's path, the metallib does not), and so does
+//! a second compile, the stitched library's included. The bytes follow the toolchain: a metallib
+//! records the compiler's version and its AIR version and target (`air64_v29-apple-macosx27.2.0`
+//! there, `air64_v28-apple-macosx26.0.0` from Metal 32023.921), so a Mac with another Xcode
+//! writes each file again with the same sources.
 //!
 //! Any other host (Linux) takes the metallibs a Mac compiled instead: those committed in
 //! `metallibs/` beside this file ([`COMMITTED`]), or those in the directory `RVG_METALLIB_DIR`
@@ -93,7 +98,7 @@ const STITCH_TOOL: [&str; 6] = [
 ];
 
 /// The tests' metallibs of one source each, `src/gpu/<name>.metal`.
-const TEST_LIBRARIES: [&str; 23] = [
+const TEST_LIBRARIES: [&str; 24] = [
     "predication",
     "no_draw",
     "icb_encode",
@@ -104,7 +109,7 @@ const TEST_LIBRARIES: [&str; 23] = [
     "ycbcr_probe",
     "refused",
     "simd_stages",
-    "spi_keys",
+    "depth_denormals",
     "slice_write_repro",
     "unrasterized",
     "icb_color1",
@@ -112,11 +117,12 @@ const TEST_LIBRARIES: [&str; 23] = [
     "five_samplers",
     "spin",
     "rgbx",
-    "tile_edges",
     "argument_probe",
     "linked_caller",
     "linked_callee",
     "mesh",
+    "optional_constant",
+    "visible_tables",
 ];
 
 /// The files [`imports`] makes.
@@ -152,22 +158,13 @@ fn steps(manifest: &Path) -> Vec<Step> {
         sources: vec![source],
         portable: true,
     };
-    let mut steps = vec![one(
-        "shaders",
-        manifest.join("../reims-vgpu-metal/src/gpu/shaders.metal"),
-        &COMPILE,
-    )];
+    let mut steps = vec![one("shaders", gpu.join("shaders.metal"), &COMPILE)];
     for name in TEST_LIBRARIES {
         steps.push(one(name, gpu.join(format!("{name}.metal")), &COMPILE));
     }
     steps.push(one(
         "rounding_safe",
         gpu.join("rounding.metal"),
-        &COMPILE_SAFE,
-    ));
-    steps.push(one(
-        "scaler",
-        manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal"),
         &COMPILE_SAFE,
     ));
     steps.push(Step {
@@ -259,7 +256,7 @@ fn main() -> Result<(), String> {
 
 /// Compiles every metallib into `out` with Apple's tools (module docs).
 fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
-    let source = manifest.join("../reims-vgpu-metal/src/gpu/shaders.metal");
+    let source = manifest.join("src/gpu/shaders.metal");
     xcrun(&COMPILE, &source, &out.join("shaders.air"))?;
     xcrun(
         &["metallib"],
@@ -280,11 +277,6 @@ fn compile(manifest: &Path, out: &Path) -> Result<(), String> {
         out.join("rounding_safe.air"),
         out.join("rounding_safe.metallib"),
     );
-    xcrun(&COMPILE_SAFE, &source, &air)?;
-    xcrun(&["metallib"], &air, &metallib)?;
-    // The scaler device's kernel, with fast math off, as the Metal platform compiles it.
-    let source = manifest.join("../reims-vgpu-metal/src/gpu/scaler.metal");
-    let (air, metallib) = (out.join("scaler.air"), out.join("scaler.metallib"));
     xcrun(&COMPILE_SAFE, &source, &air)?;
     xcrun(&["metallib"], &air, &metallib)?;
     // The tests' Core Image kernel library.

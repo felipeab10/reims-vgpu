@@ -1,19 +1,18 @@
-//! The library's own shaders on this platform: the metal crate's `shaders.metal` (the display's
-//! present functions and the XR10 paging kernels), compiled by Apple's tools when this crate is
-//! built (`build.rs`) into [`METALLIB`], which [`library`] loads with the runtime's
-//! `new_library_with_data`. Core asks for it as `newLibraryWithSource:options:error:`.
+//! The library's own shaders on this platform: `shaders.metal` (the display's present
+//! functions), compiled by Apple's tools when this crate is built (`build.rs`) into
+//! [`METALLIB`], which [`library`] loads with the runtime's `new_library_with_data`. Core asks
+//! for it as `newLibraryWithSource:options:error:`.
 //!
-//! As on the Metal platform, a library belongs to the device that made it, so the metallib is
-//! loaded once per device, the first time core asks for it (a device's blit pipelines, a
-//! display's pipeline cache, a service task's blit pipelines), and every later ask answers the
-//! same library. Devices are told apart by the registry ID the platform answers for them
+//! As in Metal, a library belongs to the device that made it, so the metallib is loaded once per
+//! device, the first time it is asked for (a display's pipelines), and every later ask answers
+//! the same library. Devices are told apart by the registry ID the platform answers for them
 //! (`device::registry_id`). A loaded library stays for the life of the process; one that fails to
 //! load is not kept, and the next ask loads again.
 
+use crate::core::platform::Handle;
+use crate::core::platform::types::NsErrorText;
+use crate::core::sync::Mutex;
 use metal2vulkan_runtime::Error;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{error_text, plain, refused};
 use crate::gpu::device::VulkanDevice;
@@ -26,8 +25,27 @@ pub const METALLIB: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/shaders.me
 /// The selector core names the shader library's creation by.
 const SELECTOR: &str = "newLibraryWithSource:options:error:";
 
-/// The libraries loaded so far, each with its device's registry ID.
+/// The libraries loaded so far, each with its device's registry ID, kept until the platform lets
+/// go of its devices ([`crate::let_go`]).
 static LOADED: Mutex<Vec<(u64, VulkanLibrary)>> = Mutex::new(Vec::new());
+
+/// How many of the libraries loaded so far are of `device` (the device object itself, by its
+/// handle's identity), and whether a handle beyond [`LOADED`]'s holds any of those: what the
+/// platform's let-go of its devices counts as its own ([`crate::let_go`]).
+pub(crate) fn kept_of(device: &VulkanDevice) -> (usize, bool) {
+    use crate::core::platform::Handle as _;
+    let loaded = LOADED.lock();
+    let of = (loaded.iter()).filter(|(_, library)| library.device.id() == device.id());
+    of.fold((0, false), |(n, held), (_, library)| {
+        (n + 1, held || library.strong_count() > 1)
+    })
+}
+
+/// Takes the libraries loaded so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it loads its own.
+pub(crate) fn take_loaded() -> Vec<(u64, VulkanLibrary)> {
+    std::mem::take(&mut *LOADED.lock())
+}
 
 /// The shader library of `device` (a new reference), loaded on the first call for its registry
 /// ID. `Err` is the runtime's refusal of the metallib's contents (`Compile`), which stands where
@@ -80,10 +98,8 @@ mod tests {
     use super::*;
     use crate::gpu::device::tests::dev;
 
-    /// The display's and the blits' nine entry points.
+    /// The display's nine entry points: the window's mirror's two kernels among them.
     const FUNCTIONS: [&str; 9] = [
-        "BlitInRGB_2P_XR10_A8",
-        "BlitOutRGB_2P_XR10_A8",
         "displayPresentVertex",
         "displayPresentFragment",
         "displayPresentFragmentWithGammaTableAndColorMatrix",
@@ -91,6 +107,8 @@ mod tests {
         "displayPipeColorScanoutFragment",
         "displayPipeLutFragment",
         "displayPipeLutScanoutFragment",
+        "displayMirrorTile",
+        "displayMirrorTileList",
     ];
 
     fn function(lib: &VulkanLibrary, name: &str) -> rt::Function {

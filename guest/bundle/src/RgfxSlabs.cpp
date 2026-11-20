@@ -182,8 +182,8 @@ RgfxPagesSlabSource::RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &ser
 
 bool RgfxPagesSlabSource::serves(uint32_t options, uint64_t size) const
 {
-	// One superpage for any heaped class; more, which are more than one run, only for a Shared
-	// buffer of its own, which BUFFER_OVER_PAGES makes over the view.
+	// A 2 MiB slab for any heaped class; a larger one only for a Shared buffer of its own, which
+	// BUFFER_OVER_PAGES makes over the view.
 	const bool shared = ((options & kStorageMask) >> kStorageShift) == kStorageShared;
 	return heaped(options) && (size == kUnit || shared);
 }
@@ -195,11 +195,24 @@ bool RgfxPagesSlabSource::heapedSlab(const Memory &memory, uint32_t options) con
 
 bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 {
-	// Superpages, each one run of guest RAM; where the kernel has none to give (no contiguous
-	// 2 MiB free, or the wire budget spent), the region's slab.
+	if (size == 0 || size % kUnit != 0)
+		return false;
+	// The kext's chunks, the block's own memory; where it gives none, plain pages, which the kext
+	// wires as it makes the block; where the kernel has none to give or the kext no pages block,
+	// the region's slab.
+	RgfxRegion::Block chunks = m_region.acquireChunkedPages(size);
+	if (chunks.ok) {
+		out->bytes = const_cast<uint8_t *>(chunks.ptr);
+		out->size = size;
+		out->regionOffset = chunks.offset;
+		out->blockSize = chunks.size;
+		out->zeroed = true; // the kext zero-fills its chunks
+		out->chunked = true;
+		return true;
+	}
 	uint8_t *bytes = nullptr;
-	if (size == 0 || size % kUnit != 0 ||
-	    m_memory.superpages(m_memory.context, size, &bytes) != KERN_SUCCESS)
+	if (m_memory.pages == nullptr ||
+	    m_memory.pages(m_memory.context, size, &bytes) != KERN_SUCCESS)
 		return false;
 	RgfxRegion::Block block = m_region.acquirePages(bytes, size, true);
 	if (!block.ok) {
@@ -210,16 +223,17 @@ bool RgfxPagesSlabSource::take(uint64_t size, Memory *out)
 	out->size = size;
 	out->regionOffset = block.offset;
 	out->blockSize = block.size;
-	out->zeroed = true; // fresh pages of the kernel's
+	out->zeroed = true; // fresh pages of the kernel's, zero-filled
 	return true;
 }
 
 void RgfxPagesSlabSource::give(const Memory &memory)
 {
 	// The block's release first: the kext answers once the device has let go of it, and unwires
-	// the pages.
+	// the pages, or unmaps and frees its chunks.
 	m_region.release(memory.regionOffset);
-	m_memory.unmap(m_memory.context, memory.bytes, memory.size);
+	if (!memory.chunked)
+		m_memory.unmap(m_memory.context, memory.bytes, memory.size);
 }
 
 bool RgfxPagesSlabSource::makeHeap(const Memory &memory, uint32_t options, Heap *out)
@@ -240,8 +254,8 @@ bool RgfxPagesSlabSource::makeBuffer(const Memory &memory, const Heap &heap, uin
 {
 	if (heap.objId != 0)
 		return RgfxRegionSlabSource::makeBuffer(memory, heap, offset, length, options, out);
-	// A dedicated slab of more than one superpage (offset 0): a Shared buffer over the block's
-	// view, at an address picked for it.
+	// A dedicated slab larger than 2 MiB (offset 0): a Shared buffer over the block's view, at an
+	// address picked for it.
 	RgfxCreated created = m_serializer.createBufferOverPages(length, options, memory.regionOffset,
 	                                                         memory.blockSize, offset);
 	if (created.obj_id == 0 || m_serializer.refused(created))
@@ -520,6 +534,7 @@ bool RgfxSlabs::take(uint64_t length, uint32_t options, uint64_t keep, Range *ou
 		Slab *made = fromEither();
 		if (made == nullptr && !refused) {
 			dropDoomed(true);
+			waitForDrops();
 			made = fromEither();
 		}
 		while (made == nullptr && !refused && !dedicated && ask > least) {
@@ -667,10 +682,36 @@ void RgfxSlabs::giveBack(const Range &range)
 
 void RgfxSlabs::drop(Slab *slab)
 {
+	const uint64_t serial = slab->serial;
 	if (slab->heap.objId != 0)
 		slab->source->dropHeap(slab->heap);
 	slab->source->give(slab->memory);
 	delete slab;
+	{
+		std::lock_guard<std::mutex> hold(m_lock);
+		m_dropping.erase(serial);
+	}
+	m_dropped.notify_all();
+}
+
+bool RgfxSlabs::waitForDrops()
+{
+	std::unique_lock<std::mutex> hold(m_lock);
+	std::set<uint64_t> waited = m_dropping;
+	for (const Slab *slab : m_doomed)
+		waited.insert(slab->serial); // dropped by the background once its piece is zeroed
+	m_dropped.wait(hold, [&] {
+		for (uint64_t serial : waited) {
+			if (m_dropping.count(serial) != 0)
+				return false;
+		}
+		for (const Slab *slab : m_doomed) {
+			if (waited.count(slab->serial) != 0)
+				return false;
+		}
+		return true;
+	});
+	return !waited.empty();
 }
 
 uint64_t RgfxSlabs::cachedBytesOf(const RgfxSlabSource *source) const
@@ -685,7 +726,9 @@ uint64_t RgfxSlabs::cachedBytesOf(const RgfxSlabSource *source) const
 
 bool RgfxSlabs::reclaim()
 {
-	return dropDoomed(true) != 0;
+	const bool dropped = dropDoomed(true) != 0;
+	const bool waited = waitForDrops();
+	return dropped || waited;
 }
 
 size_t RgfxSlabs::dropDoomed(bool evict)
@@ -710,6 +753,7 @@ size_t RgfxSlabs::dropDoomed(bool evict)
 		for (auto it = m_doomed.begin(); it != m_doomed.end();) {
 			if ((*it)->zeroing == 0) {
 				drops.push_back(*it);
+				m_dropping.insert((*it)->serial);
 				m_all.erase(*it);
 				it = m_doomed.erase(it);
 			} else {
@@ -738,6 +782,7 @@ bool RgfxSlabs::step()
 		for (auto it = m_doomed.begin(); it != m_doomed.end(); ++it) {
 			if ((*it)->zeroing == 0) {
 				drops = *it;
+				m_dropping.insert(drops->serial);
 				m_all.erase(drops);
 				m_doomed.erase(it);
 				break;
@@ -858,6 +903,6 @@ RgfxSlabs::Stats RgfxSlabs::stats()
 	}
 	out.cachedSlabs = m_cached.size();
 	out.cachedBytes = m_cachedBytes;
-	out.dooming = m_doomed.size();
+	out.dooming = m_doomed.size() + m_dropping.size();
 	return out;
 }

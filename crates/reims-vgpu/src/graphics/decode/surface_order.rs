@@ -49,27 +49,30 @@
 //! A shared event's value only rises (docs/graphics-kext/design.md, "Shared events"), so a second
 //! signal of a value is harmless.
 //!
-//! [`RGFX_OP_SURFACE_ORDER`]: reims_graphics::ops::RGFX_OP_SURFACE_ORDER
+//! [`RGFX_OP_SURFACE_ORDER`]: reims_vgpu_graphics::ops::RGFX_OP_SURFACE_ORDER
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use reims_graphics::ops::RgfxSurfaceOrderWait;
-use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::{OnFault, RaiseResult, refusals};
+use reims_vgpu_graphics::ops::RgfxSurfaceOrderWait;
+use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::clock::MonoTime;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, RaiseResult, refusals};
 
 use super::commit_order;
 
 /// The waits and signals run under a live raise handler (the ring loop's).
 const ON: OnFault = OnFault::Return;
 
-/// How many command buffers that hold the op pass between the logs of what the order did.
-const LOGGED_EVERY: u64 = 4096;
+/// How long the logs of what the order did wait after the last: the first command buffer that
+/// holds the op after it logs them. A summary at info comes at most once a minute, however many
+/// command buffers a guest sends (docs/conventions.md).
+const LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// What a queue's submission ring has published: the highest seqno of a message on it, taken or
 /// not; `None` where the queue has ended at the device. Given by the host as the queue is made.
@@ -281,6 +284,8 @@ impl<P: Platform> Queue<P> {
 pub(crate) struct SurfaceOrder<P: Platform> {
     queues: HashMap<u64, Queue<P>>,
     counts: OrderCounts,
+    /// When the counts were last logged ([`LOGGED_AFTER`]); `None` before the first buffer.
+    logged_at: Option<MonoTime>,
 }
 
 impl<P: Platform> SurfaceOrder<P> {
@@ -288,6 +293,7 @@ impl<P: Platform> SurfaceOrder<P> {
         SurfaceOrder {
             queues: HashMap::new(),
             counts: OrderCounts::default(),
+            logged_at: None,
         }
     }
 
@@ -427,16 +433,20 @@ impl<P: Platform> SurfaceOrder<P> {
     }
 
     /// Makes `cb`, a command buffer of queue `queue` that holds the op, wait on the GPU for each
-    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue.
+    /// buffer of `waits` not yet finished (the module doc); the waits it made, one a queue. Logs
+    /// the counts where it comes [`LOGGED_AFTER`] or more after their last log, at `now`.
     pub(crate) fn before(
         &mut self,
         device: &P::Device,
         queue: u64,
         cb: &P::CommandBuffer,
         waits: &[RgfxSurfaceOrderWait],
+        now: MonoTime,
     ) -> RaiseResult<Vec<OrderWait<P>>> {
         self.counts.buffers += 1;
-        if self.counts.buffers.is_multiple_of(LOGGED_EVERY) {
+        let last = *self.logged_at.get_or_insert(now);
+        if now.saturating_duration_since(last) >= LOGGED_AFTER {
+            self.logged_at = Some(now);
             let c = self.counts;
             log::info!(
                 target: "reims_vgpu::graphics",
@@ -616,7 +626,7 @@ impl<P: Platform> SurfaceOrder<P> {
                 && let Err(refusal) = refusals::refusing(move || drop(q.event))
             {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = refusal;
                     "queue {id:#x}'s surface timeline was let go of, and its release was \
                      refused: {refusal}"
                 );
@@ -631,7 +641,7 @@ impl<P: Platform> SurfaceOrder<P> {
         let queues = std::mem::take(&mut self.queues);
         if let Err(refusal) = refusals::refusing(move || drop(queues)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the surface timelines were let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );
@@ -683,9 +693,10 @@ impl<P: Platform> super::GraphicsDecoder<P> {
             let mut waited = 0;
             while !w.wait(CPU_WAIT_SLICE_MS) {
                 if cancel.cut_since(begun) {
-                    log::info!(
+                    log::debug!(
                         target: "reims_vgpu::graphics",
-                        "surface order: a reset of the device ended the CPU wait of work started                          off a command buffer for a buffer of another queue at {}",
+                        "surface order: a reset of the device ended the CPU wait of work started \
+                         off a command buffer for a buffer of another queue at {}",
                         w.value
                     );
                     return;
@@ -694,15 +705,18 @@ impl<P: Platform> super::GraphicsDecoder<P> {
                 if waited == CPU_WAIT_LOGGED_MS {
                     log::warn!(
                         target: "reims_vgpu::graphics",
-                        "surface order: work started off a command buffer has waited                          {CPU_WAIT_LOGGED_MS} ms on the CPU for a buffer of another queue at {},                          which has not finished; it waits on",
+                        "surface order: work started off a command buffer has waited \
+                         {CPU_WAIT_LOGGED_MS} ms on the CPU for a buffer of another queue at {}, \
+                         which has not finished; it waits on",
                         w.value
                     );
                 }
             }
             if waited >= CPU_WAIT_LOGGED_MS {
-                log::info!(
+                log::debug!(
                     target: "reims_vgpu::graphics",
-                    "surface order: the buffer of another queue at {} finished after about {waited}                      ms of a CPU wait",
+                    "surface order: the buffer of another queue at {} finished after about \
+                     {waited} ms of a CPU wait",
                     w.value
                 );
             }
@@ -716,19 +730,19 @@ mod tests {
 
     use std::sync::atomic::Ordering;
 
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
         RgfxCommandBuffer, RgfxOpHeader,
     };
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_EVT_CB_SUBMITTED, RgfxMsgHeader, RgfxObjectDestroy,
         RgfxQueueCreate,
     };
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::calllog::{Arg, Call};
-    use reims_vgpu_core::testkit::objects::CompleteOn;
-    use reims_vgpu_core::testkit::{FakePlatform, Step};
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::calllog::{Arg, Call};
+    use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+    use reims_vgpu_vulkan::core::testkit::{FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder, refusing};
@@ -754,7 +768,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         for queue in [A, B] {
             let create = RgfxQueueCreate {
@@ -900,16 +914,11 @@ mod tests {
             } else {
                 event.set_signaled_value(4).unwrap();
             }
-            let mut finished = false;
-            for _ in 0..2000 {
+            let finished = crate::graphics::tests::eventually(|| {
                 p.virtual_clock()
                     .advance(Duration::from_millis(CPU_WAIT_SLICE_MS));
-                if waiting.is_finished() {
-                    finished = true;
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
+                waiting.is_finished()
+            });
             assert!(finished, "the wait did not end (reset {reset})");
             let dec = waiting.join().unwrap();
             assert!(dec.order_waits.borrow().is_empty());
@@ -1092,7 +1101,6 @@ mod tests {
     #[test]
     #[allow(clippy::disallowed_methods)] // test scaffolding: a thread carries the buffer out
     fn a_cpu_set_for_a_buffer_not_carried_out_waits_for_its_queue_s_earlier_work() {
-        use std::time::Duration;
         let mut r = rig();
         // A's buffer 1 signals its timeline at 1, committed and not finished.
         let (outcome, calls) = r.commit(A, 1, &ops(Some(&[]), &[]));
@@ -1115,13 +1123,10 @@ mod tests {
         });
         // The set, or a wait before it, comes: a set first came before A's buffer 1 finished.
         let mut seen = Vec::new();
-        for _ in 0..3000 {
+        crate::graphics::tests::eventually(|| {
             seen = p.call_log().sels_since(begun);
-            if seen.contains(&SET) || seen.contains(&"waitUntilSignaledValue:timeoutMS:") {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            seen.contains(&SET) || seen.contains(&"waitUntilSignaledValue:timeoutMS:")
+        });
         assert!(
             !seen.contains(&SET),
             "the timeline was set before A's buffer 1 finished: {seen:?}"
@@ -1260,7 +1265,7 @@ mod tests {
     /// behind it on the platform
     #[test]
     fn an_order_on_the_gpu_holds_back_no_record() {
-        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        use reims_vgpu_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
         const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
         const DONE: u32 = RGFX_EVT_CB_COMPLETE;
@@ -1362,8 +1367,8 @@ mod tests {
     /// scheduling, not at its commit
     #[test]
     fn an_event_wait_still_holds_its_queue_beside_an_order() {
-        use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+        use reims_vgpu_graphics::wire::{
             RGFX_CMD_SHARED_EVENT_CREATE, RGFX_EVT_CB_SCHEDULED, RgfxSharedEventCreate,
         };
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
@@ -1431,7 +1436,7 @@ mod tests {
     /// take or commit posts them again; once the platform takes both, nothing is posted again.
     #[test]
     fn a_doorbell_answer_behind_an_order_posts_each_record_once_in_order() {
-        use reims_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
+        use reims_vgpu_graphics::wire::{RGFX_EVT_CB_COMPLETE, RGFX_EVT_CB_SCHEDULED};
         const SUB: u32 = RGFX_EVT_CB_SUBMITTED;
         const SCHED: u32 = RGFX_EVT_CB_SCHEDULED;
         const DONE: u32 = RGFX_EVT_CB_COMPLETE;
@@ -1446,7 +1451,7 @@ mod tests {
         r.dec.set_context(Some(context(B)));
         let begun = r
             .dec
-            .begin_taken(&r.device, &ordered, Some(B))
+            .begin_taken(&r.device, &ordered, Some(B), false)
             .unwrap()
             .unwrap();
         assert_eq!(of(&posted, &[o]), [(SUB, o), (SCHED, o)], "at its take");
@@ -1459,7 +1464,7 @@ mod tests {
             .decoders()
             .answer_at_doorbell(context(B), &next, move |bytes| {
                 // A CB_SUBMITTED or a CB_SCHEDULED, which share a layout.
-                let m = <reims_graphics::wire::RgfxCbScheduled as zerocopy::FromBytes>::read_from_bytes(
+                let m = <reims_vgpu_graphics::wire::RgfxCbScheduled as zerocopy::FromBytes>::read_from_bytes(
                     bytes,
                 )
                 .unwrap();
@@ -1478,7 +1483,7 @@ mod tests {
         assert_eq!(of(&posted, &[o, d]), answered, "nothing at its commit");
         let begun = r
             .dec
-            .begin_taken(&r.device, &next, Some(B))
+            .begin_taken(&r.device, &next, Some(B), false)
             .unwrap()
             .unwrap();
         let finished = r

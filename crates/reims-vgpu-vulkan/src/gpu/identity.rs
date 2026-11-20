@@ -4,20 +4,23 @@
 //! Each answer comes from one of these sources, and is `None` where none gives it:
 //! - **the runtime's answer**: `name`'s companions in `DeviceProperties` (`hasUnifiedMemory`,
 //!   `maxBufferLength`, the argument-buffer and read-write texture tiers,
-//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles,
+//!   `supports32BitFloatFiltering`), `sparseTileSizeInBytes`, each format's sparse tiles and
+//!   `minimumLinearTextureAlignmentForPixelFormat:`,
 //!   `supportsFamily:`, `supportsVertexAmplificationCount:` and
-//!   `supportsRasterizationRateMapWithLayerCount:`, and, for
-//!   `minimumTextureBufferAlignmentForPixelFormat:`, its
-//!   `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike (measured);
+//!   `supportsRasterizationRateMapWithLayerCount:`;
+//! - **a stand-in**, [`crate::gpu::caps`]' (its table), for
+//!   `minimumTextureBufferAlignmentForPixelFormat:`: `minimumLinearTextureAlignmentForPixelFormat:`
+//!   as this platform answers it ([`crate::gpu::caps::linear_alignment`]), which Metal answers
+//!   alike (measured);
 //! - **the runtime's audit of a feature row** of Apple's tables, in the Apple9 column, which lists
 //!   every row read here, as [`crate::gpu::caps`]' SIMD flags are read ([`ROWS`]): a getter is yes
 //!   where the row its feature is is exact on the device;
 //! - **the device's Vulkan memory heaps**, for `recommendedMaxWorkingSetSize`, which the runtime
 //!   does not answer: the sum of the device-local heaps, the memory the GPU reaches at its own
 //!   speed, as Metal answers on a Mac of a discrete GPU from its VRAM;
-//! - **the device's Vulkan limits and descriptor features**, for `maxArgumentBufferSamplerCount`,
-//!   which the runtime does not answer: the most sampler states an argument buffer can name at
-//!   once, as the runtime places them in its set-1 sampler arrays ([`sampler_count`]);
+//! - **the runtime's device properties**, for `maxArgumentBufferSamplerCount`: the most sampler
+//!   states an argument buffer can name at once, as the runtime places them in its set-1 sampler
+//!   arrays (`DeviceProperties::max_argument_buffer_sampler_count`);
 //! - **Metal's documented relations**:
 //!   - a family the platform claims claims the families it contains (`implied`): each Apple
 //!     family every Apple family before it, Apple1 Common1, Apple3 Common2, Apple5 Common3, and
@@ -39,14 +42,14 @@
 //! `supports32BitMSAA` and `supportsPullModelInterpolation` are the runtime's answers; a gap in the
 //! latter is `None`.
 
-use ash::vk;
-use metal2vulkan::metal::TextureType;
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::caps::{
+use crate::core::platform::caps::{
     DeviceCaps, FEATURE_SETS, FormatAnswers, IdentityCaps, IdentityFlags, IdentitySizes,
     LARGEST_COUNT_ASKED, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
     TEXTURE_BUFFER_FORMATS, feature_set_family,
 };
+use ash::vk;
+use metal2vulkan::metal::TextureType;
+use metal2vulkan_runtime as rt;
 
 use crate::gpu::runtime_pixel_format;
 
@@ -164,11 +167,17 @@ fn sparse_page(page: i64) -> Option<rt::SparsePageSize> {
     .find_map(|(p, raw)| (raw == page).then_some(p))
 }
 
-/// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles, and, of a format
-/// Metal answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers: the
-/// runtime's `minimumLinearTextureAlignmentForPixelFormat:`, which Metal answers alike for
-/// every format of the SDK (measured, an M3 Max under macOS 27.2). `None` for a format the
-/// runtime has no enumerator of.
+/// The answers of `format` [`FormatAnswers`] holds: the runtime's sparse tiles; the runtime's
+/// `minimumLinearTextureAlignmentForPixelFormat:` of a format a buffer backs, the device's own
+/// answer for that format (`rt::Device::minimum_linear_texture_alignment_for_pixel_format`, which
+/// differs between formats on some GPUs: on a Radeon RX 550, 256 bytes for texels of 1 to 4
+/// bytes, 512 for 8 and 1024 for 16, read on 2026-11-12, where the device's
+/// `linearTextureAlignmentBytes` is the largest of every format's); and, of a format Metal
+/// answers it of ([`TEXTURE_BUFFER_FORMATS`]), the alignment of its texture buffers:
+/// `minimumLinearTextureAlignmentForPixelFormat:` as this platform answers it, a stand-in
+/// ([`crate::gpu::caps::linear_alignment`]), which Metal answers alike for every format of the
+/// SDK (measured, an M3 Max under macOS 27.2). `None` for a format the runtime has no enumerator
+/// of.
 fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     let Some(pf) = runtime_pixel_format(format) else {
         return FormatAnswers {
@@ -178,13 +187,11 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     };
     let texture_buffer_alignment = TEXTURE_BUFFER_FORMATS
         .contains(&format)
-        .then(|| {
-            device
-                .properties()
-                .minimum_linear_texture_alignment_for_pixel_format(pf)
-                .ok()
-        })
+        .then(|| crate::gpu::caps::linear_alignment(device, pf).ok())
         .flatten();
+    let linear_alignment = device
+        .minimum_linear_texture_alignment_for_pixel_format(pf)
+        .ok();
     let mut tiles = [[0; 3]; 9];
     let pairs = SPARSE_SAMPLE_COUNTS
         .iter()
@@ -198,6 +205,7 @@ fn format_answers(device: &rt::Device, format: u64) -> FormatAnswers {
     FormatAnswers {
         format,
         texture_buffer_alignment,
+        linear_alignment,
         sparse_tiles: Some(tiles),
     }
 }
@@ -221,9 +229,12 @@ fn device_local_bytes(device: &rt::Device) -> u64 {
 /// The bytes of `device`'s device-local memory heaps the process may hold now
 /// ([`GpuDevice::own_memory_budget`]): the heaps' budgets (`VK_EXT_memory_budget`) where the
 /// physical device lists the extension, which a physical-device query may chain without the device
-/// enabling it, else the heaps' sizes ([`device_local_bytes`]).
+/// enabling it, each no more than its heap's size, else the heaps' sizes ([`device_local_bytes`]).
+/// A driver may answer a budget past its heap's size, which the extension bounds it by: Intel's
+/// 101.2145 driver for the UHD Graphics 630, on Windows 11, answers 47.10 GiB for its one heap of
+/// 31.92 GiB with nothing used (measured with `vulkaninfo`, 2026-11-15).
 ///
-/// [`GpuDevice::own_memory_budget`]: reims_vgpu_core::platform::device::GpuDevice::own_memory_budget
+/// [`GpuDevice::own_memory_budget`]: crate::core::platform::device::GpuDevice::own_memory_budget
 pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
     // SAFETY: the instance and physical device are the runtime's, read only, while `device`
     // lives.
@@ -250,72 +261,18 @@ pub(crate) fn device_local_budget(device: &rt::Device) -> u64 {
     (properties.memory_heaps_as_slice().iter())
         .zip(budget.heap_budget)
         .filter(|(heap, _)| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
-        .fold(0u64, |sum, (_, budget)| sum.saturating_add(budget))
+        .fold(0u64, |sum, (heap, budget)| {
+            sum.saturating_add(budget.min(heap.size))
+        })
 }
 
 /// `maxArgumentBufferSamplerCount` of `device`: how many sampler states an argument buffer can
-/// name at once ([`sampler_count`] of the device's profile and `maxSamplerAllocationCount`),
-/// where Metal answers 500000 on an M3 Max and 2048 on an AMD Radeon Pro 5300M and an Intel UHD
-/// Graphics 630 (macOS 26.7.1; docs/graphics-kext/dgpu-oracle.md, Q9).
+/// name at once, as the runtime answers it (`DeviceProperties::max_argument_buffer_sampler_count`:
+/// its set-1 sampler arrays' elements and `maxSamplerAllocationCount`, less the neutral sampler's
+/// one), where Metal answers 500000 on an M3 Max and 2048 on an AMD Radeon Pro 5300M and an Intel
+/// UHD Graphics 630 (macOS 26.7.1; docs/graphics-kext/dgpu-oracle.md, Q9).
 fn argument_buffer_sampler_count(device: &rt::Device) -> u64 {
-    let profile = device.compile_device().profile();
-    // SAFETY: the instance and physical device are the runtime's, read only, while `device`
-    // lives.
-    let allocations = unsafe {
-        let raw = device.raw();
-        raw.instance
-            .get_physical_device_properties(raw.physical_device)
-            .limits
-            .max_sampler_allocation_count
-    };
-    let limits = profile.limits();
-    sampler_count(
-        reads_sampler_arrays(profile.descriptors()),
-        limits.max_descriptor_set_update_after_bind_samplers,
-        limits.max_per_stage_descriptor_update_after_bind_samplers,
-        allocations,
-    )
-}
-
-/// Whether a function on a device of `d` can read a set-1 sampler array, as metal2vulkan's
-/// `pipeline::link` (`heap_set`) and `lower::sampler` make one: a runtime array, partially
-/// bound and updated after bind (`descriptorBindingSampledImageUpdateAfterBind`, which covers
-/// `SAMPLER` bindings), indexed non-uniformly (`shaderSampledImageArrayNonUniformIndexing`,
-/// which covers arrays of samplers). Without them it makes no function that reads an argument
-/// buffer's sampler.
-fn reads_sampler_arrays(d: &metal2vulkan::device::DescriptorCaps) -> bool {
-    d.runtime_descriptor_array
-        && d.partially_bound
-        && d.update_after_bind_sampled_image
-        && d.non_uniform_sampled_image
-}
-
-/// How many sampler states an argument buffer can name at once on a device that `reads` set-1
-/// sampler arrays, of the limits `set` (`maxDescriptorSetUpdateAfterBindSamplers`), `stage`
-/// (`maxPerStageDescriptorUpdateAfterBindSamplers`) and `allocations`
-/// (`maxSamplerAllocationCount`), as metal2vulkan at pin 15 places them:
-/// - a live sampler state is at its element of every set-1 sampler array, the lowest above 0 no
-///   live state holds; element 0 ([`metal2vulkan::bind::NEUTRAL_HEAP_ELEMENT`]) is the neutral
-///   sampler, so a device's elements hold one state fewer than they number;
-/// - an array has at most as many elements as the handle search reaches
-///   ([`metal2vulkan::bind::HANDLE_TABLE_CAPACITY`], 65536), `set` and `stage`, and none where
-///   the device cannot read one ([`reads_sampler_arrays`]);
-/// - the device holds at most `allocations` Vulkan samplers, the neutral's among them, and
-///   refuses a state past them (`SamplerCount`).
-///
-/// A state past the count reads as the neutral through an argument buffer, announced as
-/// `unlisted-argument-sampler` (metal2vulkan's `sampler.rs` and `heap_sets.rs`). So the count is
-/// the least of the elements and `allocations`, less the neutral's one, and 0 where that is
-/// none.
-fn sampler_count(reads: bool, set: u32, stage: u32, allocations: u32) -> u64 {
-    let elements = if reads {
-        u64::from(metal2vulkan::bind::HANDLE_TABLE_CAPACITY)
-            .min(u64::from(set))
-            .min(u64::from(stage))
-    } else {
-        0
-    };
-    elements.min(u64::from(allocations)).saturating_sub(1)
+    device.properties().max_argument_buffer_sampler_count
 }
 
 /// `architecture.name` of a device of PCI vendor `vendor` and device `device` whose driver
@@ -329,6 +286,34 @@ fn sampler_count(reads: bool, set: u32, stage: u32, allocations: u32) -> u64 {
 fn architecture_name(vendor: u32, device: u32, pipeline_cache: [u8; vk::UUID_SIZE]) -> String {
     let key: String = pipeline_cache.iter().map(|b| format!("{b:02x}")).collect();
     format!("vulkan_{vendor:04x}_{device:04x}_{key}")
+}
+
+/// The bytes that decide the runtime's answers to a pipeline create on `device`
+/// (`GpuDevice::pipeline_answers_identity`): the fingerprint of its translation profile, which
+/// covers every field of the profile and the device policy, and which the runtime keys its own
+/// persisted artifacts on; its semantics, artifact format and runtime versions, which it bumps
+/// where an unchanged artifact's translation, encoding or run may answer otherwise; and the
+/// driver's version, which the profile may not reach (metal2vulkan's advice, 2026-11-14). The
+/// runtime's commit is not among them: a pin move that changes none of these keeps the answers.
+pub(crate) fn pipeline_answers_identity(device: &rt::Device) -> Vec<u8> {
+    let mut out = Vec::with_capacity(48);
+    out.extend_from_slice(&device.compile_device().profile_fingerprint());
+    out.extend_from_slice(&metal2vulkan::cache::SEMANTICS_VERSION.to_le_bytes());
+    out.extend_from_slice(&metal2vulkan::cache::ARTIFACT_FORMAT_VERSION.to_le_bytes());
+    out.extend_from_slice(&metal2vulkan::cache::RUNTIME_VERSION.to_le_bytes());
+    out.extend_from_slice(&driver_version(device).to_le_bytes());
+    out
+}
+
+/// `VkPhysicalDeviceProperties::driverVersion` of `device`.
+fn driver_version(device: &rt::Device) -> u32 {
+    // SAFETY: as `pipeline_cache_uuid`'s.
+    unsafe {
+        let raw = device.raw();
+        raw.instance
+            .get_physical_device_properties(raw.physical_device)
+            .driver_version
+    }
 }
 
 /// `VkPhysicalDeviceProperties::pipelineCacheUUID` of `device`.
@@ -442,32 +427,10 @@ pub fn read(device: &rt::Device, caps: &DeviceCaps) -> IdentityCaps {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::device::GpuDevice;
+    use crate::core::platform::device::GpuDevice;
 
     use super::*;
     use crate::gpu::device::tests::dev;
-
-    /// The sampler count is the least of the handle search's 65536 elements, the two
-    /// update-after-bind sampler limits and the sampler allocations, less the neutral sampler's
-    /// element; none where the device cannot read a sampler array, and none, not a wrap, where no
-    /// element is left past the neutral's.
-    #[test]
-    fn the_sampler_count_is_the_runtimes_elements_past_the_neutral() {
-        const ALL: u32 = u32::MAX;
-        // An RTX 5080's profile: 4000 sampler allocations.
-        assert_eq!(sampler_count(true, 1_048_576, 1_048_576, 4000), 3999);
-        // lavapipe: 32768 samplers in a set and a stage.
-        assert_eq!(sampler_count(true, 32768, 32768, ALL), 32767);
-        // MoltenVK on the M3 Max: limits past the handle search's reach.
-        assert_eq!(sampler_count(true, ALL, ALL, ALL), 65535);
-        assert_eq!(sampler_count(true, 70000, 2048, 3000), 2047);
-        // No set-1 sampler array: none.
-        assert_eq!(sampler_count(false, ALL, ALL, ALL), 0);
-        // One element is the neutral's alone, and none is none.
-        assert_eq!(sampler_count(true, 1, 1, 1), 0);
-        assert_eq!(sampler_count(true, 0, ALL, ALL), 0);
-        assert_eq!(sampler_count(true, ALL, ALL, 0), 0);
-    }
 
     /// A device no Metal device stands for answers the M3 Max's feature profile and FP configs;
     /// the one Metal's registry ID names, Metal's own (on macOS)
@@ -574,11 +537,9 @@ mod tests {
                 .is_some_and(|bytes| bytes > 0)
         );
         assert_eq!(identity.flags.is_low_power, None);
-        // The sampler states an argument buffer names: the device's profile's and its sampler
-        // allocations', placed as the runtime places them (`sampler_count`), never none on a
-        // device whose functions read argument buffers' samplers.
-        let profile = d.raw.compile_device().profile();
-        let limits = profile.limits();
+        // The sampler states an argument buffer names: the runtime's answer, never none on a
+        // device whose functions read argument buffers' samplers, and within the device's sampler
+        // allocations and the handle search's reach.
         // SAFETY: the instance and physical device are the runtime's, read only, while `d` lives.
         let allocations = unsafe {
             let raw = d.raw.raw();
@@ -587,18 +548,12 @@ mod tests {
                 .limits
                 .max_sampler_allocation_count
         };
-        let reads = reads_sampler_arrays(profile.descriptors());
         let samplers = identity.sizes.max_argument_buffer_sampler_count.unwrap();
         assert_eq!(
             samplers,
-            sampler_count(
-                reads,
-                limits.max_descriptor_set_update_after_bind_samplers,
-                limits.max_per_stage_descriptor_update_after_bind_samplers,
-                allocations,
-            )
+            d.raw.properties().max_argument_buffer_sampler_count
         );
-        assert!(reads && samplers > 0);
+        assert!(samplers > 0);
         assert!(samplers < u64::from(allocations));
         assert!(samplers < u64::from(metal2vulkan::bind::HANDLE_TABLE_CAPACITY));
         // BGRA8Unorm (80): 16-byte texture buffers, and a 4-byte texel's 64x64 tile in 16 KiB,
@@ -608,6 +563,30 @@ mod tests {
         assert_eq!(bgra8.sparse_tiles.unwrap()[0], [64, 64, 1]);
         let bc1 = identity.formats.iter().find(|f| f.format == 130).unwrap();
         assert_eq!(bc1.texture_buffer_alignment, None);
+        // Each format a buffer backs answers its own linear alignment, the runtime's, at least
+        // Metal's 16 and at most the device's `linearTextureAlignmentBytes`, the largest of
+        // every format's; a format no buffer backs (BC1_RGBA) answers none. Printed, by answer.
+        assert_eq!(bc1.linear_alignment, None);
+        let largest = caps.limits.linear_texture_alignment_bytes;
+        let mut by_answer = std::collections::BTreeMap::<u64, Vec<u64>>::new();
+        for answers in &identity.formats {
+            let Some(alignment) = answers.linear_alignment else {
+                continue;
+            };
+            assert!(
+                alignment.is_power_of_two(),
+                "{}: {alignment}",
+                answers.format
+            );
+            assert!(
+                (16..=largest).contains(&alignment),
+                "{}: {alignment}",
+                answers.format
+            );
+            by_answer.entry(alignment).or_default().push(answers.format);
+        }
+        assert!(by_answer.contains_key(&bgra8.linear_alignment.unwrap()));
+        eprintln!("linear alignments (largest {largest}), by answer: {by_answer:?}");
     }
 
     /// The budget of the device's own memory is some of it, no more than its device-local heaps

@@ -17,14 +17,16 @@
 #   make            build the serialiser objects (x86_64, the guest's arch)
 #   make test       build + run the checks: the serialiser check (x86_64, under
 #                   Rosetta), the AIR argument reader's check (x86_64, under Rosetta,
-#                   over .metallibs built from tests/air_arguments.metal and
-#                   tests/air_arguments_old.metal, and the repo's committed metallibs), the
+#                   over .metallibs built from tests/air_arguments.metal,
+#                   tests/air_arguments_old.metal and tests/air_arguments_11.metal, the module
+#                   of every function of the first, and the repo's committed metallibs), the
 #                   Metal-shell wrapper/routing check (this Mac's native arch; the
 #                   device shell is not in its binary), and the device's base-class
 #                   check (x86_64, under Rosetta), which loads the bundle
 #                   (tests/inherited_tests.mm), the protocol members' check against
 #                   their register (x86_64, under Rosetta, which loads the bundle:
-#                   tests/protocol_members_tests.mm, tests/protocol_members.txt), and the
+#                   tests/protocol_members_tests.mm, tests/protocol_members.txt,
+#                   tests/protocol_members_releases.txt), and the
 #                   video driver's H.264 and HEVC parameter-set checks and its entry
 #                   points' check (x86_64, under Rosetta, tests/video_h264_tests.cpp,
 #                   tests/video_h265_tests.cpp, tests/video_driver_tests.cpp).
@@ -44,6 +46,11 @@
 #   make upload-probe
 #                   what the CPU's uploads into Managed resources cost at WindowServer's shapes
 #                   (tools/upload_probe.m), build/upload_probe-x86_64; ARCH=arm64 likewise.
+#   make icb-probe  what the CPU's encodes into indirect command buffers and its writes into
+#                   IOSurfaces cost (tools/icb_probe.m), build/icb_probe-x86_64; ARCH=arm64 likewise.
+#   make encode-probe
+#                   what the hot encoder calls cost the calling thread, in ns a call
+#                   (tools/encode_probe.m), build/encode_probe-x86_64; ARCH=arm64 likewise.
 #   make reflection-check
 #                   the stitchable functions' reflection the bundle builds against Metal's own,
 #                   build/reflection_check-x86_64 (ARCH=arm64 likewise) over
@@ -57,8 +64,6 @@
 #                   the wire round trip of the bundle's ring code against the host's library
 #                   (tests/peer_tests.mm; native arch, this Mac's GPU, never in `make test`):
 #                   build, then run holding the GPU lock. DIST names `cargo xtask dist`'s tree.
-#   make spguard    what the kernel's VM guard makes of the device's superpages
-#                   (tools/spguard), build/spguard-x86_64, run in a guest.
 #   make clean      remove build/
 #
 # Everything lands in build/, never committed.
@@ -69,14 +74,18 @@ SDK     ?= $(shell xcrun --sdk macosx --show-sdk-path)
 # the spaces before a `#`, and a trailing space breaks the object paths below.
 ARCH    ?= x86_64
 NATIVE  ?= $(shell uname -m)
-WIRE     = ../../crates/reims-graphics/include
+WIRE     = ../../crates/reims-vgpu-graphics/include
 BUILD    = build
 
 CXX      = xcrun clang++
 
 # Shared flags. The serialiser check already builds -Wall -Wextra -Werror; the
-# shell holds to the same bar.
-CXXFLAGS = -isysroot $(SDK) -std=c++17 -Os \
+# shell holds to the same bar. The deployment target is macOS 11.0, the oldest
+# release the guest kexts serve: every symbol the SDK marks newer is then a weak
+# import, which dyld leaves NULL on a release that lacks it, where a strong one
+# would make dyld refuse the whole bundle. A tool that sets its own
+# -mmacosx-version-min later on its line overrides it.
+CXXFLAGS = -isysroot $(SDK) -mmacosx-version-min=11.0 -std=c++17 -Os \
 	-Wall -Wextra -Werror -Wno-unused-parameter \
 	-I src -I $(WIRE)
 
@@ -122,8 +131,9 @@ CORE_SRCS = src/RgfxObjectModel.cpp src/RgfxCaps.cpp src/RgfxRingWriter.cpp \
 	src/RgfxRegion.cpp src/RgfxReplyReader.cpp src/RgfxLibraryKey.cpp \
 	src/RgfxCompletionThread.cpp src/RgfxFunctionConstants.cpp \
 	src/RgfxBinaryArchiveFile.cpp src/RgfxAirArguments.cpp src/RgfxKnownPipelines.cpp \
-	src/RgfxSlabs.cpp src/RgfxSuperpages.cpp src/RgfxIcbSlotTable.cpp \
-	src/RgfxLibraryStream.cpp
+	src/RgfxSlabs.cpp src/RgfxIcbSlotTable.cpp \
+	src/RgfxLibraryStream.cpp src/RgfxMetallibWriter.cpp src/RgfxGLLowering.cpp \
+	src/RgfxClMode.cpp src/RgfxLog.cpp
 
 # The video driver AppleGVA loads from this bundle (C++, src/RgfxVideoDriver.cpp): bundle only.
 VIDEO_SRCS = src/RgfxVideoDriver.cpp src/RgfxVideoH264.cpp src/RgfxVideoH265.cpp
@@ -191,7 +201,8 @@ $(SER_TESTBIN): $(CORE_OBJ_ARCH) tests/serializer_tests.cpp tests/slab_tests.cpp
 
 SHELL_TESTSRCS = tests/shell_tests.mm tests/protocol_tests.mm tests/archive_tests.mm \
 	tests/resource_tests.mm tests/queue_tests.mm \
-	tests/create_tests.mm tests/known_pipeline_tests.mm tests/icb_tests.mm
+	tests/create_tests.mm tests/known_pipeline_tests.mm tests/icb_tests.mm tests/gl_tests.mm \
+	tests/cl_mode_tests.mm tests/residency_tests.mm
 
 $(SHELL_TESTBIN): $(CORE_OBJ_NAT) $(WRAP_OBJ_NAT) $(SHELL_TESTSRCS) $(HEADERS) $(TESTHEADERS) Makefile
 	@mkdir -p $(@D)
@@ -218,6 +229,20 @@ $(STITCHABLE): tests/stitchable.metal Makefile
 		-o $(BUILD)/stitchable.air
 	xcrun -sdk macosx metallib $(BUILD)/stitchable.air -o $@
 
+# The stitchable functions of tests/stitch_constants.metal, specialised by constant values before
+# the shell tests stitch them.
+STITCH_CONSTANTS = $(BUILD)/stitch_constants.metallib
+
+$(STITCH_CONSTANTS): tests/stitch_constants.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stitch_constants.metal \
+		-o $(BUILD)/stitch_constants.air
+	xcrun -sdk macosx metallib $(BUILD)/stitch_constants.air -o $@
+
+# A committed .metallib of our own (tests/shaders), which the shell tests read at URLs of each form
+# as the device's newLibraryWithURL:error: reads them.
+LIBRARY_FILE = ../../tests/shaders/compute_add.metallib
+
 # The post-tessellation vertex functions of tests/patch.metal, for the shell tests' patch answers.
 PATCH_LIB = $(BUILD)/patch.metallib
 
@@ -227,11 +252,24 @@ $(PATCH_LIB): tests/patch.metal Makefile
 		-o $(BUILD)/patch.air
 	xcrun -sdk macosx metallib $(BUILD)/patch.air -o $@
 
+# The [[stage_in]] kernels of tests/stage_in_oracle.metal, against which the shell tests run a GL
+# kernel made one under a stage input descriptor on this Mac's GPU.
+STAGE_IN_ORACLE_LIB = $(BUILD)/stage_in_oracle.metallib
+
+$(STAGE_IN_ORACLE_LIB): tests/stage_in_oracle.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/stage_in_oracle.metal \
+		-o $(BUILD)/stage_in_oracle.air
+	xcrun -sdk macosx metallib $(BUILD)/stage_in_oracle.air -o $@
+
 # --- the AIR argument reader's check (x86_64, Rosetta) ------------------------
 # The reader (src/RgfxAirArguments.*) over a .metallib Apple's Metal compiler builds here from
 # tests/air_arguments.metal, never committed; its function constants against the library's CNST
-# tags (src/RgfxFunctionConstants.*).
+# tags (src/RgfxFunctionConstants.*). AIR_MODULE is the compiler's module of every function of the
+# source, which `metallib` splits into the library's one module a function: the reader's answers
+# for a module of several entry points.
 AIR_LIB = $(BUILD)/air_arguments.metallib
+AIR_MODULE = $(BUILD)/air_arguments.air
 # The same library built for macOS 26, whose functions Metal's library reflection answers
 # (tests/protocol_tests.mm, test_argument_encoders_of_bindings).
 AIR_REFLECTED = $(BUILD)/air_arguments_reflected.metallib
@@ -243,8 +281,8 @@ $(AIR_REFLECTED): tests/air_arguments.metal Makefile
 $(AIR_LIB): tests/air_arguments.metal Makefile
 	@mkdir -p $(@D)
 	xcrun -sdk macosx metal -c -std=metal3.1 -mmacosx-version-min=14.0 tests/air_arguments.metal \
-		-o $(BUILD)/air_arguments.air
-	xcrun -sdk macosx metallib $(BUILD)/air_arguments.air -o $@
+		-o $(AIR_MODULE)
+	xcrun -sdk macosx metallib $(AIR_MODULE) -o $@
 
 # Pipelines' reflection (src/RgfxPipelineReflection.*) over the oracle probe's library
 # (tools/oracle/oracle_reflection.metal), built for macOS 26 and Metal 3.0 as build.sh builds it,
@@ -256,6 +294,17 @@ $(ORACLE_REFLECTION_LIB): tools/oracle/oracle_reflection.metal Makefile
 	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_reflection.metal \
 		-o $(BUILD)/oracle_reflection.air
 	xcrun -sdk macosx metallib $(BUILD)/oracle_reflection.air -o $@
+
+# The overlapping arguments' functions of the oracle probe oracle_overlap
+# (tools/oracle/oracle_overlap.metal), built for macOS 26 and Metal 3.0 as build.sh builds it, whose
+# specialisations the x86 Macs' and the M3 Max's answers were measured over; never committed.
+ORACLE_OVERLAP_LIB = $(BUILD)/oracle_overlap.metallib
+
+$(ORACLE_OVERLAP_LIB): tools/oracle/oracle_overlap.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=metal3.0 -mmacosx-version-min=26.0 tools/oracle/oracle_overlap.metal \
+		-o $(BUILD)/oracle_overlap.air
+	xcrun -sdk macosx metallib $(BUILD)/oracle_overlap.air -o $@
 
 # The library of pipeline_reflection_check's c_atomic_texture case, of a language Metal 3.0 has not
 # (tools/oracle/oracle_reflection_31.metal); never committed.
@@ -276,6 +325,16 @@ $(AIR_OLD_LIB): tests/air_arguments_old.metal Makefile
 	xcrun -sdk macosx metal -c -std=macos-metal1.2 -mmacosx-version-min=10.12 \
 		tests/air_arguments_old.metal -o $(BUILD)/air_arguments_old.air
 	xcrun -sdk macosx metallib $(BUILD)/air_arguments_old.air -o $@
+
+# The same reader, and pipelines' reflection, over modules built for macOS 11, whose AIR names no
+# air.address_space on a buffer argument (tests/air_arguments_11.metal).
+AIR_11_LIB = $(BUILD)/air_arguments_11.metallib
+
+$(AIR_11_LIB): tests/air_arguments_11.metal Makefile
+	@mkdir -p $(@D)
+	xcrun -sdk macosx metal -c -std=macos-metal2.3 -mmacosx-version-min=11.0 \
+		tests/air_arguments_11.metal -o $(BUILD)/air_arguments_11.air
+	xcrun -sdk macosx metallib $(BUILD)/air_arguments_11.air -o $@
 
 # The repo's committed metallibs, which Apple's compiler built from our own sources: the reader
 # finds every function of them (tests/air_arguments_test.cpp).
@@ -298,8 +357,10 @@ $(INHERIT_TESTBIN): tests/inherited_tests.mm Makefile
 		-o $@
 
 # --- the protocol members' check (x86_64, Rosetta) ----------------------------
-# Loads the bundle and checks every member of every Metal protocol its classes adopt against
-# the register tests/protocol_members.txt, reading the members' bodies from src/: a member the
+# Loads the bundle and checks every member of every Metal protocol its classes adopt, with each
+# one's SPI counterpart and the members only older guests' protocols carry
+# (tests/protocol_members_releases.txt), against the register tests/protocol_members.txt,
+# reading the members' bodies from src/: a member the
 # register does not list, or one listed as carried out whose body does nothing or answers a
 # constant, fails (tests/protocol_members_tests.mm).
 
@@ -325,38 +386,47 @@ $(VIDEO_H265_TESTBIN): $(BUILD)/obj/$(ARCH)/core/RgfxVideoH265.o tests/video_h26
 		tests/video_h265_tests.cpp -o $@
 
 # --- the video driver's entry points over a stand-in for the host's sessions (x86_64, Rosetta) ----
+# The driver logs through the bundle's log object (src/RgfxLog.cpp).
 
-$(VIDEO_DRIVER_TESTBIN): $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp $(HEADERS) Makefile
+VIDEO_DRIVER_TESTOBJS = $(VIDEO_OBJ_ARCH) $(BUILD)/obj/$(ARCH)/core/RgfxLog.o
+
+$(VIDEO_DRIVER_TESTBIN): $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp $(HEADERS) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_OBJ_ARCH) tests/video_driver_tests.cpp \
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) -I tests $(VIDEO_DRIVER_TESTOBJS) tests/video_driver_tests.cpp \
 		-framework IOSurface -framework CoreFoundation -o $@
 
-test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
-	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(PATCH_LIB) $(INHERIT_TESTBIN) $(MEMBERS_TESTBIN) \
-	$(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
+test: $(SER_TESTBIN) $(AIR_TESTBIN) $(AIR_LIB) $(AIR_OLD_LIB) $(AIR_11_LIB) $(AIR_REFLECTED) $(ORACLE_REFLECTION_LIB) \
+	$(ORACLE_OVERLAP_LIB) \
+	$(SHELL_TESTBIN) $(CI_KERNEL) $(STITCHABLE) $(STITCH_CONSTANTS) $(PATCH_LIB) $(STAGE_IN_ORACLE_LIB) \
+	$(INHERIT_TESTBIN) \
+	$(MEMBERS_TESTBIN) $(VIDEO_TESTBIN) $(VIDEO_H265_TESTBIN) $(VIDEO_DRIVER_TESTBIN) $(BUNDLEBIN)
 	arch -$(ARCH) $(SER_TESTBIN)
-	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
-		RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) \
-		arch -$(ARCH) $(AIR_TESTBIN)
-	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_AIR_ARGUMENTS=$(AIR_LIB) \
+	RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_MODULE=$(AIR_MODULE) RGFX_AIR_ARGUMENTS_OLD=$(AIR_OLD_LIB) \
+		RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
+		RGFX_COMMITTED_METALLIBS=$(COMMITTED_METALLIBS) arch -$(ARCH) $(AIR_TESTBIN)
+	RGFX_CI_KERNEL=$(CI_KERNEL) RGFX_STITCHABLE=$(STITCHABLE) RGFX_STITCH_CONSTANTS=$(STITCH_CONSTANTS) \
+		RGFX_AIR_ARGUMENTS=$(AIR_LIB) RGFX_AIR_ARGUMENTS_11=$(AIR_11_LIB) RGFX_LIBRARY_FILE=$(LIBRARY_FILE) \
 		RGFX_AIR_REFLECTED=$(AIR_REFLECTED) RGFX_ORACLE_REFLECTION=$(ORACLE_REFLECTION_LIB) \
-		RGFX_PATCH=$(PATCH_LIB) $(SHELL_TESTBIN)
+		RGFX_PATCH=$(PATCH_LIB) RGFX_ORACLE_OVERLAP=$(ORACLE_OVERLAP_LIB) \
+		RGFX_STAGE_IN_ORACLE=$(STAGE_IN_ORACLE_LIB) $(SHELL_TESTBIN)
 	arch -$(ARCH) $(INHERIT_TESTBIN) $(BUNDLEBIN)
-	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt src
+	arch -$(ARCH) $(MEMBERS_TESTBIN) $(BUNDLEBIN) tests/protocol_members.txt \
+		tests/protocol_members_releases.txt src
 	arch -$(ARCH) $(VIDEO_TESTBIN)
 	arch -$(ARCH) $(VIDEO_H265_TESTBIN)
 	arch -$(ARCH) $(VIDEO_DRIVER_TESTBIN)
 	bash tests/bundle_files_check.sh $(BUNDLEBIN)
+	bash tests/bundle_log_check.sh $(BUNDLEBIN) Info.plist src/RgfxLog.hpp
 
 # --- the wire round trip against the host's library (native arch, this Mac's GPU) ----------
 # The bundle's own ring code (the serialiser, a queue's rings, reader and completion thread, a
 # command buffer's commit) against the host's library through its C API, with a stand-in for the
 # kext (tests/peer_tests.mm), recording the wire's traffic against tests/peer_wire2.trace. Never in
 # `make test`: it runs on the GPU, so build it first (`make peer-test-build`), then run
-# `make peer-test` holding the Mac's GPU lock. DIST is the tree `cargo xtask dist` wrote (Metal,
-# release): its archive is linked as QEMU links it, with its pkg-config file's private libraries.
+# `make peer-test` holding the Mac's GPU lock. DIST is the tree `cargo xtask dist` wrote (release):
+# its archive is linked as QEMU links it, with its pkg-config file's private libraries.
 # RGFX_PEER_RECORD=1 records the trace again.
-DIST          ?= ../../target/dist
+DIST          ?= ../../target/dist-vulkan
 PEER_TESTBIN   = $(BUILD)/peer_tests
 PEER_TRACE     = tests/peer_wire2.trace
 PEER_LIBS      = $(shell sed -n 's/^Libs.private: //p' $(DIST)/lib/pkgconfig/reims-vgpu.pc)
@@ -381,9 +451,18 @@ peer-test: $(PEER_TESTBIN)
 
 bundle: $(BUNDLEBIN)
 
+# arm64e: the linker's message-send stubs (__objc_stubs) in their small form, which branch to
+# objc_msgSend's own stub. In their default form each loads objc_msgSend from a slot of the
+# authenticated GOT of its own, and ld (ld-27106.1) then makes two slots for objc_msgSend, one
+# for those stubs and one for its call stub, and gives each its slot in either order from one
+# link to the next: the bundle's bytes, and so RgfxGate's, alternated between two builds of one
+# tree (measured on the M3 Max, 2026-11-08; docs/lessons.md). One slot, one build.
+BUNDLE_LDFLAGS = $(if $(filter arm64e,$(ARCH)),-Wl$(comma)-objc_stubs_small)
+comma := ,
+
 $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) Makefile
 	@mkdir -p $(@D)
-	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) \
+	$(CXX) -arch $(ARCH) $(CXXFLAGS) $(OBJCXXFLAGS) $(BUNDLE_LDFLAGS) \
 		-bundle -undefined dynamic_lookup $(FRAMEWORKS) $(PRIVFW) \
 		$(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) -o $@
 	@echo "$(notdir $@): $$(cat src/*.mm | grep -o 'RGFX_UNSUPPORTED[A-Z_]*(' | wc -l | tr -d ' ')" \
@@ -402,18 +481,37 @@ $(BUNDLEBIN): $(CORE_OBJ_ARCH) $(SHELL_OBJ_ARCH) $(VIDEO_OBJ_ARCH) Makefile
 
 PACKAGE    = $(BUILD)/package/reims-graphics.bundle
 PACKAGETGZ = $(BUILD)/reims-graphics.bundle.tgz
-WIRE_H       = ../../crates/reims-graphics/include/reims_graphics_wire.h
+WIRE_H       = ../../crates/reims-vgpu-graphics/include/reims_graphics_wire.h
 WIRE_VERSION = $(shell sed -n 's/^\#define RGFX_VERSION \([0-9][0-9]*\)$$/\1/p' $(WIRE_H))
 
 package: $(PACKAGETGZ)
 
-$(PACKAGETGZ): $(BUNDLEBIN) Info.plist $(WIRE_H) Makefile
+# PACKAGE_ARCHS: the architectures the installable bundle's executable carries; one is ARCH's
+# build itself, more are each built with ARCH set to it and joined with lipo. An arm64 guest
+# runs arm64e system processes (WindowServer) and arm64 apps, and Metal loads the bundle into
+# both, so its package is PACKAGE_ARCHS="arm64e arm64".
+PACKAGE_ARCHS ?= $(ARCH)
+ifeq ($(words $(PACKAGE_ARCHS)),1)
+PACKAGEBIN = $(BUNDLEBIN)
+else
+PACKAGEBIN = $(BUILD)/reims-graphics.universal
+PACKAGESLICES = $(foreach a,$(PACKAGE_ARCHS),$(BUILD)/reims-graphics-$(a).bundle)
+.PHONY: package-slices
+package-slices:
+	@for a in $(PACKAGE_ARCHS); do \
+		$(MAKE) ARCH=$$a PACKAGE_ARCHS=$$a BUILD=$(BUILD) BUNDLEBIN=$(BUILD)/reims-graphics-$$a.bundle bundle || exit 1; \
+	done
+$(PACKAGEBIN): package-slices
+	lipo -create $(PACKAGESLICES) -output $@
+endif
+
+$(PACKAGETGZ): $(PACKAGEBIN) Info.plist $(WIRE_H) Makefile
 	@test -n "$(WIRE_VERSION)" || { echo "no RGFX_VERSION in $(WIRE_H)"; exit 1; }
 	rm -rf $(PACKAGE)
 	@mkdir -p $(PACKAGE)/Contents/MacOS $(PACKAGE)/Contents/Resources
 	plutil -lint Info.plist > /dev/null
 	cp Info.plist $(PACKAGE)/Contents/Info.plist
-	cp $(BUNDLEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
+	cp $(PACKAGEBIN) $(PACKAGE)/Contents/MacOS/reims-graphics
 	: > $(PACKAGE)/Contents/Resources/wire-version-$(WIRE_VERSION)
 	codesign --force --sign - $(PACKAGE)
 	codesign -v --strict $(PACKAGE)
@@ -489,6 +587,31 @@ $(UPLOADBIN): tools/upload_probe.m Makefile
 		-Wall -Wextra -Werror -Wno-unused-parameter tools/upload_probe.m -framework Foundation \
 		-framework Metal -o $@
 
+# --- the CPU's encodes into indirect command buffers and writes into IOSurfaces (tools/icb_probe.m
+# says what each case measures). One binary for ARCH, run on a real device, never in `make test`.
+ICBBIN = $(BUILD)/icb_probe-$(ARCH)
+
+icb-probe: $(ICBBIN)
+
+$(ICBBIN): tools/icb_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/icb_probe.m -framework Foundation \
+		-framework Metal -framework IOSurface -o $@
+
+# --- the hot encoder calls' cost (tools/encode_probe.m says what each case measures) -------------
+# One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
+# run on a real device, never in `make test`.
+ENCODEBIN = $(BUILD)/encode_probe-$(ARCH)
+
+encode-probe: $(ENCODEBIN)
+
+$(ENCODEBIN): tools/encode_probe.m Makefile
+	@mkdir -p $(@D)
+	xcrun clang -arch $(ARCH) -isysroot $(SDK) -mmacosx-version-min=14.0 -fobjc-arc -O2 \
+		-Wall -Wextra -Werror -Wno-unused-parameter tools/encode_probe.m -framework Foundation \
+		-framework Metal -o $@
+
 # --- the shader and pipeline costs (tools/pipelines; pipelines.m says what each case measures) --
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`. Its source compiles in (pipelines_source.h, from
@@ -525,17 +648,6 @@ $(PIPELINES_LIBDIR)/stamp: tools/pipelines/pipelines.metal Makefile
 	rm -f $(@D)/*.air
 	echo $(PIPELINES_SEED) > $@
 
-# --- the VM guard and the device's superpages (tools/spguard; spguard.cpp says what each case does) -
-# One x86-64 binary, run in a guest, never in `make test`: no Metal.
-SPGUARDBIN = $(BUILD)/spguard-x86_64
-
-spguard: $(SPGUARDBIN)
-
-$(SPGUARDBIN): tools/spguard/spguard.cpp src/RgfxSuperpages.cpp src/RgfxSuperpages.hpp Makefile
-	@mkdir -p $(@D)
-	$(CXX) -arch x86_64 $(CXXFLAGS) -mmacosx-version-min=13.0 tools/spguard/spguard.cpp \
-		src/RgfxSuperpages.cpp -o $@
-
 # --- the stitchable reflection's check against Metal's own (tools/reflection_check.mm) ---------
 # One binary for ARCH (x86_64, a guest's or an Intel Mac's; ARCH=arm64 for an Apple-silicon Mac),
 # run on a real device, never in `make test`: it compares with Metal's own compiler's answers.
@@ -567,7 +679,6 @@ $(PIPEREFLECTBIN): tools/pipeline_reflection_check.mm tools/oracle/oracle_walk.h
 clean:
 	rm -rf $(BUILD)
 
-.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe reflection-check \
-	pipeline-reflection-check peer-test peer-test-build \
-	spguard clean
+.PHONY: all test bundle package sweep bench pipelines res submit-probe upload-probe icb-probe \
+	encode-probe reflection-check pipeline-reflection-check peer-test peer-test-build clean
 

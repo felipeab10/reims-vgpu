@@ -1,0 +1,29 @@
+# SPDX-License-Identifier: GPL-2.0-or-later OR LGPL-3.0-or-later
+# Every kernel symbol Graft uses, and how each is reached.
+# tools/internal/hook-symbols.py checks a release's kernel and kernel
+# collections for each, with no download and no Apple bytes kept: it prints
+# only the symbol name and where it is defined. A client project keeps a list
+# of its own symbols in the same form and passes it with --symbols.
+#
+# Columns: symbol  how  role. The script reads only the symbol; how and role
+# are for the reader.
+#   how  = solve   resolved by name at runtime, from the kernel's symbol table
+#          route   resolved by name and routed to a replacement
+#          link    called directly, linked by OpenCore against the Boot KC
+# Every one is a global the kernel defines; the mangled names are C++.
+
+# Graft: what its start and its kernel writes need.
+_IOLog                                          solve  calibrate the kernel's symbol table against Graft's own IOLog import
+_mp_rendezvous_no_intrs                         solve  stop the other CPUs around a kernel write
+
+# Graft: the OSKext entry points it uses to bind a consumer at the catalogue send.
+__ZN6OSKext24lookupKextWithIdentifierEPKc       solve  find a registered kext by id
+__ZN6OSKext18copyLoadedKextInfoEP7OSArrayS1_    solve  read whether a kext has started
+__ZN6OSKext24copyAllKextPersonalitiesEb         route  one catalogue-send entry
+__ZN6OSKext33sendAllKextPersonalitiesToCatalogEb route  the other catalogue-send entry
+_OSKextLoadKextWithIdentifier                   link   load a System-KC library
+_gOSKextUnresolved                              solve  where an absent weak import binds
+
+# Graft: what it reads a consumer's provider matching with, from its manifest.
+__Z16OSUnserializeXMLPKcPP8OSString             link   parse the matching dictionary
+__ZN12OSDictionary14iterateObjectsEPvPFbS0_PK8OSSymbolP8OSObjectE link   visit each personality

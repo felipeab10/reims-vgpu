@@ -2,29 +2,30 @@
 //! platform's [`DeviceCaps`] and [`IdentityCaps`], so the guest bundle's `MTLDevice`
 //! answers `supportsFamily:` of every family, `supportsFeatureSet:` of every
 //! feature set, its identity (the host GPU's real name among it), the limits and
-//! the feature queries as the host device does (Metal on macOS, the Vulkan
-//! platform on Linux). A query the platform cannot answer (a runtime gap, an `Err`
+//! the feature queries as the host device does on the Vulkan platform. A query the platform cannot answer (a runtime gap, an `Err`
 //! or `None` in the caps) is reported as unsupported here, never guessed yes.
 //! Where the lane's own device can do less than the host GPU, its answer is the
 //! lane's ([`lane`]'s table).
 //!
 //! The decoder does not touch this: [`super::GraphicsDevice`] writes it once at
 //! the device's init into the region at
-//! [`RGFX_DEVICE_INFO_OFFSET`](reims_graphics::wire::RGFX_DEVICE_INFO_OFFSET),
+//! [`RGFX_DEVICE_INFO_OFFSET`](reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_OFFSET),
 //! and the guest bundle reads it there, not a guest command.
 
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_DEVICE_ARCHITECTURE_NAME_LEN, RGFX_DEVICE_INFO_COUNTER_POINTS, RGFX_DEVICE_INFO_FAMILIES,
     RGFX_DEVICE_INFO_FEATURE_SETS, RGFX_DEVICE_INFO_FORMATS, RGFX_DEVICE_INFO_IDENTITY_FLAGS,
     RGFX_DEVICE_INFO_SIZES, RGFX_DEVICE_INFO_SPARSE_TILES, RGFX_DEVICE_INFO_VERSION,
     RGFX_DEVICE_NAME_LEN, RgfxDeviceInfo, RgfxFormatAnswers,
 };
-use reims_vgpu_core::platform::caps::{
+use reims_vgpu_vulkan::core::platform::caps::{
     COUNTER_SAMPLING_POINTS, DeviceCaps, FAMILIES, FEATURE_SETS, Flags, FormatAnswers,
-    IdentityCaps, Limits, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
+    IdentityCaps, SDK_FAMILIES, SDK_PIXEL_FORMATS, SPARSE_PAGE_SIZES, SPARSE_SAMPLE_COUNTS,
     feature_set_family,
 };
-use reims_vgpu_core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+
+use crate::GuestArch;
 
 /// `MTLGPUFamilyMetal3`.
 const MTL_GPU_FAMILY_METAL3: i64 = 5001;
@@ -70,6 +71,11 @@ fn format_answers(answers: &FormatAnswers) -> RgfxFormatAnswers {
         texture_buffer_alignment: answers
             .texture_buffer_alignment
             .and_then(|a| u32::try_from(a).ok())
+            .unwrap_or(0),
+        // Past 65535 none, where the guest answers the device's largest, which is at least it.
+        linear_alignment: answers
+            .linear_alignment
+            .and_then(|a| u16::try_from(a).ok())
             .unwrap_or(0),
         ..RgfxFormatAnswers::default()
     };
@@ -221,12 +227,21 @@ const APPLE_PIECES: [(i64, &[Piece]); 11] = {
 /// sampler ids `SAMPLER_STATE` answers), texture views (`TEXTURE_VIEW`), placement in an Automatic
 /// heap with the heap texture size (`HEAP_TEXTURE_SIZE_AND_ALIGN`), a pass's sample positions
 /// (after its colour records, `RGFX_PASS_FLAG_SAMPLE_POSITIONS`) with
-/// `SET_DEPTH_STORE_ACTION_OPTIONS`, and two the bundle does in the guest with no wire message:
-/// binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues (Metal's own IO
-/// queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`), and mesh shading
+/// `SET_DEPTH_STORE_ACTION_OPTIONS`, indirect command buffers, render and compute, with the
+/// memory barriers of a compute one's commands (`ICB_CREATE`, `ICB_WRITE` and `ICB_SLOTS`, and
+/// their executions' render and compute ops), and two the bundle does in the guest with no wire
+/// message: binary archives (`RgfxBinaryArchive`: no compiled code crosses) and IO queues
+/// (Metal's own IO queue and file handles over the bundle's device, `RgfxMetalDevice+IO.h`), and
+/// mesh shading
 /// (`MESH_RENDER_PIPELINE_CREATE` and the object and mesh stages' render ops, where the platform
 /// makes mesh pipelines: [`makes_mesh_pipelines`]). Mesh draws in an indirect command buffer are
-/// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs.
+/// not: no mesh pipeline the bundle makes supports them, as on the x86 Macs. And rasterization
+/// rate maps (`RATE_MAP_CREATE`, `RATE_MAP_RESET` and `RATE_MAP_QUERY`, and a pass's map after its
+/// other records, `RGFX_PASS_FLAG_RATE_MAP`), whose layer counts are the platform's. Function
+/// pointers (`FUNCTION_HANDLE_CREATE`, `FUNCTION_TABLE_CREATE` and `FUNCTION_TABLE_SET`, and a
+/// compute pass's table bindings) are carried in compute pipelines alone, so their piece stays out
+/// of this list until a render pipeline's are carried too, and so are dynamic libraries
+/// (`DYNAMIC_LIBRARY_CREATE`, and the run of libraries that ends a compute create).
 /// A piece joins this list when its wire messages, its decoding and its bundle members land, and
 /// the Apple families it holds back rise with it once every piece up to Apple7's is here
 /// ([`cap_apple_families`]).
@@ -235,9 +250,12 @@ const WIRED: &[Piece] = &[
     Piece::AutomaticHeaps,
     Piece::SamplePositions,
     Piece::TextureViews,
+    Piece::IndirectCommandBuffers,
+    Piece::ComputeIndirectBarriers,
     Piece::BinaryArchives,
     Piece::IoCommandQueues,
     Piece::MeshShading,
+    Piece::RasterizationRateMaps,
 ];
 
 /// `MTLGPUFamilyApple7`, the M1's: the first Apple family a Mac's GPU answers. A Mac's GPU
@@ -284,19 +302,18 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// | answer | the lane's | waits on |
 /// |---|---|---|
-/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks, and no for every one while the lane lacks a piece of Apple7's rows or of a family's before it ([`cap_apple_families`]): today no for every one, as an Intel or AMD Mac's GPU answers, though the lane carries Apple1's and Apple2's pieces | each piece in [`APPLE_PIECES`] up to Apple7's the lane lacks, from Apple3's indirect command buffers and compute indirect barriers on, then each later family's |
+/// | `supportsFamily:` of Apple1 to Apple11, and `supportsFeatureSet:` of the iOS sets that go with them | the platform's, but no from the first Apple family whose rows need a piece the lane lacks, and no for every one while the lane lacks a piece of Apple7's rows or of a family's before it ([`cap_apple_families`]): today no for every one, as an Intel or AMD Mac's GPU answers, though the lane carries Apple1's to Apple3's pieces | each piece in [`APPLE_PIECES`] up to Apple7's the lane lacks, from Apple4's tile pipelines and imageblocks on, then each later family's |
 /// | `supportsFamily:` of Mac1, Mac2, Common1 to Common3 and Metal3 | the platform's | nothing [`APPLE_PIECES`] lists: it lists the Apple families' pieces alone, and the pieces of Apple1 and Apple2 these rows were held to (argument encoders, automatic heaps, sample positions and IO command queues) the lane carries |
 /// | `supportsFamily:` of Metal4 | no | the `MTL4` API: its command queues and buffers, argument tables, compiler and allocators |
 /// | `supportsRaytracing`, `supportsRaytracingFromRender`, `supportsPrimitiveMotionBlur` | no | acceleration structures, their builds, and intersection function tables |
-/// | `supportsFunctionPointers`, `supportsFunctionPointersFromRender` | no | visible function tables and function handles |
-/// | `supportsDynamicLibraries`, `supportsRenderDynamicLibraries` | no | `newDynamicLibrary:` and linked functions |
+/// | `supportsFunctionPointersFromRender` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's visible function tables and function handles: the lane carries a compute pipeline's alone |
+/// | `supportsRenderDynamicLibraries` | no, as the AMD Radeon Pro 5300M answers | a render pipeline's preloaded and linked dynamic libraries: the lane carries a compute pipeline's alone |
 /// | `supportsPlacementSparse` | no | placement sparse buffers and textures |
 /// | `supportsCounterSampling:` | no, at every point | counter sample buffers |
-/// | `supportsRasterizationRateMapWithLayerCount:` | no, of every count | rasterization rate maps |
 /// | `maximumConcurrentCompilationTaskCount` | the device's compile threads, which run its pipeline compiles | nothing: the device's own answer |
+/// | `recommendedMaxWorkingSetSize` | on a GPU that shares the CPU's memory, three quarters of the guest's RAM rounded down to 16 KiB, or the platform's where that is less or the host maps no RAM; on a GPU of its own memory the platform's ([`lane_working_set`]) | nothing: a choice |
 /// | `maxBufferLength` | the platform's, but at most three quarters of `recommendedMaxWorkingSetSize`, rounded down to 16 KiB ([`lane_max_buffer_length`]) | nothing: a choice |
-/// | `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes` | 256 bytes, or the platform's where larger ([`LANE_LINEAR_TEXTURE_ALIGNMENT`]) | nothing: a choice |
-/// | `isFramebufferReadSupported` (SPI) | no ([`lane_flags`]) | nothing: a choice |
+/// | `isFramebufferReadSupported` (SPI) | no for an x86-64 guest; the platform's for an arm64 guest ([`lane_flags`]) | nothing: a choice |
 /// | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (SPI) | no ([`lane_flags`]) | tile pipelines, their non-square dispatch and imageblocks, Apple4's and Apple5's pieces |
 ///
 /// The rows marked "a choice" are answers real Macs give, picked from those the lane can keep for
@@ -304,7 +321,65 @@ fn cap_apple_families(identity: &mut IdentityCaps, wired: &[Piece]) {
 ///
 /// `hasUnifiedMemory` is the platform's: the decoder keeps `Managed` resources in one copy or two
 /// by the same answer (docs/graphics-kext/design.md, Decided 4).
-fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
+///
+/// `minimumLinearTextureAlignmentForPixelFormat:` and the SPI `linearTextureAlignmentBytes` and
+/// `deviceLinearTextureAlignmentBytes` are the platform's too, as each Mac answers its own GPU's
+/// (256 bytes on an AMD Radeon Pro 5300M and an Intel UHD 630, 16 on an Apple M3 Max, macOS
+/// 26.7.1): the alignment of a texture's offset and rows in a buffer at which the host GPU's
+/// linear images hold it in place (`Device::minimum_linear_texture_alignment_for_pixel_format` of
+/// the runtime, which asks the driver whether its images take a texture's reads, renders and
+/// shader writes in place, and answers at least the device's `nonCoherentAtomSize`: 256 on RADV
+/// and 128 on NVIDIA's driver, read from its records on the hosts, 2026-11-12; 64 on ANV, whose
+/// stores write back a row's last 64-byte line whole, and on lavapipe; 16 on MoltenVK). The
+/// selector answers each format's own, as the format answers carry it
+/// ([`RgfxFormatAnswers::linear_alignment`]), and the SPI ones the largest of the formats a
+/// buffer backs. The Macs measured answer one value for every format, but a host GPU may ask more
+/// of larger texels: a Radeon RX 550 answers 256 bytes for texels of 1 to 4 bytes, 512 for 8 and
+/// 1024 for 16 (read on 2026-11-12). With the largest for every format, a texture of smaller
+/// texels at its own alignment was nil: Geekbench's `MPSImageGaussianBlur` source on the RX 550,
+/// `RGBA8Unorm` rows of 7680 bytes over a buffer, against 1024. The guest's frameworks lay the
+/// rows of a texture over a buffer out at a multiple of the answer, and its device answers nil to
+/// one off it, as the 5300M's does (`RgfxBuffer.mm`): over a cold boot and a 15 s Safari scroll
+/// of a macOS 11.7.11 guest on a Radeon 780M, 1399 textures were shadows for their pitch with the
+/// device answering 16 (A8 rows of 64 and 128 bytes, a BGRA8 surface 463 pixels wide at 1856),
+/// and 11 with it answering 512. A layout at the GPU's own pitch is one the runtime takes in
+/// place: on NVIDIA's driver only that pitch is (the tight row rounded up to 128), so rows at
+/// another multiple of 128, such as the tight row rounded up to 256, are the runtime's shadow.
+///
+/// The answer moves only the layouts the guest's frameworks make by it. The device's tiled form
+/// (`newTiledTextureWithBytesNoCopy:` and a buffer's `newTiledTextureWithDescriptor:offset:
+/// bytesPerRow:`) takes a texture at any offset and pitch, as the 5300M's does (`RgfxBuffer.mm`),
+/// and WindowServer makes textures by it over the images other processes hand it, in no-copy
+/// buffers over pages it maps read-only, each buffer at the start of a page and the texels where
+/// the image puts them. In a desktop and Finder walk of a macOS 26.7.2 guest on a Radeon 780M,
+/// the device answering 256 for every format such a texture had, 233 of them were the runtime's
+/// shadows: 134 icons of 128 x 128 `BGRA8Unorm` 32 bytes into their buffers with rows of 512
+/// bytes, one more 32 bytes in with rows of 320, and 98 at offset 0 with rows at multiples of 32
+/// bytes off 256 (192 for widths of 42 to 48 pixels, 128 for 26 to 32). Textures of the tiled form
+/// over writable pages keep their own layouts too: `A8Unorm` 256 bytes in, rows at multiples of
+/// 64 bytes. RADV takes a `LINEAR` plane only at an offset and a row pitch that are multiples of
+/// 256 bytes on GFX9 to GFX11 (the pitch 128 on GFX12; Mesa 26.2.6's
+/// `ac_surface_override_offset_stride`, which `radv_image`'s layout calls for an explicit
+/// modifier's plane), so such textures are shadows there at any answer of the device's. On an
+/// Iris Xe, over a walk of every step of the same guest, 514 of the 515 read-only ones lay in
+/// place.
+///
+/// An IOSurface's rows follow two other answers. A surface made with no pitch named
+/// (`IOSurfaceCreate`, and CoreVideo's buffers and pools) takes rows at IOSurface's own
+/// alignment, `IOSurfaceGetPropertyAlignment(kIOSurfaceBytesPerRow)`: 64 bytes on the 5300M's Mac
+/// (macOS 26.7.1), and here the device info's `linear_row_alignment` where the guest's kext raises
+/// it to that. CoreAnimation names the rows of its backing stores' surfaces itself, rounded to the
+/// device's `iosurfaceTextureAlignmentBytes` and to no less than 64 bytes, and IOSurface keeps
+/// them. The guest's device answers Metal's 16 for `iosurfaceTextureAlignmentBytes` and
+/// `iosurfaceReadOnlyTextureAlignmentBytes` (the 5300M, the 630 and the M3 Max answer the first
+/// 16), not the platform's answers this info carries: CoreAnimation makes no texture of a surface
+/// whose rows are not at a multiple of the answer, and other code's surfaces keep IOSurface's own
+/// rows (the bundle's `kRgfxIOSurfaceTextureAlignmentBytes`; macOS 26.7.2 guests answering an
+/// RTX 3090's and an RTX 2080's 128 drew Safari's pages blank). So a texture over a backing store
+/// at a pitch that is not the GPU's is the runtime's shadow. metal2vulkan measured a macOS 26.7.2
+/// guest's surfaces on RADV at 4032 bytes for 1001 `BGRA` pixels, 7360 for 1831 and 14656 for
+/// 3662, IOSurface's 64-byte rows, before the kext raised them.
+fn lane(mut identity: IdentityCaps, compile_threads: u64, guest_ram: Option<u64>) -> IdentityCaps {
     cap_apple_families(&mut identity, WIRED);
     identity.families[at(MTL_GPU_FAMILY_METAL4)] = Some(false);
     let f = &mut identity.flags;
@@ -312,21 +387,55 @@ fn lane(mut identity: IdentityCaps, compile_threads: u64) -> IdentityCaps {
         &mut f.supports_raytracing,
         &mut f.supports_raytracing_from_render,
         &mut f.supports_primitive_motion_blur,
-        &mut f.supports_function_pointers,
         &mut f.supports_function_pointers_from_render,
-        &mut f.supports_dynamic_libraries,
         &mut f.supports_render_dynamic_libraries,
         &mut f.supports_placement_sparse,
     ] {
         *no = Some(false);
     }
     identity.counter_sampling = [Some(false); 5];
-    identity.sizes.largest_rasterization_rate_map_layer_count = Some(0);
     identity.sizes.maximum_concurrent_compilation_task_count = Some(compile_threads);
+    let unified = identity.flags.has_unified_memory == Some(true);
     let z = &mut identity.sizes;
+    z.recommended_max_working_set_size =
+        lane_working_set(z.recommended_max_working_set_size, unified, guest_ram);
     z.max_buffer_length =
         lane_max_buffer_length(z.max_buffer_length, z.recommended_max_working_set_size);
     identity
+}
+
+/// `recommendedMaxWorkingSetSize`, which the guest's kext also states as the GPU's memory
+/// (`VRAM,totalMB`, its `RgfxMemorySize.hpp`) and [`lane_max_buffer_length`] follows, on a GPU
+/// that shares the CPU's memory (`unified`) for a guest with `guest_ram` bytes of RAM where the
+/// host maps it: three quarters of that RAM, rounded down to 16 KiB, or the platform's where that
+/// is less; on a GPU of its own memory, or with no map, the platform's. A Mac's GPU that shares
+/// its memory answers a share of the Mac's RAM, from an Intel UHD Graphics 630's 1610612736 bytes
+/// of 64 GiB (0.023, macOS 26.7.1) to an Apple M3 Max's 55662788608 of 64 GiB (0.81, macOS
+/// 27.0.1), and three quarters lies between. The Vulkan platform answers the host GPU's
+/// device-local memory, which on a GPU that shares the CPU's memory is a share of the host's RAM
+/// and can be more than the guest's: guests of 8 GiB were told 11864629248 bytes on a Radeon 780M
+/// (macOS 11.7.11, 12.7.6 and 26.7.2) and 24950464512 on an Iris Xe (macOS 14.8.9). A GPU of its
+/// own memory answers that memory, as an AMD Radeon Pro 5300M answers 4278190080 bytes, its 4 GiB
+/// less 16 MiB (macOS 26.7.1), whatever the Mac's RAM: the platform's answer is the host GPU's
+/// own. Over a cold boot and a Safari scroll of a macOS 14.8.9 guest on an Iris Xe, told
+/// 24950464512, 5726617600, 4278190080 or 1610612736 bytes, the guest's work was the same: the
+/// runtime's blocks, the page's frames and the display's presents.
+///
+/// The RAM is what the host's memory map holds
+/// ([`GraphicsConfig::memory_map`](crate::GraphicsConfig::memory_map)): on QEMU's `q35`, the
+/// guest's RAM (guests of 8 GiB were told 6442450944 bytes, three quarters of it, in macOS
+/// 11.7.11, 12.7.6, 13.7.8, 14.8.9, 15.8.2 and 26.7.2 on a Radeon 780M, and in 14.8.9 and 26.7.2
+/// on an Iris Xe); on its `vmapple` under TCG on Linux, the guest's RAM too (macOS 14.6.1, 15.6.1
+/// and 26.6.2 guests of 8 GiB were told 6442450944 bytes on a Radeon 780M); on its `vmapple` under
+/// HVF on a Mac, the guest's RAM and the firmware's 1 MiB and the config's 64 KiB, which add
+/// 816 KiB to the answer for a guest of 8 GiB (a macOS 27.0.1 guest on an Apple M3 Max was told
+/// 6443286528 bytes, 0.7505 of its `hw.memsize`).
+fn lane_working_set(platform: Option<u64>, unified: bool, guest_ram: Option<u64>) -> Option<u64> {
+    const PAGE: u64 = 16 << 10;
+    match (platform, guest_ram) {
+        (Some(set), Some(ram)) if unified => Some(set.min(ram / 4 * 3 / PAGE * PAGE)),
+        (set, _) => set,
+    }
 }
 
 /// `maxBufferLength`: the platform's, but at most three quarters of `recommended_max_working_set`,
@@ -345,40 +454,32 @@ fn lane_max_buffer_length(platform: Option<u64>, working_set: Option<u64>) -> Op
     }
 }
 
-/// `minimumLinearTextureAlignmentForPixelFormat:` of every format a buffer can back, and the SPI
-/// `linearTextureAlignmentBytes` and `deviceLinearTextureAlignmentBytes`: 256 bytes, as an AMD
-/// Radeon Pro 5300M and an Intel UHD 630 answer (macOS 26.7.1; an Apple M3 Max answers 16), or
-/// the platform's where it needs more. A guest lays a texture's rows out in its buffer at a
-/// multiple of this alignment. The Vulkan platform on RADV takes a texture over a buffer's
-/// dma-buf pages in place only with its rows a multiple of 256 bytes apart (metal2vulkan's
-/// `dma_buf.rs`, measured on Mesa 26.0.8 and 26.2.4), and shadows one at any other pitch; how many
-/// of a guest's textures this moves in place is unmeasured. Any 256-byte layout is one the
-/// platform's 16 takes too.
-pub const LANE_LINEAR_TEXTURE_ALIGNMENT: u64 = 256;
-
-/// The device's `NSUInteger` SPI answers where the lane's differ from the platform's: the linear
-/// texture alignments, at least [`LANE_LINEAR_TEXTURE_ALIGNMENT`].
-fn lane_limits(mut limits: Limits) -> Limits {
-    for align in [
-        &mut limits.linear_texture_alignment_bytes,
-        &mut limits.device_linear_texture_alignment_bytes,
-    ] {
-        *align = (*align).max(LANE_LINEAR_TEXTURE_ALIGNMENT);
-    }
-    limits
-}
-
-/// The device's `BOOL` SPI answers where the lane's differ from the platform's:
-/// - `isFramebufferReadSupported` no, as an AMD Radeon Pro 5300M answers (macOS 26.7.1; an Intel
-///   UHD 630 and an Apple M3 Max answer yes): it steers the guest's frameworks off reading their
+/// The device's `BOOL` SPI answers where the lane's differ from the platform's, for a guest of
+/// `guest`'s architecture:
+/// - `isFramebufferReadSupported`, for an x86-64 guest no, as an AMD Radeon Pro 5300M answers,
+///   where an Intel UHD 630 answers yes (macOS 26.7.1, measured again on 2026-11-09): of the two
+///   answers the x86 Macs give, the one that steers the guest's frameworks off reading their
 ///   attachments in a fragment function, which costs the Vulkan platform most (an input
-///   attachment, or the pixel interlock), onto the paths they take on an AMD Mac;
+///   attachment, or the pixel interlock), onto the paths they take on an AMD Mac. For an arm64
+///   guest the platform's, as an Apple silicon Mac's GPU answers yes (an Apple M3 Max, macOS
+///   27.0.1): CoreAnimation in an arm64 guest compiles framebuffer fetch into its generic shader
+///   by this answer, and that shader blends against the fetched destination whatever the answer,
+///   so with no it blended against NaN and drew the menu bar black in 14.6.1, 15.6.1, 26.6.2 and
+///   27.0.1 guests (Metal on the M3 Max writes the same NaN for that pipeline and its buffers).
+///   The platform answers yes where
+///   its compile layer fetches a colour attachment at all (MoltenVK, RADV, ANV and NVIDIA); a
+///   pipeline that fetches an attachment of a format the runtime does not fetch on the host's GPU
+///   (the one- and two-channel 8-bit sRGB formats on ANV and NVIDIA, and the packed 16-bit ones
+///   and `RGB9E5Float` on NVIDIA) is a gap its creator answers nil for, relayed
+///   (`reims_vgpu_vulkan::answer::relay_gap`);
 /// - `supportsTileShaders`, `supportsNonSquareTileShaders` and `supportsImageBlocks` no, as the
 ///   5300M and the UHD 630 answer: the lane carries neither tile pipelines, nor their non-square
 ///   dispatch, nor imageblocks ([`Piece::TilePipelines`], [`Piece::NonsquareTileDispatch`],
 ///   [`Piece::Imageblocks`]).
-fn lane_flags(mut flags: Flags) -> Flags {
-    flags.is_framebuffer_read_supported = false;
+fn lane_flags(mut flags: Flags, guest: GuestArch) -> Flags {
+    if guest == GuestArch::X86_64 {
+        flags.is_framebuffer_read_supported = false;
+    }
     flags.supports_tile_shaders = false;
     flags.supports_non_square_tile_shaders = false;
     flags.supports_image_blocks = false;
@@ -386,14 +487,17 @@ fn lane_flags(mut flags: Flags) -> Flags {
 }
 
 /// The device-info caps blob for `caps` and `identity`, of a device that runs `compile_threads`
-/// pipeline compiles at once: every value the guest bundle reads once at init, the host device's
-/// answers but where the lane's own differ ([`lane`]).
+/// pipeline compiles at once for a guest of `guest`'s architecture with `guest_ram` bytes of RAM
+/// where the host maps it: every value the guest bundle reads once at init, the host device's
+/// answers but where the lane's own differ ([`lane`], [`lane_flags`]).
 pub fn device_info(
     caps: &DeviceCaps,
     identity: IdentityCaps,
     compile_threads: u64,
+    guest: GuestArch,
+    guest_ram: Option<u64>,
 ) -> RgfxDeviceInfo {
-    let identity = lane(identity, compile_threads);
+    let identity = lane(identity, compile_threads, guest_ram);
     let mut info = RgfxDeviceInfo {
         version: RGFX_DEVICE_INFO_VERSION,
         registry_id: caps.registry_id,
@@ -414,7 +518,7 @@ pub fn device_info(
     let t = caps.max_threads_per_threadgroup;
     info.max_threads_per_threadgroup = [t.width, t.height, t.depth];
 
-    let l = &lane_limits(caps.limits);
+    let l = &caps.limits;
     // In the host `Limits` field order; the bundle reads them in this order.
     info.limits = [
         l.device_linear_texture_alignment_bytes,
@@ -493,7 +597,7 @@ pub fn device_info(
     info.sample_counts = caps.sample_counts.each_ref().map(bit);
     info.primitive_types = caps.primitive_types.each_ref().map(bit);
     info.write_rounding_modes = caps.write_rounding_modes.each_ref().map(bit);
-    let f = &lane_flags(caps.flags);
+    let f = &lane_flags(caps.flags, guest);
     // In the host `Flags` field order; the bundle reads them in this order.
     info.flags = [
         f.are_raster_order_groups_supported,
@@ -571,9 +675,10 @@ const _: () =
 mod tests {
     use std::sync::Arc;
 
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::raise::Raise;
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::raise::Raise;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use zerocopy::IntoBytes;
 
     use super::*;
 
@@ -602,7 +707,13 @@ mod tests {
     fn mirrors_the_device_caps() {
         let p = Arc::new(FakePlatform::new());
         let caps = p.device().caps();
-        let info = device_info(&caps, p.device().identity_caps(), 4);
+        let info = device_info(
+            &caps,
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+            None,
+        );
 
         assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
         assert_eq!(info.registry_id, caps.registry_id);
@@ -629,7 +740,13 @@ mod tests {
         let p = Arc::new(FakePlatform::new());
         let mut caps = (*p.device().caps()).clone();
         caps.families[6] = Ok(false);
-        let info = device_info(&caps, p.device().identity_caps(), 4);
+        let info = device_info(
+            &caps,
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+            None,
+        );
         assert_eq!(info.family_count, 21);
         for yes in [2001, 2002, 3001, 3002, 3003, 5001] {
             assert_eq!(family(&info, yes), Some(1), "family {yes}");
@@ -662,7 +779,13 @@ mod tests {
     #[test]
     fn every_feature_set_is_the_platforms_or_its_familys() {
         let p = Arc::new(FakePlatform::new());
-        let info = device_info(&p.device().caps(), p.device().identity_caps(), 4);
+        let info = device_info(
+            &p.device().caps(),
+            p.device().identity_caps(),
+            4,
+            GuestArch::X86_64,
+            None,
+        );
         assert_eq!(info.feature_set_count as usize, FEATURE_SETS.len());
         for set in [10000, 10001, 10003, 10004, 10005] {
             assert_eq!(feature_set(&info, set), Some(1), "feature set {set}");
@@ -747,15 +870,19 @@ mod tests {
         }
 
         // The lane's own pieces: argument encoders, texture views, Automatic heaps, sample
-        // positions and IO queues, Apple1's and Apple2's, and binary archives, Apple3's. They
-        // fall short of Apple7, so no Apple family stands; Mac2 does.
+        // positions and IO queues, Apple1's and Apple2's, indirect command buffers, compute
+        // indirect barriers and binary archives, Apple3's, and rasterization rate maps, Apple6's.
+        // They fall short of Apple7, so no Apple family stands; Mac2 does.
         for piece in [
             Piece::ArgumentEncoders,
             Piece::TextureViews,
             Piece::AutomaticHeaps,
             Piece::SamplePositions,
             Piece::IoCommandQueues,
+            Piece::IndirectCommandBuffers,
+            Piece::ComputeIndirectBarriers,
             Piece::BinaryArchives,
+            Piece::RasterizationRateMaps,
         ] {
             assert!(WIRED.contains(&piece), "{piece:?}");
         }
@@ -791,7 +918,7 @@ mod tests {
         let mut identity = p.device().identity_caps();
         identity.flags.has_unified_memory = Some(false);
         identity.flags.is_low_power = Some(true);
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(
             &info.name[..info.name_len as usize],
             b"NVIDIA GeForce RTX 5080 Laptop GPU"
@@ -802,43 +929,53 @@ mod tests {
         );
         // is_low_power, then is_headless, is_removable, has_unified_memory.
         assert_eq!(info.identity_flags[..4], [1, 0, 0, 0]);
-        // supports_bc_texture_compression is the platform's yes; raytracing (13) the lane's no.
+        // supports_bc_texture_compression is the platform's yes; dynamic libraries (11) the
+        // platform's yes, but a render pipeline's (12) the lane's no; raytracing (13) the lane's
+        // no; function pointers (14) the platform's yes, but from a render pipeline (15) the
+        // lane's no.
         assert_eq!(info.identity_flags[7], 1);
+        assert_eq!(info.identity_flags[11], 1);
+        assert_eq!(info.identity_flags[12], 0);
         assert_eq!(info.identity_flags[13], 0);
+        assert_eq!(info.identity_flags[14], 1);
+        assert_eq!(info.identity_flags[15], 0);
         assert_eq!(info.identity_flags[18], 0);
         assert_eq!(info.counter_sampling, [0; 5]);
-        // recommended_max_working_set_size first, the rate maps' layers at 14 (the lane's 0), the
-        // driver's feature profile and FP configs last, the platform's.
+        // recommended_max_working_set_size first, the rate maps' layers at 14 (the platform's 2),
+        // the driver's feature profile and FP configs last, the platform's.
         assert_eq!(
             info.sizes[0],
             identity.sizes.recommended_max_working_set_size.unwrap()
         );
         assert_eq!(
-            info.sizes[reims_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
+            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
             identity.sizes.max_buffer_length.unwrap()
         );
         // maximum_concurrent_compilation_task_count is the device's compile threads.
         assert_eq!(info.sizes[12], 4);
         assert_eq!(info.sizes[13], 8);
-        assert_eq!(info.sizes[14], 0);
+        assert_eq!(info.sizes[14], 2);
         assert_eq!(info.sizes[15..], [10, 0xe, 0x54, 0]);
         // Every SDK format, each the platform's: BGRA8Unorm (80) 16-byte texture buffers and
-        // 64x64 tiles; BC1_RGBA (130) no texture buffers.
+        // linear textures and 64x64 tiles; BC1_RGBA (130) neither texture buffers nor linear
+        // textures.
         assert_eq!(info.format_count as usize, SDK_PIXEL_FORMATS.len());
         let at = |f: u32| info.formats.iter().find(|a| a.format == f).unwrap();
         assert_eq!(at(80).texture_buffer_alignment, 16);
+        assert_eq!(at(80).linear_alignment, 16);
         assert_eq!(at(80).sparse_tiles[0], [64, 64, 1]);
         assert_eq!(at(80).sparse_tiles[8], [128, 128, 1]);
         assert_eq!(at(130).texture_buffer_alignment, 0);
+        assert_eq!(at(130).linear_alignment, 0);
     }
 
     /// `maxBufferLength` is three quarters of the working set rounded down to 16 KiB where that is
     /// below the platform's answer, as the 5300M's and the M3 Max's answers are of theirs, and the
-    /// platform's otherwise; the linear texture alignments are 256 bytes, or the platform's where
-    /// larger; the framebuffer read, tile shader and imageblock answers are no, whatever the
-    /// platform's, and the other SPI flags the platform's.
+    /// platform's otherwise; the linear texture alignments are the platform's, below 256 bytes as
+    /// past it; for an x86-64 guest the framebuffer read, tile shader and imageblock answers are
+    /// no, whatever the platform's, and the other SPI flags the platform's.
     #[test]
-    fn the_lanes_buffer_length_alignments_and_spi_flags() {
+    fn the_lanes_buffer_length_and_spi_flags_and_the_platforms_linear_alignments() {
         // An RTX 5080 on the Vulkan platform: a terabyte against 17094934528 bytes of VRAM.
         assert_eq!(
             lane_max_buffer_length(Some(1 << 40), Some(17_094_934_528)),
@@ -867,11 +1004,12 @@ mod tests {
         identity.sizes.max_buffer_length = Some(1 << 40);
         identity.sizes.recommended_max_working_set_size = Some(17_094_934_528);
         // The fake answers 16 for both alignments, and yes for every SPI flag.
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(info.sizes[7], 12_821_200_896);
-        // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth.
-        assert_eq!(info.limits[0], 256);
-        assert_eq!(info.limits[3], 256);
+        // device_linear_texture_alignment_bytes first, linear_texture_alignment_bytes fourth: the
+        // fake's 16, as an M3 Max answers.
+        assert_eq!(info.limits[0], 16);
+        assert_eq!(info.limits[3], 16);
         // is_framebuffer_read_supported (2), supports_image_blocks (14),
         // supports_non_square_tile_shaders (17) and supports_tile_shaders (24) no; the others
         // the platform's, all yes on the fake but is_depth24_stencil8_pixel_format_supported (1).
@@ -879,12 +1017,134 @@ mod tests {
             let want = !matches!(k, 1 | 2 | 14 | 17 | 24);
             assert_eq!(flag, u8::from(want), "flag {k}");
         }
-        // A platform that needs more than 256 bytes keeps its own.
+        // NVIDIA's driver's 128 stays 128, not the 5300M's 256; a platform that needs more than
+        // 256 bytes keeps its own as well.
+        caps.limits.linear_texture_alignment_bytes = 128;
+        caps.limits.device_linear_texture_alignment_bytes = 128;
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
+        assert_eq!(info.limits[0], 128);
+        assert_eq!(info.limits[3], 128);
         caps.limits.linear_texture_alignment_bytes = 512;
         caps.limits.device_linear_texture_alignment_bytes = 1024;
-        let info = device_info(&caps, identity, 4);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
         assert_eq!(info.limits[0], 1024);
         assert_eq!(info.limits[3], 512);
+    }
+
+    /// `minimumLinearTextureAlignmentForPixelFormat:` is each format's own, the platform's: a
+    /// 16-byte texel's 1024 bytes beside a 4-byte texel's 256, while the SPI linear alignments
+    /// stay the largest of every format's; an answer past the blob's 65535 is none, where the
+    /// guest answers the largest.
+    #[test]
+    fn each_format_carries_its_own_linear_alignment() {
+        let p = Arc::new(FakePlatform::new());
+        let mut caps = (*p.device().caps()).clone();
+        caps.limits.linear_texture_alignment_bytes = 1024;
+        caps.limits.device_linear_texture_alignment_bytes = 1024;
+        let mut identity = p.device().identity_caps();
+        let mut set = |format: u64, alignment: Option<u64>| {
+            let answers = identity.formats.iter_mut().find(|f| f.format == format);
+            answers.unwrap().linear_alignment = alignment;
+        };
+        set(70, Some(256)); // RGBA8Unorm
+        set(125, Some(1024)); // RGBA32Float
+        set(80, Some(1 << 16)); // BGRA8Unorm, past the blob's field
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
+        let at = |f: u32| info.formats.iter().find(|a| a.format == f).unwrap();
+        assert_eq!(at(70).linear_alignment, 256);
+        assert_eq!(at(125).linear_alignment, 1024);
+        assert_eq!(at(80).linear_alignment, 0);
+        assert_eq!(at(130).linear_alignment, 0); // BC1_RGBA: no buffer backs it
+        assert_eq!(info.limits[0], 1024);
+        assert_eq!(info.limits[3], 1024);
+    }
+
+    /// On a GPU that shares the CPU's memory the working set is three quarters of the guest's RAM
+    /// rounded down to 16 KiB, for an x86-64 and an arm64 guest alike, or the platform's where that
+    /// is less or the host maps no RAM; on a GPU of its own memory it is the platform's;
+    /// `maxBufferLength` follows the working set
+    #[test]
+    fn a_unified_gpu_s_working_set_is_three_quarters_of_the_guest_s_ram() {
+        const GIB: u64 = 1 << 30;
+        // A Radeon 780M answers 11864629248 bytes; a guest of 8 GiB is told 6 GiB.
+        let radeon = Some(11_864_629_248);
+        assert_eq!(lane_working_set(radeon, true, Some(8 * GIB)), Some(6 * GIB));
+        // Rounded down to 16 KiB: 8 GiB and 1 MiB give 6 GiB and 48 pages, 8 GiB and 4 KiB 6 GiB.
+        assert_eq!(
+            lane_working_set(Some(1 << 40), true, Some(8 * GIB + (1 << 20))),
+            Some(6 * GIB + 786_432)
+        );
+        assert_eq!(
+            lane_working_set(Some(1 << 40), true, Some(8 * GIB + 4096)),
+            Some(6 * GIB)
+        );
+        // Never above the platform's; the platform's with no RAM, or no answer with none of its.
+        assert_eq!(
+            lane_working_set(Some(4 * GIB), true, Some(8 * GIB)),
+            Some(4 * GIB)
+        );
+        assert_eq!(lane_working_set(radeon, true, None), radeon);
+        assert_eq!(lane_working_set(None, true, Some(8 * GIB)), None);
+        // A GPU of its own memory: an RTX 5080's 17094934528 bytes stand.
+        let geforce = Some(17_094_934_528);
+        assert_eq!(lane_working_set(geforce, false, Some(8 * GIB)), geforce);
+
+        // In the blob: the working set first, and maxBufferLength three quarters of it, alike
+        // for both architectures.
+        const MAX_BUFFER_LENGTH: usize =
+            reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH;
+        let p = Arc::new(FakePlatform::new());
+        let caps = p.device().caps();
+        let mut identity = p.device().identity_caps();
+        identity.flags.has_unified_memory = Some(true);
+        identity.sizes.recommended_max_working_set_size = radeon;
+        identity.sizes.max_buffer_length = Some(1 << 40);
+        for guest in [GuestArch::X86_64, GuestArch::Arm64] {
+            let info = device_info(&caps, identity.clone(), 4, guest, Some(8 * GIB));
+            assert_eq!(info.sizes[0], 6 * GIB, "{guest:?}");
+            assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 4_831_838_208, "{guest:?}");
+        }
+        identity.flags.has_unified_memory = Some(false);
+        identity.sizes.recommended_max_working_set_size = geforce;
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, Some(8 * GIB));
+        assert_eq!(info.sizes[0], 17_094_934_528);
+        assert_eq!(info.sizes[MAX_BUFFER_LENGTH], 12_821_200_896);
+    }
+
+    /// `isFramebufferReadSupported` follows the guest: an x86-64 guest's device answers no, an
+    /// arm64 guest's the platform's (the fake's yes, a platform's no as no), and the arm64 guest's
+    /// blob differs from the x86-64 guest's in that answer's byte alone, so an x86-64 guest is
+    /// told what it was told before guests had an architecture; a config that names none serves
+    /// an x86-64 guest
+    #[test]
+    fn framebuffer_read_follows_the_guest() {
+        // is_framebuffer_read_supported, third of the flags.
+        const FRAMEBUFFER_READ: usize = 2;
+        let p = Arc::new(FakePlatform::new());
+        let mut caps = (*p.device().caps()).clone();
+        let identity = p.device().identity_caps();
+        assert!(caps.flags.is_framebuffer_read_supported);
+        let x86 = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
+        let arm64 = device_info(&caps, identity.clone(), 4, GuestArch::Arm64, None);
+        assert_eq!(x86.flags[FRAMEBUFFER_READ], 0);
+        assert_eq!(arm64.flags[FRAMEBUFFER_READ], 1);
+        let at = std::mem::offset_of!(RgfxDeviceInfo, flags) + FRAMEBUFFER_READ;
+        let differ: Vec<usize> = (x86.as_bytes().iter().zip(arm64.as_bytes()))
+            .enumerate()
+            .filter(|(_, (a, b))| a != b)
+            .map(|(k, _)| k)
+            .collect();
+        assert_eq!(differ, [at]);
+        // The tile and imageblock answers stay no for both.
+        for k in [14, 17, 24] {
+            assert_eq!(arm64.flags[k], 0, "flag {k}");
+        }
+
+        caps.flags.is_framebuffer_read_supported = false;
+        let arm64 = device_info(&caps, identity, 4, GuestArch::Arm64, None);
+        assert_eq!(arm64.flags[FRAMEBUFFER_READ], 0);
+
+        assert_eq!(GuestArch::default(), GuestArch::X86_64);
     }
 
     /// A present no reads 0, a present yes reads 1, and a platform gap (an `Err` or `None`)
@@ -895,14 +1155,17 @@ mod tests {
         let mut caps = (*p.device().caps()).clone();
         let mut identity = p.device().identity_caps();
         // The fake answers sample count 8 (index 3) with a present no.
-        assert_eq!(device_info(&caps, identity.clone(), 4).sample_counts[3], 0);
+        assert_eq!(
+            device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None).sample_counts[3],
+            0
+        );
         // A family the platform could not answer at all (a gap) also reads 0.
         caps.families[6] = Err(Raise::foreign("device_info_test_gap"));
         identity.families[8] = None;
         identity.feature_sets[0] = None;
         identity.flags.is_low_power = None;
         identity.sizes.location = None;
-        let info = device_info(&caps, identity.clone(), 4);
+        let info = device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None);
         assert_eq!(family(&info, -1009), Some(0));
         assert_eq!(family(&info, 1009), Some(0));
         assert_eq!(feature_set(&info, 0), Some(0));
@@ -911,12 +1174,15 @@ mod tests {
         // A present yes still reads 1.
         caps.families[6] = Ok(true);
         assert_eq!(
-            family(&device_info(&caps, identity.clone(), 4), -1009),
+            family(
+                &device_info(&caps, identity.clone(), 4, GuestArch::X86_64, None),
+                -1009
+            ),
             Some(1)
         );
         // 255 ASCII bytes and a two-byte character: the character does not fit, and is left out.
         caps.name = Some(format!("{}\u{e9}", "a".repeat(255)));
-        let info = device_info(&caps, identity, 4);
+        let info = device_info(&caps, identity, 4, GuestArch::X86_64, None);
         assert_eq!(info.name_len, 255);
     }
 }

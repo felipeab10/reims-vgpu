@@ -10,6 +10,17 @@
 //! fall on whole pixels, and [`Layout::image`] is that pixel rectangle again in points. The
 //! pointer is mapped through the same rectangle, so the guest pixel under the host's pointer is
 //! the one drawn there.
+//!
+//! **The guest's modes are a multiple of 16 pixels wide** ([`MODE_WIDTH_STEP`], [`offered_mode`]).
+//! The guest's desktop surfaces are its mode's width in BGRA8 pixels, 4 bytes each, and a
+//! surface over the guest's RAM is drawn in place only where each of its rows starts and ends on
+//! a line of the GPU's memory: on Intel's Vulkan driver (ANV) a render pass writes back whole
+//! 64-byte lines, so the bytes past a row's last pixel on its last line would be written too.
+//! 16 pixels are 64 bytes. Measured by metal2vulkan's lane on homelab-ms01's Iris Xe
+//! (2026-11-07): the guest's 3662-pixel desktop surface, 14648 bytes a row (ending 56 bytes
+//! into a line), stayed a copy of the guest's pages, 2.54 ms of the GPU's time a plain frame and
+//! 3.94 ms a frame that reads its own pixels. Padding a row's bytes alone does not help: the
+//! row's last line still holds bytes past its last pixel.
 
 use crate::config::{BUTTON_EXTRA, BUTTON_LEFT, BUTTON_MIDDLE, BUTTON_RIGHT, BUTTON_SIDE};
 use crate::handle::PixelRect;
@@ -51,6 +62,9 @@ pub struct Layout {
     /// The image, in the drawable's pixels: inside the drawable, and inside the insets unless
     /// they leave no room.
     pub pixels: PixelRect,
+    /// The drawable's pixels a point: the view's backing scale, 1 where it is not a positive
+    /// number.
+    pub scale: f64,
 }
 
 /// `value` where it is finite and not below 0, else 0.
@@ -130,12 +144,61 @@ pub fn layout(bounds: (f64, f64), scale: f64, insets: Insets, guest: Option<(u16
             height: as_f64(pixels.height) / scale,
         },
         pixels,
+        scale,
     }
 }
 
+/// The pixels the width of every mode offered the guest is a multiple of: 16 BGRA8 pixels are
+/// a 64-byte line of the GPU's memory, so each row of a guest surface of the mode's width starts
+/// and ends on a line (the module doc).
+pub const MODE_WIDTH_STEP: u64 = 16;
+
+/// The pixels the height of every mode offered the guest is a multiple of: the guest kext
+/// offers a mode HiDPI only where its pixels halve exactly (guest/kext's `RgfxMode::hiDpi`).
+pub const MODE_HEIGHT_STEP: u64 = 2;
+
+/// The guest mode a window that keeps its size offers the guest, for a drawable of `drawable`
+/// pixels: its width rounded down to a multiple of [`MODE_WIDTH_STEP`] and its height to a
+/// multiple of [`MODE_HEIGHT_STEP`] (a side below its step is kept). Both halve exactly, as a
+/// HiDPI mode's pixels must. A window's pixels are often neither: a resize of the person's, or a
+/// borderless window at a fractional scale, as on a 3840 × 2160 screen at 2.1, the screen's
+/// 1828.57 × 1028.57 points rounded to 1829 × 1029, which SDL's Wayland backend makes 3841 × 2161
+/// pixels (points times the scale, rounded), offered 3840 × 2160, the screen's own pixels. The
+/// layout draws that mode a guest pixel to a pixel at the drawable's top left ([`fit`]).
+pub fn offered_mode(drawable: (u64, u64)) -> (u64, u64) {
+    let down = |pixels: u64, step: u64| {
+        if pixels >= step {
+            pixels - pixels % step
+        } else {
+            pixels
+        }
+    };
+    (
+        down(drawable.0, MODE_WIDTH_STEP),
+        down(drawable.1, MODE_HEIGHT_STEP),
+    )
+}
+
 /// The largest rectangle of `guest`'s ratio in `area`, on whole pixels, centred (to within half
-/// a pixel). One side fills the area; the other is the ratio's, rounded, at least 1.
+/// a pixel). One side fills the area; the other is the ratio's, rounded, at least 1. A guest
+/// mode of the area's pixels, or fewer by less than a step each way ([`MODE_WIDTH_STEP`],
+/// [`MODE_HEIGHT_STEP`]), is drawn a guest pixel to a pixel, at the area's top left: that is the
+/// mode a window offers for its pixels ([`offered_mode`]), which shows whole and unscaled,
+/// beside up to 15 columns and a row of black.
 fn fit(area: PixelRect, guest: (u16, u16)) -> PixelRect {
+    let (gw, gh) = (u64::from(guest.0), u64::from(guest.1));
+    if gw <= area.width
+        && gh <= area.height
+        && area.width - gw < MODE_WIDTH_STEP
+        && area.height - gh < MODE_HEIGHT_STEP
+    {
+        return PixelRect {
+            x: area.x,
+            y: area.y,
+            width: gw,
+            height: gh,
+        };
+    }
     let (aw, ah) = (as_f64(area.width), as_f64(area.height));
     let (gw, gh) = (f64::from(guest.0), f64::from(guest.1));
     let (width, height) = if aw * gh <= ah * gw {
@@ -197,16 +260,13 @@ pub fn button_bit(ns_button_number: i64) -> u32 {
     }
 }
 
-/// A new window's content size in points, for a guest mode `guest` (width, height) the guest
-/// runs at scale `scale` (its pixels per point: 2 for a HiDPI desktop, 1 for a 1× one), with
+/// A new window's content size in points, for a guest mode `guest` (width, height), with
 /// `visible` the room there is for the content (the screen's visible area less the window's
-/// title bar): one guest point per host point, shrunk with its ratio kept where it does not fit.
-/// So a HiDPI guest on a Retina screen is one guest pixel per screen pixel, and a 1× guest's
-/// pixel is a point, which the draw scales on the GPU. At least one point each way; `visible`
-/// with no room is ignored.
-pub fn initial_content_size(guest: (u16, u16), scale: f64, visible: (f64, f64)) -> (f64, f64) {
-    let scale = valid_scale(scale);
-    let (width, height) = (f64::from(guest.0) / scale, f64::from(guest.1) / scale);
+/// title bar): one guest pixel per host point, shrunk with its ratio kept where it does not fit.
+/// So on a Retina screen the window's drawable is twice the mode each way. At least one point
+/// each way; `visible` with no room is ignored.
+pub fn initial_content_size(guest: (u16, u16), visible: (f64, f64)) -> (f64, f64) {
+    let (width, height) = (f64::from(guest.0), f64::from(guest.1));
     let (room_w, room_h) = (non_negative(visible.0), non_negative(visible.1));
     let shrink = if room_w > 0.0 && room_h > 0.0 && width > 0.0 && height > 0.0 {
         (room_w / width).min(room_h / height).min(1.0)
@@ -407,6 +467,65 @@ mod tests {
         assert_eq!(l.drawable, (1, 1));
     }
 
+    /// The layout carries the scale of the screen the window is on, which the reims-graphics
+    /// display tells its guest, so the guest's density follows the screen at any window size
+    #[test]
+    fn the_layout_carries_the_screen_s_scale() {
+        for scale in [1.0, 1.25, 2.0, 2.1] {
+            for bounds in [(800.0, 600.0), (1371.0, 800.0), (1829.0, 1000.0)] {
+                assert_eq!(layout(bounds, scale, NO_INSETS, None).scale, scale);
+            }
+        }
+        assert_eq!(layout((800.0, 600.0), f64::NAN, NO_INSETS, None).scale, 1.0);
+        assert_eq!(layout((800.0, 600.0), 0.0, NO_INSETS, None).scale, 1.0);
+    }
+
+    /// The mode offered for a drawable is its width rounded down to a multiple of 16 pixels and
+    /// its height to even, and a guest at that mode is drawn a guest pixel to a pixel, at the top
+    /// left, beside up to 15 columns and a row of black
+    #[test]
+    fn a_drawable_offers_a_mode_a_multiple_of_16_wide_drawn_unscaled() {
+        assert_eq!(offered_mode((3841, 2161)), (3840, 2160));
+        assert_eq!(offered_mode((3662, 2039)), (3648, 2038));
+        assert_eq!(offered_mode((3663, 2040)), (3648, 2040));
+        assert_eq!(offered_mode((3840, 2160)), (3840, 2160));
+        assert_eq!(offered_mode((1366, 768)), (1360, 768));
+        assert_eq!(offered_mode((15, 9)), (15, 8));
+        assert_eq!(offered_mode((1, 1)), (1, 1));
+        // Every mode a wide drawable offers starts each BGRA8 row on a 64-byte line, and halves
+        // exactly.
+        for width in 16..4000 {
+            let (w, h) = offered_mode((width, width / 2 + 1));
+            assert_eq!((w * 4) % 64, 0, "{width}");
+            assert!(width - w < MODE_WIDTH_STEP && h % 2 == 0 && (w / 2) % 8 == 0);
+        }
+        // Borderless on a 3840 × 2160 screen at 2.1: 1829 × 1029 points, 3841 × 2161 pixels,
+        // which show the 3840 × 2160 offered whole.
+        let l = layout(
+            (1829.0, 1029.0),
+            3841.0 / 1829.0,
+            NO_INSETS,
+            Some((3840, 2160)),
+        );
+        assert_eq!(l.drawable, (3841, 2161));
+        let whole = |width, height| PixelRect {
+            x: 0,
+            y: 0,
+            width,
+            height,
+        };
+        assert_eq!(l.pixels, whole(3840, 2160));
+        // A window of 3662 × 2039 pixels shows 3648 × 2038 whole, beside 14 columns and a row.
+        let l = layout((3662.0, 2039.0), 1.0, NO_INSETS, Some((3648, 2038)));
+        assert_eq!(l.pixels, whole(3648, 2038));
+        // A guest 16 pixels narrower, or 2 lower, is fitted as any other: centred, filling a side.
+        let l = layout((3856.0, 2160.0), 1.0, NO_INSETS, Some((3840, 2160)));
+        assert_eq!(l.pixels.height, 2160);
+        assert_ne!(l.pixels, whole(3840, 2160));
+        let l = layout((3850.0, 2162.0), 1.0, NO_INSETS, Some((3840, 2160)));
+        assert_eq!(l.pixels.height, 2162);
+    }
+
     /// With no guest mode yet, the image is the whole area inside the insets
     #[test]
     fn with_no_mode_the_image_is_the_inset_area() {
@@ -582,21 +701,20 @@ mod tests {
         assert_eq!(all.iter().fold(0, |a, b| a | b).count_ones(), 5);
     }
 
-    /// A new window shows a guest point per host point: a HiDPI guest one guest pixel per screen
-    /// pixel, a 1× guest's pixel as a point
+    /// A new window shows a guest pixel per host point
     #[test]
     fn a_new_window_shows_a_guest_point_per_host_point() {
         assert_eq!(
-            initial_content_size((1920, 1200), 2.0, (1728.0, 1080.0)),
+            initial_content_size((960, 600), (1728.0, 1080.0)),
             (960.0, 600.0)
         );
         assert_eq!(
-            initial_content_size((1280, 800), 1.0, (1920.0, 1050.0)),
+            initial_content_size((1280, 800), (1920.0, 1050.0)),
             (1280.0, 800.0)
         );
-        // Its drawable, at that scale, is the guest mode, and the image fills it.
-        let size = initial_content_size((1920, 1200), 2.0, (1728.0, 1080.0));
-        let l = layout(size, 2.0, NO_INSETS, Some((1920, 1200)));
+        // On a 1× screen its drawable is the guest mode, and the image fills it.
+        let size = initial_content_size((1920, 1200), (1920.0, 1200.0));
+        let l = layout(size, 1.0, NO_INSETS, Some((1920, 1200)));
         assert_eq!(l.drawable, (1920, 1200));
         assert_eq!(
             l.pixels,
@@ -607,9 +725,9 @@ mod tests {
                 height: 1200
             }
         );
-        // A 1× 1920×1080 guest on a Retina screen opens at 1920×1080 points where they fit: its
-        // drawable is twice the mode each way, and the image, scaled on the GPU, fills it.
-        let size = initial_content_size((1920, 1080), 1.0, (1920.0, 1200.0));
+        // 1920×1080 on a Retina screen opens at 1920×1080 points where they fit: its drawable is
+        // twice the mode each way, and the image, scaled on the GPU, fills it.
+        let size = initial_content_size((1920, 1080), (1920.0, 1200.0));
         assert_eq!(size, (1920.0, 1080.0));
         let l = layout(size, 2.0, NO_INSETS, Some((1920, 1080)));
         assert_eq!(l.drawable, (3840, 2160));
@@ -627,23 +745,20 @@ mod tests {
     /// A guest larger than the screen's visible area is shrunk to fit it, ratio kept
     #[test]
     fn a_new_window_shrinks_to_the_visible_area() {
-        let (w, h) = initial_content_size((3456, 2160), 2.0, (1728.0, 1050.0));
+        let (w, h) = initial_content_size((1728, 1080), (1728.0, 1050.0));
         assert!(
             (w - 1680.0).abs() < 1e-9 && (h - 1050.0).abs() < 1e-9,
             "{w}x{h}"
         );
-        let (w, h) = initial_content_size((3840, 2160), 1.0, (1920.0, 1200.0));
+        let (w, h) = initial_content_size((3840, 2160), (1920.0, 1200.0));
         assert_eq!((w, h), (1920.0, 1080.0));
         // No room given: left at 1:1.
         assert_eq!(
-            initial_content_size((1024, 768), 1.0, (0.0, 0.0)),
+            initial_content_size((1024, 768), (0.0, 0.0)),
             (1024.0, 768.0)
         );
         // Never below a point.
-        assert_eq!(
-            initial_content_size((0, 0), 2.0, (100.0, 100.0)),
-            (1.0, 1.0)
-        );
+        assert_eq!(initial_content_size((0, 0), (100.0, 100.0)), (1.0, 1.0));
     }
 
     /// A window following the guest's mode keeps its top left corner where the new size fits

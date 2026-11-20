@@ -52,7 +52,8 @@ pub enum Cmd {
         #[arg(long, short)]
         yes: bool,
     },
-    /// Start a VM: a window opens for each of its displays
+    /// Start a VM: a window opens for its display
+    #[command(after_help = START_HELP)]
     Start { name: String },
     /// Shut a VM down; if the guest has not shut down when the timeout ends, power it off
     Stop {
@@ -73,9 +74,6 @@ pub enum Cmd {
     #[command(after_help = VIEW_HELP)]
     View {
         name: String,
-        /// The display to show, from 1
-        #[arg(long, default_value_t = 1)]
-        display: u32,
         /// The most frames a second
         #[arg(long, default_value_t = 15)]
         fps: u32,
@@ -90,12 +88,12 @@ pub enum Cmd {
         #[arg(long, short)]
         output: Option<PathBuf>,
     },
-    /// Give a VM (x86-64) an installer image for its next start; a DMG is converted to a raw
+    /// Give a VM an installer image for its next start; a DMG is converted to a raw
     /// image in the VM's directory
     Insert { name: String, path: PathBuf },
-    /// Take the installer out of a VM (x86-64)
+    /// Take the installer out of a VM
     Eject { name: String },
-    /// Replace a VM's OpenCore image (x86-64) with one the installed reims-util makes, presenting
+    /// Replace a VM's OpenCore image with one the installed reims-util makes, presenting
     /// the same Mac
     #[command(name = "update-opencore", after_help = UPDATE_OPENCORE_HELP)]
     UpdateOpencore {
@@ -107,6 +105,18 @@ pub enum Cmd {
     },
     /// List the GPUs a VM can be given (Linux)
     Gpus,
+    /// List this host's USB devices, and give a VM some or take them back (Linux)
+    #[command(after_help = usb_help())]
+    Usb {
+        /// The VM whose devices to show or change (without one, this host's devices)
+        name: Option<String>,
+        /// Give the VM this device (repeatable)
+        #[arg(long, value_name = "DEVICE")]
+        add: Vec<String>,
+        /// Take this device back from the VM (repeatable)
+        #[arg(long, value_name = "DEVICE")]
+        remove: Vec<String>,
+    },
     /// Print the end of a VM's QEMU log, or its serial console's
     Logs {
         name: String,
@@ -120,6 +130,7 @@ pub enum Cmd {
     /// Zip a VM's logs, settings and the host's details into Downloads, for a bug report
     Report { name: String },
     /// Update reims-ctl and its QEMU from the checkout it was installed from
+    #[command(after_help = UPDATE_HELP)]
     Update {
         /// Switch the checkout to this channel first; later updates stay on it
         #[arg(long, value_enum)]
@@ -131,21 +142,6 @@ pub enum Cmd {
     Tui,
     #[command(name = "__vulkan-probe", hide = true)]
     VulkanProbe,
-    #[command(name = "__vz-install", hide = true)]
-    VzInstall {
-        #[arg(long)]
-        ipsw: PathBuf,
-        #[arg(long)]
-        dir: PathBuf,
-        #[arg(long)]
-        disk_mib: u64,
-        #[arg(long)]
-        cpus: u32,
-        #[arg(long)]
-        memory_mib: u64,
-    },
-    #[command(name = "__vz-latest", hide = true)]
-    VzLatest,
     #[command(name = "__record-install", hide = true)]
     RecordInstall {
         #[arg(long)]
@@ -157,6 +153,13 @@ pub enum Cmd {
     },
 }
 
+const START_HELP: &str = "\
+On Linux, the VM's QEMU runs in a systemd user unit of its own, reims-ctl-NAME.scope, so it gets \
+a share of the CPU of its own beside other work, a build in the terminal that started it among \
+it; systemctl --user status reims-ctl-NAME.scope shows it. Where no systemd user manager \
+answers, or from an SSH login whose manager does not linger (loginctl enable-linger), QEMU runs \
+as part of the terminal's work instead, and the start warns so.";
+
 const VIEW_HELP: &str = "\
 For a VM on a host with no screen, to set macOS up before it has screen sharing or remote \
 login. The screen is drawn with the terminal's graphics (kitty's, iTerm2's or sixel; half-block \
@@ -166,18 +169,64 @@ go to the guest as a US keyboard's and a tablet's.
 Ctrl-] disconnects; the VM keeps running. Alt+key is Cmd+key. The Cmd, Opt, Ctrl and Shift \
 buttons on the top row hold that key for the next key or click.";
 
+const UPDATE_HELP: &str = "\
+After an update, the new reims-ctl's first run (its restart from the interface, or the next \
+command) updates the VMs an older reims-ctl made, once, with a line for each VM. A VM whose \
+settings name no graphics, as those a reims-ctl from before reims-vgpu's own GPU device made, \
+runs that device, and one whose settings name apple-gfx, Apple's paravirtualized GPU, which \
+reims-vgpu no longer has, moves to it. Either's OpenCore image is made again for the device, \
+presenting the same Mac, with its macOS drivers and without the ported drivers older images \
+held, and the old image is kept beside it as <image>.pre-migration-1, or -3 for one that was on \
+apple-gfx. A VM that is running then is updated at its next start. One that can't be updated \
+stays as it was, and its line says why. A VM on VMware SVGA keeps it; where its OpenCore image \
+still loads the ported drivers, the image is made again without them, and the old one is kept \
+as <image>.pre-migration-2.";
+
 const UPDATE_OPENCORE_HELP: &str = "\
 The new image is made for the VM's graphics. On reims-vgpu it holds the macOS drivers of \
-reims-vgpu's own GPU device that this reims-ctl carries, which an image made for apple-gfx, or by \
-an older reims-ctl, lacks or holds other builds of: make it again after a change of graphics or an \
-update of reims-ctl, as reims-ctl start warns. An image an older reims-util made also lacks what a \
-newer one's carries, such as ReimsVgpu.kext, which macOS 26 needs on apple-gfx for a display wider \
-than 2048 pixels and for GPU-accelerated Chrome. The new image presents the same Mac (its model, \
+reims-vgpu's own GPU device that this reims-ctl carries. A start makes the image again where it \
+holds other builds of them, as one an older reims-ctl made does after an update of reims-ctl; an \
+image that lacks them, as one of your own may, stays as it is, which reims-ctl start warns of: \
+make it again here. A change of graphics with reims-ctl set or the interface's edit form makes it \
+again where the VM is stopped, and a start on VMware SVGA makes one without the drivers where the \
+image holds them. The new image presents the same Mac (its model, \
 serial number, MLB, UUID and ROM, read from the old image's config.plist), so macOS sees no new \
 machine, and the VM keeps its OVMF variables, which hold its boot entries. Its boot selection, \
 OpenCore's picker, is carried over unless --boot-selection gives it; hidden, OpenCore boots \
 macOS's startup disk at once. Whatever else was changed in the old image is not carried over. The \
 VM must be stopped; reims-ctl update installs the reims-util this reims-ctl needs.";
+
+/// `usb --help`'s account of passthrough, with the udev rule the install adds.
+fn usb_help() -> String {
+    format!(
+        "\
+DEVICE is a device's number in the list, its ID (1050:0407), its port (3-2.1) or a word of its \
+name; --add takes the ID of a device that isn't plugged in, too.
+
+A device a VM has is the guest's while the VM runs: QEMU takes it from this host's drivers, and \
+macOS in the guest drives it, as a Mac drives a device plugged into it. It comes back to this \
+host when the VM stops, or when you take it back. While the VM runs, --add and --remove attach \
+and detach it at once; either way the VM keeps it for its next start. A VM takes up to {max} \
+devices.
+
+A device is known by its vendor and product IDs, so the VM has it in any port. Where this host \
+has two devices with the same IDs, the one you give is known by its port too, and the VM has it \
+only in that port. A device that isn't plugged in joins the guest when it is, and one unplugged \
+comes back when it is plugged in again.
+
+QEMU opens the device's file in /dev/bus/usb, which only root may write unless a udev rule \
+says otherwise. scripts/install-ctl.sh, which reims-ctl update runs, adds {file}, which gives \
+USB devices other than hubs to the kvm group and to the user at this host's screen:
+
+  {rule}
+
+Over SSH, without a session at the screen, you need to be in the kvm group (sudo usermod -aG \
+kvm $USER, then log in again).",
+        max = vm::USB_DEVICES_MAX,
+        file = crate::usb::UDEV_RULE_FILE,
+        rule = crate::usb::UDEV_RULE,
+    )
+}
 
 /// `--flag`, `--flag=true`, `--flag false`.
 fn bool_arg() -> clap::Arg {
@@ -205,23 +254,21 @@ const CREATE_EXAMPLES: &str = r"
     # macOS is installed, reims-ctl eject mac takes the installer out
     reims-ctl create mac --macos tahoe --start
 
-    # One exact release, which installs with no network (13 to 20 GB)
-    reims-ctl create mac --macos 26.6.2 --offline --start
+    # One exact release, which installs with no network (13 to 20 GB); with the VM's
+    # network off, its installer downloads no update as it installs
+    reims-ctl create mac --macos 26.6.2 --offline --network false --start
 
     # An installer of your own, such as a recovery image (BaseSystem.dmg)
     reims-ctl create mac --installer ~/Downloads/BaseSystem.dmg
 
-    # A disk that already has macOS installed (copied; see --disk-mode), with
-    # the OpenCore image it booted from, which keeps its Mac's identity
-    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2
+    # A disk that already has macOS installed (copied; see --disk-mode): the
+    # new OpenCore image presents the Mac of the one beside it, opencore.qcow2,
+    # as a VM's directory holds them, so macOS sees no new Mac. A copy of the
+    # disk of a VM reims-ctl has is a Mac of its own, as it runs beside it
+    reims-ctl create mac --disk ~/vms/old/disk.qcow2
 
-  An arm64 guest on an Apple silicon Mac:
-
-    # Install the newest macOS this Mac supports, on a new 64G disk
-    reims-ctl create mac --ipsw latest --start
-
-    # A macosvm or tart VM that already has macOS installed (an APFS clone)
-    reims-ctl create mac --bundle ~/VMs/macos13";
+    # Or with the OpenCore image it booted from, copied, which keeps its Mac too
+    reims-ctl create mac --disk ~/vms/mac.qcow2 --opencore ~/vms/OpenCore.qcow2";
 
 #[derive(Args)]
 pub struct CreateArgs {
@@ -246,72 +293,58 @@ pub struct CreateArgs {
     /// An existing disk image
     #[arg(long, conflicts_with = "disk_size")]
     pub disk: Option<PathBuf>,
-    /// How an existing disk is used: copy (a reflink or clone where it can) or in-place
+    /// How an existing disk is used: copy (instant, a reflink, where the disk and the VM's
+    /// directory are on one file system that makes them, else a full copy) or in-place
     #[arg(long, default_value = "copy")]
     pub disk_mode: String,
-    /// x86-64: download this macOS from Apple to install: a name (tahoe), a number (26) or
-    /// latest; with --offline, also a release (26.6.2) or a build (25G83)
+    /// Download this macOS from Apple to install: a name (tahoe), a number (26) or latest; with
+    /// --offline, also a release (26.6.2) or a build (25G83)
     #[arg(long, value_name = "VERSION", conflicts_with = "installer")]
     pub macos: Option<String>,
-    /// x86-64: with --macos, an offline installer of one release (13 to 20 GB), which installs
-    /// with no network, rather than Apple's recovery image (about 1 GB), which downloads the
-    /// newest release as it installs
+    /// With --macos, an offline installer of one release (13 to 20 GB), which installs with no
+    /// network, rather than Apple's recovery image (about 1 GB), which downloads the newest
+    /// release as it installs. Install it with the VM's network off (--network false), so its
+    /// installer downloads no update
     #[arg(long, requires = "macos")]
     pub offline: bool,
-    /// x86-64: an installer image of your own, attached as a disk: a raw image, such as a
-    /// recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory
+    /// An installer image of your own, attached as a disk: a raw image, such as a recovery
+    /// image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory
     #[arg(long)]
     pub installer: Option<PathBuf>,
-    /// x86-64: an OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside
-    /// it (default: a new one made for the VM, with OVMF and a Mac identity of its own)
+    /// An OpenCore image of your own to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it
+    /// (default: a new one made for the VM, with OVMF, presenting the Mac of the image beside
+    /// --disk, opencore.qcow2, where there is one and --disk is no copy of the disk of a VM
+    /// reims-ctl has, else a Mac identity of its own)
     #[arg(long)]
     pub opencore: Option<PathBuf>,
     /// The network card's MAC, such as 52:54:00:12:34:56 (default: a random one)
     #[arg(long)]
     pub mac: Option<String>,
-    /// arm64: install macOS from this IPSW, or `latest` to download the newest this Mac supports
-    #[arg(long)]
-    pub ipsw: Option<String>,
-    /// arm64: import a Virtualization.framework VM's directory (macosvm's or tart's)
-    #[arg(long)]
-    pub bundle: Option<PathBuf>,
-    /// arm64: copy (an APFS clone) or in-place
-    #[arg(long, default_value = "copy")]
-    pub bundle_mode: String,
-    /// arm64: the machine identifier's ECID, where the bundle does not hold it
-    #[arg(long)]
-    pub ecid: Option<u64>,
-    /// x86-64: reims-vgpu (the default), apple-gfx or vmware-svga (see reims-ctl set --help);
-    /// arm64 VMs have apple-gfx alone
+    /// reims-vgpu (the default) or vmware-svga (see reims-ctl set --help)
     #[arg(long)]
     pub graphics: Option<String>,
-    /// apple-gfx: displays, 1 to 8, each in a window of its own (reims-vgpu has one)
-    #[arg(long)]
-    pub displays: Option<u32>,
-    /// apple-gfx: the guest's first mode: WIDTHxHEIGHT, or host for the host screen's modes
-    /// (reims-vgpu's display follows its window, which opens at 1920x1080)
+    /// The size reims-vgpu's window opens at, WIDTHxHEIGHT in the desktop's points, which the
+    /// guest follows; it starts a HiDPI desktop by itself in a window at least 3840 pixels
+    /// wide, and offers one in its Displays settings from 2880
     #[arg(long)]
     pub resolution: Option<String>,
-    /// apple-gfx: run the mode HiDPI (3840x2160 looks like 1920x1080); on reims-vgpu the guest
-    /// runs HiDPI of its own accord in a window at least 2880 pixels wide
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-    pub hidpi: Option<bool>,
-    /// Borderless windows that fill their screens
+    /// A borderless window that fills its screen
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
-    /// apple-gfx: the refresh rate offered to the guest (reims-vgpu's is the host screen's)
-    #[arg(long)]
-    pub refresh: Option<u32>,
-    /// The GPU (Linux): auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
+    /// The GPU: auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
     #[arg(long)]
     pub gpu: Option<String>,
     /// Keep the library's log and the serial console
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// A virtio sound device on the host's sound, with a microphone (on x86-64, also the HDA
-    /// controller OpenCore's boot chime plays on)
+    /// Two virtio sound devices on the host's sound, a speaker and a microphone, and the HDA
+    /// controller OpenCore's boot chime plays on
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
+    /// Its network card (user-mode NAT); --network false makes it with none, as an offline
+    /// installer's install is best done
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    pub network: Option<bool>,
     /// Forward this port on 127.0.0.1 to the guest's SSH port; 0 for none
     #[arg(long)]
     pub ssh_port: Option<u16>,
@@ -328,50 +361,33 @@ pub struct SetArgs {
     /// RAM, such as 8G
     #[arg(long)]
     pub memory: Option<String>,
-    /// x86-64: reims-vgpu (the default), its own GPU device, which the guest drives with the
-    /// kexts reims-ctl puts in its OpenCore image (after a change to it, run update-opencore),
-    /// on one display in a window whose size the guest follows; apple-gfx, Apple's
-    /// paravirtualized GPU, the only one of arm64 VMs, with up to 8 displays and the host's video
-    /// hardware; or vmware-svga, QEMU's VMware SVGA: one display with no GPU acceleration, in
-    /// QEMU's own window
+    /// reims-vgpu (the default), its own GPU device, which the guest drives with the kexts
+    /// reims-ctl puts in its OpenCore image (a change of graphics makes the image again for
+    /// them, as update-opencore does, where the VM is stopped), on one display in a window whose
+    /// size the guest follows; or vmware-svga, QEMU's VMware SVGA: one display with no GPU
+    /// acceleration, in QEMU's own window
     #[arg(long)]
     pub graphics: Option<String>,
-    /// x86-64: the system disk's controller: ahci (SATA), or nvme once macOS is installed (an
-    /// installer may find no disk on NVMe). Once it is installed, eject the installer before a
-    /// move, or OpenCore may start it
+    /// The system disk's controller: ahci (SATA) or nvme. Once macOS is installed, eject the
+    /// installer before a move, or OpenCore may start it
     #[arg(long)]
     pub disk_controller: Option<String>,
-    /// apple-gfx: 1 to 8 (reims-vgpu has one)
-    #[arg(long)]
-    pub displays: Option<u32>,
-    /// apple-gfx: WIDTHxHEIGHT, or host (reims-vgpu's display follows its window)
+    /// The size reims-vgpu's window opens at, WIDTHxHEIGHT in the desktop's points
     #[arg(long)]
     pub resolution: Option<String>,
-    /// apple-gfx (on reims-vgpu the guest runs HiDPI of its own accord, in a window at least
-    /// 2880 pixels wide)
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-    pub hidpi: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub borderless: Option<bool>,
-    /// apple-gfx: the refresh rate offered to the guest; 0 for the host screen's, reims-vgpu's
-    /// alone
-    #[arg(long)]
-    pub refresh: Option<u32>,
     /// auto, a number or name from `reims-ctl gpus`, or a Vulkan ICD JSON file
     #[arg(long)]
     pub gpu: Option<String>,
-    /// On apple-gfx: the host's hardware video decode, encode and scaling for the guest. Off,
-    /// the guest does them in software
-    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
-    pub video_acceleration: Option<bool>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub logs: Option<bool>,
-    /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_core=debug
+    /// REIMS_VGPU_LOG's filter, such as info or warn,reims_vgpu_vulkan::core=debug
     #[arg(long)]
     pub log_level: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
     pub audio: Option<bool>,
-    /// coreaudio, pipewire, pa, alsa, none, or auto
+    /// pipewire, pa, alsa, none, or auto
     #[arg(long)]
     pub audio_backend: Option<String>,
     #[arg(long, num_args = 0..=1, default_missing_value = "true")]
@@ -401,6 +417,12 @@ pub fn main(cli: Cli) -> Result<i32> {
         None | Some(Cmd::Tui) => return crate::tui::run().map(|_| 0),
         Some(c) => c,
     };
+    // The first run after an update brings the VMs an older reims-ctl made up to date, telling
+    // of it on stderr, so a command's output stays as it is; reims-ctl's own commands, which the
+    // installer and reims-ctl run, leave it to the user's.
+    if !matches!(cmd, Cmd::VulkanProbe | Cmd::RecordInstall { .. }) {
+        crate::migrate::run(&mut |s| eprintln!("{s}"));
+    }
     match cmd {
         Cmd::List { json } => list(json)?,
         Cmd::Capabilities { json } => capabilities(json)?,
@@ -411,12 +433,20 @@ pub fn main(cli: Cli) -> Result<i32> {
             yes,
         } => delete(&name, keep_files, yes)?,
         Cmd::Start { name } => {
-            let vm = Registry::load()?.open(&name)?;
-            for w in runtime::warnings(&vm, host) {
+            let mut vm = Registry::load()?.open(&name)?;
+            let first = runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}"));
+            for w in first
+                .into_iter()
+                .chain(runtime::warnings(&vm, host))
+                .chain(crate::usb::problems(&vm))
+            {
                 eprintln!("warning: {w}");
             }
-            let pid = runtime::start(&vm, host)?;
-            println!("{name}: running, pid {pid}");
+            let started = runtime::start(&vm, host)?;
+            if let Some(n) = &started.note {
+                eprintln!("warning: {n}");
+            }
+            println!("{name}: running, pid {}", started.pid);
         }
         Cmd::Stop {
             name,
@@ -431,16 +461,11 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::Set(a) => set(*a, host)?,
         Cmd::View {
             name,
-            display,
             fps,
             protocol,
         } => {
             let vm = Registry::load()?.open(&name)?;
-            let opts = view::Options {
-                display,
-                fps,
-                protocol,
-            };
+            let opts = view::Options { fps, protocol };
             if let Some(m) = view::run(&vm, &opts)? {
                 println!("{m}");
             }
@@ -452,8 +477,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             match output {
                 Some(p) => {
                     std::fs::write(&p, script)?;
-                    use std::os::unix::fs::PermissionsExt;
-                    std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))?;
+                    crate::os::set_mode(&p, 0o755)?;
                     println!("wrote {}", p.display());
                 }
                 None => print!("{script}"),
@@ -482,6 +506,7 @@ pub fn main(cli: Cli) -> Result<i32> {
             );
         }
         Cmd::Gpus => gpus(host),
+        Cmd::Usb { name, add, remove } => usb(host, name.as_deref(), &add, &remove)?,
         Cmd::Logs {
             name,
             lines,
@@ -512,14 +537,6 @@ pub fn main(cli: Cli) -> Result<i32> {
         Cmd::Doctor => return doctor(host),
         Cmd::Tui => unreachable!(),
         Cmd::VulkanProbe => return Ok(gpu::probe_main()),
-        Cmd::VzInstall {
-            ipsw,
-            dir,
-            disk_mib,
-            cpus,
-            memory_mib,
-        } => return crate::vz::install_main(&ipsw, &dir, disk_mib, cpus, memory_mib),
-        Cmd::VzLatest => return crate::vz::latest_main(),
         Cmd::RecordInstall { repo, qemu, commit } => {
             install::Install {
                 repo: repo.clone(),
@@ -580,7 +597,7 @@ fn capability_json() -> Result<String> {
 
 pub fn script_comment(vm: &Vm) -> String {
     let screen = match vm.config.graphics() {
-        vm::Graphics::ReimsVgpu | vm::Graphics::AppleGfx => "Its window opens under -display none",
+        vm::Graphics::ReimsVgpu => "Its window opens under -display none",
         vm::Graphics::VmwareSvga if crate::host::has_screen(&vm.config.extra_env) => {
             "Its window is QEMU's own, under -display gtk"
         }
@@ -617,8 +634,8 @@ fn list(json: bool) -> Result<()> {
         return Ok(());
     }
     println!(
-        "{:<20} {:<9} {:>5} {:>7} {:<9} DIR",
-        "NAME", "STATE", "CPUS", "MEMORY", "DISPLAYS"
+        "{:<20} {:<9} {:>5} {:>7} {:<11} DIR",
+        "NAME", "STATE", "CPUS", "MEMORY", "GRAPHICS"
     );
     for e in &reg.vms {
         match Vm::load(&e.dir) {
@@ -630,17 +647,12 @@ fn list(json: bool) -> Result<()> {
                     "stopped"
                 };
                 println!(
-                    "{:<20} {:<9} {:>5} {:>7} {:<9} {}",
+                    "{:<20} {:<9} {:>5} {:>7} {:<11} {}",
                     e.name,
                     state,
                     c.cpus,
                     format_mib(c.memory_mib),
-                    match c.graphics() {
-                        vm::Graphics::AppleGfx => {
-                            format!("{}x {}", c.display.count, c.display.resolution)
-                        }
-                        g => g.name().into(),
-                    },
+                    c.graphics().name(),
                     paths::tilde(&e.dir)
                 );
             }
@@ -659,6 +671,7 @@ pub fn resolve_gpu(arg: &str) -> Result<vm::Gpu> {
         return Ok(vm::Gpu {
             driver_file: Some(paths::absolute(a)),
             device_id: None,
+            select: None,
             name: None,
         });
     }
@@ -688,12 +701,8 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
         .or(a.name_pos.clone())
         .ok_or_else(|| with_create_examples("give the VM a name: reims-ctl create NAME"))?;
     // Nothing a VM is made from: whatever create says is missing, the examples show the ways.
-    let source = a.macos.is_some()
-        || a.installer.is_some()
-        || a.disk.is_some()
-        || a.opencore.is_some()
-        || a.ipsw.is_some()
-        || a.bundle.is_some();
+    let source =
+        a.macos.is_some() || a.installer.is_some() || a.disk.is_some() || a.opencore.is_some();
     let mut s = Spec::new(&name);
     s.dir = a
         .dir
@@ -709,14 +718,9 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
             path: paths::absolute(&p.to_string_lossy()),
             mode: ImportMode::parse(&a.disk_mode)?,
         }),
-        (None, None) if a.bundle.is_none() => Some(DiskSource::New {
-            size_mib: if a.ipsw.is_some() {
-                64 * 1024
-            } else {
-                128 * 1024
-            },
+        (None, None) => Some(DiskSource::New {
+            size_mib: 128 * 1024,
         }),
-        _ => None,
     };
     let abs = |p: &Option<PathBuf>| p.as_ref().map(|p| paths::absolute(&p.to_string_lossy()));
     s.macos = a.macos.clone().map(|version| reims_util::Download {
@@ -726,32 +730,18 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     s.opencore = abs(&a.opencore);
     s.installer = abs(&a.installer);
     s.mac = a.mac.clone();
-    s.ipsw = a.ipsw.clone().map(|i| {
-        if i == "latest" {
-            i
-        } else {
-            paths::absolute(&i).to_string_lossy().into_owned()
-        }
-    });
-    s.bundle = abs(&a.bundle);
-    s.bundle_mode = ImportMode::parse(&a.bundle_mode)?;
-    s.ecid = a.ecid;
     s.graphics = a.graphics.as_deref().map(vm::Graphics::parse).transpose()?;
-    if let Some(n) = a.displays {
-        s.display.count = n;
-    }
     if let Some(r) = &a.resolution {
         s.display.resolution = r.clone();
     }
-    s.display.hidpi = a.hidpi.unwrap_or(false);
     s.display.borderless = a.borderless.unwrap_or(false);
-    s.display.refresh = a.refresh;
     s.display.check()?;
     if let Some(g) = &a.gpu {
         s.gpu = resolve_gpu(g)?;
     }
     s.logs = a.logs.unwrap_or(false);
     s.audio = a.audio.unwrap_or(true);
+    s.network = a.network.unwrap_or(true);
     s.ssh_port = a.ssh_port;
     let vm = create::create(s, host, &mut |p| println!("{name}: {p}")).map_err(|e| {
         if source {
@@ -763,12 +753,17 @@ fn create_cmd(a: CreateArgs, host: Host) -> Result<()> {
     println!("created {name} in {}", paths::tilde(&vm.dir));
     if let Some(steps) = runtime::install_steps(&vm) {
         println!("{steps}");
-    } else if vm.config.q35.is_some() {
-        println!("{name}: {}", runtime::SET_METAL_ERROR_MODE);
     }
     if a.start {
-        let pid = runtime::start(&vm, host)?;
-        println!("{name}: running, pid {pid}");
+        let mut vm = vm;
+        for w in runtime::prepare(&mut vm, &mut |p| println!("{name}: {p}")) {
+            eprintln!("warning: {w}");
+        }
+        let started = runtime::start(&vm, host)?;
+        if let Some(n) = &started.note {
+            eprintln!("warning: {n}");
+        }
+        println!("{name}: running, pid {}", started.pid);
     }
     Ok(())
 }
@@ -778,6 +773,34 @@ fn confirm(question: &str) -> bool {
     let _ = std::io::stdout().flush();
     let mut line = String::new();
     std::io::stdin().read_line(&mut line).is_ok() && matches!(line.trim(), "y" | "Y" | "yes")
+}
+
+/// On a terminal, offers to write 0 to MGLRU's thrashing guard, `file`, with sudo; then how to
+/// keep it at 0, or to turn it off where it is not. Without a terminal it only tells.
+fn offer_min_ttl_off(file: &Path) -> String {
+    use std::io::IsTerminal;
+    let terminal = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if terminal
+        && confirm(&format!(
+            "     Write 0 to {} now with sudo?",
+            file.display()
+        ))
+    {
+        let wrote = std::process::Command::new("sudo")
+            .arg("tee")
+            .arg(file)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .and_then(|mut c| {
+                c.stdin.take().expect("piped").write_all(b"0\n")?;
+                c.wait()
+            });
+        if let Err(e) = &wrote {
+            eprintln!("     sudo didn't run: {e}");
+        }
+    }
+    runtime::min_ttl_fix(runtime::min_ttl_ms(file) == Some(0))
 }
 
 pub fn delete_vm(name: &str, keep_files: bool) -> Result<String> {
@@ -869,7 +892,7 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             None => "stopped".into(),
         },
     );
-    add("kind", c.profile.describe().into());
+    add("kind", c.profile.describe(host).into());
     add("directory", paths::tilde(&vm.dir));
     add("cpus", c.cpus.to_string());
     add("memory", format_mib(c.memory_mib));
@@ -890,19 +913,6 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         ),
         None => add("disk", format!("{disk_name} ({})", c.disk_format.as_str())),
     }
-    let mut disp = format!("{} x {}", c.display.count, c.display.resolution);
-    if c.display.hidpi {
-        disp.push_str(" HiDPI");
-    }
-    if let Some((w, h)) = c.display.looks_like() {
-        disp.push_str(&format!(" (looks like {w}x{h})"));
-    }
-    if c.display.borderless {
-        disp.push_str(", borderless");
-    }
-    if let Some(r) = c.display.refresh {
-        disp.push_str(&format!(", {r} Hz"));
-    }
     let graphics = c.graphics();
     match graphics {
         vm::Graphics::VmwareSvga => add(
@@ -911,20 +921,18 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
         ),
         g => add("graphics", g.describe().into()),
     }
-    // reims-vgpu's one display follows its window (vm::check_reims_vgpu_display): of the
-    // settings, only borderless reaches it.
-    match graphics {
-        vm::Graphics::AppleGfx => add("displays", disp),
-        vm::Graphics::ReimsVgpu => add(
+    // reims-vgpu's one display follows its window: of the settings, only the window's first size
+    // and borderless reach it.
+    if graphics == vm::Graphics::ReimsVgpu {
+        add(
             "display",
             if c.display.borderless {
-                "one, filling its screen, borderless"
+                "one, filling its screen, borderless".into()
             } else {
-                "one, in a window whose size the guest follows"
-            }
-            .into(),
-        ),
-        vm::Graphics::VmwareSvga => {}
+                let (w, h) = c.display.window_size().unwrap_or((1920, 1080));
+                format!("one, in a window opening at {w}x{h}, whose size the guest follows")
+            },
+        );
     }
     if graphics.library() && c.profile.gpu_choice(host) {
         add(
@@ -932,19 +940,8 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             match (&c.gpu.name, &c.gpu.driver_file) {
                 (Some(n), _) => n.clone(),
                 (None, Some(f)) => paths::tilde(f),
-                _ => "automatic (discrete first)".into(),
+                _ => "automatic: the only GPU, or the fastest of several".into(),
             },
-        );
-    }
-    if graphics == vm::Graphics::AppleGfx {
-        add(
-            "video",
-            if c.video_acceleration {
-                "on (the host's hardware)"
-            } else {
-                "off (the guest's software)"
-            }
-            .into(),
         );
     }
     if let Some(q) = &c.q35 {
@@ -957,9 +954,6 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             },
         );
         add("cpu model", q.cpu_model.clone());
-    }
-    if let Some(a) = &c.vmapple {
-        add("ecid", a.ecid.to_string());
     }
     add(
         "audio",
@@ -980,6 +974,19 @@ pub fn describe(vm: &Vm, host: Host) -> Vec<(String, String)> {
             }
         },
     );
+    if !c.usb.is_empty() {
+        add(
+            "usb",
+            c.usb
+                .iter()
+                .map(|u| match u.name.as_str() {
+                    "" => u.id.clone(),
+                    n => format!("{n} ({})", u.id),
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+    }
     add(
         "logs",
         if c.logs.enabled {
@@ -1070,14 +1077,8 @@ pub fn set_installer(
     Ok(match (&path, running) {
         (Some(p), false) => format!("{name}: {} attached for the next start", paths::tilde(p)),
         (Some(_), true) => format!("{name}: the installer changes at the next start"),
-        (None, false) => format!(
-            "{name}: installer removed; {}",
-            runtime::SET_METAL_ERROR_MODE
-        ),
-        (None, true) => format!(
-            "{name}: the installer goes at the next start; {}",
-            runtime::SET_METAL_ERROR_MODE
-        ),
+        (None, false) => format!("{name}: installer removed"),
+        (None, true) => format!("{name}: the installer goes at the next start"),
     })
 }
 
@@ -1108,30 +1109,14 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
             None => bail!("{}: --disk-controller is for x86-64 VMs", c.name),
         }
     }
-    if let Some(n) = a.displays {
-        c.display.count = n;
-    }
     if let Some(r) = &a.resolution {
         c.display.resolution = r.clone();
-    }
-    if let Some(b) = a.hidpi {
-        c.display.hidpi = b;
     }
     if let Some(b) = a.borderless {
         c.display.borderless = b;
     }
-    if let Some(r) = a.refresh {
-        c.display.refresh = (r != 0).then_some(r);
-    }
-    if c.graphics() == vm::Graphics::ReimsVgpu {
-        vm::check_reims_vgpu_display(a.displays, a.resolution.as_deref(), a.hidpi, a.refresh)
-            .with_context(|| c.name.clone())?;
-    }
     if let Some(g) = &a.gpu {
         c.gpu = resolve_gpu(g)?;
-    }
-    if let Some(b) = a.video_acceleration {
-        c.video_acceleration = b;
     }
     if let Some(b) = a.logs {
         c.logs.enabled = b;
@@ -1177,22 +1162,36 @@ fn set(a: SetArgs, host: Host) -> Result<()> {
         ""
     };
     println!("{}: saved{note}", vm.name());
-    // A change to reims-vgpu wants the guest's kexts in its image.
-    if a.graphics.is_some()
-        && let Some(w) = opencore::missing_guest_kexts(&vm)
-    {
-        println!("{}: {w}", vm.name());
+    // A graphics given makes the OpenCore image for it, where the VM is stopped; while it runs,
+    // its next start makes one without reims-vgpu's kexts on another device, and warns of an
+    // image that lacks them on reims-vgpu.
+    if a.graphics.is_some() && opencore::made_for_other_graphics(&vm) {
+        let name = vm.name().to_string();
+        let running = runtime::running(&vm);
+        if !running {
+            match opencore::renew(&mut vm, None, &mut |p| println!("{name}: {p}")) {
+                Ok(s) => println!("{s}"),
+                Err(e) => eprintln!(
+                    "warning: {name}: its OpenCore image is made for other graphics, and a new \
+                     one couldn't be made ({e:#}): reims-ctl update-opencore {name} makes it"
+                ),
+            }
+        } else if let Some(w) = opencore::missing_guest_kexts(&vm) {
+            println!("{name}: {w}");
+        } else {
+            println!(
+                "{name}: its OpenCore image loads reims-vgpu's macOS drivers: its next start \
+                 makes it a new one without them"
+            );
+        }
     }
     show(&vm, host);
     Ok(())
 }
 
 fn gpus(host: Host) {
-    if host.os != crate::host::Os::Linux {
-        println!(
-            "The library runs on the system's default Metal device on {}: there is no GPU to choose.",
-            qemu::os_word(host)
-        );
+    if host.default_profile().is_none() {
+        println!("{}", crate::host::UNSUPPORTED);
         return;
     }
     let list = gpu::list();
@@ -1202,7 +1201,10 @@ fn gpus(host: Host) {
         );
         return;
     }
-    println!("By default the library takes the first discrete GPU, then the first integrated one.");
+    println!(
+        "By default the library takes the only GPU, or the one of several that runs a short workload \
+         fastest, timed once for each set of GPUs and drivers."
+    );
     for (i, g) in list.iter().enumerate() {
         println!(
             "{:>2}. {}  [{:04x}:{:04x}]  {}",
@@ -1214,6 +1216,115 @@ fn gpus(host: Host) {
         );
     }
     println!("Give a VM one with: reims-ctl set NAME --gpu NUMBER");
+}
+
+/// `reims-ctl usb`: this host's USB devices, or a VM's choice of them, changed by `add` and
+/// `remove` first.
+fn usb(host: Host, name: Option<&str>, add: &[String], remove: &[String]) -> Result<()> {
+    use crate::usb;
+    if host.default_profile().is_none() {
+        bail!("{}", crate::host::UNSUPPORTED);
+    }
+    let devices = usb::host_devices();
+    let Some(name) = name else {
+        if !add.is_empty() || !remove.is_empty() {
+            bail!("name the VM to give the devices to: reims-ctl usb NAME --add DEVICE");
+        }
+        if devices.is_empty() {
+            println!("No USB devices are plugged into this host, other than hubs.");
+            return Ok(());
+        }
+        for (i, r) in usb::rows(&[], &devices).iter().enumerate() {
+            println!("{}", usb_line(i, None, r, &devices));
+        }
+        println!("Give a VM one with: reims-ctl usb NAME --add NUMBER");
+        return Ok(());
+    };
+    let mut vm = Registry::load()?.open(name)?;
+    if !add.is_empty() || !remove.is_empty() {
+        // Each named in the list as it was, then turned over in the settings as they are.
+        let rows = usb::rows(&vm.config.usb, &devices);
+        let mut picks = Vec::new();
+        // A device not plugged in, given by its IDs.
+        let mut absent = Vec::new();
+        for (arg, on) in add
+            .iter()
+            .map(|a| (a, true))
+            .chain(remove.iter().map(|a| (a, false)))
+        {
+            let found = usb::find(&rows, arg);
+            let by_id = vm::UsbDevice {
+                id: arg.trim().to_ascii_lowercase(),
+                port: None,
+                name: String::new(),
+            };
+            let r = match found {
+                Ok(i) => &rows[i],
+                Err(_) if on && by_id.ids().is_ok() => {
+                    absent.push(by_id);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            };
+            match (r.chosen.is_some(), on) {
+                (true, true) => println!("{name}: {} has it already", r.name()),
+                (false, false) => println!("{name}: {} isn't the VM's", r.name()),
+                _ => picks.push(r.clone()),
+            }
+        }
+        if !picks.is_empty() || !absent.is_empty() {
+            let (saved, said) = usb::apply(&vm, |cur| {
+                let mut c = picks
+                    .iter()
+                    .fold(cur.to_vec(), |c, r| usb::toggle(&c, &devices, r));
+                for u in &absent {
+                    if !c.contains(u) {
+                        c.push(u.clone());
+                    }
+                }
+                c
+            })?;
+            for s in said {
+                println!("{s}");
+            }
+            vm = saved;
+        }
+    }
+    let rows = usb::rows(&vm.config.usb, &devices);
+    if rows.is_empty() {
+        println!("No USB devices are plugged into this host, other than hubs.");
+        return Ok(());
+    }
+    for (i, r) in rows.iter().enumerate() {
+        println!("{}", usb_line(i, Some(r.chosen.is_some()), r, &devices));
+    }
+    if add.is_empty() && remove.is_empty() {
+        println!(
+            "Give {name} one with: reims-ctl usb {name} --add NUMBER; take one back with --remove NUMBER"
+        );
+    }
+    Ok(())
+}
+
+/// A line of `usb`'s list: its number, whether the VM has it, its name, IDs and notes.
+fn usb_line(
+    i: usize,
+    chosen: Option<bool>,
+    r: &crate::usb::Row,
+    devices: &[crate::usb::HostDevice],
+) -> String {
+    let mark = match chosen {
+        Some(true) => "[x] ",
+        Some(false) => "[ ] ",
+        None => "",
+    };
+    let mut line = format!("{:>2}. {mark}{}  [{}]", i + 1, r.name(), r.id());
+    let notes = r.notes(devices);
+    if !notes.is_empty() {
+        line.push_str("  ");
+        line.push_str(&notes.join(", "));
+    }
+    line
 }
 
 fn doctor(host: Host) -> Result<i32> {
@@ -1232,7 +1343,7 @@ fn doctor(host: Host) -> Result<i32> {
             "{host}{}",
             profile
                 .map(|p| format!(", runs {p} VMs"))
-                .unwrap_or_else(|| ", which reims-ctl does not support yet".into())
+                .unwrap_or_else(|| format!(": {}", crate::host::UNSUPPORTED))
         ),
     );
     line(
@@ -1334,6 +1445,20 @@ fn doctor(host: Host) -> Result<i32> {
                     },
                 );
             }
+            // MGLRU's thrashing guard, told of above 0 and offered off on a terminal; never a
+            // failure, as VMs run with it.
+            let min_ttl = Path::new(runtime::MIN_TTL_FILE);
+            if let Some(ms) = runtime::min_ttl_ms(min_ttl) {
+                let note = runtime::min_ttl_note(ms);
+                line(
+                    true,
+                    "lru_gen min_ttl_ms",
+                    note.clone().unwrap_or(ms.to_string()),
+                );
+                if note.is_some() {
+                    println!("     {}", offer_min_ttl_off(min_ttl));
+                }
+            }
             let gpus = gpu::list();
             line(
                 !gpus.is_empty(),
@@ -1347,6 +1472,53 @@ fn doctor(host: Host) -> Result<i32> {
                         .join("; ")
                 },
             );
+            // USB passthrough: QEMU's usb-host, and the devices this user may open, which
+            // fail the check only where a VM is given USB devices.
+            let devices = crate::usb::host_devices();
+            let closed: Vec<String> = devices
+                .iter()
+                .filter(|d| !d.usable())
+                .map(|d| d.file().display().to_string())
+                .collect();
+            let used = Registry::load().is_ok_and(|reg| {
+                reg.vms
+                    .iter()
+                    .filter_map(|e| Vm::load(&e.dir).ok())
+                    .any(|vm| !vm.config.usb.is_empty())
+            });
+            let usb_host = install::qemu_binary(profile)
+                .ok()
+                .and_then(|q| install::has_device(&q, "usb-host"));
+            let (ok, detail) = if usb_host == Some(false) {
+                (
+                    !used,
+                    "this QEMU has no usb-host, which passes USB devices through: reims-ctl \
+                     update builds one with it"
+                        .to_string(),
+                )
+            } else if devices.is_empty() {
+                (true, "no devices plugged in, other than hubs".to_string())
+            } else if closed.is_empty() {
+                (
+                    true,
+                    format!(
+                        "{} to pass through (reims-ctl usb)",
+                        plural(devices.len(), "device")
+                    ),
+                )
+            } else {
+                (
+                    !used,
+                    format!(
+                        "you can't open {} of the {} plugged in ({}): {}",
+                        closed.len(),
+                        plural(devices.len(), "device"),
+                        closed.join(", "),
+                        crate::usb::fix()
+                    ),
+                )
+            };
+            line(ok, "usb", detail);
             let session = std::env::var_os("WAYLAND_DISPLAY").is_some()
                 || std::env::var_os("DISPLAY").is_some();
             line(
@@ -1359,35 +1531,21 @@ fn doctor(host: Host) -> Result<i32> {
                 },
             );
         }
-        crate::host::Os::Mac => {
-            line(
-                std::path::Path::new(qemu::AVPBOOTER).exists(),
-                "vmapple boot ROM",
-                qemu::AVPBOOTER.into(),
-            );
-            line(
-                crate::vz::entitled(),
-                "virtualization entitlement",
-                if crate::vz::entitled() {
-                    "present (installs from IPSWs)".into()
-                } else {
-                    "missing: installing from an IPSW needs it; rerun scripts/install-ctl.sh".into()
-                },
-            );
-        }
-        crate::host::Os::Other => {}
+        crate::host::Os::Mac | crate::host::Os::Windows | crate::host::Os::Other => {}
     }
     if profile == Profile::Q35X86_64 {
         // What makes a new VM's OpenCore image, with its OVMF, and downloads its installer.
         match reims_util::binary() {
             Ok(b) => {
                 let v = reims_util::version(&b);
+                let stale = reims_util::stale(&b);
                 line(
-                    v.is_some(),
+                    v.is_some() && stale.is_none(),
                     "reims-util",
-                    match v {
-                        Some(v) => format!("{} ({v})", b.display()),
-                        None => format!(
+                    match (v, stale) {
+                        (Some(_), Some(stale)) => stale,
+                        (Some(v), None) => format!("{} ({v})", b.display()),
+                        (None, _) => format!(
                             "{} does not run: reinstall it with reims-ctl update",
                             b.display()
                         ),
@@ -1398,6 +1556,15 @@ fn doctor(host: Host) -> Result<i32> {
         }
     }
     Ok(if bad == 0 { 0 } else { 1 })
+}
+
+/// `n` of `what`: 1 device, 2 devices.
+fn plural(n: usize, what: &str) -> String {
+    if n == 1 {
+        format!("1 {what}")
+    } else {
+        format!("{n} {what}s")
+    }
 }
 
 #[cfg(test)]
@@ -1437,13 +1604,7 @@ mod tests {
         let dir = env.root.join("vms/x");
         register("x", &dir, "name = ");
         let pidfile = vm::pidfile_in(&dir);
-        // A process whose command line names the pid file, as QEMU's does.
-        let mut qemu = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :"])
-            .arg(&pidfile)
-            .spawn()
-            .unwrap();
-        std::fs::write(&pidfile, format!("{}\n", qemu.id())).unwrap();
+        let mut qemu = crate::runtime::test_qemu(&pidfile, 30);
         let r = delete_vm("x", false);
         let _ = qemu.kill();
         let _ = qemu.wait();
@@ -1463,13 +1624,14 @@ mod tests {
             format!(
                 r#"
                 name = "{name}"
-                profile = "vmapple-arm64"
+                profile = "q35-x86_64"
                 cpus = 2
                 memory_mib = 4096
                 disk = "{disk}"
-                [vmapple]
-                aux = "aux.img"
-                ecid = 1
+                [q35]
+                opencore = "opencore.qcow2"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
                 "#
             )
         };
@@ -1482,7 +1644,7 @@ mod tests {
         register(
             "c",
             &env.root.join("c"),
-            &config("c", &shared.to_string_lossy()),
+            &config("c", &crate::testenv::toml_path(&shared)),
         );
 
         let e = format!("{:#}", delete_vm("a", false).unwrap_err());

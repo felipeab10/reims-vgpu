@@ -1,0 +1,11 @@
+[package]
+name = "reims-vgpu-video-conformance"
+description = "The test streams' readers and writers: MP4 in and out, and MD5 for frame hashes"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true

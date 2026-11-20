@@ -47,13 +47,13 @@ use std::cell::Cell;
 use std::ops::Range;
 use std::sync::atomic::Ordering;
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use crate::core::platform::types::NsRange;
+use crate::core::raise::{OnFault, RaiseResult};
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
 
 use crate::answer::{Policy, plain, send, unrepresentable};
 use crate::gpu::command::executions::{self, Execution, Points};
@@ -257,7 +257,7 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 comparison,
                 reference_value,
             } => predication::start_while(self, sel, buffer, offset, comparison, reference_value),
-            ComputeCmd::EndEncoding => self.end(sel, rt::ComputeCommandEncoder::end_encoding),
+            ComputeCmd::EndEncoding => self.end(sel, |e| e.end_encoding()),
             ComputeCmd::ExecuteCommandsIndirect {
                 indirect_commandbuffer,
                 indirect_range_buffer,
@@ -435,6 +435,24 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
                 let (length, index) = (small(sel, length), small(sel, index));
                 caught(&mut |e| e.set_threadgroup_memory_length(length, index))
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => {
+                let index = small(sel, buffer_index);
+                caught(&mut |e| e.set_visible_function_table(function_table.map(|t| &**t), index))
+            }
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => {
+                let at = first(sel, range, &[function_tables.len()]);
+                listed(
+                    function_tables,
+                    |t| t.map(|t| &**t),
+                    |tables| caught(&mut |e| e.set_visible_function_tables(tables, at)),
+                )
+            }
             ComputeCmd::UpdateFence { fence } => caught(&mut |e| e.update_fence(fence)),
             ComputeCmd::UseHeaps { heaps } => {
                 let heaps: Vec<&rt::Heap> = heaps.iter().flatten().map(|h| &h.raw).collect();
@@ -498,17 +516,17 @@ impl ComputeEncoder<VulkanPlatform> for VulkanComputeEncoder {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::types::MtlSize;
+    use crate::core::platform::values::{ComputePassDesc, TextureDesc};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::bind::SamplerDescriptor;
     use metal2vulkan::metal::SamplerAddressMode;
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-    use reims_vgpu_core::platform::types::MtlSize;
-    use reims_vgpu_core::platform::values::{ComputePassDesc, TextureDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
@@ -521,12 +539,9 @@ mod tests {
     /// `build.rs` compiled from `icb_encode.metal`.
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
 
-    const ADD: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
-    const TGMEM: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_tgmem.metallib");
-    const SAMPLE: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_sample.metallib");
+    const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
+    const TGMEM: &[u8] = include_bytes!("../../../../tests/shaders/compute_tgmem.metallib");
+    const SAMPLE: &[u8] = include_bytes!("../../../../tests/shaders/compute_sample.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;
@@ -591,21 +606,314 @@ mod tests {
         run(&cb, &e, encode);
     }
 
-    /// A dispatch through a buffer over pages mapped read-only runs where its kernel reads the
-    /// buffer, at a `const` pointer, and dies where it is encoded where the kernel may write it,
-    /// by its slot writes, or the buffer is made resident for writing: on Linux the runtime
-    /// imports a writable twin of the pages, which the write would reach, where Metal's GPU drops
-    /// it ([`crate::gpu::writes::kept_write`]). The pages stay zeros
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_dispatch_through_read_only_pages_dies_on_linux() {
-        use reims_vgpu_core::platform::os::vm::HostVm as _;
+    /// The tests' kernel that writes texel (x, y) of texture 0.
+    #[cfg(any(target_os = "linux", windows))]
+    const TEXWRITE: &[u8] = include_bytes!("../../../../tests/shaders/compute_texwrite.metallib");
 
-        use crate::gpu::resource::tests::over_read_only_pages;
-        use crate::os::{OsVm, PAGE};
+    /// A 16 × 16 `BGRA8Unorm` texture of `levels` mipmap levels and shader read and write usage at
+    /// the start of a heap made with bit 24 over pages of the test's own
+    /// (`resource::tests::guest_pages_of`), as the guest makes a read-only heap, with the pages and
+    /// their length; the runtime makes the heap over a copy of them on Linux and Windows,
+    /// announcing `copied-host-pages`, which dies in strict mode, so it is made under the default.
+    #[cfg(any(target_os = "linux", windows))]
+    fn bgra_in_read_only_heap(
+        levels: u64,
+    ) -> (
+        crate::gpu::resource::VulkanTexture,
+        crate::core::host::HostPtr,
+        u64,
+    ) {
+        use crate::core::host::HostPtr;
+        use crate::core::num::ToUsize as _;
+        use crate::core::platform::HostRange;
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
+
+        use crate::gpu::resource::tests::{BIT_24, guest_pages_of, over_pages};
+
+        let size = over_pages();
+        let pages = HostPtr::from_addr(guest_pages_of(size).to_usize());
+        // SAFETY: pages of the test's, left mapped until the process ends.
+        let bytes = unsafe { HostRange::new(pages, size) };
+        let heap = crate::answer::relaxed(|| {
+            dev().new_heap_over_host_memory(
+                bytes,
+                &HeapDesc {
+                    size,
+                    heap_type: 1,
+                    options: vec![
+                        OptionSet::StorageMode(0),
+                        OptionSet::HazardTrackingMode(0),
+                        OptionSet::ResourceOptionsOr(BIT_24),
+                    ],
+                    pinned_gpu_address: None,
+                },
+            )
+        })
+        .unwrap()
+        .heap
+        .unwrap();
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            mipmap_level_count: levels,
+            usage: 0x3,
+            resource_options: Some(heap.resource_options() & !BIT_24),
+            ..TextureDesc::default()
+        });
+        let texture = heap.new_texture(&desc, 0).unwrap().unwrap();
+        (texture, pages, size)
+    }
+
+    /// A kernel's `write()` of a texture over a guest's read-only memory, a buffer made with bit 24
+    /// (`resource::tests::read_only_buffer`) or a heap made with it over pages
+    /// ([`bgra_in_read_only_heap`]), and a blit's copy into such a texture out of a buffer or a
+    /// texture, each complete with no error, and the pages, and what a later command buffer reads
+    /// of the texture, stay zeros, as Metal's GPU takes those writes nowhere (measured on the M3
+    /// Max, macOS 27.0.1, metal2vulkan's `probes/readonly_gpu_writes.m`; the runtime's
+    /// `read_only_view.rs`): the runtime's copy of the pages drops them. Linux's and Windows's: on
+    /// macOS they go to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn texture_writes_into_read_only_memory_are_dropped() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::types::MtlOrigin;
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+
+        let write = pipeline(TEXWRITE, "tex_write");
+        let source = shared(16 * 64);
+        // SAFETY: a Shared buffer of 16 rows of 64 bytes, which no command uses yet.
+        unsafe { std::ptr::write_bytes(source.contents().as_ptr::<u8>(), 0x3c, 16 * 64) };
+        let held = d_texture(0x5a);
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, 0x3);
+        let (in_heap, heap_pages, heap_size) = bgra_in_read_only_heap(1);
+        let whole = MtlSize::new(16, 16, 1);
+        let at = MtlOrigin::new(0, 0, 0);
+        for (name, texture, (pages, length)) in [
+            ("over a buffer", &over, (pages, 16 * 64)),
+            ("in a heap", &in_heap, (heap_pages, heap_size)),
+        ] {
+            // The kernel's write.
+            run_serial(vec![
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(&write),
+                },
+                ComputeCmd::SetTexture {
+                    texture: Some(texture),
+                    index: 0,
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: whole,
+                    threads_per_threadgroup: MtlSize::new(4, 4, 1),
+                },
+            ]);
+            // The blit's copies, out of a buffer and out of a texture.
+            for copy in [
+                BlitCmd::CopyBufferToTexture {
+                    source_buffer: &source,
+                    source_offset: 0,
+                    source_bytes_per_row: 64,
+                    source_bytes_per_image: 16 * 64,
+                    source_size: whole,
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: at,
+                },
+                BlitCmd::CopyTextureRegion {
+                    source_texture: &held,
+                    source_slice: 0,
+                    source_level: 0,
+                    source_origin: at,
+                    source_size: whole,
+                    destination_texture: texture,
+                    destination_slice: 0,
+                    destination_level: 0,
+                    destination_origin: at,
+                },
+            ] {
+                let cb = command_buffer();
+                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+                e.encode(OnFault::Return, copy).unwrap();
+                e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+                assert_eq!((cb.status().0, cb.error()), (COMPLETED, None), "{name}");
+            }
+            let length = usize::try_from(length).unwrap();
+            assert!(
+                host_bytes_at(pages, length).iter().all(|&b| b == 0),
+                "{name}: the pages"
+            );
+            // What a later command buffer reads of the texture.
+            let out = shared(16 * 64);
+            let cb = command_buffer();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            let read = BlitCmd::CopyTextureToBuffer {
+                source_texture: texture,
+                source_slice: 0,
+                source_level: 0,
+                source_origin: at,
+                source_size: whole,
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: 64,
+                destination_bytes_per_image: 16 * 64,
+            };
+            e.encode(OnFault::Return, read).unwrap();
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(words(&out).iter().all(|&w| w == 0), "{name}: read back");
+        }
+        drop((over, ro, in_heap));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, crate::os::PAGE)
+                .is_success()
+        );
+    }
+
+    /// A blit's other writes of a texture over a guest's read-only memory, a buffer made with bit
+    /// 24 (`resource::tests::read_only_buffer`) or a heap made with it
+    /// ([`bgra_in_read_only_heap`]), complete with no error, the writes dropped and the buffer's
+    /// pages staying zeros, as the M3 Max's GPU drops them (plain Metal, macOS 27.0.1, m3-max-29292
+    /// and m3-max-29309): a fill by a colour or by bytes and an invalidation (the `fillTexture:`
+    /// and `invalidateCompressedTexture:` SPI, which the Radeon Pro 5300M and UHD Graphics 630
+    /// under macOS 26.7.1 end the process at with bit 24 or without), and mipmaps' generation,
+    /// after which level 1 of a heap's texture whose level 0 the CPU wrote reads zeros, where it
+    /// reads level 0's texels without bit 24 (`mipmaps-shared`, m3-max-29309). The two x86 GPUs
+    /// complete mipmaps' generation too, writing it. Linux's and Windows's: on macOS they go to
+    /// Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn blit_writes_of_a_texture_in_read_only_memory_are_dropped() {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion};
+
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+
+        let blit = |cmd| {
+            let cb = command_buffer();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            e.encode(OnFault::Return, cmd).unwrap();
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            (cb.status().0, cb.error())
+        };
+        let (ro, pages) = read_only_buffer(1);
+        let over = bgra_over(&ro, 0x3);
+        let (in_heap, _, _) = bgra_in_read_only_heap(2);
+        let at = MtlOrigin::new(0, 0, 0);
+        let region = MtlRegion::new(at, MtlSize::new(16, 16, 1));
+        let texel = [0x77u8; 4];
+        let white = ClearColor {
+            red: 1.0,
+            green: 1.0,
+            blue: 1.0,
+            alpha: 1.0,
+        };
+        for (name, texture) in [("over a buffer", &over), ("in a heap", &in_heap)] {
+            let fills = [
+                BlitCmd::FillTextureColor {
+                    texture,
+                    level: 0,
+                    slice: 0,
+                    region,
+                    color: white,
+                    pixel_format: 80,
+                },
+                BlitCmd::FillTexture {
+                    texture,
+                    level: 0,
+                    slice: 0,
+                    region,
+                    bytes: HostRange::of_slice(&texel),
+                },
+                BlitCmd::InvalidateCompressedTexture { texture },
+            ];
+            for fill in fills {
+                let sel = fill.selector();
+                assert_eq!(blit(fill), (COMPLETED, None), "{name}: {sel}");
+            }
+        }
+        assert!(host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0));
+        let level_0 = [0x3cu8; 16 * 64];
+        in_heap
+            .replace_region(region, 0, 0, HostRange::of_slice(&level_0), 64, 0)
+            .unwrap();
+        let mipmaps = BlitCmd::GenerateMipmaps {
+            texture: Some(&in_heap),
+        };
+        assert_eq!(blit(mipmaps), (COMPLETED, None), "mipmaps");
+        let out = shared(8 * 32);
+        let read = BlitCmd::CopyTextureToBuffer {
+            source_texture: &in_heap,
+            source_slice: 0,
+            source_level: 1,
+            source_origin: at,
+            source_size: MtlSize::new(8, 8, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: 32,
+            destination_bytes_per_image: 8 * 32,
+        };
+        assert_eq!(blit(read), (COMPLETED, None), "level 1 read back");
+        assert!(words(&out).iter().all(|&w| w == 0), "level 1");
+        drop((over, ro, in_heap));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, crate::os::PAGE)
+                .is_success()
+        );
+    }
+
+    /// A 16 × 16 `BGRA8Unorm` texture of the device's memory, every byte `byte`.
+    #[cfg(any(target_os = "linux", windows))]
+    fn d_texture(byte: u8) -> crate::gpu::resource::VulkanTexture {
+        use crate::core::platform::HostRange;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::types::{MtlOrigin, MtlRegion};
+
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 80,
+            width: 16,
+            height: 16,
+            usage: 0x1,
+            resource_options: Some(0),
+            ..TextureDesc::default()
+        });
+        let t = dev().new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(16, 16, 1));
+        let texels = [byte; 16 * 64];
+        t.replace_region(region, 0, 0, HostRange::of_slice(&texels), 64, 0)
+            .unwrap();
+        t
+    }
+
+    /// A dispatch whose kernel stores into a guest's read-only buffer (made with bit 24,
+    /// `resource::tests::read_only_buffer`), bound at the slot it writes and made resident for
+    /// writing, completes with no error, its stores dropped, the pages staying zeros, as Metal
+    /// drops a kernel's stores there (`crate::gpu::writes`'s docs): through the runtime's copy of
+    /// the pages on Linux and Windows, and Metal's read-only view on macOS. The kernel reads it as
+    /// the pages
+    #[test]
+    fn a_kernel_store_into_a_read_only_buffer_is_dropped() {
+        use crate::core::platform::os::vm::HostVm as _;
+
+        use crate::gpu::resource::tests::{host_bytes_at, read_only_buffer};
+        use crate::os::PAGE;
 
         let add = pipeline(ADD, "add_one");
-        let (ro, pages) = over_read_only_pages(1);
+        let (ro, pages) = read_only_buffer(1);
         let out = shared(16);
         let four = || ComputeCmd::DispatchThreads {
             threads_per_grid: MtlSize::new(4, 1, 1),
@@ -620,29 +928,12 @@ mod tests {
             },
             four(),
         ]);
-        assert_eq!(words(&out), [1; 4], "read through the twin");
-        let cb = command_buffer();
-        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-        let dies = |cmd: ComputeCmd<'_, VulkanPlatform>| {
-            let sel = cmd.selector();
-            let site = catch_death(|| e.encode(OnFault::Return, cmd)).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        };
-        for cmd in [
+        assert_eq!(words(&out), [1; 4], "read as the pages");
+        let source = holding(&[7; 4]);
+        run_serial(vec![
             ComputeCmd::SetComputePipelineState { state: Some(&add) },
             ComputeCmd::SetBuffers {
-                buffers: &[Some(&ro), Some(&out)],
-                offsets: &[0, 0],
-                range: NsRange::new(0, 2),
-            },
-        ] {
-            e.encode(OnFault::Return, cmd).unwrap();
-        }
-        dies(four());
-        // Read at slot 1 again, but made resident for writing.
-        for cmd in [
-            ComputeCmd::SetBuffers {
-                buffers: &[Some(&out), Some(&ro)],
+                buffers: &[Some(&ro), Some(&source)],
                 offsets: &[0, 0],
                 range: NsRange::new(0, 2),
             },
@@ -650,16 +941,15 @@ mod tests {
                 resources: &[Some(ResourceRef::Buffer(&ro))],
                 usage: 3,
             },
-        ] {
-            e.encode(OnFault::Return, cmd).unwrap();
-        }
-        dies(four());
-        run(&cb, &e, Vec::new());
-        // SAFETY: the page, mapped readable, which no GPU work uses now.
-        let first = unsafe { pages.as_ptr::<u32>().read_volatile() };
-        assert_eq!(first, 0);
-        drop((cb, e, ro));
-        assert!(OsVm::new().deallocate(pages, PAGE).is_success());
+            four(),
+        ]);
+        assert!(host_bytes_at(pages, 16).iter().all(|&b| b == 0), "dropped");
+        drop((ro, source, out));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
     }
 
     /// Prints how long 512 one-thread dispatches take to encode after one `useResources` of 0,
@@ -677,7 +967,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, run by hand: prints the times"]
     fn dispatches_after_a_large_residency() {
-        use reims_vgpu_core::platform::os::Clock as _;
+        use crate::core::platform::os::Clock as _;
         let now = || crate::os::OsClock::new().now_mono();
         let add = pipeline(ADD, "add_one");
         let (input, out) = (shared(1024), shared(1024));
@@ -976,6 +1266,206 @@ mod tests {
         }
     }
 
+    /// A device cache the host's video writes from outside the runtime (NVDEC's copy within the
+    /// GPU, through CUDA's import of the cache's exported memory) reads each picture written
+    /// there through a texture over it: an exportable `Private` buffer, its memory imported into
+    /// a second `VkDevice` of the same physical device, which fills it with a new byte three
+    /// times, each fill waited for and said done (`external_write_done`), and a texture over it
+    /// laid as CoreVideo lays a frame's plane, 32 bytes in, which the runtime keeps as a shadow
+    /// of the bytes rather than a linear image over them, sampled by a kernel in a command buffer
+    /// of its own after each fill. Without the call the runtime's shadow kept what its first copy
+    /// in read, as it does where only its own commands write a buffer, and the kernel read the
+    /// first fill's byte after every later one. Linux's: MoltenVK exports no buffer's memory.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_device_cache_another_api_writes_reads_each_write_through_a_texture_over_it() {
+        use ash::vk;
+        use std::os::fd::IntoRawFd as _;
+
+        use crate::core::platform::resource::Buffer as _;
+
+        const LENGTH: u64 = 64 * 1024;
+        const OFFSET: u64 = 32;
+        const WIDTH: u64 = 200;
+        const HEIGHT: u64 = 16;
+        const BYTES_PER_ROW: u64 = 256;
+        /// `MTLResourceStorageModePrivate`.
+        const PRIVATE: u64 = 2 << 4;
+        let d = dev();
+        let made = d.new_exportable_buffer_of_length(OnFault::Return, LENGTH, PRIVATE, None);
+        let cache = made.expect("no raise").expect("an exportable buffer");
+        let exported = cache.export_memory().expect("its memory");
+        // The export's memory type, which the import names: the runtime's own answer.
+        let memory_type_index = (cache.raw.export_memory_fd())
+            .expect("its memory")
+            .memory_type_index;
+        let desc = platform().texture_descriptor(&TextureDesc {
+            pixel_format: 10,
+            width: WIDTH,
+            height: HEIGHT,
+            usage: 1,
+            resource_options: Some(PRIVATE),
+            ..TextureDesc::default()
+        });
+        let texture = (cache.new_texture(OnFault::Return, &desc, OFFSET, BYTES_PER_ROW))
+            .expect("no raise")
+            .expect("an R8Unorm texture over the cache");
+        let sampler = {
+            let mut desc = SamplerDescriptor::default();
+            desc.s_address_mode = SamplerAddressMode::ClampToEdge;
+            desc.t_address_mode = SamplerAddressMode::ClampToEdge;
+            Obj::new(d.raw.new_sampler_state(&desc).unwrap())
+        };
+        let k = pipeline(SAMPLE, "sample_k");
+
+        // SAFETY: the handles are used while `d` lives; the second device is the test's own and
+        // destroyed below, after its work.
+        let handles = unsafe { d.raw.raw() };
+        let (instance, physical) = (handles.instance, handles.physical_device);
+        let mut features12 = vk::PhysicalDeviceVulkan12Features::default();
+        let mut features = vk::PhysicalDeviceFeatures2::default().push_next(&mut features12);
+        // SAFETY: the physical device is the instance's.
+        unsafe { instance.get_physical_device_features2(physical, &mut features) };
+        let device_address = features12.buffer_device_address == vk::TRUE;
+        let family = handles.queue_family;
+        let priorities = [1.0];
+        let queues = [vk::DeviceQueueCreateInfo::default()
+            .queue_family_index(family)
+            .queue_priorities(&priorities)];
+        let extensions = [ash::khr::external_memory_fd::NAME.as_ptr()];
+        let mut enabled12 =
+            vk::PhysicalDeviceVulkan12Features::default().buffer_device_address(device_address);
+        let info = vk::DeviceCreateInfo::default()
+            .queue_create_infos(&queues)
+            .enabled_extension_names(&extensions)
+            .push_next(&mut enabled12);
+        // SAFETY: the physical device is the instance's and lists the extension (the export ran).
+        let second = unsafe { instance.create_device(physical, &info, None) }.expect("a device");
+        // The buffer the import binds, made as the runtime makes an exportable one: a dedicated
+        // import names a buffer of the same parameters.
+        use vk::BufferUsageFlags as U;
+        let mut usage = U::TRANSFER_SRC
+            | U::TRANSFER_DST
+            | U::UNIFORM_BUFFER
+            | U::STORAGE_BUFFER
+            | U::UNIFORM_TEXEL_BUFFER
+            | U::STORAGE_TEXEL_BUFFER
+            | U::INDEX_BUFFER
+            | U::VERTEX_BUFFER
+            | U::INDIRECT_BUFFER;
+        if device_address {
+            usage |= U::SHADER_DEVICE_ADDRESS;
+        }
+        let mut external = vk::ExternalMemoryBufferCreateInfo::default()
+            .handle_types(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD);
+        let buffer_info = vk::BufferCreateInfo::default()
+            .size(LENGTH)
+            .usage(usage)
+            .sharing_mode(vk::SharingMode::EXCLUSIVE)
+            .push_next(&mut external);
+        // SAFETY: the second device is live and the info valid for it.
+        let imported = unsafe { second.create_buffer(&buffer_info, None) }.expect("a buffer");
+        let mut import = vk::ImportMemoryFdInfoKHR::default()
+            .handle_type(vk::ExternalMemoryHandleTypeFlags::OPAQUE_FD)
+            .fd(exported.fd.into_raw_fd());
+        let mut dedicated = vk::MemoryDedicatedAllocateInfo::default().buffer(imported);
+        let mut flags =
+            vk::MemoryAllocateFlagsInfo::default().flags(vk::MemoryAllocateFlags::DEVICE_ADDRESS);
+        let mut allocate = vk::MemoryAllocateInfo::default()
+            .allocation_size(exported.allocation_size)
+            .memory_type_index(memory_type_index)
+            .push_next(&mut import);
+        if exported.dedicated {
+            allocate = allocate.push_next(&mut dedicated);
+        }
+        if device_address {
+            allocate = allocate.push_next(&mut flags);
+        }
+        // SAFETY: the descriptor is the export's, of the same physical device, its size and type
+        // the allocation's; the import owns it once made.
+        let memory = unsafe { second.allocate_memory(&allocate, None) }.expect("the import");
+        // SAFETY: the buffer and the memory are the second device's; the cache lies at the
+        // export's offset in the allocation.
+        unsafe { second.bind_buffer_memory(imported, memory, exported.offset) }.expect("bound");
+        // SAFETY: the family is the second device's, made with one queue.
+        let queue = unsafe { second.get_device_queue(family, 0) };
+        let pool_info = vk::CommandPoolCreateInfo::default()
+            .queue_family_index(family)
+            .flags(vk::CommandPoolCreateFlags::RESET_COMMAND_BUFFER);
+        // SAFETY: as above.
+        let pool = unsafe { second.create_command_pool(&pool_info, None) }.expect("a pool");
+        let allocate_info = vk::CommandBufferAllocateInfo::default()
+            .command_pool(pool)
+            .level(vk::CommandBufferLevel::PRIMARY)
+            .command_buffer_count(1);
+        // SAFETY: as above.
+        let command = unsafe { second.allocate_command_buffers(&allocate_info) }.expect("one")[0];
+        // The second device fills the cache's bytes with `byte` and waits for it.
+        let fill = |byte: u8| {
+            let begin = vk::CommandBufferBeginInfo::default()
+                .flags(vk::CommandBufferUsageFlags::ONE_TIME_SUBMIT);
+            let commands = [command];
+            let submit = [vk::SubmitInfo::default().command_buffers(&commands)];
+            // SAFETY: the command buffer is the second device's, recorded and submitted here
+            // alone, its fill within the imported buffer; the queue is waited idle before the
+            // next recording.
+            unsafe {
+                second.begin_command_buffer(command, &begin).unwrap();
+                second.cmd_fill_buffer(command, imported, 0, LENGTH, u32::from(byte) * 0x0101_0101);
+                second.end_command_buffer(command).unwrap();
+                second
+                    .queue_submit(queue, &submit, vk::Fence::null())
+                    .unwrap();
+                second.queue_wait_idle(queue).unwrap();
+            }
+        };
+
+        // Each fill's byte, and the words the kernel sampled after it.
+        let mut read = Vec::new();
+        for byte in [0x11u8, 0x22, 0x33] {
+            fill(byte);
+            cache.external_write_done().expect("the acquire");
+            let out = shared(32);
+            run_serial(vec![
+                ComputeCmd::SetComputePipelineState { state: Some(&k) },
+                ComputeCmd::SetTexture {
+                    texture: Some(&texture),
+                    index: 0,
+                },
+                ComputeCmd::SetSamplerStates {
+                    samplers: &[Some(&sampler)],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&out)],
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(8, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(8, 1, 1),
+                },
+            ]);
+            read.push((byte, words(&out)));
+        }
+        // SAFETY: the second device's objects, its queue idle; the cache outlives the import.
+        unsafe {
+            second.destroy_command_pool(pool, None);
+            second.destroy_buffer(imported, None);
+            second.free_memory(memory, None);
+            second.destroy_device(None);
+        }
+        // An R8Unorm texel sampled and packed as unorm4x8: the byte, zeros, and an alpha of one.
+        let wrong: Vec<_> = (read.iter())
+            .filter(|(byte, words)| words.iter().any(|&w| w != u32::from(*byte) | 0xff00_0000))
+            .collect();
+        assert!(
+            wrong.is_empty(),
+            "(the byte written, the words sampled after it) on {}: {wrong:x?}",
+            d.raw.name()
+        );
+    }
+
     /// A nil pipeline, slices of another length than their range, a scope no Metal value is and
     /// a command after endEncoding, predication's too, die at their selectors
     #[test]
@@ -1014,8 +1504,8 @@ mod tests {
     /// of the buffer, whose command dispatches nothing
     #[test]
     fn a_dispatch_after_an_icb_made_writable_runs() {
-        use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-        use reims_vgpu_core::platform::values::IcbDesc;
+        use crate::core::platform::icb::IndirectCommandBuffer as _;
+        use crate::core::platform::values::IcbDesc;
 
         let d = dev();
         d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
@@ -1127,6 +1617,74 @@ mod tests {
             let mut ran = set(&reset);
             ran.extend([resident(usage), last]);
             run_serial(ran);
+        }
+    }
+
+    /// What a compute encoder's `setBuffers:` costs the thread that encodes it (a measurement, not
+    /// a check; run it by name with `--run-ignored only --no-capture` in a release build, holding
+    /// the host's GPU): `BIND_COST_ROUNDS` sends (default 4,096) of 8 buffers at indices 0 to 7,
+    /// as a kernel's binds before each of its dispatches, in two shapes. `same`: an upload chunk
+    /// at index 0 at its next 256-byte offset, as the bundle sends `setBytes:`, and the same 7
+    /// buffers after it each time; `fresh`: 8 buffers of a pool of 64 each time, none bound at its
+    /// index the send before. Prints each shape's user-space instructions and cycles a buffer
+    /// bound, the median of 5 runs, each an encoder of its own.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn set_buffers_cost() {
+        let rounds: u64 = std::env::var("BIND_COST_ROUNDS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(4096);
+        let chunk = shared(0x1_0000);
+        let pool: Vec<VulkanBuffer> = (0..64).map(|_| shared(256)).collect();
+        let offsets_of = |r: u64| -> [u64; 8] {
+            let mut offsets = [0; 8];
+            offsets[0] = (r * 256) % 0x1_0000;
+            offsets
+        };
+        for shape in ["same", "fresh"] {
+            let mut figures: [Vec<u64>; 2] = Default::default();
+            for _ in 0..5 {
+                let cb = command_buffer();
+                let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+                let mut spent = [0u64; 2];
+                for r in 0..rounds {
+                    let mut buffers: [Option<&VulkanBuffer>; 8] = [Some(&chunk); 8];
+                    for (i, slot) in buffers.iter_mut().enumerate().skip(1) {
+                        let pick = match shape {
+                            "same" => i,
+                            _ => (r as usize * 8 + i) % pool.len(),
+                        };
+                        *slot = Some(&pool[pick]);
+                    }
+                    let offsets = offsets_of(r);
+                    let cmd = ComputeCmd::SetBuffers {
+                        buffers: &buffers,
+                        offsets: &offsets,
+                        range: NsRange::new(0, 8),
+                    };
+                    let before = crate::os::thread_counts::now();
+                    e.encode(OnFault::Return, cmd).unwrap();
+                    let after = crate::os::thread_counts::now();
+                    for k in 0..2 {
+                        spent[k] += after[k] - before[k];
+                    }
+                }
+                e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+                for k in 0..2 {
+                    figures[k].push(spent[k] / (rounds * 8));
+                }
+            }
+            for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+                figure.sort_unstable();
+                eprintln!(
+                    "setBuffers of 8, {shape:<5}: {name:<12} a buffer bound {:6} ({} to {})",
+                    figure[2], figure[0], figure[4]
+                );
+            }
         }
     }
 

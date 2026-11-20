@@ -10,7 +10,7 @@
 //! - **The pattern** of `pattern4:` is its four bytes, low first, repeated from the range's start
 //!   up to the first offset that is a multiple of 16 (the head), and from that offset afresh to
 //!   the range's end: a fill of 7 bytes at 41 writes `01 02 03 04 01 02 03`, then `01 02 ..` from
-//!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_the_metal_platforms`).
+//!   48. An empty range writes nothing (`encode_blit`'s `pattern_fills_are_metals`).
 //! - **A texel** of either texture fill is its pattern (the bytes, or the colour's bytes) repeated
 //!   from its start and cut at the texture format's block bytes: bytes past a block go unread,
 //!   and a colour of fewer bytes repeats (an R8Unorm colour fills each byte of an RGBA32Uint
@@ -28,24 +28,28 @@
 //!   and those below them; and doubles on, beside and between the 8-, 16- and 32-bit integer
 //!   edges. A colour in a format of [`OWN_FORMAT_PACKED`] (the bfloat formats, the
 //!   extended-range `_sRGB` twins, the RGBX formats) is compared into a texture of its own format
-//!   (`encode_blit`'s `colours_the_runtime_packs_are_the_metal_platforms`); into a texture of
+//!   (`encode_blit`'s `colours_the_runtime_packs_are_metals`); into a texture of
 //!   another format nothing compared it ([`crate::gpu::encode_blit`]).
 //! - **A colour in a format Metal packs none in** (every format outside [`PACKED`] and
 //!   [`OWN_FORMAT_PACKED`]: Invalid, the depth and stencil formats and the two-plane XR10
 //!   formats, 550 and 551, [`LEFTOVER_FORMATS`]; the compressed, 4:2:2, YCbCr and padded ones)
-//!   writes no byte of the colour, but bytes Metal holds from earlier work (measured): after an
-//!   RGBA32Uint fill of (7, 9, 3, 1) into one texture, a fill of any colour in one of these
-//!   formats later in the encoder, or in a later encoder of the command buffer, writes `07 00 00
-//!   00 09 00 00 00 03 00 00 00 01 00 00 00` into another texture's RGBA32Uint texel, cut at a
-//!   narrower one; with no colour packed before it in the command buffer, bytes no colour gave
-//!   (not a colour an earlier command buffer packed), which differ between texture formats and
-//!   between runs (a 550 colour into a 550 texture, paged out by core's XR10 kernel: plane 0 `77
-//!   d7 44 c7` in one process and `00 00 00 c0` in another, whatever the colour, NaN included;
-//!   `metal_fills_a_colour_it_packs_none_in_with_an_earlier_fills_bytes`). The runtime's colour
-//!   fill holds the command buffer's last packed texel over zeros and fills those bytes, Metal's
-//!   in every case measured (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`, each of
-//!   these formats); where Metal's are other bytes of its own, it announces `UnpackedFillColor`,
-//!   one of Metal's answers, relayed.
+//!   writes no byte of the colour, but the 16 bytes of the calling thread's stack where Metal's
+//!   packing writes a colour in a format it packs, which hold what the last call to use them
+//!   left (measured on the M3 Max, macOS 27.0.1, 2026-11-07): a fill sent right after an
+//!   RGBA32Uint fill of (7, 9, 3, 1) into another texture, with no call between the two, writes
+//!   `07 00 00 00 09 00 00 00 03 00 00 00 01 00 00 00` into an RGBA32Uint texel, cut at a
+//!   narrower one, and one sent right after a call that set the stack below to one byte writes
+//!   that byte. A call between them leaves its own bytes: an encoder's end and the next
+//!   encoder's start leave other bytes, and objc2's check of the method before each send in a
+//!   dev build, which this library's sends to Metal made, leaves the encoder's class and the
+//!   selector, as pointers (measured: `80 ef 0b 82 02 00 00 00 42 a2 3d fe 01 00 00 00`),
+//!   whatever came before. On the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 (macOS
+//!   26.7.1) every colour fill raises `NSInvalidArgumentException`: Metal's colour fill sends
+//!   `fillTexture:level:slice:region:bytes:length:`, which their encoders do not implement. The
+//!   runtime's colour fill holds the command buffer's last packed texel over zeros and fills
+//!   those bytes, Metal's for a fill sent right after another
+//!   (`leftover_colours_fill_an_earlier_colours_bytes_as_metals`, each of these formats), and
+//!   announces `UnpackedFillColor`, one of Metal's answers, relayed.
 //! - **Where** ([`place`]): a level past the texture's writes nothing; the region is cut at the
 //!   level's extent. A 3D texture takes the region's depth and ignores the slice; every other
 //!   type ignores the region's `z` and depth. A 1D or 2D texture ignores the slice; an array
@@ -59,7 +63,7 @@
 //!   from the texture's offset plus the region's `x` texels, one row whatever the level, slice,
 //!   row, height and depth, the pattern running across the region's bytes, not started again at
 //!   each texel, past the width too and cut at the buffer's end, as the runtime's fill writes it
-//!   (`texture_buffer_fills_are_the_metal_platforms`,
+//!   (`texture_buffer_fills_within_a_texel_are_metals`,
 //!   `texture_buffer_fills_metal_streams_are_metals`), of a pattern of up to 32752 bytes; a
 //!   longer one ends Metal's process in the call, whatever the region, and dies there, naming the
 //!   runtime's refusal of it ([`streamed_pattern`]). Where a 16-byte chunk of Metal's reads
@@ -68,12 +72,12 @@
 //! - **A multisample texture's** fill writes every sample of the region's texels and no other,
 //!   each sample its own bytes of the pattern where a texel's samples hold 16 bytes or fewer,
 //!   else every sample the pattern cut at the texel, as the runtime's fill writes them
-//!   (`encode_blit`'s `multisample_fills_are_the_metal_platforms`). The runtime refuses one only
+//!   (`encode_blit`'s `multisample_fills_are_metals`). The runtime refuses one only
 //!   where the device cannot run its sample copies, which dies naming the refusal.
 
+use crate::core::platform::types::MtlRegion;
 use metal2vulkan::metal::{PixelFormat, TextureType};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::MtlRegion;
 
 use crate::answer::unrepresentable;
 
@@ -93,8 +97,8 @@ pub const MOST_PATTERN_BYTES: usize = 16;
 /// buffers): a longer pattern ends Metal's process in the call ([`streamed_pattern`]).
 pub const MOST_STREAMED_PATTERN_BYTES: usize = 32752;
 
-/// The formats Metal packs no colour in, for which a colour fill writes bytes Metal holds from
-/// earlier work (the module's docs).
+/// The formats Metal packs no colour in, for which a colour fill writes bytes of the calling
+/// thread's stack (the module's docs).
 pub const LEFTOVER_FORMATS: [PixelFormat; 10] = [
     PixelFormat::Invalid,
     PixelFormat::Depth16Unorm,
@@ -206,8 +210,8 @@ pub const RGBX: [PixelFormat; 11] = [
 ];
 
 /// The pixel format `raw` a colour fill for `sel` packs its colour in: any format, one of
-/// [`PACKED`] or [`OWN_FORMAT_PACKED`] packing it and any other taking the bytes an earlier
-/// colour fill left (the module's docs). A value no format is dies.
+/// [`PACKED`] or [`OWN_FORMAT_PACKED`] packing it and any other taking the bytes of the calling
+/// thread's stack on Metal (the module's docs). A value no format is dies.
 pub fn colour_format(sel: &'static str, raw: u64) -> PixelFormat {
     let format = u32::try_from(raw)
         .ok()
@@ -262,7 +266,7 @@ pub fn texture_buffer_writes(sel: &'static str, region: MtlRegion) -> bool {
 /// (`LongTextureBufferFillPattern`), before the region is read: the runtime refuses it only for a
 /// region it is given, and this platform gives none of no texels across.
 pub fn streamed_pattern(sel: &'static str, length: u64) {
-    use reims_vgpu_core::num::ToU64 as _;
+    use crate::core::num::ToU64 as _;
     if length > MOST_STREAMED_PATTERN_BYTES.to_u64() {
         let problem = rt::Problem::LongTextureBufferFillPattern { length };
         let e = rt::Error::Invalid(rt::Invalid::new("fill_texture", problem));
@@ -340,9 +344,9 @@ pub fn place(
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::types::{MtlOrigin, MtlSize};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
 

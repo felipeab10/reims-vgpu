@@ -44,8 +44,13 @@
  * block (RgfxRegion::acquireSurface), found by the pages of plane 0 the process maps, holding
  * every plane. Where the kext gives no shared block, the process keeps a block of its own for the
  * surface. The kext gives a surface's blocks in one mode, so every holder of a surface copied
- * copies it. Each view made, in place or a copy and why, is counted in the "surface copies" line
- * the process logs (os_log, info) every 10 s while views are made or copied.
+ * copies it. Each view made, in place or a copy and why, and each copy's block, shared or the
+ * process's own, is counted in the "surface copies" line the process logs (os_log, info) once a
+ * minute at most while views are made or copied; the kext logs why it first refused a shared
+ * block. The line also says whether the kext answers the surfaces' unlock seeds ("unlock seeds
+ * on", off, or unknown before a device says), and counts the uploads made while a CPU held the
+ * surface locked for writing ("mid-write"), those made again once such a CPU let go ("synced
+ * again at the unlock"), and the kext's answers they took ("asks for it").
  *
  * The copy holds the planes in plane order, each from a kShadowRowAlign multiple, its rows
  * kShadowRowAlign apart, as the surface's own memory holds them one after another; a header past
@@ -53,7 +58,14 @@
  * which every holder reads and writes. The copy syncs with the pages, every plane, at two
  * points:
  *   - before a commit, from the pages, where the surface's seed is not the header's: a CPU
- *     wrote the surface under a lock since any holder synced it;
+ *     wrote the surface under a lock since any holder synced it; and where a CPU held the
+ *     surface locked for writing as a holder last synced it, once it has let go of the lock.
+ *     IOSurface moves the seed at a read-write lock and its unlock seed at the unlock (both at a
+ *     GPU write), so a sync made between the two copies the pages as the CPU has written them so
+ *     far, as a GPU that reads the pages in place reads them then; the header records the unlock
+ *     seed then (RgfxRegion::surfaceSeeds, the kext's), and the commit after the unlock seed
+ *     moves syncs again. Without the kext's seeds, a sync made mid-write stands until the next
+ *     lock;
  *   - when a command buffer that writes the copy completes, before it reports completion,
  *     back to the pages, with no lock of the surface. A write is a render attachment, a
  *     blit's destination, a resource used with Write usage, or a texture bound at an index
@@ -110,8 +122,9 @@
  *
  * A texture the creator cannot make is nil, as Metal answers one, and never silently: each cause
  * (no view in place and no room for a copy, a plane past the surface's, no texture resource id
- * left, ...) logs one "RGFX:" line per surface naming the surface and the checks that refused,
- * however often the texture is asked for (rgfxIOSurfaceNilLog).
+ * left, ...) logs one "RGFX:" line per cause and pixel format in the process, naming the first
+ * surface and the checks that refused, however often and over however many surfaces the texture
+ * is asked for; each surface's count and line are kept (rgfxIOSurfaceNilLog).
  *
  * Left for later, for a copy: syncing the pages at the CPU's lock instead of at every GPU
  * write's completion (the device cache's sync); CPU writes made without a lock. In either
@@ -177,7 +190,8 @@ NS_ASSUME_NONNULL_END
 
 /// Before a commit: syncs each copy the command buffer of `enc` uses or writes (as its encoders
 /// named them, rgfxIOSurfaceNoteUse and rgfxIOSurfaceNoteWrite) from the surface's pages, where
-/// the surface's seed moved since any holder synced it (a view in place needs none). A copy the
+/// the surface's seed moved since any holder synced it, or a CPU that held the surface locked for
+/// writing then has let go of the lock since (a view in place needs none). A copy the
 /// buffer does not name is synced at the commit of one that does: Metal has a function reach a
 /// resource only through a binding, an attachment, a blit, or useResource for one an argument
 /// buffer names, and each of those names it.
@@ -211,6 +225,25 @@ void rgfxIOSurfaceKeepSweepAt(uint64_t nowNs);
 /// Whether the keep keeps a cached block's view while another process holds its surface, as
 /// WindowServer's does (RgfxIOSurface.mm): for the tests.
 void rgfxIOSurfaceKeepCountClients(bool on);
+
+/// Whether the kext answers surfaces' lock and unlock seeds to this process's device
+/// (kRgfxKextFeatureSurfaceSeeds): the "surface copies" summary says so, "unknown" before a device
+/// says.
+void rgfxIOSurfaceNoteSurfaceSeeds(bool on);
+
+/// The rows of a plane, `pitch` bytes apart from its first byte at `offsets[plane]`, that lie before
+/// the next of the `count` planes' first bytes (`offsets`, from the surface's base) and before
+/// `end` (the surface's allocation): the rows its surface holds for it, the rows it extends the
+/// plane by below (CoreVideo's extended pixels) among them. 0 for a plane past `count`, a pitch of
+/// 0, or a plane at or past `end`.
+uint64_t rgfxPlaneRowsHeld(const uint64_t *_Nonnull offsets, size_t count, size_t plane,
+                           uint64_t pitch, uint64_t end);
+
+/// The rows the GPU's view of the surface `texture` lies over holds for the texture's plane, from
+/// the plane's first byte at the plane's pitch (rgfxPlaneRowsHeld), where the view is the
+/// surface's own pages and `texture` is over its whole plane; 0 where the view is a copy (which
+/// holds each plane's own rows), `texture` lies inside its plane, or it is over no IOSurface.
+uint64_t rgfxIOSurfaceRowsHeld(__unsafe_unretained id _Nullable texture);
 
 /// Records on `enc` that its command buffer writes `texture`, when `texture` is one
 /// over an IOSurface or a view of one, through any views (otherwise nothing), and, where its

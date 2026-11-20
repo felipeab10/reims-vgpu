@@ -4,9 +4,13 @@
 //! **What a read draws.** The window's own draw ([`ScanoutDraw::encode_shown`]): the guest's
 //! scanout, or the IOSurface its display pipe presents, through the display's colour, into a
 //! texture of the display's mode, the size the guest is told (the window's size in pixels, or
-//! 1920 × 1080 without a window), placed and clipped as in a drawable of that size. Where the
+//! 1920 × 1080 without a window, sized to the display's scanout room on a device of several
+//! displays: `reims-vgpu-graphics`' `display::offered_in_room`), placed and clipped as in a
+//! drawable of that size. Where the
 //! guest has no scanout and presents no surface the display shows black, and so does the read.
-//! The texture is BGRA8, shared, a render target, as a frame target is (`frame`), and is read
+//! While the display's panel is off (the guest's display asleep) the draw clears the texture to
+//! black, and the read is black whatever the guest shows.
+//! The texture is BGRA8, shared, a render target, and is read
 //! once the draw has finished on the GPU: rows of `width * 4` bytes, B, G, R and A in memory.
 //!
 //! **What it touches.** Nothing the guest or the window sees. Its draws go on a queue of their
@@ -19,23 +23,26 @@
 
 use std::sync::{Arc, OnceLock};
 
-use reims_graphics::Screen;
-use reims_graphics::region::Region;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::CommandBuffer as _;
-use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_graphics::Screen;
+use reims_vgpu_graphics::display::offered_in_room;
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
+use reims_vgpu_vulkan::core::platform::descriptor::TextureDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::core::sync::Mutex;
 use reims_vgpu_window::PixelRect;
 
 use super::sink::ScanoutDraw;
 use super::{Presented, Shown};
-use crate::display::no_catch;
+use crate::entry::no_catch;
 use crate::error::Error;
-use crate::frame::MAX_FRAME_TARGET_SIZE;
 use crate::platform::ApiPlatform;
+
+/// The largest width or height of a read's texture.
+const MAX_READ_SIZE: u32 = 16384;
 
 /// `MTLPixelFormatBGRA8Unorm`.
 const BGRA8_UNORM: u64 = 80;
@@ -46,8 +53,10 @@ const READ_RESOURCE_OPTIONS: u64 = 0;
 /// A pixel the display shows where it shows nothing: opaque black, B, G, R, A.
 const BLACK: [u8; 4] = [0, 0, 0, 0xff];
 
-/// A read's texture, with its size.
-type ReadTexture<P> = ((u32, u32), <P as Platform>::Texture);
+/// A read's texture, with its size and the device's recoveries when it was made
+/// (`GpuDevice::recoveries`): a texture made before a recovery is made again, as the draws' kept
+/// objects are (`sink`'s module doc, "A recovered device").
+type ReadTexture<P> = ((u32, u32, u64), <P as Platform>::Texture);
 
 /// Reads of what a graphics device's display shows (the module doc).
 pub(crate) struct DisplayRead<P: ApiPlatform> {
@@ -61,6 +70,8 @@ pub(crate) struct DisplayRead<P: ApiPlatform> {
     presented: Arc<Presented<P>>,
     /// The screen, whose mode a read has.
     screen: Arc<dyn Screen>,
+    /// How many displays the device has, whose rooms the mode is sized to.
+    displays: u32,
     /// The reads' draw, made at the first; `None` inside where the platform refused it.
     draw: OnceLock<Option<ScanoutDraw<P>>>,
     /// The last read's texture and its size: held through a read, so reads run one at a time.
@@ -68,14 +79,16 @@ pub(crate) struct DisplayRead<P: ApiPlatform> {
 }
 
 impl<P: ApiPlatform> DisplayRead<P> {
-    /// Reads of the display `screen` shows, over `region`, the scanout `shown` keeps and the
-    /// surfaces `presented` shows; nothing is made until the first read.
+    /// Reads of the display `screen` shows on a device of `displays` displays, over `region`, the
+    /// scanout `shown` keeps and the surfaces `presented` shows; nothing is made until the first
+    /// read.
     pub(crate) fn new(
         platform: &Arc<P>,
         region: &Arc<Region>,
         shown: &Arc<Shown>,
         presented: &Arc<Presented<P>>,
         screen: Arc<dyn Screen>,
+        displays: u32,
     ) -> DisplayRead<P> {
         DisplayRead {
             platform: Arc::clone(platform),
@@ -83,9 +96,24 @@ impl<P: ApiPlatform> DisplayRead<P> {
             shown: Arc::clone(shown),
             presented: Arc::clone(presented),
             screen,
+            displays,
             draw: OnceLock::new(),
             texture: Mutex::new(None),
         }
+    }
+
+    /// Reads of the display `self` reads, at `screen`'s mode: the Vulkan platform's tests' read at
+    /// the size of a window, which a device without one does not have.
+    #[cfg(test)]
+    pub(crate) fn at_screen(&self, screen: Arc<dyn Screen>) -> DisplayRead<P> {
+        DisplayRead::new(
+            &self.platform,
+            &self.region,
+            &self.shown,
+            &self.presented,
+            screen,
+            self.displays,
+        )
     }
 
     /// What the display shows now, into the first `width * height * 4` bytes of `dst`, rows of
@@ -94,7 +122,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
     /// where `dst` holds fewer bytes; [`Error::Metal`] where the platform refuses the texture or
     /// the draw; [`Error::Gpu`] where the draw ended with an error. Waits for the draw on the GPU.
     pub(crate) fn read(&self, dst: &mut [u8]) -> ((u32, u32), Result<(), Error>) {
-        let mode = self.screen.mode();
+        let mode = offered_in_room(self.screen.mode(), self.displays);
         let size = (mode.width, mode.height);
         (size, self.read_at(size, dst))
     }
@@ -110,9 +138,7 @@ impl<P: ApiPlatform> DisplayRead<P> {
             .and_then(|h| h.checked_mul(row))
             .ok_or(Error::InvalidArgument)?;
         let dst = dst.get_mut(..length).ok_or(Error::InvalidArgument)?;
-        if !(1..=MAX_FRAME_TARGET_SIZE).contains(&width)
-            || !(1..=MAX_FRAME_TARGET_SIZE).contains(&height)
-        {
+        if !(1..=MAX_READ_SIZE).contains(&width) || !(1..=MAX_READ_SIZE).contains(&height) {
             return Err(Error::Metal);
         }
         let draw = self
@@ -128,9 +154,10 @@ impl<P: ApiPlatform> DisplayRead<P> {
             .as_ref()
             .ok_or(Error::Metal)?;
         let mut kept = self.texture.lock();
-        if !kept.as_ref().is_some_and(|(at, _)| *at == (width, height)) {
+        let made_for = (width, height, draw.device.recoveries());
+        if !kept.as_ref().is_some_and(|(at, _)| *at == made_for) {
             *kept = None;
-            *kept = Some(((width, height), self.texture_of(draw, width, height)?));
+            *kept = Some((made_for, self.texture_of(draw, width, height)?));
         }
         let Some((_, texture)) = kept.as_ref() else {
             return Err(Error::Metal);

@@ -36,10 +36,36 @@
 //             block), 10 runs each: whether the wait for 1 returned, when, and when the buffer
 //             completed; and a signal at the very end of a buffer, 20 runs: its listener's block
 //             against the buffer's completed handler. Times are ms from the commit.
+//   gputimes  what GPUStartTime and GPUEndTime answer for one long command buffer: K encoders
+//             (K = 1, 8, 32) of ~0.5 ms of GPU work each in one buffer ("whole"), against the
+//             same encoders committed back to back one buffer each ("apart"), compute
+//             (slow_write) and render (K passes over a 1920 x 1080 BGRA8 target, each clearing
+//             it and blending 6 full-target quads), 7 runs each, and a whole compute buffer
+//             whose CPU sleeps 1 ms between its encoders as it encodes them. For each, medians
+//             of: whole, the span (GPUEndTime less GPUStartTime), GPUStartTime from the commit,
+//             and the completed handler from GPUEndTime; apart, the buffers' spans summed, the
+//             span from the first's start to the last's end, and the first's start from the
+//             first commit. Times are ms.
+//   schedsig  the command-buffer SPI encodeSignalEventScheduled:value: (where the buffer responds to
+//             it): which class answers it; when a shared event it signals reads the value, against
+//             the buffer's scheduled handler, GPUStartTime and GPUEndTime, encoded before and after a
+//             ~100 ms kernel on an idle queue and behind a ~200 ms buffer of its queue, where a
+//             buffer of a second queue waits for the value; the value it leaves on an event at 5
+//             (3, 7, two signals in either order) against a GPU signal and a CPU set of 3; the
+//             order against GPU signals of the buffer; against a wait of the buffer on another
+//             event, encoded before and after it, and behind a kernel, and of an earlier buffer of
+//             its queue; against a wait on the same event; and the queue of a listener's block. Times are ms from the commit.
+//   schedsig_open, schedsig_late, schedsig_nil, schedsig_nil_unretained, schedsig_plain,
+//   schedsig_plain_unretained
+//             the same call with a blit encoder open, after the commit, with a nil event and with
+//             a plain event (newEvent), the last two on a buffer that retains its references and
+//             on one that does not: a line after the call, the buffer's status and error, the
+//             event's value.
 // Build: see README.md.
 #import "oracle_common.h"
 #include <dispatch/dispatch.h>
 #include <objc/message.h>
+#include <objc/runtime.h>
 #include <pthread.h>
 #include <spawn.h>
 #include <sys/wait.h>
@@ -839,6 +865,662 @@ static void case_events(void)
 	}
 }
 
+// ---- schedsig
+
+enum { SCHED_RUNS = 5 };
+static SEL gSchedSel;
+
+static void sched_signal(id<MTLCommandBuffer> cb, id<MTLEvent> ev, uint64_t value)
+{
+	((void (*)(id, SEL, id, uint64_t))objc_msgSend)((id)cb, gSchedSel, ev, value);
+}
+
+// The class in `obj`'s chain whose own methods hold `sel`, or "none".
+static const char *defining_class(id obj, SEL sel)
+{
+	for (Class c = object_getClass(obj); c; c = class_getSuperclass(c)) {
+		unsigned n = 0;
+		Method *ms = class_copyMethodList(c, &n);
+		BOOL has = NO;
+		for (unsigned i = 0; i < n && !has; i++)
+			has = method_getName(ms[i]) == sel;
+		free(ms);
+		if (has)
+			return class_getName(c);
+	}
+	return "none";
+}
+
+static void enc_tiny(id<MTLCommandBuffer> cb, id<MTLBuffer> b)
+{
+	id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+	[e fillBuffer:b range:NSMakeRange(0, 256) value:1];
+	[e endEncoding];
+}
+
+static void enc_kernel(id<MTLCommandBuffer> cb, id<MTLBuffer> big, uint32_t iters)
+{
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	enc_slow(e, big, iters);
+	[e endEncoding];
+}
+
+// Polls `ev` on a global queue from `*t0` (once set) until it reads at least `value` or 3 s pass:
+// `*seen` gets the time it first did, 0 where it never did.
+static void poll_event(dispatch_group_t g, id<MTLSharedEvent> ev, uint64_t value,
+                       volatile double *t0, volatile double *seen)
+{
+	dispatch_group_async(g, dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		while (*t0 == 0)
+			;
+		while (ev.signaledValue < value && oracle_now_ms() - *t0 < 3000)
+			;
+		*seen = ev.signaledValue >= value ? oracle_now_ms() : 0;
+	});
+}
+
+static void print_status(const char *what, id<MTLCommandBuffer> cb)
+{
+	printf("    %s: status %s, error %s\n", what, status_name(cb.status),
+	       cb.error ? [NSString stringWithFormat:@"%@ %ld %@", cb.error.domain, (long)cb.error.code,
+	                                             cb.error.localizedDescription]
+	                      .UTF8String
+	                : "(none)");
+}
+
+static void case_schedsig(void)
+{
+	gSchedSel = sel_registerName("encodeSignalEventScheduled:value:");
+	gSlow = cpipe("slow_write");
+	if (!gSlow)
+		return;
+	id<MTLBuffer> big = [D newBufferWithLength:N * 4 options:MTLResourceStorageModeShared];
+	id<MTLBuffer> small = [D newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+	MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+
+	printf("case schedsig: 1. who answers encodeSignalEventScheduled:value:\n");
+	{
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		id<MTLCommandBuffer> ucb = [Q commandBufferWithUnretainedReferences];
+		printf("    a command buffer (%s): responds %d, from %s; unretained (%s): responds %d\n",
+		       object_getClassName(cb), (int)[(id)cb respondsToSelector:gSchedSel],
+		       defining_class(cb, gSchedSel), object_getClassName(ucb),
+		       (int)[(id)ucb respondsToSelector:gSchedSel]);
+		SEL k = sel_registerName("_encodeIOGPUKernelSignalEventScheduledCommandArgs:value:");
+		id<MTLEvent> pe = [D newEvent];
+		id<MTLSharedEvent> se = [D newSharedEvent];
+		printf("    a plain event (%s): kernel args from %s; a shared event (%s): from %s\n",
+		       object_getClassName(pe), defining_class(pe, k), object_getClassName(se),
+		       defining_class(se, k));
+		if (![(id)cb respondsToSelector:gSchedSel])
+			return;
+	}
+
+	// Calibrate one kernel near 100 ms.
+	uint32_t iters = 2000;
+	double gpu = 0;
+	for (int k = 0; k < 6; k++) {
+		oracle_commit_wait(long_cb(Q, big, iters), NULL, &gpu);
+		if ((gpu > 75 && gpu < 150) || k == 5)
+			break;
+		iters = (uint32_t)(iters * (100.0 / (gpu > 0.5 ? gpu : 0.5)));
+	}
+	printf("  one kernel %u iterations = %.1f ms GPU\n", iters, gpu);
+
+	static const char *const idle_names[] = {
+	    "2. idle queue: scheduled signal 1, then a ~100 ms kernel",
+	    "3. idle queue: a ~100 ms kernel, then scheduled signal 1",
+	};
+	for (int p = 0; p < 2; p++) {
+		printf("  %s, %d runs (ms from the commit)\n", idle_names[p], SCHED_RUNS);
+		double polled[SCHED_RUNS], heard[SCHED_RUNS], sched[SCHED_RUNS], start[SCHED_RUNS];
+		double end[SCHED_RUNS], done[SCHED_RUNS];
+		int in_handler = 0, before_start = 0, listener_first = 0;
+		for (int k = 0; k < SCHED_RUNS; k++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = [Q commandBuffer];
+			if (p == 0)
+				sched_signal(cb, ev, 1);
+			enc_kernel(cb, big, iters);
+			if (p == 1)
+				sched_signal(cb, ev, 1);
+			__block volatile double tl = 0, ts = 0, tc = 0, tp = 0, t0 = 0;
+			__block volatile uint64_t at_sched = 0;
+			[ev notifyListener:listener
+			           atValue:1
+			             block:^(id<MTLSharedEvent> _e, uint64_t _v) { tl = oracle_now_ms(); }];
+			[cb addScheduledHandler:^(id<MTLCommandBuffer> _) {
+				ts = oracle_now_ms();
+				at_sched = ev.signaledValue;
+			}];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> _) { tc = oracle_now_ms(); }];
+			dispatch_group_t g = dispatch_group_create();
+			poll_event(g, ev, 1, &t0, &tp);
+			double c = oracle_now_ms();
+			t0 = c;
+			[cb commit];
+			[cb waitUntilCompleted];
+			dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+			usleep(5000);
+			polled[k] = tp ? tp - c : -1;
+			heard[k] = tl ? tl - c : -1;
+			sched[k] = ts - c;
+			start[k] = (cb.GPUStartTime - c / 1e3) * 1e3;
+			end[k] = (cb.GPUEndTime - c / 1e3) * 1e3;
+			done[k] = tc - c;
+			in_handler += at_sched >= 1;
+			before_start += tp != 0 && polled[k] < start[k];
+			listener_first += tl != 0 && tl <= ts;
+			usleep(5000);
+		}
+		print_ms("signaledValue first reads 1 (polling)", polled, SCHED_RUNS);
+		print_ms("the listener's block for 1 runs", heard, SCHED_RUNS);
+		print_ms("the scheduled handler runs", sched, SCHED_RUNS);
+		print_ms("GPUStartTime", start, SCHED_RUNS);
+		print_ms("GPUEndTime", end, SCHED_RUNS);
+		print_ms("the completed handler runs", done, SCHED_RUNS);
+		printf("    the scheduled handler read 1: %d of %d; polling read 1 before GPUStartTime: %d of %d; "
+		       "listener's block before the scheduled handler: %d of %d\n",
+		       in_handler, SCHED_RUNS, before_start, SCHED_RUNS, listener_first, SCHED_RUNS);
+	}
+
+	printf("  4. a ~200 ms buffer A, then buffer B on the same queue: scheduled signal 1 (shared event), a "
+	       "tiny blit; buffer C on a second queue waits for 1, a tiny blit; %d runs (ms from B's commit)\n",
+	       SCHED_RUNS);
+	id<MTLCommandQueue> q2 = [D newCommandQueue];
+	{
+		double polled[SCHED_RUNS], heard[SCHED_RUNS], sched[SCHED_RUNS], a_end[SCHED_RUNS];
+		double b_start[SCHED_RUNS], b_done[SCHED_RUNS], c_done[SCHED_RUNS];
+		int c_before_a = 0;
+		for (int k = 0; k < SCHED_RUNS; k++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> a = long_cb(Q, big, iters * 2);
+			id<MTLCommandBuffer> b = [Q commandBuffer];
+			sched_signal(b, ev, 1);
+			enc_tiny(b, small);
+			id<MTLCommandBuffer> cq = [q2 commandBuffer];
+			[cq encodeWaitForEvent:ev value:1];
+			enc_tiny(cq, small);
+			__block volatile double tl = 0, ts = 0, tb = 0, tcq = 0, tp = 0, t0 = 0;
+			[ev notifyListener:listener
+			           atValue:1
+			             block:^(id<MTLSharedEvent> _e, uint64_t _v) { tl = oracle_now_ms(); }];
+			[b addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms(); }];
+			[b addCompletedHandler:^(id<MTLCommandBuffer> _) { tb = oracle_now_ms(); }];
+			[cq addCompletedHandler:^(id<MTLCommandBuffer> _) { tcq = oracle_now_ms(); }];
+			dispatch_group_t g = dispatch_group_create();
+			[a commit];
+			poll_event(g, ev, 1, &t0, &tp);
+			double c = oracle_now_ms();
+			t0 = c;
+			[b commit];
+			[cq commit];
+			[b waitUntilCompleted];
+			[cq waitUntilCompleted];
+			dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+			usleep(5000);
+			polled[k] = tp ? tp - c : -1;
+			heard[k] = tl ? tl - c : -1;
+			sched[k] = ts - c;
+			a_end[k] = (a.GPUEndTime - c / 1e3) * 1e3;
+			b_start[k] = (b.GPUStartTime - c / 1e3) * 1e3;
+			b_done[k] = tb - c;
+			c_done[k] = tcq - c;
+			c_before_a += cq.GPUEndTime < a.GPUEndTime;
+			usleep(5000);
+		}
+		print_ms("signaledValue first reads 1 (polling)", polled, SCHED_RUNS);
+		print_ms("the listener's block for 1 runs", heard, SCHED_RUNS);
+		print_ms("B's scheduled handler runs", sched, SCHED_RUNS);
+		print_ms("A's GPUEndTime", a_end, SCHED_RUNS);
+		print_ms("B's GPUStartTime", b_start, SCHED_RUNS);
+		print_ms("B's completed handler runs", b_done, SCHED_RUNS);
+		print_ms("C's completed handler runs", c_done, SCHED_RUNS);
+		printf("    C's GPU work ended before A's: %d of %d\n", c_before_a, SCHED_RUNS);
+	}
+
+	printf("  5. value: a shared event at 5, one buffer each (the value once it completed)\n");
+	{
+		static const char *const names[] = {
+		    "scheduled signal 3", "GPU signal 3 (encodeSignalEvent)", "CPU set 3 (setSignaledValue)",
+		    "scheduled signal 7", "scheduled signals 6 then 8", "scheduled signals 8 then 6",
+		};
+		for (int s = 0; s < 6; s++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			ev.signaledValue = 5;
+			if (s == 2) {
+				ev.signaledValue = 3;
+				printf("    %-40s -> %llu\n", names[s], (unsigned long long)ev.signaledValue);
+				continue;
+			}
+			id<MTLCommandBuffer> cb = [Q commandBuffer];
+			if (s == 0)
+				sched_signal(cb, ev, 3);
+			else if (s == 1)
+				[cb encodeSignalEvent:ev value:3];
+			else if (s == 3)
+				sched_signal(cb, ev, 7);
+			else if (s == 4) {
+				sched_signal(cb, ev, 6);
+				sched_signal(cb, ev, 8);
+			} else {
+				sched_signal(cb, ev, 8);
+				sched_signal(cb, ev, 6);
+			}
+			enc_tiny(cb, small);
+			[cb commit];
+			[cb waitUntilCompleted];
+			usleep(2000);
+			printf("    %-40s -> %llu\n", names[s], (unsigned long long)ev.signaledValue);
+		}
+	}
+
+	printf("  6. order against the buffer's GPU signals, %d runs each (ms from the commit)\n", SCHED_RUNS);
+	{
+		static const char *const names[] = {
+		    "a. ~50 ms kernel, GPU signal 2, scheduled signal 1",
+		    "b. scheduled signal 2, ~50 ms kernel, GPU signal 1",
+		};
+		for (int s = 0; s < 2; s++) {
+			double h1[SCHED_RUNS], h2[SCHED_RUNS], sched[SCHED_RUNS], end[SCHED_RUNS];
+			uint64_t final[SCHED_RUNS], at_sched[SCHED_RUNS];
+			for (int k = 0; k < SCHED_RUNS; k++) {
+				id<MTLSharedEvent> ev = [D newSharedEvent];
+				id<MTLCommandBuffer> cb = [Q commandBuffer];
+				if (s == 0) {
+					enc_kernel(cb, big, iters / 2);
+					[cb encodeSignalEvent:ev value:2];
+					sched_signal(cb, ev, 1);
+				} else {
+					sched_signal(cb, ev, 2);
+					enc_kernel(cb, big, iters / 2);
+					[cb encodeSignalEvent:ev value:1];
+				}
+				__block volatile double t1 = 0, t2 = 0, ts = 0;
+				__block volatile uint64_t vs = 0;
+				[ev notifyListener:listener
+				           atValue:1
+				             block:^(id<MTLSharedEvent> _e, uint64_t _v) { t1 = oracle_now_ms(); }];
+				[ev notifyListener:listener
+				           atValue:2
+				             block:^(id<MTLSharedEvent> _e, uint64_t _v) { t2 = oracle_now_ms(); }];
+				[cb addScheduledHandler:^(id<MTLCommandBuffer> _) {
+					ts = oracle_now_ms();
+					vs = ev.signaledValue;
+				}];
+				double c = oracle_now_ms();
+				[cb commit];
+				[cb waitUntilCompleted];
+				usleep(10000);
+				h1[k] = t1 ? t1 - c : -1;
+				h2[k] = t2 ? t2 - c : -1;
+				sched[k] = ts - c;
+				end[k] = (cb.GPUEndTime - c / 1e3) * 1e3;
+				final[k] = ev.signaledValue;
+				at_sched[k] = vs;
+				usleep(5000);
+			}
+			printf("    %s:\n", names[s]);
+			print_ms("the listener's block for 1 runs", h1, SCHED_RUNS);
+			print_ms("the listener's block for 2 runs", h2, SCHED_RUNS);
+			print_ms("the scheduled handler runs", sched, SCHED_RUNS);
+			print_ms("GPUEndTime", end, SCHED_RUNS);
+			printf("    the value in the scheduled handler:");
+			for (int k = 0; k < SCHED_RUNS; k++)
+				printf(" %llu", (unsigned long long)at_sched[k]);
+			printf("; at the end:");
+			for (int k = 0; k < SCHED_RUNS; k++)
+				printf(" %llu", (unsigned long long)final[k]);
+			printf("\n");
+		}
+	}
+
+	printf("  7. against the buffer's waits on another shared event W, which the CPU sets to 1 at 200 ms; "
+	       "3 runs each (ms from the commit)\n");
+	{
+		static const char *const names[] = {
+		    "a. wait W 1, scheduled signal 1, tiny blit",
+		    "b. scheduled signal 1, wait W 1, tiny blit",
+		    "c. ~50 ms kernel, wait W 1, scheduled signal 1, tiny blit",
+		    "d. scheduled signal 1, ~50 ms kernel, wait W 1, tiny blit",
+		};
+		for (int s = 0; s < 4; s++) {
+			printf("    %s:", names[s]);
+			for (int k = 0; k < 3; k++) {
+				id<MTLSharedEvent> ev = [D newSharedEvent], w = [D newSharedEvent];
+				id<MTLCommandBuffer> cb = [Q commandBuffer];
+				if (s == 0) {
+					[cb encodeWaitForEvent:w value:1];
+					sched_signal(cb, ev, 1);
+				} else if (s == 1) {
+					sched_signal(cb, ev, 1);
+					[cb encodeWaitForEvent:w value:1];
+				} else if (s == 2) {
+					enc_kernel(cb, big, iters / 2);
+					[cb encodeWaitForEvent:w value:1];
+					sched_signal(cb, ev, 1);
+				} else {
+					sched_signal(cb, ev, 1);
+					enc_kernel(cb, big, iters / 2);
+					[cb encodeWaitForEvent:w value:1];
+				}
+				enc_tiny(cb, small);
+				__block volatile double tp = 0, t0 = 0, ts = 0;
+				[cb addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms(); }];
+				dispatch_group_t g = dispatch_group_create();
+				poll_event(g, ev, 1, &t0, &tp);
+				double c = oracle_now_ms();
+				t0 = c;
+				[cb commit];
+				usleep(200000);
+				MTLCommandBufferStatus st = cb.status;
+				double set = oracle_now_ms() - c;
+				w.signaledValue = 1;
+				[cb waitUntilCompleted];
+				dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+				printf(" [status at 200 ms %s; set at %.1f; 1 read at %.2f; scheduled handler %.2f; end %.2f; %s]",
+				       status_name(st), set, tp ? tp - c : -1, ts ? ts - c : -1,
+				       (cb.GPUEndTime - c / 1e3) * 1e3, status_name(cb.status));
+				usleep(5000);
+			}
+			printf("\n");
+		}
+	}
+
+	printf("    e. buffer A waits W 1, tiny blit; buffer B behind it on the queue: scheduled signal 1, tiny blit "
+	       "(ms from B's commit):");
+	for (int k = 0; k < 3; k++) {
+		id<MTLSharedEvent> ev = [D newSharedEvent], w = [D newSharedEvent];
+		id<MTLCommandBuffer> a = [Q commandBuffer];
+		[a encodeWaitForEvent:w value:1];
+		enc_tiny(a, small);
+		id<MTLCommandBuffer> b = [Q commandBuffer];
+		sched_signal(b, ev, 1);
+		enc_tiny(b, small);
+		__block volatile double tp = 0, t0 = 0;
+		dispatch_group_t g = dispatch_group_create();
+		poll_event(g, ev, 1, &t0, &tp);
+		[a commit];
+		double c = oracle_now_ms();
+		t0 = c;
+		[b commit];
+		usleep(200000);
+		double set = oracle_now_ms() - c;
+		w.signaledValue = 1;
+		[b waitUntilCompleted];
+		dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 4 * NSEC_PER_SEC));
+		printf(" [set at %.1f; 1 read at %.2f; %s]", set, tp ? tp - c : -1, status_name(b.status));
+		usleep(5000);
+	}
+	printf("\n");
+
+	printf("  8. the same event: a scheduled signal and a wait on it in one buffer, no CPU set (up to 8 s)\n");
+	{
+		static const char *const names[] = {
+		    "a. wait 1, scheduled signal 1, tiny blit",
+		    "b. scheduled signal 1, wait 1, tiny blit",
+		};
+		for (int s = 0; s < 2; s++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = [Q commandBuffer];
+			if (s == 0) {
+				[cb encodeWaitForEvent:ev value:1];
+				sched_signal(cb, ev, 1);
+			} else {
+				sched_signal(cb, ev, 1);
+				[cb encodeWaitForEvent:ev value:1];
+			}
+			enc_tiny(cb, small);
+			dispatch_semaphore_t fin = dispatch_semaphore_create(0);
+			__block volatile double tc = 0, ts = 0;
+			[cb addScheduledHandler:^(id<MTLCommandBuffer> _) { ts = oracle_now_ms(); }];
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> _) {
+				tc = oracle_now_ms();
+				dispatch_semaphore_signal(fin);
+			}];
+			double c = oracle_now_ms();
+			[cb commit];
+			long timed_out =
+			    dispatch_semaphore_wait(fin, dispatch_time(DISPATCH_TIME_NOW, 8 * NSEC_PER_SEC));
+			printf("    %s: value %llu; scheduled handler %.2f ms; completed handler %.2f ms%s\n",
+			       names[s], (unsigned long long)ev.signaledValue, ts ? ts - c : -1, tc ? tc - c : -1,
+			       timed_out ? " (not within 8 s)" : "");
+			print_status("  the buffer", cb);
+			if (timed_out) {
+				ev.signaledValue = 1;
+				[cb waitUntilCompleted];
+				print_status("  after a CPU set of 1", cb);
+			}
+		}
+	}
+
+	printf("  9. a listener's queue: the block's queue label for a listener of its own queue, and the "
+	       "default listener's\n");
+	{
+		dispatch_queue_t own = dispatch_queue_create("oracle.listener", DISPATCH_QUEUE_SERIAL);
+		MTLSharedEventListener *mine = [[MTLSharedEventListener alloc] initWithDispatchQueue:own];
+		for (int s = 0; s < 2; s++) {
+			id<MTLSharedEvent> ev = [D newSharedEvent];
+			id<MTLCommandBuffer> cb = [Q commandBuffer];
+			sched_signal(cb, ev, 1);
+			enc_tiny(cb, small);
+			static char label[64];
+			label[0] = 0;
+			dispatch_semaphore_t got = dispatch_semaphore_create(0);
+			[ev notifyListener:s ? mine : listener
+			           atValue:1
+			             block:^(id<MTLSharedEvent> _e, uint64_t _v) {
+				             const char *q = dispatch_queue_get_label(DISPATCH_CURRENT_QUEUE_LABEL);
+				             snprintf(label, sizeof label, "%s", q ? q : "");
+				             dispatch_semaphore_signal(got);
+			             }];
+			[cb commit];
+			[cb waitUntilCompleted];
+			dispatch_semaphore_wait(got, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC));
+			printf("    %s listener: '%s'\n", s ? "its own queue's" : "the default", label);
+		}
+	}
+}
+
+// Misuse, each in a child process of its own: the call with an encoder open, after the commit,
+// with a nil event (on a buffer that retains its references and on one that does not) and with a
+// plain event (newEvent). Prints a line after the call, so a line missing says it ended the
+// process.
+static void case_schedsig_misuse(const char *which)
+{
+	gSchedSel = sel_registerName("encodeSignalEventScheduled:value:");
+	id<MTLBuffer> small = [D newBufferWithLength:4096 options:MTLResourceStorageModeShared];
+	id<MTLSharedEvent> ev = [D newSharedEvent];
+	id<MTLCommandBuffer> cb = !strcmp(which, "schedsig_nil_unretained") ||
+	                                  !strcmp(which, "schedsig_plain_unretained")
+	                              ? [Q commandBufferWithUnretainedReferences]
+	                              : [Q commandBuffer];
+	if (![(id)cb respondsToSelector:gSchedSel]) {
+		printf("case %s: n/r\n", which);
+		return;
+	}
+	if (!strcmp(which, "schedsig_open")) {
+		id<MTLBlitCommandEncoder> e = [cb blitCommandEncoder];
+		[e fillBuffer:small range:NSMakeRange(0, 256) value:1];
+		sched_signal(cb, ev, 1);
+		printf("case %s: the call returned with a blit encoder open\n", which);
+		[cb commit];
+		[cb waitUntilCompleted];
+	} else if (!strcmp(which, "schedsig_late")) {
+		enc_tiny(cb, small);
+		[cb commit];
+		sched_signal(cb, ev, 1);
+		printf("case %s: the call returned after the commit\n", which);
+		[cb waitUntilCompleted];
+	} else if (!strncmp(which, "schedsig_plain", 14)) {
+		id<MTLEvent> plain = [D newEvent];
+		sched_signal(cb, plain, 1);
+		printf("case %s: the call returned for a plain event\n", which);
+		enc_tiny(cb, small);
+		[cb commit];
+		[cb waitUntilCompleted];
+	} else {
+		sched_signal(cb, nil, 1);
+		printf("case %s: the call returned for a nil event\n", which);
+		enc_tiny(cb, small);
+		[cb commit];
+		[cb waitUntilCompleted];
+	}
+	usleep(10000);
+	print_status("the buffer", cb);
+	printf("    the event's value: %llu\n", (unsigned long long)ev.signaledValue);
+}
+
+enum { GPUTIMES_RUNS = 7, GPUTIMES_W = 1920, GPUTIMES_H = 1080 };
+
+static id<MTLRenderPipelineState> gBlend;
+static id<MTLTexture> gTarget;
+
+// One render pass over gTarget: a clear, then 6 blended full-target quads.
+static void enc_pass(id<MTLCommandBuffer> cb)
+{
+	MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+	rp.colorAttachments[0].texture = gTarget;
+	rp.colorAttachments[0].loadAction = MTLLoadActionClear;
+	rp.colorAttachments[0].storeAction = MTLStoreActionStore;
+	rp.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
+	id<MTLRenderCommandEncoder> e = [cb renderCommandEncoderWithDescriptor:rp];
+	[e setRenderPipelineState:gBlend];
+	float rect[4] = {-1, -1, 1, 1}, z = 0, color[4] = {0.2f, 0.4f, 0.6f, 0.3f};
+	[e setVertexBytes:rect length:sizeof rect atIndex:0];
+	[e setVertexBytes:&z length:sizeof z atIndex:1];
+	[e setFragmentBytes:color length:sizeof color atIndex:0];
+	for (int i = 0; i < 6; i++)
+		[e drawPrimitives:MTLPrimitiveTypeTriangleStrip vertexStart:0 vertexCount:4];
+	[e endEncoding];
+}
+
+// K encoders of one kind in `cb`: compute (slow_write of `iters`) or a render pass; the CPU
+// sleeps `sleep_us` between them.
+static void enc_k(id<MTLCommandBuffer> cb, int render, int k, id<MTLBuffer> b, uint32_t iters,
+                  useconds_t sleep_us)
+{
+	for (int i = 0; i < k; i++) {
+		if (i && sleep_us)
+			usleep(sleep_us);
+		if (render) {
+			enc_pass(cb);
+		} else {
+			id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+			enc_slow(e, b, iters);
+			[e endEncoding];
+		}
+	}
+}
+
+static void gputimes_row(const char *what, int render, int k, id<MTLBuffer> b, uint32_t iters,
+                         useconds_t sleep_us)
+{
+	double span[GPUTIMES_RUNS], start[GPUTIMES_RUNS], handler[GPUTIMES_RUNS];
+	double sum[GPUTIMES_RUNS], aspan[GPUTIMES_RUNS], astart[GPUTIMES_RUNS];
+	for (int r = 0; r < GPUTIMES_RUNS; r++) {
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		enc_k(cb, render, k, b, iters, sleep_us);
+		__block volatile double done = 0;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> _) { done = oracle_now_ms(); }];
+		double c0 = oracle_now_ms();
+		[cb commit];
+		[cb waitUntilCompleted];
+		while (done == 0)
+			usleep(100);
+		span[r] = (cb.GPUEndTime - cb.GPUStartTime) * 1e3;
+		start[r] = cb.GPUStartTime * 1e3 - c0;
+		handler[r] = done - cb.GPUEndTime * 1e3;
+		if (cb.status != MTLCommandBufferStatusCompleted)
+			printf("  ! whole status %ld\n", (long)cb.status);
+		if (sleep_us) {
+			sum[r] = aspan[r] = astart[r] = 0;
+			continue;
+		}
+		id<MTLCommandBuffer> cbs[32];
+		for (int i = 0; i < k; i++) {
+			cbs[i] = [Q commandBuffer];
+			enc_k(cbs[i], render, 1, b, iters, 0);
+		}
+		double a0 = oracle_now_ms();
+		for (int i = 0; i < k; i++)
+			[cbs[i] commit];
+		[cbs[k - 1] waitUntilCompleted];
+		sum[r] = 0;
+		for (int i = 0; i < k; i++) {
+			[cbs[i] waitUntilCompleted];
+			sum[r] += (cbs[i].GPUEndTime - cbs[i].GPUStartTime) * 1e3;
+		}
+		aspan[r] = (cbs[k - 1].GPUEndTime - cbs[0].GPUStartTime) * 1e3;
+		astart[r] = cbs[0].GPUStartTime * 1e3 - a0;
+	}
+	sort_ms(span, GPUTIMES_RUNS);
+	sort_ms(start, GPUTIMES_RUNS);
+	sort_ms(handler, GPUTIMES_RUNS);
+	sort_ms(sum, GPUTIMES_RUNS);
+	sort_ms(aspan, GPUTIMES_RUNS);
+	sort_ms(astart, GPUTIMES_RUNS);
+	int m = GPUTIMES_RUNS / 2;
+	printf("  %-34s K %2d  whole: span %8.3f (min %8.3f max %8.3f) start %+7.3f handler %+7.3f  "
+	       "apart: summed %8.3f span %8.3f start %+7.3f\n",
+	       what, k, span[m], span[0], span[GPUTIMES_RUNS - 1], start[m], handler[m], sum[m], aspan[m],
+	       astart[m]);
+}
+
+static void case_gputimes(void)
+{
+	gSlow = cpipe("slow_write");
+	if (!gSlow)
+		return;
+	MTLRenderPipelineDescriptor *pd = [MTLRenderPipelineDescriptor new];
+	pd.vertexFunction = [L newFunctionWithName:@"quad_vs"];
+	pd.fragmentFunction = [L newFunctionWithName:@"solid_fs"];
+	pd.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+	pd.colorAttachments[0].blendingEnabled = YES;
+	pd.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+	pd.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+	NSError *err = nil;
+	gBlend = [D newRenderPipelineStateWithDescriptor:pd error:&err];
+	if (!gBlend) {
+		printf("  ! render pipeline: %s\n", err.description.UTF8String);
+		return;
+	}
+	MTLTextureDescriptor *td = [MTLTextureDescriptor
+	    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                 width:GPUTIMES_W
+	                                height:GPUTIMES_H
+	                             mipmapped:NO];
+	td.usage = MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModePrivate;
+	gTarget = [D newTextureWithDescriptor:td];
+	id<MTLBuffer> b = [D newBufferWithLength:N * 4 options:MTLResourceStorageModePrivate];
+	// Calibrate one encoder near 0.5 ms
+	uint32_t iters = 40;
+	double gpu = 0;
+	for (int k = 0; k < 8; k++) {
+		id<MTLCommandBuffer> cb = [Q commandBuffer];
+		enc_k(cb, 0, 1, b, iters, 0);
+		oracle_commit_wait(cb, NULL, &gpu);
+		if ((gpu > 0.4 && gpu < 0.65) || k == 7)
+			break;
+		iters = (uint32_t)(iters * (0.5 / (gpu > 0.01 ? gpu : 0.01)));
+		if (iters < 1)
+			iters = 1;
+	}
+	id<MTLCommandBuffer> one = [Q commandBuffer];
+	enc_k(one, 1, 1, b, iters, 0);
+	double pass = 0;
+	oracle_commit_wait(one, NULL, &pass);
+	printf("case gputimes: compute encoder %u iterations = %.3f ms GPU; render pass = %.3f ms GPU\n",
+	       iters, gpu, pass);
+	int ks[] = {1, 8, 32};
+	for (int i = 0; i < 3; i++)
+		gputimes_row("compute", 0, ks[i], b, iters, 0);
+	for (int i = 0; i < 3; i++)
+		gputimes_row("render", 1, ks[i], b, iters, 0);
+	gputimes_row("compute, CPU sleeps 1 ms between", 0, 8, b, iters, 1000);
+}
+
 static int run_case(int argc, char **argv)
 {
 	L = oracle_library(D, gArgv0, "oracle");
@@ -852,6 +1534,12 @@ static int run_case(int argc, char **argv)
 		case_submitted();
 	else if (!strcmp(argv[0], "events"))
 		case_events();
+	else if (!strcmp(argv[0], "gputimes"))
+		case_gputimes();
+	else if (!strcmp(argv[0], "schedsig"))
+		case_schedsig();
+	else if (!strncmp(argv[0], "schedsig_", 9))
+		case_schedsig_misuse(argv[0]);
 	else
 		return 2;
 	return 0;
@@ -872,7 +1560,10 @@ int main(int argc, char **argv)
 	}
 	oracle_header("oracle_cmdbuf", D);
 	D = nil;
-	static const char *const all[] = {"hazards", "timing", "submitted", "events"};
+	static const char *const all[] = {"hazards",  "timing",        "submitted",     "events",
+	                                  "gputimes", "schedsig",      "schedsig_open", "schedsig_late",
+	                                  "schedsig_nil", "schedsig_nil_unretained", "schedsig_plain",
+	                                  "schedsig_plain_unretained"};
 	for (size_t i = 0; i < sizeof all / sizeof all[0]; i++) {
 		if (argc > 2 && strcmp(argv[2], all[i]))
 			continue;

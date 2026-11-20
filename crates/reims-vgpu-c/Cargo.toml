@@ -1,6 +1,6 @@
 [package]
 name = "reims-vgpu-c"
-description = "The C API (rvg_*) over reims-vgpu; adds no behaviour"
+description = "The C API (rvg_*) of the reims-graphics device over reims-vgpu; adds no behaviour"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,9 +8,9 @@ publish.workspace = true
 license.workspace = true
 
 [lib]
-# cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the suite's
-# runner links; staticlib: lib/libreims_vgpu.a, which QEMU and the smoke link; rlib so Rust tests
-# link it.
+# cdylib: the dist tree's lib/libreims_vgpu.dylib (@rpath/libreims_vgpu.dylib), which the C
+# harness links (built as @rpath/libreims_vgpu_c.dylib on macOS, build.rs); staticlib:
+# lib/libreims_vgpu.a, which QEMU links; rlib so Rust tests link it.
 crate-type = ["cdylib", "staticlib", "rlib"]
 
 [features]
@@ -18,21 +18,23 @@ default = ["macos-sdl"]
 # SDL3's window on macOS (`reims-vgpu`'s `macos-sdl`), on by default: `--no-default-features`
 # builds the macOS library without SDL, its windows AppKit's alone.
 macos-sdl = ["reims-vgpu/macos-sdl"]
-# The Vulkan platform's proof of concept (architecture 11.1): every handle is made on
-# `VulkanPlatform` in place of `MetalPlatform`. Off by default: the Metal platform is the product.
-# `cargo xtask dist --platform vulkan` builds the dist tree with it.
+# Kept for the builds that name it (`--features vulkan`): every handle is made on `VulkanPlatform`
+# with or without it (`Plat`, `lib.rs`).
 vulkan = ["reims-vgpu/vulkan"]
 
 [dependencies]
 reims-vgpu.workspace = true
 # The graphics device's wire constants, which the C API's PCI constants are checked against.
-reims-graphics.workspace = true
-# The platform trait's associated types (the unit tests' testkit platform stands where
-# MetalPlatform stands in the product), and the log hook.
-reims-vgpu-core.workspace = true
+reims-vgpu-graphics.workspace = true
+# The death of a NULL handle, and the mark of the library's threads (the unit tests' testkit
+# platform stands where VulkanPlatform stands in the product).
+reims-vgpu-vulkan.workspace = true
+# A refusal of a memory map's files.
 log.workspace = true
-parking_lot.workspace = true
-# `fstat` and the host's page size, for the files behind a memory map's ranges.
+
+# On Linux and macOS, `fstat` and the host's page size, for the files behind a memory map's
+# ranges (Windows's sections take `windows-sys`, below).
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [target.'cfg(any(all(target_os = "linux", target_arch = "x86_64"), all(target_os = "macos", target_arch = "aarch64")))'.dependencies]
@@ -43,9 +45,25 @@ tikv-jemallocator.workspace = true
 # `exception::catch` around every call of a host function (`ffi::host_call`, `ffi/catch/macos.rs`).
 objc2.workspace = true
 
+# On Windows, the sections behind a memory map's ranges: the host's page size, a view that checks
+# a section's size, and the duplicate of its handle (`memory/windows.rs`).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+# On Windows, the tests: the sections they make (`CreateFileMappingW`).
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { workspace = true, features = ["Win32_Security", "Win32_System_Memory"] }
+
 [dev-dependencies]
 reims-vgpu = { workspace = true, features = ["testkit"] }
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+reims-vgpu-vulkan = { workspace = true, features = ["testkit"] }
+# The window tests' recorder.
+parking_lot.workspace = true
 
 [target.'cfg(target_os = "macos")'.dev-dependencies]
 # The exceptions `ffi`'s tests throw as a host would (`ffi/tests/macos.rs`).

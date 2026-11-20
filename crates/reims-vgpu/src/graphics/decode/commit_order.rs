@@ -34,13 +34,13 @@
 //!   their waiters each. One that holds the op takes the order's lock once at its begin, and waits
 //!   only where the queues' threads took the buffers in another order than the guest posted them.
 //!
-//! [`RGFX_OP_COMMIT_ORDER`]: reims_graphics::ops::RGFX_OP_COMMIT_ORDER
+//! [`RGFX_OP_COMMIT_ORDER`]: reims_vgpu_graphics::ops::RGFX_OP_COMMIT_ORDER
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 use super::surface_order::Marks;
 
@@ -214,16 +214,16 @@ mod tests {
     use std::thread::JoinHandle;
     use std::time::{Duration, Instant};
 
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_SUBMITTED, RgfxCommandBuffer,
         RgfxOpHeader, RgfxSurfaceOrderWait,
     };
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
         RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxMsgHeader, RgfxObjectDestroy, RgfxQueueCreate,
     };
-    use reims_vgpu_core::sync::Mutex;
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::sync::Mutex;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
     use zerocopy::IntoBytes;
 
     use super::super::{DecodeError, GraphicsDecoder};
@@ -251,7 +251,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let submitted = Arc::new(Mutex::new(Vec::new()));
         let sink = Arc::clone(&submitted);
@@ -347,7 +347,9 @@ mod tests {
             (std::thread::Builder::new().name(name.into()))
                 .spawn(move || {
                     let device = p.device();
-                    let begun = dec.begin_taken(&device, &message, Some(queue)).unwrap()?;
+                    let begun = dec
+                        .begin_taken(&device, &message, Some(queue), false)
+                        .unwrap()?;
                     dec.finish_command_buffer(&device, &message, begun).unwrap()
                 })
                 .unwrap()
@@ -422,7 +424,10 @@ mod tests {
         let device = r.p.device();
         let mut y = r.sender(A);
         let named = message(A, 5, &ops(&[], false));
-        let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+        let begun = y
+            .begin_taken(&device, &named, Some(A), false)
+            .unwrap()
+            .unwrap();
         assert_eq!(r.state(A), (5, 0));
         until("its begin", || r.state(A2).0 == 3);
         std::thread::sleep(WATCH);
@@ -462,7 +467,7 @@ mod tests {
                     (namer, message(A2, 3, &ops(&[(A, 5)], false))),
                     (asker, message(A2, 4, &ops(&[], true))),
                 ] {
-                    let begun = dec.begin_taken(&device, &message, Some(A2)).unwrap();
+                    let begun = dec.begin_taken(&device, &message, Some(A2), false).unwrap();
                     to_lane.send((dec, message, begun)).unwrap();
                 }
             })
@@ -541,7 +546,7 @@ mod tests {
     /// failure is posted.
     #[test]
     fn a_buffer_named_whose_begin_fails_lets_the_buffer_that_names_it_go_on() {
-        use reims_vgpu_core::testkit::Step;
+        use reims_vgpu_vulkan::core::testkit::Step;
         use zerocopy::FromBytes;
 
         for how in ["op_bytes", "short", "refused"] {
@@ -562,7 +567,7 @@ mod tests {
                 "short" => named.truncate(size_of::<RgfxMsgHeader>() + 4),
                 _ => r.p.script().push("commandBuffer", Step::Nil),
             }
-            let failed = y.begin_taken(&device, &named, Some(A)).unwrap();
+            let failed = y.begin_taken(&device, &named, Some(A), false).unwrap();
             let expected = if how == "refused" {
                 DecodeError::Refused
             } else {
@@ -587,7 +592,10 @@ mod tests {
             let device = r.p.device();
             let mut y = r.sender(A);
             let named = message(A, 5, &ops(&[], false));
-            let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+            let begun = y
+                .begin_taken(&device, &named, Some(A), false)
+                .unwrap()
+                .unwrap();
             let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
             std::thread::sleep(WATCH);
             assert!(
@@ -610,7 +618,10 @@ mod tests {
         let device = r.p.device();
         let mut y = r.sender(A);
         let named = message(A, 5, &ops(&[], false));
-        let begun = y.begin_taken(&device, &named, Some(A)).unwrap().unwrap();
+        let begun = y
+            .begin_taken(&device, &named, Some(A), false)
+            .unwrap()
+            .unwrap();
         let x = r.carry_out("x", A2, 3, &ops(&[(A, 5)], false));
         std::thread::sleep(WATCH);
         assert!(

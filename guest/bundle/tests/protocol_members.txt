@@ -1,15 +1,16 @@
 # The register of the Metal protocol members the bundle's classes answer, and how each is
 # answered: tests/protocol_members_tests.mm walks every member of every MTL* protocol a class of
-# ours adopts, through the Objective-C runtime, and fails on a member this file does not list, a
-# line no class has, or a kind the code contradicts. Its header says what each kind means and
-# what is checked of it. A new member (a new macOS, a new class or protocol) fails the test until
-# it is listed here; the test's --propose prints a line for each, with the kind the code suggests.
+# ours adopts, and of each one's SPI counterpart (MTLFooSPI), through the Objective-C runtime, and
+# fails on a member this file does not list, a line no class has, or a kind the code contradicts.
+# Its header says what each kind means and what is checked of it. A new member (a new macOS, a
+# new class or protocol) fails the test until it is listed here; the test's --propose prints a
+# line for each, with the kind the code suggests.
 #
 # One line per member, "selector kind text", under the [Class] that answers it: a member a
 # subclass inherits from a class of ours is listed under that class, and one only a base that is
 # not ours answers, or no class answers, under the class that adopts the protocol. The protocols
-# are those of the Mac the test runs on (its Metal.framework), which the guest's macOS may differ
-# from by a few members.
+# are those of the Mac the test runs on (its Metal.framework), with the members the guest's
+# releases carry and the Mac's lacks (tests/protocol_members_releases.txt).
 #
 # The reasons several lines share:
 
@@ -17,6 +18,7 @@
 %no-peers a view of the object on another GPU of a peer group: no buffer or texture of the device is one, and Metal answers nil for an object that is not (measured for a texture: M3 Max)
 %no-sparse the device makes no sparse buffers or textures (their creators are RGFX_UNSUPPORTED), so no resource of it has a sparse tier, tiles or a mip tail
 %pipeline-reflection Metal answers nil for a pipeline a device makes, reflection asked for or not (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
+%iosurface-rows Metal's 16, as the AMD 5300M, the Intel 630 and the M3 Max answer (measured), not the host's answer: CoreAnimation makes no texture of a surface whose rows are not at a multiple of it, and the surfaces other code makes carry rows at IOSurface's own alignment, 64 bytes, which the host's answer can exceed (src/RgfxCaps.hpp, kRgfxIOSurfaceTextureAlignmentBytes)
 %no-validation the device validates no shader, and Metal answers MTLShaderValidationDisabled for a pipeline made without validation (measured: M3 Max, compute and render; AMD 5300M and Intel 630, render)
 %absent-as-metal none of Metal's own devices answers it either (measured with respondsToSelector:, M3 Max on macOS 27 and the AMD 5300M and Intel 630 on macOS 26.7.1), so a caller that sends it to any device checks first
 %base-creator left to the base, as tests/inherited_tests.mm lists, with why
@@ -25,9 +27,28 @@
 %spi-no-ray-tracing the IOGPU base answers NO, the lane's answer: it makes no acceleration structures (ray tracing is RGFX_UNSUPPORTED, and supportsRaytracing answers the host's NO), where Metal's devices answer YES
 %icb-render-states the macOS 26 render states of an indirect command: the AMD 5300M and the Intel 630 raise an unrecognized selector for each, answering respondsToSelector: YES (measured, tools/oracle/oracle_icb.m), and so does the command (the M3 Max raises an API-not-supported exception)
 %spi-no-counters the IOGPU base answers NO, the lane's answer: it samples no counters (counter sampling is RGFX_UNSUPPORTED, and counterSets is nil), where Metal's devices answer YES
-%spi-no-dylibs the IOGPU base answers NO, the lane's answer: it makes no dynamic libraries (RGFX_UNSUPPORTED, and supportsDynamicLibraries answers NO), where Metal's devices answer YES
+%spi-no-dylibs the IOGPU base answers NO: the lane makes a compute pipeline's dynamic libraries and no render pipeline's (supportsRenderDynamicLibraries answers NO), and what these queries gate of them is not established, where Metal's devices answer YES
 %spi-no-pipeline-libraries the IOGPU base answers NO, the lane's answer: it makes no pipeline libraries (newPipelineLibraryWithFilePath:error: is RGFX_UNSUPPORTED), where Metal's devices answer YES
 %spi-no-shared-textures the IOGPU base answers NO, the lane's answer: it makes no shared textures or handles (RGFX_UNSUPPORTED), where Metal's devices answer YES
+%gl-function Metal's own function of GL IR answers it, the same for every shader (measured: macOS 26.7.1, the Intel 630's device: the name __main, MTLPatchTypeNone, a control point count of 0, no vertex or stage input attributes, no function constants, no options)
+%gl-spi Metal's function of GL IR answers it, the same for both shaders asked (measured: macOS 26.7.1, the Intel 630's device, tools/gl_probe.m -s, the functions of a vertex and a fragment shader; each is a function of a library, _MTLFunctionInternal)
+%fnptr-spi the x86 Macs' answer is not measured: oracle_spi_members makes no function handle or visible function table, and no class of ours answers it
+%dylib-spi the x86 Macs' answer is not measured: oracle_spi_members makes no dynamic library, and no class of ours answers it
+%spi-neither an SPI member neither the AMD 5300M's nor the Intel 630's objects of the kind answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
+%spi-differ an SPI member one of the AMD 5300M's and the Intel 630's objects of the kind answers and the other does not (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m), so a caller that sends it to an x86 Mac's object asks first
+%cb-base Metal's base command buffer, _MTLCommandBuffer, and its IOAccel subclass, MTLIOAccelCommandBuffer (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandBufferSPI); that the AMD 5300M's and the Intel 630's buffers answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
+%cb-answers what a fresh buffer of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%q-base Metal's base command queue, _MTLCommandQueue (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, MTLCommandQueueSPI); that the AMD 5300M's and the Intel 630's queues answer from it, not from their own classes, is to be measured with oracle_spi_members' answering class
+%q-answers what a fresh queue of the AMD 5300M's and of the Intel 630's answers (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%enc-base Metal's base command encoder, _MTLCommandEncoder, its base parallel render encoder, _MTLParallelRenderCommandEncoder, and their IOAccel subclasses (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxCommandObjects.mm, the encoders' SPI sections); that the AMD 5300M's and the Intel 630's encoders answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
+%pipe-base Metal's base pipelines, _MTLComputePipelineState and _MTLRenderPipelineState (read from code: macOS 27.0.1's Metal on the M3 Max; src/RgfxComputePipelineState.mm and src/RgfxRenderPipelineState.mm, their SPI sections); that the AMD 5300M's and the Intel 630's pipelines answer from these classes, not from their own, is to be measured with oracle_spi_members' answering class
+%spi-answers what a fresh object of the kind of the AMD 5300M's and of the Intel 630's answers, for a member that takes no argument (measured: macOS 26.7.1, tools/oracle/oracle_spi_members.m answers)
+%in-flight NO while a command buffer that names the resource's memory is submitted and its completion is yet to be taken, for any use, and YES before and after, as the Intel 630 answers (measured: macOS 26.7.1, tools/oracle/oracle_complete.m; docs/graphics-kext/dgpu-oracle.md, Q26; RGFX_RESOURCE_SPI)
+%old-only a member only older guest releases' protocols carry (tests/protocol_members_releases.txt), with no public counterpart; no app pass on the releases that carry it showed a guest framework sending it to the bundle's objects (the bundle logs each selector it does not recognize, RGFX: unrecognized), so a call raises an unrecognized selector, as it did before
+%x86-residency residency sets on the x86 device, which makes none, as the x86 Macs make none (measured: macOS 26.7.1, the AMD 5300M and the Intel 630; RgfxMakesResidencySets, src/RgfxResidencySet.h): this register's bundle is the x86 one; the arm64 device makes them and its queue, command buffer and encoders hold them
+%residency-held the device keeps every allocation resident, so a residency set's request of residency, and its end, have nothing to do, and neither changes what the set answers, as on the M3 Max (measured: macOS 27.0.1, tools/oracle/oracle_residency)
+%residency-spi Metal's IOGPU queue and command buffer send it to their own sets (measured: the M3 Max, macOS 27.0.1, tools/oracle/oracle_residency layer-spy, which saw setCurrentGeneration: and setExpiredGeneration: of these, from IOGPU alone); the device's queue and command buffer are its own and send none, and QuartzCore, which changes a CAMetalLayer's set, sends none of them
+%old-only-device a member only macOS 11's or 12's MTLDeviceSPI carries (tests/protocol_members_releases.txt): on those releases the device's IOGPU base answers it, the guest's own class (measured: macOS 11.7.11, the device answers it); on the Mac the base lacks it
 
 [RgfxArgumentEncoder]
 alignment implemented
@@ -53,7 +74,7 @@ setSamplerState:atIndex: implemented
 setSamplerStates:withRange: implemented
 setTexture:atIndex: implemented
 setTextures:withRange: implemented
-setVisibleFunctionTable:atIndex: partial function pointers
+setVisibleFunctionTable:atIndex: implemented
 setVisibleFunctionTables:withRange: implemented
 
 [RgfxBinaryArchive]
@@ -120,6 +141,7 @@ newTextureWithDescriptor:offset:bytesPerRow: implemented
 remoteStorageBuffer metal %no-peers
 removeAllDebugMarkers metal %debug
 resourceOptions implemented
+setPurgeableState: implemented
 sparseBufferTier metal %no-sparse
 storageMode implemented
 
@@ -158,21 +180,21 @@ resourceStateCommandEncoderWithDescriptor: unsupported sparse textures
 retainedReferences implemented
 setLabel: implemented
 status implemented
-useResidencySet: partial residency sets
-useResidencySets:count: partial residency sets
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
 waitUntilCompleted implemented
 waitUntilScheduled implemented
 
 [RgfxCommandQueue]
-addResidencySet: partial residency sets
-addResidencySets:count: partial residency sets
+addResidencySet: partial %x86-residency
+addResidencySets:count: partial %x86-residency
 commandBuffer implemented
 commandBufferWithDescriptor: implemented
 commandBufferWithUnretainedReferences implemented
 insertDebugCaptureBoundary metal %debug
 label implemented
-removeResidencySet: partial residency sets
-removeResidencySets:count: partial residency sets
+removeResidencySet: partial %x86-residency
+removeResidencySets:count: partial %x86-residency
 setLabel: implemented
 
 [RgfxComputeCommandEncoder]
@@ -215,8 +237,8 @@ setStageInRegionWithIndirectBuffer:indirectBufferOffset: implemented
 setTexture:atIndex: implemented
 setTextures:withRange: implemented
 setThreadgroupMemoryLength:atIndex: implemented
-setVisibleFunctionTable:atBufferIndex: partial function pointers
-setVisibleFunctionTables:withBufferRange: partial function pointers
+setVisibleFunctionTable:atBufferIndex: implemented
+setVisibleFunctionTables:withBufferRange: implemented
 updateFence: implemented
 useHeap: implemented
 useHeaps:count: implemented
@@ -228,15 +250,15 @@ waitForFence: implemented
 allocatedSize unsupported a pipeline's allocated size (not in the host's reflection)
 forwardProgressUsage implemented
 functionHandleWithBinaryFunction: unsupported function pointers
-functionHandleWithFunction: unsupported function pointers
-functionHandleWithName: unsupported function pointers
+functionHandleWithFunction: partial function pointers, where the host makes none
+functionHandleWithName: metal raises an unrecognized selector, as the AMD 5300M's pipeline does, though it answers respondsToSelector: YES (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m)
 gpuResourceID implemented
 imageblockMemoryLengthForDimensions: unsupported imageblock memory queries (not in the host's reflection)
 maxTotalThreadsPerThreadgroup implemented
 newComputePipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
 newComputePipelineStateWithBinaryFunctions:error: unsupported binary functions
 newIntersectionFunctionTableWithDescriptor: unsupported ray tracing
-newVisibleFunctionTableWithDescriptor: unsupported function pointers
+newVisibleFunctionTableWithDescriptor: partial function pointers, where the host makes none
 recommendedPersistentThreadgroupsPerGridForThreadsPerThreadgroup: unsupported persistent threadgroup queries (not in the host's reflection)
 reflection metal %pipeline-reflection
 requiredThreadsPerThreadgroup implemented
@@ -247,6 +269,10 @@ threadExecutionWidth implemented
 
 [RgfxDepthStencilState]
 gpuResourceID metal no x86 Mac's depth/stencil state has a resource id: the AMD 5300M's and the Intel 630's answer respondsToSelector: YES and raise an unrecognized selector (measured, tools/oracle/oracle_bundle.m argbuf.ds.id), as this does
+
+[RgfxDynamicLibrary]
+installName implemented
+serializeToURL:error: implemented
 
 [RgfxFunction]
 functionConstantsDictionary implemented
@@ -272,6 +298,26 @@ newIntersectionFunctionWithDescriptor:completionHandler: implemented
 newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
 reflectionForFunctionWithName: metal a function array's library reflects no function: both x86 Macs answer nil (measured, tools/oracle/oracle_bundle.m libforms3)
 type metal a function array's library is executable: both x86 Macs answer MTLLibraryTypeExecutable (measured, tools/oracle/oracle_bundle.m libforms2)
+
+[RgfxFunctionHandle]
+functionType implemented
+gpuResourceID metal raises an unrecognized selector, as the AMD 5300M's handle does (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m): a handle reaches a shader through a table
+name implemented
+
+[RgfxGLFunction]
+device implemented
+functionConstantsDictionary metal %gl-function
+functionType implemented
+label implemented
+name metal %gl-function
+newArgumentEncoderWithBufferIndex: metal Metal's function of GL IR asserts that the index identifies no argument buffer (measured: macOS 26.7.1, the Intel 630's device), and so does this, with its words
+newArgumentEncoderWithBufferIndex:reflection: metal as newArgumentEncoderWithBufferIndex:, which ends the process
+options metal %gl-function
+patchControlPointCount metal %gl-function
+patchType metal %gl-function
+setLabel: implemented
+stageInputAttributes metal %gl-function
+vertexAttributes metal %gl-function
 
 [RgfxHeap]
 allocatedSize implemented
@@ -354,7 +400,7 @@ setVertexBuffer:offset:attributeStride:atIndex: implemented
 
 [RgfxLibrary]
 functionNames implemented
-installName metal every library the device makes is executable (it makes no dynamic library: supportsDynamicLibraries answers NO), and an executable library has no install name (nil, as Metal answers)
+installName implemented
 newFunctionWithDescriptor:completionHandler: implemented
 newFunctionWithDescriptor:error: implemented
 newFunctionWithName: implemented
@@ -363,7 +409,7 @@ newFunctionWithName:constantValues:error: partial function constants set by name
 newIntersectionFunctionWithDescriptor:completionHandler: implemented
 newIntersectionFunctionWithDescriptor:error: unsupported ray tracing
 reflectionForFunctionWithName: partial function reflection (the host sends no argument bindings)
-type metal every library the device makes is executable: it makes no dynamic library (supportsDynamicLibraries answers NO)
+type implemented
 
 [RgfxMetalDevice]
 GPUBVHBuilder base %base-spi
@@ -433,8 +479,8 @@ heapBufferSizeAndAlignWithLength:options: partial the host's heap buffer alignme
 heapTextureSizeAndAlignWithDescriptor: implemented
 indirectArgumentBufferCapabilities base %base-spi
 indirectArgumentBufferDecodingData base %base-spi
-iosurfaceReadOnlyTextureAlignmentBytes base %base-spi
-iosurfaceTextureAlignmentBytes base %base-spi
+iosurfaceReadOnlyTextureAlignmentBytes metal %iosurface-rows
+iosurfaceTextureAlignmentBytes metal %iosurface-rows
 isASTCPixelFormatsSupported base %base-spi
 isAnisoSampleFixSupported base %base-spi
 isBCTextureCompressionSupported base %base-spi
@@ -593,21 +639,21 @@ newDefaultLibrary implemented
 newDefaultLibraryWithBundle:error: implemented
 newDepthStencilStateWithDescriptor: implemented
 newDynamicLibrary:computeDescriptor:error: unsupported dynamic libraries
-newDynamicLibrary:error: unsupported dynamic libraries
+newDynamicLibrary:error: partial dynamic libraries on a host that makes none
 newDynamicLibraryFromURL:error: unsupported dynamic libraries
 newDynamicLibraryWithDescriptor:error: unsupported dynamic libraries
-newDynamicLibraryWithURL:error: unsupported dynamic libraries
+newDynamicLibraryWithURL:error: partial dynamic libraries on a host that makes none
 newDynamicLibraryWithURL:options:error: unsupported dynamic libraries
 newEvent implemented
 newEventWithOptions: implemented
 newFence implemented
-newFunctionWithGLCoreIR:functionType: unsupported OpenGL
-newFunctionWithGLCoreIR:inputsDescription:functionType: unsupported OpenGL
-newFunctionWithGLESIR:functionType: unsupported OpenGL
-newFunctionWithGLESIR:inputsDescription:functionType: unsupported OpenGL
-newFunctionWithGLIR:functionType: unsupported OpenGL
-newFunctionWithGLIR:inputsDescription:functionType: unsupported OpenGL
-newGLDrawable unsupported OpenGL
+newFunctionWithGLCoreIR:functionType: implemented
+newFunctionWithGLCoreIR:inputsDescription:functionType: implemented
+newFunctionWithGLESIR:functionType: implemented
+newFunctionWithGLESIR:inputsDescription:functionType: implemented
+newFunctionWithGLIR:functionType: implemented
+newFunctionWithGLIR:inputsDescription:functionType: implemented
+newGLDrawable base %base-creator
 newHeapWithDescriptor: implemented
 newIOCommandQueueWithDescriptor:error: partial Metal IO command queues
 newIOFileHandleWithURL:compressionMethod:error: implemented
@@ -651,7 +697,7 @@ newPipelineLibraryWithFilePath:error: unsupported pipeline libraries
 newPrecompiledComputePipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled compute pipelines of another descriptor
 newPrecompiledRenderPipelineStateWithDescriptor:options:pipelineCache:completionHandler: partial precompiled render pipelines of another descriptor
 newProfileWithExecutionSize: unsupported profiles
-newRasterizationRateMapWithDescriptor: unsupported rasterization rate maps
+newRasterizationRateMapWithDescriptor: implemented
 newRenderPipelineDescriptorWithSerializedData:deserializationContext: base %base-creator
 newRenderPipelineStateWithDescriptor:completionHandler: implemented
 newRenderPipelineStateWithDescriptor:error: implemented
@@ -665,7 +711,7 @@ newRenderPipelineStateWithTileDescriptor:completionHandler: implemented
 newRenderPipelineStateWithTileDescriptor:error: implemented
 newRenderPipelineStateWithTileDescriptor:options:completionHandler: partial tile pipelines (no tile pipeline create on the wire)
 newRenderPipelineStateWithTileDescriptor:options:reflection:error: partial tile pipelines (no tile pipeline create on the wire)
-newResidencySetWithDescriptor:error: unsupported residency sets (none on the wire)
+newResidencySetWithDescriptor:error: partial %x86-residency
 newResourceGroupFromResources:count: unsupported resource groups
 newSamplerStateWithDescriptor: implemented
 newSharedEvent implemented
@@ -818,7 +864,7 @@ supportsFragmentBufferWrites implemented
 supportsFragmentOnlyEncoders base %base-spi
 supportsFunctionPointers implemented
 supportsFunctionPointersFromMesh base %base-spi
-supportsFunctionPointersFromRender implemented
+supportsFunctionPointersFromRender metal NO, as the AMD 5300M answers (measured: macOS 26.7.1, tools/oracle/oracle_fnptr.m): the bundle carries no render stage's handles or tables
 supportsGFXIndirectCommandBuffers implemented
 supportsGPUStatistics base %spi-no-counters
 supportsGlobalVariableBindingInDylibs base %spi-no-dylibs
@@ -894,7 +940,7 @@ supportsPostDepthCoverage base %base-spi
 supportsPrimitiveMotionBlur implemented
 supportsPrimitiveRestartOverride base %base-spi
 supportsPrimitiveType: implemented
-supportsProgrammableBlending base %base-spi
+supportsProgrammableBlending implemented
 supportsProgrammableSamplePositions base %base-spi
 supportsPublicXR10Formats base %base-spi
 supportsPullModelInterpolation implemented
@@ -934,7 +980,7 @@ supportsRenderPassWithoutRenderTarget implemented
 supportsRenderTargetTextureRotation base %base-spi
 supportsRenderTextureWrites implemented
 supportsRenderToLinearTextures base %base-spi
-supportsResourceDetachBacking base %base-spi
+supportsResourceDetachBacking metal NO, as the AMD 5300M and the Intel 630 answer (measured: macOS 26.7.1, tools/base_answers_probe.m), where the IOGPU base answered YES: the device's heaps neither detach nor replace their backing (RgfxHeap's detachBacking and replaceBackingWithRanges:readOnly: raise an unrecognized selector)
 supportsResourceHeaps implemented
 supportsSIMDGroup implemented
 supportsSIMDGroupMatrix base %base-spi
@@ -991,7 +1037,7 @@ supportsYCBCRFormatsXR base %base-spi
 supportsYCBCRPackedFormats12 base %base-spi
 supportsYCBCRPackedFormatsPQ base %base-spi
 supportsYCBCRPackedFormatsXR base %base-spi
-targetDeviceArchitecture base class 2 (the Macs diverge): the IOGPU base answers nil, the lane's answer. Each Mac answers an MTLTargetDeviceArchitecture naming its GPU compiler's target (measured: cpuType 0x1000013 subType 0x1a3 on the M3 Max, 0x1000014 0x1773 on the AMD 5300M, 0x1000015 0x950200 on the Intel UHD 630), an instruction set the host cannot run; nil names none
+targetDeviceArchitecture implemented class 4 (outside the envelope) for nil, which the IOGPU base answered and no Mac does: Metal's loader ends the process at nil (+[MTLLoader sliceIDForDevice:legacyDriverVersion:airntDriverVersion:]), and MTLAssetUpgraderD ended at every app installed in the guest. Every Mac answers Metal's MTLTargetDeviceArchitecture naming its own compiler's target (measured, tools/oracle/oracle_archtype.m: cpuType 0x1000013 subType 0x1a3 driverVersion and versionCombined 0x30000 on the M3 Max, 0x1000014 0x1773 0x7d4 0xe0002 on the AMD 5300M, 0x1000015 0x950200 0x1a0701 0x1a0701 on the Intel UHD 630), so the device answers one naming its own: cpuType 0x01005247 (its PCI device id), which no Metal slice carries, subType 0, version 1.0.0 and driverVersion 0x10000
 targetDeviceInfo base %base-spi
 tensorSizeAndAlignWithDescriptor: unsupported tensors
 threadsPerCompilerProcess base %base-spi
@@ -1001,7 +1047,7 @@ unmapShaderSampleBuffer metal the device maps no shader sample buffer (its map i
 validateDynamicLibrary:state:error: base %base-spi
 validateDynamicLibraryDescriptor:error: base %base-spi
 validateDynamicLibraryURL:error: base %base-spi
-vendorName base %base-spi
+vendorName implemented class 2 (the Macs diverge): the host GPU's vendor, from the first word of the device name, in the words the Macs answer (measured: "AMD" for AMD Radeon Pro 5300M, "Intel(R)" for Intel(R) UHD Graphics 630), so "NVIDIA" for an RTX 5080; "AMD" for a name of no vendor the system's GL renderer knows, which it ends the process at; the IOGPU base answered "Apple" beside Mac2 alone, which no Mac does
 writeMeshShaderEmulatorDataStructureHeader:meshShaderPSO:scalingFactor: base %base-spi
 
 [RgfxParallelRenderCommandEncoder]
@@ -1020,6 +1066,16 @@ setDepthStoreActionOptions: implemented
 setLabel: implemented
 setStencilStoreAction: implemented
 setStencilStoreActionOptions: implemented
+
+[RgfxRasterizationRateMap]
+copyParameterDataToBuffer:offset: implemented
+layerCount implemented
+mapPhysicalToScreenCoordinates:forLayer: implemented
+mapScreenToPhysicalCoordinates:forLayer: implemented
+parameterBufferSizeAndAlign implemented
+physicalGranularity implemented
+physicalSizeForLayer: implemented
+screenSize implemented
 
 [RgfxRenderCommandEncoder]
 barrierAfterQueueStages:beforeStages: implemented
@@ -1189,6 +1245,22 @@ shaderValidation metal %no-validation
 supportIndirectCommandBuffers implemented
 threadgroupSizeMatchesTileSize implemented
 
+[RgfxResidencySet]
+addAllocation: implemented
+addAllocations:count: implemented
+allAllocations implemented
+allocatedSize implemented
+allocationCount implemented
+commit implemented
+containsAllocation: implemented
+device implemented
+endResidency metal %residency-held
+label implemented
+removeAllAllocations implemented
+removeAllocation: implemented
+removeAllocations:count: implemented
+requestResidency metal %residency-held
+
 [RgfxResource]
 device implemented
 heap implemented
@@ -1261,3 +1333,672 @@ tailSizeInBytes metal %no-sparse
 textureType implemented
 usage implemented
 width implemented
+
+[RgfxVisibleFunctionTable]
+allocatedSize implemented
+cpuCacheMode implemented
+gpuResourceID implemented
+hazardTrackingMode implemented
+resourceOptions implemented
+setFunction:atIndex: implemented
+setFunctions:withRange: implemented
+setPurgeableState: metal NonVolatile: the host backs the table with no purgeable allocation, and the M3 Max's and the Intel 630's tables answer NonVolatile whatever they are told, where the AMD 5300M's keep the state told (measured, tools/oracle/oracle_fnptr.m)
+storageMode implemented
+
+# --- the SPI counterparts' members (MTLFooSPI for each MTLFoo a class adopts) --------------------
+# Metal's own objects adopt them, and the guest's frameworks send their members without asking:
+# macOS 13's Maps sends MTLLibrarySPI's newFunctionWithName:constantValues:pipelineLibrary:error:
+# to its libraries. The forwarders are src/RgfxSpiForwarders.mm.
+
+[RgfxArgumentEncoder]
+layout unsupported argument buffers of a layout object
+[RgfxBinaryArchive]
+addComputePipelineFunctionsWithDescriptor:options:error: implemented
+addMeshRenderPipelineFunctionsWithDescriptor:options:error: implemented
+addRenderPipelineFunctionsWithDescriptor:options:error: implemented
+addTileRenderPipelineFunctionsWithDescriptor:options:error: implemented
+archiveFunctionIds unsupported an archive's function IDs
+enumerateArchivesFromBackingFile: unsupported Metal's archive backing files
+enumerateArchivesFromPipelineCollection: unsupported Metal's archive backing files
+formattedDescription: implemented
+keys implemented
+options implemented
+pipelineCollection metal null: the archive keeps no pipeline collection of Metal's, as a fresh archive of both x86 Macs answers (%spi-answers)
+recompileToArchiveWithURL:error: unsupported recompiling an archive for another target
+serializeToURL:options:error: implemented
+storeComputePipelineDescriptor: unsupported Metal's archive pipeline collections
+storeMeshRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
+storeRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
+storeTileRenderPipelineDescriptor: unsupported Metal's archive pipeline collections
+[RgfxBlitCommandEncoder]
+copyFromTensor:sourceSlice:toTensor:destinationSlice: unsupported tensors
+copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:destinationSlice:destinationLevel:destinationOrigin:options: absent %spi-differ (the Intel 630 answers it)
+endEncodingAndRetrieveProgramAddressTable implemented
+fillBuffer:range:pattern4: metal raises an unrecognized selector, as Metal's IOAccel blit encoder does: it sends itself doesNotRecognizeSelector: (read from code, MTLIOAccelBlitCommandEncoder, macOS 27.0.1)
+fillTexture:level:slice:region:bytes:length: metal raises an unrecognized selector, as Metal's IOAccel blit encoder does: it sends itself doesNotRecognizeSelector: (read from code, MTLIOAccelBlitCommandEncoder, macOS 27.0.1)
+fillTexture:level:slice:region:color: metal fills from the color in the texture's own format, as Metal's IOAccel blit encoder does (read from code, MTLIOAccelBlitCommandEncoder, macOS 27.0.1), which raises, as the fill from bytes does
+fillTexture:level:slice:region:color:pixelFormat: metal fills from the color packed as bytes, as Metal's IOAccel blit encoder does (read from code, MTLIOAccelBlitCommandEncoder, macOS 27.0.1), which raises, as the fill from bytes does
+insertSplit metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+invalidateCompressedTexture: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+invalidateCompressedTexture:slice:level: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+optimizeContentsForTexture:readAccessPattern:readAccessor: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+optimizeContentsForTexture:readAccessPattern:readAccessor:slice:level: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+[RgfxBuffer]
+_aneIOSurface metal null, as Metal's IOAccel buffer answers (read from code, MTLIOAccelBuffer, macOS 27.0.1; %spi-answers)
+allocationID implemented
+detachBacking absent %spi-neither
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+iosurface metal the device makes no buffer over an IOSurface, as neither x86 Mac does (newBufferWithIOSurface:), so the buffer lies in none, as a buffer made from a length or bytes answers none (measured: M3 Max, macOS 27)
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
+isPurgeable implemented
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
+newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage: implemented
+newTiledTextureWithDescriptor:offset:bytesPerRow: implemented
+parentGPUAddress absent %spi-neither
+parentGPUSize absent %spi-neither
+replaceBackingWithBytesNoCopy:length:deallocator: absent %spi-neither
+replaceBackingWithRanges:readOnly: absent %spi-neither
+resourceIndex absent %spi-differ (the Intel 630 answers it)
+setParentGPUAddress: absent %spi-neither
+setParentGPUSize: absent %spi-neither
+unfilteredResourceOptions implemented
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
+[RgfxCmdBuffer]
+__waitUntilCompletedAsync: implemented
+__waitUntilScheduledAsync: implemented
+addPurgedHeap: unsupported purging a heap as a command buffer runs: Metal's IOAccel buffer hands it to its kernel to purge (read from code, %cb-base)
+addPurgedResource: unsupported purging a resource as a command buffer runs: Metal's IOAccel buffer hands it to its kernel to purge (read from code, %cb-base)
+commitAndHold implemented
+commitAndWaitUntilSubmitted implemented
+commitAndWaitUntilSubmittedWithDeadline: metal commits with commitWithDeadline:, which raises an unrecognized selector, as Metal's base buffer does (read from code, %cb-base; whether the AMD 5300M's and the Intel 630's own classes override it is to be measured with oracle_spi_members' answering class)
+commitWithDeadline: metal raises an unrecognized selector, as Metal's base buffer does: it sends itself doesNotRecognizeSelector: (read from code, %cb-base; whether the AMD 5300M's and the Intel 630's own classes override it is to be measured with oracle_spi_members' answering class)
+computeCommandEncoderWithDispatchType:substreamCount: absent %spi-neither
+configWithCommandBufferDescriptor: metal Metal's base buffer takes only the descriptor's log state (read from code, %cb-base), and a descriptor of the device's has none: the device makes no log state
+deadlineProfile metal nil, as the AMD 5300M's and the Intel 630's buffers answer (measured, %cb-answers); the device carries no deadline
+debugBufferContentsWithLength: metal no debug buffer, of length 0, as Metal's base buffer answers (read from code, %cb-base)
+debugCommandEncoder absent %spi-neither
+doCorruptCBSPI: unsupported corrupting a command buffer on purpose, a tool's hook into Metal's IOAccel buffer's kernel commands (read from code, %cb-base)
+dropResourceGroups:count: absent %spi-neither
+encodeCacheHintFinalize:resourceGroups:count: absent %spi-neither
+encodeCacheHintTag:resourceGroups:count: absent %spi-neither
+encodeConditionalAbortEvent: unsupported aborting a command buffer on an event, a kernel command of Metal's IOAccel buffer (read from code, %cb-base)
+encodeDashboardFinalizeForResourceGroup:dashboard:value:forIndex: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
+encodeDashboardFinalizeForResourceGroup:dashboard:values:indices:count: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
+encodeDashboardTagForResourceGroup: metal ends the process with Metal's words, as Metal's base buffer does: not supported on this device (read from code, %cb-base)
+encodeSignalEvent:value:agentMask: implemented
+encodeSignalEventScheduled:value: absent %spi-neither (the arm64 bundle answers it, as the M3 Max's buffers do: an Apple GPU's SPI, src/RgfxCommandObjects.mm)
+encodeWaitForEvent:value:timeout: implemented
+getListIndex metal 0, as the AMD 5300M's and the Intel 630's buffers answer (measured, %cb-answers)
+globalTraceObjectID implemented
+isProfilingEnabled implemented
+presentDrawable:options: implemented
+privateData implemented
+privateDataOffset implemented
+privateLoggingBuffer implemented
+profilingResults implemented
+protectionOptions implemented
+sampledAccelerationStructureCommandEncoder:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledAccelerationStructureCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledBlitCommandEncoder:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledBlitCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithDispatchType:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledComputeCommandEncoderWithProgramInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: metal nil, as Metal's base buffer answers for each sampling encoder (read from code, %cb-base); the device samples no counters
+setLogs: implemented
+setPrivateData: implemented
+setPrivateDataOffset: implemented
+setPrivateLoggingBuffer: implemented
+setProfilingEnabled: implemented
+setProtectionOptions: implemented
+setResourceGroups:count: absent %spi-neither
+setResponsibleTaskIDs:count: metal names the tasks the work is for, which Metal's IOAccel buffer takes and does nothing with (read from code, %cb-base); nothing the guest sees changes
+setSharedIndirectionTable: implemented
+sharedIndirectionTable implemented
+useInternalResidencySet: implemented
+useInternalResidencySets:count: implemented
+userDictionary implemented
+videoCommandEncoder absent %spi-differ (the AMD 5300M answers it)
+[RgfxCommandQueue]
+StatLocations implemented
+StatOptions implemented
+addPerfSampleHandler: metal Metal's queue never called the handler after a command buffer completed (measured: M3 Max, macOS 27), and nor does this
+availableCounters metal none: the device gathers no statistics (setStatEnabled: YES is unsupported) and samples no counters, where the AMD 5300M's and the Intel 630's queues list their GPUs' own (measured, %q-answers); Metal's base queue fails it as not implemented (read from code, %q-base)
+availableCountersAndDict absent %spi-differ (the Intel 630 answers it)
+backgroundTrackingPID implemented
+commitQueue implemented
+commitSynchronously implemented
+commitsWithQoS implemented
+completionQueue implemented
+counterInfo implemented
+disableCrossQueueHazardTracking implemented
+dispatchAvailableCompletionNotifications metal does nothing, as Metal's base queue does (read from code, %q-base): the queue delivers its records as they come (rgfxDeliver:here:)
+executionEnabled implemented
+finish implemented
+getBackgroundGPUPriority implemented
+getGPUPriority implemented
+getRequestedCounters metal nil, as the AMD 5300M's and the Intel 630's queues answer (measured, %q-answers): the device samples no counters
+getStatLocations implemented
+getStatOptions implemented
+isOpenGLQueue implemented
+isProfilingEnabled implemented
+isStatEnabled implemented
+maxCommandBufferCount implemented
+numInternalSampleCounters implemented
+numRequestedCounters implemented
+qosLevel implemented
+requestCounters: metal -1, as requestCounters:withIndex: answers for every list tried (measured: M3 Max, macOS 27): the device samples no counters; Metal's base queue fails it as not implemented (read from code, %q-base)
+requestCounters:withIndex: metal -1 for every list tried (nil, empty, one counter), as Metal's queue answers (measured: M3 Max, macOS 27)
+setBackgroundGPUPriority: implemented
+setBackgroundGPUPriority:offset: implemented
+setBackgroundTrackingPID: implemented
+setCompletionQueue: implemented
+setCounterInfo: implemented
+setExecutionEnabled: partial completing a queue's command buffers without running them, as Metal's queue does while execution is off (read from code, %q-base): the device runs them
+setGPUPriority: implemented
+setGPUPriority:offset: implemented
+setNumInternalSampleCounters: implemented
+setNumRequestedCounters: implemented
+setProfilingEnabled: implemented
+setSkipRender: partial skipping a queue's render work: Metal's buffers take the switch from their queue as they are made (read from code, %q-base); what a GPU's driver skips with it is not read
+setStatEnabled: partial  command statistics
+setStatLocations: implemented
+setStatOptions: implemented
+setSubmissionQueue: implemented
+skipRender implemented
+subdivideCounterList: implemented
+[RgfxComputeCommandEncoder]
+beginVirtualSubstream absent %spi-neither
+dispatchThreadsWithIndirectBuffer:indirectBufferOffset: absent %spi-neither
+enableNullBufferBinds: absent %spi-neither
+encodeEndDoWhile:offset:comparison:referenceValue: unsupported GPU-side loops (none on the wire)
+encodeEndIf metal NO, as encodeEndWhile answers with no loop open: no conditional is ever open here (encodeStartIf:offset:comparison:referenceValue: is unsupported)
+encodeEndWhile metal NO: Metal answers NO with no loop open, and no loop is ever open here (encodeStartWhile: is unsupported)
+encodeStartDoWhile unsupported GPU-side loops (none on the wire)
+encodeStartElse unsupported GPU-side conditionals (none on the wire)
+encodeStartIf:offset:comparison:referenceValue: unsupported GPU-side conditionals (none on the wire)
+encodeStartWhile:offset:comparison:referenceValue: unsupported  GPU-side loops (none on the wire)
+endEncodingAndRetrieveProgramAddressTable implemented
+endVirtualSubstream absent %spi-neither
+insertCompressedTextureReinterpretationFlush absent %spi-neither
+insertSplit metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+insertUncompressedToCompressedFlush absent %spi-neither
+newKernelDebugInfo unsupported a shader's debug info
+nextVirtualSubstream absent %spi-neither
+setSubstream: absent %spi-neither
+setThreadgroupDistributionMode: metal does nothing, as Metal's base encoder does (read from code, %enc-base): the host's GPU spreads a dispatch's threadgroups
+setThreadgroupDistributionModeWithClusterGroupIndex: metal does nothing, as Metal's base encoder does (read from code, %enc-base): the host's GPU spreads a dispatch's threadgroups
+setThreadgroupPackingDisabled: metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+setToolsDispatchBufferSPI:atIndex: metal raises an unrecognized selector, as Metal's IOAccel compute encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+signalProgress: absent %spi-neither
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
+useResourceGroup:usage: absent %spi-neither
+waitForProgress: absent %spi-neither
+waitForVirtualSubstream: absent %spi-neither
+[RgfxComputePipelineState]
+debugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+functionReflectionWithFunctionDescriptor: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+getComputeKernelTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
+globalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+globalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
+gpuHandle metal resourceIndex, as Metal's base pipeline answers (read from code, %pipe-base; %spi-answers)
+newComputePipelineStateWithAdditionalBinaryFunctions:resourceIndices:error: unsupported  binary functions
+pipelineBinaries metal an empty dictionary, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+resourceIndex metal gpuResourceID's value: Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex (read from code, %pipe-base)
+shaderValidationState metal MTLShaderValidationDisabled, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers) and shaderValidation answers (%no-validation)
+textureWriteRoundingMode implemented
+uniqueIdentifier implemented
+[RgfxDepthStencilState]
+readsDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+readsStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+resourceIndex metal raises an unrecognized selector, as Metal's base state does (read from code, _MTLDepthStencilState, macOS 27.0.1), which ends the process on both x86 Macs (%spi-answers); as gpuResourceID
+uniqueIdentifier metal raises an unrecognized selector, as Metal's base state does (read from code, _MTLDepthStencilState, macOS 27.0.1), which ends the process on both x86 Macs (%spi-answers); as gpuResourceID
+writesDepth metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+writesStencil metal YES for every descriptor, as the AMD 5300M's and the Intel 630's states answer (measured: macOS 26.7.1)
+[RgfxDynamicLibrary]
+binaryData pending %dylib-spi
+debugInstrumentationData pending %dylib-spi
+exportedFunctions pending %dylib-spi
+exportedVariables pending %dylib-spi
+formattedDescription: pending %dylib-spi
+globalConstantsBase pending %dylib-spi
+globalConstantsSize pending %dylib-spi
+importedLibraries pending %dylib-spi
+importedSymbols pending %dylib-spi
+libraryPath pending %dylib-spi
+libraryUUID pending %dylib-spi
+reflectionData pending %dylib-spi
+relocations pending %dylib-spi
+serializeToURL:options:error: pending %dylib-spi
+setDebugInstrumentationData: pending %dylib-spi
+setRelocations: pending %dylib-spi
+shaderValidationEnabled pending %dylib-spi
+[RgfxEvent]
+enableBarrier implemented
+setEnableBarrier: implemented
+supportsRollback metal NO (%spi-answers): the device's events are never rolled back
+[RgfxFunction]
+arguments implemented
+bindings implemented
+bitCodeHash implemented
+bitcodeData implemented
+debugInstrumentationData implemented
+filePath implemented
+functionHandle metal ends the process with Metal's words, as Metal's base function does: Driver needs to override this (read from code, _MTLFunction, macOS 27.0.1; %spi-answers: a fresh function of either x86 Mac ends the process at it)
+importedLibraries implemented
+importedSymbols implemented
+lineNumber implemented
+newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
+newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
+newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
+newFunctionWithPluginData:bitcodeType: implemented
+reflectionWithOptions: implemented
+reflectionWithOptions:binaryArchives: implemented
+reflectionWithOptions:completionHandler: implemented
+reflectionWithOptions:pipelineLibrary: implemented
+relocations implemented
+renderTargetArrayIndexType implemented
+returnType implemented
+setRelocations: implemented
+unpackedFilePath implemented
+[RgfxFunctionArrayLibrary]
+bitcodeData metal nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27): its functions keep their bitcode
+externFunctionNames metal nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27)
+libraryIdentifier metal nil, as Metal's library answers for one made from bytes, from a URL and of a function array (measured: M3 Max, macOS 27)
+newExternFunctionWithName: implemented
+newFunctionWithDescriptor:destinationArchive:error: implemented
+newFunctionWithName:constantValues:functionCache:error: implemented
+newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
+newFunctionWithName:constantValues:pipelineLibrary:error: implemented
+overrideTriple implemented
+serializeToURL:error: implemented
+setOverrideTriple: implemented
+setShaderValidationEnabled: implemented
+shaderValidationEnabled implemented
+[RgfxFunctionHandle]
+resourceIndex pending %fnptr-spi
+
+[RgfxGLFunction]
+arguments metal nil (%gl-spi)
+bindings metal nil (%gl-spi)
+bitCodeHash implemented
+bitcodeData implemented
+debugInstrumentationData metal nil (%gl-spi)
+filePath metal nil (%gl-spi)
+functionHandle metal ends the process with Metal's words, as Metal's base function does: Driver needs to override this (read from code, _MTLFunction, macOS 27.0.1); Metal's function of GL IR answers it from the base (%gl-spi)
+importedLibraries metal nil (%gl-spi)
+importedSymbols metal nil (%gl-spi)
+lineNumber metal 0 (%gl-spi)
+newArgumentEncoderWithBufferIndex:pipelineLibrary: implemented
+newArgumentEncoderWithBufferIndex:reflection:binaryArchives: implemented
+newArgumentEncoderWithBufferIndex:reflection:pipelineLibrary: implemented
+newFunctionWithPluginData:bitcodeType: implemented
+reflectionWithOptions: unsupported the reflection of a function of GL IR
+reflectionWithOptions:binaryArchives: implemented
+reflectionWithOptions:completionHandler: implemented
+reflectionWithOptions:pipelineLibrary: implemented
+relocations implemented
+renderTargetArrayIndexType metal 0 (%gl-spi)
+returnType metal nil (%gl-spi)
+setRelocations: implemented
+unpackedFilePath metal nil (%gl-spi)
+[RgfxHeap]
+detachBacking metal raises an unrecognized selector, as Metal's base heap does: it sends itself doesNotRecognizeSelector: (read from code, _MTLHeap, macOS 27.0.1)
+formattedDescription: implemented
+gpuAddress implemented
+memoryPoolId metal 0, as Metal's base heap answers (read from code, _MTLHeap, macOS 27.0.1; %spi-answers)
+newAccelerationStructureWithSize:offset:resourceIndex: unsupported  ray tracing
+newAccelerationStructureWithSize:resourceIndex: unsupported  ray tracing
+replaceBackingWithRanges:readOnly: metal raises an unrecognized selector, as Metal's base heap does: it sends itself doesNotRecognizeSelector: (read from code, _MTLHeap, macOS 27.0.1)
+unfilteredResourceOptions implemented
+[RgfxIOSurfaceTexture]
+canGenerateMipmapLevels absent %spi-neither
+compressionMetadata absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+generateMipmapLevel:slice: absent %spi-neither
+gpuAddress implemented
+newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
+sparseSurfaceDefaultValue absent %spi-neither
+writeAccessPattern absent %spi-neither
+[RgfxIndirectCommandBuffer]
+allocationID implemented
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+getHeader:headerSize: unsupported an indirect command buffer's driver header
+gpuAddress gap 0: the buffer's commands live on the host, so the guest sees no GPU address of them; both x86 Macs answer their buffer's (%spi-answers)
+gpuHandle implemented
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
+isPurgeable implemented
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
+resourceIndex implemented
+unfilteredResourceOptions implemented
+uniqueIdentifier implemented
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
+[RgfxIndirectComputeCommand]
+dispatchThreadgroupsArguments unsupported reading back what an indirect command was given
+dispatchThreadsArguments unsupported reading back what an indirect command was given
+getCommandType unsupported reading back what an indirect command was given
+getImageBlockSize unsupported reading back what an indirect command was given
+getKernelAttributeStrideAtIndex: unsupported reading back what an indirect command was given
+getKernelBufferAddressAtIndex: unsupported reading back what an indirect command was given
+getKernelBufferAtIndex: unsupported reading back what an indirect command was given
+getOptimizedStatus unsupported reading back what an indirect command was given
+getPipelineStateUniqueIdentifier unsupported reading back what an indirect command was given
+getStageInRegion unsupported reading back what an indirect command was given
+getThreadgroupMemoryLengthAtIndex: unsupported reading back what an indirect command was given
+hasBarrier unsupported reading back what an indirect command was given
+setToolsDispatchBufferSPI:atIndex: absent %spi-neither
+[RgfxIndirectRenderCommand]
+drawArguments unsupported reading back what an indirect command was given
+drawIndexedArguments unsupported reading back what an indirect command was given
+drawIndexedPatchesArguments unsupported reading back what an indirect command was given
+drawMeshThreadgroupsArguments metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1); no command here draws a mesh
+drawMeshThreadsArguments metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1); no command here draws a mesh
+drawPatchesArguments unsupported reading back what an indirect command was given
+getBlendColor metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getCommandType unsupported reading back what an indirect command was given
+getCullMode metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getDepthBiasInfo metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getDepthClipMode metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getDepthStencilState metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getDepthStencilStateUniqueIdentifier metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getDepthTestBounds metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getFragmentBufferAddressAtIndex: unsupported reading back what an indirect command was given
+getFragmentBufferAtIndex: unsupported reading back what an indirect command was given
+getFrontFacingWinding metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getMeshBufferAddressAtIndex: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1); no command here draws a mesh
+getObjectBufferAddressAtIndex: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1); no command here draws a mesh
+getObjectThreadgroupMemoryLengthAtIndex: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1); no command here draws a mesh
+getOptimizedStatus unsupported reading back what an indirect command was given
+getPipelineStateUniqueIdentifier unsupported reading back what an indirect command was given
+getScissorRects metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getStencilReferenceValues metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getTessellationFactorArguments unsupported reading back what an indirect command was given
+getTriangleFillMode metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+getVertexAttributeStrideAtIndex: unsupported reading back what an indirect command was given
+getVertexBufferAddressAtIndex: unsupported reading back what an indirect command was given
+getVertexBufferAtIndex: unsupported reading back what an indirect command was given
+getViewports metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+hasBarrier unsupported reading back what an indirect command was given
+setBlendColorRed:green:blue:alpha: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setDepthTestMinBound:maxBound: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setScissorRect: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setScissorRects:count: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setStencilFrontReferenceValue:backReferenceValue: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setStencilReferenceValue: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setToolsDispatchBufferSPI:atIndex:stages: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setViewport: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+setViewports:count: metal raises an unrecognized selector, as Metal's base indirect render command does: it sends itself doesNotRecognizeSelector: (read from code, _MTLIndirectRenderCommand, macOS 27.0.1), which neither x86 Mac's command overrides
+[RgfxLibrary]
+bitcodeData implemented
+externFunctionNames implemented
+libraryIdentifier implemented
+newExternFunctionWithName: implemented
+newFunctionWithDescriptor:destinationArchive:error: implemented
+newFunctionWithName:constantValues:functionCache:error: implemented
+newFunctionWithName:constantValues:pipelineLibrary:completionHandler: implemented
+newFunctionWithName:constantValues:pipelineLibrary:error: implemented
+overrideTriple implemented
+serializeToURL:error: partial  serializing a library Metal's own does not hold
+setOverrideTriple: implemented
+setShaderValidationEnabled: implemented
+shaderValidationEnabled implemented
+[RgfxParallelRenderCommandEncoder]
+endEncodingAndRetrieveProgramAddressTable implemented
+insertSplit metal raises an unrecognized selector, as Metal's base parallel encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+sampledRenderCommandEncoderWithProgramInfoBuffer:capacity: metal nil, as the buffer's sampledRenderCommandEncoderWithDescriptor:programInfoBuffer:capacity: answers: Metal's base parallel encoder makes its sampled sub-encoder with that (read from code, %enc-base); the device samples no counters
+separateCommits metal NO, as Metal's IOAccel parallel encoder answers (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS 27.0.1)
+setSeparateCommits: metal does nothing, as Metal's IOAccel parallel encoder does (read from code, MTLIOAccelParallelRenderCommandEncoder, macOS 27.0.1)
+[RgfxRasterizationRateMap]
+formattedDescription: implemented
+minFactor implemented
+mutability implemented
+resetUsingDescriptor: implemented
+
+[RgfxRenderCommandEncoder]
+addSplitHandler: metal nothing to carry out: the device sends a pass to the host whole, so it reports no split and calls no handler
+dispatchThreadsPerTile:inRegion: unsupported  tile dispatches over a region
+dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex: absent %spi-neither
+dispatchThreadsPerTile:inRegion:withRenderTargetArrayIndex:withCondition: absent %spi-neither
+dispatchThreadsPerTile:withCondition: absent %spi-neither
+enableNullBufferBinds: absent %spi-neither
+endEncodingAndRetrieveProgramAddressTable implemented
+insertSplit metal raises an unrecognized selector, as Metal's base encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+isMemorylessRender metal NO, as Metal's IOAccel render encoder, MTLIOAccelRenderCommandEncoder, answers (read from code: macOS 27.0.1's Metal on the M3 Max)
+resetTileCondition absent %spi-neither
+setAlphaTestReferenceValue: absent %spi-neither
+setClipPlane:p2:p3:p4:atIndex: absent %spi-neither
+setColorResolveTexture:slice:depthPlane:level:atIndex: absent %spi-neither
+setColorResolveTexture:slice:depthPlane:level:yInvert:atIndex: absent %spi-neither
+setCommandDataCorruptModeSPI: absent %spi-neither
+setDepthCleared gap what Metal's encoder does with it is not established; this does nothing
+setDepthClipModeSPI: implemented
+setDepthResolveTexture:slice:depthPlane:level: absent %spi-neither
+setDepthResolveTexture:slice:depthPlane:level:yInvert: absent %spi-neither
+setFragmentSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex: absent %spi-neither
+setFragmentTexture:atTextureIndex:samplerState:atSamplerIndex: implemented
+setLineWidth: implemented
+setMeshAccelerationStructure:atBufferIndex: partial ray tracing
+setMeshIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setMeshIntersectionFunctionTables:withBufferRange: partial ray tracing
+setMeshVisibleFunctionTable:atBufferIndex: partial function pointers
+setMeshVisibleFunctionTables:withBufferRange: partial function pointers
+setObjectAccelerationStructure:atBufferIndex: partial ray tracing
+setObjectIntersectionFunctionTable:atBufferIndex: partial ray tracing
+setObjectIntersectionFunctionTables:withBufferRange: partial ray tracing
+setObjectVisibleFunctionTable:atBufferIndex: partial function pointers
+setObjectVisibleFunctionTables:withBufferRange: partial function pointers
+setPointSize: absent %spi-neither
+setPrimitiveRestartEnabled: absent %spi-neither
+setPrimitiveRestartEnabled:index: implemented
+setProvokingVertexMode: implemented
+setStencilCleared gap what Metal's encoder does with it is not established; this does nothing
+setStencilResolveTexture:slice:depthPlane:level: absent %spi-neither
+setStencilResolveTexture:slice:depthPlane:level:yInvert: absent %spi-neither
+setToolsDispatchBufferSPI:atIndex:stages: metal raises an unrecognized selector, as Metal's IOAccel render encoder does: it sends itself doesNotRecognizeSelector: (read from code, %enc-base)
+setTransformFeedbackState: absent %spi-neither
+setTriangleFrontFillMode:backFillMode: absent %spi-neither
+setVertexAmplificationMode:value: unsupported a vertex amplification mode
+setVertexSamplerState:lodMinClamp:lodMaxClamp:lodBias:atIndex: absent %spi-neither
+setViewportTransformEnabled: absent %spi-neither
+useResidencySet: partial %x86-residency
+useResidencySets:count: partial %x86-residency
+useResourceGroup:usage:stages: absent %spi-neither
+[RgfxRenderPipelineState]
+emulationMeshMaxPrimitiveCount metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshMaxVertexCount metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum1PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum2PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshPrefixSum3PSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshShaderPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationMeshSize metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationNoObjectPrefixSumPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectPrefixSumPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationObjectShaderPSO metal nil, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationPayloadMemoryLength metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationPrimitiveTopology metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+emulationVertexShaderIntermediateBufferSlot metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers) and Metal's base pipeline answers until its emulation is set up (read from code, %pipe-base): no pipeline of the device emulates mesh shaders
+explicitVisibilityGroupID metal 0, as both x86 Macs' fresh pipeline answers (%spi-answers); the device makes no visibility groups
+fragmentDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+fragmentFunctionHandleWithFunction: unsupported function pointers
+fragmentGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+fragmentGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+functionReflectionWithFunctionDescriptor:stage: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+getFragmentShaderTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
+getVertexShaderTelemetryID metal the low 32 bits of uniqueIdentifier, as Metal's base pipeline and the AMD 5300M's answer (read from code, %pipe-base; %spi-answers; the Intel 630's answers 0)
+gpuAddress metal 0 for every pipeline, one that supports indirect command buffers too, as Metal's answer (measured: M3 Max, macOS 27)
+gpuHandle metal resourceIndex, as Metal's base pipeline answers (read from code, %pipe-base; %spi-answers)
+meshDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+meshFunctionHandleWithFunction: unsupported function pointers
+meshGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+meshGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+newFragmentIntersectionFunctionTableWithDescriptor: implemented
+newFragmentShaderDebugInfo unsupported a shader's debug info
+newMeshIntersectionFunctionTableWithDescriptor: implemented
+newObjectIntersectionFunctionTableWithDescriptor: implemented
+newRenderPipelineStateWithAdditionalBinaryFunctions:fragmentAdditionalBinaryFunctions:error: unsupported  binary functions
+newTileIntersectionFunctionTableWithDescriptor: implemented
+newTileRenderPipelineStateWithAdditionalBinaryFunctions:error: unsupported binary functions
+newVertexIntersectionFunctionTableWithDescriptor: implemented
+newVertexShaderDebugInfo unsupported a shader's debug info
+newVisibleFunctionTableFromFragmentStageWithDescriptor: implemented
+newVisibleFunctionTableFromMeshStageWithDescriptor: implemented
+newVisibleFunctionTableFromObjectStageWithDescriptor: implemented
+newVisibleFunctionTableFromTileStageWithDescriptor: implemented
+newVisibleFunctionTableFromVertexStageWithDescriptor: implemented
+objectDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+objectFunctionHandleWithFunction: unsupported function pointers
+objectGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+objectGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+pipelineBinaries metal an empty dictionary, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+reflectionForFunctionDescriptor: metal raises an unrecognized selector, as Metal's base pipeline does: it sends itself doesNotRecognizeSelector: (read from code, %pipe-base)
+resourceIndex metal gpuResourceID's value: Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex (read from code, %pipe-base); both x86 Macs' fresh pipeline answers its uniqueIdentifier (%spi-answers)
+setEmulationMeshMaxPrimitiveCount: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshMaxVertexCount: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshShaderPSO: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationMeshSize: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationObjectShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationObjectShaderPSO: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationPayloadMemoryLength: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationPrimitiveTopology: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setEmulationVertexShaderIntermediateBufferSlot: unsupported Metal's mesh shader emulation (the host draws mesh pipelines)
+setUsesMeshShaderEmulation: metal does nothing: Metal's base pipeline stores a flag its usesMeshShaderEmulation does not read, answering from its emulation properties instead (read from code, %pipe-base)
+shaderValidationState metal MTLShaderValidationDisabled, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers) and shaderValidation answers (%no-validation)
+textureWriteRoundingMode implemented
+tileDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+tileFunctionHandleWithFunction: unsupported function pointers
+tileGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+tileGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+uniqueIdentifier implemented
+usesMeshShaderEmulation metal NO, as both x86 Macs' fresh pipeline answers (%spi-answers): the device carries mesh draws to the host, so no pipeline of it emulates mesh shaders
+vertexDebugInstrumentationData metal nil, as Metal's base pipeline answers for one made without debug instrumentation (read from code, %pipe-base; %spi-answers): the device instruments no shader
+vertexFunctionHandleWithFunction: unsupported function pointers
+vertexGlobalConstantsBase metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+vertexGlobalConstantsSize metal 0, as Metal's base pipeline answers for every pipeline (read from code, %pipe-base; %spi-answers)
+[RgfxResidencySet]
+allCommittedAllocations absent %residency-spi
+currentGeneration absent %residency-spi
+expiredGeneration absent %residency-spi
+generationForAllocation: absent %residency-spi
+setCurrentGeneration: absent %residency-spi
+setExpiredGeneration: absent %residency-spi
+[RgfxResource]
+protectionOptions metal the content protection the resource was made with: the device protects no content and no call sets it, so none
+responsibleProcess implemented
+setResponsibleProcess: implemented
+[RgfxSampler]
+gpuAddress metal no GPU address, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
+gpuHandle implemented
+pixelFormat metal no pixel format, whatever the descriptor, as Metal's sampler answers (measured: M3 Max, macOS 27)
+resourceIndex implemented
+uniqueIdentifier implemented
+[RgfxSharedEvent]
+IOSurfaceSharedEvent implemented
+enableBarrier absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+setEnableBarrier: absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+supportsRollback metal NO, as Metal's base shared event answers (read from code, _MTLSharedEvent, macOS 27.0.1; %spi-answers)
+[RgfxTexture]
+allocationID implemented
+canGenerateMipmapLevels absent %spi-neither
+colorSpaceConversionMatrix metal 0, as Metal's base resource answers (read from code, _MTLResource, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device converts no colour space
+compressionFeedback metal 0, as Metal's IOAccel texture answers (read from code, MTLIOAccelTexture, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device compresses no texture
+compressionFootprint metal 0, as Metal's base resource answers (read from code, _MTLResource, macOS 27.0.1) and both x86 Macs' textures answer (%spi-answers): the device compresses no texture
+compressionMetadata absent %spi-neither (asked, tools/oracle/oracle_spi_members.m ask)
+didModifyData implemented
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+generateMipmapLevel:slice: absent %spi-neither
+gpuAddress implemented
+gpuHandle implemented
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
+isCompressed implemented
+isDrawable metal the device's textures are no drawable's: Metal answers NO for every texture an app makes (private, shared, IOSurface and views)
+isPurgeable implemented
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
+newCompressedTextureViewWithPixelFormat:textureType:level:slice: absent %spi-neither
+newTextureViewWithPixelFormat:resourceIndex: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices:resourceIndex: implemented
+newTextureViewWithPixelFormat:textureType:levels:slices:swizzle:resourceIndex: implemented
+numFaces implemented
+resourceIndex implemented
+rotation metal the device's textures are shown unrotated: Metal answers 0 for every texture an app makes (private, shared, IOSurface and views)
+sparseSurfaceDefaultValue absent %spi-neither
+swizzleKey implemented
+unfilteredResourceOptions implemented
+uniqueIdentifier implemented
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
+writeAccessPattern absent %spi-neither
+
+[RgfxVisibleFunctionTable]
+allocationID implemented
+bufferAddressAtIndex: pending %fnptr-spi
+doesAliasAllResources:count: implemented
+doesAliasAnyResources:count: implemented
+doesAliasResource: implemented
+globalBuffer pending %fnptr-spi
+globalBufferOffset pending %fnptr-spi
+gpuAddress pending %fnptr-spi
+gpuHandle pending %fnptr-spi
+isComplete implemented %in-flight (the M3 Max answers the same, macOS 27)
+isPurgeable implemented
+isWriteComplete gap %in-flight (the M3 Max answers YES for a buffer that only reads it, macOS 27, which arm64 guests do not get: they see NO, as isComplete answers)
+resourceIndex pending %fnptr-spi
+setBuffer:offset:atIndex: pending %fnptr-spi
+setBuffers:offsets:withRange: pending %fnptr-spi
+setGlobalBuffer: pending %fnptr-spi
+setGlobalBufferOffset: pending %fnptr-spi
+setValue:atIndex: pending %fnptr-spi
+setValue:withRange: pending %fnptr-spi
+setVisibleFunctionTable:atBufferIndex: pending %fnptr-spi
+setVisibleFunctionTables:withBufferRange: pending %fnptr-spi
+unfilteredResourceOptions pending %fnptr-spi
+uniqueIdentifier pending %fnptr-spi
+waitUntilComplete implemented waits while isComplete answers NO, as the Intel 630's and the M3 Max's do (measured, %in-flight)
+
+# The members only older guest releases' protocols carry (tests/protocol_members_releases.txt).
+[RgfxArgumentEncoder]
+setFunctionPointer:atIndex: absent %old-only
+setFunctionPointers:withRange: absent %old-only
+[RgfxBinaryArchive]
+addArchiveEntry:forKey: absent %old-only
+addBinaryEntry:forKey: absent %old-only
+getArchiveDataForKey: absent %old-only
+getArchiveIDWithError: absent %old-only
+getBinaryDataForKey: absent %old-only
+initMetalScriptWithArchive: absent %old-only
+newPipelineDescriptorAtIndex:pipelineType:error: absent %old-only
+recompilablePipelineCount absent %old-only
+recompileToArchive:error: absent %old-only
+[RgfxComputePipelineState]
+functionPointerHandleWithFunction: absent %old-only
+functionPointerHandlesWithFunctions:range: absent %old-only
+setGlobalConstantsBase: absent %old-only
+setGlobalConstantsSize: absent %old-only
+[RgfxIndirectRenderCommand]
+drawMeshArguments absent %old-only
+getMeshBufferAtIndex: absent %old-only
+getObjectBufferAtIndex: absent %old-only
+[RgfxRenderPipelineState]
+setFragmentGlobalConstantsBase: absent %old-only
+setFragmentGlobalConstantsSize: absent %old-only
+setMeshGlobalConstantsBase: absent %old-only
+setMeshGlobalConstantsSize: absent %old-only
+setObjectGlobalConstantsBase: absent %old-only
+setObjectGlobalConstantsSize: absent %old-only
+setTileGlobalConstantsBase: absent %old-only
+setTileGlobalConstantsSize: absent %old-only
+setVertexGlobalConstantsBase: absent %old-only
+setVertexGlobalConstantsSize: absent %old-only
+[RgfxMetalDevice]
+isBinaryFunctionPointersSupported absent %old-only-device
+requiresIABEmulation absent %old-only-device
+setResourcesPurgeableState:newState:oldState:count: absent %old-only-device
+supportsBinaryFunctionPointers absent %old-only-device

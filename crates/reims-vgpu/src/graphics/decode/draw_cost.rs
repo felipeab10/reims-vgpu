@@ -1,16 +1,18 @@
 //! What a draw costs the thread that decodes it, through the decoder as a queue's ring hands it a
 //! `COMMAND_BUFFER`, against the same commands sent through the platform's core traits and
-//! through what the platform drives alone: metal2vulkan's runtime on the Vulkan platform, Metal
-//! itself on the Metal one. A measurement, run by hand in a release build, holding the host's
-//! GPU (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! through what the platform drives alone, metal2vulkan's runtime. A measurement, run by hand in a release build, in a potluck job
+//! holding the host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(draw_cost)'
 //! --no-capture`).
 //!
 //! A command buffer is one render pass of draws, or, in a compositor's frame, many ([`Shape`],
 //! [`Stream`]). In `draws.10k`'s stream
 //! each draw of 3 vertices comes after a `setVertexBuffer:` at index 0 of an upload chunk at its
-//! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB
-//! `BUFFER_OVER_HOST_MEMORY` chunk of the region, 256 draws a chunk). In a compositor's, each
+//! next 256-byte offset, as the bundle sends `setVertexBytes:` (a 64 KiB chunk, 256 draws a
+//! chunk, [`Chunks`]), under the bench's own pipeline: its vertex function reads the draw's bytes
+//! and its fragment function a colour set once a pass, each a `constant float4 &` at buffer 0
+//! (`render_small` and `render_flat` of the tests' shaders), as the runtime binds an app's bytes.
+//! In a compositor's, each
 //! draw of a 4-vertex strip binds a texture of 16 and its own vertex and fragment bytes, under one
 //! of 4 pipelines that change every 4 draws with the sampler set again. The command buffers go
 //! back to back and are then waited for, as `draws.10k` commits them. Each path's figures are
@@ -25,14 +27,18 @@
 //! draws of a compositor's stream; `mc`, 8 of WindowServer's Mission Control composites, each of
 //! 92 render passes of 3 draws; or `mc1`, the same ops in one pass a command buffer, whose gap to
 //! `mc` is what 91 more passes cost), `DRAW_COST_RUNS` the runs (9), `DRAW_COST_ONLY` one path, for
-//! a profile of it (`decoder`, `platform` or `runtime`, the runtime or Metal alone), and
-//! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach.
+//! a profile of it (`decoder`, `platform` or `runtime`, the runtime alone),
+//! `DRAW_COST_SECONDS` a time to keep running that path for, so a sampling profiler can attach,
+//! `DRAW_COST_CHUNKS` where the upload chunks lie: `pages`, the default where the host maps
+//! the guest's pages, else `heap`; or `buffer` ([`Chunks`]); and `DRAW_COST_RUNTIME_PASS=fresh`
+//! a runtime path that makes each pass's descriptor anew inside the count, as the platform's
+//! path and the decoder's do, where by default it takes one of two made before it.
 
 use std::sync::Arc;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use reims_graphics::ops::render::{
+use reims_vgpu_graphics::ops::render::{
     RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_BUFFER,
     RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
     RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RGFX_OP_RENDER_SET_VERTEX_BUFFER,
@@ -40,29 +46,35 @@ use reims_graphics::ops::render::{
     RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetVertexBuffer,
     RgfxSamplerBinding,
 };
-use reims_graphics::ops::{
+use reims_vgpu_graphics::ops::{
     RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
     RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment,
     RgfxRenderPassDesc,
 };
-use reims_graphics::wire::{
-    RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_QUEUE_CREATE,
-    RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxMsgHeader,
-    RgfxQueueCreate,
+use reims_vgpu_graphics::wire::{
+    RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_COMMAND_BUFFER,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_QUEUE_CREATE,
+    RGFX_CMD_SURFACE_PAGES, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_VA_BASE,
+    RGFX_CURSOR_SPAN, RGFX_STATUS_OK, RGFX_SURFACE_PAGES_PRIVATE, RgfxBufferAtOffset,
+    RgfxBufferOverHostMemory, RgfxHeapOverHostMemory, RgfxHeapOverPages, RgfxMsgHeader,
+    RgfxPageRun, RgfxQueueCreate, RgfxSurfacePages,
 };
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _, VertexDraw};
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::values::{
-    ColorAttachmentSet, RenderPipelineDesc, SamplerDesc, TextureDesc,
+use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _, VertexDraw};
+use reims_vgpu_vulkan::core::platform::resource::Library as _;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::values::{
+    ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, SamplerDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
+use super::surface_pages::costs::{RAM, Ram, guest_ram};
+use super::surface_pages::{GUEST_PAGE, Lease};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -148,9 +160,14 @@ impl Shape {
         (self.draws as u64 * self.slots() * ALIGN).div_ceil(CHUNK)
     }
 
-    /// The chunks the region holds: a repetition's command buffers each take their own.
+    /// The chunks a repetition's command buffers take, each its own.
     fn chunks(self) -> u64 {
         self.chunks_a_cb() * self.cbs as u64
+    }
+
+    /// The slabs the chunks lie in.
+    fn slabs(self) -> u64 {
+        self.chunks().div_ceil(CHUNKS_A_SLAB)
     }
 
     /// The shape `DRAW_COST_SHAPE` names: `many`, `ws`, `mc`, `mc1` or, by default, `10k`.
@@ -178,19 +195,54 @@ const WARM: usize = 2;
 /// `kUploadChunkSize` and `kUploadAlign`).
 const CHUNK: u64 = 0x1_0000;
 const ALIGN: u64 = 256;
+/// A slab of the bundle's that holds chunks, and the chunks it holds: 2 MiB, as its pages slab
+/// source takes them (`RgfxPagesSlabSource::kUnit`).
+const SLAB: u64 = 2 << 20;
+const CHUNKS_A_SLAB: u64 = SLAB / CHUNK;
+/// A pages slab's block: a page, then the pages its runs ([`RgfxPageRun`]) take, one for each
+/// chunk of the slab's pages, as the kext's 64 KiB chunks make a slab.
+const PAGES_BLOCK: u64 =
+    GUEST_PAGE + (CHUNKS_A_SLAB * size_of::<RgfxPageRun>() as u64).next_multiple_of(GUEST_PAGE);
+/// The GPU address the first slab's heap is pinned at, the first of the guest's
+/// (`RGFX_CONTEXT_VA_BASE`), each next one a slab's span further: the guest picks a heap's
+/// address, a span of its pages and one guard page, rounded up to 32 KiB
+/// (`RgfxIdSpace::addressSpan`), which Metal's space holds for a pin, so a heap pinned a bare
+/// slab further meets the one before it and is nil.
+const SLAB_ADDRESS: u64 = RGFX_CONTEXT_VA_BASE;
+const SLAB_SPAN: u64 = SLAB + 0x8000;
+/// `MTLResourceHazardTrackingModeTracked`, which the bundle resolves a slab's `Default` mode to
+/// and gives its heap, as Metal resolves a buffer's.
+const TRACKED: u32 = 2 << 8;
+/// `MTLHeapTypePlacement`.
+const PLACEMENT: i32 = 1;
+
+/// Where the upload chunks lie, as the bundle takes them (`RgfxUploadPool::take`): each chunk a
+/// buffer of the slabs, a `BUFFER_AT_OFFSET` in a slab's placement heap; the slab is 2 MiB of the
+/// process's own pages, a `HEAP_OVER_PAGES` over a pages block of 32 runs of 64 KiB, where the
+/// host maps the guest's pages (`Pages`), else a block of the region, a `HEAP_OVER_HOST_MEMORY`
+/// (`Heap`). With no slabs, a chunk is a `BUFFER_OVER_HOST_MEMORY` of the region (`Buffer`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Chunks {
+    Pages,
+    Heap,
+    Buffer,
+}
 
 /// The object ids: the queue, the target, the per-draw constant buffers (vertex 1 and fragment
-/// 0), the pipelines from [`PIPELINE_ID`], the textures from [`TEXTURE_ID`], the sampler, then
-/// the chunks from [`CHUNK_ID`].
+/// 0), the compositor's pipelines from [`PIPELINE_ID`], `draws.10k`'s pipeline, the textures from
+/// [`TEXTURE_ID`], the sampler, the slabs' heaps from [`HEAP_ID`], then the chunks from
+/// [`CHUNK_ID`].
 const QUEUE_ID: u64 = 1;
 const TARGET_ID: u64 = 2;
 const CONSTANTS_ID: u64 = 4;
 const PIPELINE_ID: u64 = 0x10;
+const SMALL_PIPELINE_ID: u64 = 0x18;
 const TEXTURE_ID: u64 = 0x20;
 const SAMPLER_ID: u64 = 0x40;
+const HEAP_ID: u64 = 0x80;
 const CHUNK_ID: u64 = 0x100;
 /// A compositor's pipelines: a fragment buffer's colour and a texture's, each opaque and blended
-/// over (`draws.10k`'s is the first); its textures; and the draws a pipeline runs for.
+/// over; its textures; and the draws a pipeline runs for.
 const PIPELINES: u64 = 4;
 const TEXTURES: u64 = 16;
 const RUN: usize = 4;
@@ -212,6 +264,13 @@ const TEXTURE_SIDE: u64 = 64;
 /// This thread's CPU time in nanoseconds, the instructions it retired and its cycles, each as a
 /// count that only grows; the counters are 0 where the host gives none.
 pub(in crate::graphics) fn counts() -> Counts {
+    let [instructions, cycles] = counters::now();
+    Counts([thread_cpu_ns(), instructions, cycles])
+}
+
+/// This thread's CPU time in nanoseconds (`CLOCK_THREAD_CPUTIME_ID`).
+#[cfg(unix)]
+fn thread_cpu_ns() -> u64 {
     let mut at = libc::timespec {
         tv_sec: 0,
         tv_nsec: 0,
@@ -221,9 +280,34 @@ pub(in crate::graphics) fn counts() -> Counts {
         unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut at) },
         0
     );
-    let ns = u64::try_from(at.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(at.tv_nsec).unwrap();
-    let [instructions, cycles] = counters::now();
-    Counts([ns, instructions, cycles])
+    u64::try_from(at.tv_sec).unwrap() * 1_000_000_000 + u64::try_from(at.tv_nsec).unwrap()
+}
+
+/// [`thread_cpu_ns`] on Windows: this thread's kernel and user times (`GetThreadTimes`), kept in
+/// 100 ns units.
+#[cfg(windows)]
+fn thread_cpu_ns() -> u64 {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadTimes};
+    let nanos =
+        |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) * 100;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let [mut made, mut ended, mut kernel, mut user] = [zero; 4];
+    // SAFETY: the running thread's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    nanos(kernel) + nanos(user)
 }
 
 /// What [`counts`] answers, and the differences of two answers.
@@ -261,6 +345,21 @@ mod counters {
         // SAFETY: kind 1 writes two `u64`s, the thread's instructions and cycles, into `out`.
         let r = unsafe { thread_selfcounts(1, out.as_mut_ptr(), size_of_val(&out)) };
         if r != 0 { [0, 0] } else { out }
+    }
+}
+
+/// This thread's instructions and cycles: on Windows its cycles alone (`QueryThreadCycleTime`),
+/// with no count of instructions, which stays 0.
+#[cfg(windows)]
+mod counters {
+    use windows_sys::Win32::System::Threading::GetCurrentThread;
+    use windows_sys::Win32::System::WindowsProgramming::QueryThreadCycleTime;
+
+    pub(super) fn now() -> [u64; 2] {
+        let mut cycles = 0u64;
+        // SAFETY: the running thread's pseudo-handle, and a live out-parameter.
+        let ok = unsafe { QueryThreadCycleTime(GetCurrentThread(), &mut cycles) };
+        [0, if ok != 0 { cycles } else { 0 }]
     }
 }
 
@@ -372,11 +471,17 @@ fn steps(shape: Shape, cb: usize) -> Vec<Vec<Step>> {
                 passes[draw / a_group / (shape.groups / shape.passes) - 1] =
                     std::mem::take(&mut steps);
             }
-            steps.extend([
-                Step::Pipeline(PIPELINE_ID),
-                Step::VertexBuffer(CONSTANTS_ID, 0, 1),
-                Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
-            ]);
+            match shape.stream {
+                Stream::Bytes => steps.extend([
+                    Step::Pipeline(SMALL_PIPELINE_ID),
+                    Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
+                ]),
+                Stream::Layers => steps.extend([
+                    Step::Pipeline(PIPELINE_ID),
+                    Step::VertexBuffer(CONSTANTS_ID, 0, 1),
+                    Step::FragmentBuffer(CONSTANTS_ID, 0, 0),
+                ]),
+            }
         }
         let slot = draw as u64 * shape.slots();
         match shape.stream {
@@ -507,11 +612,35 @@ fn command_buffer(shape: Shape, cb: usize, cb_obj_id: u64) -> Vec<u8> {
     message
 }
 
+/// The committed test shaders, `tests/shaders`, under the manifest directory
+/// cargo or nextest gives the test as it runs, which a run of a nextest archive on another host
+/// remaps to that host's tree.
+pub(super) fn test_shaders() -> std::path::PathBuf {
+    std::path::PathBuf::from(
+        std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo or nextest"),
+    )
+    .join("../../tests/shaders")
+}
+
+/// A colour attachment of `pixel_format` that blends each fragment, its colour premultiplied,
+/// over the target by its alpha: both source factors `one` (1), both destination factors
+/// `oneMinusSourceAlpha` (5).
+pub(super) fn over(pixel_format: u64) -> ColorAttachmentDesc {
+    ColorAttachmentDesc {
+        pixel_format,
+        blending_enabled: true,
+        source_rgb_blend_factor: 1,
+        destination_rgb_blend_factor: 5,
+        source_alpha_blend_factor: 1,
+        destination_alpha_blend_factor: 5,
+        ..ColorAttachmentDesc::default()
+    }
+}
+
 /// A function of the suite's fixture `name`.
 pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../tests/suite/fixtures/shaders")
-        .join(format!("{name}.metallib"));
+    let path = test_shaders().join(format!("{name}.metallib"));
     let library = d
         .new_library(&std::fs::read(path).unwrap())
         .unwrap()
@@ -520,26 +649,138 @@ pub(super) fn fixture<P: Platform>(d: &P::Device, name: &str) -> P::Function {
     library.new_function(OnFault::Die, name).unwrap().unwrap()
 }
 
+/// The guest's RAM `shape`'s pages slabs lie in, as `decoder`'s guest memory, and the holds on
+/// it: for each slab 32 runs of 64 KiB, a run's gap apart so no two make one, every page touched
+/// as a running guest's RAM is.
+fn guest_pages<P: ApiPlatform>(
+    platform: &Arc<P>,
+    decoder: &mut GraphicsDecoder<P>,
+    shape: Shape,
+) -> (Arc<CoreMemoryMap<P>>, Lease, Ram) {
+    let ram = guest_ram(shape.slabs() * SLAB * 2, true);
+    let lease: Lease = Arc::from(platform.guest_memory(&ram.map));
+    let core = CoreMemoryMap::new(Arc::clone(platform), &ram.map.to_core()).expect("a memory map");
+    decoder.set_guest_memory(Arc::clone(&core), Arc::clone(&lease));
+    (core, lease, ram)
+}
+
+/// The guest's pages of pages slab `slab`: 32 runs of 64 KiB, as the kext's chunks make a slab,
+/// each a run's gap past the one before, so no two make one run.
+fn slab_runs(slab: u64) -> Vec<RgfxPageRun> {
+    (0..CHUNKS_A_SLAB)
+        .map(|r| RgfxPageRun {
+            address: RAM + (slab * CHUNKS_A_SLAB + r) * 2 * CHUNK,
+            length: CHUNK,
+        })
+        .collect()
+}
+
+/// Makes `shape`'s upload chunks of kind `chunks` on `decoder` ([`Chunks`]), whose guest memory
+/// holds the pages slabs' ([`guest_pages`]).
+fn make_chunks<P: ApiPlatform>(
+    device: &P::Device,
+    decoder: &mut GraphicsDecoder<P>,
+    shape: Shape,
+    chunks: Chunks,
+) {
+    let header = |r#type| RgfxMsgHeader {
+        r#type,
+        size: 0,
+        seqno: 0,
+    };
+    let made = |decoder: &mut GraphicsDecoder<P>, m: &[u8]| {
+        assert_eq!(decoder.decode(device, m).unwrap(), Ok(()));
+    };
+    if chunks == Chunks::Buffer {
+        for n in 0..shape.chunks() {
+            let chunk = RgfxBufferOverHostMemory {
+                header: header(RGFX_CMD_BUFFER_OVER_HOST_MEMORY),
+                obj_id: CHUNK_ID + n,
+                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * CHUNK,
+                length: CHUNK,
+                ..RgfxBufferOverHostMemory::default()
+            };
+            made(decoder, chunk.as_bytes());
+        }
+        return;
+    }
+    for slab in 0..shape.slabs() {
+        let gpu_address = SLAB_ADDRESS + slab * SLAB_SPAN;
+        if chunks == Chunks::Heap {
+            let heap = RgfxHeapOverHostMemory {
+                header: header(RGFX_CMD_HEAP_OVER_HOST_MEMORY),
+                obj_id: HEAP_ID + slab,
+                gpu_address,
+                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + slab * SLAB,
+                size_bytes: SLAB,
+                options: TRACKED,
+                heap_type: PLACEMENT,
+            };
+            made(decoder, heap.as_bytes());
+            continue;
+        }
+        let block = RGFX_CONTEXT_ALLOCATIONS_OFFSET + slab * PAGES_BLOCK;
+        let runs = slab_runs(slab);
+        let pages = RgfxSurfacePages {
+            header: header(RGFX_CMD_SURFACE_PAGES),
+            context: 0,
+            run_count: runs.len() as u32,
+            block_offset: block,
+            block_size: PAGES_BLOCK,
+            runs_offset: block + GUEST_PAGE,
+            length: SLAB,
+        };
+        let status = decoder.surface_pages(device, &pages, &runs, RGFX_SURFACE_PAGES_PRIVATE);
+        assert_eq!(status, RGFX_STATUS_OK, "slab {slab}'s SURFACE_PAGES");
+        let heap = RgfxHeapOverPages {
+            header: header(RGFX_CMD_HEAP_OVER_PAGES),
+            obj_id: HEAP_ID + slab,
+            gpu_address,
+            block_offset: block,
+            block_size: PAGES_BLOCK,
+            size_bytes: SLAB,
+            options: TRACKED,
+            heap_type: PLACEMENT,
+        };
+        made(decoder, heap.as_bytes());
+    }
+    for n in 0..shape.chunks() {
+        let chunk = RgfxBufferAtOffset {
+            header: header(RGFX_CMD_BUFFER_AT_OFFSET),
+            obj_id: CHUNK_ID + n,
+            heap_obj_id: HEAP_ID + n / CHUNKS_A_SLAB,
+            offset: n % CHUNKS_A_SLAB * CHUNK,
+            length: CHUNK,
+            options: 0,
+            reserved_34: 0,
+        };
+        made(decoder, chunk.as_bytes());
+    }
+}
+
 /// A decoder on `P`'s system device, holding the objects [`command_buffer`] names, and the
 /// channel its completions come on.
 struct Bench<P: ApiPlatform> {
     shape: Shape,
+    chunks: Chunks,
     platform: Arc<P>,
     device: P::Device,
     decoder: GraphicsDecoder<P>,
     completed: mpsc::Receiver<u64>,
+    /// The guest's RAM the pages slabs lie in, and the holds on it, let go after the decoder.
+    _guest: Option<(Arc<CoreMemoryMap<P>>, Lease, Ram)>,
 }
 
 impl<P: ApiPlatform> Bench<P> {
     fn new(shape: Shape) -> Bench<P> {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
-        let region_size =
-            RGFX_CONTEXT_ALLOCATIONS_OFFSET + shape.chunks() * CHUNK + RGFX_CURSOR_SPAN;
-        let region = reims_graphics::region::Region::new(region_size as usize).unwrap();
+        // Room for the chunks of any kind: a slab of the region a heap, or its pages block.
+        let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + shape.slabs() * SLAB + RGFX_CURSOR_SPAN;
+        let region = crate::platform::test_region(&*platform, region_size as usize);
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
         let (tx, completed) = mpsc::channel();
-        let tx = reims_vgpu_core::sync::Mutex::new(tx);
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
         decoder.set_completion_sink(Arc::new(move |m| {
             let _ = tx.lock().send(m.cb_obj_id);
         }));
@@ -553,20 +794,18 @@ impl<P: ApiPlatform> Bench<P> {
             ..RgfxQueueCreate::default()
         };
         assert_eq!(decoder.decode(&device, queue.as_bytes()).unwrap(), Ok(()));
-        for n in 0..shape.chunks() {
-            let chunk = RgfxBufferOverHostMemory {
-                header: RgfxMsgHeader {
-                    r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
-                    size: size_of::<RgfxBufferOverHostMemory>() as u32,
-                    seqno: 0,
-                },
-                obj_id: CHUNK_ID + n,
-                region_offset: RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * CHUNK,
-                length: CHUNK,
-                ..RgfxBufferOverHostMemory::default()
-            };
-            assert_eq!(decoder.decode(&device, chunk.as_bytes()).unwrap(), Ok(()));
-        }
+        let asked = std::env::var("DRAW_COST_CHUNKS").ok();
+        let guest = match asked.as_deref() {
+            Some("heap" | "buffer") => None,
+            _ => Some(guest_pages(&platform, &mut decoder, shape)),
+        };
+        let chunks = match asked.as_deref() {
+            Some("buffer") => Chunks::Buffer,
+            Some("heap") => Chunks::Heap,
+            _ if decoder.surface_pages_available() => Chunks::Pages,
+            _ => Chunks::Heap,
+        };
+        make_chunks(&device, &mut decoder, shape, chunks);
         let target = platform.texture_descriptor(&TextureDesc {
             pixel_format: BGRA8,
             width: SIDE,
@@ -581,20 +820,42 @@ impl<P: ApiPlatform> Bench<P> {
             fixture::<P>(&device, "render_ftex"),
         ];
         for n in 0..PIPELINES {
+            let color = if n >= 2 {
+                over(BGRA8)
+            } else {
+                ColorAttachmentDesc {
+                    pixel_format: BGRA8,
+                    ..ColorAttachmentDesc::default()
+                }
+            };
             let pipeline = device
-                .new_render_pipeline_state(&RenderPipelineDesc {
-                    label: None,
-                    vertex: &vertex,
-                    fragment: &colours[(n % 2) as usize],
-                    color0_pixel_format: BGRA8,
-                    blend_over: n >= 2,
-                    resource_index: None,
+                .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&colours[(n % 2) as usize]))
                 })
                 .unwrap()
                 .unwrap();
             let handle = ObjHandle::RenderPipeline(pipeline);
             assert_eq!(decoder.insert(PIPELINE_ID + n, handle).unwrap(), Ok(()));
         }
+        let small = device
+            .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: vec![(
+                    0,
+                    ColorAttachmentDesc {
+                        pixel_format: BGRA8,
+                        ..ColorAttachmentDesc::default()
+                    },
+                )],
+                ..FullRenderPipelineDesc::new(
+                    &fixture::<P>(&device, "render_small"),
+                    Some(&fixture::<P>(&device, "render_flat")),
+                )
+            })
+            .unwrap()
+            .unwrap();
+        let handle = ObjHandle::RenderPipeline(small);
+        assert_eq!(decoder.insert(SMALL_PIPELINE_ID, handle).unwrap(), Ok(()));
         let sampled = platform.texture_descriptor(&TextureDesc {
             pixel_format: BGRA8,
             width: TEXTURE_SIDE,
@@ -624,10 +885,12 @@ impl<P: ApiPlatform> Bench<P> {
         }
         Bench {
             shape,
+            chunks,
             platform,
             device,
             decoder,
             completed,
+            _guest: guest,
         }
     }
 
@@ -871,22 +1134,38 @@ fn target_pass<P: ApiPlatform>(bench: &Bench<P>, pass: usize) -> P::RenderPassDe
 
 /// The runtime alone, on the Vulkan platform's objects of `bench`: the calls the platform makes
 /// of it for each command.
-#[cfg(feature = "vulkan")]
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     use metal2vulkan_runtime as rt;
-    let (queue, _) = bench.queue_and_target();
+    let (queue, target) = bench.queue_and_target();
     let shape = bench.shape;
     let bound = bench.bound();
     let passes = [
         target_pass(bench, 0).pass().0,
         target_pass(bench, 1).pass().0,
     ];
+    // The descriptor `target_pass` sets, made with the runtime alone.
+    let fresh = |p: usize| {
+        let mut d = rt::RenderPassDescriptor::new();
+        let a = &mut d.color_attachments[0];
+        a.texture = Some(target.raw.clone());
+        a.load_action = rt::LoadAction::from_raw(Shape::load(p)).unwrap();
+        a.store_action = rt::StoreAction::from_raw(STORE).unwrap();
+        d
+    };
+    let anew = runtime_passes_fresh();
     let (tx, rx) = mpsc::channel();
     let start = counts();
     for cb_bound in &bound {
         let cb = queue.raw.command_buffer().unwrap();
         for (p, pass_bound) in cb_bound.iter().enumerate() {
-            let mut e = cb.render_command_encoder(&passes[p.min(1)]).unwrap();
+            let made;
+            let pass = if anew {
+                made = fresh(p);
+                &made
+            } else {
+                &passes[p.min(1)]
+            };
+            let mut e = cb.render_command_encoder(pass).unwrap();
             for &b in pass_bound {
                 match b {
                     Bound::Pipeline(p) => e.set_render_pipeline_state(&p.raw),
@@ -925,77 +1204,18 @@ fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
     spent
 }
 
-/// Metal alone, on the Metal platform's objects of `bench`: the selectors the platform sends for
-/// each command. Its command buffers are waited for, not handled, after the count.
-#[cfg(target_os = "macos")]
-fn through_metal(bench: &Bench<reims_vgpu_metal::MetalPlatform>) -> Counts {
-    use objc2::runtime::ProtocolObject;
-    use objc2_foundation::NSRange;
-    use objc2_metal::{
-        MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _, MTLPrimitiveType,
-        MTLRenderCommandEncoder as _, MTLSamplerState,
-    };
-    let (queue, _) = bench.queue_and_target();
-    let bound = bench.bound();
-    let passes = [target_pass(bench, 0), target_pass(bench, 1)];
-    objc2::rc::autoreleasepool(|_| {
-        let mut committed = Vec::with_capacity(bound.len());
-        let start = counts();
-        for cb_bound in &bound {
-            let cb = queue.get().commandBuffer().unwrap();
-            for (p, pass_bound) in cb_bound.iter().enumerate() {
-                let e = cb
-                    .renderCommandEncoderWithDescriptor(passes[p.min(1)].get())
-                    .unwrap();
-                for &b in pass_bound {
-                    // SAFETY: the bench's objects, at indices and offsets inside what they hold and
-                    // what the pipelines' functions bind; the sampler list outlives its call.
-                    unsafe {
-                        match b {
-                            Bound::Pipeline(p) => e.setRenderPipelineState(p.get()),
-                            Bound::VertexBuffer(buffer, offset, index) => e
-                                .setVertexBuffer_offset_atIndex(
-                                    Some(buffer.get()),
-                                    offset as usize,
-                                    index as usize,
-                                ),
-                            Bound::FragmentBuffer(buffer, offset, index) => e
-                                .setFragmentBuffer_offset_atIndex(
-                                    Some(buffer.get()),
-                                    offset as usize,
-                                    index as usize,
-                                ),
-                            Bound::FragmentTexture(texture, index) => {
-                                e.setFragmentTexture_atIndex(Some(texture.get()), index as usize)
-                            }
-                            Bound::FragmentSampler(sampler) => {
-                                let list: [*const ProtocolObject<dyn MTLSamplerState>; 1] =
-                                    [sampler.get()];
-                                e.setFragmentSamplerStates_withRange(
-                                    std::ptr::NonNull::from(&list).cast(),
-                                    NSRange::new(0, 1),
-                                )
-                            }
-                            Bound::Draw(primitive_type, count) => e
-                                .drawPrimitives_vertexStart_vertexCount(
-                                    MTLPrimitiveType(primitive_type as usize),
-                                    0,
-                                    count as usize,
-                                ),
-                        }
-                    }
-                }
-                e.endEncoding();
-            }
-            cb.commit();
-            committed.push(cb);
-        }
-        let spent = counts() - start;
-        for cb in &committed {
-            cb.waitUntilCompleted();
-        }
-        spent
-    })
+/// Whether the runtime path makes each pass's descriptor anew (`DRAW_COST_RUNTIME_PASS=fresh`).
+fn runtime_passes_fresh() -> bool {
+    std::env::var("DRAW_COST_RUNTIME_PASS").is_ok_and(|v| v == "fresh")
+}
+
+/// What the figures' line says of the runtime path's descriptors where it makes them anew.
+fn fresh_note() -> &'static str {
+    if runtime_passes_fresh() {
+        ", the runtime's pass descriptors made anew each pass"
+    } else {
+        ""
+    }
 }
 
 /// The median, lowest and highest of `values`.
@@ -1010,7 +1230,7 @@ pub(super) fn spread(values: &mut [f64]) -> [f64; 3] {
     [median, values[0], values[n - 1]]
 }
 
-/// Runs the paths of `bench`, `alone` what the platform drives alone (the runtime, or Metal) and
+/// Runs the paths of `bench`, `alone` what the platform drives alone (the runtime) and
 /// its name, and prints each one's figures a draw.
 #[allow(clippy::disallowed_methods)] // a measurement: real time decides how long a profile runs
 fn measure<P: ApiPlatform>(
@@ -1037,7 +1257,7 @@ fn measure<P: ApiPlatform>(
             })
             .collect::<Vec<_>>()
     };
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     // On a Mac, the thread asks for the performance cores, which an efficiency core's slower
     // draws would otherwise mix into the figures.
     #[cfg(target_os = "macos")]
@@ -1064,8 +1284,10 @@ fn measure<P: ApiPlatform>(
         let [ns, instructions, cycles] = a_draw(spent, reps);
         println!(
             "{name}: {} for {seconds} s: {reps} repetitions, a draw {ns:.1} ns, {instructions:.0} \
-             instructions, {cycles:.0} cycles",
+             instructions, {cycles:.0} cycles, the upload chunks {:?}{}",
             only.unwrap_or("decoder"),
+            bench.chunks,
+            fresh_note(),
         );
         return;
     }
@@ -1100,8 +1322,14 @@ fn measure<P: ApiPlatform>(
     println!(
         "{name}: a draw on the decoding thread, median [lowest, highest] of {runs} runs of {REPS} \
          repetitions of {} command buffers of {} draws of {:?} in {} passes, {ops} ops (a command \
-         buffer's: {} times as much)",
-        shape.cbs, shape.draws, shape.stream, shape.passes, shape.draws
+         buffer's: {} times as much), the upload chunks {:?}{}",
+        shape.cbs,
+        shape.draws,
+        shape.stream,
+        shape.passes,
+        shape.draws,
+        bench.chunks,
+        fresh_note(),
     );
     for (f, figure) in FIGURES.iter().enumerate() {
         let mut medians = [0.0f64; 3];
@@ -1131,7 +1359,7 @@ fn measure<P: ApiPlatform>(
 
 /// The mc shapes' command buffers: in `mc`, 92 passes of 3 draws, each pass's ops beginning with
 /// its pipeline and constant buffers; in `mc1`, the same ops in one pass. The other shapes keep
-/// one pass.
+/// one pass, `draws.10k`'s under the bench's pipeline.
 #[test]
 fn the_mc_shapes_cut_their_draws_into_passes() {
     let draws = |pass: &Vec<Step>| pass.iter().filter(|s| matches!(s, Step::Draw(..))).count();
@@ -1149,22 +1377,49 @@ fn the_mc_shapes_cut_their_draws_into_passes() {
         assert_eq!(one.len(), 1);
         assert_eq!(draws(&one[0]), shape.draws);
     }
+    // `draws.10k`'s stream runs under the bench's own pipeline.
+    assert!(matches!(
+        steps(Shape::TEN_K, 0)[0][..2],
+        [
+            Step::Pipeline(SMALL_PIPELINE_ID),
+            Step::FragmentBuffer(CONSTANTS_ID, 0, 0)
+        ]
+    ));
+}
+
+/// A pages slab is 32 runs of 64 KiB of the guest's RAM, as the kext's chunks make the bundle's
+/// 2 MiB slab, no two of them one run, inside the RAM [`guest_pages`] maps; its block holds their
+/// list after its first page; and each command buffer's chunks lie in the shape's slabs, 32 a
+/// slab, at their 64 KiB offsets.
+#[test]
+fn pages_slabs_are_the_bundle_s() {
+    for shape in [Shape::TEN_K, Shape::MANY, Shape::WS, Shape::MC] {
+        let ram = shape.slabs() * SLAB * 2;
+        for slab in 0..shape.slabs() {
+            let runs = slab_runs(slab);
+            assert_eq!(runs.len() as u64, CHUNKS_A_SLAB);
+            assert_eq!(runs.iter().map(|r| r.length).sum::<u64>(), SLAB);
+            for pair in runs.windows(2) {
+                assert!(
+                    pair[0].address + pair[0].length < pair[1].address,
+                    "{pair:?}"
+                );
+            }
+            let last = runs.last().unwrap();
+            assert!(last.address + last.length <= RAM + ram);
+        }
+        assert!(GUEST_PAGE + CHUNKS_A_SLAB * size_of::<RgfxPageRun>() as u64 <= PAGES_BLOCK);
+        assert!(shape.chunks() <= shape.slabs() * CHUNKS_A_SLAB);
+        assert!(shape.slabs() * PAGES_BLOCK <= shape.slabs() * SLAB);
+    }
+    // A heap's pin holds its pages, one 16 KiB guard page and the rounding up to 32 KiB.
+    assert_eq!(SLAB_SPAN, (SLAB + 0x4000).next_multiple_of(0x8000));
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
 fn on_vulkan_draw_cost() {
     let bench = Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(Shape::chosen());
     measure("vulkan", bench, ("runtime", through_runtime));
-}
-
-/// On the Metal platform: the decoder, the platform and Metal alone.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a draw's cost"]
-fn on_metal_draw_cost() {
-    let bench = Bench::<reims_vgpu_metal::MetalPlatform>::new(Shape::chosen());
-    measure("metal", bench, ("metal", through_metal));
 }

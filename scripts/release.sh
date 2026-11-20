@@ -14,7 +14,7 @@
 #   1. Lê a última tag `v*` e os commits desde então, e sugere a próxima versão
 #      (feat/:new: sobem minor; fix/:bug: sobem patch; BREAKING sobe major).
 #   2. Confere que os artefatos do pacote existem ANTES de mexer no git: o QEMU,
-#      a ROM do vGPU, o pc-bios e o motor `reims-ctl`.
+#      a ROM do device graphics, o pc-bios e o motor `reims-ctl`.
 #   3. Empacota no mesmo layout que o appliance consome (ver
 #      core/reims_release.py e core/reims_build.py no vhackintosh — os três têm
 #      de concordar). O pacote leva `bin/reims-ctl`: sem o motor, a compilação
@@ -66,7 +66,7 @@ O que ele faz, em ordem:
   1. Lê a última tag `v*` e os commits desde então, e sugere a próxima versão
      (feat/:new: sobem minor; fix/:bug: sobem patch; BREAKING sobe major).
   2. Confere que os artefatos do pacote existem ANTES de mexer no git: o QEMU,
-     a ROM do vGPU, o pc-bios e o motor `reims-ctl`.
+     a ROM do device graphics, o pc-bios e o motor `reims-ctl`.
   3. Empacota no mesmo layout que o appliance consome (ver
      core/reims_release.py e core/reims_build.py no vhackintosh — os três têm
      de concordar). O pacote leva `bin/reims-ctl`: sem o motor, a compilação
@@ -239,53 +239,77 @@ fi
 # ------------------------------------------------------------------------------
 say "${BLUE}▶ Conferindo os artefatos do pacote...${NC}"
 
-# De onde este checkout realmente constrói: o install-ctl.sh deixa o QEMU em
-# ~/.cache/reims-ctl/qemu-build-<plataforma>/ e o bundle com as ROMs em
-# <target>/dist-vulkan/. A ROM do vGPU hoje é `ReimsVgpu.rom`, instalada pelo
-# próprio QEMU (vendor/qemu/meson.build); o antigo `reims-vgpu-gop.rom` vinha de
-# crates/reims-vgpu-efi, que o commit 98fe2a3b removeu da árvore.
+# De onde este checkout realmente constrói: o `make qemu` deixa o binário em
+# build/qemu/, o install-ctl.sh em ~/.cache/reims-ctl/qemu-build-<plataforma>/,
+# e a biblioteca em <target>/dist-vulkan/. A ROM do device do produto graphics é
+# `firmware/prebuilt/ReimsGraphics.rom`, embutida no reims-ctl (prebuilt.rs) e
+# entregue ao QEMU pelo `romfile`; não existe mais uma `ReimsVgpu.rom` gerada
+# pelo build do QEMU (era da geração apple-gfx).
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/reims-ctl"
 BUILD_PLATFORM="linux-x86_64"
 
-# Aceita o caminho que o usuário já tem; senão, procura no cache do install-ctl.
+# Aceita o caminho que o usuário já tem; senão, procura onde o `make qemu` e o
+# install-ctl.sh o deixam. O produto graphics constrói o binário em `build/qemu`
+# (Makefile, QEMU_BUILD); o install-ctl.sh o deixa em
+# `$CACHE/qemu-build-<plataforma>/` antes de instalar; o layout antigo (in-tree,
+# em `vendor/qemu/build`) fica como último recurso para checkouts v1.6.
 if [[ -z "${QEMU_BIN_OVERRIDE:-}" ]]; then
-    QEMU_BIN="vendor/qemu/build/qemu-system-x86_64"
-    if [[ ! -f "${QEMU_BIN}" ]]; then
-        FOUND_QEMU="$(find "${CACHE_DIR}" -maxdepth 3 -name qemu-system-x86_64 -type f 2>/dev/null | head -n1 || true)"
-        [[ -n "${FOUND_QEMU}" ]] && QEMU_BIN="${FOUND_QEMU}"
+    # All the places a binary may be, best first: the checkout's own builds,
+    # then the install-ctl cache (which may hold an older generation too).
+    CANDIDATES=(
+        "build/qemu/qemu-system-x86_64"
+        "vendor/qemu/build/bin/qemu-system-x86_64"
+        "vendor/qemu/build/qemu-system-x86_64"
+    )
+    while IFS= read -r found; do
+        [[ -n "${found}" ]] && CANDIDATES+=("${found}")
+    done < <(find "${CACHE_DIR}" -maxdepth 3 -name qemu-system-x86_64 -type f 2>/dev/null || true)
+    # Prefer a binary of this generation; a stale apple-gfx build in the cache
+    # must not win over a graphics one beside it. If none is graphics, keep the
+    # first that exists so the check below can say which generation it is.
+    QEMU_BIN=""
+    for candidato in "${CANDIDATES[@]}"; do
+        if [[ -f "${candidato}" ]] && grep -aq 'reims-graphics-pci' "${candidato}"; then
+            QEMU_BIN="${candidato}"
+            break
+        fi
+    done
+    if [[ -z "${QEMU_BIN}" ]]; then
+        for candidato in "${CANDIDATES[@]}"; do
+            if [[ -f "${candidato}" ]]; then
+                QEMU_BIN="${candidato}"
+                break
+            fi
+        done
     fi
 else
     QEMU_BIN="${QEMU_BIN_OVERRIDE}"
 fi
 
-# A ROM do vGPU. Procura pelo NOME ATUAL (`ReimsVgpu.rom`, 5632 bytes), que é o
-# que o QEMU carrega pelo `romfile`. A antiga `reims-vgpu-gop.rom` (26112 bytes,
-# sha256 distinto) fica FORA de propósito: o QEMU aceita as duas como romfile sem
-# reclamar, então empacotar a antiga renomeada publicaria a release com o
-# firmware errado e nenhum erro na tela.
-ROM_BIN=""
-for candidato in \
-    "vendor/qemu/build/share/qemu/ReimsVgpu.rom" \
-    "vendor/qemu/build/share/reims-vgpu/ReimsVgpu.rom" \
-    "vendor/qemu/pc-bios/ReimsVgpu.rom"
-do
-    [[ -f "${candidato}" ]] && { ROM_BIN="${candidato}"; break; }
-done
-if [[ -z "${ROM_BIN}" ]]; then
-    FOUND_ROM="$(find target vendor -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
-    [[ -z "${FOUND_ROM}" ]] && FOUND_ROM="$(find "${CACHE_DIR}" -name 'ReimsVgpu.rom' -type f 2>/dev/null | head -n1 || true)"
-    [[ -n "${FOUND_ROM}" ]] && ROM_BIN="${FOUND_ROM}"
-fi
-if [[ -z "${ROM_BIN}" ]]; then
-    say "${RED}Erro: não achei a ROM do vGPU (ReimsVgpu.rom).${NC}"
-    say "  Sem ela o QEMU sobe sem GPU virtual. A ROM é gerada pelo build do QEMU"
-    say "  (vendor/qemu/meson.build) — rode o install-ctl.sh antes de publicar."
-    # Diagnóstico: se só existir a ROM antiga, dizer isso em vez de "não achei".
-    if [[ -f "crates/reims-vgpu-efi/out/reims-vgpu-gop.rom" ]]; then
-        say "  ${YELLOW}Achei crates/reims-vgpu-efi/out/reims-vgpu-gop.rom, mas ela não é a"
-        say "  ROM do vGPU: tem outro tamanho e outro conteúdo. Não vou publicá-la"
-        say "  renomeada como ReimsVgpu.rom.${NC}"
+# O produto graphics não gera mais `ReimsVgpu.rom`: a ROM do device é
+# `firmware/prebuilt/ReimsGraphics.rom`, que o reims-ctl carrega embutida
+# (crates/reims-ctl/src/prebuilt.rs, `GRAPHICS_ROM`) e entrega ao QEMU pelo
+# `romfile`. O sinal de geração é o NOME DO DEVICE compilado, como no appliance
+# (core/reims_release.py, `_device_of_this_binary`), e não o nome de um arquivo:
+# o binário graphics anuncia `reims-graphics-pci`; o da geração v1.6 anuncia
+# `apple-gfx-pci`. Empacotar a ROM de outra geração publica uma release que sobe
+# a VM com tela preta e nenhum erro.
+GRAPHICS_ROM_BIN="firmware/prebuilt/ReimsGraphics.rom"
+if [[ -f "${QEMU_BIN}" ]]; then
+    if ! grep -aq 'reims-graphics-pci' "${QEMU_BIN}"; then
+        if grep -aq 'apple-gfx-pci' "${QEMU_BIN}"; then
+            die "o QEMU ${QEMU_BIN} é da geração apple-gfx (v1.6), não do produto graphics: esta release empacota reims-graphics-pci"
+        fi
+        die "o QEMU ${QEMU_BIN} não anuncia reims-graphics-pci: rode 'make qemu' ou ./scripts/install-ctl.sh antes de publicar"
     fi
+    if grep -aq 'reims-vgpu-pci' "${QEMU_BIN}"; then
+        die "o QEMU ${QEMU_BIN} traz reims-vgpu-pci junto de reims-graphics-pci: binário híbrido, recusado"
+    fi
+fi
+if [[ ! -f "${GRAPHICS_ROM_BIN}" ]]; then
+    say "${RED}Erro: não achei a ROM do device graphics (${GRAPHICS_ROM_BIN}).${NC}"
+    say "  Ela é gerada por 'make -C firmware prebuilt' e embutida no reims-ctl;"
+    say "  sem ela o device reims-graphics-pci sobe sem firmware e a VM não vê GPU."
     exit 1
 fi
 
@@ -310,8 +334,6 @@ fi
 
 MISSING=()
 [[ -f "${QEMU_BIN}" ]] || MISSING+=("QEMU (${QEMU_BIN})")
-[[ -n "${ROM_BIN}" && -f "${ROM_BIN}" ]] || MISSING+=("a ROM do vGPU (ReimsVgpu.rom)")
-GRAPHICS_ROM_BIN="firmware/prebuilt/ReimsGraphics.rom"
 [[ -f "${GRAPHICS_ROM_BIN}" ]] || MISSING+=("a ROM do ReimsGraphics (firmware/prebuilt/ReimsGraphics.rom)")
 [[ -n "${CTL_BIN}" && -f "${CTL_BIN}" ]] || MISSING+=("o motor reims-ctl (target/release/reims-ctl)")
 [[ -d "vendor/qemu/pc-bios" ]] || MISSING+=("vendor/qemu/pc-bios/")
@@ -328,11 +350,12 @@ if [[ "${#MISSING[@]}" -gt 0 ]]; then
     say "  ${GREEN}cargo build --release -p reims-ctl${NC}"
     say ""
     say "Depois rode este script de novo: ele encontra o QEMU em"
-    say "  ${CACHE_DIR}/qemu-build-${BUILD_PLATFORM}/"
+    say "  build/qemu/qemu-system-x86_64 (make qemu)"
+    say "  ${CACHE_DIR}/qemu-build-${BUILD_PLATFORM}/qemu-system-x86_64 (install-ctl.sh)"
     say "o motor em"
     say "  target/release/reims-ctl"
-    say "e a ROM em"
-    say "  target/dist-vulkan/share/reims-vgpu/ReimsVgpu.rom"
+    say "e a ROM do device em"
+    say "  firmware/prebuilt/ReimsGraphics.rom (make -C firmware prebuilt)"
     say ""
     say "Para apontar o QEMU na mão: ${GREEN}QEMU_BIN_OVERRIDE=/caminho/qemu-system-x86_64 $0${NC}"
     say "Para apontar o motor na mão: ${GREEN}CTL_BIN_OVERRIDE=/caminho/reims-ctl $0${NC}"
@@ -341,8 +364,8 @@ if [[ "${#MISSING[@]}" -gt 0 ]]; then
     exit 1
 fi
 say "  ✓ QEMU: ${QEMU_BIN} ($(du -h "${QEMU_BIN}" | cut -f1))"
-say "  ✓ ROM:  ${ROM_BIN}"
 say "  ✓ Motor: ${CTL_BIN} ($(du -h "${CTL_BIN}" | cut -f1))"
+say "  ✓ ROM:  ${GRAPHICS_ROM_BIN} (embutida no reims-ctl)"
 say "  ✓ pc-bios presente"
 
 if ! "${QEMU_BIN}" --version >/dev/null 2>&1; then
@@ -421,10 +444,11 @@ say "${BLUE}▶ Empacotando ${ASSET}...${NC}"
 
 # Mesmo layout que o QEMU instalado pelo install-ctl.sh usa:
 #   bin/qemu-system-x86_64
-#   share/qemu/ReimsVgpu.rom   <- o QEMU a procura pelo `romfile`, relativo
-#                                 ao seu próprio prefixo
 #   share/qemu/... (pc-bios)   <- as ROMs padrão do QEMU
-# O appliance só precisa copiar esta árvore para o prefixo dele.
+#   firmware/prebuilt/ReimsGraphics.rom <- a ROM do device graphics, que o
+#                                 reims-ctl embutida entrega pelo `romfile`
+# O appliance só precisa copiar esta árvore para o prefixo dele; o QEMU do
+# produto graphics não traz `ReimsVgpu.rom` (ela é da geração apple-gfx).
 mkdir -p "${DIST_TMP}/vendor/qemu/build/bin"
 mkdir -p "${DIST_TMP}/vendor/qemu/build/share/qemu"
 mkdir -p "${DIST_TMP}/vm/ovmf"
@@ -439,15 +463,11 @@ cp -a "${QEMU_BIN}" "${DIST_TMP}/vendor/qemu/build/bin/qemu-system-x86_64"
 cp -a "${CTL_BIN}" "${DIST_TMP}/bin/reims-ctl"
 chmod 0755 "${DIST_TMP}/bin/reims-ctl"
 
-# A ROM do vGPU, com o nome que o binário pede (`romfile ReimsVgpu.rom`).
-ROM_DEST_NAME="$(basename "${ROM_BIN}")"
-if [[ "${ROM_DEST_NAME}" != "ReimsVgpu.rom" ]]; then
-    say "${YELLOW}  Aviso: a ROM encontrada é ${ROM_DEST_NAME}; ela será publicada como ReimsVgpu.rom, que é o nome que o binário procura.${NC}"
-fi
-cp -a "${ROM_BIN}" "${DIST_TMP}/vendor/qemu/build/share/qemu/ReimsVgpu.rom"
+# A ROM do device graphics, no caminho que `core.reims_build.prebuilt_graphics_rom`
+# procura e que o reims-ctl repassa ao QEMU pelo `romfile`.
 cp -a "${GRAPHICS_ROM_BIN}" "${DIST_TMP}/firmware/prebuilt/ReimsGraphics.rom"
 
-# pc-bios: as ROMs padrão do QEMU (pxe, vgabios, edk2), ao lado da do vGPU.
+# pc-bios: as ROMs padrão do QEMU (pxe, vgabios, edk2).
 if [[ -d "vendor/qemu/pc-bios" ]]; then
     cp -a vendor/qemu/pc-bios/. "${DIST_TMP}/vendor/qemu/build/share/qemu/"
 fi
@@ -478,7 +498,6 @@ TAR_LIST="$(tar -tzf "${OUT_TAR}")" || die "não consegui listar o tarball gerad
 
 for esperado in \
     'vendor/qemu/build/bin/qemu-system-x86_64' \
-    'vendor/qemu/build/share/qemu/ReimsVgpu.rom' \
     'firmware/prebuilt/ReimsGraphics.rom' \
     'vendor/qemu/build/share/qemu/' \
     'bin/reims-ctl'
@@ -538,14 +557,14 @@ say "${BLUE}▶ Publicando o Release ${NEXT_TAG} em ${REPO}...${NC}"
 gh release create "${NEXT_TAG}" "${OUT_TAR}" "${OUT_TAR}.sha256" \
     --repo "${REPO}" \
     --title "Reims vGPU ${NEXT_TAG} (x86_64 Linux)" \
-    --notes "Binários pré-compilados do Reims vGPU (QEMU com backend Vulkan + ROM UEFI GOP).
+    --notes "Binários pré-compilados do Reims vGPU (QEMU com o device reims-graphics-pci).
 
 Linux x86-64. Carrega o Vulkan em runtime via dlopen(\"libvulkan.so.1\"),
 então o mesmo binário serve em qualquer host com Vulkan 1.2+.
 
 Conteúdo do pacote:
-  vendor/qemu/build/bin/qemu-system-x86_64   QEMU com apple-gfx (Vulkan)
-  vendor/qemu/build/share/qemu/ReimsVgpu.rom ROM do vGPU (romfile)
+  vendor/qemu/build/bin/qemu-system-x86_64   QEMU com reims-graphics-pci
+  firmware/prebuilt/ReimsGraphics.rom        ROM do device (embutida no reims-ctl)
   vendor/qemu/build/share/qemu/              pc-bios do QEMU
   vm/ovmf/                                   firmware UEFI
   bin/reims-ctl                              motor que cria e sobe a VM

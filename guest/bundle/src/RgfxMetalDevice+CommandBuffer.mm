@@ -18,7 +18,7 @@
 
 namespace {
 // A queue's submission and completion ring byte-ring sizes (each a power of two). The
-// host's ring loop (crates/reims-graphics/src/device.rs) posts this queue's command-
+// host's ring loop (crates/reims-vgpu-graphics/src/device.rs) posts this queue's command-
 // buffer completions on its own completion ring, so the queue reads that ring (not the
 // device's control completion ring); see newCommandQueue.
 constexpr uint32_t kQueueSubmitDataSize = 32768;
@@ -32,11 +32,16 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	return [self newCommandQueueWithMaxCommandBufferCount:0];
 }
 
-// A queue of the descriptor's command buffer count. The descriptor's log state can only be one
-// the device made, and it makes none (newLogStateWithDescriptor:error:).
+// A queue of the descriptor's command buffer count, which takes what else the descriptor names
+// (rgfxTakeDescriptor:). The descriptor's log state can only be one the device made, and it
+// makes none (newLogStateWithDescriptor:error:).
 - (nullable id<MTLCommandQueue>)newCommandQueueWithDescriptor:(MTLCommandQueueDescriptor *)descriptor
 {
-	return [self newCommandQueueWithMaxCommandBufferCount:descriptor.maxCommandBufferCount];
+	id<MTLCommandQueue> queue =
+	    [self newCommandQueueWithMaxCommandBufferCount:descriptor.maxCommandBufferCount];
+	if (queue != nil)
+		[(RgfxCommandQueue *)queue rgfxTakeDescriptor:descriptor];
+	return queue;
 }
 
 - (nullable id<MTLCommandQueue>)newCommandQueueWithMaxCommandBufferCount:
@@ -60,8 +65,8 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 		return nil; // the region had no room for the ring pair
 	}
 	auto releaseRings = [region, rings] {
-		region->release(rings.submit_offset);
-		region->release(rings.complete_offset);
+		region->release(rings.submit_block);
+		region->release(rings.complete_block);
 	};
 	RgfxRingWriter *submit = [self addQueueSubmitRingAtOffset:rings.submit_offset
 	                                                dataSize:kQueueSubmitDataSize];
@@ -102,10 +107,17 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 	[queue adoptReplyReader:reader];
 	// A command buffer too large for the ring puts its message in a block of the region.
 	queue.region = region;
+	queue.slabs = [self slabs];
 	// Its command buffers that commitAndWaitUntilSubmitted commits ask for their submission
 	// where the host answers it.
 	const RgfxCaps *caps = [self caps];
 	queue.asksSubmitted = caps != nullptr && (caps->features() & RGFX_FEATURE_CB_SUBMITTED) != 0;
+	// A thread that waits for one of them to be scheduled asks for its record where the host
+	// answers that.
+	queue.asksScheduled = caps != nullptr && (caps->features() & RGFX_FEATURE_SCHEDULED_ASK) != 0;
+	// Its command buffers carry the guest's times, for the host's split of the time before it
+	// takes them, where the device's word holds GUEST_TIMES.
+	queue.stampsGuestTimes = caps != nullptr && (caps->features() & RGFX_FEATURE_GUEST_TIMES) != 0;
 	// A commit that finds the queue's ring full waits for the host's room record on the queue's
 	// completion ring, which the reader hands to the ring's writer, where the device's word holds
 	// SUBMIT_ROOM; else it sleeps between looks (RgfxRingWriter::post).
@@ -114,6 +126,10 @@ constexpr uint32_t kQueueCompleteDataSize = 32768;
 		reader->setRoomEvents(room);
 		submit->setRoomEvents(room);
 	}
+	// A buffer that asks for its CB_SUBMITTED rings its doorbell apart from the rest, so the
+	// host may take the rest with no exit to its process, where the device's word holds
+	// DOORBELL_ASKS.
+	submit->setDoorbellAsks(caps != nullptr && (caps->features() & RGFX_FEATURE_DOORBELL_ASKS) != 0);
 	// Where the host commits a process's command buffers in the order its queues put them on
 	// their rings, the queue takes part in the process's commit order (RgfxCommitOrder.hpp): the
 	// device made one where its word holds RGFX_FEATURE_COMMIT_ORDER.

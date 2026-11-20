@@ -30,14 +30,13 @@
 //! state, so a refresh that found no window does not keep the next change from posting one.
 //!
 //! **Who moves the guest's cursor.** The window's pointer events move it, through the host, and
-//! over the image the host's cursor takes the guest's glyph, at the host's pointer. At each of
-//! the guest's cursor doorbells the window reads the guest's cursor position through its sink
-//! ([`Window::cursor_moved`]); a doorbell that leaves it where it was (one rung for a show or a
-//! hide, say) moves nothing, and so does the first position read. Where the guest moves its
+//! over the image the host's cursor takes the guest's glyph, at the host's pointer. The display
+//! tells the window each place the guest puts its cursor ([`Window::cursor_at`]); a place where
+//! it was (a show or a hide, say) moves nothing, and so does the first. Where the guest moves its
 //! cursor with no pointer event of the window's in the [`POINTER_LEADS_FOR`] before, something
 //! else moves it: a mouse the host passed through to the guest, which the host's pointer never
 //! sees, or the guest placing its own. The window then draws the guest's cursor into its image
-//! itself, at the position it read ([`DrawnCursor`], which the render thread hands the sink with
+//! itself, at the place it was told ([`DrawnCursor`], which the render thread hands the sink with
 //! each draw), each move drawing again, and the host's cursor is invisible over the image. The
 //! window's next pointer event gives the cursor back to the host's pointer. A move the guest
 //! reports soon after a pointer event of the window's is the guest following it, however late its
@@ -47,14 +46,13 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::MonoTime;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::platform::os::MonoTime;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
-pub use crate::native::FrameSink;
+pub use crate::present::FrameSink;
 
 use crate::config::{WindowCallbacks, WindowConfig};
 use crate::native::{self, Surface};
-use crate::policy;
 
 /// The next window's id.
 static NEXT_ID: AtomicU64 = AtomicU64::new(1);
@@ -216,12 +214,6 @@ pub struct Window {
     port: u64,
     /// The window's title.
     title: String,
-    /// The config's flag.
-    match_host_screen: bool,
-    /// The config's chosen mode.
-    chosen_mode: Option<(u16, u16)>,
-    /// The config's density for the chosen mode.
-    chosen_ppi: Option<f64>,
     /// The config's `keeps_its_size`.
     keeps_its_size: bool,
     /// The host's callbacks, until the window's end takes them out.
@@ -230,9 +222,6 @@ pub struct Window {
     guest: Mutex<GuestState>,
     /// The first mode the display offers the guest, once it offers one.
     offered: Mutex<Option<(u16, u16)>>,
-    /// The size in millimetres the display tells the guest, once it is known: what the guest's
-    /// scale follows ([`policy::guest_scale`]).
-    told_size: Mutex<Option<(f64, f64)>>,
     /// What draws the display's frames, once the display exists.
     sink: Mutex<Option<Arc<dyn FrameSink>>>,
     /// Set at the window's end.
@@ -244,6 +233,8 @@ pub struct Window {
     open_posted: AtomicBool,
     /// A cursor refresh is posted to the UI thread and has not run yet.
     cursor_posted: AtomicBool,
+    /// How many frames the window was asked to draw ([`Window::new_frame`]).
+    frames_asked: AtomicU64,
     /// What the render thread draws with.
     surface: Surface,
     /// What it posts to the UI thread.
@@ -278,19 +269,16 @@ impl Window {
             id: NEXT_ID.fetch_add(1, Ordering::Relaxed),
             port,
             title,
-            match_host_screen: config.match_host_screen,
-            chosen_mode: config.mode,
-            chosen_ppi: config.mode_ppi,
             keeps_its_size: config.keeps_its_size,
             callbacks: Mutex::new(Some(config.callbacks)),
             guest: Mutex::new(GuestState::default()),
             offered: Mutex::new(None),
-            told_size: Mutex::new(None),
             sink: Mutex::new(None),
             closed: AtomicBool::new(false),
             attached: AtomicBool::new(false),
             open_posted: AtomicBool::new(false),
             cursor_posted: AtomicBool::new(false),
+            frames_asked: AtomicU64::new(0),
             surface: Surface::new(),
             posts,
         })
@@ -304,11 +292,6 @@ impl Window {
     /// The window's title.
     pub fn title(&self) -> &str {
         &self.title
-    }
-
-    /// Whether the config asked for modes and a density matching the host's screen.
-    pub fn match_host_screen(&self) -> bool {
-        self.match_host_screen
     }
 
     /// Opens the window over `sink`, the display's: its render thread starts, and the window
@@ -340,7 +323,14 @@ impl Window {
 
     /// The guest presented a frame: the window draws it.
     pub fn new_frame(&self) {
+        self.frames_asked.fetch_add(1, Ordering::Relaxed);
         self.surface.request_draw();
+    }
+
+    /// How many frames the window was asked to draw ([`Window::new_frame`]) since it was made,
+    /// whether it drew each or took several in one draw.
+    pub fn frames_asked(&self) -> u64 {
+        self.frames_asked.load(Ordering::Relaxed)
     }
 
     /// The display offers the guest `width` by `height` first: the window opens sized for it
@@ -390,21 +380,11 @@ impl Window {
         }
     }
 
-    /// The guest rang the doorbell that reports its cursor's moves: the window reads its cursor
-    /// position through the sink ([`FrameSink::guest_cursor_position`]), on this thread, and
-    /// takes it as `Window::cursor_at` does. Nothing before the sink is attached, after the
-    /// display has ended, without a guest display, or while it is paused.
-    pub fn cursor_moved(&self) {
-        let sink = self.sink.lock().clone();
-        if let Some(at) = sink.and_then(|sink| sink.guest_cursor_position()) {
-            self.cursor_at(at);
-        }
-    }
-
-    /// The guest's cursor is at `at`: where it moved, with no pointer event of the window's in
-    /// the [`POINTER_LEADS_FOR`] before, the window draws the guest's cursor there, and hides the
+    /// The guest put its cursor's hot spot at `at`, in its mode's pixels (a display's move of the
+    /// guest's cursor): where it moved, with no pointer event of the window's in the
+    /// [`POINTER_LEADS_FOR`] before, the window draws the guest's cursor there, and hides the
     /// host's over the image (the module doc). Each move then draws again.
-    pub(crate) fn cursor_at(&self, at: (u16, u16)) {
+    pub fn cursor_at(&self, at: (u16, u16)) {
         let (changed, drawn) = {
             let mut guest = self.guest.lock();
             let Some(changed) = guest.lead.guest_at(native::now(), at) else {
@@ -465,25 +445,9 @@ impl Window {
         *self.offered.lock()
     }
 
-    /// The config's chosen mode (`WindowConfig::mode`).
-    pub fn chosen_mode(&self) -> Option<(u16, u16)> {
-        self.chosen_mode
-    }
-
-    /// The config's density for its chosen mode (`WindowConfig::mode_ppi`).
-    pub fn chosen_ppi(&self) -> Option<f64> {
-        self.chosen_ppi
-    }
-
     /// Whether the window never resizes for the guest's mode (`WindowConfig::keeps_its_size`).
     pub fn keeps_its_size(&self) -> bool {
         self.keeps_its_size
-    }
-
-    /// The display tells the guest it is `size_in_millimeters`: the window opens and resizes at
-    /// a guest point per host point, the guest's scale for each mode following it.
-    pub fn told_size(&self, size_in_millimeters: (f64, f64)) {
-        *self.told_size.lock() = Some(size_in_millimeters);
     }
 }
 
@@ -533,8 +497,9 @@ impl Window {
     }
 
     /// The cursor the render thread has the sink draw into the image: the guest's, where the
-    /// guest moves it on its own and shows it, once it has a glyph and a mode; else none.
-    pub(crate) fn drawn_cursor(&self) -> Option<DrawnCursor> {
+    /// guest moves it on its own and shows it, once it has a glyph and a mode; else none. Public
+    /// for the display's tests, which check what the window draws from the guest's cursor.
+    pub fn drawn_cursor(&self) -> Option<DrawnCursor> {
         let guest = self.guest.lock();
         if !(guest.lead.guest_leads() && guest.cursor_visible) {
             return None;
@@ -554,14 +519,6 @@ impl Window {
     /// The guest's mode, once it has set one.
     pub(crate) fn mode(&self) -> Option<(u16, u16)> {
         self.guest.lock().mode
-    }
-
-    /// The scale the guest runs `mode` at: 2 or 1 by the size the display tells it
-    /// ([`policy::guest_scale`]), 1 before the display says.
-    pub(crate) fn guest_scale(&self, mode: (u16, u16)) -> u8 {
-        self.told_size
-            .lock()
-            .map_or(1, |size| policy::guest_scale(mode, size))
     }
 
     /// The sink, copied out of its lock, until the window's end.
@@ -786,7 +743,7 @@ mod tests {
         assert_eq!(
             lead.guest_at(idle, (8, 5)),
             None,
-            "a doorbell that moves nothing"
+            "a place that moves nothing"
         );
         assert!(!lead.guest_leads());
         assert_eq!(
@@ -797,65 +754,6 @@ mod tests {
         assert!(lead.guest_leads());
     }
 
-    /// A sink that answers only the guest's cursor position, as the test sets it.
-    struct PositionSink(Mutex<Option<(u16, u16)>>);
-
-    #[cfg(target_os = "macos")]
-    impl FrameSink for PositionSink {
-        fn device(
-            &self,
-        ) -> Option<objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>>
-        {
-            None
-        }
-
-        fn draw(
-            &self,
-            _drawable: &objc2::runtime::ProtocolObject<dyn objc2_quartz_core::CAMetalDrawable>,
-            _region: PixelRect,
-            _cursor: Option<&DrawnCursor>,
-        ) -> bool {
-            false
-        }
-
-        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-            *self.0.lock()
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    impl FrameSink for PositionSink {
-        fn presenter(
-            &self,
-            _target: &dyn crate::VulkanTarget,
-        ) -> Option<Box<dyn crate::Presenter>> {
-            None
-        }
-
-        fn guest_cursor_position(&self) -> Option<(u16, u16)> {
-            *self.0.lock()
-        }
-    }
-
-    /// At each doorbell the window reads the guest's cursor position through its sink: none
-    /// reads nothing, the first position is no move, and a new one is
-    #[test]
-    fn a_doorbell_reads_the_guest_s_cursor_through_the_sink() {
-        let window = Window::new(WindowConfig::default(), 0, title(0));
-        let sink = Arc::new(PositionSink(Mutex::new(None)));
-        *window.sink.lock() = Some(Arc::clone(&sink) as Arc<dyn FrameSink>);
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), None);
-        *sink.0.lock() = Some((3, 4));
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), Some((3, 4)));
-        assert!(!window.guest().lead.guest_leads());
-        *sink.0.lock() = Some((5, 4));
-        window.cursor_moved();
-        assert!(window.guest().lead.guest_leads());
-        window.close();
-    }
-
     /// While the guest moves its cursor on its own, the window draws it, with its glyph, in the
     /// guest's mode, and the host's cursor is invisible over the image; a hidden guest cursor is
     /// drawn by neither; the window's pointer event gives it back to the host's cursor
@@ -864,8 +762,6 @@ mod tests {
         let window = Window::new(WindowConfig::default(), 0, title(0));
         let g = glyph(4);
         window.cursor_show(true);
-        window.cursor_moved();
-        assert_eq!(window.guest().lead.at(), None, "no sink, no position");
         window.cursor_at((10, 20));
         window.cursor_at((11, 20));
         assert!(window.drawn_cursor().is_none(), "no glyph or mode yet");

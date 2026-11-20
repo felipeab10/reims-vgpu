@@ -1,85 +1,30 @@
 //! The process-wide platform and the panic-hook install.
 //!
 //! The process-wide state (the serial number set, the latest IOSurface host device) lives in one
-//! platform instance (D17), so every public constructor goes through the process's: on macOS
-//! [`platform`], one `MetalPlatform` per process, made on first use. Making it installs the
-//! aborting panic hook first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
-//! (`reims_vgpu_core::logging::init`). Every function of the C API installs the hook too, before
+//! platform instance (D17), so every public constructor goes through the process's: [`platform`],
+//! one `VulkanPlatform` per process, made on first use. Making it installs the aborting panic hook
+//! first (6.5), then the stderr logger if `REIMS_VGPU_LOG` asks for it
+//! (`reims_vgpu_vulkan::core::logging::init`). Every function of the C API installs the hook too, before
 //! its body runs, since some make no platform.
-//!
-//! With the `vulkan` feature, `vulkan_platform` is the process's `VulkanPlatform`, made the
-//! same way on its first use: the only platform on Linux.
-
-// The docs name macOS's platform, which other OSes have none of: their links resolve, and are
-// checked, on macOS.
-#![cfg_attr(not(target_os = "macos"), allow(rustdoc::broken_intra_doc_links))]
 
 use std::sync::{Arc, Once, OnceLock};
 
-use reims_vgpu_core::platform::os::Preferences;
-use reims_vgpu_core::rt::is_our_thread;
-use reims_vgpu_core::tasks::isolation::TaskThreads;
-#[cfg(target_os = "macos")]
-use reims_vgpu_metal::MetalPlatform;
-#[cfg(feature = "vulkan")]
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::rt::is_our_thread;
 
-#[cfg(target_os = "macos")]
-static PLATFORM: OnceLock<Arc<MetalPlatform>> = OnceLock::new();
-#[cfg(feature = "vulkan")]
-static VULKAN_PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
+static PLATFORM: OnceLock<Arc<VulkanPlatform>> = OnceLock::new();
 static HOOK: Once = Once::new();
 
-/// The process's platform (D17) on macOS, made on first use: the panic hook first, the logger,
-/// then one `MetalPlatform` whose launcher runs each isolated task's service on threads of its own
-/// ([`TaskThreads`]).
-#[cfg(target_os = "macos")]
-pub fn platform() -> Arc<MetalPlatform> {
-    platform_ref().clone()
-}
-
-/// [`platform`], borrowed for the life of the process.
-#[cfg(target_os = "macos")]
-pub fn platform_ref() -> &'static Arc<MetalPlatform> {
-    PLATFORM.get_or_init(|| {
-        install_panic_hook();
-        reims_vgpu_core::logging::init();
-        Arc::new(MetalPlatform::new(Box::new(TaskThreads::new())))
-    })
-}
-
-/// The process's Vulkan platform, made on first use as [`platform`] makes the Metal one: the
-/// panic hook first, the logger, then one `VulkanPlatform` whose launcher runs each isolated
-/// task's service on threads of its own ([`TaskThreads`]).
-#[cfg(feature = "vulkan")]
-pub fn vulkan_platform() -> Arc<VulkanPlatform> {
-    VULKAN_PLATFORM
+/// The process's platform (D17), made on first use: the panic hook first, the logger, then one
+/// `VulkanPlatform`.
+pub fn platform() -> Arc<VulkanPlatform> {
+    PLATFORM
         .get_or_init(|| {
             install_panic_hook();
-            reims_vgpu_core::logging::init();
-            Arc::new(VulkanPlatform::new(Box::new(TaskThreads::new())))
+            reims_vgpu_vulkan::core::logging::init();
+            Arc::new(VulkanPlatform::new())
         })
         .clone()
-}
-
-/// The process's settings reader, for [`crate::DisplayConfig::apply_preferences`] and
-/// [`crate::DisplayMode::with_preferences`]: every key is absent, as the library reads no
-/// preferences domain.
-pub fn preferences() -> &'static dyn Preferences {
-    &NoPreferences
-}
-
-/// A reader with no settings.
-struct NoPreferences;
-
-impl Preferences for NoPreferences {
-    fn app_bool(&self, _key: &str) -> (bool, bool) {
-        (false, false)
-    }
-
-    fn any_user_f32(&self, _key: &str) -> Option<f32> {
-        None
-    }
 }
 
 /// The line the hook writes before it aborts.
@@ -88,12 +33,12 @@ pub(crate) fn hook_message(info: &dyn std::fmt::Display) -> String {
 }
 
 /// Installs the panic hook of architecture 6.5, once per process. A panic is a bug, and a panic
-/// in the library's code (on the FIFO thread, in one of its queue blocks, in a Metal completion
+/// in the library's code (on one of its threads, in one of its queue blocks, in a Metal completion
 /// handler, inside a public entry point or a C export, each marked by `rt::enter_ours`) ends the
 /// process as a death does: one line on stderr, then `abort()`, before anything unwinds, so no
 /// panic crosses into the host's frames and no drop runs first. Inside a refusal scope (the
 /// graphics lane's ops) it is refused as a death there is: the line is written, and the panic
-/// unwinds to the scope, which refuses the op (`reims_vgpu_core::raise::refusals`, "Panics"). A
+/// unwinds to the scope, which refuses the op (`reims_vgpu_vulkan::core::raise::refusals`, "Panics"). A
 /// panic anywhere else is the host's own, and goes to the previous hook.
 pub fn install_panic_hook() {
     HOOK.call_once(|| {
@@ -102,7 +47,7 @@ pub fn install_panic_hook() {
             if is_our_thread() {
                 use std::io::Write as _;
                 let _ = std::io::stderr().write_all(hook_message(info).as_bytes());
-                if reims_vgpu_core::raise::refusals::refuses_panics() {
+                if reims_vgpu_vulkan::core::raise::refusals::refuses_panics() {
                     return;
                 }
                 #[allow(clippy::disallowed_methods)] // a panic's abort (6.5)
@@ -116,8 +61,9 @@ pub fn install_panic_hook() {
 #[cfg(test)]
 mod tests {
 
-    use std::os::unix::process::ExitStatusExt as _;
     use std::process::Command;
+
+    use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
     use super::*;
 
@@ -135,12 +81,12 @@ mod tests {
     /// capture off, as the product runs.
     #[test]
     fn a_panic_in_a_refusal_scope_is_refused_and_the_process_goes_on() {
-        use reims_vgpu_core::raise::death::DeathId;
-        use reims_vgpu_core::raise::refusals::refusing;
+        use reims_vgpu_vulkan::core::raise::death::DeathId;
+        use reims_vgpu_vulkan::core::raise::refusals::refusing;
         if std::env::var_os("RVG_SCOPED_PANIC_CHILD").is_some() {
-            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            reims_vgpu_vulkan::core::testkit::capture::set_capture_enabled(false);
             install_panic_hook();
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             let r: Result<(), _> = refusing(|| panic!("in a guest op"));
             assert_eq!(r.unwrap_err().id, DeathId::Panic);
             let _ = std::io::Write::write_all(&mut std::io::stderr(), b"the process goes on\n");
@@ -151,7 +97,7 @@ mod tests {
             "RVG_SCOPED_PANIC_CHILD",
         );
         let stderr = String::from_utf8_lossy(&out.stderr);
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         let refused = stderr
             .find("reims-vgpu: panic: ")
             .expect("the refused panic's line");
@@ -166,7 +112,6 @@ mod tests {
 
     /// platform() is one per process (D17). In a child: making the platform installs the aborting
     /// hook, which must not meet the death-capture panics of this binary's fake-platform tests.
-    #[cfg(target_os = "macos")]
     #[test]
     fn one_platform_per_process() {
         if std::env::var_os("RVG_PLATFORM_CHILD").is_some() {
@@ -174,34 +119,14 @@ mod tests {
             let b = platform();
             assert!(Arc::ptr_eq(&a, &b));
             // The hook is in: a panic on our thread now aborts.
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             panic!("after platform()");
         }
         let out = child(
             "singleton::tests::one_platform_per_process",
             "RVG_PLATFORM_CHILD",
         );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
-        assert!(String::from_utf8_lossy(&out.stderr).contains("reims-vgpu: "));
-    }
-
-    /// vulkan_platform() is one per process, and installs the aborting hook as platform() does;
-    /// in a child, for the reason above.
-    #[cfg(feature = "vulkan")]
-    #[test]
-    fn one_vulkan_platform_per_process() {
-        if std::env::var_os("RVG_VULKAN_PLATFORM_CHILD").is_some() {
-            let a = vulkan_platform();
-            let b = vulkan_platform();
-            assert!(Arc::ptr_eq(&a, &b));
-            let _ours = reims_vgpu_core::rt::enter_ours();
-            panic!("after vulkan_platform()");
-        }
-        let out = child(
-            "singleton::tests::one_vulkan_platform_per_process",
-            "RVG_VULKAN_PLATFORM_CHILD",
-        );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         assert!(String::from_utf8_lossy(&out.stderr).contains("reims-vgpu: "));
     }
 
@@ -223,7 +148,7 @@ mod tests {
                 }
             }
             install_panic_hook();
-            let _ours = reims_vgpu_core::rt::enter_ours();
+            let _ours = reims_vgpu_vulkan::core::rt::enter_ours();
             let _l = Loud;
             panic!("ours panic");
         }
@@ -231,7 +156,7 @@ mod tests {
             "singleton::tests::panic_on_our_thread_aborts_before_unwinding",
             "RVG_HOOK_OURS_CHILD",
         );
-        assert_eq!(out.status.signal(), Some(6), "{out:?}");
+        assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert!(!stdout.contains("DROPPED"), "{stdout}");
@@ -261,7 +186,7 @@ mod tests {
             "singleton::tests::panic_elsewhere_defers_to_the_previous_hook",
             "RVG_HOOK_OTHER_CHILD",
         );
-        assert_eq!(out.status.signal(), None, "{out:?}");
+        assert_eq!(exit_signal(out.status), None, "{out:?}");
         assert!(!out.status.success());
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);

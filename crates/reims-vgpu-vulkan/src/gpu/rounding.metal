@@ -1,9 +1,8 @@
-// The tests' functions that write a sweep of values through a texture (`serialized.rs`), for
-// `textureWriteRoundingMode`: value `i` of 65536, at texel `(i % 256, i / 256)`, in every
-// component, from a sweep `kind` (buffer 0) chooses. `sweep_kernel` writes it with
-// `access::write`; `sweep_vertex` and `sweep_fragment` draw it into colour attachment 0 over a
-// 256 by 256 target, and `sweep_vertex` and `write_fragment` write it into texture 0 with
-// `access::write` from the fragment stage.
+// The tests' functions that write a sweep of values through a texture (`encode_render.rs`'s tests):
+// value `i` of 65536, at texel `(i % 256, i / 256)`, in every component, from a sweep `kind`
+// (buffer 0) chooses. `sweep_kernel` writes it with `access::write`; `sweep_vertex` and
+// `sweep_fragment` draw it into colour attachment 0 over a 256 by 256 target, and `sweep_vertex`
+// and `write_fragment` write it into texture 0 with `access::write` from the fragment stage.
 #include <metal_stdlib>
 using namespace metal;
 
@@ -45,7 +44,7 @@ fragment void write_fragment(Sweep in [[stage_in]], constant uint &kind [[buffer
 }
 
 // `write_args_fragment` writes `write_fragment`'s value into the texture an argument buffer at
-// buffer 1 holds (`encode_render.rs`, `textureWriteRoundingMode`).
+// buffer 1 holds (`encode_render.rs`'s tests).
 struct WrittenArgs {
     texture2d<float, access::write> t [[id(0)]];
 };
@@ -57,7 +56,7 @@ fragment void write_args_fragment(Sweep in [[stage_in]], constant uint &kind [[b
 }
 
 // `read_vertex` and `read_fragment` read buffer 1 through a `device` pointer that is not `const`,
-// which Metal's reflection answers read-write, and write no memory (`client_direction.rs`).
+// which Metal's reflection answers read-write, and write no memory.
 vertex Sweep read_vertex(uint vid [[vertex_id]], device float *scale [[buffer(1)]]) {
     const float2 p[3] = {float2(-1, -1), float2(3, -1), float2(-1, 3)};
     return Sweep{float4(p[vid] * scale[0], 0, 1)};
@@ -69,7 +68,7 @@ fragment float4 read_fragment(Sweep in [[stage_in]], device float4 *color [[buff
 
 // `store_words`, `exchange_words`, `store_vertex` and `store_fragment` store 0x11223344 into
 // buffer 1, a word a thread, vertex or fragment (`exchange_words` by an atomic exchange): the
-// fragment at `(x, y)` into word `y * width + x`, `width` from buffer 2 (`client_direction.rs`).
+// fragment at `(x, y)` into word `y * width + x`, `width` from buffer 2.
 kernel void store_words(device uint *dst [[buffer(1)]], uint g [[thread_position_in_grid]]) {
     dst[g] = 0x11223344;
 }
@@ -92,7 +91,7 @@ fragment float4 store_fragment(Sweep in [[stage_in]], device uint *dst [[buffer(
 }
 
 // `sweep_four_fragment` draws `sweep_fragment`'s value into colour attachments 0 to 3
-// (`encode_render.rs`, `textureWriteRoundingMode`).
+// (`encode_render.rs`'s tests).
 struct Four {
     float4 c0 [[color(0)]];
     float4 c1 [[color(1)]];
@@ -107,7 +106,7 @@ fragment Four sweep_four_fragment(Sweep in [[stage_in]], constant uint &kind [[b
 }
 
 // `sweep_half_fragment` draws `sweep_fragment`'s value as a `half4`, which the function's
-// conversion rounds, into colour attachment 0 (`serialized.rs`, `textureWriteRoundingMode`).
+// conversion rounds, into colour attachment 0 (`encode_render.rs`'s tests).
 fragment half4 sweep_half_fragment(Sweep in [[stage_in]], constant uint &kind [[buffer(0)]]) {
     uint2 g = uint2(in.position.xy);
     return half4(value(g.y * 256 + g.x, kind));

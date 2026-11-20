@@ -7,6 +7,12 @@
 //                newBufferWithBytes:, of lengths 1 to 1 MiB + 1
 //   heapbuffers  allocatedSize of buffers in a 4 MiB Private heap, and the device's
 //                heapBufferSizeAndAlignWithLength:options:
+//   heap.shared  a 4 MiB Shared heap: whether the device makes one, its buffers' sizes and
+//                contents, and a texture in it
+//   bit17, bit18, bit19  buffers by length (each storage mode) and by bytes (Shared, Managed),
+//                and the device's textures (each storage mode), of options holding that bit
+//   tiled.responds  whether a buffer of each storage mode answers the tiled and linear texture
+//                SPI, and the device the tiled one over bytes
 //   nocopy.*     a no-copy buffer (newBufferWithBytesNoCopy:) over pages the probe maps: its
 //                allocatedSize, length, contents and gpuAddress; .page (one page), .3pages,
 //                .16k, .len100 (100 bytes), .off16 (16 bytes into a page), .managed (one page)
@@ -40,7 +46,9 @@
 //   buftex.*     a 2D texture over a Shared buffer by the public newTextureWithDescriptor:offset:
 //                bytesPerRow:: .bc1 and .depth (formats minimumLinearTextureAlignmentForPixelFormat:
 //                may end the process at), .shortrow (468 x 36 BGRA8 rows 1536 bytes apart, under
-//                the row's 1872); linear.shortrow, the same by the buffer's linear SPI
+//                the row's 1872); linear.shortrow, the same by the buffer's linear SPI;
+//                .depth16, .stencil8, .d32s8 and .x32s8, the other depth and stencil formats;
+//                linear.depth, Depth32Float by the linear SPI
 //   devtex.*     a 64 x 64 2D texture the device makes, usage RenderTarget: .depth.shared,
 //                .depth.managed, .stencil.managed and .depth.private, by format and storage mode
 //   texaddr      (a group) for a texture of each storage mode and shape (texaddr.MODE.SHAPE):
@@ -85,12 +93,34 @@
 //   argbuf.ds.tex  setDepthStencilState:atIndex: of a state, and (.texnil) of nil, on an encoder of
 //                one texture; argbuf.ds.nil, of nil on one holding a depth/stencil state
 //   libforms3    a function array's library: which functions it answers, by name, with values and
-//                by descriptor, its names' order, label, device, reflection and serialization
+//                by descriptor, its names' order, label, device, reflection and serialization;
+//                libforms.order, its names' order for each order of three functions and four of
+//                five, each made twice
 //   classes.spi  which classes of the device's, its shared event's and its buffer's (and
 //                IOGPU's base classes) define the SPI the cases above call
 //   libforms2    newLibraryWithFunctionArray:error: of two functions, of one twice, and the
 //                packages' creators over an empty directory and other URLs; libforms.kernel and
 //                libforms.vertex, a function array of a kernel or a vertex function
+//   ds.queries   readsDepth, writesDepth, readsStencil and writesStencil (SPI; Apple's GL renderer
+//                asks them) of depth/stencil states of 15 descriptors (kDsQueryCases)
+//   ds.grid      the same four queries over a grid, one line a state "ds.grid TAG => rd wd rs ws":
+//                every depth compare with and without writes (depth.C.W); every stencil compare
+//                of the front face with each operation set and masks (front.C.OPS.RM.WM, the
+//                depth test Less without writes, the back face Always and Keep); the back face's
+//                compares and operations (back.C.OPS); and stencil operations under the depth
+//                tests Always, Never and Less with and without writes (mix.DC.W.SC.OPS)
+//   ds.resourceIndex, ds.uniqueIdentifier  whether a depth/stencil state answers that SPI member,
+//                and what it returns
+//   purgeable.kinds  setPurgeableState: answers of each kind of resource the device makes: asked
+//                Volatile, then KeepCurrent, Empty, KeepCurrent, NonVolatile and KeepCurrent, one
+//                line a kind "purgeable KIND => A B C D E F": a Shared and a Private buffer, a
+//                no-copy buffer, a Private texture, a view of it, a texture over a buffer, one
+//                over an IOSurface, a Private heap and a buffer and a texture in it, and an
+//                indirect command buffer
+//   tiled.bytes  the device's tiled texture SPI over bytes, both forms, of a one-level and a
+//                six-level 64 x 64 BGRA8Unorm descriptor (usage ShaderRead | RenderTarget) of
+//                each storage mode, 256 bytes a row; tiled.buffer, a Shared buffer's tiled SPI
+//                (newTiledTextureWithDescriptor:offset:bytesPerRow:) sent whether it answers or not
 // Build: see README.md.
 #import "oracle_common.h"
 #import <IOSurface/IOSurface.h>
@@ -191,6 +221,161 @@ static void case_heapbuffers(id<MTLDevice> d)
 			       (unsigned long)b.allocatedSize);
 		}
 	}
+}
+
+static void case_heap_shared(id<MTLDevice> d)
+{
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 4u << 20;
+	hd.storageMode = MTLStorageModeShared;
+	printf("heap.shared asking for a 4 MiB Shared heap\n");
+	id<MTLHeap> h = [d newHeapWithDescriptor:hd];
+	printf("heap.shared heap=%s size=%lu storage=%lu\n", cls(h), (unsigned long)h.size,
+	       (unsigned long)h.storageMode);
+	if (h == nil)
+		return;
+	const MTLResourceOptions o = MTLResourceStorageModeShared;
+	const NSUInteger lens[] = {1, 100, 4097, 16385, 65537};
+	for (int i = 0; i < 5; i++) {
+		MTLSizeAndAlign sa = [d heapBufferSizeAndAlignWithLength:lens[i] options:o];
+		id<MTLBuffer> b = [h newBufferWithLength:lens[i] options:o];
+		printf("heap.shared length=%lu sizeAndAlign=%lu,%lu buffer=%s allocatedSize=%lu "
+		       "contents=%s\n",
+		       (unsigned long)lens[i], (unsigned long)sa.size, (unsigned long)sa.align, cls(b),
+		       (unsigned long)b.allocatedSize, b.contents ? "yes" : "NULL");
+	}
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModeShared;
+	id<MTLTexture> t = [h newTextureWithDescriptor:td];
+	printf("heap.shared texture=%s\n", cls(t));
+}
+
+// The purgeable states a resource answers, asked in turn (purgeable.kinds).
+static void purgeable_line(const char *kind, id<MTLResource> r)
+{
+	if (r == nil) {
+		printf("purgeable %s => nil\n", kind);
+		return;
+	}
+	const MTLPurgeableState asks[] = {MTLPurgeableStateVolatile, MTLPurgeableStateKeepCurrent,
+	                                  MTLPurgeableStateEmpty, MTLPurgeableStateKeepCurrent,
+	                                  MTLPurgeableStateNonVolatile, MTLPurgeableStateKeepCurrent};
+	printf("purgeable %s =>", kind);
+	for (int i = 0; i < 6; i++)
+		printf(" %lu", (unsigned long)[r setPurgeableState:asks[i]]);
+	printf("\n");
+}
+
+static void case_purgeable_kinds(id<MTLDevice> d)
+{
+	purgeable_line("buffer.shared", [d newBufferWithLength:65536 options:MTLResourceStorageModeShared]);
+	purgeable_line("buffer.private", [d newBufferWithLength:65536 options:MTLResourceStorageModePrivate]);
+	const size_t page = (size_t)getpagesize();
+	void *mem = NULL;
+	posix_memalign(&mem, page, 4 * page);
+	purgeable_line("buffer.nocopy", [d newBufferWithBytesNoCopy:mem
+	                                                     length:4 * page
+	                                                    options:MTLResourceStorageModeShared
+	                                                deallocator:nil]);
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.storageMode = MTLStorageModePrivate;
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsagePixelFormatView;
+	id<MTLTexture> t = [d newTextureWithDescriptor:td];
+	purgeable_line("texture.private", t);
+	purgeable_line("texture.view", [t newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB]);
+	id<MTLBuffer> backing = [d newBufferWithLength:64 * 256 options:MTLResourceStorageModeShared];
+	MTLTextureDescriptor *bd = [td copy];
+	bd.storageMode = MTLStorageModeShared;
+	bd.usage = MTLTextureUsageShaderRead;
+	purgeable_line("texture.overbuffer", [backing newTextureWithDescriptor:bd offset:0 bytesPerRow:256]);
+	NSDictionary *props = @{
+		(id)kIOSurfaceWidth : @64,
+		(id)kIOSurfaceHeight : @64,
+		(id)kIOSurfaceBytesPerElement : @4,
+		(id)kIOSurfacePixelFormat : @((uint32_t)'BGRA')
+	};
+	IOSurfaceRef surf = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+	MTLTextureDescriptor *sd = [bd copy];
+	sd.storageMode = MTLStorageModeShared;
+	purgeable_line("texture.iosurface", surf ? [d newTextureWithDescriptor:sd iosurface:surf plane:0] : nil);
+	MTLHeapDescriptor *hd = [MTLHeapDescriptor new];
+	hd.size = 4u << 20;
+	hd.storageMode = MTLStorageModePrivate;
+	id<MTLHeap> h = [d newHeapWithDescriptor:hd];
+	id<MTLBuffer> hb = [h newBufferWithLength:65536 options:MTLResourceStorageModePrivate];
+	id<MTLTexture> ht = [h newTextureWithDescriptor:td];
+	purgeable_line("heap.buffer", hb);
+	purgeable_line("heap.texture", ht);
+	if (h == nil) {
+		printf("purgeable heap => nil\n");
+	} else {
+		const MTLPurgeableState asks[] = {MTLPurgeableStateVolatile, MTLPurgeableStateKeepCurrent,
+		                                  MTLPurgeableStateEmpty, MTLPurgeableStateKeepCurrent,
+		                                  MTLPurgeableStateNonVolatile, MTLPurgeableStateKeepCurrent};
+		printf("purgeable heap =>");
+		for (int i = 0; i < 6; i++)
+			printf(" %lu", (unsigned long)[h setPurgeableState:asks[i]]);
+		printf("\n");
+	}
+	MTLIndirectCommandBufferDescriptor *id_ = [MTLIndirectCommandBufferDescriptor new];
+	id_.commandTypes = MTLIndirectCommandTypeDraw;
+	id_.maxVertexBufferBindCount = 1;
+	purgeable_line("icb", [d newIndirectCommandBufferWithDescriptor:id_
+	                                                maxCommandCount:16
+	                                                        options:MTLResourceStorageModeShared]);
+	if (surf)
+		CFRelease(surf);
+}
+
+// Buffers and the device's textures of options holding bit `bit`.
+static void case_option_bit(id<MTLDevice> d, const char *tag, int bit)
+{
+	const MTLResourceOptions modes[] = {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+	                                    MTLResourceStorageModePrivate};
+	const char *names[] = {"shared", "managed", "private"};
+	const MTLResourceOptions b = (MTLResourceOptions)1 << bit;
+	uint8_t bytes[64] = {0};
+	for (int m = 0; m < 3; m++) {
+		printf("%s length %s buffer=%s\n", tag, names[m],
+		       cls([d newBufferWithLength:64 options:modes[m] | b]));
+		if (m < 2)
+			printf("%s bytes %s buffer=%s\n", tag, names[m],
+			       cls([d newBufferWithBytes:bytes length:64 options:modes[m] | b]));
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.resourceOptions = modes[m] | b;
+		printf("%s texture %s texture=%s\n", tag, names[m], cls([d newTextureWithDescriptor:td]));
+	}
+}
+
+static void case_tiled_responds(id<MTLDevice> d)
+{
+	const MTLResourceOptions modes[] = {MTLResourceStorageModeShared, MTLResourceStorageModeManaged,
+	                                    MTLResourceStorageModePrivate};
+	const char *names[] = {"shared", "managed", "private"};
+	SEL tiled = sel_registerName("newTiledTextureWithDescriptor:offset:bytesPerRow:");
+	SEL linear = sel_registerName("newLinearTextureWithDescriptor:offset:bytesPerRow:bytesPerImage:");
+	for (int m = 0; m < 3; m++) {
+		id<MTLBuffer> b = [d newBufferWithLength:1 << 16 options:modes[m]];
+		printf("tiled.responds %s buffer=%s tiled=%d linear=%d\n", names[m], cls(b),
+		       (int)[(id)b respondsToSelector:tiled], (int)[(id)b respondsToSelector:linear]);
+	}
+	SEL bytes6 = sel_registerName(
+	    "newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow:");
+	SEL bytes5 = sel_registerName("newTiledTextureWithBytesNoCopy:length:descriptor:offset:bytesPerRow:");
+	printf("tiled.responds device=%s bytes.deallocator=%d bytes=%d\n", cls(d),
+	       (int)[(id)d respondsToSelector:bytes6], (int)[(id)d respondsToSelector:bytes5]);
 }
 
 static void nocopy(id<MTLDevice> d, const char *tag, size_t offset, size_t length,
@@ -2287,6 +2472,40 @@ static void case_libforms3(id<MTLDevice> d)
 	printf("libforms3 reversed functionNames=%s\n", [other.functionNames componentsJoinedByString:@","].UTF8String);
 }
 
+// The order of a function array's functionNames against the array's: each of the six orders of
+// three functions, then five functions in four orders, each order twice (two libraries).
+static void case_libforms_order(id<MTLDevice> d)
+{
+	NSError *e = nil;
+	id<MTLLibrary> lib = [d newLibraryWithURL:beside(@"oracle_bundle.metallib") error:&e];
+	id<MTLFunction> v = [lib newFunctionWithName:@"div_visible"];
+	id<MTLFunction> s = [lib newFunctionWithName:@"div_stitchable"];
+	id<MTLFunction> k = [lib newFunctionWithName:@"div_kernel" constantValues:kernel_values(2.0f) error:&e];
+	id<MTLFunction> vx = [lib newFunctionWithName:@"div_vertex"];
+	id<MTLFunction> fr = [lib newFunctionWithName:@"div_fragment"];
+	if (v == nil || s == nil || k == nil || vx == nil || fr == nil) {
+		printf("libforms.order no functions error=%s\n", err_text(e));
+		return;
+	}
+	NSArray<NSArray *> *orders = @[
+		@[ v, s, k ], @[ v, k, s ], @[ s, v, k ], @[ s, k, v ], @[ k, v, s ], @[ k, s, v ],
+		@[ vx, fr, k, v, s ], @[ s, v, k, fr, vx ], @[ k, vx, s, fr, v ], @[ fr, s, vx, v, k ]
+	];
+	SEL arr = sel_registerName("newLibraryWithFunctionArray:error:");
+	for (NSArray *order in orders) {
+		NSMutableArray<NSString *> *given = [NSMutableArray array];
+		for (id<MTLFunction> fn in order)
+			[given addObject:fn.name];
+		for (int twice = 0; twice < 2; twice++) {
+			e = nil;
+			id<MTLLibrary> l = ((id(*)(id, SEL, id, NSError **))objc_msgSend)(d, arr, order, &e);
+			printf("libforms.order given=%s functionNames=%s error=%s\n",
+			       [given componentsJoinedByString:@","].UTF8String,
+			       [l.functionNames componentsJoinedByString:@","].UTF8String, err_text(e));
+		}
+	}
+}
+
 // --- who answers the SPI (classes.spi) ---------------------------------------------------
 
 // Whether `c` itself (not a superclass) has an instance method `sel`.
@@ -2338,6 +2557,283 @@ static void case_classes_spi(id<MTLDevice> d)
 	print_owners("classes.spi buffer", b, objc_getClass("IOGPUMetalBuffer"), bufferSels, 1);
 }
 
+// --- depth/stencil states' queries and ids -------------------------------------------------
+
+// The descriptors ds.queries asks of: a tag, the depth test and write, and each face's stencil
+// (compare, stencil fail, depth fail and pass operations, read and write masks); a face whose
+// compare is -1 is left as the descriptor has it.
+static const struct {
+	const char *tag;
+	MTLCompareFunction depth;
+	BOOL write;
+	int fc, fsf, fdf, fp;
+	uint32_t frm, fwm;
+	int bc, bsf, bdf, bp;
+	uint32_t brm, bwm;
+} kDsQueryCases[] = {
+    {"default", MTLCompareFunctionAlways, NO, -1, 0, 0, 0, 0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"less", MTLCompareFunctionLess, NO, -1, 0, 0, 0, 0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"less.write", MTLCompareFunctionLess, YES, -1, 0, 0, 0, 0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"always.write", MTLCompareFunctionAlways, YES, -1, 0, 0, 0, 0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"never", MTLCompareFunctionNever, NO, -1, 0, 0, 0, 0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"stencil.default", MTLCompareFunctionAlways, NO, MTLCompareFunctionAlways, 0, 0, 0, 0xff, 0xff,
+     MTLCompareFunctionAlways, 0, 0, 0, 0xff, 0xff},
+    {"stencil.equal.keep", MTLCompareFunctionAlways, NO, MTLCompareFunctionEqual, 0, 0, 0, 0xff, 0xff,
+     MTLCompareFunctionEqual, 0, 0, 0, 0xff, 0xff},
+    {"stencil.always.replace", MTLCompareFunctionAlways, NO, MTLCompareFunctionAlways, 0, 0,
+     MTLStencilOperationReplace, 0xff, 0xff, MTLCompareFunctionAlways, 0, 0,
+     MTLStencilOperationReplace, 0xff, 0xff},
+    {"stencil.replace.wmask0", MTLCompareFunctionAlways, NO, MTLCompareFunctionAlways, 0, 0,
+     MTLStencilOperationReplace, 0xff, 0, MTLCompareFunctionAlways, 0, 0,
+     MTLStencilOperationReplace, 0xff, 0},
+    {"stencil.equal.rmask0", MTLCompareFunctionAlways, NO, MTLCompareFunctionEqual, 0, 0, 0, 0, 0xff,
+     MTLCompareFunctionEqual, 0, 0, 0, 0, 0xff},
+    {"stencil.front.equal", MTLCompareFunctionAlways, NO, MTLCompareFunctionEqual, 0, 0, 0, 0xff,
+     0xff, -1, 0, 0, 0, 0xff, 0xff},
+    {"stencil.back.replace", MTLCompareFunctionAlways, NO, -1, 0, 0, 0, 0xff, 0xff,
+     MTLCompareFunctionAlways, 0, 0, MTLStencilOperationReplace, 0xff, 0xff},
+    {"stencil.depthfail.incr", MTLCompareFunctionLess, NO, MTLCompareFunctionAlways, 0,
+     MTLStencilOperationIncrementClamp, 0, 0xff, 0xff, MTLCompareFunctionAlways, 0,
+     MTLStencilOperationIncrementClamp, 0, 0xff, 0xff},
+    {"stencil.fail.zero", MTLCompareFunctionAlways, NO, MTLCompareFunctionNotEqual,
+     MTLStencilOperationZero, 0, 0, 0xff, 0xff, MTLCompareFunctionNotEqual, MTLStencilOperationZero,
+     0, 0, 0xff, 0xff},
+    {"both", MTLCompareFunctionLess, YES, MTLCompareFunctionEqual, 0, 0, MTLStencilOperationReplace,
+     0xff, 0xff, -1, 0, 0, 0, 0xff, 0xff},
+};
+
+static MTLStencilDescriptor *ds_face(int c, int sf, int df, int p, uint32_t rm, uint32_t wm)
+{
+	if (c < 0)
+		return nil;
+	MTLStencilDescriptor *s = [MTLStencilDescriptor new];
+	s.stencilCompareFunction = (MTLCompareFunction)c;
+	s.stencilFailureOperation = (MTLStencilOperation)sf;
+	s.depthFailureOperation = (MTLStencilOperation)df;
+	s.depthStencilPassOperation = (MTLStencilOperation)p;
+	s.readMask = rm;
+	s.writeMask = wm;
+	return s;
+}
+
+static int ds_bool(id ds, const char *name)
+{
+	SEL s = sel_registerName(name);
+	if (![ds respondsToSelector:s])
+		return -1;
+	return (int)((BOOL(*)(id, SEL))objc_msgSend)(ds, s);
+}
+
+static void case_ds_queries(id<MTLDevice> d)
+{
+	for (size_t i = 0; i < sizeof kDsQueryCases / sizeof kDsQueryCases[0]; i++) {
+		@autoreleasepool {
+			MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+			dd.depthCompareFunction = kDsQueryCases[i].depth;
+			dd.depthWriteEnabled = kDsQueryCases[i].write;
+			MTLStencilDescriptor *f = ds_face(kDsQueryCases[i].fc, kDsQueryCases[i].fsf,
+			                                  kDsQueryCases[i].fdf, kDsQueryCases[i].fp,
+			                                  kDsQueryCases[i].frm, kDsQueryCases[i].fwm);
+			MTLStencilDescriptor *b = ds_face(kDsQueryCases[i].bc, kDsQueryCases[i].bsf,
+			                                  kDsQueryCases[i].bdf, kDsQueryCases[i].bp,
+			                                  kDsQueryCases[i].brm, kDsQueryCases[i].bwm);
+			if (f != nil)
+				dd.frontFaceStencil = f;
+			if (b != nil)
+				dd.backFaceStencil = b;
+			id<MTLDepthStencilState> ds = [d newDepthStencilStateWithDescriptor:dd];
+			printf("ds.queries %s state=%s readsDepth=%d writesDepth=%d readsStencil=%d "
+			       "writesStencil=%d\n",
+			       kDsQueryCases[i].tag, cls(ds), ds_bool(ds, "readsDepth"),
+			       ds_bool(ds, "writesDepth"), ds_bool(ds, "readsStencil"),
+			       ds_bool(ds, "writesStencil"));
+		}
+	}
+}
+
+// ds.grid's stencil operation sets: a tag, then the stencil failure, depth failure and pass
+// operations.
+static const struct {
+	const char *tag;
+	MTLStencilOperation sf, df, p;
+} kDsGridOps[] = {
+    {"keep", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationKeep},
+    {"sf.replace", MTLStencilOperationReplace, MTLStencilOperationKeep, MTLStencilOperationKeep},
+    {"df.replace", MTLStencilOperationKeep, MTLStencilOperationReplace, MTLStencilOperationKeep},
+    {"p.replace", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationReplace},
+    {"p.incr", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationIncrementClamp},
+    {"p.invert", MTLStencilOperationKeep, MTLStencilOperationKeep, MTLStencilOperationInvert},
+    {"all.zero", MTLStencilOperationZero, MTLStencilOperationZero, MTLStencilOperationZero},
+};
+
+static void ds_grid_line(id<MTLDevice> d, const char *tag, MTLCompareFunction dc, BOOL dw,
+                         MTLStencilDescriptor *front, MTLStencilDescriptor *back)
+{
+	@autoreleasepool {
+		MTLDepthStencilDescriptor *dd = [MTLDepthStencilDescriptor new];
+		dd.depthCompareFunction = dc;
+		dd.depthWriteEnabled = dw;
+		if (front != nil)
+			dd.frontFaceStencil = front;
+		if (back != nil)
+			dd.backFaceStencil = back;
+		id ds = [d newDepthStencilStateWithDescriptor:dd];
+		printf("ds.grid %s => %d %d %d %d\n", tag, ds_bool(ds, "readsDepth"), ds_bool(ds, "writesDepth"),
+		       ds_bool(ds, "readsStencil"), ds_bool(ds, "writesStencil"));
+	}
+}
+
+static void case_ds_grid(id<MTLDevice> d)
+{
+	char tag[96];
+	const size_t nops = sizeof kDsGridOps / sizeof kDsGridOps[0];
+	for (int c = 0; c < 8; c++)
+		for (int w = 0; w < 2; w++) {
+			snprintf(tag, sizeof tag, "depth.%d.%d", c, w);
+			ds_grid_line(d, tag, (MTLCompareFunction)c, (BOOL)w, nil, nil);
+		}
+	const uint32_t rms[] = {0, 0x01, 0xff}, wms[] = {0, 0x0f, 0xff};
+	MTLStencilDescriptor *plain = ds_face(MTLCompareFunctionAlways, 0, 0, 0, 0xff, 0xff);
+	for (int c = 0; c < 8; c++)
+		for (size_t o = 0; o < nops; o++)
+			for (int r = 0; r < 3; r++)
+				for (int w = 0; w < 3; w++) {
+					snprintf(tag, sizeof tag, "front.%d.%s.%x.%x", c, kDsGridOps[o].tag, rms[r], wms[w]);
+					ds_grid_line(d, tag, MTLCompareFunctionLess, NO,
+					             ds_face(c, (int)kDsGridOps[o].sf, (int)kDsGridOps[o].df,
+					                     (int)kDsGridOps[o].p, rms[r], wms[w]),
+					             plain);
+				}
+	for (int c = 0; c < 8; c++)
+		for (size_t o = 0; o < nops; o++) {
+			snprintf(tag, sizeof tag, "back.%d.%s", c, kDsGridOps[o].tag);
+			ds_grid_line(d, tag, MTLCompareFunctionLess, NO, plain,
+			             ds_face(c, (int)kDsGridOps[o].sf, (int)kDsGridOps[o].df, (int)kDsGridOps[o].p,
+			                     0xff, 0xff));
+		}
+	const MTLCompareFunction dcs[] = {MTLCompareFunctionAlways, MTLCompareFunctionNever,
+	                                  MTLCompareFunctionLess};
+	const MTLCompareFunction scs[] = {MTLCompareFunctionAlways, MTLCompareFunctionNever,
+	                                  MTLCompareFunctionEqual};
+	for (int dc = 0; dc < 3; dc++)
+		for (int w = 0; w < 2; w++)
+			for (int sc = 0; sc < 3; sc++)
+				for (size_t o = 0; o < nops; o++) {
+					snprintf(tag, sizeof tag, "mix.%d.%d.%d.%s", (int)dcs[dc], w, (int)scs[sc],
+					         kDsGridOps[o].tag);
+					MTLStencilDescriptor *s = ds_face(scs[sc], (int)kDsGridOps[o].sf,
+					                                  (int)kDsGridOps[o].df, (int)kDsGridOps[o].p,
+					                                  0xff, 0xff);
+					ds_grid_line(d, tag, dcs[dc], (BOOL)w, s, s);
+				}
+}
+
+static void case_ds_id(id<MTLDevice> d, const char *tag, const char *name)
+{
+	id<MTLDepthStencilState> ds = probe_ds(d);
+	SEL s = sel_registerName(name);
+	printf("%s state=%s responds=%d\n", tag, cls(ds), (int)[(id)ds respondsToSelector:s]);
+	fflush(stdout);
+	@try {
+		uint64_t v = ((uint64_t(*)(id, SEL))objc_msgSend)((id)ds, s);
+		id<MTLDepthStencilState> ds2 = probe_ds(d);
+		uint64_t v2 = ((uint64_t(*)(id, SEL))objc_msgSend)((id)ds2, s);
+		printf("%s value=0x%llx second=0x%llx\n", tag, (unsigned long long)v, (unsigned long long)v2);
+	} @catch (NSException *e) {
+		printf("%s raises %s: %s\n", tag, e.name.UTF8String,
+		       [e.reason stringByReplacingOccurrencesOfString:@"\n" withString:@" | "].UTF8String);
+	}
+}
+
+// --- the device's tiled texture SPI over bytes -------------------------------------------
+
+static void case_tiled_bytes(id<MTLDevice> d)
+{
+	SEL bytes6 = sel_registerName(
+	    "newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:bytesPerRow:");
+	SEL bytes5 = sel_registerName("newTiledTextureWithBytesNoCopy:length:descriptor:offset:bytesPerRow:");
+	const MTLStorageMode modes[] = {MTLStorageModeShared, MTLStorageModeManaged, MTLStorageModePrivate};
+	const char *names[] = {"shared", "managed", "private"};
+	const size_t length = 1 << 16;
+	for (int levels = 1; levels <= 6; levels += 5)
+		for (int m = 0; m < 3; m++)
+			for (int form = 5; form <= 6; form++) {
+				@autoreleasepool {
+					void *bytes = NULL;
+					if (posix_memalign(&bytes, (size_t)getpagesize(), length) != 0)
+						return;
+					memset(bytes, 0x5a, length);
+					MTLTextureDescriptor *td = [MTLTextureDescriptor
+					    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+					                                 width:64
+					                                height:64
+					                             mipmapped:NO];
+					td.mipmapLevelCount = (NSUInteger)levels;
+					td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+					td.storageMode = modes[m];
+					printf("tiled.bytes levels=%d %s form=%d asking\n", levels, names[m], form);
+					fflush(stdout);
+					__block int freed = 0;
+					id t = nil;
+					@try {
+						if (form == 6) {
+							void (^dealloc)(void *, NSUInteger) = ^(void *p, NSUInteger n) {
+								(void)n;
+								freed = 1;
+								free(p);
+							};
+							t = ((id(*)(id, SEL, void *, NSUInteger, id, id, NSUInteger,
+							            NSUInteger))objc_msgSend)((id)d, bytes6, bytes, length,
+							                                       dealloc, td, 0, 256);
+						} else {
+							t = ((id(*)(id, SEL, void *, NSUInteger, id, NSUInteger,
+							            NSUInteger))objc_msgSend)((id)d, bytes5, bytes, length, td,
+							                                       0, 256);
+						}
+					} @catch (NSException *e) {
+						printf("tiled.bytes levels=%d %s form=%d raises %s: %s\n", levels, names[m],
+						       form, e.name.UTF8String, e.reason.UTF8String);
+						continue;
+					}
+					id<MTLTexture> tex = t;
+					printf("tiled.bytes levels=%d %s form=%d texture=%s", levels, names[m], form,
+					       cls(t));
+					if (tex != nil)
+						printf(" storage=%lu levels=%lu buffer=%s offset=%lu bytesPerRow=%lu "
+						       "iosurface=%d",
+						       (unsigned long)tex.storageMode, (unsigned long)tex.mipmapLevelCount,
+						       cls(tex.buffer), (unsigned long)tex.bufferOffset,
+						       (unsigned long)tex.bufferBytesPerRow, tex.iosurface != NULL);
+					printf("\n");
+					tex = nil;
+					t = nil;
+					printf("tiled.bytes levels=%d %s form=%d released freed=%d\n", levels,
+					       names[m], form, freed);
+				}
+			}
+}
+
+static void case_tiled_buffer(id<MTLDevice> d)
+{
+	id<MTLBuffer> b = [d newBufferWithLength:1 << 16 options:MTLResourceStorageModeShared];
+	SEL tiled = sel_registerName("newTiledTextureWithDescriptor:offset:bytesPerRow:");
+	MTLTextureDescriptor *td =
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO];
+	td.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+	td.storageMode = MTLStorageModeManaged;
+	printf("tiled.buffer buffer=%s responds=%d\n", cls(b), (int)[(id)b respondsToSelector:tiled]);
+	fflush(stdout);
+	@try {
+		id t = ((id(*)(id, SEL, id, NSUInteger, NSUInteger))objc_msgSend)((id)b, tiled, td, 0, 256);
+		printf("tiled.buffer texture=%s\n", cls(t));
+	} @catch (NSException *e) {
+		printf("tiled.buffer raises %s: %s\n", e.name.UTF8String, e.reason.UTF8String);
+	}
+}
+
 // --- the cases ----------------------------------------------------------------------------
 
 static const char *const kCases[] = {
@@ -2356,6 +2852,10 @@ static const char *const kCases[] = {
     "archive.slices",   "libforms2",        "libforms.kernel", "libforms.vertex", "classes.spi",
     "props2",           "argbuf.index.1",   "argbuf.index.5", "argbuf.index.5.nilreflection",
     "argbuf.ds.tex",    "argbuf.ds.texnil", "argbuf.ds.nil", "libforms3",
+    "heap.shared",      "bit17",            "bit18",         "bit19",         "tiled.responds",
+    "buftex.depth16",   "buftex.stencil8",  "buftex.d32s8",  "buftex.x32s8",  "linear.depth",
+    "ds.queries",       "ds.resourceIndex", "ds.uniqueIdentifier", "tiled.bytes", "tiled.buffer",
+    "ds.grid",          "purgeable.kinds", "libforms.order",
 };
 
 static int run_case(id<MTLDevice> d, const char *c)
@@ -2366,6 +2866,14 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_buffers(d);
 	else if (!strcmp(c, "heapbuffers"))
 		case_heapbuffers(d);
+	else if (!strcmp(c, "heap.shared"))
+		case_heap_shared(d);
+	else if (!strcmp(c, "purgeable.kinds"))
+		case_purgeable_kinds(d);
+	else if (!strcmp(c, "bit17") || !strcmp(c, "bit18") || !strcmp(c, "bit19"))
+		case_option_bit(d, c, atoi(c + 3));
+	else if (!strcmp(c, "tiled.responds"))
+		case_tiled_responds(d);
 	else if (!strcmp(c, "nocopy.page"))
 		nocopy(d, c, 0, page, shared);
 	else if (!strcmp(c, "nocopy.3pages"))
@@ -2433,6 +2941,16 @@ static int run_case(id<MTLDevice> d, const char *c)
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, NO);
 	else if (!strcmp(c, "linear.shortrow"))
 		buffer_texture(d, c, MTLPixelFormatBGRA8Unorm, 468, 36, 1536, YES);
+	else if (!strcmp(c, "buftex.depth16"))
+		buffer_texture(d, c, MTLPixelFormatDepth16Unorm, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.stencil8"))
+		buffer_texture(d, c, MTLPixelFormatStencil8, 64, 64, 256, NO);
+	else if (!strcmp(c, "buftex.d32s8"))
+		buffer_texture(d, c, MTLPixelFormatDepth32Float_Stencil8, 64, 64, 512, NO);
+	else if (!strcmp(c, "buftex.x32s8"))
+		buffer_texture(d, c, MTLPixelFormatX32_Stencil8, 64, 64, 512, NO);
+	else if (!strcmp(c, "linear.depth"))
+		buffer_texture(d, c, MTLPixelFormatDepth32Float, 64, 64, 256, YES);
 	else if (!strcmp(c, "devtex.depth.shared"))
 		device_texture(d, c, MTLPixelFormatDepth32Float, MTLStorageModeShared);
 	else if (!strcmp(c, "devtex.depth.managed"))
@@ -2538,6 +3056,20 @@ static int run_case(id<MTLDevice> d, const char *c)
 		case_argbuf_ds_nil(d);
 	else if (!strcmp(c, "libforms3"))
 		case_libforms3(d);
+	else if (!strcmp(c, "libforms.order"))
+		case_libforms_order(d);
+	else if (!strcmp(c, "ds.queries"))
+		case_ds_queries(d);
+	else if (!strcmp(c, "ds.grid"))
+		case_ds_grid(d);
+	else if (!strcmp(c, "ds.resourceIndex"))
+		case_ds_id(d, c, "resourceIndex");
+	else if (!strcmp(c, "ds.uniqueIdentifier"))
+		case_ds_id(d, c, "uniqueIdentifier");
+	else if (!strcmp(c, "tiled.bytes"))
+		case_tiled_bytes(d);
+	else if (!strcmp(c, "tiled.buffer"))
+		case_tiled_buffer(d);
 	else {
 		fprintf(stderr, "no case %s\n", c);
 		return 2;

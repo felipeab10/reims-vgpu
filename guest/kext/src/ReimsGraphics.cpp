@@ -5,11 +5,17 @@
 
 #include "ReimsGraphics.hpp"
 #include "RgfxAccelerator.hpp"
+#include "RgfxAnswerLook.hpp"
 #include "RgfxBootConsole.hpp"
+#include "RgfxCompletionArm.hpp"
+#include "RgfxControlRing.hpp"
+#include "RgfxDisplayPower.hpp"
 #include "RgfxFeatures.hpp"
 #include "RgfxPipeColor.hpp"
+#include "RgfxRegionMapping.hpp"
 
 #include <IOKit/IOLib.h>
+#include <IOKit/IOMessage.h>
 #include <IOKit/IOPlatformExpert.h>
 #include <IOKit/IOUserClient.h>
 #include <kern/clock.h>
@@ -17,11 +23,18 @@
 #include <kern/task_ref.h>
 #include <kern/thread.h>
 #include <libkern/libkern.h>
+#include <libkern/OSKextLib.h>
 
+#include "RgfxDisplayIdentity.hpp"
 #include "RgfxTrace.hpp"
 
+#if defined(__x86_64__)
 #define super IOFramebuffer
 OSDefineMetaClassAndStructors(ReimsGraphics, IOFramebuffer);
+#else
+#define super IOMobileFramebufferLegacy
+OSDefineMetaClassAndStructors(ReimsGraphics, IOMobileFramebufferLegacy);
+#endif
 
 namespace {
 
@@ -38,10 +51,18 @@ constexpr UInt32 kMsgAlign = 8;
 static_assert(kRgfxIOReturnError == static_cast<uint32_t>(kIOReturnError) &&
                   kRgfxIOReturnUnsupportedMode == static_cast<uint32_t>(kIOReturnUnsupportedMode),
               "RgfxDisplayModes.hpp's statuses are IOReturn's");
+#if defined(__x86_64__)
+// A mode the device no longer shows (RgfxDisplayModes.hpp).
+static_assert(kRgfxModeNeverShowFlag == kDisplayModeNeverShowFlag,
+              "RgfxDisplayModes.hpp's never-show flag is IOGraphicsTypes.h's");
+// The display's connection is built in (RgfxDisplayIdentity.hpp).
+static_assert(kRgfxDisplayConnectionFlags == kIOConnectionBuiltIn,
+              "RgfxDisplayIdentity.hpp's connection flags are IOGraphicsTypes.h's built-in one");
 IOReturn noSuchMode(RgfxModeCall call)
 {
 	return static_cast<IOReturn>(rgfxNoSuchModeStatus(call));
 }
+#endif
 
 // The ring header's fields, by their offset in it (each in a 64-byte line).
 constexpr UInt32 kRingProducer = __builtin_offsetof(RgfxRingHeader, producer);
@@ -49,22 +70,20 @@ constexpr UInt32 kRingConsumer = __builtin_offsetof(RgfxRingHeader, consumer);
 constexpr UInt32 kRingConsumerIdle = __builtin_offsetof(RgfxRingHeader, consumer_idle);
 constexpr UInt32 kRingProducerWaiting = __builtin_offsetof(RgfxRingHeader, producer_waiting);
 constexpr UInt32 kRingArmed = __builtin_offsetof(RgfxRingHeader, armed);
-
-// The cursor image's slot, at the region's end: 256 x 256 BGRA8, the largest
-// image the hardware cursor takes. A larger one is IOFramebuffer's to draw.
-constexpr UInt32 kCursorMax = 256;
-constexpr UInt64 kCursorSlot = kCursorMax * kCursorMax * 4;
+constexpr UInt32 kRingGuestClockOffset = __builtin_offsetof(RgfxRingHeader, guest_clock_offset_ns);
+constexpr UInt32 kRingGuestClockBound = __builtin_offsetof(RgfxRingHeader, guest_clock_bound_ns);
 
 // Scanout rows start on 256-byte boundaries, as the option ROM's do, so the
 // boot frame keeps its layout when the driver takes the display over.
 constexpr UInt32 kStrideAlign = 256;
-constexpr UInt32 kMaxDimension = 16384;
+constexpr UInt32 kMaxDimension = kRgfxDisplayMaxDimension;
 
 // How long a command waits for ring space, and then for its answer.
 constexpr UInt32 kPostTimeoutMs = 5000;
 constexpr UInt32 kAnswerTimeoutMs = 5000;
-// How often the control ring's room line is logged at most, while posts sleep for room.
-constexpr UInt32 kRoomLogMs = 1000;
+// How often the control ring's room line is logged at most, while posts sleep for room: a summary,
+// at most once a minute (docs/conventions.md).
+constexpr UInt32 kRoomLogMs = 60000;
 
 // Answers carry the device's status; a payload the driver cannot read is
 // answered with this one.
@@ -95,6 +114,25 @@ inline void fullFence()
 {
 	__atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
+
+// Ring 0's submit ring as RgfxControlRing.hpp writes it: the rings' mapping, and the
+// write-combined one of the data's span (null where none was made: every word then goes through
+// the rings' mapping).
+struct ControlWords {
+	volatile UInt8 *rings;
+	volatile UInt8 *combined;
+
+	void data(UInt32 at, UInt64 word, bool viaCombined)
+	{
+		volatile UInt8 *p = viaCombined && combined ? combined + (at - kRgfxControlWcFrom)
+		                                            : rings + at;
+		*reinterpret_cast<volatile UInt64 *>(p) = word;
+	}
+	void storeFence() { rgfxStoreFence(); }
+	void publish(UInt64 count) { store64(rings + RGFX_CONTROL_SUBMIT_OFFSET + kRingProducer, count); }
+	void fullFence() { ::fullFence(); }
+	UInt32 consumerIdle() { return load32(rings + RGFX_CONTROL_SUBMIT_OFFSET + kRingConsumerIdle); }
+};
 
 // A payload's 32-bit field, little-endian as x86-64 is.
 inline UInt32 field32(const volatile UInt8 *payload, UInt32 offset)
@@ -145,8 +183,34 @@ void traceAttribute(const char *kind, IOIndex connect, IOSelect attribute, uintp
 }
 #else
 #define FBTRACE(...) do {} while (0)
+#if defined(__x86_64__)
 inline void traceAttribute(const char *, IOIndex, IOSelect, uintptr_t, IOReturn) {}
 #endif
+#endif
+
+// The guest's clock in nanoseconds, which RgfxVblankClock maps the host's stamps in, and back: an
+// x86-64 guest's mach_absolute_time counts nanoseconds, and an arm64 guest's its timebase's ticks.
+inline UInt64 clockNs(UInt64 absolute)
+{
+#if defined(__arm64__)
+	UInt64 ns = 0;
+	absolutetime_to_nanoseconds(absolute, &ns);
+	return ns;
+#else
+	return absolute;
+#endif
+}
+
+inline UInt64 clockAbsolute(UInt64 ns)
+{
+#if defined(__arm64__)
+	UInt64 absolute = 0;
+	nanoseconds_to_absolutetime(ns, &absolute);
+	return absolute;
+#else
+	return ns;
+#endif
+}
 
 } // namespace
 
@@ -154,12 +218,13 @@ inline void traceAttribute(const char *, IOIndex, IOSelect, uintptr_t, IOReturn)
 
 UInt32 ReimsGraphics::readRegister(UInt32 offset) const
 {
-	return *reinterpret_cast<const volatile UInt32 *>(registers + offset);
+	return rgfxRegisterRead32(registers + offset);
 }
 
 void ReimsGraphics::writeRegister(UInt32 offset, UInt32 value)
 {
-	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
+	rgfxRegisterWriteBarrier();
+	rgfxRegisterWrite32(registers + offset, value);
 }
 
 volatile UInt8 *ReimsGraphics::ring(UInt32 offset) const
@@ -176,9 +241,10 @@ bool ReimsGraphics::tryPost(UInt32 type, const void *message, UInt32 size, UInt6
 		return false;
 	IOSimpleLockLock(submitLock);
 	const bool written = writeLocked(type, message, size, seqno, waiterSeqno);
-	if (written)
-		publishLocked();
+	const bool bell = written && publishLocked();
 	IOSimpleLockUnlock(submitLock);
+	if (bell)
+		ringControl();
 	return written;
 }
 
@@ -188,7 +254,7 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
                                 UInt64 *waiterSeqno)
 {
 	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
-	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
+	ControlWords words = {rings, controlData};
 	UInt64 used = produced - load64(header + kRingConsumer);
 	UInt32 offset = static_cast<UInt32>(produced) & kRingMask;
 	UInt32 tail = kRingBytes - offset;
@@ -198,11 +264,8 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
 	if (pad) {
 		// A message never wraps: type 0 pads to the ring's end. When 8
 		// bytes are left, they hold its type and size alone.
-		volatile UInt32 *p = reinterpret_cast<volatile UInt32 *>(bytes + offset);
-		p[0] = RGFX_MSG_PAD;
-		p[1] = pad;
-		if (pad >= kHeaderBytes)
-			*reinterpret_cast<volatile UInt64 *>(bytes + offset + 8) = 0;
+		const UInt32 padHeader[4] = {RGFX_MSG_PAD, pad, 0, 0};
+		rgfxControlWrite(words, offset, padHeader, pad >= kHeaderBytes ? 16 : 8);
 		produced += pad;
 		offset = 0;
 	}
@@ -210,33 +273,29 @@ bool ReimsGraphics::writeLocked(UInt32 type, const void *message, UInt32 size, U
 	if (waiterSeqno)
 		__atomic_store_n(waiterSeqno, s, __ATOMIC_RELEASE);
 	// The caller filled the payload fields; the header is stamped here.
-	RgfxMsgHeader h = {type, size, s};
-	UInt64 words[2];
-	memcpy(words, &h, sizeof(words));
-	volatile UInt64 *dst = reinterpret_cast<volatile UInt64 *>(bytes + offset);
-	dst[0] = words[0];
-	dst[1] = words[1];
-	const UInt8 *src = static_cast<const UInt8 *>(message);
-	for (UInt32 i = kHeaderBytes / 8; i < size / 8; i++) {
-		UInt64 w;
-		memcpy(&w, src + i * 8, sizeof(w));
-		dst[i] = w;
-	}
+	const RgfxMsgHeader h = {type, size, s};
+	rgfxControlWrite(words, offset, &h, kHeaderBytes);
+	rgfxControlWrite(words, offset + kHeaderBytes, static_cast<const UInt8 *>(message) + kHeaderBytes,
+	                 size - kHeaderBytes);
 	produced += size;
 	if (seqno)
 		*seqno = s;
 	return true;
 }
 
-// Publishes what writeLocked wrote, submitLock held: the doorbell rings only when the host's
-// consumer sleeps.
-void ReimsGraphics::publishLocked()
+// Publishes what writeLocked wrote, submitLock held, after it: whether the host's consumer sleeps,
+// and ringControl is to wake it once the lock is let go (rgfxControlPublishWantsBell).
+bool ReimsGraphics::publishLocked()
 {
-	volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
-	store64(header + kRingProducer, produced);
-	fullFence();
-	if (load32(header + kRingConsumerIdle) == 1)
-		writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
+	ControlWords words = {rings, controlData};
+	return rgfxControlPublishWantsBell(words, produced);
+}
+
+// Ring 0's doorbell, out of submitLock: its write exits to the host, which no other CPU's post
+// waits out.
+void ReimsGraphics::ringControl()
+{
+	writeRegister(RGFX_REG_DOORBELL, RGFX_CONTROL_RING_ID);
 }
 
 // Puts one command on ring 0, waiting for space (waitForRoom): thread context only. A message
@@ -257,7 +316,10 @@ IOReturn ReimsGraphics::post(UInt32 type, const void *message, UInt32 size, UInt
 		if (askForRoom() && tryPost(type, message, size, seqno, waiterSeqno))
 			return kIOReturnSuccess;
 		if (!waitForRoom(mark, deadline)) {
-			IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
+			// Once per command type a boot: every post meets a ring that stays full.
+			static char site;
+			if (rgfxFirstCalls(&site, type, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", type);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}
@@ -353,14 +415,19 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 	IOLockWakeup(stateLock, controlWaiters, false);
 	IOLockUnlock(stateLock);
 
+	// Once per command type, and status, a boot.
 	if (r == kIOReturnTimeout) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, s);
+		static char unanswered;
+		if (rgfxFirstCalls(&unanswered, type, 1))
+			IOLog("ReimsGraphics: command %u (seqno %llu): no answer\n", type, s);
 		return kIOReturnTimeout;
 	}
 	if (r != kIOReturnSuccess)
 		return r;
 	if (status != 0) {
-		IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, s, status);
+		static char refused;
+		if (rgfxFirstCalls(&refused, (static_cast<UInt64>(type) << 32) | status, 1))
+			IOLog("ReimsGraphics: command %u (seqno %llu): status %u\n", type, s, status);
 		return kIOReturnError;
 	}
 	return kIOReturnSuccess;
@@ -368,7 +435,8 @@ IOReturn ReimsGraphics::command(UInt32 type, const void *message, UInt32 size)
 
 IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 size,
                                       UInt32 replyType, void *reply, UInt32 replyCapacity,
-                                      UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs)
+                                      UInt32 *replyLength, UInt64 *seqno, UInt32 timeoutMs,
+                                      const UInt32 *seedOrder)
 {
 	if (replyLength)
 		*replyLength = 0;
@@ -398,10 +466,15 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	w->replyType = replyType;
 	w->length = 0;
 	w->done = false;
+	w->seed = seedOrder != nullptr;
+	w->order = seedOrder ? *seedOrder : 0;
 	IOLockUnlock(stateLock);
 
 	UInt64 s = 0;
 	IOReturn r = post(type, message, size, &s, &w->seqno);
+	// Most answers come within tens of microseconds: looked for here first (RgfxAnswerLook.hpp).
+	if (r == kIOReturnSuccess)
+		lookForAnswer(w);
 	IOLockLock(stateLock);
 	// Each waiter sleeps on its own `done`, so an answer wakes only the thread it is for, not
 	// every waiter (which, with many in flight, would herd on stateLock and starve the work loop
@@ -419,9 +492,11 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 	}
 	w->replyType = 0;
 	w->seqno = 0;
+	w->seed = false;
 	IOLockWakeup(stateLock, lifecycleWaiters, false);
 	IOLockUnlock(stateLock);
-	if (r == kIOReturnTimeout)
+	static char unanswered;
+	if (r == kIOReturnTimeout && rgfxFirstCalls(&unanswered, type, 1))
 		IOLog("ReimsGraphics: lifecycle %u (seqno %llu): no answer\n", type, s);
 	if (seqno)
 		*seqno = s;
@@ -429,10 +504,10 @@ IOReturn ReimsGraphics::postLifecycle(UInt32 type, const void *message, UInt32 s
 }
 
 IOReturn ReimsGraphics::postDeferred(UInt32 context, UInt32 type, const void *message,
-                                     UInt32 size, UInt64 *seqno)
+                                     UInt32 size, UInt64 *seqno, const UInt8 *key)
 {
 	IOLockLock(stateLock);
-	const int slot = deferredAnswers.reserve(context);
+	const int slot = deferredAnswers.reserve(context, key);
 	IOLockUnlock(stateLock);
 	if (slot < 0)
 		return kIOReturnNoResources;
@@ -488,10 +563,173 @@ void ReimsGraphics::forgetDeferred(UInt64 seqno)
 	IOLockUnlock(stateLock);
 }
 
+bool ReimsGraphics::findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+                                       RgfxPipelineReflection *out)
+{
+	if (!sharedPipelines)
+		return false;
+	IOLockLock(stateLock);
+	const bool found = sharedPipelines->find(key, seqno, objId, out);
+	IOLockUnlock(stateLock);
+	return found;
+}
+
+void ReimsGraphics::learnSharedPipeline(const UInt8 *reply, UInt32 length)
+{
+	if (!sharedPipelines)
+		return;
+	IOLockLock(stateLock);
+	sharedPipelines->learn(reply, length);
+	IOLockUnlock(stateLock);
+}
+
+void ReimsGraphics::seedSharedPipelines()
+{
+	if (!sharedPipelines || !pipelineAnswersTaken)
+		return;
+	// A query's answers fill at most a quarter of the completion ring, so its other events go on.
+	constexpr UInt32 kSeedBatch = 64;
+	static_assert(kSeedBatch * SharedPipelines::kKeyedReplyBytes <= kRingBytes / 4,
+	              "a seed's answers leave the completion ring room");
+	UInt32 handed = 0;
+	while (handed < SharedPipelines::kSeeds) {
+		RgfxPipelineAnswersQuery query;
+		bzero(&query, sizeof(query));
+		query.first = handed;
+		query.most = kSeedBatch;
+		RgfxComplete reply;
+		bzero(&reply, sizeof(reply));
+		UInt32 length = 0;
+		const UInt32 order = handed;
+		IOReturn r = postLifecycle(RGFX_CMD_PIPELINE_ANSWERS, &query, sizeof(query),
+		                           RGFX_EVT_COMPLETE, &reply, sizeof(reply), &length, nullptr,
+		                           kAnswerTimeoutMs, &order);
+		if (r != kIOReturnSuccess || length < sizeof(reply) || reply.status > kSeedBatch) {
+			IOLog("ReimsGraphics: the device's kept pipeline answers stop at %u (0x%x, %u)\n",
+			      handed, r, reply.status);
+			break;
+		}
+		handed += reply.status;
+		if (reply.status < kSeedBatch)
+			break;
+	}
+	IOLockLock(stateLock);
+	const UInt32 kept = sharedPipelines->size();
+	IOLockUnlock(stateLock);
+	IOLog("ReimsGraphics: %u pipeline answers of earlier runs from the device, %u kept\n", handed,
+	      kept);
+}
+
 void ReimsGraphics::kickWorkLoop()
 {
 	if (kick)
 		kick->interruptOccurred(nullptr, nullptr, 0);
+}
+
+// MARK: - The display's panel
+
+static_assert(kRgfxMessageDeviceWillPowerOff == kIOMessageDeviceWillPowerOff,
+              "RgfxDisplayPower.hpp's WillPowerOff is the kernel's");
+static_assert(kRgfxMessageDeviceHasPoweredOn == kIOMessageDeviceHasPoweredOn,
+              "RgfxDisplayPower.hpp's HasPoweredOn is the kernel's");
+
+// Where the host took DISPLAY_POWER, the x86-64 framebuffer follows the display wrangler's power:
+// its handler registers the framebuffer's general interest in the wrangler once it is published,
+// or at once where it is already. An arm64 guest has none, and the arm64e framebuffer does not
+// take DISPLAY_POWER (RgfxFeatures.hpp).
+void ReimsGraphics::startDisplayPower()
+{
+#if defined(__x86_64__)
+	if (!displayPowerTaken)
+		return;
+	OSDictionary *matching = serviceMatching("IODisplayWrangler");
+	IONotifier *notifier = matching ? addMatchingNotification(gIOFirstPublishNotification, matching,
+	                                                          wranglerPublished, this)
+	                                : nullptr;
+	OSSafeReleaseNULL(matching);
+	if (!notifier) {
+		IOLog("ReimsGraphics: no notification of the display wrangler: the display stays lit "
+		      "through its sleep\n");
+		return;
+	}
+	IOLockLock(stateLock);
+	wranglerNotifier = notifier;
+	IOLockUnlock(stateLock);
+#endif
+}
+
+// Each notifier's remove waits for its handler where one runs: the publication's first, which
+// may register the interest, then the interest's.
+void ReimsGraphics::stopDisplayPower()
+{
+	IOLockLock(stateLock);
+	IONotifier *notifier = wranglerNotifier;
+	wranglerNotifier = nullptr;
+	IOLockUnlock(stateLock);
+	if (notifier)
+		notifier->remove();
+	IOLockLock(stateLock);
+	IONotifier *interest = wranglerInterest;
+	wranglerInterest = nullptr;
+	IOLockUnlock(stateLock);
+	if (interest)
+		interest->remove();
+}
+
+bool ReimsGraphics::wranglerPublished(void *target, void *, IOService *wrangler, IONotifier *)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(target);
+	IOLockLock(self->stateLock);
+	const bool registered = self->wranglerInterest != nullptr;
+	IOLockUnlock(self->stateLock);
+	if (registered)
+		return true;
+	IONotifier *interest =
+	    wrangler->registerInterest(gIOGeneralInterest, wranglerMessage, self, nullptr);
+	IOLockLock(self->stateLock);
+	if (!self->wranglerInterest) {
+		self->wranglerInterest = interest;
+		interest = nullptr;
+	}
+	IOLockUnlock(self->stateLock);
+	if (interest)
+		interest->remove();
+	IOLog("ReimsGraphics: the display's panel %s the display wrangler's power\n",
+	      self->wranglerInterest ? "follows" : "cannot follow");
+	return true;
+}
+
+// The wrangler's power messages: the panel each leaves (RgfxDisplayPower.hpp), which the work loop
+// tells the host. Every message is answered at once: the framebuffer holds up no power change.
+IOReturn ReimsGraphics::wranglerMessage(void *target, void *, UInt32 type, IOService *,
+                                        void *argument, vm_size_t size)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(target);
+	const IOPowerStateChangeNotification *change =
+	    argument && size >= sizeof(IOPowerStateChangeNotification)
+	        ? static_cast<const IOPowerStateChangeNotification *>(argument)
+	        : nullptr;
+	const RgfxPanel panel =
+	    rgfxPanelAfter(type, change != nullptr, change ? change->stateNumber : 0);
+	if (panel == RgfxPanel::Unchanged)
+		return kIOReturnSuccess;
+	const bool lit = panel == RgfxPanel::On;
+	if (self->wantPanel(lit))
+		IOLog("ReimsGraphics: the display wrangler goes to power state %lu: the display's panel "
+		      "%s\n",
+		      change->stateNumber, lit ? "lights" : "goes dark");
+	return kIOReturnSuccess;
+}
+
+bool ReimsGraphics::wantPanel(bool lit)
+{
+	IOSimpleLockLock(interruptLock);
+	const bool changed = panelWanted != lit;
+	panelWanted = lit;
+	IOSimpleLockUnlock(interruptLock);
+	if (changed)
+		kickWorkLoop();
+	return changed;
 }
 
 // MARK: - The work loop
@@ -510,14 +748,7 @@ void ReimsGraphics::service()
 {
 	if (!ready)
 		return;
-	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
-	for (;;) {
-		drainEvents();
-		store32(events + kRingArmed, 1);
-		fullFence();
-		if (load64(events + kRingProducer) == consumed)
-			break;
-	}
+	takeCompletions();
 	// The host has moved on: a post waiting for room on the control ring looks again.
 	if (rgfxRingRoomPass(room)) {
 		IOLockLock(stateLock);
@@ -542,6 +773,7 @@ void ReimsGraphics::service()
 	if (displayChange.armed(connect.enabled && connect.proc))
 		late = connect;
 	bool want = vblankWanted || pipes.anyVblank();
+	const bool panel = panelWanted;
 	IOSimpleLockUnlock(interruptLock);
 	if (late.proc)
 		late.proc(late.target, late.ref);
@@ -551,6 +783,13 @@ void ReimsGraphics::service()
 		v.enabled = want ? 1u : 0u;
 		if (tryPost(RGFX_CMD_SET_VBLANK, &v, sizeof(v), nullptr))
 			vblankSent = want;
+	}
+	if (rgfxPanelToSend(displayPowerTaken, panel, panelTold)) {
+		RgfxSetDisplayPower p = {};
+		p.display = displayId;
+		p.on = panel ? 1u : 0u;
+		if (tryPost(RGFX_CMD_SET_DISPLAY_POWER, &p, sizeof(p), nullptr))
+			panelTold = panel;
 	}
 	if (refreshWanted) {
 		UInt64 seqno = 0;
@@ -562,15 +801,75 @@ void ReimsGraphics::service()
 	}
 }
 
-bool ReimsGraphics::drainEvents()
+// The completion ring drained, then its interrupt armed and the ring looked at again, so an event
+// published meanwhile is never left without one; armed only where something changed since the
+// last arm found it empty (RgfxCompletionArm.hpp): in the work loop's gate (service, takeAction).
+void ReimsGraphics::takeCompletions()
+{
+	struct Ring {
+		ReimsGraphics *self;
+		volatile UInt8 *events;
+		uint64_t producer() { return load64(events + kRingProducer); }
+		void take(uint64_t end) { self->drainEvents(end); }
+		void arm()
+		{
+			store32(events + kRingArmed, 1);
+			fullFence();
+		}
+	} completions = {this, ring(RGFX_CONTROL_COMPLETE_OFFSET)};
+	rgfxTakeAndArm(completions, consumed, armedAt);
+}
+
+// A waiter's take of the completion ring (lookForAnswer), in the work loop's gate as the work
+// loop's own; the rest of service() follows at the interrupt the record raised.
+IOReturn ReimsGraphics::takeAction(OSObject *owner, void *, void *, void *, void *)
+{
+	ReimsGraphics *self = static_cast<ReimsGraphics *>(owner);
+	if (self->ready)
+		self->takeCompletions();
+	return kIOReturnSuccess;
+}
+
+// Looks for `w`'s answer for at most kRgfxAnswerLookNs (RgfxAnswerLook.hpp), taking the
+// completion ring in the work loop's gate where it holds a record the work loop has not taken,
+// and the gate is free (lookGate's attemptAction): it never waits for it, as its holder may wait
+// for a lock this thread's caller holds (the event hooks take the release table's lock and the
+// pipe clients'), which only the sleep's deadline below bounds. A device that stops meanwhile ends
+// the look: its caller then waits as before.
+void ReimsGraphics::lookForAnswer(const LifecycleWaiter *w)
+{
+	IOCommandGate *gate = lookGate;
+	if (!ready || !gate)
+		return;
+	gate->retain();
+	volatile UInt8 *events = ring(RGFX_CONTROL_COMPLETE_OFFSET);
+	uint64_t span = 0;
+	nanoseconds_to_absolutetime(kRgfxAnswerLookNs, &span);
+	rgfxLookForAnswer(
+	    mach_absolute_time() + span, [] { return mach_absolute_time(); },
+	    [this, w] {
+		    return !__atomic_load_n(&ready, __ATOMIC_RELAXED) ||
+		           __atomic_load_n(&w->done, __ATOMIC_ACQUIRE);
+	    },
+	    [events] { return load64(events + kRingProducer) != load64(events + kRingConsumer); },
+	    [this, gate] {
+		    return gate->attemptAction(&ReimsGraphics::takeAction, this) == kIOReturnSuccess;
+	    },
+	    [] { rgfxAnswerLookPause(); });
+	gate->release();
+}
+
+void ReimsGraphics::drainEvents(UInt64 end)
 {
 	volatile UInt8 *header = ring(RGFX_CONTROL_COMPLETE_OFFSET);
 	volatile UInt8 *bytes = header + RGFX_RING_HEADER_SIZE;
-	UInt64 end = load64(header + kRingProducer);
-	bool any = consumed != end;
+	const UInt64 from = consumed;
 	while (consumed != end) {
+		static char outOfRange;
 		if (end - consumed > kRingBytes) {
-			IOLog("ReimsGraphics: the completion ring's producer is out of range; skipping to it\n");
+			if (rgfxFirstCalls(&outOfRange, 0, 1))
+				IOLog("ReimsGraphics: the completion ring's producer is out of range; skipping to "
+				      "it\n");
 			consumed = end;
 			break;
 		}
@@ -590,16 +889,19 @@ bool ReimsGraphics::drainEvents()
 			continue;
 		}
 		if (size < kHeaderBytes || size % kMsgAlign || size > tail || size > end - consumed) {
-			IOLog("ReimsGraphics: malformed event (type %u, size %u); skipping the ring's contents\n",
-			      type, size);
+			static char malformed;
+			if (rgfxFirstCalls(&malformed, type, 1))
+				IOLog("ReimsGraphics: malformed event (type %u, size %u); skipping the ring's "
+				      "contents\n",
+				      type, size);
 			consumed = end;
 			break;
 		}
 		handleEvent(type, seqno, m + kHeaderBytes, size - kHeaderBytes);
 		consumed += size;
 	}
-	store64(header + kRingConsumer, consumed);
-	return any;
+	if (consumed != from)
+		store64(header + kRingConsumer, consumed);
 }
 
 void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size)
@@ -626,7 +928,7 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		answer(seqno, status);
 		// Every pipe client: the one whose transaction this answers takes it, at the time of
 		// the refresh the host answered in.
-		UInt64 shown = vblankClock.shownAt(mach_absolute_time());
+		UInt64 shown = clockAbsolute(vblankClock.shownAt(clockNs(mach_absolute_time())));
 		OSObject *clients[kMaxPipeClients];
 		IOSimpleLockLock(interruptLock);
 		UInt32 n = pipes.all(clients);
@@ -639,6 +941,12 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 				hook(clients[i], seqno, status, shown);
 			clients[i]->release();
 		}
+		// The display shows a surface from this answer: the boot screen under it, black, once.
+		if (status == RGFX_STATUS_OK && !bootScreenCleared &&
+		    seqno == __atomic_load_n(&bootScreenSeqno, __ATOMIC_ACQUIRE)) {
+			__atomic_store_n(&bootScreenCleared, true, __ATOMIC_RELEASE);
+			clearBootScreen();
+		}
 		return;
 	}
 	case RGFX_EVT_DISPLAYS: {
@@ -649,6 +957,13 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// senses the connection again, or once it has its connect interrupt
 		// registered and on (RgfxDisplayModes.hpp, RgfxConnectChange).
 		refreshSeqno = 0;
+#if defined(__arm64e__)
+		// On arm64 a list that changed the modes is republished, off this work loop, and the
+		// processes told (republishMobileDisplay).
+		if (__atomic_exchange_n(&mobileListChanged, false, __ATOMIC_RELAXED) && mobileChangeCall &&
+		    hasStarted())
+			thread_call_enter(mobileChangeCall);
+#endif
 		IOSimpleLockLock(interruptLock);
 		if (displayChange.changed(connect.enabled && connect.proc))
 			fire = connect;
@@ -668,6 +983,9 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 	case RGFX_EVT_SAMPLER_STATE:
 	case RGFX_EVT_ICB_STATE:
 	case RGFX_EVT_SHARED_EVENT_VALUE:
+	case RGFX_EVT_RATE_MAP_STATE:
+	case RGFX_EVT_RATE_MAP_ANSWER:
+	case RGFX_EVT_FUNCTION_POINTER_STATE:
 		answerLifecycle(type, seqno, payload, size);
 		return;
 	case RGFX_EVT_VBLANK: {
@@ -682,22 +1000,34 @@ void ReimsGraphics::handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 
 		// The event's count and the host's stamp are 8 and 16 bytes into its payload
 		// (RgfxVblank); the refresh's time is the stamp in the guest's clock.
 		UInt64 count = size >= 16 ? *reinterpret_cast<const volatile UInt64 *>(payload + 8) : 0;
-		UInt64 now = mach_absolute_time();
+		UInt64 now = clockNs(mach_absolute_time());
 		if (hostTime) {
 			// The host's clock, read between two of ours (RgfxVblankClock::reading): only LO's
 			// read is timed.
 			UInt32 hi = readRegister(RGFX_REG_HOST_TIME_HI);
-			UInt64 before = mach_absolute_time();
+			UInt64 before = clockNs(mach_absolute_time());
 			UInt32 lo = readRegister(RGFX_REG_HOST_TIME_LO);
-			UInt64 after = mach_absolute_time();
+			UInt64 after = clockNs(mach_absolute_time());
 			UInt32 hiAgain = readRegister(RGFX_REG_HOST_TIME_HI);
 			vblankClock.reading(before, RgfxVblankClock::hostTime(hi, lo, hiAgain), after);
+			// Where the bundle stamps its command buffers (GUEST_TIMES), the held reading's
+			// offset and bound go in ring 0's header for the host: the offset, then the bound
+			// with release, which the host reads first.
+			int64_t offset = 0;
+			uint64_t bound = 0;
+			if (guestTimes && vblankClock.offsetAt(after, &offset, &bound)) {
+				volatile UInt8 *header = ring(RGFX_CONTROL_SUBMIT_OFFSET);
+				store64(header + kRingGuestClockOffset, static_cast<UInt64>(offset));
+				store32(header + kRingGuestClockBound, RgfxVblankClock::headerBound(bound));
+			}
 		}
-		UInt64 time = size >= 24 ? vblankClock.vblank(count,
-		                                              *reinterpret_cast<const volatile UInt64 *>(payload + 16),
-		                                              now)
-		                         : now;
-		UInt64 next = size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs;
+		UInt64 time = clockAbsolute(
+		    size >= 24 ? vblankClock.vblank(count,
+		                                    *reinterpret_cast<const volatile UInt64 *>(payload + 16),
+		                                    now)
+		               : now);
+		UInt64 next =
+		    clockAbsolute(size >= 24 ? vblankClock.next() : now + RgfxVblankClock::kDefaultPeriodNs);
 		for (UInt32 i = 0; i < n; i++) {
 			if (hook)
 				hook(clients[i], count, time, next);
@@ -721,6 +1051,23 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		return false;
 	bool found = false;
 	IOLockLock(stateLock);
+	// A seed's answers (seedSharedPipelines): into the shared pipelines, in the order they come.
+	for (UInt32 i = 0; type == RGFX_EVT_PIPELINE_REFLECTION && i < kLifecycleWaiters && !found;
+	     i++) {
+		LifecycleWaiter &w = lifecycleWaiters[i];
+		if (!w.seed || w.done || __atomic_load_n(&w.seqno, __ATOMIC_ACQUIRE) != seqno)
+			continue;
+		found = true;
+		UInt8 reply[SharedPipelines::kKeyedReplyBytes];
+		RgfxMsgHeader h = {type, size + kHeaderBytes, seqno};
+		UInt32 n = size + kHeaderBytes < sizeof(reply) ? size + kHeaderBytes : sizeof(reply);
+		memcpy(reply, &h, kHeaderBytes);
+		for (UInt32 b = kHeaderBytes; b < n; b++)
+			reply[b] = payload[b - kHeaderBytes];
+		if (sharedPipelines)
+			sharedPipelines->seed(reply, n, w.order);
+		w.order++;
+	}
 	for (UInt32 i = 0; i < kLifecycleWaiters && !found; i++) {
 		LifecycleWaiter &w = lifecycleWaiters[i];
 		if (w.replyType != type || w.done ||
@@ -739,10 +1086,25 @@ bool ReimsGraphics::answerLifecycle(UInt32 type, UInt64 seqno, const volatile UI
 		IOLockWakeup(stateLock, &w.done, true);
 	}
 	// Else a deferred create's (postDeferred), kept for its process to take; its waiters, if any,
-	// look again.
+	// look again. The shared pipelines take the device's own answer (RgfxSharedPipelines::
+	// answered): one posted for a kept answer whose pipeline the device did not make forgets the
+	// kept answer, so the next equal create waits for its own, and a made pipeline's keyed answer
+	// replaces the kept one, so a kept answer the device answers otherwise (a seed of an earlier
+	// run) answers no later create.
+	bool refused = false;
+	UInt8 refusedKey[DeferredAnswers::kKeyBytes];
 	if (!found && deferredAnswers.answer(RgfxMsgHeader{type, size + kHeaderBytes, seqno},
-	                                     payload, size)) {
+	                                     payload, size, &refused, refusedKey)) {
 		found = true;
+		if (sharedPipelines) {
+			UInt8 reply[SharedPipelines::kKeyedReplyBytes];
+			RgfxMsgHeader h = {type, size + kHeaderBytes, seqno};
+			UInt32 n = size + kHeaderBytes < sizeof(reply) ? size + kHeaderBytes : sizeof(reply);
+			memcpy(reply, &h, kHeaderBytes);
+			for (UInt32 b = kHeaderBytes; b < n; b++)
+				reply[b] = payload[b - kHeaderBytes];
+			sharedPipelines->answered(reply, n, refused ? refusedKey : nullptr);
+		}
 		IOLockWakeup(stateLock, &deferredAnswers, false);
 	}
 	IOLockUnlock(stateLock);
@@ -770,12 +1132,14 @@ void ReimsGraphics::answer(UInt64 seqno, UInt32 status)
 	IOLockUnlock(stateLock);
 }
 
-// Takes the display's modes from a DISPLAYS answer. The driver's display is
-// the first listed when it starts, and the display of that id after; a list
-// without it leaves the display disconnected with its modes. Modes the
-// scanout space cannot hold are left out. A list that changes the modes makes
-// the next server connection drop the mode configuration the last one left
-// (newUserClient). Returns the answer's status.
+// Takes the display's modes from a DISPLAYS answer, and where the host took
+// DISPLAY_SCALE its screen's scale, the record after the display's. The
+// driver's display is the first listed when it starts, and the display of
+// that id after; a list without it leaves the display disconnected with its
+// modes. Modes the scanout space cannot hold are left out. A list that
+// changes the modes or the scale makes the next server connection drop the
+// mode configuration the last one left (newUserClient), and on arm64 the
+// display published again, its density with it. Returns the answer's status.
 UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 {
 	if (size < sizeof(uint32_t))
@@ -786,15 +1150,16 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 
 	IOLockLock(stateLock);
 	bool found = false;
-	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0;
+	UInt32 id = 0, isConnected = 0, preferred = 0, listed = 0, listAt = 0, scale = 0;
+	const UInt32 scaleBytes = displayScaleTaken ? sizeof(RgfxDisplayScale) : 0;
 	for (UInt32 i = 0; i < count; i++) {
-		if (size - offset < sizeof(RgfxDisplayEntry)) {
+		if (size - offset < sizeof(RgfxDisplayEntry) + scaleBytes) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
 		}
 		UInt32 did = field32(payload, offset);
 		UInt32 n = field32(payload, offset + 12);
-		UInt32 at = offset + sizeof(RgfxDisplayEntry);
+		UInt32 at = offset + sizeof(RgfxDisplayEntry) + scaleBytes;
 		if (static_cast<UInt64>(n) * sizeof(RgfxModeEntry) > size - at) {
 			IOLockUnlock(stateLock);
 			return kStatusUnreadable;
@@ -806,6 +1171,8 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 			preferred = field32(payload, offset + 8);
 			listed = n;
 			listAt = at;
+			if (scaleBytes)
+				scale = field32(payload, offset + sizeof(RgfxDisplayEntry));
 		}
 		offset = at + n * sizeof(RgfxModeEntry);
 	}
@@ -834,8 +1201,14 @@ UInt32 ReimsGraphics::parseDisplays(const volatile UInt8 *payload, UInt32 size)
 	haveDisplay = true;
 	displayId = id;
 	connected = isConnected != 0;
-	if (modeSet.take(fresh, freshCount, freshPreferred))
+	const bool rescaled = scale != displayScale;
+	displayScale = scale;
+	const bool changed = modeSet.take(fresh, freshCount, freshPreferred) || rescaled;
+	if (changed)
 		modeConfig.listChanged();
+#if defined(__arm64e__)
+	mobileListChanged = changed;
+#endif
 	IOLockUnlock(stateLock);
 	return 0;
 }
@@ -849,17 +1222,43 @@ UInt32 ReimsGraphics::refreshMhzOf(const IODetailedTimingInformationV2 &t)
 	return total ? static_cast<UInt32>((t.pixelClock * 1000 + total / 2) / total) : 0;
 }
 
-void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
+ReimsGraphics::Mode ReimsGraphics::nativeMode(const Mode &m) const
 {
-	// The EDID's size, from the preferred mode.
 	Mode native = m;
 	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
 		if (modeSet.modes[i].id == modeSet.preferredId)
 			native = modeSet.modes[i];
 	}
-	UInt32 ppi = native.width >= 2880 ? 220 : 110;
-	*width = static_cast<UInt16>((native.width * 254 + ppi * 5) / (ppi * 10));
-	*height = static_cast<UInt16>((native.height * 254 + ppi * 5) / (ppi * 10));
+	return native;
+}
+
+void ReimsGraphics::imageSize(const Mode &m, UInt16 *width, UInt16 *height) const
+{
+	// The preferred mode's size at the display's density; the EDID's is a reference display's.
+	Mode native = nativeMode(m);
+	*width = static_cast<UInt16>(rgfxDisplayMillimetres(native.width, displayScale));
+	*height = static_cast<UInt16>(rgfxDisplayMillimetres(native.height, displayScale));
+}
+
+// A mode's information flags: valid and safe; the preferred mode is the default and the display's
+// native one; and a mode RgfxMode::hiDpi takes on the display's host screen, `scale120ths`, is
+// valid for HiDPI (kDisplayModeValidForHiResFlag). WindowServer then lists the mode at half its
+// points each way as well, drawn at all its pixels, and starts on that one where the display's
+// density says so (kRgfxDisplayConnectionFlags, RgfxDisplayIdentity.hpp). Measured on the x86-64
+// guest, macOS 26.7.2: a 1600x900 HiDPI mode, once chosen, kept to the next boot. A mode whose
+// pixels do not halve exactly has no HiDPI one; the host offers this
+// framebuffer even modes, since with a native 3841x2161 the guest never brought its display up,
+// with the flag or without it (CoreGraphics listed no mode, and the framebuffer's mode was set
+// again every 10 seconds). A mode the device no longer shows is answered never shown
+// (rgfxListedModeFlags).
+UInt32 ReimsGraphics::modeFlags(const Mode &m, bool preferred, UInt32 scale120ths)
+{
+	UInt32 flags = kDisplayModeValidFlag | kDisplayModeSafeFlag;
+	if (preferred)
+		flags |= kDisplayModeDefaultFlag | kDisplayModeNativeFlag;
+	if (m.hiDpi(scale120ths))
+		flags |= kDisplayModeValidForHiResFlag;
+	return flags;
 }
 
 UInt32 ReimsGraphics::strideFor(UInt32 width)
@@ -872,6 +1271,36 @@ UInt32 ReimsGraphics::strideFor(UInt32 width)
 UInt64 ReimsGraphics::scanoutLimit() const
 {
 	return rgfxScanoutRoom(regionSize, kCursorSlot);
+}
+
+// The boot screen, black: the logo and progress bar the firmware and the kernel's console drew
+// into the scanout, which the display shows again whenever it shows the scanout (PRESENT_SURFACE
+// 0, when the last display pipe client goes: WindowServer's quit at a shutdown, or its crash).
+// Measured on a macOS 26.7.2 guest: a shutdown showed the boot frame of 13 s in, unchanged, until
+// power off. Cleared on the work loop at the answer of the first present of a surface, while the
+// display shows that surface, so the clear is never seen; once, as nothing draws the boot screen
+// again. A clear that finds no mapping is not tried again.
+void ReimsGraphics::clearBootScreen()
+{
+	if (!region)
+		return;
+	IOLockLock(stateLock);
+	const UInt64 largest = largestScanout;
+	IOLockUnlock(stateLock);
+	const UInt64 length = rgfxBootScreenSpan(bootConsole, largest, scanoutLimit());
+	if (length == 0)
+		return;
+	IOMemoryMap *map = region->createMappingInTask(
+	    kernel_task, 0, kIOMapAnywhere | kIOMapCopybackCache, RGFX_ALLOCATIONS_OFFSET, length);
+	if (!map) {
+		IOLog("ReimsGraphics: display %u: the boot screen was not cleared: no mapping of it\n",
+		      displayId);
+		return;
+	}
+	bzero(reinterpret_cast<void *>(map->getVirtualAddress()), static_cast<size_t>(length));
+	map->release();
+	IOLog("ReimsGraphics: display %u: the boot screen cleared (%llu bytes of the scanout)\n",
+	      displayId, length);
 }
 
 IOReturn ReimsGraphics::setScanout(const Mode &mode)
@@ -888,8 +1317,11 @@ IOReturn ReimsGraphics::setScanout(const Mode &mode)
 	IOReturn r = command(RGFX_CMD_SET_SCANOUT, &s, sizeof(s));
 	if (r != kIOReturnSuccess)
 		return r;
+	const UInt64 span = static_cast<UInt64>(stride) * mode.height;
 	IOLockLock(stateLock);
 	modeSet.set(mode);
+	if (span > largestScanout)
+		largestScanout = span;
 	IOLockUnlock(stateLock);
 	IOLog("ReimsGraphics: display %u: scanout %ux%u at %u.%03u Hz, stride %u\n", displayId,
 	      mode.width, mode.height, mode.refreshMhz / 1000, mode.refreshMhz % 1000, stride);
@@ -957,6 +1389,7 @@ RgfxAccelerator *ReimsGraphics::copyAccelerator()
 	return accelerator;
 }
 
+#if defined(__x86_64__)
 IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt32 type,
                                       IOUserClient **clientH)
 {
@@ -1013,6 +1446,17 @@ IOReturn ReimsGraphics::newUserClient(task_t owningTask, void *securityID, UInt3
 		      caller.name, caller.pid, r);
 	return r;
 }
+#endif
+
+// IOAcceleratorFamily2's IOAccelMemoryMap::getAssignedGPUVirtualAddressLength() const,
+// referenced weakly and never called (assignedLengthExported). A binder that cannot resolve it
+// binds it to gOSKextUnresolved, as the kernel's linker does, or to 0: either reads as absent.
+// An arm64 kernel collection has no IOAcceleratorFamily2, so the arm64e kext references nothing
+// of it and reads the function as absent.
+#if defined(__x86_64__)
+extern "C" void rgfxAssignedGPUVirtualAddressLength()
+    __asm("__ZNK16IOAccelMemoryMap34getAssignedGPUVirtualAddressLengthEv") __attribute__((weak_import));
+#endif
 
 bool ReimsGraphics::start(IOService *provider)
 {
@@ -1027,17 +1471,50 @@ bool ReimsGraphics::start(IOService *provider)
 	presentsLock = IOLockAlloc();
 	if (!submitLock || !interruptLock || !stateLock || !presentsLock)
 		return false;
+	// The answers kept by pipeline key, empty at each start. Without the table, none is kept and
+	// every create waits.
+	if (!sharedPipelines)
+		sharedPipelines = static_cast<SharedPipelines *>(IOMalloc(sizeof(SharedPipelines)));
+	if (sharedPipelines)
+		sharedPipelines->clear();
+	started = false;
 	nextSeqno = 1;
+	largestScanout = 0;
+	bootScreenSeqno = 0;
+	bootScreenCleared = false;
 	modeSet.reset();
 	taken = false;
 	submitRoom = false;
 	displayColorTaken = false;
+	displayScaleTaken = false;
+	displayScale = 0;
 	hostTime = false;
+	guestTimes = false;
+	displayPowerTaken = false;
+	pipelineAnswersTaken = false;
+	wranglerNotifier = nullptr;
+	wranglerInterest = nullptr;
+	// The device is lit from its reset (design.md, "The display's sleep").
+	panelWanted = true;
+	panelTold = true;
 	roomStats = {};
 	roomRecords = 0;
+#if defined(__x86_64__)
+	assignedLength = &rgfxAssignedGPUVirtualAddressLength != nullptr &&
+	                 OSKextSymbolIsResolved(rgfxAssignedGPUVirtualAddressLength);
+#else
+	assignedLength = false;
+#endif
 
 	pci->setMemoryEnable(true);
-	pci->setBusLeadEnable(true);
+	// setBusMasterEnable, which the SDK deprecates in favour of setBusLeadEnable: it is virtual, so
+	// the call goes through IOPCIDevice's vtable, whose slot for it holds the same member on macOS 11
+	// to 26, and the kext imports nothing for it. setBusLeadEnable is a plain member the kernel links
+	// by name, and macOS 11's IOPCIFamily does not export it.
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	pci->setBusMasterEnable(true);
+#pragma clang diagnostic pop
 
 	int msixIndex = -1;
 	IOReturn r = kIOReturnSuccess;
@@ -1088,6 +1565,23 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	rings = reinterpret_cast<volatile UInt8 *>(ringMap->getVirtualAddress());
 	cursorPixels = reinterpret_cast<UInt8 *>(cursorMap->getVirtualAddress());
+	// Ring 0's submit data, write-combined where the region's write-combined mappings are
+	// ordinary memory (RgfxControlRing.hpp), from a descriptor of its own: a mapping's cache mode
+	// is set on its descriptor's one VM object (RgfxAccelerator::copyWriteCombinedRegion). Without
+	// it, the data goes through `rings` as before.
+	if (kRgfxControlWriteCombines) {
+		IODeviceMemory *span = IODeviceMemory::withRange(
+		    region->getPhysicalSegment(0, nullptr, kIOMemoryMapperNone) + kRgfxControlWcFrom,
+		    kRgfxControlWcTo - kRgfxControlWcFrom);
+		if (span) {
+			controlDataMap = span->createMappingInTask(
+			    kernel_task, 0, kIOMapAnywhere | kIOMapWriteCombineCache, 0,
+			    kRgfxControlWcTo - kRgfxControlWcFrom);
+			span->release();
+		}
+		if (controlDataMap)
+			controlData = reinterpret_cast<volatile UInt8 *>(controlDataMap->getVirtualAddress());
+	}
 
 	// MSI-X vector 0 is the device's first message-signalled interrupt.
 	for (int i = 0;; i++) {
@@ -1113,6 +1607,14 @@ bool ReimsGraphics::start(IOService *provider)
 		IOLog("ReimsGraphics: no work loop\n");
 		goto fail;
 	}
+	// The gate a waiter takes the completion ring in (lookForAnswer): without it, waiters sleep
+	// for their answers alone.
+	lookGate = IOCommandGate::commandGate(this);
+	if (lookGate && workLoop->addEventSource(lookGate) != kIOReturnSuccess)
+		OSSafeReleaseNULL(lookGate);
+	if (!lookGate)
+		IOLog("ReimsGraphics: no gate for waiters to look for their answers in: they sleep for "
+		      "them\n");
 
 	// The device from scratch: reset, then the features the kext takes of the host's offer
 	// (RgfxFeatures.hpp), then take the rings' counters as they stand and say the driver is
@@ -1121,8 +1623,15 @@ bool ReimsGraphics::start(IOService *provider)
 	taken = true;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_RESET);
 	{
-		const uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
-		                         readRegister(RGFX_REG_FEATURES_LO);
+		uint64_t offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+		                   readRegister(RGFX_REG_FEATURES_LO);
+		// PAGES_16K first, where the kext takes it: a host whose page is 16 KiB shows the
+		// features over guest RAM only from that take on (RgfxFeatures.hpp).
+		if (const uint64_t first = rgfxDriverFeaturesFirst(offered)) {
+			writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(first >> 32));
+			offered = (static_cast<uint64_t>(readRegister(RGFX_REG_FEATURES_HI)) << 32) |
+			          readRegister(RGFX_REG_FEATURES_LO);
+		}
 		const uint64_t wanted = rgfxDriverFeatures(offered);
 		writeRegister(RGFX_REG_DRIVER_FEATURES_LO, static_cast<UInt32>(wanted));
 		writeRegister(RGFX_REG_DRIVER_FEATURES_HI, static_cast<UInt32>(wanted >> 32));
@@ -1138,10 +1647,17 @@ bool ReimsGraphics::start(IOService *provider)
 		setProperty("RgfxFeaturesTaken", took, 64);
 		submitRoom = (took & RGFX_FEATURE_SUBMIT_ROOM) != 0;
 		displayColorTaken = (took & RGFX_FEATURE_DISPLAY_COLOR) != 0;
+		displayScaleTaken = (took & RGFX_FEATURE_DISPLAY_SCALE) != 0;
 		hostTime = (took & RGFX_FEATURE_HOST_TIME) != 0;
+		guestTimes = (took & RGFX_FEATURE_GUEST_TIMES) != 0;
+		displayPowerTaken = (took & RGFX_FEATURE_DISPLAY_POWER) != 0;
+		pipelineAnswersTaken =
+		    (took & (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS)) ==
+		    (RGFX_FEATURE_PIPELINE_KEYS | RGFX_FEATURE_PIPELINE_ANSWERS);
 	}
 	produced = load64(ring(RGFX_CONTROL_SUBMIT_OFFSET) + kRingProducer);
 	consumed = load64(ring(RGFX_CONTROL_COMPLETE_OFFSET) + kRingConsumer);
+	armedAt = kRgfxNotArmed;
 	writeRegister(RGFX_REG_STATUS, RGFX_STATUS_DRIVER_READY);
 	ready = true;
 	msix->enable();
@@ -1157,11 +1673,15 @@ bool ReimsGraphics::start(IOService *provider)
 		goto fail;
 	}
 	IOLog("ReimsGraphics: display %u, %u modes, region 0x%llx bytes\n", displayId, count, regionSize);
+	// Before any process can make a pipeline: the bundle loads once the accelerator is published.
+	seedSharedPipelines();
 
 	// The display's accelerator and pipe, which the wrangler, CoreDisplay and IOPresentment read
 	// off the framebuffer when it is published: our one display is pipe 0 of the accelerator on
 	// the same PCI device, named by its service-plane path, which is the PCI device's path and
-	// the accelerator's class name whichever of the two starts first.
+	// the accelerator's class name whichever of the two starts first. An accelerator that starts
+	// after renames the PCI device (GFX0) and names itself again by its new path
+	// (RgfxAccelerator::copyFramebuffer).
 	{
 		char path[512];
 		int length = sizeof(path) - sizeof("/RgfxAccelerator");
@@ -1172,6 +1692,7 @@ bool ReimsGraphics::start(IOService *provider)
 	}
 	setProperty("IOAccelIndex", 0ull, 32);
 
+#if defined(__x86_64__)
 	// The framebuffer is its own controller's one dependent (index 0), named by its own registry
 	// ID. IOFramebuffer finishes a framebuffer's open (postOpen, in IOGraphics' open source) only
 	// for one with a dependent ID: there it publishes kIOFBNeedsRefreshKey, initialises the
@@ -1240,18 +1761,42 @@ bool ReimsGraphics::start(IOService *provider)
 	// accelerated, transactional display model (kIOWindowServerActiveAttribute) off for a name in
 	// which it finds none, as it does for "ReimsGraphics".
 	setProperty("IOClassNameOverride", "ReimsGraphicsAMD");
+#else
+	if (!startMobile())
+		goto fail;
+#endif
 
+	startDisplayPower();
+	// The device is ours and its rings are up: contexts may open from here, as the class's start
+	// can register the framebuffer and WindowServer open it before it returns.
+	__atomic_store_n(&started, true, __ATOMIC_RELEASE);
 	if (super::start(provider))
 		return true;
 fail:
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	stopDisplayPower();
+#if defined(__arm64e__)
+	stopMobile();
+#endif
 	quiesce();
+#if defined(__arm64e__)
+	freeMobileChanges();
+#endif
 	teardown();
 	return false;
 }
 
 void ReimsGraphics::stop(IOService *provider)
 {
+	__atomic_store_n(&started, false, __ATOMIC_RELEASE);
+	stopDisplayPower();
+#if defined(__arm64e__)
+	stopMobile();
+#endif
 	quiesce();
+#if defined(__arm64e__)
+	freeMobileChanges();
+#endif
 	super::stop(provider);
 	teardown();
 }
@@ -1271,11 +1816,13 @@ void ReimsGraphics::quiesce()
 		kick->disable();
 		workLoop->removeEventSource(kick);
 	}
+	if (lookGate)
+		workLoop->removeEventSource(lookGate);
 }
 
 // The boot framebuffer the platform expert's console info names now, before IOFramebuffer moves
 // the console onto this framebuffer, as the RgfxBootFramebuffer property (RgfxBootConsole.hpp),
-// and once in the log.
+// and once in the log; kept for clearBootScreen.
 void ReimsGraphics::publishBootConsole()
 {
 	PE_Video video = {};
@@ -1283,6 +1830,7 @@ void ReimsGraphics::publishBootConsole()
 	const bool answered = platform && platform->getConsoleInfo(&video) == kIOReturnSuccess;
 	const RgfxBootConsole boot = rgfxBootConsole(answered, video.v_baseAddr, video.v_rowBytes,
 	                                             video.v_width, video.v_height, video.v_depth);
+	bootConsole = boot;
 	IOLog("ReimsGraphics: boot framebuffer %s 0x%llx (%ux%u, %u bytes a row, %u bits)\n",
 	      boot.answered ? "at" : "unknown,", boot.address, boot.width, boot.height, boot.rowBytes,
 	      boot.depth);
@@ -1320,12 +1868,15 @@ void ReimsGraphics::teardown()
 	taken = false;
 	OSSafeReleaseNULL(msix);
 	OSSafeReleaseNULL(kick);
+	OSSafeReleaseNULL(lookGate);
 	OSSafeReleaseNULL(workLoop);
 	OSSafeReleaseNULL(cursorMap);
+	OSSafeReleaseNULL(controlDataMap);
 	OSSafeReleaseNULL(ringMap);
 	OSSafeReleaseNULL(region);
 	OSSafeReleaseNULL(registerMap);
 	rings = nullptr;
+	controlData = nullptr;
 	cursorPixels = nullptr;
 	registers = nullptr;
 }
@@ -1342,6 +1893,9 @@ void ReimsGraphics::free()
 		IOLockFree(presentsLock);
 	submitLock = interruptLock = nullptr;
 	stateLock = presentsLock = nullptr;
+	if (sharedPipelines)
+		IOFree(sharedPipelines, sizeof(SharedPipelines));
+	sharedPipelines = nullptr;
 	const void *oldTask = nullptr, *oldClient = nullptr;
 	scanoutOwner.clear(&oldTask, &oldClient);
 	if (oldTask)
@@ -1357,9 +1911,14 @@ void ReimsGraphics::free()
 	}
 	OSSafeReleaseNULL(queueTarget);
 	OSSafeReleaseNULL(releaseTarget);
+#if defined(__arm64e__)
+	OSSafeReleaseNULL(mobileSwapAnswer);
+	OSSafeReleaseNULL(mobileSwapLoop);
+#endif
 	super::free();
 }
 
+#if defined(__x86_64__)
 // MARK: - IOFramebuffer: the device and its modes
 
 IOReturn ReimsGraphics::enableController()
@@ -1479,6 +2038,8 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	IOLockLock(stateLock);
 	bool ok = modeSet.modeFor(displayMode, &m);
 	bool preferred = ok && modeSet.isPreferred(m);
+	const bool stale = ok && modeSet.stale(m.id);
+	const UInt32 scale = displayScale;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(m, &mmWide, &mmHigh);
@@ -1494,7 +2055,7 @@ IOReturn ReimsGraphics::getInformationForDisplayMode(IODisplayModeID displayMode
 	info->nominalHeight = m.height;
 	info->refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(m.refreshMhz) << 16) / 1000);
 	info->maxDepthIndex = 0;
-	info->flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+	info->flags = rgfxListedModeFlags(modeFlags(m, preferred, scale), stale);
 	info->imageWidth = mmWide;
 	info->imageHeight = mmHigh;
 	return kIOReturnSuccess;
@@ -1587,7 +2148,7 @@ IOReturn ReimsGraphics::setStartupDisplayMode(IODisplayModeID displayMode, IOInd
 	return ok ? kIOReturnSuccess : noSuchMode(RgfxModeCall::SetStartupMode);
 }
 
-// Each mode is a fixed-rate panel's, with the timing its EDID entry gives.
+// Each mode is a fixed-rate panel's, with the timing timingFor gives it.
 IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
                                                     IOTimingInformation *info)
 {
@@ -1636,6 +2197,39 @@ IOReturn ReimsGraphics::getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	return kIOReturnSuccess;
 }
 
+// IOFramebuffer gives a mode's valid, safe and default flags from IODisplay, which asks this
+// (IOFramebuffer::extGetInformationForDisplayMode and IODisplay::getConnectFlagsForDisplayMode,
+// read from IOGraphics' published source): unanswered, every mode is valid and safe alone. Of
+// the modes valid and safe, IOGraphicsLib's default is the one flagged default, else the one of
+// the most pixels (IOKitUser's published source), and WindowServer takes the default when the
+// display changes. Measured on the x86-64 guest, macOS 26.7.2, with no flag answered here: once
+// the window shrank, the mode set, which stays listed until another is set, was the default, so
+// the guest kept it. The preferred mode is the default, and a mode the framebuffer does not list
+// is left to IODisplay.
+IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+                                     IOOptionBits *flags)
+{
+	Mode m;
+	IOLockLock(stateLock);
+	bool ok = modeSet.modeFor(displayMode, &m);
+	bool preferred = ok && modeSet.isPreferred(m);
+	const bool stale = ok && modeSet.stale(m.id);
+	const UInt32 scale = displayScale;
+	IOLockUnlock(stateLock);
+	IOReturn r = kIOReturnUnsupported;
+	if (connectIndex != 0 || !flags)
+		r = kIOReturnBadArgument;
+	else if (ok) {
+		*flags = rgfxListedModeFlags(modeFlags(m, preferred, scale), stale) &
+		         kDisplayModeSafetyFlags;
+		r = kIOReturnSuccess;
+	}
+	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
+	        static_cast<int>(displayMode), r,
+	        r == kIOReturnSuccess ? static_cast<unsigned>(*flags) : 0);
+	return r;
+}
+
 // A timing the device can show: a listed mode's size and rate, unscaled and progressive. For a
 // mode description, the description's mode information is filled in.
 IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount descripSize)
@@ -1661,6 +2255,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 	bool ok = !scaled && !(t->signalConfig & kIOInterlacedCEATiming) &&
 	          modeSet.deviceMode(t->horizontalActive, t->verticalActive, refresh, &host);
 	bool preferred = ok && host.id == modeSet.preferredId;
+	const UInt32 scale = displayScale;
 	UInt16 mmWide = 0, mmHigh = 0;
 	if (ok)
 		imageSize(host, &mmWide, &mmHigh);
@@ -1677,7 +2272,7 @@ IOReturn ReimsGraphics::validateDetailedTiming(void *description, IOByteCount de
 		info.nominalHeight = t->verticalActive;
 		info.refreshRate = static_cast<IOFixed1616>((static_cast<UInt64>(refresh) << 16) / 1000);
 		info.maxDepthIndex = 0;
-		info.flags = kDisplayModeValidFlag | kDisplayModeSafeFlag | (preferred ? kDisplayModeDefaultFlag : 0);
+		info.flags = modeFlags(host, preferred, scale);
 		info.imageWidth = mmWide;
 		info.imageHeight = mmHigh;
 	}
@@ -1794,9 +2389,10 @@ IOReturn ReimsGraphics::connectionAttribute(IOIndex connectIndex, IOSelect attri
 		IOLockUnlock(stateLock);
 		return kIOReturnSuccess;
 	case kConnectionFlags:
+		// Built in, so the display's density picks its default scale (RgfxDisplayIdentity.hpp).
 		if (!value)
 			return kIOReturnBadArgument;
-		*value = 0;
+		*value = kRgfxDisplayConnectionFlags;
 		return kIOReturnSuccess;
 	case kConnectionSupportsHLDDCSense:
 		// The driver's own EDID, block by block (getDDCBlock); value may be null.
@@ -1841,8 +2437,8 @@ IOReturn ReimsGraphics::setConnectionAttribute(IOIndex connectIndex, IOSelect at
 	}
 }
 
-// MARK: - The display's timings and EDID
-
+// MARK: - The display's timings (both front ends: arm64e's modes too) and EDID
+#endif // defined(__x86_64__)
 void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 {
 	// Reduced blanking: 80 pixels of horizontal blank (8 front porch, 32 sync), and enough
@@ -1872,216 +2468,15 @@ void ReimsGraphics::timingFor(const Mode &mode, Timing *t)
 	// half hertz that would change WebKit's whole number.
 	t->pixelClock = (clock + 5000) / 10000 * 10000;
 }
-
-UInt32 ReimsGraphics::edidExtensionCount() const
-{
-	UInt32 n = (modeSet.modeCount + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
-	return n ? n : 1;
-}
-
-namespace {
-
-// The EDID's identity: our own three-letter PNP manufacturer ID "RVG", packed as five
-// bits a letter ('A' is 1), and our product code.
-constexpr UInt16 kEdidManufacturer = ((('R' - '@') << 10) | (('V' - '@') << 5) | ('G' - '@'));
-constexpr UInt16 kEdidProduct = 0x5247;
-constexpr char kEdidName[] = "Reims Display";
-
-// The largest pixel clock a base block's detailed timing holds: 16 bits of 10 kHz.
-constexpr UInt64 kEdidDetailedClockMax = 0xffffull * 10000;
-
-// The size, in millimetres, the EDID gives a mode's display: at 220 pixels per inch for a
-// mode at least 2880 pixels wide, as a high-density panel, and 110 otherwise.
-UInt32 edidMillimetres(UInt32 pixels, UInt32 width)
-{
-	UInt32 ppi = width >= 2880 ? 220 : 110;
-	return (pixels * 254 + ppi * 5) / (ppi * 10);
-}
-
-void edidChecksum(UInt8 *block)
-{
-	UInt8 sum = 0;
-	for (UInt32 i = 0; i < 127; i++)
-		sum = static_cast<UInt8>(sum + block[i]);
-	block[127] = static_cast<UInt8>(-sum);
-}
-
-// One 10-bit chromaticity coordinate, from thousandths.
-constexpr UInt32 chroma(UInt32 thousandths)
-{
-	return (thousandths * 1024 + 500) / 1000;
-}
-
-} // namespace
-
-// Block 0 is the base block: the identity, sRGB colour, the preferred mode's detailed timing
-// when its clock fits one (else the largest mode whose does), and the product name. Each
-// extension is a DisplayID 1.3 section with a type I timing block of up to five modes, the
-// preferred mode first and marked so.
+#if defined(__x86_64__)
+// The EDID is one base block, made from the display's id, its host screen's scale and its native
+// mode's size (RgfxDisplayIdentity.hpp).
 bool ReimsGraphics::makeEdid(UInt32 index, UInt8 *b) const
 {
-	UInt32 extensions = edidExtensionCount();
-	if (index > extensions)
+	if (index > 0)
 		return false;
-	bzero(b, kEdidBlockBytes);
-
-	// The modes, the preferred one first.
-	Mode order[kMaxModes];
-	UInt32 n = 0;
-	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
-		if (modeSet.modes[i].id == modeSet.preferredId)
-			order[n++] = modeSet.modes[i];
-	}
-	for (UInt32 i = 0; i < modeSet.modeCount; i++) {
-		if (modeSet.modes[i].id != modeSet.preferredId)
-			order[n++] = modeSet.modes[i];
-	}
-
-	if (index > 0) {
-		UInt32 first = (index - 1) * kEdidModesPerBlock;
-		UInt32 count = first < n ? n - first : 0;
-		if (count > kEdidModesPerBlock)
-			count = kEdidModesPerBlock;
-		b[0] = 0x70; // DisplayID
-		b[1] = 0x13; // version 1.3
-		b[3] = 0x00; // an extension section
-		b[4] = 0x00; // no further sections
-		UInt32 at = 5;
-		if (count) {
-			b[at++] = 0x03; // type I detailed timings
-			b[at++] = 0x00;
-			b[at++] = static_cast<UInt8>(count * 20);
-			for (UInt32 j = 0; j < count; j++, at += 20) {
-				Timing t;
-				timingFor(order[first + j], &t);
-				UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000) - 1;
-				UInt8 *d = b + at;
-				d[0] = static_cast<UInt8>(clock);
-				d[1] = static_cast<UInt8>(clock >> 8);
-				d[2] = static_cast<UInt8>(clock >> 16);
-				// Preferred (bit 7) for the first mode of the first block; aspect undefined.
-				d[3] = static_cast<UInt8>((index == 1 && j == 0 ? 0x80 : 0x00) | 0x08);
-				UInt16 fields[8] = {
-				    static_cast<UInt16>(t.hActive - 1), static_cast<UInt16>(t.hBlank - 1),
-				    // Bit 15: positive horizontal sync.
-				    static_cast<UInt16>((t.hFront - 1) | 0x8000), static_cast<UInt16>(t.hSync - 1),
-				    static_cast<UInt16>(t.vActive - 1), static_cast<UInt16>(t.vBlank - 1),
-				    static_cast<UInt16>(t.vFront - 1), static_cast<UInt16>(t.vSync - 1),
-				};
-				for (UInt32 f = 0; f < 8; f++) {
-					d[4 + f * 2] = static_cast<UInt8>(fields[f]);
-					d[5 + f * 2] = static_cast<UInt8>(fields[f] >> 8);
-				}
-			}
-		}
-		b[2] = static_cast<UInt8>(at - 5);
-		UInt8 sum = 0;
-		for (UInt32 i = 1; i < at; i++)
-			sum = static_cast<UInt8>(sum + b[i]);
-		b[at] = static_cast<UInt8>(-sum);
-		edidChecksum(b);
-		return true;
-	}
-
-	// The base block's detailed timing: the preferred mode, or the largest that fits.
-	const Mode *detailed = nullptr;
-	for (UInt32 i = 0; i < n; i++) {
-		Timing t;
-		timingFor(order[i], &t);
-		if (t.pixelClock > kEdidDetailedClockMax || order[i].width > 4095 || order[i].height > 4095)
-			continue;
-		if (!detailed || i == 0 ||
-		    static_cast<UInt64>(order[i].width) * order[i].height >
-		        static_cast<UInt64>(detailed->width) * detailed->height)
-			detailed = &order[i];
-		if (i == 0)
-			break;
-	}
-	const Mode &native = n ? order[0] : modeSet.current;
-
-	static const UInt8 header[8] = {0x00, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00};
-	memcpy(b, header, sizeof(header));
-	b[8] = static_cast<UInt8>(kEdidManufacturer >> 8);
-	b[9] = static_cast<UInt8>(kEdidManufacturer);
-	b[10] = static_cast<UInt8>(kEdidProduct);
-	b[11] = static_cast<UInt8>(kEdidProduct >> 8);
-	// The serial: the product code over the device's display id, so each display keeps its own.
-	UInt32 serial = (static_cast<UInt32>(kEdidProduct) << 16) | ((displayId + 1) & 0xffff);
-	b[12] = static_cast<UInt8>(serial);
-	b[13] = static_cast<UInt8>(serial >> 8);
-	b[14] = static_cast<UInt8>(serial >> 16);
-	b[15] = static_cast<UInt8>(serial >> 24);
-	b[16] = 0;    // week unspecified
-	b[17] = 36;   // 2026
-	b[18] = 1;    // EDID 1.4
-	b[19] = 4;
-	b[20] = 0xa5; // digital, 8 bits a component, DisplayPort
-	b[21] = static_cast<UInt8>((edidMillimetres(native.width, native.width) + 5) / 10);
-	b[22] = static_cast<UInt8>((edidMillimetres(native.height, native.width) + 5) / 10);
-	b[23] = 120;  // gamma 2.2
-	// RGB 4:4:4, sRGB the default colour space, and the first timing the preferred one
-	// where it is.
-	b[24] = static_cast<UInt8>(0x04 | (detailed == &order[0] ? 0x02 : 0x00));
-
-	// sRGB's primaries and D65 white, 10 bits each.
-	const UInt32 rx = chroma(640), ry = chroma(330), gx = chroma(300), gy = chroma(600);
-	const UInt32 bx = chroma(150), by = chroma(60), wx = chroma(313), wy = chroma(329);
-	b[25] = static_cast<UInt8>(((rx & 3) << 6) | ((ry & 3) << 4) | ((gx & 3) << 2) | (gy & 3));
-	b[26] = static_cast<UInt8>(((bx & 3) << 6) | ((by & 3) << 4) | ((wx & 3) << 2) | (wy & 3));
-	b[27] = static_cast<UInt8>(rx >> 2);
-	b[28] = static_cast<UInt8>(ry >> 2);
-	b[29] = static_cast<UInt8>(gx >> 2);
-	b[30] = static_cast<UInt8>(gy >> 2);
-	b[31] = static_cast<UInt8>(bx >> 2);
-	b[32] = static_cast<UInt8>(by >> 2);
-	b[33] = static_cast<UInt8>(wx >> 2);
-	b[34] = static_cast<UInt8>(wy >> 2);
-	// No established timings; no standard timings (01 01 each).
-	for (UInt32 i = 38; i < 54; i++)
-		b[i] = 0x01;
-
-	UInt8 *d = b + 54;
-	if (detailed) {
-		Timing t;
-		timingFor(*detailed, &t);
-		UInt32 clock = static_cast<UInt32>(t.pixelClock / 10000);
-		UInt32 hmm = edidMillimetres(t.hActive, native.width);
-		UInt32 vmm = edidMillimetres(t.vActive, native.width);
-		d[0] = static_cast<UInt8>(clock);
-		d[1] = static_cast<UInt8>(clock >> 8);
-		d[2] = static_cast<UInt8>(t.hActive);
-		d[3] = static_cast<UInt8>(t.hBlank);
-		d[4] = static_cast<UInt8>(((t.hActive >> 8) << 4) | (t.hBlank >> 8));
-		d[5] = static_cast<UInt8>(t.vActive);
-		d[6] = static_cast<UInt8>(t.vBlank);
-		d[7] = static_cast<UInt8>(((t.vActive >> 8) << 4) | (t.vBlank >> 8));
-		d[8] = static_cast<UInt8>(t.hFront);
-		d[9] = static_cast<UInt8>(t.hSync);
-		d[10] = static_cast<UInt8>(((t.vFront & 0xf) << 4) | (t.vSync & 0xf));
-		d[11] = static_cast<UInt8>(((t.hFront >> 8) << 6) | ((t.hSync >> 8) << 4) |
-		                           ((t.vFront >> 4) << 2) | (t.vSync >> 4));
-		d[12] = static_cast<UInt8>(hmm);
-		d[13] = static_cast<UInt8>(vmm);
-		d[14] = static_cast<UInt8>(((hmm >> 8) << 4) | ((vmm >> 8) & 0xf));
-		// Digital separate sync, vertical negative, horizontal positive.
-		d[17] = 0x1a;
-	} else {
-		d[3] = 0x10; // a dummy descriptor
-	}
-	d += 18;
-
-	// The product name, padded as the descriptor asks.
-	d[3] = 0xfc;
-	UInt32 len = sizeof(kEdidName) - 1;
-	for (UInt32 i = 0; i < 13; i++)
-		d[5 + i] = i < len ? static_cast<UInt8>(kEdidName[i]) : (i == len ? 0x0a : 0x20);
-	d += 18;
-	d[3] = 0x10;
-	d += 18;
-	d[3] = 0x10;
-
-	b[126] = static_cast<UInt8>(extensions);
-	edidChecksum(b);
+	const Mode native = nativeMode(modeSet.current);
+	rgfxDisplayEdid(b, displayId, displayScale, native.width, native.height);
 	return true;
 }
 
@@ -2094,7 +2489,7 @@ bool ReimsGraphics::hasDDCConnect(IOIndex connectIndex)
 	return r;
 }
 
-// Block 1 is the base block and 2 on its extensions, as IODisplay asks for them.
+// Block 1 is the base block, as IODisplay asks for it; there is no other.
 IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
                                     IOOptionBits options, UInt8 *data, IOByteCount *length)
 {
@@ -2113,12 +2508,13 @@ IOReturn ReimsGraphics::getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IO
 
 // MARK: - Power
 
-// The framebuffer stays out of power management, as the stock framebuffer does: it registers
-// no power states, so it and its AppleDisplay stay at power state 0 while the display wrangler
-// idles and wakes. IOFramebuffer then never turns the display's sleep into one of the
-// framebuffer's: WindowServer hears of no display sleep and takes no sleep image, and the
-// scanout goes on showing what it shows. With IOFBDependentID published, IOFramebuffer counts
-// the framebuffer usable from its start without a power driver.
+// The framebuffer stays out of power management, as the stock framebuffer does: it registers no
+// power states, so it and its AppleDisplay stay at power state 0 while the display wrangler idles
+// and wakes. IOFramebuffer then never turns the display's sleep into one of the framebuffer's:
+// WindowServer hears of no display sleep and takes no sleep image, and goes on presenting. The
+// framebuffer hears of the display's sleep from the wrangler's own power messages instead, and the
+// host's panel goes dark with it ("The display's panel", above). With IOFBDependentID published,
+// IOFramebuffer counts the framebuffer usable from its start without a power driver.
 
 // MARK: - IOFramebuffer: the hardware cursor
 
@@ -2224,6 +2620,7 @@ IOReturn ReimsGraphics::setInterruptState(void *interruptRef, UInt32 state)
 	kickWorkLoop();
 	return kIOReturnSuccess;
 }
+#endif
 
 // MARK: - The display pipe
 
@@ -2244,9 +2641,16 @@ IOReturn ReimsGraphics::postPresent(UInt32 surfaceId, UInt32 transactionId, UInt
 	p.present.flags = flags;
 	const bool kept = (flags & RGFX_PRESENT_KEEP) != 0;
 	const bool cached = !kept && rgfxSurfaceCacheGeneration(surfaceId, &p.gen.cpu_gen);
+	// Until the boot screen is cleared, a surface's present takes the clear's seqno, written
+	// before the host can answer it (handleEvent).
+	UInt64 *clearsBootScreen =
+	    !kept && surfaceId != 0 && !__atomic_load_n(&bootScreenCleared, __ATOMIC_ACQUIRE)
+	        ? &bootScreenSeqno
+	        : nullptr;
 	// Never waits for room: the caller does, with its lock let go (waitForRoom).
 	IOReturn r = kIOReturnSuccess;
-	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno))
+	if (!tryPost(RGFX_CMD_PRESENT_SURFACE, &p, cached ? sizeof(p) : sizeof(p.present), seqno,
+	             clearsBootScreen))
 		r = ready ? kIOReturnNoSpace : kIOReturnNotReady;
 	if (r == kIOReturnSuccess && !kept) {
 		IOSimpleLockLock(interruptLock);
@@ -2304,8 +2708,9 @@ void ReimsGraphics::removePipe(OSObject *client)
 	client->release();
 	if (showScanout) {
 		// The last client went with a surface shown: the scanout again, so whatever draws into
-		// it next is seen. Its answer goes to no client. It comes between no transaction's
-		// colour and present (lockPresents).
+		// it next is seen, and black till then: the boot screen was cleared at the first
+		// surface's present (clearBootScreen). Its answer goes to no client. It comes between no
+		// transaction's colour and present (lockPresents).
 		RgfxPresentSurface p = {};
 		p.display = displayId;
 		lockPresents();
@@ -2360,21 +2765,55 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 	static_assert(sizeof(RgfxBlockRelease) % kMsgAlign == 0 &&
 	                  sizeof(RgfxBlockRelease) <= kLifecycleMessageMax,
 	              "a release is not a whole message");
+	return postRun(RGFX_CMD_BLOCK_RELEASE, releases, sizeof(*releases), count, waiterSeqnos,
+	               posted);
+}
+
+IOReturn ReimsGraphics::postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+                                UInt64 *const *waiterSeqnos, UInt32 *posted)
+{
 	*posted = 0;
+	const UInt8 *bytes = static_cast<const UInt8 *>(messages);
+	// Each message's type and size, the run's or, with `type` 0, its own header's.
+	auto at = [&](size_t offset, UInt32 *t, UInt32 *n) {
+		*t = type;
+		*n = size;
+		if (type == 0) {
+			RgfxMsgHeader h;
+			memcpy(&h, bytes + offset, sizeof(h));
+			*t = h.type;
+			*n = h.size;
+		}
+	};
+	size_t length = 0;
+	for (UInt32 i = 0; i < count; i++) {
+		UInt32 t = 0, n = 0;
+		at(length, &t, &n);
+		if (n < kHeaderBytes || n % kMsgAlign || n > kLifecycleMessageMax)
+			return kIOReturnBadArgument;
+		length += n;
+	}
 	uint64_t deadline = 0;
 	clock_interval_to_deadline(kPostTimeoutMs, kMillisecondScale, &deadline);
 	// As many as fit, under one hold of the ring's lock and with one doorbell at most: whether
-	// all are posted.
+	// all are posted. `next` is where the first not yet posted lies.
+	size_t next = 0;
 	auto look = [&]() {
 		UInt32 n = 0;
 		IOSimpleLockLock(submitLock);
-		while (*posted + n < count &&
-		       writeLocked(RGFX_CMD_BLOCK_RELEASE, &releases[*posted + n], sizeof(*releases),
-		                   nullptr, waiterSeqnos[*posted + n]))
+		while (*posted + n < count) {
+			UInt32 t = 0, m = 0;
+			at(next, &t, &m);
+			if (!writeLocked(t, bytes + next, m, nullptr,
+			                 waiterSeqnos ? waiterSeqnos[*posted + n] : nullptr))
+				break;
+			next += m;
 			n++;
-		if (n)
-			publishLocked();
+		}
+		const bool bell = n && publishLocked();
 		IOSimpleLockUnlock(submitLock);
+		if (bell)
+			ringControl();
 		*posted += n;
 		return *posted == count;
 	};
@@ -2385,8 +2824,11 @@ IOReturn ReimsGraphics::postReleases(const RgfxBlockRelease *releases, UInt32 co
 		if (look() || (askForRoom() && look()))
 			break;
 		if (!waitForRoom(mark, deadline)) {
-			IOLog("ReimsGraphics: command %u: the control ring stayed full\n",
-			      RGFX_CMD_BLOCK_RELEASE);
+			UInt32 t = 0, m = 0;
+			at(next, &t, &m);
+			static char site;
+			if (rgfxFirstCalls(&site, t, 1))
+				IOLog("ReimsGraphics: command %u: the control ring stayed full\n", t);
 			return ready ? kIOReturnTimeout : kIOReturnNotReady;
 		}
 	}
@@ -2401,7 +2843,7 @@ void ReimsGraphics::setPipeVblankEnabled(OSObject *client, bool enabled)
 	kickWorkLoop();
 }
 
-#if RGFX_FB_TRACE
+#if RGFX_FB_TRACE && defined(__x86_64__)
 // MARK: - The trace build's forwarding overrides
 
 IOReturn ReimsGraphics::open()
@@ -2497,15 +2939,6 @@ IOReturn ReimsGraphics::setCLUTWithEntries(IOColorEntry *colors, UInt32 index, U
 {
 	IOReturn r = super::setCLUTWithEntries(colors, index, numEntries, options);
 	FBTRACE(4, "setCLUTWithEntries %u+%u -> 0x%x", index, numEntries, r);
-	return r;
-}
-
-IOReturn ReimsGraphics::connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
-                                     IOOptionBits *flags)
-{
-	IOReturn r = super::connectFlags(connectIndex, displayMode, flags);
-	FBTRACE(48, "connectFlags conn %d mode %d -> 0x%x flags 0x%x", static_cast<int>(connectIndex),
-	        static_cast<int>(displayMode), r, flags ? static_cast<unsigned>(*flags) : 0);
 	return r;
 }
 

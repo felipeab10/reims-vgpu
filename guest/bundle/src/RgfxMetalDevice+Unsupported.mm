@@ -11,8 +11,19 @@ namespace {
 constexpr const char *kRayTracing = "ray tracing";
 constexpr const char *kFunctionPointers = "function pointers";
 constexpr const char *kMetal4 = "the Metal 4 API";
-constexpr const char *kOpenGL = "OpenGL";
 constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
+
+// Metal's refusal of a Metal 4 member on a device that answers NO to supportsFamily: of
+// MTLGPUFamilyMetal4, as this one does: MTLDeviceErrorDomain's MTLDeviceErrorNotSupported (measured:
+// newArchiveWithURL:error: at every URL, nil among them, macOS 26.7.1, the AMD Radeon Pro 5300M and
+// the Intel UHD 630, tools/oracle/oracle_urls.m). The domain is named by its string: its symbol is
+// macOS 26.4's, and the bundle loads from macOS 11 on.
+NSError *metal4Refusal()
+{
+	return [NSError errorWithDomain:@"MTLDeviceErrorDomain"
+	                           code:1 // MTLDeviceErrorNotSupported
+	                       userInfo:@{NSLocalizedDescriptionKey : @"Device does not support Metal 4."}];
+}
 } // namespace
 
 @implementation RgfxMetalDevice (Unsupported)
@@ -43,20 +54,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 - (id<MTLFunctionHandle>)functionHandleWithBinaryFunction:(id<MTL4BinaryFunction>)function
 {
 	RGFX_UNSUPPORTED(kFunctionPointers);
-	return nil;
-}
-
-- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
-	                          MTLDynamicLibraryErrorUnsupported);
-	return nil;
-}
-
-- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
-	                          MTLDynamicLibraryErrorUnsupported);
 	return nil;
 }
 
@@ -128,20 +125,6 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-- (id<MTLRasterizationRateMap>)newRasterizationRateMapWithDescriptor:
-    (MTLRasterizationRateMapDescriptor *)descriptor
-{
-	RGFX_UNSUPPORTED("rasterization rate maps");
-	return nil;
-}
-
-- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)desc
-                                               error:(NSError **)error
-{
-	RGFX_UNSUPPORTED_ERROR(error, "residency sets (none on the wire)");
-	return nil;
-}
-
 // --- counters and shader logging ------------------------------------------------------
 
 - (id<MTLCounterSampleBuffer>)newCounterSampleBufferWithDescriptor:
@@ -210,9 +193,13 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
+// Metal's refusal of a device without Metal 4, at every URL (metal4Refusal).
 - (id<MTL4Archive>)newArchiveWithURL:(NSURL *)url error:(NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR(error, kMetal4);
+	(void)url;
+	RGFX_UNSUPPORTED(kMetal4);
+	if (error)
+		*error = metal4Refusal();
 	return nil;
 }
 
@@ -355,59 +342,21 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
+// No options is refused before the URL is looked at, at every URL, nil among them, with "At least
+// one option must be set." (MTLBinaryArchiveDomain 2, measured: macOS 26.7.1, the AMD Radeon Pro
+// 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike, tools/oracle/oracle_urls.m).
 - (id)newBinaryLibraryWithOptions:(NSUInteger)options url:(NSURL *)url error:(NSError **)error
 {
-	RGFX_UNSUPPORTED_ERROR(error, "binary libraries");
-	return nil;
-}
-
-// OpenGL's functions of its IR (`@32@0:8^v16Q24` and `@40@0:8^v16@24Q32` for each of GL, GL Core
-// and GL ES) and drawables (`@16@0:8`): the device runs no OpenGL.
-- (id<MTLFunction>)newFunctionWithGLIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLIR:(void *)ir
-                     inputsDescription:(id)inputsDescription
-                          functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLCoreIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLCoreIR:(void *)ir
-                         inputsDescription:(id)inputsDescription
-                              functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLESIR:(void *)ir functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id<MTLFunction>)newFunctionWithGLESIR:(void *)ir
-                       inputsDescription:(id)inputsDescription
-                            functionType:(NSUInteger)functionType
-{
-	RGFX_UNSUPPORTED(kOpenGL);
-	return nil;
-}
-
-- (id)newGLDrawable
-{
-	RGFX_UNSUPPORTED(kOpenGL);
+	(void)url;
+	if (options != 0) {
+		RGFX_UNSUPPORTED_ERROR(error, "binary libraries");
+		return nil;
+	}
+	RgfxLogUnsupported([self class], _cmd, "binary libraries");
+	if (error)
+		*error = [NSError errorWithDomain:MTLBinaryArchiveDomain
+		                             code:MTLBinaryArchiveErrorUnexpectedElement
+		                         userInfo:@{NSLocalizedDescriptionKey : @"At least one option must be set."}];
 	return nil;
 }
 
@@ -470,27 +419,11 @@ constexpr const char *kArgumentLayouts = "argument buffers of a layout object";
 	return nil;
 }
 
-// Residency sets (`@16@0:8`), counters' resolve (`@40@0:8@16{_NSRange=QQ}24`), rasterization
-// rate maps of a screen size (`@56@0:8{?=QQQ}16Q40r^@48`) and textures shared by handle at a
-// resource index (`@32@0:8@16Q24`), as their public forms above.
-- (id)allocResidencySet
-{
-	RGFX_UNSUPPORTED("residency sets (none on the wire)");
-	return nil;
-}
-
+// Counters' resolve (`@40@0:8@16{_NSRange=QQ}24`) and textures shared by handle at a resource
+// index (`@32@0:8@16Q24`), as their public forms above.
 - (NSData *)resolveCounters:(id<MTLCounterSampleBuffer>)buffer withRange:(NSRange)range
 {
 	RGFX_UNSUPPORTED("counter sampling");
-	return nil;
-}
-
-- (id<MTLRasterizationRateMap>)
-    newRasterizationRateMapWithScreenSize:(MTLSize)screenSize
-                               layerCount:(NSUInteger)layerCount
-                                   layers:(const __unsafe_unretained id *)layers
-{
-	RGFX_UNSUPPORTED("rasterization rate maps");
 	return nil;
 }
 

@@ -1,9 +1,11 @@
-//! Textures made while the GPU runs earlier work, on both platforms.
+//! Textures made while the GPU runs earlier work, on this crate's platform.
 //!
 //! Metal makes a texture with no GPU work: a texture over an IOSurface (as a guest display's
 //! mapped present makes one) and a texture of memory of its own come back while a committed
 //! kernel still runs. So does the runtime's: it records a new image's move to its first layout
-//! in the device's next submission.
+//! in the device's next submission. The surface is the buffer that stands for it
+//! (`Buffer::new_texture_over_surface_plane`), as the reims-graphics device's surfaces reach this
+//! platform.
 //!
 //! The kernel ([`SPIN`]) runs [`ROUNDS`] rounds of busy work, about half a second, then marks its
 //! end in a word the test reads as each creation returns: still unmarked where the creation did
@@ -12,7 +14,14 @@
 //! word while the kernel polled it (`fresh_res_spin`'s loop, released 100 µs into its run, ended
 //! at its cap).
 
-#![cfg(target_os = "macos")] // Compares with Metal, which is macOS's.
+#![cfg(target_os = "macos")]
+// Compares with Metal's answers, recorded on macOS.
+// Every platform object is `Send` and `Sync` (core's `Handle`, and `Obj`'s bound, which an
+// encoder's drop asks of `PredicatedEncoder`), and the proof walks the object's fields: an
+// encoder's command buffer, its predication, and the runtime objects that holds, 141 to 150
+// levels deep (measured: rustc warns at a limit of 140, not at 150). That is deeper than
+// rustc's default of 128, as in the library (`src/lib.rs`).
+#![recursion_limit = "256"]
 #![allow(
     clippy::unwrap_used,
     clippy::indexing_slicing,
@@ -21,23 +30,19 @@
     unsafe_code
 )]
 
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::clock::{Clock, MonoTime};
-use reims_vgpu_core::platform::os::surface::SurfaceSpec;
-use reims_vgpu_core::platform::resource::{Buffer, Library};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
-use reims_vgpu_metal::MetalPlatform;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock, MonoTime};
+use reims_vgpu_vulkan::core::platform::resource::{Buffer, Library};
+use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, MtlSize, NsRange};
+use reims_vgpu_vulkan::core::platform::values::{SurfaceFacts, SurfacePlane, TextureDesc};
+use reims_vgpu_vulkan::core::raise::OnFault;
 
 /// The kernel that keeps the GPU busy (`src/gpu/spin.metal`).
 const SPIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/spin.metallib"));
@@ -61,15 +66,6 @@ const PRIVATE: u64 = 0x20;
 const ROUNDS_WORD: usize = 0;
 const END_WORD: usize = 1;
 const ENDED: u32 = 0x600d;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl<P: Platform> TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// What each creation saw as it returned: the kernel's end mark, its command buffer's status,
 /// and how long the creation took.
@@ -129,20 +125,25 @@ fn textures_while_a_kernel_runs<P: Platform>(p: &P, d: &P::Device) -> Seen {
     cb.wait_until_scheduled().unwrap();
 
     let (width, height) = (64, 16);
-    let surface = p
-        .surfaces()
-        .create(&SurfaceSpec {
+    let surface = d
+        .new_buffer_of_length(OnFault::Die, 0x4000, SHARED)
+        .unwrap()
+        .unwrap();
+    let plane = SurfacePlane {
+        plane: 0,
+        offset: 0,
+        bytes_per_row: width * 4,
+        planar: false,
+        facts: Some(SurfaceFacts {
             pixel_format: u32::from_be_bytes(*b"BGRA"),
-            alloc_size: 0x4000,
+            plane_count: 0,
             width,
             height,
-            bytes_per_element: 4,
-            bytes_per_row: width * 4,
-            element_width: 1,
-            element_height: 1,
-            ..SurfaceSpec::default()
-        })
-        .unwrap();
+            chroma_offset: 0,
+            chroma_bytes_per_row: 0,
+            ycbcr_matrix: None,
+        }),
+    };
     let on_surface = p.texture_descriptor(&TextureDesc {
         pixel_format: BGRA8,
         width,
@@ -154,8 +155,8 @@ fn textures_while_a_kernel_runs<P: Platform>(p: &P, d: &P::Device) -> Seen {
     let clock = p.clock();
     let since = |at: MonoTime| Duration::from_nanos(clock.now_mono().as_nanos() - at.as_nanos());
     let at = clock.now_mono();
-    let over = d
-        .new_texture_on_surface(&on_surface, Some(&surface), 0)
+    let over = surface
+        .new_texture_over_surface_plane(OnFault::Die, &on_surface, plane)
         .unwrap()
         .unwrap();
     let made = |at: MonoTime| Made {
@@ -214,15 +215,8 @@ fn assert_made_while_running(seen: &Seen) {
 }
 
 #[test]
-fn metal_makes_textures_while_the_gpu_runs() {
-    let p = MetalPlatform::new(Box::new(NoLauncher));
-    let seen = textures_while_a_kernel_runs(&p, &MetalPlatform::system_default_device().unwrap());
-    assert_made_while_running(&seen);
-}
-
-#[test]
 fn this_platform_makes_textures_while_the_gpu_runs() {
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     let seen = textures_while_a_kernel_runs(&p, &VulkanPlatform::system_default_device().unwrap());
     assert_made_while_running(&seen);
 }

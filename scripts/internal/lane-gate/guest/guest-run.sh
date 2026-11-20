@@ -61,20 +61,25 @@ run_info() {
 	*"enabled."*) item sip PASS "$csr" ;;
 	*) item sip FAIL "$csr" ;;
 	esac
-	local kexts; kexts=$(kmutil showloaded 2>/dev/null | grep -o -E 'com\.steelbrain\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
+	local kexts; kexts=$(kmutil showloaded 2>/dev/null | grep -o -E 'ai\.aneesiqbal\.[A-Za-z.]+' | sort -u | tr '\n' ' ')
 	case $kexts in
-	*com.steelbrain.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
+	*ai.aneesiqbal.ReimsGraphics\ *) item kexts PASS "$kexts" ;;
 	*) item kexts FAIL "ReimsGraphics is not loaded: $kexts" ;;
 	esac
-	# The loader's log says whether every site of ReimsGraphics resolved: guest/loader's
-	# ReimsGraphicsLoader keeps it in LoaderLog, the older AppleParavirtGPULoader in ApvLoadLog.
-	local ld bind
-	ld=$({ ioreg -l -w0 -c ReimsGraphicsLoader; ioreg -l -w0 -c AppleParavirtGPULoader; } 2>/dev/null |
-		grep -o -E 'ReimsGraphics:[^"]{0,160}')
-	bind=$(echo "$ld" | grep -o -E 'ReimsGraphics: all [0-9]+ sites resolved.{0,40}' | head -1)
-	if [ -n "$bind" ]; then item loader-bind PASS "$bind"; else
-		item loader-bind FAIL "$(echo "$ld" | head -2 | tr '\n' ' ')"
-	fi
+	# Graft says whether it bound ReimsGraphics: the registry root's
+	# GraftClient.ai.aneesiqbal.ReimsGraphics reads "bound: imports and vtables committed;
+	# waiting for a provider of personality <names> to open the gate" once every site and vtable
+	# is written, and "bound: imports and vtables committed; activation gate open on a provider of
+	# personality <name>" once Graft has set the gate property on the device's nub, which lets
+	# IOKit construct and start ReimsGraphics. Only the open gate passes; any other value, a
+	# refusal naming what Graft declined among them, is printed.
+	local bind
+	bind=$(ioreg -l -w0 -d1 2>/dev/null | grep -o -E '"GraftClient\.ai\.aneesiqbal\.ReimsGraphics" = "[^"]{0,160}"' |
+		sed 's/^[^=]*= //')
+	case $bind in
+	'"bound:'*'activation gate open'*) item graft-bind PASS "$bind" ;;
+	*) item graft-bind FAIL "${bind:-no GraftClient.ai.aneesiqbal.ReimsGraphics on the registry root}" ;;
+	esac
 	local b=/Library/GPUBundles/reims-graphics.bundle
 	if codesign -v --strict "$b" 2>/dev/null; then
 		item bundle PASS "$(shasum "$b/Contents/MacOS/reims-graphics" | cut -c1-16) $(codesign -dvvv "$b" 2>&1 | grep -E '^CDHash=' | head -1)"

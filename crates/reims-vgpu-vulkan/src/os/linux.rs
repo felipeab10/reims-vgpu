@@ -1,20 +1,21 @@
 //! The OS services on Linux: the clocks ([`LinuxClock`]), threads ([`LinuxThreads`]), Mach VM's
 //! calls over `mmap` ([`LinuxVm`]), whose views of the guest's pages map the files the backing
-//! table names (`files`), IOSurface's stand-in over that memory ([`LinuxSurface`]), and what the
-//! window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
-//! the loader). No Objective-C runs here: core pushes no autorelease pool where none is
+//! table names (`files`), what the window system's Vulkan extensions take here (`crate::os`'s `wsi`: the surface extensions and
+//! the loader), and the GPU's copies of another driver's planes in dma-bufs into a runtime buffer
+//! ([`PlaneCopier`]). No Objective-C runs here: core pushes no autorelease pool where none is
 //! installed.
 
 mod budget;
 mod clock;
 mod device_lend;
-pub mod dirty;
 mod dma_buf;
-mod files;
 mod hints;
 mod host_ram;
 mod import;
-mod surface;
+mod lease;
+mod plane_copy;
+#[cfg(test)]
+pub(crate) mod thread_counts;
 mod threads;
 mod vm;
 
@@ -24,26 +25,26 @@ use ash::vk;
 use metal2vulkan_runtime as rt;
 
 pub use clock::LinuxClock;
-pub use device_lend::{DeviceLend, LendRefusal, LentDmaBuf, lend_to_devices};
-pub use files::{GuestMemoryLease, lease_guest_memory};
-pub use surface::{LinuxSurface, LinuxSurfaces, attachment};
+pub use device_lend::{LendRefusal, LentDmaBuf, dma_buf_of_host, map_for_pointer};
+pub use lease::{GuestMemoryLease, lease_guest_memory};
+pub use plane_copy::{CopyError, DmaBufPlane, PlaneCopier, PlaneCopy, PlaneFormat};
 pub use threads::LinuxThreads;
-pub use vm::LinuxVm;
+pub use vm::{LinuxVm, RegionMemory};
 
-pub(crate) use host_ram::{
-    copies as copies_guest_ram, copy_from_host_ram, copy_to_host_ram, ram_over,
+pub(crate) use dma_buf::{
+    fits_one as one_dma_buf_fits, fits_one_of as one_dma_buf_of_fits,
+    fits_pieces as one_dma_buf_of_pieces_fits,
 };
 #[cfg(test)]
-pub(crate) use import::views_through_dma_bufs;
+pub(crate) use host_ram::ram_has_sources;
+pub(crate) use host_ram::with_ram_sources;
 pub(crate) use import::{
-    ImportView, TWINS_READ_ONLY, allocate_zeros, dma_buf_refusal, host_memory, host_memory_vouched,
-    import_view, learn_view_imports, shown_at,
-};
-pub(crate) use surface::{
-    base_views_pages, own_alias, plane_at, plane_shape, recorded_mut, surface_memory_hold,
-    ycbcr_matrix,
+    COPIES_READ_ONLY, ImportMade, dma_buf_refusal, host_memory, host_memory_vouched,
+    import_heap_view, import_view, learn_view_imports,
 };
 pub(crate) use vm::allocate_aliasable;
+#[cfg(test)]
+pub(crate) use vm::memfd;
 #[cfg(test)]
 pub(crate) use vm::tests::{PAGE, mapped, writable};
 
@@ -93,14 +94,10 @@ pub type OsClock = LinuxClock;
 pub type OsThreads = LinuxThreads;
 /// Mach VM's calls.
 pub type OsVm = LinuxVm;
-/// An IOSurface: the stand-in's, one reference.
-pub type OsSurface = LinuxSurface;
-/// IOSurface creation: the stand-in's.
-pub type OsSurfaces = LinuxSurfaces;
 
 /// Installs what the process's platform needs before it runs, once: the soft limit of open files
-/// raised to the hard limit, as each IOSurface stand-in of its own memory holds a file open
-/// (`memfd_create`), as does each range a view can be made of. A limit left lower is logged.
+/// raised to the hard limit, as each range a view can be made of holds a file open
+/// (`memfd_create`). A limit left lower is logged.
 pub fn install_process_services() {
     static RAISED: std::sync::Once = std::sync::Once::new();
     RAISED.call_once(|| {

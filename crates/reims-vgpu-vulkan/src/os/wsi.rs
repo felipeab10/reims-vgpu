@@ -14,7 +14,10 @@
 //! physical devices' lists are read through an instance of the probe's own, made with no
 //! extensions but `VK_KHR_portability_enumeration` where the loader lists it, as the runtime
 //! makes its own (so the probe lists MoltenVK, a portability driver, as the runtime does), and
-//! destroyed at once. The loader is the one the runtime opens (`crate::os`'s `open_loader`).
+//! destroyed at once. The loader is the one the runtime opens (`crate::os`'s `open_loader`). The
+//! probe runs once a process ([`HOST`]), and the library's choice of device reads what it read
+//! of each physical device too ([`seen_devices`], [`crate::device_choice`]), so the choice costs
+//! no instance of its own.
 //!
 //! **Present fences.** The device also takes `VK_KHR_swapchain_maintenance1` (or, where a device
 //! lists only that, `VK_EXT_swapchain_maintenance1`), and the instance its surface counterpart
@@ -31,11 +34,28 @@
 //! requires (`VK_KHR_swapchain` with `VK_KHR_surface`; `swapchain_maintenance1` with its surface
 //! counterpart and `VK_KHR_get_surface_capabilities2`), which the runtime checks before it makes
 //! the instance (`Error::InstanceExtensionRequired`).
+//!
+//! **The loader's list in one call.** The loader's instance extensions are read with one
+//! `vkEnumerateInstanceExtensionProperties` call into room for [`LISTED_FIRST`] of them, asked
+//! again with twice the room while the loader answers `VK_INCOMPLETE`
+//! ([`instance_extensions`]), where ash's read makes two calls, for the count and then the list.
+//! The loader loads and asks every driver its manifests name at each such call, and at each
+//! `vkCreateInstance`, and unloads one that makes no instance, and a driver's load can be slow.
+//! Measured on a host with a Radeon RX 550, a Radeon 780M and NVIDIA's driver package but no
+//! NVIDIA GPU (Vulkan loader 1.4.363, NVIDIA 615.78.08, Mesa 26.2.6, 2026-11-07): at each call,
+//! NVIDIA's driver library read the PCI configuration of each of the host's 45 PCI devices, which
+//! resumed each one runtime power management had suspended, 13 ms for most and 140 ms for a USB
+//! controller, 0.25 to 0.7 s a call. A test process that made the platform's device made 13 such
+//! calls and ran 7 to 10 s, against 0.05 s with that driver's manifest left out of the loader's
+//! search; 3 of the calls were this module's, 2 of them its list's read through ash.
 
 use std::ffi::{CStr, CString};
+use std::sync::LazyLock;
 
 use ash::vk;
 use metal2vulkan_runtime as rt;
+
+use crate::device_choice::{DrmNodes, Seen};
 
 use super::host_os::{WINDOW_DEVICE_EXTENSIONS, WINDOW_SURFACE_EXTENSIONS, open_loader};
 
@@ -56,8 +76,8 @@ const PRESENT_FENCES: [(&CStr, &CStr); 2] = [
 /// module doc). Where the loader does not open, or lists no `VK_KHR_surface`, it adds nothing,
 /// and says why once.
 pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
-    let entry = match open_loader() {
-        Ok(entry) => entry,
+    let host = match &*HOST {
+        Ok(host) => host,
         Err(e) => {
             log::warn!(
                 target: "reims_vgpu_vulkan::wsi",
@@ -66,12 +86,7 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
             return;
         }
     };
-    // SAFETY: a global command of a loaded entry.
-    let listed = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap_or_default();
-    let listed: Vec<&CStr> = listed
-        .iter()
-        .filter_map(|p| p.extension_name_as_c_str().ok())
-        .collect();
+    let listed: Vec<&CStr> = host.listed.iter().map(CString::as_c_str).collect();
     if !listed.contains(&ash::khr::surface::NAME) {
         log::warn!(
             target: "reims_vgpu_vulkan::wsi",
@@ -85,7 +100,7 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
             add(&mut options.instance_extensions, name);
         }
     }
-    let devices = probe(&entry, &listed);
+    let devices = &host.devices;
     let wanted = std::iter::once(ash::khr::swapchain::NAME).chain(WINDOW_DEVICE_EXTENSIONS);
     for name in wanted.clone() {
         if !devices.every_lists(name) {
@@ -100,7 +115,7 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
     for name in wanted {
         add(&mut options.device_extensions, name);
     }
-    match fence_extensions(&listed, &devices) {
+    match fence_extensions(&listed, devices) {
         Ok((device, surface)) => {
             add(
                 &mut options.instance_extensions,
@@ -117,6 +132,35 @@ pub fn add_window_extensions(options: &mut rt::DeviceOptions) {
     }
 }
 
+/// What the probe read of the host's loader: its instance extensions, and every physical device
+/// it lists ([`probe`]).
+struct HostProbe {
+    /// The loader's instance extensions, in its order ([`instance_extensions`]).
+    listed: Vec<CString>,
+    /// What the probe read of each physical device.
+    devices: Probed,
+}
+
+/// The host's loader and devices, read once a process, through the probe's one instance (the
+/// module doc): the window's extensions and the library's choice of device
+/// ([`crate::device_choice`]) both read it. Why the loader does not open, where it does not.
+static HOST: LazyLock<Result<HostProbe, String>> = LazyLock::new(|| {
+    let entry = open_loader().map_err(|e| e.to_string())?;
+    let listed: Vec<CString> = instance_extensions(&entry)
+        .iter()
+        .filter_map(|p| p.extension_name_as_c_str().ok().map(CStr::to_owned))
+        .collect();
+    let names: Vec<&CStr> = listed.iter().map(CString::as_c_str).collect();
+    let devices = probe(&entry, &names);
+    Ok(HostProbe { listed, devices })
+});
+
+/// Every physical device the host's loader lists, in its order, as the probe read it: none where
+/// the loader does not open or its instance is refused.
+pub(crate) fn seen_devices() -> &'static [Seen] {
+    HOST.as_ref().map_or(&[], |host| &host.devices.seen)
+}
+
 /// Whether `options` give a device present fences: they list one of the device extensions
 /// [`add_window_extensions`] adds for them, whose feature the runtime then enables on every
 /// device it makes of them (the module doc).
@@ -126,6 +170,50 @@ pub fn present_fences(options: &rt::DeviceOptions) -> bool {
             .iter()
             .any(|(device, _)| name.as_c_str() == *device)
     })
+}
+
+/// The room the first call of [`instance_extensions`] has: more than any loader measured lists
+/// (26 on Linux, with the loader 1.4.363 and Mesa's and NVIDIA's drivers).
+const LISTED_FIRST: u32 = 64;
+
+/// The most room [`instance_extensions`] asks with, past which a loader that still answers
+/// `VK_INCOMPLETE` is taken to list nothing, as a failed call is.
+const LISTED_MOST: u32 = 1 << 16;
+
+/// The instance extensions `entry`'s loader lists, in its order, read in one call where they fit
+/// in room for [`LISTED_FIRST`] (the module doc); none where the loader fails the call.
+pub(crate) fn instance_extensions(entry: &ash::Entry) -> Vec<vk::ExtensionProperties> {
+    instance_extensions_from(entry, LISTED_FIRST)
+}
+
+/// [`instance_extensions`], its first call with room for `first` (at least one), and each next
+/// with twice the last's, while the loader answers `VK_INCOMPLETE`: it then writes as many as
+/// there is room for, and the count it leaves is that room, not how many it lists.
+fn instance_extensions_from(entry: &ash::Entry, first: u32) -> Vec<vk::ExtensionProperties> {
+    let mut room = first.max(1);
+    while room <= LISTED_MOST {
+        let mut listed: Vec<vk::ExtensionProperties> = Vec::with_capacity(room as usize);
+        let mut count = room;
+        // SAFETY: a global command of a loaded entry, with no layer named, and room for `count`
+        // properties at the pointer.
+        let result = unsafe {
+            (entry.fp_v1_0().enumerate_instance_extension_properties)(
+                std::ptr::null(),
+                &mut count,
+                listed.as_mut_ptr(),
+            )
+        };
+        match result {
+            vk::Result::SUCCESS => {
+                // SAFETY: the loader wrote `count` properties, at most the room asked for.
+                unsafe { listed.set_len(count.min(room) as usize) };
+                return listed;
+            }
+            vk::Result::INCOMPLETE => room *= 2,
+            _ => break,
+        }
+    }
+    Vec::new()
 }
 
 /// Adds `name` to `names` where it is not there yet.
@@ -169,6 +257,9 @@ struct Probed {
     /// one of [`PRESENT_FENCES`]' device extensions; false where there is no device, or the
     /// loader cannot ask.
     every_has_maintenance1: bool,
+    /// What the library's choice of device reads of each ([`crate::device_choice`]), in the
+    /// loader's order.
+    seen: Vec<Seen>,
 }
 
 impl Probed {
@@ -183,21 +274,25 @@ impl Probed {
 }
 
 /// Every physical device `entry`'s loader lists, read through an instance of this call's own, at
-/// Vulkan 1.1 where the loader takes it, for the features query, with portability drivers
-/// enumerated where the loader lists the instance extensions it names (`listed`), as the runtime
-/// enumerates them: nothing where there is none.
+/// Vulkan 1.2 where the loader takes it, as the runtime makes its own, else 1.1 where it takes
+/// that, for the features query and the device's UUID, with portability drivers enumerated where
+/// the loader lists the instance extensions it names (`listed`), as the runtime enumerates them:
+/// nothing where there is none.
 fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
     // SAFETY: a global command of a loaded entry.
     let version = unsafe { entry.try_enumerate_instance_version() }
         .ok()
         .flatten()
         .unwrap_or(vk::API_VERSION_1_0);
-    let features2 = version >= vk::API_VERSION_1_1;
-    let app = vk::ApplicationInfo::default().api_version(if features2 {
-        vk::API_VERSION_1_1
-    } else {
-        vk::API_VERSION_1_0
-    });
+    // The runtime's instance is at Vulkan 1.2, and MoltenVK answers a device's `apiVersion` no
+    // higher than its instance's (measured on the M3 Max: 1.1 under an instance at 1.1), so the
+    // probe reads the version the runtime reads at the same instance version.
+    let asked = [vk::API_VERSION_1_2, vk::API_VERSION_1_1]
+        .into_iter()
+        .find(|&asked| version >= asked)
+        .unwrap_or(vk::API_VERSION_1_0);
+    let features2 = asked >= vk::API_VERSION_1_1;
+    let app = vk::ApplicationInfo::default().api_version(asked);
     let portability = listed.contains(&ash::khr::portability_enumeration::NAME);
     let extensions = [ash::khr::portability_enumeration::NAME.as_ptr()];
     let mut info = vk::InstanceCreateInfo::default().application_info(&app);
@@ -243,14 +338,119 @@ fn probe(entry: &ash::Entry, listed: &[&CStr]) -> Probed {
                     }
                 }
             });
+        let seen = devices
+            .iter()
+            .zip(&extensions)
+            .map(|(&device, names)| {
+                let lists = |name: &CStr| names.iter().any(|n| n.as_c_str() == name);
+                let drm = lists(ash::ext::physical_device_drm::NAME);
+                let pci = lists(ash::ext::pci_bus_info::NAME);
+                seen(&instance, device, features2, drm, pci)
+            })
+            .collect();
         Probed {
             extensions,
             every_has_maintenance1,
+            seen,
         }
     };
     // SAFETY: nothing made of `instance` outlives it.
     unsafe { instance.destroy_instance(None) };
     probed
+}
+
+/// What the library's choice of device reads of `device` ([`Seen`]): its properties, its
+/// largest device-local heap, whether a queue family does graphics and compute work, and its UUID,
+/// read where the instance (`properties2`) and the device are at Vulkan 1.1 or later, its DRM
+/// nodes where it also lists `VK_EXT_physical_device_drm` (`drm`), and its PCI address where it
+/// also lists `VK_EXT_pci_bus_info` (`pci`).
+///
+/// # Safety
+///
+/// `device` is a physical device `instance` lists, and `instance` is live.
+unsafe fn seen(
+    instance: &ash::Instance,
+    device: vk::PhysicalDevice,
+    properties2: bool,
+    drm: bool,
+    pci: bool,
+) -> Seen {
+    // SAFETY: the caller's.
+    let (properties, memory, families) = unsafe {
+        (
+            instance.get_physical_device_properties(device),
+            instance.get_physical_device_memory_properties(device),
+            instance.get_physical_device_queue_family_properties(device),
+        )
+    };
+    let uuid = (properties2 && properties.api_version >= vk::API_VERSION_1_1).then(|| {
+        let mut id = vk::PhysicalDeviceIDProperties::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut id);
+        // SAFETY: the caller's; the instance and the device are at Vulkan 1.1 or later, where
+        // the structure is core.
+        unsafe { instance.get_physical_device_properties2(device, &mut asked) };
+        id.device_uuid
+    });
+    let drm = (drm && properties2 && properties.api_version >= vk::API_VERSION_1_1).then(|| {
+        let mut nodes = vk::PhysicalDeviceDrmPropertiesEXT::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut nodes);
+        // SAFETY: the caller's; the device lists the extension whose structure this is.
+        unsafe { instance.get_physical_device_properties2(device, &mut asked) };
+        let node = |has: vk::Bool32, major: i64, minor: i64| {
+            (has == vk::TRUE).then(|| (u32::try_from(major).ok(), u32::try_from(minor).ok()))
+        };
+        let pair = |n: Option<(Option<u32>, Option<u32>)>| match n {
+            Some((Some(a), Some(b))) => Some((a, b)),
+            _ => None,
+        };
+        DrmNodes {
+            primary: pair(node(
+                nodes.has_primary,
+                nodes.primary_major,
+                nodes.primary_minor,
+            )),
+            render: pair(node(
+                nodes.has_render,
+                nodes.render_major,
+                nodes.render_minor,
+            )),
+        }
+    });
+    let pci = (pci && properties2 && properties.api_version >= vk::API_VERSION_1_1).then(|| {
+        let mut bus = vk::PhysicalDevicePCIBusInfoPropertiesEXT::default();
+        let mut asked = vk::PhysicalDeviceProperties2::default().push_next(&mut bus);
+        // SAFETY: the caller's; the device lists the extension whose structure this is.
+        unsafe { instance.get_physical_device_properties2(device, &mut asked) };
+        (
+            bus.pci_domain,
+            bus.pci_bus,
+            bus.pci_device,
+            bus.pci_function,
+        )
+    });
+    let work = vk::QueueFlags::GRAPHICS | vk::QueueFlags::COMPUTE;
+    Seen {
+        name: properties.device_name_as_c_str().map_or_else(
+            |_| String::new(),
+            |name| name.to_string_lossy().into_owned(),
+        ),
+        kind: properties.device_type,
+        vendor_id: properties.vendor_id,
+        device_id: properties.device_id,
+        api_version: properties.api_version,
+        driver_version: properties.driver_version,
+        graphics_compute: families.iter().any(|f| f.queue_flags.contains(work)),
+        device_local: memory
+            .memory_heaps_as_slice()
+            .iter()
+            .filter(|heap| heap.flags.contains(vk::MemoryHeapFlags::DEVICE_LOCAL))
+            .map(|heap| heap.size)
+            .max()
+            .unwrap_or(0),
+        uuid,
+        drm,
+        pci,
+    }
 }
 
 #[cfg(test)]
@@ -293,6 +493,7 @@ mod tests {
                 .map(|names| names.iter().map(|n| (*n).to_owned()).collect())
                 .collect(),
             every_has_maintenance1: has,
+            seen: Vec::new(),
         };
         let loader = [
             ash::khr::get_surface_capabilities2::NAME,
@@ -314,6 +515,35 @@ mod tests {
         assert!(fence_extensions(&loader, &probed(&[], true)).is_err());
         assert!(fence_extensions(&loader[..1], &probed(&[both], true)).is_err());
         assert!(fence_extensions(&loader[1..], &probed(&[both], true)).is_err());
+    }
+
+    /// The loader's instance extensions read in one call are those ash's read of two calls lists,
+    /// in its order, whatever room the first call has
+    #[test]
+    fn the_instance_extensions_are_the_loaders_whatever_the_first_room() {
+        let Ok(entry) = open_loader() else {
+            return;
+        };
+        let named = |listed: &[vk::ExtensionProperties]| -> Vec<(CString, u32)> {
+            listed
+                .iter()
+                .filter_map(|p| {
+                    Some((p.extension_name_as_c_str().ok()?.to_owned(), p.spec_version))
+                })
+                .collect()
+        };
+        // SAFETY: a global command of a loaded entry.
+        let asked = unsafe { entry.enumerate_instance_extension_properties(None) }.unwrap();
+        assert!(!asked.is_empty());
+        assert_eq!(named(&instance_extensions(&entry)), named(&asked));
+        let len = u32::try_from(asked.len()).unwrap();
+        for first in [0, 1, 2, len - 1, len, len + 1] {
+            assert_eq!(
+                named(&instance_extensions_from(&entry, first)),
+                named(&asked),
+                "first room {first}"
+            );
+        }
     }
 
     /// Options that list a present-fence extension give present fences; others do not

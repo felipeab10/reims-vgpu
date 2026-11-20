@@ -12,7 +12,7 @@
 //! named (a command buffer that names it fails at the op that names it first), one destroyed after
 //! it is named whole, and one made after it is not named. A command buffer's view is taken after
 //! ring 0 has carried out every message published before the buffer was taken off its ring
-//! (`reims_graphics`'s order), so it sees every create its process posted before it.
+//! (`reims_vgpu_graphics`'s order), so it sees every create its process posted before it.
 //!
 //! **What an entry is.** An object's handle, the region span it lies over, the CPU copy of a
 //! `Managed` one, where a texture over an IOSurface plane lies in its buffer, and a queue's counts:
@@ -22,8 +22,8 @@
 //!
 //! **When an entry goes.** An entry removed (a destroy, an id made again, the context's close or
 //! the device's reset) while a view that names it is open is kept on the table's gone list, where
-//! only such views find it, and let go of when the last of them closes, on that view's thread,
-//! with the others it frees in the order they were removed: as an object destroyed after a whole
+//! only such views find it, and let go of once the last of them closes, on the thread of a view
+//! closing then, with the others it frees in the order they were removed: as an object destroyed after a whole
 //! message under one lock is let go of after it. A view names an entry where it was taken at or
 //! after the entry's make, or by the message that made it ([`View::made`]), and before its removal.
 //! Else it is let go of at once, by whoever removed it, as one is that only a view taken before its
@@ -38,13 +38,14 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
 use parking_lot::RwLock;
-use reims_vgpu_core::collections::hasher::KeyBuild;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::collections::hasher::KeyBuild;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::sync::Mutex;
 
 use super::lane::Lane;
 use super::managed::ManagedCopy;
+use super::surface_cache::Repitched;
 use super::video::PlanePlace;
 use super::{Drain, ObjHandle, drop_refused};
 
@@ -128,8 +129,9 @@ pub(crate) struct Entry<P: Platform> {
     pub(crate) place: Option<PlanePlace>,
     /// A command queue's counts.
     pub(crate) queue: Option<QueueCounts>,
-    /// A heap over a pages block's guest RAM (`HEAP_OVER_PAGES`): the host bytes it lies in, its
-    /// first byte and length, which `span`, the block's, does not name.
+    /// A heap over a pages block's pages (`HEAP_OVER_PAGES`): the host bytes it lies in, in the
+    /// guest's RAM or the block's view, its first byte and length, which `span`, the block's, does
+    /// not name.
     pub(crate) ram: Option<(HostPtr, u64)>,
     /// A buffer whose contents are the guest's bytes: where they lie, which `span` names only for
     /// a buffer over its own block (`BUFFER_OVER_HOST_MEMORY`); `None` for any other object.
@@ -142,6 +144,14 @@ pub(crate) struct Entry<P: Platform> {
     /// An indirect command buffer's commands whose draws and dispatches are dropped
     /// ([`super::icb::Dropped`]); `None` for any other object.
     pub(crate) icb_dropped: Option<Box<super::icb::Dropped>>,
+    /// A buffer over a block's device cache that lays its surface's planes out at the GPU's
+    /// pitch: that layout, by which each texture over the buffer is placed in it
+    /// ([`Repitched`]); `None` for any other object.
+    pub(crate) laid_out: Option<Arc<Repitched>>,
+    /// A texture over a plane of a device cache laid out at the GPU's pitch: its block, and
+    /// whether it lies in the cache or in the block's wide home ([`LaidUse`]); `None` for any
+    /// other object.
+    pub(crate) laid_use: Option<LaidUse>,
     /// The table's clock at its make.
     made: u64,
     /// The first clock of a view that names it: its make's, or the making message's view's where
@@ -162,6 +172,8 @@ impl<P: Platform> Entry<P> {
             bytes: None,
             over_view: false,
             icb_dropped: None,
+            laid_out: None,
+            laid_use: None,
             made: 0,
             seen: 0,
         }
@@ -179,11 +191,30 @@ impl<P: Platform> Entry<P> {
         self
     }
 
+    /// The entry, a buffer over a device cache laid out as `laid_out` says (the field
+    /// `laid_out`).
+    pub(crate) fn laid_out(mut self, laid_out: Option<Arc<Repitched>>) -> Self {
+        self.laid_out = laid_out;
+        self
+    }
+
     /// The entry, a buffer whose contents are the guest's `bytes` (the field `bytes`).
     pub(crate) fn with_bytes(mut self, bytes: Option<GuestBytes>) -> Self {
         self.bytes = bytes;
         self
     }
+}
+
+/// A texture over a plane of a surface whose device cache lays its planes out at the GPU's pitch
+/// ([`Repitched`]), as a command buffer's walk notes each use of it
+/// ([`super::surface_cache::Caches::reconcile`]): the block, whether the texture lies in the
+/// block's wide home rather than in the cache (`super::surface_cache`, "Wider than the plane"), and
+/// whether the use may write it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct LaidUse {
+    pub(crate) block: u64,
+    pub(crate) wide: bool,
+    pub(crate) writes: bool,
 }
 
 /// An entry the table owns: boxed, and freed only by its drop, so a view's pointer to it stays
@@ -283,11 +314,41 @@ struct Tables<P: Platform> {
     gone: Vec<(Removed<P>, u64)>,
     /// Moves at each make and removal.
     clock: u64,
-    /// The open views, by the clock at which each was taken: how many at each.
-    views: BTreeMap<u64, usize>,
+    /// The region spans the live entries lie over ([`Entry::span`]), each with how many lie over
+    /// it: what [`Context::span_in`] looks through, a few keys about the range it asks of, where
+    /// the entries themselves are thousands. It cannot go stale: an entry's span is counted where
+    /// the entry goes into `live` ([`Context::insert`], [`Context::insert_if`]) and taken out where
+    /// it leaves ([`Self::retire`], which every removal from `live` goes through: a remove, a make
+    /// over its id again, a close's removal of every entry), each under the table's write lock with
+    /// the change itself, and a span is set at the entry's make and never changed while it is in
+    /// the table (the module doc). A context dropped takes its spans with it.
+    spans: BTreeMap<(u64, u64), usize>,
+    /// The longest span `spans` ever counted: how far before a range a span that reaches into it
+    /// may start.
+    longest: u64,
 }
 
 impl<P: Platform> Tables<P> {
+    /// Counts `span`, a live entry's, in [`Self::spans`].
+    fn count_span(&mut self, span: Option<(u64, u64)>) {
+        if let Some(span) = span {
+            *self.spans.entry(span).or_default() += 1;
+            self.longest = self.longest.max(span.1);
+        }
+    }
+
+    /// Takes `span`, an entry's that leaves the live ones, out of [`Self::spans`].
+    fn uncount_span(&mut self, span: Option<(u64, u64)>) {
+        if let Some(span) = span
+            && let Some(n) = self.spans.get_mut(&span)
+        {
+            *n -= 1;
+            if *n == 0 {
+                self.spans.remove(&span);
+            }
+        }
+    }
+
     /// The entry of `id` a view taken at `at` sees: in the table and made by then, else removed
     /// since and made by then.
     fn find(&self, id: u64, at: u64) -> Option<NonNull<Entry<P>>> {
@@ -299,13 +360,13 @@ impl<P: Platform> Tables<P> {
         })
     }
 
-    /// Removes `owned`, `id`'s entry: onto the gone list where an open view names it (each open
-    /// view was taken before this), else handed back to let go of.
-    fn retire(&mut self, id: u64, owned: Owned<P>) -> Option<Removed<P>> {
+    /// Removes `owned`, `id`'s entry: onto the gone list where an open view of `views` names it
+    /// (each open view was taken before this), else handed back to let go of.
+    fn retire(&mut self, id: u64, owned: Owned<P>, views: &mut Views) -> Option<Removed<P>> {
         self.clock += 1;
+        self.uncount_span(owned.entry().span);
         let removed = Removed { id, owned };
-        if self
-            .views
+        if (views.open)
             .range(removed.owned.entry().seen..)
             .next()
             .is_none()
@@ -313,30 +374,62 @@ impl<P: Platform> Tables<P> {
             return Some(removed);
         }
         self.gone.push((removed, self.clock));
+        views.gone = true;
         None
     }
 
-    /// The gone entries no open view names any more, in the order removed: a view names one where
-    /// it was taken from the entry's `seen` up to its removal.
-    fn sweep(&mut self) -> Vec<Removed<P>> {
-        if self.views.is_empty() {
+    /// The gone entries no open view of `views` names any more, in the order removed: a view
+    /// names one where it was taken from the entry's `seen` up to its removal.
+    fn sweep(&mut self, views: &mut Views) -> Vec<Removed<P>> {
+        if self.gone.is_empty() {
+            return Vec::new();
+        }
+        if views.open.is_empty() {
+            views.gone = false;
             return std::mem::take(&mut self.gone)
                 .into_iter()
                 .map(|(r, _)| r)
                 .collect();
         }
-        let views = &self.views;
+        let open = &views.open;
         let (keep, out): (Vec<_>, Vec<_>) =
             std::mem::take(&mut self.gone)
                 .into_iter()
                 .partition(|(r, removed_at)| {
-                    views
-                        .range(r.owned.entry().seen..*removed_at)
+                    open.range(r.owned.entry().seen..*removed_at)
                         .next()
                         .is_some()
                 });
         self.gone = keep;
+        views.gone = !self.gone.is_empty();
         out.into_iter().map(|(r, _)| r).collect()
+    }
+}
+
+/// The open views of a context's table, by the clock at which each was taken: how many at each,
+/// and whether the table's gone list holds an entry. A view is counted with the table's read lock
+/// held, so no make or removal (each under its write lock) comes between its reading of the clock
+/// and its count, and a removal, which reads them with the write lock held, finds every view open
+/// then; a view's close uncounts it under this lock alone, and takes the write lock to sweep the
+/// gone list only where the list holds an entry. So a command buffer's view, taken at its begin
+/// on its queue's thread and closed after its walk on its lane's, holds up neither the lanes'
+/// lookups of the table nor ring 0's makes: as the write lock, the view's taking was 1.2 µs of a
+/// Super Resolution buffer's begin on the Iris Xe host, up to 9.8 µs in one of a hundred
+/// (**measured** 2026-11-14, laps of the begin, gpre m3-max-31335).
+#[derive(Default)]
+struct Views {
+    /// How many views are open at each clock.
+    open: BTreeMap<u64, usize>,
+    /// The table's gone list holds an entry: set as one goes on it, cleared as a sweep empties
+    /// it, both with the write lock held too.
+    gone: bool,
+}
+
+impl<P: Platform> Tables<P> {
+    /// Removes `id`'s live entry, where it has one, as [`Self::retire`] does.
+    fn retire_live(&mut self, id: u64, views: &mut Views) -> Option<Option<Removed<P>>> {
+        let owned = self.live.remove(&id)?;
+        Some(self.retire(id, owned, views))
     }
 }
 
@@ -345,9 +438,18 @@ pub(crate) struct Context<P: Platform> {
     /// The context's id.
     pub(crate) id: u32,
     tables: RwLock<Tables<P>>,
+    /// The table's open views ([`Views`]), taken with `tables`' lock held where both are.
+    views: Mutex<Views>,
+    /// What a test runs at a step of a view's taking or close ([`ViewStep`]).
+    #[cfg(test)]
+    view_step: Mutex<Option<ViewStepHook>>,
     /// The command buffers committed since the context's last drain began: each holds a clone
     /// until its completion handler has run ([`super::GraphicsDecoder::drain_context`]).
     pub(crate) drain: Mutex<Arc<Drain>>,
+    /// The device's recoveries its two-copy `Managed` textures were last looked at for
+    /// (`GraphicsDecoder::refill_managed`): a command buffer's begin past one refills those made
+    /// before it, under this lock, so no command buffer of the context is begun between.
+    pub(crate) managed_recoveries: Mutex<u64>,
 }
 
 impl<P: Platform> Context<P> {
@@ -359,9 +461,14 @@ impl<P: Platform> Context<P> {
                 live: HashMap::default(),
                 gone: Vec::new(),
                 clock: 0,
-                views: BTreeMap::new(),
+                spans: BTreeMap::new(),
+                longest: 0,
             }),
+            views: Mutex::default(),
+            #[cfg(test)]
+            view_step: Mutex::new(None),
             drain: Mutex::new(Arc::default()),
+            managed_recoveries: Mutex::new(0),
         }
     }
 
@@ -374,9 +481,11 @@ impl<P: Platform> Context<P> {
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
+        t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
+        let replaced =
+            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
         (at, replaced)
     }
 
@@ -396,9 +505,11 @@ impl<P: Platform> Context<P> {
         t.clock += 1;
         entry.made = t.clock;
         entry.seen = seen_from.map_or(t.clock, |at| at.min(t.clock));
+        t.count_span(entry.span);
         let owned = Owned::new(entry);
         let at = owned.0;
-        let replaced = t.live.insert(id, owned).and_then(|old| t.retire(id, old));
+        let replaced =
+            (t.live.insert(id, owned)).and_then(|old| t.retire(id, old, &mut self.views.lock()));
         Some((at, replaced))
     }
 
@@ -406,37 +517,36 @@ impl<P: Platform> Context<P> {
     /// where no view needs it.
     pub(crate) fn remove(&self, id: u64) -> Option<(bool, Option<Removed<P>>)> {
         let mut t = self.tables.write();
-        let owned = t.live.remove(&id)?;
-        let texture = matches!(owned.entry().handle, ObjHandle::Texture(_));
-        Some((texture, t.retire(id, owned)))
+        let texture = matches!(t.live.get(&id)?.entry().handle, ObjHandle::Texture(_));
+        let removed = t.retire_live(id, &mut self.views.lock())?;
+        Some((texture, removed))
     }
 
     /// Removes every entry, in the table's order: those to let go of now, where no view needs
     /// them, and how many there were.
     pub(crate) fn remove_all(&self) -> (Vec<Removed<P>>, usize) {
         let mut t = self.tables.write();
+        let mut views = self.views.lock();
         let ids: Vec<u64> = t.live.keys().copied().collect();
         let count = ids.len();
         let mut out = Vec::new();
         for id in ids {
-            if let Some(owned) = t.live.remove(&id)
-                && let Some(removed) = t.retire(id, owned)
-            {
+            if let Some(Some(removed)) = t.retire_live(id, &mut views) {
                 out.push(removed);
             }
         }
         (out, count)
     }
 
-    /// Whether any entry in the table lies in the `size` bytes at region offset `offset`.
+    /// Whether any entry in the table lies in the `size` bytes at region offset `offset`: a span
+    /// the live entries lie over that starts before the range ends and ends past its start, looked
+    /// for among those that start no further before it than the longest span counted.
     pub(crate) fn span_in(&self, offset: u64, size: u64) -> bool {
         let end = offset.saturating_add(size);
         let t = self.tables.read();
-        t.live.values().any(|o| {
-            o.entry()
-                .span
-                .is_some_and(|(at, length)| at < end && offset < at.saturating_add(length))
-        })
+        let from = offset.saturating_sub(t.longest);
+        (t.spans.range((from, 0)..(end, 0)))
+            .any(|(&(at, length), _)| offset < at.saturating_add(length))
     }
 
     /// Calls `f` with each entry the table holds now, with its id, under its read lock: what a
@@ -510,6 +620,15 @@ impl<P: Platform> Drop for Context<P> {
     }
 }
 
+/// The names a view's map of what it found holds before it grows: a command buffer of a few
+/// dispatches names tens of objects, and each growth moves every name found so far.
+const SEEN_ROOM: usize = 32;
+
+/// How many entries [`View::find_all`] looks for under one hold of the table's lock: a command
+/// buffer of a few dispatches finds every name it has in one, and the table's makes and removals
+/// wait no longer than as many lookups.
+const FOUND_A_HOLD: usize = 32;
+
 /// A message's view of one context's table (the module doc): open from its taking until it drops,
 /// which lets go of the removed entries only it still kept. It lends the entries it finds for its
 /// own life, and keeps each found, and each change of the message's own, so a name it looks up
@@ -530,15 +649,35 @@ impl<P: Platform> View<P> {
     /// A view of `context`'s table, taken now.
     pub(crate) fn take(context: Arc<Context<P>>) -> Self {
         let at = {
-            let mut t = context.tables.write();
+            let t = context.tables.read();
             let at = t.clock;
-            *t.views.entry(at).or_default() += 1;
+            #[cfg(test)]
+            context.step(ViewStep::Taking);
+            *context.views.lock().open.entry(at).or_default() += 1;
             at
         };
         View {
             context,
             at,
-            seen: RefCell::new(HashMap::default()),
+            seen: RefCell::new(HashMap::with_capacity_and_hasher(
+                SEEN_ROOM,
+                KeyBuild::default(),
+            )),
+        }
+    }
+
+    /// A view of the same table at this one's clock, with what this one found and the message's
+    /// own changes it holds: it names what this one names, for chunks of the message's command
+    /// buffer walked on another thread beside the rest ([`super::split`], "Two threads at once").
+    /// The entries it keeps are let go of once both have closed, as any open view's are.
+    pub(crate) fn twin(&self) -> Self {
+        // This view, open at the same clock, holds its count there: no removal's or sweep's answer
+        // changes with the twin's, so no lock of the table's is needed for it.
+        *self.context.views.lock().open.entry(self.at).or_default() += 1;
+        View {
+            context: Arc::clone(&self.context),
+            at: self.at,
+            seen: RefCell::new(self.seen.borrow().clone()),
         }
     }
 
@@ -552,15 +691,14 @@ impl<P: Platform> View<P> {
         &self.context
     }
 
-    /// The entry of `id` the view sees.
+    /// The entry of `id` the view sees: looked up in what the view found and changed with one
+    /// hash of `id`, which the table's answer then goes in at.
     pub(crate) fn get(&self, id: u64) -> Option<&Entry<P>> {
-        let seen = self.seen.borrow().get(&id).copied();
-        let found = match seen {
-            Some(found) => found,
-            None => {
+        let found = match self.seen.borrow_mut().entry(id) {
+            std::collections::hash_map::Entry::Occupied(seen) => *seen.get(),
+            std::collections::hash_map::Entry::Vacant(slot) => {
                 let found = self.context.tables.read().find(id, self.at)?;
-                self.seen.borrow_mut().insert(id, Some(found));
-                Some(found)
+                *slot.insert(Some(found))
             }
         };
         // SAFETY: the entry was in the table, made by the view's taking, or removed after it; or
@@ -569,6 +707,38 @@ impl<P: Platform> View<P> {
         // names it, so it is freed only once no such view is open, and this one is until it
         // drops: it outlives `&self`.
         found.map(|p| unsafe { p.as_ref() })
+    }
+
+    /// Finds each of `ids` the view has not found yet, [`FOUND_A_HOLD`] of them under each hold
+    /// of the table's lock, so [`Self::get`] answers them from what the view found. A view's
+    /// answer for an id is set at its taking (the module doc): finding it now or at its first
+    /// [`Self::get`] finds the same entry, or none. An id the table holds no entry of for the
+    /// view is not kept, and [`Self::get`] looks it up again; one found that no op of the message
+    /// reaches changes nothing the table keeps.
+    pub(crate) fn find_all(&self, ids: impl IntoIterator<Item = u64>) {
+        let mut ids = ids.into_iter();
+        while self.find_some(&mut ids) {}
+    }
+
+    /// [`Self::find_all`]'s next [`FOUND_A_HOLD`] lookups of `ids` in the table, under one hold
+    /// of its lock, let go of before it answers: whether `ids` may hold more.
+    fn find_some(&self, ids: &mut impl Iterator<Item = u64>) -> bool {
+        let mut seen = self.seen.borrow_mut();
+        let mut tables = None;
+        let mut held = 0;
+        for id in ids {
+            if let std::collections::hash_map::Entry::Vacant(slot) = seen.entry(id) {
+                let t = tables.get_or_insert_with(|| self.context.tables.read());
+                if let Some(found) = t.find(id, self.at) {
+                    slot.insert(Some(found));
+                }
+                held += 1;
+                if held == FOUND_A_HOLD {
+                    return true;
+                }
+            }
+        }
+        false
     }
 
     /// The message made `id`'s entry at `at`: the view sees it from now on.
@@ -583,29 +753,70 @@ impl<P: Platform> View<P> {
 }
 
 impl<P: Platform> Drop for View<P> {
+    /// Uncounts the view; then, where the table's gone list holds an entry, lets go of those no
+    /// open view names any more ([`Views`]).
     fn drop(&mut self) {
-        let out = {
-            let mut t = self.context.tables.write();
-            if let Some(n) = t.views.get_mut(&self.at) {
+        let gone = {
+            let mut views = self.context.views.lock();
+            if let Some(n) = views.open.get_mut(&self.at) {
                 *n -= 1;
                 if *n == 0 {
-                    t.views.remove(&self.at);
+                    views.open.remove(&self.at);
                 }
             }
-            t.sweep()
+            views.gone
+        };
+        if !gone {
+            return;
+        }
+        #[cfg(test)]
+        self.context.step(ViewStep::Uncounted);
+        let out = {
+            let mut t = self.context.tables.write();
+            t.sweep(&mut self.context.views.lock())
         };
         let_go(out);
     }
 }
 
+/// A step of a view's taking or close, at which a test runs what it set
+/// ([`Context::on_view_step`]), to put another thread's work there.
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ViewStep {
+    /// The table's clock read for the view, its read lock held, the view not yet counted.
+    Taking,
+    /// The view uncounted, the gone list holding an entry, before the sweep.
+    Uncounted,
+}
+
+/// What a test runs at a [`ViewStep`].
+#[cfg(test)]
+type ViewStepHook = Arc<dyn Fn(ViewStep) + Send + Sync>;
+
+#[cfg(test)]
+impl<P: Platform> Context<P> {
+    /// Runs `hook` at each step of a view's taking or close from now on.
+    pub(crate) fn on_view_step(&self, hook: impl Fn(ViewStep) + Send + Sync + 'static) {
+        *self.view_step.lock() = Some(Arc::new(hook));
+    }
+
+    fn step(&self, step: ViewStep) {
+        let hook = self.view_step.lock().clone();
+        if let Some(hook) = hook {
+            hook(step);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 
     fn fence(p: &FakePlatform) -> ObjHandle<FakePlatform> {
-        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
         let device = p.device();
         ObjHandle::Fence(device.new_fence().unwrap().unwrap())
     }
@@ -637,6 +848,212 @@ mod tests {
         let late = View::take(Arc::clone(&ctx));
         assert!(late.get(1).is_none());
         assert!(late.get(2).is_some());
+    }
+
+    /// Holds the first view step of `want` a thread comes to, there, until the test lets it go:
+    /// the step's answer on `at` once there, and the thread goes on once `go` is sent to. Every
+    /// later step runs on.
+    fn hold_first(
+        ctx: &Context<FakePlatform>,
+        want: ViewStep,
+    ) -> (std::sync::mpsc::Receiver<()>, std::sync::mpsc::Sender<()>) {
+        let (at_tx, at) = std::sync::mpsc::channel();
+        let (go, go_rx) = std::sync::mpsc::channel::<()>();
+        let held = std::sync::atomic::AtomicBool::new(false);
+        let (at_tx, go_rx) = (Mutex::new(at_tx), Mutex::new(go_rx));
+        ctx.on_view_step(move |step| {
+            if step == want && !held.swap(true, std::sync::atomic::Ordering::AcqRel) {
+                at_tx.lock().send(()).unwrap();
+                go_rx.lock().recv().unwrap();
+            }
+        });
+        (at, go)
+    }
+
+    /// A view's taking reads the table's clock and counts the view with the table's read lock
+    /// held: a removal, which takes its write lock, comes wholly before it or after it. Held
+    /// between the two, the taking keeps the write lock from every removal; the removal after it
+    /// keeps the entry for the view, which finds it, and lets go of it once the view closes. A
+    /// removal before a taking is not seen by its view.
+    #[test]
+    fn a_views_taking_and_a_removal_come_one_after_the_other() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in [1, 2] {
+            let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+            assert!(replaced.is_none());
+        }
+        let (at, go) = hold_first(&ctx, ViewStep::Taking);
+        std::thread::scope(|scope| {
+            let taking = scope.spawn(|| View::take(Arc::clone(&ctx)));
+            at.recv().unwrap();
+            assert!(
+                ctx.tables.try_write().is_none(),
+                "no removal while the taking holds the read lock"
+            );
+            assert!(
+                ctx.views.lock().open.is_empty(),
+                "not counted yet, the clock read"
+            );
+            go.send(()).unwrap();
+            let view = taking.join().unwrap();
+            assert!(
+                ctx.remove(1).is_some_and(|(_, now)| now.is_none()),
+                "kept for the view taken before the removal"
+            );
+            assert!(view.get(1).is_some(), "the view finds it");
+            assert_eq!(ctx.gone_len(), 1);
+            drop(view);
+            assert_eq!(ctx.gone_len(), 0, "let go of as the view closes");
+        });
+        assert!(
+            ctx.remove(2).is_some_and(|(_, now)| now.is_some()),
+            "no view open: let go of at once"
+        );
+        let late = View::take(Arc::clone(&ctx));
+        assert!(late.get(2).is_none(), "removed before the view: not seen");
+    }
+
+    /// A view's close uncounts it before it sweeps the gone list, with no lock of the table's
+    /// held between: a removal there finds the view closed and lets go of its entry at once, a
+    /// view closed meanwhile sweeps what neither names, and the sweep after lets go of what is
+    /// left, each entry once.
+    #[test]
+    fn a_removal_between_a_views_uncounting_and_its_sweep_lets_go_at_once() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in [1, 2, 3] {
+            let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+            assert!(replaced.is_none());
+        }
+        let first = View::take(Arc::clone(&ctx));
+        let second = View::take(Arc::clone(&ctx));
+        assert!(first.get(1).is_some() && second.get(1).is_some());
+        assert!(
+            ctx.remove(3).is_some_and(|(_, now)| now.is_none()),
+            "kept for the open views"
+        );
+        let (at, go) = hold_first(&ctx, ViewStep::Uncounted);
+        std::thread::scope(|scope| {
+            let closing = scope.spawn(move || drop(first));
+            at.recv().unwrap();
+            assert!(
+                ctx.tables.try_write().is_some(),
+                "no lock of the table's held between the two"
+            );
+            assert_eq!(
+                ctx.views.lock().open.values().sum::<usize>(),
+                1,
+                "the first uncounted"
+            );
+            drop(second);
+            assert_eq!(
+                ctx.gone_len(),
+                0,
+                "the second's sweep let go of what neither names"
+            );
+            assert!(
+                ctx.remove(1).is_some_and(|(_, now)| now.is_some()),
+                "both closed: let go of at once"
+            );
+            go.send(()).unwrap();
+            closing.join().unwrap();
+        });
+        assert_eq!(ctx.gone_len(), 0, "the first's sweep found nothing more");
+        let views = ctx.views.lock();
+        assert!(
+            views.open.is_empty() && !views.gone,
+            "nothing open, nothing gone"
+        );
+        drop(views);
+        let late = View::take(Arc::clone(&ctx));
+        assert!(late.get(1).is_none() && late.get(3).is_none());
+        assert!(late.get(2).is_some());
+    }
+
+    /// A view that finds its names at once ([`View::find_all`]) answers each as one taken at the
+    /// same clock that looks it up only after the table changed: through random makes, makes over
+    /// an id again and removes, each view of a pair taken together sees the same entry, or none,
+    /// for every id, and what the table keeps for them goes once both close.
+    #[test]
+    fn a_view_finds_at_once_what_it_would_find_later() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let mut seed: u64 = 0x1234_5678_9abc_def1;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let change = |ctx: &Context<FakePlatform>, next: &mut dyn FnMut(u64) -> u64| {
+            let id = next(48);
+            if next(3) == 0 {
+                if let Some((_, Some(removed))) = ctx.remove(id) {
+                    let_go(vec![removed]);
+                }
+            } else {
+                let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)), None);
+                let_go(replaced.into_iter().collect());
+            }
+        };
+        for _ in 0..200 {
+            for _ in 0..next(12) {
+                change(&ctx, &mut next);
+            }
+            let early = View::take(Arc::clone(&ctx));
+            let late = View::take(Arc::clone(&ctx));
+            assert_eq!(early.at(), late.at());
+            early.find_all(0..64);
+            for _ in 0..next(24) {
+                change(&ctx, &mut next);
+            }
+            for id in 0..64 {
+                assert_eq!(
+                    early.get(id).map(std::ptr::from_ref),
+                    late.get(id).map(std::ptr::from_ref),
+                    "id {id}"
+                );
+            }
+            drop((early, late));
+            assert_eq!(ctx.gone_len(), 0, "nothing kept once both close");
+        }
+    }
+
+    /// A view finds its names [`FOUND_A_HOLD`] at a time, the table's lock let go of between: a
+    /// make goes through after each hold, before the next, and is not seen by the view; names it
+    /// found already, or found before, take no lookup; and a name the table holds nothing of is
+    /// not kept, so a later [`View::get`] looks it up again.
+    #[test]
+    fn a_view_finds_its_names_a_hold_at_a_time() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..100 {
+            ctx.insert(id, Entry::of(fence(&p)), None);
+        }
+        let view = View::take(Arc::clone(&ctx));
+        assert!(view.get(5).is_some());
+        // 0 to 99 twice, and 1,000, which the table does not hold: 100 lookups, as 5 was found.
+        let mut ids = (0..100).chain(0..100).chain([1_000]);
+        let mut holds = 0;
+        loop {
+            let more = view.find_some(&mut ids);
+            holds += 1;
+            assert!(ctx.tables.try_write().is_some(), "let go of after a hold");
+            ctx.insert(10_000 + holds, Entry::of(fence(&p)), None);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(holds, 4, "100 lookups, 32 a hold");
+        assert!((0..100).all(|id| view.get(id).is_some()));
+        assert!(
+            (1..=4).all(|n| view.get(10_000 + n).is_none()),
+            "made after it"
+        );
+        assert!(!view.seen.borrow().contains_key(&1_000), "not kept");
+        ctx.insert(1_000, Entry::of(fence(&p)), None);
+        assert!(view.get(1_000).is_none(), "made after it, looked up again");
     }
 
     /// One view taken long ago and still open (a message that waits) while frames of messages
@@ -744,6 +1161,344 @@ mod tests {
             );
         }
         drop(old);
+    }
+
+    /// What a command buffer's view of its table costs, a command buffer (a measurement, not a
+    /// check; run it by name with `--run-ignored only --no-capture` in a release build): Super
+    /// Resolution's 6,847 command buffers of about 6 dispatches each, each binding buffers that
+    /// lie in heaps. Over a table of `TABLES_COST_LIVE` objects (default 4,096), each of
+    /// `TABLES_COST_CBS` command buffers (default 2,000) takes a view, names `TABLES_COST_NAMED`
+    /// objects of the table (default 64, picked at random) for the first time, then
+    /// `TABLES_COST_AGAIN` more times each (default 3: the names a dispatch's binds take again
+    /// that the decoder's cache of recent entries misses), and drops the view. Prints the
+    /// thread's user-space instructions and cycles a command buffer and a name, the median of 9
+    /// runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_command_buffer_s_view_costs() {
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let live = env("TABLES_COST_LIVE", 4096);
+        let cbs = env("TABLES_COST_CBS", 2000);
+        let named = env("TABLES_COST_NAMED", 64);
+        let again = env("TABLES_COST_AGAIN", 3);
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..live {
+            ctx.insert(0x1000 + id, Entry::of(fence(&p)), None);
+        }
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let ids: Vec<Vec<u64>> = (0..cbs)
+            .map(|_| (0..named).map(|_| 0x1000 + next(live)).collect())
+            .collect();
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        for _ in 0..9 {
+            let before = counts();
+            for cb in &ids {
+                let view = View::take(Arc::clone(&ctx));
+                for _ in 0..=again {
+                    for &id in cb {
+                        assert!(view.get(std::hint::black_box(id)).is_some());
+                    }
+                }
+                drop(view);
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / cbs as f64);
+            }
+        }
+        eprintln!(
+            "{cbs} views over {live} objects, each naming {named} objects {} times: user-space \
+             instructions and cycles a command buffer, then a name (median, lowest, highest of 9)",
+            again + 1
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            let names = (named * (again + 1)) as f64;
+            eprintln!(
+                "  {name:<12} {median:9.0} ({low:.0} to {high:.0}) a command buffer, {:6.1} a \
+                 name",
+                median / names
+            );
+        }
+    }
+
+    /// What a command buffer's view of its table costs beside the threads that share the table
+    /// (a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
+    /// release build): [`a_command_buffer_s_view_costs`]'s command buffers, while ring 0's thread
+    /// makes an object and removes one made `TABLES_COST_KEEP` makes before (default 64) every
+    /// `TABLES_COST_SPIN` spins (default 2,000; 0 makes none), and `TABLES_COST_LANES` more lanes
+    /// (default 1) walk command buffers of their own. Each command buffer names
+    /// `TABLES_COST_FRESH` of ring 0's latest makes (default 4) among its `TABLES_COST_NAMED`
+    /// (default 26), as Super Resolution's name the buffers made in its heaps for them; with
+    /// `TABLES_COST_AT_ONCE=1`, each view finds its names at once ([`View::find_all`]). Prints
+    /// the measured lane's user-space instructions and cycles a command buffer and a first
+    /// lookup, the median of 9 runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    #[allow(clippy::disallowed_methods)] // a measurement: real threads contend for the view's lock
+    fn a_command_buffer_s_view_costs_beside_ring_0() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+
+        use reims_vgpu_vulkan::core::platform::Handle as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        // Ring 0's latest makes, as ids from `FIRST` on.
+        const FIRST: u64 = 1 << 32;
+        let env = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        let live = env("TABLES_COST_LIVE", 4096);
+        let cbs = env("TABLES_COST_CBS", 2000);
+        let named = env("TABLES_COST_NAMED", 26);
+        let fresh = env("TABLES_COST_FRESH", 4).min(named);
+        let again = env("TABLES_COST_AGAIN", 3);
+        let keep = env("TABLES_COST_KEEP", 64).max(fresh + 1);
+        let spin = env("TABLES_COST_SPIN", 2000);
+        let lanes = env("TABLES_COST_LANES", 1);
+        let at_once = env("TABLES_COST_AT_ONCE", 0) == 1;
+        let p = FakePlatform::new();
+        let fence = p.device().new_fence().unwrap().unwrap();
+        let of = |f: &<FakePlatform as Platform>::Fence| Entry::of(ObjHandle::Fence(f.clone_ref()));
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        for id in 0..live {
+            ctx.insert(0x1000 + id, of(&fence), None);
+        }
+        for id in FIRST..FIRST + keep {
+            ctx.insert(id, of(&fence), None);
+        }
+        // The newest of ring 0's makes.
+        let latest = Arc::new(AtomicU64::new(FIRST + keep - 1));
+        let stop = Arc::new(AtomicBool::new(false));
+        let mut threads = Vec::new();
+        if spin > 0 {
+            let (ctx, latest, stop) = (Arc::clone(&ctx), Arc::clone(&latest), Arc::clone(&stop));
+            let fence = fence.clone_ref();
+            threads.push(std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let next = latest.load(Ordering::Relaxed) + 1;
+                    let (_, replaced) = ctx.insert(next, of(&fence), None);
+                    let_go(replaced.into_iter().collect());
+                    latest.store(next, Ordering::Release);
+                    if let Some((_, Some(removed))) = ctx.remove(next - keep) {
+                        let_go(vec![removed]);
+                    }
+                    for _ in 0..spin {
+                        std::hint::spin_loop();
+                    }
+                }
+            }));
+        }
+        let rng = |mut seed: u64| {
+            move |n: u64| {
+                seed ^= seed << 13;
+                seed ^= seed >> 7;
+                seed ^= seed << 17;
+                seed % n
+            }
+        };
+        // A command buffer: a view, its names looked up `again` + 1 times, the view dropped.
+        let walk = move |ctx: &Arc<Context<FakePlatform>>,
+                         latest: u64,
+                         next: &mut dyn FnMut(u64) -> u64| {
+            let ids: Vec<u64> = (0..named)
+                .map(|i| {
+                    if i < fresh {
+                        latest - i
+                    } else {
+                        0x1000 + next(live)
+                    }
+                })
+                .collect();
+            let view = View::take(Arc::clone(ctx));
+            if at_once {
+                view.find_all(ids.iter().copied());
+            }
+            for _ in 0..=again {
+                for &id in &ids {
+                    std::hint::black_box(view.get(std::hint::black_box(id)));
+                }
+            }
+            drop(view);
+        };
+        for lane in 0..lanes {
+            let (ctx, latest, stop) = (Arc::clone(&ctx), Arc::clone(&latest), Arc::clone(&stop));
+            threads.push(std::thread::spawn(move || {
+                let mut next = rng(0x2545_f491_4f6c_dd1d ^ (lane + 1));
+                while !stop.load(Ordering::Relaxed) {
+                    walk(&ctx, latest.load(Ordering::Acquire), &mut next);
+                }
+            }));
+        }
+        let mut next = rng(0x9e37_79b9_7f4a_7c15);
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        for _ in 0..9 {
+            let before = counts();
+            for _ in 0..cbs {
+                walk(&ctx, latest.load(Ordering::Acquire), &mut next);
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / cbs as f64);
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        for t in threads {
+            t.join().unwrap();
+        }
+        eprintln!(
+            "{cbs} views over {live} objects, each naming {named} objects ({fresh} of ring 0's \
+             latest) {} times{}, ring 0 making and removing every {spin} spins, {lanes} more \
+             lanes: user-space instructions and cycles a command buffer, then a first lookup \
+             (median, lowest, highest of 9)",
+            again + 1,
+            if at_once { ", found at once" } else { "" }
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            eprintln!(
+                "  {name:<12} {median:9.0} ({low:.0} to {high:.0}) a command buffer, {:7.1} a \
+                 first lookup",
+                median / named as f64
+            );
+        }
+    }
+
+    /// Through random makes, makes over an id again, removes and a close's removal of every
+    /// entry, with views open over some of them, whether an entry lies in a range answers what a
+    /// look at every live entry's span answers: spans of blocks apart, of one block shared by the
+    /// objects placed in it, of no bytes, and ranges of no bytes, over, across and beside them; and the index of spans holds the live entries' spans, recounted from them at each step
+    #[test]
+    fn span_in_answers_as_a_look_at_every_live_entry() {
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let mut seed: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = move |n: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % n
+        };
+        let every = |ctx: &Context<FakePlatform>, offset: u64, size: u64| {
+            let end = offset.saturating_add(size);
+            let mut any = false;
+            ctx.for_each_live(|_, e| {
+                any |= e
+                    .span
+                    .is_some_and(|(at, length)| at < end && offset < at.saturating_add(length));
+            });
+            any
+        };
+        let mut views = Vec::new();
+        for round in 0..3000 {
+            let id = next(64);
+            match next(8) {
+                0..=3 => {
+                    let span = match next(4) {
+                        0 => None,
+                        1 => Some((0x1_0000 + next(32) * 0x1000, 0)),
+                        _ => Some((0x1_0000 + next(32) * 0x1000, (1 + next(4)) * 0x1000)),
+                    };
+                    let (_, replaced) = ctx.insert(id, Entry::of(fence(&p)).over(span), None);
+                    let_go(replaced.into_iter().collect());
+                }
+                4 | 5 => {
+                    if let Some((_, Some(removed))) = ctx.remove(id) {
+                        let_go(vec![removed]);
+                    }
+                }
+                6 => match views.len() {
+                    0..4 => views.push(View::take(Arc::clone(&ctx))),
+                    _ => views.clear(),
+                },
+                _ if round % 500 == 0 => let_go(ctx.remove_all().0),
+                _ => {}
+            }
+            // The index holds the live entries' spans, each counted as many times as entries lie
+            // over it.
+            let mut counted: BTreeMap<(u64, u64), usize> = BTreeMap::new();
+            ctx.for_each_live(|_, e| {
+                if let Some(span) = e.span {
+                    *counted.entry(span).or_default() += 1;
+                }
+            });
+            assert_eq!(ctx.tables.read().spans, counted, "the index of spans");
+            for _ in 0..4 {
+                let (offset, size) = (0xf000 + next(40) * 0x800, next(4) * 0x800);
+                assert_eq!(
+                    ctx.span_in(offset, size),
+                    every(&ctx, offset, size),
+                    "{offset:#x}+{size:#x}"
+                );
+            }
+        }
+    }
+
+    /// What a block's release's check that no object lies in it costs ([`Context::span_in`];
+    /// a measurement, not a check; run it by name with `--run-ignored only --no-capture` in a
+    /// release build): Particle Physics' 106 releases spent 2.31 us a dispatch there on gbp-iris,
+    /// about 0.5 ms each. A table of `TABLES_COST_LIVE` objects (default 8,192), each over a
+    /// block of its own of 64 KiB, one in four over the block of the object before (a buffer
+    /// placed in a heap), and 2,000 checks of blocks among them and past them. Prints the
+    /// thread's user-space instructions and cycles a check, the median of 9 runs.
+    #[test]
+    #[ignore = "a measurement: run it by name"]
+    fn a_block_release_s_check_costs() {
+        use crate::graphics::decode::draw_cost::{counts, spread};
+        let live: u64 = std::env::var("TABLES_COST_LIVE")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(8192);
+        let p = FakePlatform::new();
+        let ctx = Arc::new(Context::<FakePlatform>::new(1));
+        let block = |i: u64| (0x10_0000 + i * 0x1_0000, 0x1_0000);
+        let mut at = 0;
+        for id in 0..live {
+            if id % 4 != 3 {
+                at += 1;
+            }
+            ctx.insert(id, Entry::of(fence(&p)).over(Some(block(at))), None);
+        }
+        let checks: Vec<(u64, u64)> = (0..2000u64)
+            .map(|i| block((i * 7919) % (at + at / 8)))
+            .collect();
+        let mut figures: [Vec<f64>; 2] = Default::default();
+        let mut held = 0;
+        for _ in 0..9 {
+            let before = counts();
+            for &(offset, size) in &checks {
+                held += usize::from(ctx.span_in(std::hint::black_box(offset), size));
+            }
+            let spent = counts() - before;
+            for (f, figure) in figures.iter_mut().enumerate() {
+                figure.push(spent.0[f + 1] as f64 / checks.len() as f64);
+            }
+        }
+        assert!(held > 0);
+        eprintln!(
+            "span_in over {live} objects: user-space instructions and cycles a check (median, \
+             lowest, highest of 9)"
+        );
+        for (figure, name) in figures.iter_mut().zip(["instructions", "cycles"]) {
+            let [median, low, high] = spread(figure);
+            eprintln!("  {name:<12} {median:9.0} ({low:.0} to {high:.0})");
+        }
     }
 
     /// An entry removed with no view open is handed back at once, and a view taken after a

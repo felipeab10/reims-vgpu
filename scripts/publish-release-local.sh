@@ -18,8 +18,9 @@
 # cria o Release, então um outro processo publicando a mesma tag dá colisão.
 #
 # O `release.sh` faz o mesmo trabalho de forma completa: calcula a versão a
-# partir dos commits (gitmoji), empacota no layout que o QEMU reconhece
-# (bin/ + share/qemu/ReimsVgpu.rom), cria a tag anotada, empurra e publica.
+# partir dos commits (gitmoji), empacota no layout que o appliance reconhece
+# (bin/ + vendor/qemu/build/bin/ + firmware/prebuilt/ReimsGraphics.rom), cria a
+# tag anotada, empurra e publica.
 #
 # Este arquivo fica apenas como aviso e encaminhador para quem usar o nome antigo.
 set -euo pipefail

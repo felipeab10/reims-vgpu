@@ -1,0 +1,111 @@
+{
+  "libraries": [
+    {
+      "id": "com.apple.iokit.IOGraphicsFamily"
+    },
+    {
+      "id": "com.apple.iokit.IOMobileGraphicsFamily"
+    },
+    {
+      "id": "com.apple.iokit.IOAVFamily",
+      "anchor": "IOAVVideoTimingElement"
+    }
+  ],
+  "classes": [
+    {
+      "name": "IOMobileFramebufferLegacy",
+      "header": "graft/IOMobileFramebufferLegacy.h",
+      "library": 1
+    },
+    {
+      "name": "IOAccelerator",
+      "header": "IOKit/graphics/IOAccelerator.h",
+      "library": 0,
+      "required": [
+        "__ZNK8OSObject14getRetainCountEv",
+        "__ZNK8OSObject6retainEv",
+        "__ZNK8OSObject7releaseEv",
+        "__ZNK8OSObject9serializeEP11OSSerialize",
+        "__ZN9IOService4freeEv",
+        "__ZN15IORegistryEntry11setPropertyEPKcP8OSObject",
+        "__ZN15IORegistryEntry11setPropertyEPKcS1_",
+        "__ZN15IORegistryEntry11setPropertyEPKcyj",
+        "__ZNK15IORegistryEntry11getPropertyEPKc",
+        "__ZNK15IORegistryEntry12copyPropertyEPKc",
+        "__ZNK15IORegistryEntry7getNameEPK15IORegistryPlane",
+        "__ZN15IORegistryEntry7setNameEPKcPK15IORegistryPlane",
+        "__ZNK15IORegistryEntry7getPathEPcPiPK15IORegistryPlane",
+        "__ZN9IOService15registerServiceEj",
+        "__ZN9IOService9terminateEj",
+        "__ZN9IOService6attachEPS_",
+        "__ZN9IOService6detachEPS_",
+        "__ZNK9IOService17getClientIteratorEv",
+        "__ZN9IOService16getInterruptTypeEiPi"
+      ]
+    }
+  ],
+  "consumers": [
+    {
+      "name": "RgfxAccelerator",
+      "header": "RgfxAccelerator.hpp",
+      "parent": 1
+    }
+  ],
+  "synthesized": [
+    {
+      "name": "ReimsGraphics",
+      "header": "ReimsGraphics.hpp",
+      "parent": 0,
+      "sibling": "AppleParavirtDisplay",
+      "overrides": {
+        "set_notify_tag_mask_gated": { "required": true },
+        "supported_frame_info": {
+          "required": true,
+          "selectors": ["__ZN13ReimsGraphics20supported_frame_infoEjPjPA64_c"]
+        },
+        "factory_portal": { "required": true },
+        "executeFactoryConfigurations_gated": { "required": true },
+        "set_frame_info_notification_state_gated": { "required": true },
+        "do_swap_info_notify_gated": { "required": true },
+        "notify_swap_done_gated": { "required": true },
+        "notify_crc_ready_gated": { "required": true },
+        "are_timings_enabled": { "required": true },
+        "start": {},
+        "stop": {},
+        "free": {},
+        "start_hardware": {},
+        "stop_hardware_gated": {},
+        "swap_begin_gated": {},
+        "verify_swap": {},
+        "swap_layer_map": {},
+        "surface_layer_map": {},
+        "surface_layer_unmap": {},
+        "get_dot_pitch": { "required": true },
+        "set_digital_out_mode": { "required": true },
+        "swap_set_color_matrix": { "required": true },
+        "set_parameter": { "required": true }
+      }
+    }
+  ],
+  "imports": {
+    "__ZN22IOAVVideoTimingElement8withDataEPK19IOAVVideoTimingData16IOAVStandardType23IOAVVideoTimingStandard": {
+      "library": 2
+    },
+    "__ZN21IOAVVideoColorElement16withCapabilitiesE16IOAVStandardTypej22IOAVVideoPixelEncoding26IOAVVideoColorDynamicRange18IOAVVideoColorEOTF20IOAVVideoColorimetrybPK12OSDictionaryS7_S7_PK5OSSet": {
+      "library": 2
+    },
+    "__ZN22IOAVVideoTimingElement16setColorElementsEP7OSArray": {
+      "library": 2
+    },
+    "__ZN29IOMobileFramebufferUserClient26enqueueInIOSharedDataQueueEPyj": {
+      "library": 1
+    },
+    "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb": {
+      "library": 1,
+      "candidates": [
+        "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEb",
+        "__ZN25IOMobileFramebufferLegacy22dropAbortedSwaps_gatedEv"
+      ]
+    }
+  }
+}

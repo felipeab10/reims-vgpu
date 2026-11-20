@@ -5,7 +5,7 @@
  * the host decoder it mirrors is crates/reims-vgpu/src/graphics/decode.rs).
  *
  * This is the first serialiser slice: the object lifecycle whose wire structs are
- * fixed in crates/reims-graphics/src/wire.rs (reims_graphics_wire.h) — command
+ * fixed in crates/reims-vgpu-graphics/src/wire.rs (reims_graphics_wire.h) — command
  * queue, heap, buffer, texture, sampler, depth/stencil, library, event, shared
  * event, fence, and OBJECT_DESTROY. The guest picks each ObjId, GPU address and
  * resource id (RgfxIdSpace); the host pins them. Lifecycle messages go on the
@@ -41,6 +41,21 @@
 
 class RgfxIcbSlotTable;
 
+/// The MTLResourceOptions bits a heap or buffer create carries to the host: the CPU cache mode
+/// (bits 0-3), the storage mode (4-7), the hazard tracking mode (8-9), and Metal's private bit 24,
+/// which the host takes as Metal does. Any other bit is a hint from the caller to the device's
+/// driver, which the bundle is, and the bundle takes none; the host's runtime refuses a buffer
+/// with a bit Metal gives no meaning (measured, macOS 26.6.1 on an RTX 5080 host: the GL
+/// renderer's no-copy buffers, made with bit 20, 0x100000, by GLDBufferRec::load). A buffer
+/// answers its three modes alone, as the x86 Macs' do (RgfxBuffer's resourceOptions).
+constexpr uint32_t kRgfxHostResourceOptions = 0xfu | (0xfu << 4) | (0x3u << 8) | (1u << 24);
+
+/// `options` as a create carries them to the host: the bits kRgfxHostResourceOptions names.
+constexpr uint32_t RgfxHostResourceOptions(uint32_t options)
+{
+	return options & kRgfxHostResourceOptions;
+}
+
 /// A sampler's state, as MTLSamplerDescriptor gives it. The LOD clamps are
 /// floats here; the serialiser stores their bits on the wire (so it stays
 /// all-integer), as RgfxSamplerCreate asks.
@@ -57,7 +72,20 @@ struct RgfxSamplerParams {
 	float lod_min_clamp;
 	float lod_max_clamp;
 	uint32_t flags; // bit 0 normalized coords, bit 1 LOD average, bit 2 argument-buffer usable
+	uint32_t reduction_mode; // MTLSamplerReductionMode, SAMPLER_CREATE's extension
+	float lod_bias;          // lodBias, SAMPLER_CREATE's extension
 };
+
+/// SAMPLER_CREATE as the serialiser sends it: the create and its extension
+/// (RGFX_SAMPLER_CREATE_EXT_OFFSET), the reduction mode and the LOD bias.
+struct RgfxSamplerCreateWhole {
+	RgfxSamplerCreate create;
+	RgfxSamplerCreateExt ext;
+};
+static_assert(offsetof(RgfxSamplerCreateWhole, ext) == RGFX_SAMPLER_CREATE_EXT_OFFSET &&
+                  sizeof(RgfxSamplerCreateWhole) ==
+                      RGFX_SAMPLER_CREATE_EXT_OFFSET + sizeof(RgfxSamplerCreateExt),
+              "SAMPLER_CREATE and its extension");
 
 /// A function reference a pipeline draws from: the library it lives in, its
 /// entry-point name, and the function constants that specialise it (`constants`
@@ -80,6 +108,13 @@ struct RgfxLinkedFunctionRef {
 	uint32_t options;
 	const char *group;
 	const char *specialized_name;
+};
+
+/// One dynamic library a compute pipeline's kernel links (RgfxPipelineLibrary): dynamic library
+/// `library`, preloaded where `install_name` is null, else the library that install name loads.
+struct RgfxPipelineLibraryRef {
+	RgfxObjId library;
+	const char *install_name;
 };
 
 /// A render pipeline's descriptor, as MTLRenderPipelineDescriptor gives it, in
@@ -107,6 +142,9 @@ struct RgfxRenderPipelineParams {
 	uint32_t vertex_linked_count;
 	const RgfxLinkedFunctionRef *fragment_linked;
 	uint32_t fragment_linked_count;
+	/// The descriptor's private state, sent after the head with RGFX_RENDER_PIPELINE_PRIVATE_STATE;
+	/// null for none.
+	const RgfxRenderPipelinePrivateState *private_state;
 };
 
 /// A mesh render pipeline's descriptor, as MTLMeshRenderPipelineDescriptor gives it, in plain
@@ -143,7 +181,8 @@ struct RgfxMeshRenderPipelineParams {
 /// A compute pipeline's descriptor in plain fields the serialiser packs into
 /// RgfxComputePipelineCreate. The stage-input descriptor's `layouts` and
 /// `attributes` (their step functions MTLStepFunction, their formats
-/// MTLAttributeFormat) and the linked functions may be null when their counts are 0.
+/// MTLAttributeFormat), the linked functions and the dynamic libraries may be null when their
+/// counts are 0.
 struct RgfxComputePipelineParams {
 	RgfxFunctionRef function;
 	uint32_t flags; // RGFX_COMPUTE_PIPELINE_*
@@ -157,6 +196,8 @@ struct RgfxComputePipelineParams {
 	uint32_t stage_input_index_buffer_index;
 	const RgfxLinkedFunctionRef *linked;
 	uint32_t linked_count;
+	const RgfxPipelineLibraryRef *libraries; // where the host makes dynamic libraries alone
+	uint32_t library_count;
 };
 
 /// What a create did. `obj_id`, `gpu_address` and `resource_id` are the values
@@ -195,6 +236,23 @@ struct RgfxCreated {
 	uint64_t seqno;
 	bool posted;
 	uint32_t status;
+};
+
+/// A rasterization rate map's descriptor (MTLRasterizationRateMapDescriptor) as RATE_MAP_CREATE
+/// and RATE_MAP_RESET carry it: its screen size, its private mutability where set, and its layers
+/// from index 0, each its sample counts and its samples, horizontal then vertical.
+struct RgfxRateMapShape {
+	struct Layer {
+		uint32_t horizontal_count = 0;
+		uint32_t vertical_count = 0;
+		std::vector<float> samples; // horizontal_count horizontal ones, then the vertical ones
+	};
+	uint64_t screen_width = 0;
+	uint64_t screen_height = 0;
+	uint64_t screen_depth = 0;
+	bool mutability_set = false;
+	uint32_t mutability = 0;
+	std::vector<Layer> layers;
 };
 
 /// A pipeline create's post against the process's known pipelines (RgfxKnownPipelines): where
@@ -264,6 +322,38 @@ public:
 	void setEventSharer(EventShareFn share, EventTakeFn take, void *context);
 	/// Whether events cross processes here: a sharer is set.
 	bool sharesEvents() const { return m_eventShare != nullptr; }
+	/// Whether render pipeline creates carry their descriptors' private state: the host took
+	/// RGFX_FEATURE_PRIVATE_RENDER_STATE. Set once, before the first create; off by default.
+	void setCarriesPrivateRenderState(bool carries) { m_privateRenderState = carries; }
+	bool carriesPrivateRenderState() const { return m_privateRenderState; }
+	/// Whether a texture's didModifyData reaches the host (textureDidModifyData): the host took
+	/// RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA. Set once, before the first texture; off by default.
+	void setCarriesTextureDidModifyData(bool carries) { m_textureDidModifyData = carries; }
+	bool carriesTextureDidModifyData() const { return m_textureDidModifyData; }
+	/// Whether the host makes rasterization rate maps (createRateMap, resetRateMap and
+	/// queryRateMap): it took RGFX_FEATURE_RATE_MAPS. Set once, before the first map; off by
+	/// default.
+	void setCarriesRateMaps(bool carries) { m_rateMaps = carries; }
+	bool carriesRateMaps() const { return m_rateMaps; }
+	/// Whether render and compute pipeline creates ask for their pipeline keys
+	/// (RGFX_*_PIPELINE_ANSWER_KEY) and are posted against the answers the kext keeps for every
+	/// process (RgfxRingWriter::tryPostShared): the host took RGFX_FEATURE_PIPELINE_KEYS and the
+	/// route shares answers. Set once, before the first create; off by default.
+	void setSharesPipelines(bool shares) { m_sharesPipelines = shares; }
+	bool sharesPipelines() const { return m_sharesPipelines; }
+	/// Keeps library `obj_id`'s content key (32 bytes, RgfxLibraryKey.hpp), which the keys of the
+	/// pipelines made of it name (rgfxSharedPipelineKey), until its destroy.
+	void setLibraryKey(RgfxObjId obj_id, const uint8_t *key);
+	/// Whether the host makes a compute pipeline's function handles and visible function tables
+	/// (createFunctionHandle, createFunctionTable and setFunctionTable): it took
+	/// RGFX_FEATURE_FUNCTION_POINTERS. Set once, before the first pipeline; off by default.
+	void setCarriesFunctionPointers(bool carries) { m_functionPointers = carries; }
+	bool carriesFunctionPointers() const { return m_functionPointers; }
+	/// Whether the host makes dynamic libraries (createDynamicLibrary) and links them into a
+	/// compute pipeline (RgfxComputePipelineParams::libraries): it took
+	/// RGFX_FEATURE_DYNAMIC_LIBRARIES. Set once, before the first library; off by default.
+	void setCarriesDynamicLibraries(bool carries) { m_dynamicLibraries = carries; }
+	bool carriesDynamicLibraries() const { return m_dynamicLibraries; }
 	/// Names shared event `event` for other processes: its port, 0 where none was given.
 	uint32_t shareEvent(RgfxObjId event);
 	/// The process's new shared event made of the one `port` names: its id in `obj_id` and the
@@ -342,7 +432,10 @@ public:
 	RgfxCreated createBufferOverPages(uint64_t length, uint32_t options, uint64_t block_offset,
 	                                  uint64_t block_size, uint64_t offset);
 
-	/// A buffer at `offset` in the heap `heap`.
+	/// A buffer at `offset` in the heap `heap`. No one waits for it: where the control ring
+	/// batches (RgfxRingWriter::postLater), it is held to go with the messages around it, before
+	/// anything posted after it and before any command buffer committed after it
+	/// (postHeldCreates), and `seqno` is 0.
 	RgfxCreated createBufferAtOffset(RgfxObjId heap, uint64_t offset, uint64_t length,
 	                                 uint32_t options);
 
@@ -355,14 +448,25 @@ public:
 
 	/// A Managed buffer of `length` bytes at a picked GPU address, its CPU copy the first `length`
 	/// bytes of the Shared buffer `cpu_buffer` over the process's memory (`MANAGED_BUFFER_CREATE`,
-	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS).
+	/// where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS). The pick holds `offset` bytes
+	/// more, and the buffer's address is the pick plus `offset`, as a no-copy buffer's over the
+	/// app's pages keeps its pointer's offset in its page (createBufferOverPages). The answer's
+	/// `gpu_address` is the address picked, given back through releaseAddress. No one waits for
+	/// it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length, uint32_t options,
-	                                uint64_t align = kDefaultAddressAlign);
+	                                uint64_t align = kDefaultAddressAlign, uint64_t offset = 0);
 
 	/// The process wrote `length` bytes at `location` of Managed buffer `buffer`'s CPU copy
-	/// (`didModifyRange:`): every command buffer committed after it sees them. False where the
-	/// message was not posted.
+	/// (`didModifyRange:`): every command buffer committed after it sees them. Held where the
+	/// control ring batches, as createBufferAtOffset's buffer is, so a commit posts it first.
+	/// False where the message was neither held nor posted.
 	bool bufferDidModifyRange(RgfxObjId buffer, uint64_t location, uint64_t length);
+
+	/// The process changed the bytes texture `texture` lies over (`didModifyData`, SPI): a
+	/// mipmapped texture over a buffer takes them again at its next use in a command buffer
+	/// committed after it. False where the message was not posted, and where the host does not
+	/// carry it (carriesTextureDidModifyData), which posts nothing.
+	bool textureDidModifyData(RgfxObjId texture);
 
 	// --- textures -------------------------------------------------------------
 
@@ -382,7 +486,8 @@ public:
 	/// A texture of shape `desc`. When `heap` is RGFX_OBJ_NONE the texture is
 	/// device-placed at a picked GPU address, whose range holds `span` bytes (its
 	/// allocatedSize), as a buffer's holds its length; otherwise it lies at
-	/// `heap_offset` in `heap`. A resource id is picked either way.
+	/// `heap_offset` in `heap`. A resource id is picked either way. No one waits for it: held
+	/// where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createTexture(const RgfxTextureDescriptor &desc, RgfxObjId heap = RGFX_OBJ_NONE,
 	                          uint64_t heap_offset = 0, uint64_t align = kDefaultAddressAlign,
 	                          uint64_t span = 1);
@@ -390,7 +495,8 @@ public:
 	/// A Managed texture of shape `desc` at a picked GPU address, whose CPU copy is the Shared
 	/// buffer `cpu_buffer` over a block, of blocks `bytes_per_block` bytes and `block_width` by
 	/// `block_height` texels (RgfxManagedLayout.hpp), `flags` RGFX_MANAGED_TEXTURE_LINEAR or 0,
-	/// the address's range `span` bytes (its allocatedSize). A resource id is picked.
+	/// the address's range `span` bytes (its allocatedSize). A resource id is picked. No one waits
+	/// for it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createManagedTexture(const RgfxTextureDescriptor &desc, RgfxObjId cpu_buffer,
 	                                 uint32_t bytes_per_block, uint32_t block_width,
 	                                 uint32_t block_height, uint32_t flags,
@@ -403,7 +509,8 @@ public:
 	                          const uint32_t origin[3], const uint32_t size[3]);
 
 	/// A view of a texture (RGFX_CMD_TEXTURE_VIEW): `view`'s parent, format, flags, type, levels,
-	/// slices and swizzle, with its id and resource id picked; `view`'s own are not read.
+	/// slices and swizzle, with its id and resource id picked; `view`'s own are not read. No one
+	/// waits for it: held where the control ring batches, as createBufferAtOffset's buffer is.
 	RgfxCreated createTextureView(const RgfxTextureView &view);
 
 	/// A texture of shape `desc` over the buffer `buffer` from `offset`, each row
@@ -437,6 +544,49 @@ public:
 	/// goes on the ring unanswered, with no resource id.
 	RgfxCreated createSampler(const RgfxSamplerParams &params);
 
+	/// A rasterization rate map of `shape` (RATE_MAP_CREATE), asked of the device, whose answer,
+	/// the map's state (RATE_MAP_STATE), lands in `*state`: `status` is its status, `posted`
+	/// false where no answer came back. No message goes where the host makes no maps
+	/// (carriesRateMaps), where no asker is set, or where the message is past what the kext takes
+	/// of a lifecycle message (half the control ring): `status` is then kRgfxNoAnswer.
+	RgfxCreated createRateMap(const RgfxRateMapShape &shape, RgfxRateMapState *state);
+
+	/// Compiles map `map` again from `shape` (RATE_MAP_RESET, `resetUsingDescriptor:`), its new
+	/// state in `*state`. The device's status, or kRgfxNoAnswer, as createRateMap.
+	uint32_t resetRateMap(RgfxObjId map, const RgfxRateMapShape &shape, RgfxRateMapState *state);
+
+	/// One of map `map`'s answers that takes an argument (RATE_MAP_QUERY, `query` an
+	/// RGFX_RATE_MAP_QUERY_*, `at` its layer or offset, `buffer` a copy's buffer, `x` and `y` a
+	/// coordinate), its values in `values`. The device's status, or kRgfxNoAnswer, as
+	/// createRateMap; `values` is zeroed where it is not RGFX_STATUS_OK.
+	uint32_t queryRateMap(RgfxObjId map, uint32_t query, uint64_t at, RgfxObjId buffer, float x,
+	                      float y, uint64_t values[3]);
+
+	/// The handle of `function` (FUNCTION_HANDLE_CREATE), one of the functions compute pipeline
+	/// `pipeline` links, asked of the device, whose answer (FUNCTION_POINTER_STATE) lands in
+	/// `*state`: `status` is its status (RGFX_STATUS_NOT_FOUND where the pipeline links no such
+	/// function, Metal's nil), `posted` false where no answer came back. No message goes where the
+	/// host makes no function pointers (carriesFunctionPointers), where no asker is set, or where
+	/// the message is past what the kext takes of a lifecycle message: `status` is then
+	/// kRgfxNoAnswer.
+	RgfxCreated createFunctionHandle(RgfxObjId pipeline, const RgfxLinkedFunctionRef &function,
+	                                 RgfxFunctionPointerState *state);
+
+	/// A visible function table of `count` entries of compute pipeline `pipeline`
+	/// (FUNCTION_TABLE_CREATE), asked as createFunctionHandle: the state holds the table's
+	/// gpuResourceID, allocatedSize and resourceOptions.
+	RgfxCreated createFunctionTable(RgfxObjId pipeline, uint64_t count,
+	                                RgfxFunctionPointerState *state);
+
+	/// Sets `count` of table `table`'s entries from `first` to the handles `handles` names (0 a
+	/// nil entry) through FUNCTION_TABLE_SET messages, which the device does not answer and
+	/// carries out before any command buffer the process posts after them: as many as the kext's
+	/// lifecycle messages take, each of a run of the entries. False where one did not go (the
+	/// entries of the runs after it are not set either), or where the host makes no function
+	/// pointers.
+	bool setFunctionTable(RgfxObjId table, uint64_t first, const RgfxObjId *handles,
+	                      uint64_t count);
+
 	/// A depth/stencil state.
 	RgfxCreated createDepthStencil(uint32_t depth_compare, bool depth_write_enabled,
 	                               const RgfxStencilDescriptor &front,
@@ -450,6 +600,12 @@ public:
 	/// to a multiple of 8) does not fit the ring; `status` is the device's answer.
 	RgfxCreated createLibrary(const void *bytes, uint64_t byte_length,
 	                          const uint8_t *key = nullptr);
+
+	/// A dynamic library of library `library` (DYNAMIC_LIBRARY_CREATE): `status` is the
+	/// device's answer (RGFX_STATUS_OK where it made it), `posted` false where the ring had no
+	/// room. No message goes where the host makes no dynamic libraries
+	/// (carriesDynamicLibraries): `status` is then kRgfxNoAnswer.
+	RgfxCreated createDynamicLibrary(RgfxObjId library);
 
 	/// A LIBRARY_LOOKUP of the library whose `slice_size` bytes have the content
 	/// key `key` (32 bytes), under a new id: `status` RGFX_STATUS_OK where the device
@@ -527,8 +683,8 @@ public:
 	/// message would pass the largest the control ring takes, when that message goes at once.
 	void icbRecord(RgfxObjId icb, uint16_t op, uint32_t index, const void *body, uint16_t size);
 
-	/// Posts every waiting write: the slots written since the last flush (ICB_SLOTS, their runs,
-	/// RgfxIcbSlotTable.hpp), then the records (ICB_WRITE, one message for each buffer's run of
+	/// Posts every waiting write: the slots written since the last flush (ICB_SLOTS and
+	/// ICB_SLOTS_IN_PAGES, their runs, RgfxIcbSlotTable.hpp), then the records (ICB_WRITE, one message for each buffer's run of
 	/// records), so the device carries them out before any command buffer the process posts after
 	/// this returns. One load where none waits.
 	RgfxIcbFlush flushIcbWrites();
@@ -571,12 +727,40 @@ public:
 	/// destroy waiting before them, and go out at the next destroy() or postWaitingDestroys(), so
 	/// nothing reuses what the object lay over until the host has dropped it. Returns whether
 	/// this destroy reached the ring now.
-	bool destroy(RgfxObjId obj_id, std::function<void()> after = {});
+	///
+	/// Where the route batches (RgfxRingWriter::batches), the destroy is held to go with others in
+	/// one call instead (RgfxRingWriter::postLater), unless `atOnce`, and `after` runs at once:
+	/// whatever reuses what it gives back, a create or a block's free, is posted after the held
+	/// destroys, so the host still drops the object first. A destroy the host orders other
+	/// contexts' messages by goes `atOnce`: a texture over an IOSurface, which a present of the
+	/// surface waits for (docs/graphics-kext/design.md, "Destroys and heap-placed buffers go
+	/// together").
+	bool destroy(RgfxObjId obj_id, std::function<void()> after = {}, bool atOnce = false);
 
 	/// Posts the destroys waiting (destroy()), in the order they were made, each one's `after`
 	/// run once it is on the ring, until one is refused again. One load where none waits.
 	/// Returns whether none waits now.
 	bool postWaitingDestroys();
+
+	/// Posts what the control ring holds to go together (RgfxRingWriter::postLater), as a command
+	/// buffer's commit does before the buffer goes on its ring, which the host reads after the
+	/// control ring's messages posted before it: whether nothing but destroys stays held, so no
+	/// create the buffer may name, nor a Managed buffer's range it may read. Destroys left held
+	/// wait for a later post, as refused ones do.
+	bool postHeldCreates();
+
+	/// The control ring's writer, where a command buffer's commit may hand its publish to the held
+	/// messages instead of posting them first (RgfxPublishVia): the route takes it
+	/// (RgfxRingWriter::publishesQueues) and nothing else goes between them, no encode into an
+	/// indirect command buffer nor a refused destroy waiting (flushIcbWrites,
+	/// postWaitingDestroys). Else null, and the commit posts them first (postHeldCreates).
+	RgfxRingWriter *publishVia() const
+	{
+		return m_control.publishesQueues() && !m_icbPending.load(std::memory_order_acquire) &&
+		               !m_destroysWaiting.load(std::memory_order_acquire)
+		           ? &m_control
+		           : nullptr;
+	}
 
 	/// The default alignment for a picked GPU address when the caller names none.
 	/// The caller passes a caps-derived alignment where Metal demands one; this
@@ -594,7 +778,21 @@ private:
 	void *m_askContext = nullptr;
 	EventShareFn m_eventShare = nullptr;
 	EventTakeFn m_eventTake = nullptr;
+	bool m_privateRenderState = false;
+	bool m_textureDidModifyData = false;
+	bool m_rateMaps = false;
+	bool m_functionPointers = false;
+	bool m_dynamicLibraries = false;
+	bool m_sharesPipelines = false;
 	void *m_eventContext = nullptr;
+
+	// Each keyed library's content key (setLibraryKey), by its id, under m_libraryKeysLock.
+	std::mutex m_libraryKeysLock;
+	std::unordered_map<RgfxObjId, RgfxLibraryContentKey> m_libraryKeys;
+	// Posts the pipeline create of `type`, the `size` bytes at `message`, into `out`: against
+	// `post`'s known pipelines, then the kext's answers of every process, where it can.
+	void postPipeline(uint32_t type, const uint8_t *message, uint32_t size, RgfxCreated &out,
+	                  RgfxPipelinePost *post);
 
 	// heapTextureSizeAndAlign's answers, by the shape's bytes, under m_sizesLock.
 	typedef std::array<uint8_t, sizeof(RgfxTextureDescriptor)> SizeKey;
@@ -621,6 +819,13 @@ private:
 	// Posts OBJECT_DESTROY of `obj_id`: whether it reached the ring.
 	bool postDestroy(RgfxObjId obj_id);
 
+	// Posts a message no one waits for that names no block (a create of one, a Managed buffer's
+	// modified range): where the route batches (RgfxRingWriter::postLater), held to go with the
+	// messages around it, before anything posted after it and before any command buffer
+	// committed after it (postHeldCreates), `*out_seqno` left as it is; else at once, as tryPost
+	// posts it. Whether it is held or posted.
+	bool postUnwaited(uint32_t type, const void *message, uint32_t size, uint64_t *out_seqno);
+
 	// The ICB records waiting for flushIcbWrites(), under m_icbLock: one ICB_WRITE message for
 	// each buffer's run of records, in the order the runs began. m_icbPending is set as a record
 	// is added, and cleared only once a flush has posted them all, so a flush that finds it
@@ -641,9 +846,14 @@ private:
 	uint32_t icbMessageCap() const;
 	// Posts `message` (under m_icbLock), adding to `*flush`.
 	void postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush);
-	// Posts `runs` as ICB_SLOTS, as few as the ring's cap allows (under m_icbLock), adding to
-	// `*flush` where given.
-	void postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush);
+	// Posts `runs` as messages of `type` (ICB_SLOTS of RgfxIcbSlotRun, ICB_SLOTS_IN_PAGES of
+	// RgfxIcbSlotPagesRun), as few as the ring's cap allows (under m_icbLock), adding to `*flush`
+	// where given.
+	template <typename Run>
+	void postIcbSlots(uint32_t type, const std::vector<Run> &runs, RgfxIcbFlush *flush);
+	// Posts the runs of both kinds (postIcbSlots), the region's first.
+	void postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs,
+	                  const std::vector<RgfxIcbSlotPagesRun> &pagesRuns, RgfxIcbFlush *flush);
 };
 
 #endif // RGFX_SERIALIZER_HPP_

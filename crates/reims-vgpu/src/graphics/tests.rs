@@ -1,17 +1,21 @@
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
-use reims_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
-use reims_graphics::wire::*;
-use reims_vgpu_core::platform::ObjId;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::types::CommandBufferStatus;
-use reims_vgpu_core::testkit::faults::Fault;
-use reims_vgpu_core::testkit::objects::CompleteOn;
-use reims_vgpu_core::testkit::{Arg, FakePlatform, HeldCall};
+use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+use reims_vgpu_graphics::wire::*;
+use reims_vgpu_vulkan::core::platform::ObjId;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::types::CommandBufferStatus;
+use reims_vgpu_vulkan::core::testkit::faults::Fault;
+use reims_vgpu_vulkan::core::testkit::impls::device::{FAKE_LINEAR_ROW_ALIGNMENT, FAKE_OWN_MEMORY};
+use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
+use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, HeldCall};
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::*;
+
+mod displays;
+mod full_ring;
 
 /// A graphics device on the testkit's platform, with no window, raising through `raised`.
 fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
@@ -22,10 +26,13 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
                 assert_eq!(vector, 0);
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap()
 }
@@ -37,12 +44,12 @@ fn headless(raised: &Arc<AtomicU32>) -> GraphicsDevice<FakePlatform> {
 fn a_headless_device_answers_its_guest() {
     let raised = Arc::new(AtomicU32::new(0));
     let device = headless(&raised);
-    assert_eq!(device.region_size(), reims_graphics::REGION_SIZE);
+    assert_eq!(device.region_size(), reims_vgpu_graphics::REGION_SIZE);
     assert!(!device.region_base().is_null());
     assert_eq!(device.mmio_read(RGFX_REG_MAGIC.into()), RGFX_MAGIC);
     assert_eq!(
         device.mmio_read(RGFX_REG_REGION_SIZE_LO.into()),
-        (reims_graphics::REGION_SIZE & 0xffff_ffff) as u32
+        (reims_vgpu_graphics::REGION_SIZE & 0xffff_ffff) as u32
     );
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     // SAFETY: the region is the device's, mapped while it lives, and the rings' fields are at
@@ -66,12 +73,7 @@ fn a_headless_device_answers_its_guest() {
         std::sync::atomic::AtomicU64::from_ptr(producer.cast()).store(16, Ordering::SeqCst);
     }
     device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
-    for _ in 0..2000 {
-        if raised.load(Ordering::SeqCst) > 0 {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(1));
-    }
+    eventually(|| raised.load(Ordering::SeqCst) > 0);
     assert_eq!(raised.load(Ordering::SeqCst), 1);
     // The answer: DISPLAYS, its one mode 1920 × 1080 at 60 Hz.
     // SAFETY: as above; the device published the answer before it raised.
@@ -88,6 +90,86 @@ fn a_headless_device_answers_its_guest() {
     assert_eq!(words, [1920, 1080, 60_000]);
 }
 
+/// The guest's ask for its displays on `device`'s control ring, with its completion armed: the
+/// device's control thread answers it and raises.
+fn ask_displays<P: ApiPlatform>(device: &GraphicsDevice<P>) {
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    // SAFETY: the region is the device's, mapped while it lives, and the rings' fields are at
+    // their offsets; nothing else writes the guest's side.
+    unsafe {
+        let base = device.region_base();
+        let ring = base.add(RGFX_CONTROL_SUBMIT_OFFSET as usize + 256);
+        let header = RgfxMsgHeader {
+            r#type: RGFX_CMD_GET_DISPLAYS,
+            size: 16,
+            seqno: 1,
+        };
+        std::ptr::copy_nonoverlapping(
+            std::ptr::from_ref(&header).cast::<u8>(),
+            ring,
+            size_of::<RgfxMsgHeader>(),
+        );
+        let armed = base.add(RGFX_CONTROL_COMPLETE_OFFSET as usize + 0xc0);
+        std::sync::atomic::AtomicU32::from_ptr(armed.cast()).store(1, Ordering::SeqCst);
+        let producer = base.add(RGFX_CONTROL_SUBMIT_OFFSET as usize);
+        std::sync::atomic::AtomicU64::from_ptr(producer.cast()).store(16, Ordering::SeqCst);
+    }
+    device.mmio_write(RGFX_REG_DOORBELL.into(), RGFX_CONTROL_RING_ID);
+}
+
+/// On the Vulkan platform, the let-go of the GPU device after the process's last graphics device
+/// ([`GraphicsDevice::let_go_of_gpu`], the C API's release) waits for a device callback blocked
+/// on a lock the releasing thread holds only its bound: the callback holds the device's control
+/// thread, and so its decoder and the GPU device, so the let-go names the ended decoder and lets
+/// go of nothing, and returns, never in a deadlock. Once the lock goes, the callback returns, the
+/// device's threads end, and the next let-go lets go of the GPU device. Each runs on a thread of
+/// its own, whose answer the test waits for at most 30 s, so a let-go that never returned fails
+/// the test at that wait
+#[test]
+fn on_vulkan_the_let_go_waits_for_a_callback_blocked_on_the_releasers_lock_only_its_bound() {
+    use std::sync::mpsc;
+    let let_go = |bound: Duration| {
+        let (answer, answered) = mpsc::channel();
+        let letting_go = std::thread::Builder::new().spawn(move || {
+            let _ = answer.send(GraphicsDevice::<crate::DefaultPlatform>::let_go_of_gpu(
+                bound,
+            ));
+        });
+        letting_go.unwrap();
+        answered.recv_timeout(Duration::from_secs(30))
+    };
+    let lock = Arc::new(Mutex::new(()));
+    let (entered, blocked) = mpsc::channel();
+    let in_callback = Arc::clone(&lock);
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: Some(Arc::new(move |_| {
+                let _ = entered.send(());
+                drop(in_callback.lock());
+            })),
+            ..GraphicsCallbacks::default()
+        },
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(crate::singleton::platform(), config).unwrap();
+    let held = lock.lock();
+    ask_displays(&device);
+    blocked.recv_timeout(Duration::from_secs(10)).unwrap();
+    drop(device);
+    let answer = let_go(Duration::from_millis(300)).expect("the let-go returned");
+    let held_up = answer.unwrap_err();
+    assert!(
+        held_up.contains("the decoder of 1 ended graphics devices"),
+        "{held_up}"
+    );
+    drop(held);
+    assert_eq!(let_go(Duration::from_secs(20)), Ok(Ok(true)));
+}
+
 /// The host screen's rate in thousandths of a hertz, rounded; 60 Hz for a rate that is none
 #[test]
 fn a_screen_s_rate_is_kept_in_millihertz() {
@@ -99,7 +181,15 @@ fn a_screen_s_rate_is_kept_in_millihertz() {
 
 /// A headless graphics device and the platform its decoder drives, raising through `raised`.
 fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
-    let platform = Arc::new(FakePlatform::new());
+    headless_over(raised, Arc::new(FakePlatform::new()))
+}
+
+/// A headless device on `platform`, as [`headless_on`] makes one, for a test that sets the
+/// platform's answers before the device takes them
+fn headless_over(
+    raised: &Arc<AtomicU32>,
+    platform: Arc<FakePlatform>,
+) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
     let raised = Arc::clone(raised);
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
@@ -107,10 +197,13 @@ fn headless_on(raised: &Arc<AtomicU32>) -> (GraphicsDevice<FakePlatform>, Arc<Fa
                 assert_eq!(vector, 0);
                 raised.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -145,23 +238,25 @@ fn the_device_reserves_the_guest_s_texture_ids_first() {
     assert_eq!(checks, RESERVATION_CHECKS);
 }
 
-/// On Metal, a texture the guest places at one of its ids and the plain textures the host makes
-/// never share an id, and one placed at the guest's last id, past the table a fresh device has,
-/// is made and lives (Metal's heap is not corrupted). Each test runs in a process of its own, so
-/// the device's ids start fresh
-#[cfg(target_os = "macos")]
+/// On the Vulkan platform, a texture the guest places at one of its ids and the plain textures the
+/// host makes never share an id, and one placed at the guest's last id, past the table a fresh
+/// device has, is made and lives. Each test runs in a process of its own, so the device's ids
+/// start fresh
 #[test]
-fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+fn on_vulkan_guest_texture_ids_are_kept_from_the_host_s() {
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     let gpu = platform.metal_device(None).unwrap();
@@ -202,6 +297,307 @@ fn on_metal_guest_texture_ids_are_kept_from_the_host_s() {
     for (t, id) in placed.iter().zip([1, 2, 65, last / 2, last - 1, last]) {
         assert_eq!(t.gpu_resource_id(), id);
     }
+}
+
+/// On the Vulkan platform, a command queue made on the device after it is made but before the
+/// graphics device's reservation, as the device's fold probe makes one where a GPU's imports of
+/// views need their pages' files and its fold verdict is not kept yet (a cold cache, a new driver
+/// or kernel), leaves every guest texture id to the guest: the platform was told the ids first and
+/// reserved them as the device was made, so no plain texture of the host's takes one. Without that
+/// reservation Metal, as the runtime imitates, hands the pool's first range out twice past the
+/// queue. Each test runs in a process of its own, so the device is made here
+#[test]
+fn on_vulkan_a_queue_before_the_graphics_device_takes_no_guest_texture_id() {
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    let platform = crate::singleton::platform();
+    platform.present_guest_texture_ids(guest_texture_ids());
+    let gpu = platform.metal_device(None).unwrap();
+    let queue = gpu.new_command_queue().expect("a command queue");
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks {
+            raise_interrupt: None,
+            ..GraphicsCallbacks::default()
+        },
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let plain_desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 4,
+        height: 4,
+        usage: 1,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let plain: Vec<_> = (0..256)
+        .map(|_| {
+            gpu.new_texture(OnFault::Return, &plain_desc)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let inside: Vec<u64> = plain
+        .iter()
+        .map(|t| t.gpu_resource_id())
+        .filter(|id| guest_texture_ids().contains(id))
+        .collect();
+    assert!(
+        inside.is_empty(),
+        "plain textures took the guest's ids {inside:?}"
+    );
+    drop(queue);
+}
+
+/// The variable that makes [`on_vulkan_a_cold_device_takes_no_guest_texture_id`]'s process the
+/// child, which runs in the new empty `HOME` its parent made, its user cache directory in it.
+const COLD_HOME_CHILD: &str = "RVG_COLD_HOME_CHILD";
+
+/// On the Vulkan platform, a graphics device whose GPU device is made cold leaves every guest
+/// texture id to the guest. Cold is a user's first boot, or the first after a GPU driver or kernel
+/// update: nothing the library or the runtime keeps in the user's cache directory, or a driver
+/// under `HOME`, is found, so each check and probe whose verdict is kept there runs as the device
+/// is made. One of them is the fold probe, where
+/// the GPU's imports of views need their pages' files (NVIDIA, ANV). Its command queue came before
+/// the graphics device's reservation, and the host's textures then took the guest's ids from 1
+/// (a user's RTX 3060). The child runs in a new empty `HOME` that holds its user cache directory
+/// (`reims_vgpu_vulkan::os::TESTS_CACHE_DIRECTORY`, as Windows' is not under `HOME`), its graphics
+/// device the process's first, and names what was kept there once the device was made (the fold
+/// probe's verdict where it ran); the parent prints that
+#[test]
+fn on_vulkan_a_cold_device_takes_no_guest_texture_id() {
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+    const LINE: &str = "COLD-DEVICE: ";
+    if std::env::var_os(COLD_HOME_CHILD).is_none() {
+        let home = std::env::temp_dir().join(format!("rvg-cold-home-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&home);
+        std::fs::create_dir_all(&home).unwrap();
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "graphics::tests::on_vulkan_a_cold_device_takes_no_guest_texture_id",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(COLD_HOME_CHILD, "1")
+            .env("HOME", &home)
+            .env(
+                reims_vgpu_vulkan::os::TESTS_CACHE_DIRECTORY,
+                home.join(".cache"),
+            )
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&home);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(out.status.success(), "{stdout}{stderr}");
+        // The child's line follows libtest's own `test NAME ... ` on its line.
+        let ran = stdout.lines().find_map(|l| l.find(LINE).map(|at| &l[at..]));
+        let Some(ran) = ran else {
+            panic!("the child ran no device: {stdout}{stderr}");
+        };
+        println!("{ran}");
+        return;
+    }
+    let home = std::path::PathBuf::from(std::env::var_os("HOME").expect("the child's HOME"));
+    assert!(
+        std::fs::read_dir(&home).unwrap().next().is_none(),
+        "the child's HOME {} is not empty",
+        home.display()
+    );
+    let platform = crate::singleton::platform();
+    let _device =
+        GraphicsDevice::with_platform(Arc::clone(&platform), GraphicsConfig::default()).unwrap();
+    let gpu = platform.metal_device(None).unwrap();
+    let plain_desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 80,
+        width: 4,
+        height: 4,
+        usage: 1,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let plain: Vec<_> = (0..256)
+        .map(|_| {
+            gpu.new_texture(OnFault::Return, &plain_desc)
+                .unwrap()
+                .unwrap()
+        })
+        .collect();
+    let inside: Vec<u64> = plain
+        .iter()
+        .map(|t| t.gpu_resource_id())
+        .filter(|id| guest_texture_ids().contains(id))
+        .collect();
+    assert!(
+        inside.is_empty(),
+        "plain textures took the guest's ids {inside:?}"
+    );
+    let checks = reims_vgpu_vulkan::platform::cache_directory()
+        .map(|dir| dir.join("device-checks"))
+        .and_then(|dir| std::fs::read_dir(dir).ok());
+    let mut kept: Vec<String> = (checks.into_iter().flatten().flatten())
+        .map(|entry| entry.file_name().to_string_lossy().into_owned())
+        .collect();
+    kept.sort();
+    println!(
+        "{LINE}{}: the device checks kept in the empty HOME: {kept:?}",
+        gpu.raw.properties().name
+    );
+}
+
+/// The variable naming the guest architecture of [`the_guest_s_class_decides_the_answers`]'s
+/// child, `x86_64` or `arm64`.
+const GUEST_CLASS_CHILD: &str = "RVG_GUEST_CLASS_CHILD";
+
+/// The guest's class decides the answers whatever the host GPU: on the Vulkan platform, a graphics
+/// device for an arm64 guest makes its GPU device present an Apple silicon Mac to the runtime, and
+/// one for an x86-64 guest a Mac with an Intel or AMD GPU (`GuestArch::mac_class`), on an Apple
+/// GPU (MoltenVK) as on any other. A new `Private` 64 by 64 `RGBA8Unorm` render target, blitted
+/// into a buffer before anything writes it, reads Metal's fixed pattern for the arm64 guest, opaque
+/// magenta in every texel, as an Apple M3 Max reads it; for the x86-64 guest it reads zero on every
+/// host GPU, as the Intel UHD 630 and the AMD Radeon Pro 5300M read zero: the runtime fills it with
+/// zeros, so it never shows the earlier bytes of its memory. The class is the
+/// process's, fixed at its first device, so each architecture runs in a child process of its own,
+/// in which the graphics device is the process's first
+#[test]
+fn on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu() {
+    the_guest_s_class_decides_the_answers();
+}
+
+/// [`on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu`]: in the child, the
+/// device and the texture of [`GUEST_CLASS_CHILD`]'s architecture; else a child for each.
+fn the_guest_s_class_decides_the_answers() {
+    use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+    use reims_vgpu_vulkan::core::platform::values::TextureDesc;
+
+    const SIDE: u64 = 64;
+    let Ok(arch) = std::env::var(GUEST_CLASS_CHILD) else {
+        for arch in ["x86_64", "arm64"] {
+            let out = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "graphics::tests::on_vulkan_the_guest_s_class_decides_the_answers_whatever_the_host_gpu",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env(GUEST_CLASS_CHILD, arch)
+                .output()
+                .unwrap();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(out.status.success(), "{arch}: {stdout}{stderr}");
+            // The child's line follows libtest's own `test NAME ... ` on its line.
+            let line = format!("GUEST-CLASS {arch}: ");
+            let ran = stdout
+                .lines()
+                .find_map(|l| l.find(&line).map(|at| &l[at..]));
+            let Some(ran) = ran else {
+                panic!("{arch}: the child ran no device: {stdout}{stderr}");
+            };
+            println!("{ran}");
+        }
+        return;
+    };
+    let guest = match arch.as_str() {
+        "x86_64" => GuestArch::X86_64,
+        "arm64" => GuestArch::Arm64,
+        other => panic!("{GUEST_CLASS_CHILD}={other}"),
+    };
+    let platform = crate::singleton::platform();
+    let config = GraphicsConfig {
+        guest_arch: guest,
+        ..GraphicsConfig::default()
+    };
+    let _device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let gpu = platform.metal_device(None).unwrap();
+    let properties = gpu.raw.properties();
+    let apple_gpu = metal2vulkan_runtime::MacClass::of_vendor(properties.vendor_id)
+        == metal2vulkan_runtime::MacClass::AppleSilicon;
+    assert_eq!(
+        properties.lossless_compression,
+        guest == GuestArch::Arm64,
+        "{guest:?} on {}",
+        properties.name
+    );
+    // RGBA8Unorm, RenderTarget | ShaderRead, Private.
+    let desc = platform.texture_descriptor(&TextureDesc {
+        pixel_format: 70,
+        width: SIDE,
+        height: SIDE,
+        usage: 5,
+        resource_options: Some(0x20),
+        ..TextureDesc::default()
+    });
+    let before = gpu.raw.work_counts();
+    let texture = gpu.new_texture(OnFault::Die, &desc).unwrap().unwrap();
+    let after = gpu.raw.work_counts();
+    let length = SIDE * SIDE * 4;
+    let out = gpu
+        .new_buffer_of_length(OnFault::Die, length, 0)
+        .unwrap()
+        .unwrap();
+    let queue = gpu.new_command_queue().unwrap();
+    let cb = queue.command_buffer(OnFault::Die).unwrap().unwrap();
+    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+    blit.encode(
+        OnFault::Die,
+        BlitCmd::CopyTextureToBuffer {
+            source_texture: &texture,
+            source_slice: 0,
+            source_level: 0,
+            source_origin: MtlOrigin::new(0, 0, 0),
+            source_size: MtlSize::new(SIDE, SIDE, 1),
+            destination_buffer: &out,
+            destination_offset: 0,
+            destination_bytes_per_row: SIDE * 4,
+            destination_bytes_per_image: length,
+        },
+    )
+    .unwrap();
+    blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    cb.commit(OnFault::Die).unwrap();
+    cb.wait_until_completed(OnFault::Die).unwrap();
+    assert_eq!(cb.error(), None);
+    // SAFETY: a Shared buffer of `length` bytes, read after the blit that wrote it completed.
+    let read = unsafe {
+        std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), length as usize).to_vec()
+    };
+    let zero_filled = after.private_textures_zero_filled - before.private_textures_zero_filled;
+    match guest {
+        GuestArch::Arm64 => {
+            assert!(
+                read.chunks(4).all(|t| t == [0xff, 0x00, 0xff, 0xff]),
+                "{guest:?} on {}: a new texture reads Metal's pattern: {:02x?}",
+                properties.name,
+                &read[..16]
+            );
+            assert_eq!(zero_filled, 0);
+        }
+        // Whatever the host GPU: a new Private texture never shows its memory's earlier bytes.
+        GuestArch::X86_64 => {
+            assert!(
+                read.iter().all(|&b| b == 0),
+                "{guest:?} on {}: a new texture reads zero: {:02x?}",
+                properties.name,
+                &read[..16]
+            );
+            assert_eq!(zero_filled, 1);
+        }
+    }
+    println!(
+        "GUEST-CLASS {arch}: {:?} on {}, Apple GPU {apple_gpu}",
+        guest.mac_class(),
+        properties.name
+    );
 }
 
 /// The control ring's data-ring size.
@@ -317,11 +713,25 @@ impl Guest {
         self.event()
     }
 
-    /// The next completion-ring event, waiting about 2 s; `None` where none came.
+    /// Whether no completion-ring event comes over `polls` polls a millisecond's sleep apart:
+    /// what a check that a message is not answered waits, a span of its own, as the device's
+    /// threads may take that long to post one.
+    fn quiet_for(&mut self, polls: u32) -> bool {
+        for _ in 0..polls {
+            if self.event_now().is_some() {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        self.event_now().is_none()
+    }
+
+    /// The next completion-ring event, waiting for it [`PATIENCE`] polls at most; `None` where
+    /// none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let at =
             |count: u64| RGFX_CONTROL_COMPLETE_OFFSET as usize + 256 + (count % RING_DATA) as usize;
-        for _ in 0..2000 {
+        for _ in 0..PATIENCE {
             // SAFETY: as the helpers above.
             let produced = unsafe { self.load_u64(RGFX_CONTROL_COMPLETE_OFFSET as usize) };
             if produced != self.consumed {
@@ -380,7 +790,7 @@ fn command_buffer(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 /// [`command_buffer`] with one op, `SUBMITTED`: a buffer that asks for its `CB_SUBMITTED`, as
 /// `commitAndWaitUntilSubmitted` commits it.
 fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
 
     let mut message = command_buffer(queue_obj_id, cb_obj_id);
     let submitted = RgfxOpHeader {
@@ -394,6 +804,31 @@ fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
     message
 }
 
+/// Whether the `COMMAND_BUFFER` `message` asks for its `CB_SUBMITTED`: its last op is the ask, as
+/// the bundle appends it.
+fn asks_submitted(message: &[u8]) -> bool {
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+
+    let Some(at) = message.len().checked_sub(size_of::<RgfxOpHeader>()) else {
+        return false;
+    };
+    message[0..4] == RGFX_CMD_COMMAND_BUFFER.to_le_bytes()
+        && message.len() > RGFX_COMMAND_BUFFER_OPS_OFFSET as usize
+        && RgfxOpHeader::read_from_bytes(&message[at..])
+            .is_ok_and(|h| h.tag == RGFX_OP_SUBMITTED && h.len == 8)
+}
+
+/// The device-info caps blob `device` wrote into its region at [`RGFX_DEVICE_INFO_OFFSET`].
+fn device_info_of(device: &GraphicsDevice<FakePlatform>) -> RgfxDeviceInfo {
+    // SAFETY: the region is the device's, mapped while it lives, and the blob lies in the
+    // completion ring span's unused tail the wire names.
+    let bytes = unsafe {
+        let p = device.region_base().add(RGFX_DEVICE_INFO_OFFSET as usize);
+        std::slice::from_raw_parts(p, size_of::<RgfxDeviceInfo>()).to_vec()
+    };
+    RgfxDeviceInfo::read_from_bytes(&bytes).unwrap()
+}
+
 /// The device-info caps blob is written into the region at [`RGFX_DEVICE_INFO_OFFSET`] at init,
 /// mirroring the GPU device's caps and features the guest bundle reads before it makes any queue;
 /// on the fake (an M3 Max's answers) it answers no Apple family and no iOS feature set, as an
@@ -402,13 +837,7 @@ fn asking(queue_obj_id: u64, cb_obj_id: u64) -> Vec<u8> {
 fn device_info_is_written_into_the_region_at_init() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
-    // SAFETY: the region is the device's, mapped while it lives, and the blob lies in the
-    // completion ring span's unused tail the wire names.
-    let bytes = unsafe {
-        let p = device.region_base().add(RGFX_DEVICE_INFO_OFFSET as usize);
-        std::slice::from_raw_parts(p, size_of::<RgfxDeviceInfo>()).to_vec()
-    };
-    let info = RgfxDeviceInfo::read_from_bytes(&bytes).unwrap();
+    let info = device_info_of(&device);
     let caps = platform.device().caps();
     assert_eq!(info.version, RGFX_DEVICE_INFO_VERSION);
     assert_eq!(
@@ -446,6 +875,75 @@ fn device_info_is_written_into_the_region_at_init() {
     assert_eq!(feature_set(10005), Some(1));
 }
 
+/// The guest's RAM the host maps reaches the blob: on the fake's GPU, which shares the CPU's
+/// memory, the working set is three quarters of it rounded down to 16 KiB and `maxBufferLength`
+/// three quarters of that, for an x86-64 and an arm64 guest alike; with no map, the platform's
+#[test]
+fn the_blob_answers_a_unified_gpu_s_working_set_from_the_guest_s_mapped_ram() {
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
+
+    let sizes = |guest_arch: GuestArch, mapped: bool| {
+        let platform = Arc::new(FakePlatform::new());
+        assert_eq!(
+            platform.device().identity_caps().flags.has_unified_memory,
+            Some(true)
+        );
+        let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
+        platform.fake_vm().adopt(&ram);
+        let mut map = crate::MemoryMap::new();
+        for r in ram.ranges() {
+            // SAFETY: the fake RAM stays mapped while the device, dropped before it, lives.
+            unsafe {
+                map.push(
+                    r.physical_address,
+                    r.physical().physical_length,
+                    r.host().as_ptr(),
+                );
+            }
+        }
+        let config = GraphicsConfig {
+            memory_map: mapped.then_some(map),
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(platform, config).unwrap();
+        let info = device_info_of(&device);
+        (
+            info.sizes[0],
+            info.sizes[reims_vgpu_graphics::wire::RGFX_DEVICE_INFO_MAX_BUFFER_LENGTH],
+        )
+    };
+    // 1 MiB of RAM: 786432 bytes, 48 pages of 16 KiB, and 589824, 36 of them.
+    for guest in [GuestArch::X86_64, GuestArch::Arm64] {
+        assert_eq!(sizes(guest, true), (786_432, 589_824), "{guest:?}");
+    }
+    let platform = sizes(GuestArch::X86_64, false);
+    assert_eq!(platform.0, FAKE_OWN_MEMORY);
+    assert_eq!(sizes(GuestArch::Arm64, false), platform);
+}
+
+/// The config's guest architecture reaches the blob: an x86-64 guest's device answers
+/// `isFramebufferReadSupported` no, an arm64 guest's the platform's yes (the fake's), and the
+/// families alike for both
+#[test]
+fn the_blob_answers_framebuffer_read_by_the_guest_s_architecture() {
+    let framebuffer_read = |guest_arch: GuestArch| {
+        let config = GraphicsConfig {
+            guest_arch,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let info = device_info_of(&device);
+        // is_framebuffer_read_supported, third of the flags.
+        (info.flags[2], info.family_answers)
+    };
+    let (x86, x86_families) = framebuffer_read(GuestArch::X86_64);
+    let (arm64, arm64_families) = framebuffer_read(GuestArch::Arm64);
+    assert_eq!(x86, 0);
+    assert_eq!(arm64, 1);
+    assert_eq!(x86_families, arm64_families);
+}
+
 /// An object-create message on ring 0 reaches the decoder: its handle is held
 #[test]
 fn an_object_create_reaches_the_decoder() {
@@ -455,14 +953,7 @@ fn an_object_create_reaches_the_decoder() {
     assert_eq!(device.decoder_object_count(), 0);
     let mut guest = Guest::new(&device);
     guest.send(&device, event_create(obj(1, 10)));
-    let mut grew = false;
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 1 {
-            grew = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let grew = eventually(|| device.decoder_object_count() == 1);
     assert!(grew, "the create never reached the decoder");
 }
 
@@ -633,13 +1124,10 @@ fn a_command_buffer_submission_completes_on_the_ring() {
     ring.send(&device, command_buffer(obj(context, 1), 100));
     // The host decodes and commits asynchronously; complete the committed buffer on the GPU once
     // it is there (a no-op before it is), until the handler posts onto the completion ring.
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let bytes = ring.event().expect("a CB_COMPLETE");
     let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
@@ -860,27 +1348,29 @@ impl QueueRing {
     }
 
     /// Publishes `command` (its `size` its length) on the submission ring and rings the queue's
-    /// doorbell through `mmio_write_taking`, as QEMU rings, only where the host marked the ring
-    /// idle, as the guest's writer does (`RgfxRingWriter`): whether it rang.
+    /// doorbell through `mmio_write_taking`, as QEMU rings, as the guest's writer does
+    /// (`RgfxRingWriter`): where the host marked the ring asleep, or walking and `command` asks
+    /// for its `CB_SUBMITTED` (its last op the ask). Whether it rang.
     fn send_as_guest(&mut self, device: &GraphicsDevice<FakePlatform>, command: Vec<u8>) -> bool {
+        let asks = asks_submitted(&command);
         self.publish(command);
-        let idle = self.marked_idle();
-        if idle {
+        let idle = self.consumer_idle();
+        let rings = idle == RGFX_CONSUMER_ASLEEP || (idle == RGFX_CONSUMER_WALKING && asks);
+        if rings {
             device.mmio_write_taking(RGFX_REG_DOORBELL.into(), self.submit_off as u32);
         }
-        idle
+        rings
     }
 
-    /// Whether the host marked the submission ring idle (`consumer_idle` 1), so the guest's
-    /// writer rings the doorbell for what it has just published.
-    fn marked_idle(&self) -> bool {
+    /// The submission ring's `consumer_idle`, which the guest's writer reads for what it has
+    /// just published.
+    fn consumer_idle(&self) -> u32 {
         // SAFETY: as the helpers above; `consumer_idle` is at 0x80 of the submission ring header,
         // read after the publish's store, as the writer reads it after a full fence.
-        let idle = unsafe {
+        unsafe {
             AtomicU32::from_ptr(self.base.add(self.submit_off as usize + 0x80).cast())
                 .load(Ordering::SeqCst)
-        };
-        idle == 1
+        }
     }
 
     /// Publishes `command` (its `size` its length) on the submission ring, ringing no doorbell.
@@ -933,12 +1423,12 @@ impl QueueRing {
         false
     }
 
-    /// The next completion-ring event other than a `CB_SCHEDULED` (see `has_event`), waiting
-    /// about 2 s; `None` where none came.
+    /// The next completion-ring event other than a `CB_SCHEDULED` (see `has_event`), waiting for
+    /// it [`PATIENCE`] polls at most; `None` where none came.
     fn event(&mut self) -> Option<Vec<u8>> {
         let (complete_off, data) = (self.complete_off, self.data);
         let at = |count: u64| complete_off as usize + 256 + (count % data) as usize;
-        for _ in 0..2000 {
+        for _ in 0..PATIENCE {
             if self.has_event() {
                 // SAFETY: as the helpers above; `has_event` stopped at a published message.
                 let header = unsafe { self.read(at(self.consumed), 8) };
@@ -967,10 +1457,13 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(move |vector| vrec.lock().push(vector))),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1007,13 +1500,10 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 
     // The host decodes and commits asynchronously; complete the committed buffer on the GPU once it
     // is there until the handler posts onto the queue's completion ring.
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let bytes = ring.event().expect("a CB_COMPLETE on the queue ring");
     let done = RgfxCbComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(done.header.r#type, RGFX_EVT_CB_COMPLETE);
@@ -1027,15 +1517,79 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 
     // Destroying the queue ends its per-queue service, and its handle goes.
     guest.send(&device, object_destroy(queue));
-    let mut gone = false;
-    for _ in 0..2000 {
-        if device.graphics_queue_count() == 0 && device.decoder_object_count() == 0 {
-            gone = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let gone =
+        eventually(|| device.graphics_queue_count() == 0 && device.decoder_object_count() == 0);
     assert!(gone, "the queue's destroy never ended it");
+}
+
+/// A queue's command buffers are begun with the sinks made at its first, which post each one's
+/// records onto the queue's own ring, in its order, as sinks made for each would: no begin after
+/// the first makes them. They go with the queue's destroy.
+#[test]
+fn a_queue_s_buffers_share_the_sinks_its_first_was_begun_with() {
+    let platform = Arc::new(FakePlatform::new());
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE_OFF: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let (context, mut guest) = (3, Guest::new(&device));
+    let queue = obj(context, 1);
+    assert_eq!(
+        create_queue(
+            &device,
+            &mut guest,
+            context,
+            1,
+            (SUBMIT_OFF, COMPLETE_OFF),
+            RING_DATA,
+            1
+        ),
+        RGFX_STATUS_OK
+    );
+    let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
+    let completed = |ring: &mut QueueRing, cb: u64| {
+        ring.send(&device, command_buffer(queue, cb));
+        eventually(|| {
+            platform.world().complete_all(CompleteOn::Caller);
+            ring.has_event()
+        });
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!(
+            (done.header.r#type, done.cb_obj_id),
+            (RGFX_EVT_CB_COMPLETE, cb)
+        );
+        assert_eq!(done.status, RGFX_CB_OK);
+        done.header.seqno
+    };
+    let first = completed(&mut ring, 100);
+    let sinks = device.queue_completion_sinks();
+    assert_eq!(sinks.len(), 1);
+    assert_eq!(sinks[0].0, queue);
+    assert_ne!(sinks[0].1, 0, "the queue's sinks post its completions");
+    let second = completed(&mut ring, 101);
+    let third = completed(&mut ring, 102);
+    assert_eq!(
+        device.queue_completion_sinks(),
+        sinks,
+        "a later begin made sinks of its own"
+    );
+    // Each buffer's scheduled record came ahead of its completion, on the queue's ring.
+    assert_eq!(ring.scheduled, [(first, 100), (second, 101), (third, 102)]);
+
+    guest.send(&device, object_destroy(queue));
+    let gone = eventually(|| {
+        device.graphics_queue_count() == 0 && device.queue_completion_sinks().is_empty()
+    });
+    assert!(gone, "the queue's sinks outlived its destroy");
 }
 
 /// A command buffer too large for its queue's ring, whose whole message lies in a block of its
@@ -1044,16 +1598,19 @@ fn a_per_queue_ring_decodes_and_completes_a_command_buffer() {
 /// its message's length on the way, and it completes as one from the ring does.
 #[test]
 fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
-    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RgfxOpHeader};
 
     let platform = Arc::new(FakePlatform::new());
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1128,7 +1685,12 @@ fn an_out_of_line_command_buffer_is_carried_out_from_one_copy() {
 /// `mmio_write_taking`, is answered on the ringing thread: its `CB_SUBMITTED` is on its queue's
 /// completion ring, the queue's vector raised on that thread, before the write returns; its
 /// queue's thread takes, walks and commits it, and it completes as one that thread answered. One
-/// that does not ask is left to the queue's thread, and completes as before
+/// that does not ask is left to the queue's thread, and completes as before.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which `consumer_idle` does not show alone (`a_doorbell_s_answer_allocates_nothing`): a buffer
+/// the write left is answered by the queue's thread, in order, as any is, and the next is rung, up
+/// to 64.
 #[test]
 fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
     let raised = Arc::new(super::Mutex::new(Vec::<(u32, Option<String>)>::new()));
@@ -1140,10 +1702,13 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
                 let name = std::thread::current().name().map(str::to_owned);
                 record.lock().push((vector, name));
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1165,53 +1730,56 @@ fn a_doorbell_write_answers_a_command_buffer_on_its_thread() {
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
-    for _ in 0..2000 {
-        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    ring.arm();
-
-    ring.publish(asking(queue, 100));
-    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
-    assert!(
-        ring.has_event(),
-        "the CB_SUBMITTED is posted before the write returns"
-    );
-    let bytes = ring.event().unwrap();
-    let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
-    assert_eq!(
-        (posted.header.r#type, posted.cb_obj_id),
-        (RGFX_EVT_CB_SUBMITTED, 100)
-    );
-    let here = std::thread::current().name().map(str::to_owned);
-    assert_eq!(raised.lock().first(), Some(&(1, here)));
-
     let complete = |ring: &mut QueueRing| {
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap()
     };
-    let done = complete(&mut ring);
-    assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
+    let here = std::thread::current().name().map(str::to_owned);
+    let mut rung = Vec::new();
+    let mut answered = false;
+    for cb in 100..164 {
+        // The queue's thread sleeps with the ring idle, as the guest rings for a buffer.
+        wait_idle(&device, SUBMIT_OFF);
+        ring.arm();
+        ring.publish(asking(queue, cb));
+        let raises = raised.lock().len();
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+        // Answered in the write where the vector was raised on this thread, which runs nothing of
+        // the device's but the write: a `CB_SUBMITTED` there now may be the queue's thread's,
+        // posted as soon as the write that left the buffer woke it.
+        answered = raised.lock()[raises..].contains(&(1, here.clone()));
+        if answered {
+            assert!(
+                ring.has_event(),
+                "the CB_SUBMITTED is posted before the write returns"
+            );
+        }
+        // Posted before the write returned, or by the queue's thread where the write left it.
+        let bytes = ring.event().expect("a CB_SUBMITTED");
+        let posted = RgfxCbSubmitted::read_from_bytes(&bytes).unwrap();
+        assert_eq!(
+            (posted.header.r#type, posted.cb_obj_id),
+            (RGFX_EVT_CB_SUBMITTED, cb)
+        );
+        let done = complete(&mut ring);
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+        rung.push((0, cb));
+        if answered {
+            break;
+        }
+    }
+    assert!(answered, "no write of 64 answered its buffer");
 
-    ring.publish(command_buffer(queue, 101));
+    // One that does not ask, with an id the loop's buffers do not use.
+    ring.publish(command_buffer(queue, 164));
     device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
     let done = complete(&mut ring);
-    assert_eq!((done.cb_obj_id, done.status), (101, RGFX_CB_OK));
-    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+    assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
+    rung.push((0, 164));
+    assert_eq!(ring.scheduled, rung);
 }
 
 /// A doorbell write's answer neither allocates nor frees on the ringing thread, the guest's vCPU,
@@ -1238,10 +1806,13 @@ fn a_doorbell_s_answer_allocates_nothing() {
             raise_interrupt: Some(Arc::new(move |_| {
                 count.fetch_add(1, Ordering::SeqCst);
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1299,13 +1870,10 @@ fn a_doorbell_s_answer_allocates_nothing() {
             (posted.header.r#type, posted.cb_obj_id),
             (RGFX_EVT_CB_SUBMITTED, cb)
         );
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
     }
@@ -1322,13 +1890,10 @@ fn a_doorbell_s_answer_allocates_nothing() {
         (0, 0),
         "a write that only woke the queue's thread called the allocator (allocations, frees)"
     );
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
     let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (164, RGFX_CB_OK));
 }
@@ -1359,10 +1924,13 @@ fn a_landed_download_s_answer_at_its_doorbell_allocates_nothing() {
                     count.fetch_add(1, Ordering::SeqCst);
                 }
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1437,10 +2005,13 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(Arc::new(|_| {})),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -1475,13 +2046,10 @@ fn a_lone_buffer_s_doorbell_to_its_cb_submitted() {
         );
     };
     let finish = |ring: &mut QueueRing, cb: u64| {
-        for _ in 0..3000 {
+        eventually(|| {
             platform.world().complete_all(CompleteOn::Caller);
-            if ring.has_event() {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+            ring.has_event()
+        });
         let done = RgfxCbComplete::read_from_bytes(&ring.event().expect("a CB_COMPLETE")).unwrap();
         assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
         ring.scheduled.clear();
@@ -1599,7 +2167,11 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
         let start = Instant::now();
         if plain {
             device.mmio_write(RGFX_REG_DOORBELL.into(), submit_off as u32);
-        } else if ring.marked_idle() {
+        } else if matches!(
+            ring.consumer_idle(),
+            RGFX_CONSUMER_ASLEEP | RGFX_CONSUMER_WALKING
+        ) {
+            // The guest rings for an asking buffer where the ring is asleep or walking.
             taking();
         }
         let in_write = !plain && ring.has_event();
@@ -1669,7 +2241,7 @@ fn an_asking_buffer_s_doorbell_to_its_cb_submitted_behind_a_walk() {
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_lone_buffer_s_doorbell_to_its_cb_scheduled() {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
     use std::time::Instant;
 
     const ROUNDS: usize = 2000;
@@ -1760,22 +2332,22 @@ fn a_lone_buffer_s_doorbell_to_its_cb_scheduled() {
     );
 }
 
-/// Waits about 2 s at most for the service thread of the queue whose submission ring is at region
+/// Waits, [`PATIENCE`] polls at most, for the service thread of the queue whose submission ring is at region
 /// offset `submit_off` to sleep with its ring idle (its `consumer_idle` 1), as the guest finds it
 /// when it rings for a buffer.
 fn wait_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) {
-    for _ in 0..2000 {
-        // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80
-        // of the submission ring's header, which the host writes atomically.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(submit_off as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| ring_idle(device, submit_off));
+}
+
+/// Whether the queue's thread of the submission ring at `submit_off` sleeps with it idle.
+fn ring_idle(device: &GraphicsDevice<FakePlatform>, submit_off: u64) -> bool {
+    // SAFETY: the region is the device's, mapped while it lives; `consumer_idle` is at 0x80 of
+    // the submission ring's header, which the host writes atomically.
+    let idle = unsafe {
+        AtomicU32::from_ptr(device.region_base().add(submit_off as usize + 0x80).cast())
+            .load(Ordering::SeqCst)
+    };
+    idle == 1
 }
 
 /// The name of the thread each raise that called the device ran on, once its calls returned.
@@ -1811,10 +2383,13 @@ fn calling_back(ring: u64) -> (Arc<GraphicsDevice<FakePlatform>>, Returned) {
                 let name = std::thread::current().name().map(str::to_owned);
                 record.lock().push(name);
             })),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
     let device = Arc::new(device);
@@ -1849,28 +2424,17 @@ fn a_raise_may_call_the_device_at_once() {
         );
         assert_eq!(created, RGFX_STATUS_OK);
         let ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-        for _ in 0..2000 {
-            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-            let idle = unsafe {
-                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                    .load(Ordering::SeqCst)
-            };
-            if idle == 1 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        wait_idle(&device, SUBMIT_OFF);
         ring.arm();
         (device, returned, guest, ring)
     };
     let returned_on = |returned: &Returned| {
-        for _ in 0..3000 {
-            if let Some(name) = returned.lock().first() {
-                return name.clone();
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the raise's calls never returned");
+        let mut name = None;
+        eventually(|| {
+            name = returned.lock().first().cloned();
+            name.is_some()
+        });
+        name.expect("the raise's calls never returned")
     };
     let reset = |device: &GraphicsDevice<FakePlatform>| {
         assert_eq!(device.mmio_read(RGFX_REG_STATUS.into()), RGFX_STATUS_RESET);
@@ -1888,13 +2452,31 @@ fn a_raise_may_call_the_device_at_once() {
     );
     reset(&device);
 
-    // On the doorbell's thread, inside the write that takes the buffer.
-    let (device, returned, _guest, mut ring) = started();
-    ring.publish(asking(queue, 100));
-    device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+    // On the doorbell's thread, inside the write that takes the buffer. The write answers it only
+    // where no thread holds a lock it tries, which `wait_idle` does not show alone
+    // (`a_doorbell_s_answer_allocates_nothing`): where the write left it, the queue's thread
+    // raised, and a new device's buffer is rung, up to 64.
     let here = std::thread::current().name().map(str::to_owned);
-    assert_eq!(returned.lock().first(), Some(&here));
-    reset(&device);
+    let mut in_write = false;
+    for _ in 0..64 {
+        let (device, returned, _guest, mut ring) = started();
+        ring.publish(asking(queue, 100));
+        device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
+        in_write = returned.lock().first() == Some(&here);
+        if !in_write {
+            let on = returned_on(&returned);
+            assert!(
+                on.as_deref()
+                    .is_some_and(|name| name.starts_with("reims-vgpu.graphics-queue-")),
+                "raised on {on:?}"
+            );
+        }
+        reset(&device);
+        if in_write {
+            break;
+        }
+    }
+    assert!(in_write, "no write of 64 answered its buffer");
 
     // On the presents' lane (one of ring 0's threads), at a present of the scanout, which the host
     // shows and answers at once.
@@ -1918,19 +2500,30 @@ fn a_raise_may_call_the_device_at_once() {
     reset(&device);
 }
 
-/// The window shows the guest's cursor once it has an image and while the guest shows it,
-/// telling the window only of a change
+/// The window shows the guest's cursor once it has an image, while the guest shows it and the
+/// display's panel is on, telling the window only of a change
 #[test]
 fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     let window = Window::new(WindowConfig::default(), 0, "test".to_owned());
     let mut cursor = CursorState {
         image: false,
         visible: true,
+        asleep: false,
         shown: None,
     };
     cursor.update(&window);
     assert_eq!(cursor.shown, Some(false));
     cursor.image = true;
+    cursor.update(&window);
+    assert_eq!(cursor.shown, Some(true));
+    cursor.asleep = true;
+    cursor.update(&window);
+    assert_eq!(
+        cursor.shown,
+        Some(false),
+        "a cursor shows while the panel is off"
+    );
+    cursor.asleep = false;
     cursor.update(&window);
     assert_eq!(cursor.shown, Some(true));
     cursor.visible = false;
@@ -1939,29 +2532,318 @@ fn the_cursor_shows_with_an_image_while_the_guest_shows_it() {
     window.close();
 }
 
+/// What the host's cursor callbacks were told, in order.
+#[derive(Debug, PartialEq)]
+enum Told {
+    Glyph(u32, u32, (u16, u16), Vec<u8>),
+    Show(u8),
+    Move,
+}
+
+/// The host's cursor callbacks, recording what they are told and the threads they run on.
+fn telling(told: &Arc<Mutex<Vec<(Told, std::thread::ThreadId)>>>) -> GraphicsCallbacks {
+    let (glyph, show, moved) = (Arc::clone(told), Arc::clone(told), Arc::clone(told));
+    let here = || std::thread::current().id();
+    GraphicsCallbacks {
+        cursor_glyph: Some(Arc::new(move |g: &CursorGlyph<'_>| {
+            let told = Told::Glyph(g.width, g.height, g.hot_spot, g.rgba.to_vec());
+            glyph.lock().push((told, here()));
+        })),
+        cursor_show: Some(Arc::new(move |s| show.lock().push((Told::Show(s), here())))),
+        cursor_move: Some(Arc::new(move || moved.lock().push((Told::Move, here())))),
+        ..GraphicsCallbacks::default()
+    }
+}
+
+/// The guest's cursor reaches the host's callbacks off the threads that took it, in the order the
+/// device took its commands: the image as straight RGBA with its hot spot, that it shows once it
+/// has an image while the guest shows it and hides when the guest hides it, and each move, the
+/// hot spot's place kept to 0 to 65535; a reset puts it at (0, 0), still hidden with no image
+#[test]
+fn the_guest_s_cursor_reaches_the_host() {
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let config = GraphicsConfig {
+        callbacks: telling(&told),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let wait = |count: usize| {
+        eventually(|| told.lock().len() >= count);
+        let told = told.lock();
+        assert_eq!(told.len(), count, "{told:?}");
+        told.iter()
+            .map(|(t, _)| format!("{t:?}"))
+            .collect::<Vec<_>>()
+    };
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // The kext's cursor slot, at the region's end: two premultiplied BGRA pixels.
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255, 64, 32, 0, 128]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 2,
+        height: 1,
+        hot_x: 1,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    let move_to = |x, y, visible| {
+        RgfxMoveCursor {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MOVE_CURSOR,
+                size: 0,
+                seqno: 0,
+            },
+            display: 0,
+            x,
+            y,
+            visible,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    guest.send(&device, move_to(100, 50, 1));
+    let glyph = Told::Glyph(2, 1, (1, 0), vec![30, 20, 10, 255, 0, 64, 128, 128]);
+    assert_eq!(
+        wait(3),
+        [format!("{glyph:?}"), "Show(1)".into(), "Move".into()]
+    );
+    assert_eq!(device.cursor_position(), (100, 50));
+
+    guest.send(&device, move_to(-5, 70_000, 0));
+    assert_eq!(wait(5)[3..], ["Move", "Show(0)"]);
+    assert_eq!(device.cursor_position(), (0, 65535));
+
+    device.reset();
+    assert_eq!(wait(6)[5..], ["Move"]);
+    assert_eq!(device.cursor_position(), (0, 0));
+    let here = std::thread::current().id();
+    assert!(told.lock().iter().all(|(_, on)| *on != here));
+}
+
+/// `SET_DISPLAY_POWER`'s message, display 0's panel `on` or off.
+fn display_power(on: u32) -> Vec<u8> {
+    RgfxSetDisplayPower {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_DISPLAY_POWER,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        on,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// While the display's panel is off the host is told the cursor does not show, and once it is on
+/// that it shows again, where the guest shows it; a reset of a device whose panel is off turns it
+/// on, the cursor still hidden with no image
+#[test]
+fn the_host_is_told_no_cursor_while_the_display_s_panel_is_off() {
+    let told = Arc::new(Mutex::new(Vec::new()));
+    let config = GraphicsConfig {
+        callbacks: telling(&told),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+    let wait = |count: usize| {
+        eventually(|| told.lock().len() >= count);
+        let told = told.lock();
+        assert_eq!(told.len(), count, "{told:?}");
+        told.iter()
+            .map(|(t, _)| format!("{t:?}"))
+            .collect::<Vec<_>>()
+    };
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 1,
+        height: 1,
+        hot_x: 0,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(2)[1..], ["Show(1)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(3)[2..], ["Show(0)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(4)[3..], ["Show(1)"]);
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(5)[4..], ["Show(0)"]);
+    device.reset();
+    // The reset removes the image, so the panel's turning on shows no cursor yet.
+    assert_eq!(wait(6)[5..], ["Move"]);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(wait(8)[7..], ["Show(1)"], "a reset left the panel off");
+}
+
+/// Where the guest moves its cursor on its own, with no pointer event of the window's (a mouse
+/// passed through to the guest with QEMU's `usb-host`, or a warp of the guest's own), the window
+/// draws the guest's cursor where `MOVE_CURSOR` puts its hot spot, in the guest's mode, with the
+/// guest's glyph (features.md, "Cursor"): the first position the window reads is no move, the
+/// next one is
+#[test]
+fn the_window_draws_the_cursor_the_guest_moves_on_its_own() {
+    let (device, _platform) = windowed();
+    let window = device.windows.first().expect("a window").window();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // The guest's mode, 64 x 32, from its scanout.
+    let scanout = RgfxSetScanout {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_SCANOUT,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 64,
+        height: 32,
+        stride: 256,
+        offset: RGFX_ALLOCATIONS_OFFSET,
+    }
+    .as_bytes()
+    .to_vec();
+    assert_eq!(
+        answered(&device, &mut guest, scanout.clone()),
+        RGFX_STATUS_OK
+    );
+    // The kext's cursor slot, at the region's end: one premultiplied BGRA pixel, its hot spot.
+    let slot = device.region_size() - RGFX_CURSOR_SPAN;
+    // SAFETY: the slot lies in the device's region, mapped while the device lives.
+    unsafe {
+        guest.write(slot as usize, &[10, 20, 30, 255]);
+    }
+    let set = RgfxSetCursor {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SET_CURSOR,
+            size: 0,
+            seqno: 0,
+        },
+        display: 0,
+        width: 1,
+        height: 1,
+        hot_x: 0,
+        hot_y: 0,
+        reserved_24: 0,
+        offset: slot,
+    };
+    assert_eq!(
+        answered(&device, &mut guest, set.as_bytes().to_vec()),
+        RGFX_STATUS_OK
+    );
+    let move_to = |x, y| {
+        RgfxMoveCursor {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_MOVE_CURSOR,
+                size: 0,
+                seqno: 0,
+            },
+            display: 0,
+            x,
+            y,
+            visible: 1,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    // `MOVE_CURSOR` is not answered: the control ring takes its commands in order, so the moves
+    // are taken once the scanout set after them is answered.
+    guest.send(&device, move_to(10, 20));
+    assert_eq!(
+        answered(&device, &mut guest, scanout.clone()),
+        RGFX_STATUS_OK
+    );
+    assert!(window.drawn_cursor().is_none(), "the first position moved");
+    guest.send(&device, move_to(11, 20));
+    assert_eq!(answered(&device, &mut guest, scanout), RGFX_STATUS_OK);
+    let drawn = window
+        .drawn_cursor()
+        .expect("the window draws no cursor where the guest moved it on its own");
+    assert_eq!((drawn.mode, drawn.at), ((64, 32), (11, 20)));
+    assert_eq!(
+        (drawn.glyph.width, drawn.glyph.height, drawn.glyph.hot_spot),
+        (1, 1, (0, 0))
+    );
+}
+
 /// The window's sink makes its queue unshared and imports nothing at its making, then only the
 /// host pages under the scanout it draws (to `stride × height` bytes on), again only when the
 /// scanout moves or changes size, and kept to the region
 #[test]
 fn the_sink_imports_only_the_scanout_s_pages() {
-    use reims_vgpu_core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
 
     const IMPORT: &str = "newBufferWithBytesNoCopy:length:options:deallocator:";
     let platform = Arc::new(FakePlatform::new());
-    let region = Arc::new(Region::new(reims_graphics::REGION_SIZE as usize).unwrap());
+    let region = Arc::new(Region::new(reims_vgpu_graphics::REGION_SIZE as usize).unwrap());
     let shown = Arc::new(Shown::default());
     let presented = Arc::new(Presented::<FakePlatform>::default());
     let draw = sink::ScanoutDraw::new(Arc::clone(&platform), &region, &shown, &presented).unwrap();
     assert_eq!(platform.call_log().count(IMPORT), 0);
     // Its queue is unshared: each draw is on a present's path.
     {
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
         assert_eq!(platform.call_log().count(UNSHARED_QUEUE), 1);
         assert_eq!(platform.call_log().count("newCommandQueue"), 0);
     }
 
-    // SAFETY: sysconf reads a constant of the host's.
-    let page = u64::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) }).unwrap();
+    let page = {
+        use reims_vgpu_vulkan::core::platform::os::vm::HostVm as _;
+        reims_vgpu_vulkan::os::OsVm::new().page_size()
+    };
     let base = region.base() as u64;
     let addr = |b: &<FakePlatform as Platform>::Buffer| b.contents().addr() as u64;
     let scanout = |width: u32, height: u32, offset: u64| Scanout {
@@ -2001,25 +2883,18 @@ fn the_sink_imports_only_the_scanout_s_pages() {
     assert_eq!(platform.call_log().count(IMPORT), 3);
 }
 
-/// The regions the host's dirty log was asked about, in order.
-type Asked = Arc<Mutex<Vec<(u64, u64)>>>;
-
-/// A graphics device on the testkit's platform with a display window, whose dirty log answers
-/// every ask written, recording it in `asked`. The platform draws no sink, so the window never
-/// opens: the test draws what it shows through a sink of its own ([`windowed_draw`]).
-fn windowed(asked: &Asked) -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
+/// A graphics device on the testkit's platform with a display window. The platform draws no
+/// sink, so the window never opens: the test draws what it shows through a sink of its own
+/// ([`windowed_draw`]), and counts the frames it is asked for ([`frames_asked`]).
+fn windowed() -> (GraphicsDevice<FakePlatform>, Arc<FakePlatform>) {
     let platform = Arc::new(FakePlatform::new());
-    let asked = Arc::clone(asked);
     let config = GraphicsConfig {
-        callbacks: GraphicsCallbacks {
-            raise_interrupt: None,
-            scanout_written: Some(Arc::new(move |offset, length| {
-                asked.lock().push((offset, length));
-                true
-            })),
-        },
+        callbacks: GraphicsCallbacks::default(),
         window: Some(WindowConfig::default()),
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     (device, platform)
@@ -2041,7 +2916,7 @@ fn windowed_draw(
         Arc::clone(platform),
         &device.control.region,
         shown,
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     let drawable = platform.texture_descriptor(&TextureDesc {
@@ -2073,7 +2948,7 @@ fn draws_the_scanout(
     drawable: &<FakePlatform as Platform>::Texture,
     stride: u64,
 ) -> bool {
-    use reims_vgpu_core::platform::resource::Texture as _;
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
     let blits = platform.call_log().count(SCANOUT_BLIT);
     let rect = reims_vgpu_window::PixelRect {
         x: 0,
@@ -2081,7 +2956,8 @@ fn draws_the_scanout(
         width: drawable.width(),
         height: drawable.height(),
     };
-    if draw.encode(drawable, rect).is_none() || platform.call_log().count(SCANOUT_BLIT) != blits + 1
+    if draw.encode(drawable, rect, None).is_none()
+        || platform.call_log().count(SCANOUT_BLIT) != blits + 1
     {
         return false;
     }
@@ -2090,27 +2966,30 @@ fn draws_the_scanout(
     blit.args[1..3] == [Arg::U64(0), Arg::U64(stride)]
 }
 
-/// Waits about 2 s for the refresh thread to ask the host's dirty log about `range`.
-fn asked_about(asked: &Asked, range: (u64, u64)) -> bool {
-    for _ in 0..2000 {
-        if asked.lock().contains(&range) {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+/// The frames `device`'s window was asked to draw so far.
+fn frames_asked(device: &GraphicsDevice<FakePlatform>) -> u64 {
+    device
+        .windows
+        .first()
+        .expect("a window")
+        .window()
+        .frames_asked()
+}
+
+/// Waits ([`eventually`]) for `device`'s window to be asked for `count` frames past `from`.
+fn frames_asked_past(device: &GraphicsDevice<FakePlatform>, from: u64, count: u64) -> bool {
+    eventually(|| frames_asked(device) >= from + count)
 }
 
 /// The guest's driver fails after it took the device, as the kext does where the device lists no
 /// usable display or `IOFramebuffer`'s start fails: the firmware sets its scanout, the kext resets
 /// the device to take it, starts it and asks `GET_DISPLAYS`, and resets it on the way out. The
 /// window keeps the firmware's scanout, so the frames the OS then draws into the firmware's
-/// framebuffer reach it: the refresh thread asks the host's dirty log over that scanout again,
-/// showing it where the guest wrote it, and the window's draw blits it out of the region
+/// framebuffer reach it: each refresh asks the window to draw that scanout again, and the
+/// window's draw blits it out of the region
 #[test]
 fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
-    let asked = Asked::default();
-    let (device, platform) = windowed(&asked);
+    let (device, platform) = windowed();
     let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
     let scanout = Scanout {
         width: 64,
@@ -2167,7 +3046,7 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
     std::thread::sleep(Duration::from_millis(50));
 
     // The OS draws its next frame into the firmware's framebuffer.
-    asked.lock().clear();
+    let frames = frames_asked(&device);
     // SAFETY: the scanout lies in the device's region, mapped while the device lives.
     unsafe {
         std::ptr::write_bytes(
@@ -2177,8 +3056,8 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
         );
     }
     assert!(
-        asked_about(&asked, (scanout.offset, scanout.span())),
-        "no refresh asked about the firmware's scanout after the failure"
+        frames_asked_past(&device, frames, 2),
+        "no refresh drew the firmware's scanout after the failure"
     );
     let shown = device.shown.as_ref().unwrap();
     assert_eq!(*shown.scanout.lock(), Some(scanout));
@@ -2194,8 +3073,7 @@ fn a_failure_after_the_take_keeps_the_firmware_s_scanout_in_the_window() {
 /// its surface
 #[test]
 fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
-    let asked = Asked::default();
-    let (device, platform) = windowed(&asked);
+    let (device, platform) = windowed();
     let (draw, drawable) = windowed_draw(&device, &platform, 64, 32);
     let (mut guest, _ring) = surface_and_queue(&device);
     let scanout = RgfxSetScanout {
@@ -2220,14 +3098,9 @@ fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
 
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_RESET);
     reset_done(&device);
-    for _ in 0..2000 {
-        if device.control.presented.shown().is_none() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.control.presented[0].shown().is_none());
     assert!(
-        device.control.presented.shown().is_none(),
+        device.control.presented[0].shown().is_none(),
         "the surface stayed"
     );
     assert!(
@@ -2241,6 +3114,70 @@ fn a_reset_shows_the_scanout_in_place_of_the_surface_shown() {
     let status = answered(&device, &mut guest, present_surface(0x77));
     assert_eq!(status, RGFX_STATUS_OK);
     assert_eq!(shown_width(&device), Some(64));
+}
+
+/// While the window shows the guest's scanout, each refresh asks it to draw the scanout again,
+/// as the guest may have written it since; before the guest sets one, a refresh asks for nothing
+#[test]
+fn a_refresh_draws_the_scanout_again_while_no_surface_shows() {
+    let (device, _platform) = windowed();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    // Six refreshes at the window's 60 Hz.
+    let frames = frames_asked(&device);
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        frames_asked(&device),
+        frames,
+        "a refresh with no scanout asked for a frame"
+    );
+
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    let frames = frames_asked(&device);
+    assert!(
+        frames_asked_past(&device, frames, 3),
+        "the refreshes drew the scanout {} times",
+        frames_asked(&device) - frames
+    );
+}
+
+/// While the window shows a presented surface, a refresh asks it for no frame: the guest's
+/// presents alone draw it. Once the guest presents the scanout again, each refresh draws it
+#[test]
+fn a_refresh_draws_nothing_while_a_presented_surface_shows() {
+    let (device, _platform) = windowed();
+    let (mut guest, _ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    assert!(frames_asked_past(&device, frames_asked(&device), 2));
+
+    // With no window open, the present is answered as it is shown.
+    let status = answered(&device, &mut guest, present_surface(0x77));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    // Past a refresh that found the scanout shown before the present.
+    std::thread::sleep(Duration::from_millis(20));
+    let frames = frames_asked(&device);
+    // Six refreshes at the window's 60 Hz.
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        frames_asked(&device),
+        frames,
+        "a refresh asked for a frame while the surface showed"
+    );
+
+    let status = answered(&device, &mut guest, present_surface(0));
+    assert_eq!(status, RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), None);
+    assert!(
+        frames_asked_past(&device, frames, 2),
+        "no refresh drew the scanout presented again"
+    );
 }
 
 /// The display pipe's present: a surface the decoder holds no texture over is answered invalid
@@ -2272,7 +3209,7 @@ fn a_present_needs_the_surface_s_texture() {
         let done = RgfxComplete::read_from_bytes(&bytes).unwrap();
         assert_eq!(done.header.r#type, RGFX_EVT_COMPLETE);
         assert_eq!(done.status, status, "IOSurface {id}");
-        assert!(device.control.presented.texture.lock().is_none());
+        assert!(device.control.presented[0].texture.lock().is_none());
     }
 }
 
@@ -2343,7 +3280,7 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
         RgfxComplete::read_from_bytes(&bytes).unwrap().status
     };
     let reds = |stage: u32| -> Option<Vec<f32>> {
-        let (_, color) = device.control.presented.color();
+        let (_, color) = device.control.presented[0].color();
         let table = color.stages[usize::try_from(stage).unwrap()].as_ref()?;
         Some(table.iter().map(|e| e[0]).collect())
     };
@@ -2357,7 +3294,7 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
         RGFX_STATUS_INVALID_ARGUMENT
     );
     assert_eq!(reds(RGFX_COLOR_POST_GAMMA), None);
-    let (before, _) = device.control.presented.color();
+    let (before, _) = device.control.presented[0].color();
 
     // The kept present after it takes the staged table, and shows what it showed.
     assert_eq!(
@@ -2367,8 +3304,8 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
     let table = reds(RGFX_COLOR_POST_GAMMA).expect("the post-gamma table");
     assert_eq!(table.len(), 300);
     assert_eq!((table[0], table[255], table[299]), (0.0, 255.0, 299.0));
-    assert_ne!(device.control.presented.color().0, before);
-    assert!(device.control.presented.texture.lock().is_none());
+    assert_ne!(device.control.presented[0].color().0, before);
+    assert!(device.control.presented[0].texture.lock().is_none());
 
     // A matrix of three rows, and the pre-gamma table turned off, with a present of the scanout:
     // the post-gamma table stays.
@@ -2389,13 +3326,8 @@ fn display_colors_take_effect_with_the_next_accepted_present() {
 
     // The reset, which the control thread tells the host: every stage off.
     device.reset();
-    for _ in 0..3000 {
-        if device.control.presented.color().1.is_identity() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(device.control.presented.color().1.is_identity());
+    eventually(|| device.control.presented[0].color().1.is_identity());
+    assert!(device.control.presented[0].color().1.is_identity());
 }
 
 /// A `DISPLAY_COLOR` of display 0's transaction 1 carrying all of `stage`'s entries, each red,
@@ -2438,8 +3370,8 @@ fn display_color_entries(stage: u32, entries: &[[f32; 3]]) -> Vec<u8> {
 /// the black a fade ends on
 #[test]
 fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::testkit::objects::kind;
+    use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+    use reims_vgpu_vulkan::core::testkit::objects::kind;
     const FRAGMENT_BUFFER: &str = "setFragmentBuffer:offset:atIndex:";
     /// `displayPipeColorScanoutFragment`'s buffer of the post-gamma table.
     const POST_TABLE: u64 = 3;
@@ -2459,7 +3391,7 @@ fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
         Arc::clone(&platform),
         &device.control.region,
         &shown,
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     let drawable = platform.texture_descriptor(&TextureDesc {
@@ -2492,7 +3424,7 @@ fn a_kept_present_s_table_reaches_the_next_drawn_frame() {
     let drawn_table = || -> Vec<f32> {
         let log = platform.call_log();
         let mark = log.mark();
-        let _drawn = draw.encode(&drawable, rect).expect("a draw");
+        let _drawn = draw.encode(&drawable, rect, None).expect("a draw");
         let bound = log
             .since(mark)
             .into_iter()
@@ -2673,10 +3605,10 @@ fn compute_pipeline_create(obj_id: u64, library: u64) -> Vec<u8> {
 /// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` whose one compute encoder sets compute
 /// pipeline `pipeline`.
 fn compute_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64) -> Vec<u8> {
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_SET_COMPUTE_PIPELINE_STATE, RgfxComputeOpSetComputePipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let op = |tag: u16, body: &[u8]| {
@@ -2726,16 +3658,13 @@ fn next_event(guest: &mut Guest, r#type: u32) -> Vec<u8> {
     bytes
 }
 
-/// Completes the platform's committed command buffers until `ring` has an event, about 3 s.
+/// Completes the platform's committed command buffers until `ring` has an event, [`PATIENCE`]
+/// polls at most.
 fn complete_until_event(platform: &FakePlatform, ring: &mut QueueRing) -> bool {
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+        ring.has_event()
+    })
 }
 
 /// One process's pipeline compile holds nothing of another's: while context 1's render pipeline
@@ -3000,11 +3929,11 @@ fn sampler_answered(device: &GraphicsDevice<FakePlatform>, guest: &mut Guest, ob
 
 /// A command buffer whose compute pass binds the sampler `sampler` at index 0.
 fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Vec<u8> {
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_SET_SAMPLER_STATES, RgfxComputeOpSetSamplerStates,
         RgfxComputeSamplerBinding,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let op = |tag: u16, body: &[u8]| {
@@ -3056,8 +3985,8 @@ fn sampler_command_buffer(queue_obj_id: u64, cb_obj_id: u64, sampler: u64) -> Ve
 /// a walk in flight, which holds nothing device-wide.
 /// Whether a walk took the gate, stopped at it, and whether it is open; and their moves.
 type GateState = Arc<(
-    reims_vgpu_core::sync::Mutex<(bool, bool, bool)>,
-    reims_vgpu_core::sync::Condvar,
+    reims_vgpu_vulkan::core::sync::Mutex<(bool, bool, bool)>,
+    reims_vgpu_vulkan::core::sync::Condvar,
 )>;
 
 struct WalkGate {
@@ -3081,8 +4010,8 @@ impl WalkGate {
     /// short buffer whose commit would wait for nothing stops there on its queue's service thread.
     fn in_place(device: &GraphicsDevice<FakePlatform>) -> WalkGate {
         let state = Arc::new((
-            reims_vgpu_core::sync::Mutex::new((false, false, false)),
-            reims_vgpu_core::sync::Condvar::new(),
+            reims_vgpu_vulkan::core::sync::Mutex::new((false, false, false)),
+            reims_vgpu_vulkan::core::sync::Condvar::new(),
         ));
         let passed = Arc::new(AtomicU32::new(0));
         let taken_on = Arc::new(super::Mutex::new(None));
@@ -3125,29 +4054,23 @@ impl WalkGate {
         self.taken_on.lock().clone()
     }
 
-    /// Waits, about 3 s at most, for `n` ops to be walked past the gate once a walk took it;
+    /// Waits, [`PATIENCE`] polls at most, for `n` ops to be walked past the gate once a walk took it;
     /// whether they were.
     fn passed(&self, n: u32) -> bool {
-        for _ in 0..3000 {
-            if self.passed.load(Ordering::SeqCst) >= n {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        false
+        eventually(|| self.passed.load(Ordering::SeqCst) >= n)
     }
 
-    /// Waits, about 3 s at most, for a walk to stop at the gate; whether one did.
+    /// Waits, [`PATIENCE`] polls at most, for a walk to stop at the gate; whether one did.
     fn reached(&self) -> bool {
         let (lock, moved) = &*self.state;
         let mut s = lock.lock();
-        for _ in 0..3000 {
+        for _ in 0..PATIENCE {
             if s.1 {
                 return true;
             }
             moved.wait_for(&mut s, Duration::from_millis(1));
         }
-        false
+        s.1
     }
 
     /// Lets the walk stopped at the gate go on.
@@ -3180,10 +4103,11 @@ fn create_queue_flagged(
     answered(device, guest, create)
 }
 
-/// The platform's queue creators' calls, newest last, once `count` of them were made (about 2 s):
-/// each queue's handle is made on its service thread, after its create is answered.
+/// The platform's queue creators' calls, newest last, once `count` of them were made
+/// ([`PATIENCE`] polls at most): each queue's handle is made on its service thread, after its
+/// create is answered.
 fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
-    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
     let made = || -> Vec<&'static str> {
         let calls = platform.call_log().calls();
         let creators = calls.iter().map(|c| c.sel);
@@ -3191,12 +4115,7 @@ fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
             .filter(|&sel| sel == "newCommandQueue" || sel == UNSHARED_QUEUE)
             .collect()
     };
-    for _ in 0..2000 {
-        if made().len() >= count {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| made().len() >= count);
     made()
 }
 
@@ -3205,7 +4124,7 @@ fn queue_calls(platform: &FakePlatform, count: usize) -> Vec<&'static str> {
 /// did not take the feature, a flagged create is refused and the platform makes no queue for it.
 #[test]
 fn a_queue_the_kext_asks_unshared_is_the_platforms_unshared_queue() {
-    use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+    use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
     const RING_DATA: u32 = 0x1_0000;
     let rings = |n: u64| {
         let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
@@ -3333,21 +4252,17 @@ fn a_close_during_a_walk_is_answered_after_the_buffer() {
     assert!(gate.reached(), "the walk did not start");
     guest.send(&device, context_close(2));
     let close = guest.seqno;
-    let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     gate.open();
-    for _ in 0..3000 {
-        if platform.call_log().count("commit") > commits {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    assert!(
-        platform.call_log().count("commit") > commits,
-        "not committed"
-    );
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself.
+    committed(&platform, held + 1);
     // The buffer's completion is its ended queue's, which posts nothing more; the close is
     // answered once its completion handler has run.
-    platform.world().complete_all(CompleteOn::Caller);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     let bytes = guest.event().expect("the close's COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(
@@ -3392,15 +4307,15 @@ fn a_close_during_a_walk_holds_up_nothing_on_ring_0() {
         1,
         "the close was not carried out: only context 3's sampler is left"
     );
-    let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     gate.open();
-    for _ in 0..3000 {
-        if platform.call_log().count("commit") > commits {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    platform.world().complete_all(CompleteOn::Caller);
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself.
+    committed(&platform, held + 1);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     let bytes = guest.event().expect("the close's COMPLETE");
     let complete = RgfxComplete::read_from_bytes(&bytes).unwrap();
     assert_eq!(complete.status, RGFX_STATUS_OK);
@@ -3432,6 +4347,7 @@ fn a_reset_during_a_walk_comes_after_it() {
     ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
     assert!(gate.reached(), "the walk did not start");
     let commits = platform.call_log().count("commit");
+    let held = platform.world().committed().len();
     device.reset();
     // The decoder's reset, on the control thread, waits for the walk.
     std::thread::sleep(Duration::from_millis(100));
@@ -3441,18 +4357,20 @@ fn a_reset_during_a_walk_comes_after_it() {
         "the reset dropped the walk's objects before the walk ended"
     );
     gate.open();
-    for _ in 0..3000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(device.decoder_object_count(), 0, "the reset left objects");
     assert!(
         platform.call_log().count("commit") > commits,
         "the walk was not committed before the reset"
     );
-    platform.world().complete_all(CompleteOn::Caller);
+    // The fake logs a commit before it holds the buffer as committed: wait for the buffer itself,
+    // so that its completion runs before the ring is read.
+    committed(&platform, held + 1);
+    assert_eq!(
+        platform.world().complete_all(CompleteOn::Caller),
+        held + 1,
+        "the walked buffer completes"
+    );
     assert!(!ring.has_event(), "the buffer posted after the reset");
 }
 
@@ -3519,7 +4437,7 @@ fn a_queue_s_buffer_runs_beside_another_queue_s_walk() {
 /// `message`, a command buffer, with a `SUBMITTED` op after its ops: it asks for its
 /// `CB_SUBMITTED`, as `commitAndWaitUntilSubmitted` commits it.
 fn with_ask(mut message: Vec<u8>) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RgfxOpHeader};
 
     let submitted = RgfxOpHeader {
         tag: RGFX_OP_SUBMITTED,
@@ -3545,12 +4463,28 @@ fn two_processes(
     Guest,
     [QueueRing; 3],
 ) {
+    two_processes_taking(raised, 0)
+}
+
+/// [`two_processes`], the guest's driver having taken the feature bits `taken` of those the
+/// device offers.
+fn two_processes_taking(
+    raised: &Arc<AtomicU32>,
+    taken: u64,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    Guest,
+    [QueueRing; 3],
+) {
     const RING_DATA: u32 = 0x1_0000;
     let rings = |n: u64| {
         let at = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * 0x4_0000;
         (at, at + 0x2_0000)
     };
     let (device, platform) = headless_on(raised);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_LO.into(), taken as u32);
+    device.mmio_write(RGFX_REG_DRIVER_FEATURES_HI.into(), (taken >> 32) as u32);
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
     let mut guest = Guest::new(&device);
     for (at, (context, n)) in [(1, 1), (1, 2), (2, 1)].into_iter().enumerate() {
@@ -3784,6 +4718,228 @@ fn a_walk_held_in_a_draw_holds_up_no_other_queue() {
     );
 }
 
+/// A `SCHEDULED_ASK` of command buffer `cb_obj_id`, posted on its queue's ring at `cb_seqno`, the
+/// ask's own seqno `seqno`: a thread waits for the buffer to be scheduled.
+fn scheduled_ask(cb_obj_id: u64, cb_seqno: u64, seqno: u64) -> Vec<u8> {
+    RgfxScheduledAsk {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_SCHEDULED_ASK,
+            size: size_of::<RgfxScheduledAsk>() as u32,
+            seqno,
+        },
+        cb_obj_id,
+        cb_seqno,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// `message`, a command buffer, at `seqno` on its ring.
+fn at_seqno(mut message: Vec<u8>, seqno: u64) -> Vec<u8> {
+    message[8..16].copy_from_slice(&seqno.to_le_bytes());
+    message
+}
+
+/// Whether `ring` takes the `CB_SCHEDULED` `(seqno, cb_obj_id)` within [`PATIENCE`] polls,
+/// completing nothing on the platform meanwhile.
+fn scheduled_comes(ring: &mut QueueRing, record: (u64, u64)) -> bool {
+    eventually(|| {
+        ring.has_event();
+        ring.scheduled.contains(&record)
+    })
+}
+
+/// A command buffer that waits for nothing and does not ask for its `CB_SUBMITTED` gets its
+/// `CB_SCHEDULED` as its queue's service thread takes a waiting thread's `SCHEDULED_ASK` of it,
+/// before the platform has its work: with its walk held inside the platform's draw, the record
+/// comes, the buffer not yet committed. It completes once its draw returns, its record posted
+/// once; a later ask of it posts nothing more
+#[test]
+fn a_waited_buffer_is_scheduled_before_its_submission() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, _, _]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    // Walked on its queue's lane, as a long buffer is (`GraphicsControl::carry_out`).
+    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    let draw = hold_next_draw(&platform);
+    let commits = platform.call_log().count("commit");
+    held.send(
+        &device,
+        at_seqno(
+            render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+            1,
+        ),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+    std::thread::sleep(Duration::from_millis(20));
+    assert!(
+        !held.has_event() && held.scheduled.is_empty(),
+        "scheduled before the ask"
+    );
+    held.send(&device, scheduled_ask(100, 1, 2));
+    assert!(
+        scheduled_comes(&mut held, (1, 100)),
+        "no CB_SCHEDULED at the ask"
+    );
+    assert_eq!(
+        platform.call_log().count("commit"),
+        commits,
+        "the buffer was committed before its record came"
+    );
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    held.send(&device, scheduled_ask(100, 1, 3));
+    held.send(&device, at_seqno(asking(obj(1, 1), 101), 4));
+    assert_eq!(
+        ring_events(&platform, &mut held, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 101, 0),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        held.scheduled,
+        [(1, 100), (4, 101)],
+        "a record posted twice, or out of the queue's order"
+    );
+}
+
+/// A command buffer whose walk is held inside the platform's draw holds up its process's other
+/// queues only while a thread waits for it to be scheduled: before the ask, a buffer of the
+/// process's other queue is committed and completed with the draw held, as no thread waits for
+/// the held one; once a thread's `SCHEDULED_ASK` has its `CB_SCHEDULED` posted, a buffer of that
+/// queue begun after the record is answered its `CB_SUBMITTED` but committed only after the held
+/// one ([`decode::sequencer`]), as a `CB_SUBMITTED` at the held one's take would have it. Another
+/// process's buffer is committed and completed throughout
+#[test]
+fn a_held_walk_holds_up_its_process_s_other_queues_only_once_waited_for() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, mut beside, mut other]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    device.control.inline_walk_max.store(0, Ordering::Relaxed);
+    let draw = hold_next_draw(&platform);
+    held.send(
+        &device,
+        at_seqno(
+            render_command_buffer(obj(1, 1), 100, obj(1, 11), obj(1, 20)),
+            1,
+        ),
+    );
+    assert!(
+        draw.reached(Duration::from_secs(3)),
+        "the walk did not reach its draw"
+    );
+
+    // No thread waits for it: the process's other queue goes on.
+    beside.send(&device, at_seqno(asking(obj(1, 2), 300), 1));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 300, 0),
+            (RGFX_EVT_CB_COMPLETE, 300, u64::from(RGFX_CB_OK)),
+        ],
+        "a buffer of the held process's other queue waited for the held walk before any ask"
+    );
+
+    // A thread waits for it: its record comes with the draw still held.
+    held.send(&device, scheduled_ask(100, 1, 2));
+    assert!(
+        scheduled_comes(&mut held, (1, 100)),
+        "no CB_SCHEDULED at the ask"
+    );
+    // Another process's buffer goes on.
+    other.send(&device, at_seqno(asking(obj(2, 1), 200), 1));
+    assert_eq!(
+        ring_events(&platform, &mut other, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 200, 0),
+            (RGFX_EVT_CB_COMPLETE, 200, u64::from(RGFX_CB_OK)),
+        ],
+        "another process's buffer waited for the held walk"
+    );
+    // The held process's other queue's buffer, begun after the record: answered, and committed
+    // only after the held buffer.
+    let commits = platform.call_log().count("commit");
+    beside.send(&device, at_seqno(asking(obj(1, 2), 301), 2));
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 301, 0)],
+        "the held process's other queue's buffer was not begun beside the held walk"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        platform.call_log().count("commit"),
+        commits,
+        "a buffer of the held process begun after the record was committed before the held one"
+    );
+
+    draw.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 3),
+        [
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 4),
+            (RGFX_EVT_EVENT_SIGNALLED, obj(1, 20), 5),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(
+        ring_events(&platform, &mut beside, 1),
+        [(RGFX_EVT_CB_COMPLETE, 301, u64::from(RGFX_CB_OK))]
+    );
+}
+
+/// A `SCHEDULED_ASK` of a command buffer that waits for an event changes nothing: its walk held at
+/// the gate, the ask posts no `CB_SCHEDULED`, and the record comes at the buffer's scheduling, once
+/// it is committed (the fake platform schedules each buffer at its commit), as without the ask.
+/// Nor does an ask of a buffer behind it on its queue, which it holds
+#[test]
+fn an_ask_of_a_buffer_that_waits_for_an_event_changes_nothing() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, _, _]) =
+        two_processes_taking(&raised, RGFX_FEATURE_SCHEDULED_ASK);
+    let wait = RgfxOpEvent {
+        event_obj_id: obj(1, 20),
+        value: 1,
+    };
+    let gate = WalkGate::on(&device);
+    let waits = command_buffer_of(obj(1, 1), 100, &[(RGFX_OP_WAIT_EVENT, wait.as_bytes())]);
+    held.send(&device, at_seqno(waits, 1));
+    assert!(gate.reached(), "the walk did not start");
+    held.send(
+        &device,
+        at_seqno(sampler_command_buffer(obj(1, 1), 101, obj(1, 4)), 2),
+    );
+    held.send(&device, scheduled_ask(100, 1, 3));
+    held.send(&device, scheduled_ask(101, 2, 4));
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        !held.has_event() && held.scheduled.is_empty(),
+        "an ask posted the record of a buffer that waits, or of one behind it"
+    );
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut held, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK)),
+            (RGFX_EVT_CB_COMPLETE, 101, u64::from(RGFX_CB_OK)),
+        ]
+    );
+    assert_eq!(held.scheduled, [(1, 100), (2, 101)]);
+}
+
 /// A command buffer answered its `CB_SUBMITTED` whose walk is held inside the platform's draw
 /// holds up no other queue's take or begin, and only the commits of its own process's buffers
 /// begun after its answer, which come after it ([`decode::sequencer`]): with the draw held,
@@ -3868,7 +5024,7 @@ fn a_held_walk_answered_its_submitted_holds_only_its_process_s_later_commits() {
 /// whichever slot named it
 #[test]
 fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -3879,7 +5035,7 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
         message[8..16].copy_from_slice(&seqno.to_le_bytes());
         message
     };
-    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+    let events = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], sel: &str| {
         (calls.iter())
             .filter(|c| c.sel == sel)
             .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
@@ -3958,7 +5114,7 @@ fn a_reader_in_another_process_waits_on_the_gpu_for_an_answered_writer() {
 /// which signals what it waits for once the service thread goes on and the buffer is taken
 #[test]
 fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -3970,7 +5126,7 @@ fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
         message[8..16].copy_from_slice(&seqno.to_le_bytes());
         message
     };
-    let events = |calls: &[reims_vgpu_core::testkit::calllog::Call], sel: &str| {
+    let events = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], sel: &str| {
         (calls.iter())
             .filter(|c| c.sel == sel)
             .map(|c| (c.args[0].as_obj(), c.args[1].as_u64()))
@@ -4057,7 +5213,7 @@ fn a_queue_s_buffers_are_waited_for_before_its_handle_is_made() {
 
 /// A command buffer with the ops `ops`, each a tag and its body, on queue `queue_obj_id`.
 fn command_buffer_of(queue_obj_id: u64, cb_obj_id: u64, ops: &[(u16, &[u8])]) -> Vec<u8> {
-    use reims_graphics::ops::RgfxOpHeader;
+    use reims_vgpu_graphics::ops::RgfxOpHeader;
 
     let mut stream = Vec::new();
     for &(tag, body) in ops {
@@ -4142,6 +5298,146 @@ fn a_queue_s_buffers_are_walked_at_once_and_committed_in_order() {
     }
 }
 
+/// Sends `n` command buffers that bind process 1's sampler 4 on its queue `queue_obj_id` through
+/// `ring`, their `cb_obj_id`s from `first`, at seqnos from `seqno`.
+fn send_sampler_buffers(
+    device: &GraphicsDevice<FakePlatform>,
+    ring: &mut QueueRing,
+    queue_obj_id: u64,
+    (first, seqno): (u64, u64),
+    n: u64,
+) {
+    for at in 0..n {
+        let message = sampler_command_buffer(queue_obj_id, first + at, obj(1, 4));
+        ring.send(device, at_seqno(message, seqno + at));
+    }
+}
+
+/// The platform's command buffers committed and not completed, waited for until there are `n`,
+/// are in the order their buffers were begun: the fake platform numbers its objects as it makes
+/// them, and a buffer's command buffer is made at its begin.
+fn committed_in_begin_order(platform: &FakePlatform, n: usize) {
+    let ids = committed(platform, n);
+    let mut sorted = ids.clone();
+    sorted.sort_unstable_by_key(|id| id.0);
+    assert_eq!(ids, sorted, "committed out of the order they were begun");
+}
+
+/// Every command buffer of a queue sent behind one whose walk is held is walked beside it, more
+/// than a lane walks at once ([`decode::LANE_THREADS`]), as each walked waits for its turn and a
+/// walk waiting so is not among them (`decode`'s `lane`); and none of them is committed before
+/// the held one, nor out of the order they came. They complete in that order
+#[test]
+fn every_buffer_behind_a_held_walk_is_walked_beside_it_and_committed_in_turn() {
+    const BEHIND: u64 = 3 * decode::LANE_THREADS as u64;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (100, 1), 1);
+    assert!(gate.reached(), "the first walk did not start");
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (101, 2), BEHIND);
+    assert!(
+        gate.passed(3 * BEHIND as u32),
+        "{} ops of the buffers behind the held walk were walked beside it",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "a buffer walked beside the held one was committed before it"
+    );
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    for cb in 100..=100 + BEHIND {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+}
+
+/// A queue's lane holds [`decode::LANE_MOST`] threads at most, whatever count the guest's queue
+/// was made with (`QUEUE_CREATE` carries none): of the buffers sent behind a held walk, the
+/// first `LANE_MOST - 1` are walked beside it and the rest wait to start, and all are committed in
+/// the order they came, once the held one is
+#[test]
+fn a_queue_s_buffers_past_its_lane_s_most_threads_wait_to_start_and_commit_in_turn() {
+    const WALKED: u64 = decode::LANE_MOST as u64 - 1;
+    const BEHIND: u64 = WALKED + 8;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::on(&device);
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (100, 1), 1);
+    assert!(gate.reached(), "the first walk did not start");
+    send_sampler_buffers(&device, &mut ring, obj(1, 1), (101, 2), BEHIND);
+    assert!(
+        gate.passed(3 * WALKED as u32),
+        "{} ops of the buffers behind the held walk were walked beside it",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert_eq!(
+        gate.passed.load(Ordering::SeqCst),
+        3 * WALKED as u32,
+        "the lane walked past its most threads"
+    );
+    assert!(platform.world().committed().is_empty());
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    for cb in 100..=100 + BEHIND {
+        assert!(complete_until_event(&platform, &mut ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    }
+}
+
+/// The buffers of a process's other queue sent after its answered buffer, whose walk is held,
+/// are all walked beside it, more than a lane walks at once, as each waits for the answered
+/// buffer's ticket and a walk waiting so is not among them (`decode`'s `lane`); and every one is
+/// committed after the answered buffer, in the order they came
+#[test]
+fn a_process_s_buffers_behind_its_held_answered_one_are_walked_and_committed_after_it() {
+    const BEHIND: u64 = 3 * decode::LANE_THREADS as u64;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, [mut held, mut beside, _]) = two_processes(&raised);
+    let gate = WalkGate::on(&device);
+    held.send(
+        &device,
+        at_seqno(
+            with_ask(sampler_command_buffer(obj(1, 1), 100, obj(1, 4))),
+            1,
+        ),
+    );
+    assert!(gate.reached(), "the answered walk did not start");
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_SUBMITTED, 100, 0)]
+    );
+    send_sampler_buffers(&device, &mut beside, obj(1, 2), (300, 1), BEHIND);
+    assert!(
+        gate.passed(3 * BEHIND as u32),
+        "{} ops of the other queue's buffers were walked beside the held one",
+        gate.passed.load(Ordering::SeqCst)
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "a buffer sent after the answer was committed before the answered one"
+    );
+    gate.open();
+    committed_in_begin_order(&platform, 1 + BEHIND as usize);
+    assert_eq!(
+        ring_events(&platform, &mut held, 1),
+        [(RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))]
+    );
+    let completes: Vec<_> = (300..300 + BEHIND)
+        .map(|cb| (RGFX_EVT_CB_COMPLETE, cb, u64::from(RGFX_CB_OK)))
+        .collect();
+    assert_eq!(
+        ring_events(&platform, &mut beside, BEHIND as usize),
+        completes
+    );
+}
+
 /// What a drain of small command buffers costs the device's own threads, from the first one's
 /// doorbell write to the last one's `CB_COMPLETE`, on the fake platform, whose commits and
 /// completions cost next to nothing, the queue's thread asleep before each drain: a lone buffer,
@@ -4160,18 +5456,10 @@ fn a_drain_s_first_doorbell_to_its_last_cb_complete() {
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
     let idle = || {
-        for _ in 0..2000 {
-            // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-            let idle = unsafe {
-                AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                    .load(Ordering::SeqCst)
-            };
-            if idle == 1 {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("the queue's thread did not go idle");
+        assert!(
+            eventually(|| ring_idle(&device, SUBMIT_OFF)),
+            "the queue's thread did not go idle"
+        );
     };
     let mut cb = 1000;
     for buffers in [1, 8] {
@@ -4333,7 +5621,7 @@ const SIDE_ROUNDS: usize = 5;
 /// carried out whole first (the fake platform schedules each buffer at its commit)
 #[test]
 fn a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_scheduling() {
-    use reims_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_WAIT_EVENT, RgfxOpEvent};
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, mut guest, mut ring) = one_queue(&raised);
@@ -4373,7 +5661,7 @@ fn a_buffer_behind_one_that_waits_and_is_still_walked_is_answered_at_its_schedul
 /// and its failure comes after the first's completion
 #[test]
 fn a_video_buffer_is_walked_in_its_turn() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
         RgfxOpVideoPass,
     };
@@ -4417,14 +5705,14 @@ fn a_video_buffer_is_walked_in_its_turn() {
 /// the lane ([`a_video_buffer_is_walked_in_its_turn`])
 #[test]
 fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_VIDEO, RGFX_OP_ENCODER_END,
         RgfxOpVideoPass,
     };
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
-    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+    let threads = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&threads);
     device
         .control
@@ -4470,8 +5758,8 @@ fn a_lone_video_buffer_is_walked_on_its_queue_s_service_thread() {
 /// their walks began.
 fn walk_threads(
     device: &GraphicsDevice<FakePlatform>,
-) -> Arc<reims_vgpu_core::sync::Mutex<Vec<String>>> {
-    let threads = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+) -> Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<String>>> {
+    let threads = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
     let seen = Arc::clone(&threads);
     device
         .control
@@ -4492,7 +5780,7 @@ fn walk_threads(
 /// behind its process's buffer on another queue answered its `CB_SUBMITTED` and still walked
 #[test]
 fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread() {
-    use reims_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
 
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform, _guest, mut ring) = one_queue(&raised);
@@ -4556,12 +5844,7 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
     );
     let threads = walk_threads(&device);
     beside.send(&device, sampler_command_buffer(obj(1, 2), 300, obj(1, 4)));
-    for _ in 0..3000 {
-        if !threads.lock().is_empty() {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| !threads.lock().is_empty());
     draw.open();
     assert_eq!(
         ring_events(&platform, &mut beside, 1),
@@ -4576,53 +5859,173 @@ fn a_short_buffer_that_waits_for_nothing_is_walked_on_its_queue_s_service_thread
     );
 }
 
+/// A long command buffer, its queue's lane idle, has the lane's thread that waits for a job woken
+/// for it as it is begun (`decode`'s `lane`, "Woken as the buffer is begun"), and is walked on
+/// that thread; a short one, walked on the service thread, wakes nothing. One sent behind a
+/// buffer whose walk the lane holds finds no thread waiting, wakes none, and is walked beside
+/// it and committed after it, in its turn
+#[test]
+fn a_long_buffer_wakes_its_idle_lane_s_thread_as_it_is_begun() {
+    use reims_vgpu_graphics::ops::{RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END};
+
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let threads = walk_threads(&device);
+    let passes: Vec<(u16, &[u8])> = (0..200)
+        .flat_map(|_| {
+            [
+                (RGFX_OP_ENCODER_BEGIN_BLIT, &[][..]),
+                (RGFX_OP_ENCODER_END, &[][..]),
+            ]
+        })
+        .collect();
+    let long = |cb| command_buffer_of(obj(1, 1), cb, &passes);
+    assert!(long(100).len() > super::INLINE_WALK_MAX);
+    let wakes = || device.control.decoder().lane_wakes(obj(1, 1)).unwrap();
+    let complete = |ring: &mut QueueRing, cb| {
+        assert!(complete_until_event(&platform, ring), "no completion");
+        let done = RgfxCbComplete::read_from_bytes(&ring.event().unwrap()).unwrap();
+        assert_eq!((done.cb_obj_id, done.status), (cb, RGFX_CB_OK));
+    };
+    // The first makes the lane's thread, which then waits for a job.
+    ring.send(&device, long(100));
+    complete(&mut ring, 100);
+    assert!(
+        eventually(|| wakes().2 == 1),
+        "the lane's thread: {:?}",
+        wakes()
+    );
+    assert_eq!(
+        wakes().1,
+        0,
+        "an expectation woke a thread before there was one"
+    );
+    ring.send(&device, long(101));
+    complete(&mut ring, 101);
+    assert_eq!(wakes().1, 1, "the begin woke no thread for the long buffer");
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 102, obj(1, 4)));
+    complete(&mut ring, 102);
+    assert_eq!(wakes().1, 1, "a short buffer woke a thread");
+    let walked = threads.lock().clone();
+    assert_eq!(walked.len(), 3, "walks seen: {walked:?}");
+    assert!(
+        walked[..2]
+            .iter()
+            .all(|name| name.starts_with("reims-vgpu.graphics-lane-")),
+        "a long buffer walked off its lane: {walked:?}"
+    );
+    assert!(
+        walked[2].starts_with("reims-vgpu.graphics-queue-"),
+        "the short buffer walked on {:?}",
+        walked[2]
+    );
+
+    // Behind a held walk on the lane's one thread, woken for it: no thread waits, and none is
+    // woken.
+    assert!(eventually(|| wakes().2 == 1));
+    let gate = WalkGate::on(&device);
+    ring.send(&device, long(103));
+    assert!(gate.reached(), "the held walk did not start");
+    assert_eq!(wakes().1, 2, "the begin woke no thread for the held buffer");
+    ring.send(&device, long(104));
+    assert!(
+        gate.passed(400),
+        "the buffer behind was not walked beside the held one"
+    );
+    assert_eq!(
+        wakes().1,
+        2,
+        "an expectation woke a thread with none waiting"
+    );
+    std::thread::sleep(Duration::from_millis(50));
+    assert!(
+        platform.world().committed().is_empty(),
+        "the buffer behind was committed before the held one"
+    );
+    gate.open();
+    committed(&platform, 2);
+    complete(&mut ring, 103);
+    complete(&mut ring, 104);
+}
+
 /// A command buffer that asks for its `CB_SUBMITTED` behind a short buffer its queue's service
 /// thread walks is answered before that walk ends, as behind one a lane's thread walks:
-/// published during the walk, rung for, as the guest rings only for a ring the host marked idle,
-/// which the service thread marks it through the walk, and answered inside the write; and
+/// published during the walk, rung for, as the guest rings for an asking buffer on a ring the
+/// host marked walking, which the service thread marks it through the walk, and answered inside
+/// the write; and
 /// published before the service thread took the buffer before it, by that thread, before the
 /// walk. Each completes after the buffer before it. The service thread held its claim on the
 /// queue's messages through the walk, so the write answered nothing and the buffer was answered
 /// only at its take, after the walk and the commit before it; and once it let the claim go, it
 /// still kept the ring marked busy, so the guest rang no doorbell for a buffer it published
 /// during the walk, which was answered after it all the same: a guest's
-/// `commitAndWaitUntilSubmitted` behind a buffer of fills waited for them
+/// `commitAndWaitUntilSubmitted` behind a buffer of fills waited for them.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which the walk's start does not show alone (`a_doorbell_s_answer_allocates_nothing`): where
+/// the write left the buffer behind the walk, the service thread answers it after the walk, in
+/// order, and a new device's walk is tried, up to 64.
 #[test]
 fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the_walk_ends() {
     let raised = Arc::new(AtomicU32::new(0));
     let ok = u64::from(RGFX_CB_OK);
     // Published, and rung for, during the walk.
-    let (device, platform, _guest, mut ring) = one_queue(&raised);
-    let gate = WalkGate::in_place(&device);
-    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
-    assert!(gate.reached(), "the short buffer's walk did not start");
-    let walked_on = gate.taken_on().unwrap_or_default();
+    let mut answered = false;
+    for _ in 0..64 {
+        let (device, platform, _guest, mut ring) = one_queue(&raised);
+        let gate = WalkGate::in_place(&device);
+        ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+        assert!(gate.reached(), "the short buffer's walk did not start");
+        let walked_on = gate.taken_on().unwrap_or_default();
+        assert!(
+            walked_on.starts_with("reims-vgpu.graphics-queue-"),
+            "the short buffer walked on {walked_on:?}"
+        );
+        assert!(
+            ring.send_as_guest(&device, asking(obj(1, 1), 101)),
+            "the ring was not marked walking during the walk: the guest rang no doorbell"
+        );
+        answered = ring.has_event();
+        if answered {
+            let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
+            assert_eq!(
+                (posted.header.r#type, posted.cb_obj_id),
+                (RGFX_EVT_CB_SUBMITTED, 101)
+            );
+        }
+        gate.open();
+        if answered {
+            assert_eq!(
+                ring_events(&platform, &mut ring, 2),
+                [
+                    (RGFX_EVT_CB_COMPLETE, 100, ok),
+                    (RGFX_EVT_CB_COMPLETE, 101, ok)
+                ]
+            );
+        } else {
+            // Answered by the service thread once the walk ended: its `CB_SUBMITTED` before its
+            // `CB_COMPLETE`, which comes after the buffer before it's.
+            let events = ring_events(&platform, &mut ring, 3);
+            let at = |event: (u32, u64, u64)| events.iter().position(|&e| e == event);
+            let submitted = at((RGFX_EVT_CB_SUBMITTED, 101, 0));
+            let (before, behind) = (
+                at((RGFX_EVT_CB_COMPLETE, 100, ok)),
+                at((RGFX_EVT_CB_COMPLETE, 101, ok)),
+            );
+            assert!(
+                submitted.is_some() && before.is_some() && submitted < behind && before < behind,
+                "{events:?}"
+            );
+        }
+        assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
+        if answered {
+            break;
+        }
+    }
     assert!(
-        walked_on.starts_with("reims-vgpu.graphics-queue-"),
-        "the short buffer walked on {walked_on:?}"
+        answered,
+        "no write of 64 answered the buffer behind the walk"
     );
-    assert!(
-        ring.send_as_guest(&device, asking(obj(1, 1), 101)),
-        "the ring was not marked idle during the walk: the guest rang no doorbell"
-    );
-    assert!(
-        ring.has_event(),
-        "the write did not answer the buffer behind the walk"
-    );
-    let posted = RgfxCbSubmitted::read_from_bytes(&ring.event().unwrap()).unwrap();
-    assert_eq!(
-        (posted.header.r#type, posted.cb_obj_id),
-        (RGFX_EVT_CB_SUBMITTED, 101)
-    );
-    gate.open();
-    assert_eq!(
-        ring_events(&platform, &mut ring, 2),
-        [
-            (RGFX_EVT_CB_COMPLETE, 100, ok),
-            (RGFX_EVT_CB_COMPLETE, 101, ok)
-        ]
-    );
-    assert_eq!(ring.scheduled, [(0, 100), (0, 101)]);
 
     // Published, and rung for, before the service thread took the buffer before it.
     let (device, platform, _guest, mut ring) = one_queue(&raised);
@@ -4657,6 +6060,36 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
     assert_eq!(ring.scheduled, [(0, 200), (0, 201)]);
 }
 
+/// A command buffer that does not ask for its `CB_SUBMITTED`, published while its queue's service
+/// thread walks the buffer before it, rings no doorbell, as the ring is marked walking, not
+/// asleep, and is carried out once the walk is done, after that buffer, with no doorbell: the
+/// thread takes the ring again after the walk. The service thread marked its ring as it marks it
+/// before it sleeps, so the guest rang for each such buffer, a VM exit that answered nothing
+/// (26.7.2 guest, 780M host: 11.9 µs a doorbell, two in three commits of a back-to-back run)
+#[test]
+fn a_buffer_that_does_not_ask_rings_no_doorbell_behind_a_walk() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let ok = u64::from(RGFX_CB_OK);
+    let (device, platform, _guest, mut ring) = one_queue(&raised);
+    let gate = WalkGate::in_place(&device);
+    ring.send(&device, sampler_command_buffer(obj(1, 1), 100, obj(1, 4)));
+    assert!(gate.reached(), "the short buffer's walk did not start");
+    assert_eq!(ring.consumer_idle(), RGFX_CONSUMER_WALKING);
+    assert!(
+        !ring.send_as_guest(&device, sampler_command_buffer(obj(1, 1), 101, obj(1, 4))),
+        "the guest rang for a buffer that does not ask behind a walk"
+    );
+    assert!(!ring.has_event(), "the buffer behind the walk was answered");
+    gate.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_COMPLETE, 100, ok),
+            (RGFX_EVT_CB_COMPLETE, 101, ok)
+        ]
+    );
+}
+
 /// A queue's buffers decide their signals of its surface timeline in their turns: a buffer of
 /// another queue that names the first of two buffers, sent while the first is still walked and
 /// the second, which holds no `SURFACE_ORDER`, has been walked whole beside it, waits on the GPU
@@ -4665,7 +6098,7 @@ fn a_buffer_that_asks_behind_a_walk_on_its_service_thread_is_answered_before_the
 /// buffer would wait for nothing
 #[test]
 fn a_buffer_named_while_its_queue_s_later_buffer_is_walked_first_is_waited_for() {
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_END, RGFX_OP_SURFACE_ORDER,
         RgfxSurfaceOrderWait,
     };
@@ -4878,6 +6311,154 @@ fn a_library_lookup_misses_then_hits_across_two_contexts() {
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
 }
 
+/// A pipeline create that asks for its pipeline key gets it after its reflection where the device
+/// made the pipeline and holds every library it names under a key it checked: two processes'
+/// equal creates, over their own ids of one keyed library, get one key, which the kext keeps their
+/// answer by; a render create is keyed too. A create naming a library held under no key, and one
+/// that does not ask, get the plain reflection.
+#[test]
+fn a_keyed_pipeline_create_answers_its_pipeline_key() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    let made = keyed_library_create(obj(1, 10), &bytes, Some(key));
+    assert_eq!(answered(&device, &mut guest, made), RGFX_STATUS_OK);
+    let found = library_lookup(obj(2, 10), bytes.len(), key);
+    assert_eq!(answered(&device, &mut guest, found), RGFX_STATUS_OK);
+    let unkeyed = keyed_library_create(obj(1, 11), &bytes, None);
+    assert_eq!(answered(&device, &mut guest, unkeyed), RGFX_STATUS_OK);
+
+    let flagged = |mut message: Vec<u8>, at: usize, flag: u32| {
+        let flags = u32::from_le_bytes(message[at..at + 4].try_into().unwrap()) | flag;
+        message[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+        message
+    };
+    let compute = |obj_id, library| {
+        let at = std::mem::offset_of!(RgfxComputePipelineCreate, flags);
+        flagged(
+            compute_pipeline_create(obj_id, library),
+            at,
+            RGFX_COMPUTE_PIPELINE_ANSWER_KEY,
+        )
+    };
+    let render = |obj_id, library| {
+        let at = std::mem::offset_of!(RgfxRenderPipelineCreate, flags);
+        flagged(
+            render_pipeline_create(obj_id, library),
+            at,
+            RGFX_RENDER_PIPELINE_ANSWER_KEY,
+        )
+    };
+    // The reply to `message`: its reflection, and the key after it where it carries one.
+    let mut reply = |message: Vec<u8>| {
+        guest.send(&device, message);
+        let bytes = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+        let (r, _) = RgfxPipelineReflection::read_from_prefix(&bytes).unwrap();
+        assert_eq!(r.status, RGFX_PIPELINE_OK);
+        let at = RGFX_PIPELINE_REFLECTION_KEY_OFFSET as usize;
+        let keyed = r.flags & RGFX_PIPELINE_REFLECT_KEYED != 0;
+        assert_eq!(r.header.size as usize, if keyed { at + 32 } else { at });
+        keyed.then(|| <[u8; 32]>::try_from(&bytes[at..at + 32]).unwrap())
+    };
+
+    let first = reply(compute(obj(1, 12), obj(1, 10))).expect("a keyed library's create is keyed");
+    let second = reply(compute(obj(2, 12), obj(2, 10)));
+    assert_eq!(
+        second,
+        Some(first),
+        "two processes' equal creates have one key"
+    );
+    let drawn = reply(render(obj(1, 13), obj(1, 10))).expect("a render create is keyed");
+    assert_ne!(drawn, first);
+    assert_eq!(
+        reply(compute(obj(1, 14), obj(1, 11))),
+        None,
+        "a library held under no key"
+    );
+    assert_eq!(
+        reply(compute_pipeline_create(obj(1, 15), obj(1, 10))),
+        None,
+        "not asked"
+    );
+}
+
+/// The kext's `PIPELINE_ANSWERS` gets the device's kept answers of keyed creates, each a keyed
+/// reply of the query's seqno with what the device gives each create alone 0, newest first, then
+/// a `COMPLETE` of how many went: a refused create, one not keyed and a query past the last get
+/// none.
+#[test]
+fn the_kext_gets_the_kept_answers_of_keyed_creates() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, _platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let (bytes, key) = keyed_metallib();
+    let made = keyed_library_create(obj(1, 10), &bytes, Some(key));
+    assert_eq!(answered(&device, &mut guest, made), RGFX_STATUS_OK);
+    let keyed = |obj_id, library| {
+        let mut message = compute_pipeline_create(obj_id, library);
+        let at = std::mem::offset_of!(RgfxComputePipelineCreate, flags);
+        let flags = u32::from_le_bytes(message[at..at + 4].try_into().unwrap())
+            | RGFX_COMPUTE_PIPELINE_ANSWER_KEY;
+        message[at..at + 4].copy_from_slice(&flags.to_le_bytes());
+        message
+    };
+    guest.send(&device, keyed(obj(1, 12), obj(1, 10)));
+    let reply = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    let (made, _) = RgfxPipelineReflection::read_from_prefix(&reply).unwrap();
+    assert_ne!(made.flags & RGFX_PIPELINE_REFLECT_KEYED, 0);
+    let at = RGFX_PIPELINE_REFLECTION_KEY_OFFSET as usize;
+    let made_key = <[u8; 32]>::try_from(&reply[at..at + 32]).unwrap();
+    // Not keyed: kept by no one.
+    guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
+    next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+
+    let query = |first: u32, most: u32| {
+        RgfxPipelineAnswersQuery {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_PIPELINE_ANSWERS,
+                size: size_of::<RgfxPipelineAnswersQuery>() as u32,
+                seqno: 0,
+            },
+            first,
+            most,
+        }
+        .as_bytes()
+        .to_vec()
+    };
+    guest.send(&device, query(0, 8));
+    let seqno = guest.seqno;
+    let kept = next_event(&mut guest, RGFX_EVT_PIPELINE_REFLECTION);
+    assert_eq!(kept.len(), at + 32);
+    let (answer, _) = RgfxPipelineReflection::read_from_prefix(&kept).unwrap();
+    assert_eq!(answer.header.seqno, seqno);
+    assert_eq!(answer.header.size as usize, at + 32);
+    assert_eq!(answer.status, RGFX_PIPELINE_OK);
+    assert_ne!(answer.flags & RGFX_PIPELINE_REFLECT_KEYED, 0);
+    assert_eq!(
+        (
+            answer.obj_id,
+            answer.gpu_resource_id,
+            answer.unique_identifier,
+            answer.resource_index
+        ),
+        (0, 0, 0, 0)
+    );
+    assert_eq!(
+        answer.max_total_threads_per_threadgroup,
+        made.max_total_threads_per_threadgroup
+    );
+    assert_eq!(answer.thread_execution_width, made.thread_execution_width);
+    assert_eq!(&kept[at..], &made_key);
+    let done = next_event(&mut guest, RGFX_EVT_COMPLETE);
+    let done = RgfxComplete::read_from_bytes(&done).unwrap();
+    assert_eq!((done.header.seqno, done.status), (seqno, 1));
+    // Past the last: a COMPLETE of none.
+    assert_eq!(answered(&device, &mut guest, query(1, 8)), 0);
+}
+
 /// A create whose key is not the one the host computes from its bytes makes the library for its
 /// request, and keeps it under no key: neither key finds it
 #[test]
@@ -4924,6 +6505,67 @@ fn a_library_with_a_wrong_key_is_not_kept() {
             library_lookup(obj(2, 10), bytes.len(), key)
         ),
         RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(library_makes(&platform), 2);
+}
+
+/// A library whose tags the host cannot vouch for (Core Image's: they are no SHA-256 of their
+/// bitcode) is kept under the key of its whole bytes instead of the guest's: a lookup of the
+/// guest's key misses, one of the whole bytes' key, from another process, finds it with nothing
+/// made again
+#[test]
+fn a_library_the_host_cannot_vouch_for_is_kept_under_its_whole_bytes() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let bitcode = b"one module for every function";
+    let len = u64::try_from(bitcode.len()).expect("its length");
+    let bytes = decode::test_metallib(
+        bitcode,
+        &[
+            (0, len, decode::test_sha(b"not its bitcode")),
+            (0, len, decode::test_sha(b"not its bitcode")),
+        ],
+    );
+    assert_eq!(decode::test_key(&bytes), None);
+    let whole = decode::test_whole_key(&bytes).expect("the whole bytes' key");
+    // The guest's key: the content key it computes, which the host cannot vouch for.
+    let mut guest_key = whole;
+    guest_key[0] ^= 1;
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 10), &bytes, Some(guest_key))
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 10), bytes.len(), guest_key)
+        ),
+        RGFX_STATUS_NOT_FOUND
+    );
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            library_lookup(obj(2, 11), bytes.len(), whole)
+        ),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(library_makes(&platform), 1);
+    // Unkeyed bytes are kept under no key, the whole bytes' neither.
+    assert_eq!(
+        answered(
+            &device,
+            &mut guest,
+            keyed_library_create(obj(1, 12), &bytes, None)
+        ),
+        RGFX_STATUS_OK
     );
     assert_eq!(library_makes(&platform), 2);
 }
@@ -5065,7 +6707,7 @@ fn a_destroy_of_a_pending_library_keeps_the_pipeline_before_it() {
         .expect("the pipeline's reflection");
     assert_eq!(reflection.obj_id, obj(1, 11));
     assert_eq!(reflection.status, RGFX_PIPELINE_OK);
-    assert!(guest.event().is_none());
+    assert!(guest.quiet_for(2000), "a third event");
     assert_eq!(device.decoder_object_count(), 1);
 }
 
@@ -5342,6 +6984,102 @@ fn a_linear_texture_is_made_by_the_platform_s_linear_form() {
     );
 }
 
+/// A `TEXTURE_FROM_BUFFER` of more than one level, WindowServer's 54 x 54 BGRA8 of 6 levels at
+/// 256 bytes a row, is made by the platform's tiled form with the offset and the bytes per row
+/// the guest asked, and one of one level by the public form
+#[test]
+fn a_texture_of_more_levels_over_a_buffer_is_made_by_the_platform_s_tiled_form() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const SIZE: u64 = 0x1_0000;
+    guest.send(&device, block_grant(1, BLOCK, SIZE));
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 1), BLOCK, 0x8000));
+    let (mut tiled, _) =
+        RgfxTextureFromBuffer::read_from_prefix(&texture_from_buffer(obj(1, 2), 1, obj(1, 1)))
+            .unwrap();
+    tiled.offset = 0x4000;
+    tiled.desc = RgfxTextureDescriptor {
+        width: 54,
+        height: 54,
+        mipmap_level_count: 6,
+        usage: 1,
+        ..tiled.desc
+    };
+    guest.send(&device, tiled.as_bytes().to_vec());
+    guest.send(&device, texture_from_buffer(obj(1, 3), 2, obj(1, 1)));
+    // The block holds the buffer and both textures until they go.
+    let status = answered(&device, &mut guest, block_release(1, BLOCK, SIZE));
+    assert_eq!(status, RGFX_STATUS_REFUSED, "the buffer and its textures");
+    assert_eq!(device.decoder_object_count(), 3);
+    let log = platform.call_log();
+    let tiled = log.calls_to("newTiledTextureWithDescriptor:offset:bytesPerRow:");
+    assert_eq!(tiled.len(), 1);
+    assert_eq!(tiled[0].args[1..], [Arg::U64(0x4000), Arg::U64(256)]);
+    let public = log.calls_to("newTextureWithDescriptor:offset:bytesPerRow:");
+    assert_eq!(public.len(), 1, "the one of one level");
+    assert_eq!(public[0].args[1..], [Arg::U64(0), Arg::U64(256)]);
+}
+
+/// A texture's `TEXTURE_DID_MODIFY_DATA` on ring 0 reaches the platform before a command buffer
+/// its process commits after it on a queue's own ring, as a `Managed` range does: the texture's
+/// `didModifyData` comes before the buffer's commit, so a mipmapped texture over a buffer takes
+/// the bytes again at its first use there; one naming no texture reaches no platform call
+#[test]
+fn a_texture_s_modified_data_is_carried_out_before_a_later_command_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    const RING_DATA: u32 = 0x1_0000;
+    let mut guest = Guest::new(&device);
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 1, (SUBMIT, COMPLETE), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    guest.send(&device, resource_id_chunk(1, 0));
+    guest.send(&device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x8000));
+    let (mut tiled, _) =
+        RgfxTextureFromBuffer::read_from_prefix(&texture_from_buffer(obj(1, 3), 1, obj(1, 2)))
+            .unwrap();
+    tiled.desc = RgfxTextureDescriptor {
+        width: 54,
+        height: 54,
+        mipmap_level_count: 6,
+        usage: 1,
+        ..tiled.desc
+    };
+    guest.send(&device, tiled.as_bytes().to_vec());
+    let modified = |obj_id: u64| RgfxTextureDidModifyData {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+    };
+    guest.send(&device, modified(obj(1, 2)).as_bytes().to_vec());
+    guest.send(&device, modified(obj(1, 3)).as_bytes().to_vec());
+    let mut ring = QueueRing::new(&device, SUBMIT, COMPLETE, u64::from(RING_DATA));
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let at = |sel: &str| calls.iter().position(|c| c.sel == sel);
+    let did = at("didModifyData").expect("no didModifyData");
+    assert!(did < at("commit").expect("no commit"));
+    assert_eq!(
+        platform.call_log().calls_to("didModifyData").len(),
+        1,
+        "the buffer's is no texture's"
+    );
+}
+
 /// Whether ring 0's completion ring stays without a new event for about 100 ms.
 fn quiet(guest: &Guest) -> bool {
     std::thread::sleep(Duration::from_millis(100));
@@ -5361,10 +7099,11 @@ fn answer_of(guest: &mut Guest, seqno: u64) -> u32 {
 /// (a present's wait was not seen within 2,000 polls, 2.2 s and 3.3 s, on msi beside other
 /// lanes' builds, where the test passes in under 0.4 s alone). A test that passes polls only
 /// until the state holds.
-const PATIENCE: u32 = 60_000;
+pub(crate) const PATIENCE: u32 = 60_000;
 
-/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held.
-fn eventually(mut done: impl FnMut() -> bool) -> bool {
+/// Polls `done` until it holds, [`PATIENCE`] times at most: whether it held. The decoder's tests
+/// wait with it too.
+pub(crate) fn eventually(mut done: impl FnMut() -> bool) -> bool {
     for _ in 0..PATIENCE {
         if done() {
             return true;
@@ -5372,6 +7111,21 @@ fn eventually(mut done: impl FnMut() -> bool) -> bool {
         std::thread::sleep(Duration::from_millis(1));
     }
     done()
+}
+
+unsafe extern "C" {
+    /// The C library's `exit`, which runs the exit handlers ([`host_exit`]).
+    #[link_name = "exit"]
+    fn c_exit(status: i32) -> !;
+}
+
+/// Ends a test's child as a host ends: through the C library's `exit`, which runs the exit
+/// handlers, the exit gate's hook among them (`reims_vgpu_vulkan::exit_gate`). That is what
+/// `std::process::exit` calls on Unix; on Windows it calls `ExitProcess`, which runs none of them,
+/// where QEMU ends through the C library's.
+pub(crate) fn host_exit(status: i32) -> ! {
+    // SAFETY: the C library's exit, which never returns.
+    unsafe { c_exit(status) }
 }
 
 /// Waits ([`eventually`]) for the platform to hold `n` committed command buffers not yet
@@ -5471,9 +7225,9 @@ fn a_managed_range_is_carried_out_before_a_later_command_buffer() {
     };
     let modified = at(
         "didModifyRange:",
-        Some(Arg::val(&reims_vgpu_core::platform::types::NsRange::new(
-            0x40, 0x10,
-        ))),
+        Some(Arg::val(
+            &reims_vgpu_vulkan::core::platform::types::NsRange::new(0x40, 0x10),
+        )),
     );
     assert!(modified < at("commit", None));
 }
@@ -5526,8 +7280,10 @@ fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
         RGFX_STATUS_OK,
         "ring 0 waited for the walk"
     );
-    let modified = |calls: &[reims_vgpu_core::testkit::calllog::Call]| {
-        let range = Arg::val(&reims_vgpu_core::platform::types::NsRange::new(0x40, 0x10));
+    let modified = |calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call]| {
+        let range = Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
+            0x40, 0x10,
+        ));
         (calls.iter()).position(|c| c.sel == "didModifyRange:" && c.args.first() == Some(&range))
     };
     assert_eq!(
@@ -5548,6 +7304,256 @@ fn a_managed_range_behind_an_answered_walk_holds_up_nothing_on_ring_0() {
         commits[commits.len() - 2] < modified && modified < commits[commits.len() - 1],
         "between the two buffers' commits"
     );
+}
+
+/// A process's queue rings at `submit`, `complete` (data `RING_DATA`), queue `n` of context 1,
+/// on `device`, after the guest granted their blocks.
+fn managed_order_queue(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    n: u64,
+    (submit, complete): (u64, u64),
+) -> QueueRing {
+    const RING_DATA: u32 = 0x1_0000;
+    assert_eq!(
+        create_queue(device, guest, 1, n, (submit, complete), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    QueueRing::new(device, submit, complete, u64::from(RING_DATA))
+}
+
+/// `BUFFER_DID_MODIFY_RANGE` of `obj_id`'s 0x10 bytes at `location`.
+fn modified_range(obj_id: u64, location: u64) -> Vec<u8> {
+    RgfxBufferDidModifyRange {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id,
+        location,
+        length: 0x10,
+    }
+    .as_bytes()
+    .to_vec()
+}
+
+/// Where in `calls` the `didModifyRange:` of the 0x10 bytes at `location` was made.
+fn modified_at(calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call], location: u64) -> usize {
+    let range = Arg::val(&reims_vgpu_vulkan::core::platform::types::NsRange::new(
+        location, 0x10,
+    ));
+    (calls.iter())
+        .position(|c| c.sel == "didModifyRange:" && c.args.first() == Some(&range))
+        .unwrap_or_else(|| panic!("no didModifyRange: at {location:#x}"))
+}
+
+/// Where in `calls` the last `commit` was made.
+fn last_commit(calls: &[reims_vgpu_vulkan::core::testkit::calllog::Call]) -> usize {
+    (calls.iter().rposition(|c| c.sel == "commit")).expect("no commit")
+}
+
+/// A `Managed` buffer's range on ring 0 reaches the platform before the commit of a command
+/// buffer its process sends after it that asks for its `CB_SUBMITTED`, Metal's encode,
+/// `didModifyRange:` and commit, whose doorbell write may answer it on the guest's vCPU. While the
+/// range's `didModifyRange:` is still being made, ring 0 is not carried out through it: the write
+/// answers nothing and nothing is committed, and the buffer is answered and committed after it.
+/// Once ring 0 is carried out through the next range, the write of a buffer that asks answers it
+/// at once, its ticket issued after the range, and its commit still comes after the range.
+///
+/// The write answers a buffer only where no thread holds a lock it tries (`answer_on_doorbell`),
+/// which the range's answer does not show alone (`a_doorbell_s_answer_allocates_nothing`): a
+/// buffer the write left is answered, carried out and committed by the queue's thread, after its
+/// range all the same, and a next range and buffer are sent, up to 64.
+#[test]
+fn a_managed_range_comes_before_a_later_buffer_answered_at_its_doorbell() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let mut ring = managed_order_queue(&device, &mut guest, 1, (SUBMIT, COMPLETE));
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    let held = HeldCall::new();
+    platform
+        .faults()
+        .at("MTLBuffer", "didModifyRange:", 0, Fault::Hold(held.clone()));
+    guest.send(&device, modified_range(obj(1, 2), 0x40));
+    assert!(
+        held.reached(Duration::from_secs(60)),
+        "the range's didModifyRange: was not made"
+    );
+    wait_idle(&device, SUBMIT);
+    assert!(
+        ring.send_as_guest(&device, asking(obj(1, 1), 100)),
+        "the guest rang no doorbell for an idle ring"
+    );
+    assert!(
+        !ring.has_event(),
+        "answered before ring 0 carried out the range"
+    );
+    assert!(
+        platform.world().committed().is_empty(),
+        "committed before the range"
+    );
+    held.open();
+    assert_eq!(
+        ring_events(&platform, &mut ring, 2),
+        [
+            (RGFX_EVT_CB_SUBMITTED, 100, 0),
+            (RGFX_EVT_CB_COMPLETE, 100, u64::from(RGFX_CB_OK))
+        ]
+    );
+    let calls = platform.call_log().calls();
+    assert!(modified_at(&calls, 0x40) < last_commit(&calls));
+
+    let mut answered = false;
+    for n in 0..64 {
+        // Ranges of their own, within the buffer's 0x1000 bytes, and samplers of their own.
+        let location = 0x80 + n * 0x20;
+        guest.send(&device, modified_range(obj(1, 2), location));
+        assert_eq!(
+            sampler_answered(&device, &mut guest, obj(1, 4 + n)),
+            RGFX_STATUS_OK,
+            "ring 0 carried out through the range"
+        );
+        wait_idle(&device, SUBMIT);
+        assert!(
+            ring.send_as_guest(&device, asking(obj(1, 1), 101 + n)),
+            "the guest rang no doorbell for an idle ring"
+        );
+        answered = ring.has_event();
+        if answered {
+            committed(&platform, 1);
+        } else {
+            assert_eq!(
+                ring_events(&platform, &mut ring, 2),
+                [
+                    (RGFX_EVT_CB_SUBMITTED, 101 + n, 0),
+                    (RGFX_EVT_CB_COMPLETE, 101 + n, u64::from(RGFX_CB_OK))
+                ]
+            );
+        }
+        let calls = platform.call_log().calls();
+        assert!(modified_at(&calls, location) < last_commit(&calls));
+        if answered {
+            break;
+        }
+    }
+    assert!(answered, "no write of 64 answered its buffer");
+}
+
+/// A `Managed` buffer's range on ring 0 reaches the platform before the commit of a command
+/// buffer its process sends after it on another of its queues, as on the queue that used it last
+#[test]
+fn a_managed_range_comes_before_a_later_buffer_of_another_queue() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let first = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000,
+    );
+    let second = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+    );
+    let mut ring = managed_order_queue(&device, &mut guest, 1, first);
+    let mut other = managed_order_queue(&device, &mut guest, 5, second);
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    let mut managed = buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000);
+    let options = std::mem::offset_of!(RgfxBufferOverHostMemory, options);
+    managed[options..options + 4].copy_from_slice(&(1u32 << 4).to_le_bytes());
+    guest.send(&device, managed);
+    ring.send(&device, command_buffer(obj(1, 1), 100));
+    committed(&platform, 1);
+    guest.send(&device, modified_range(obj(1, 2), 0x40));
+    other.send(&device, asking(obj(1, 5), 101));
+    committed(&platform, 2);
+    let calls = platform.call_log().calls();
+    assert!(modified_at(&calls, 0x40) < last_commit(&calls));
+}
+
+/// A `Managed` texture's `TEXTURE_REPLACE_REGION` on ring 0 reaches the platform's texture, the
+/// GPU copy of a discrete GPU, before the commit of a command buffer its process sends after it
+/// that asks for its `CB_SUBMITTED`, as a `Managed` buffer's range does
+#[test]
+fn a_managed_texture_s_replaced_region_comes_before_a_later_buffer() {
+    let raised = Arc::new(AtomicU32::new(0));
+    // The device takes the GPU's memory as it is made.
+    let platform = Arc::new(FakePlatform::new());
+    platform.device().set_unified_memory(false);
+    let (device, platform) = headless_over(&raised, platform);
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    const SUBMIT: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+    const COMPLETE: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x2_0000;
+    const BLOCK: u64 = RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x10_0000;
+    let mut guest = Guest::new(&device);
+    let mut ring = managed_order_queue(&device, &mut guest, 1, (SUBMIT, COMPLETE));
+    guest.send(&device, block_grant(1, BLOCK, 0x1_0000));
+    guest.send(&device, resource_id_chunk(1, 0));
+    // 16x16 RGBA8, one level, its rows of 256 bytes: 4096 bytes of CPU copy.
+    guest.send(&device, buffer_over_host_memory(obj(1, 2), BLOCK, 0x1000));
+    let texture = RgfxManagedTextureCreate {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_MANAGED_TEXTURE_CREATE,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        gpu_address: 0,
+        resource_id: 1,
+        cpu_buffer_obj_id: obj(1, 2),
+        bytes_per_block: 4,
+        block_width: 1,
+        block_height: 1,
+        flags: RGFX_MANAGED_TEXTURE_LINEAR,
+        desc: RgfxTextureDescriptor {
+            pixel_format: 70,
+            texture_type: 2,
+            width: 16,
+            height: 16,
+            depth: 1,
+            mipmap_level_count: 1,
+            array_length: 1,
+            sample_count: 1,
+            usage: 1,
+            options: 1 << 4,
+            ..RgfxTextureDescriptor::default()
+        },
+    };
+    guest.send(&device, texture.as_bytes().to_vec());
+    let replace = RgfxTextureReplaceRegion {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_TEXTURE_REPLACE_REGION,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 3),
+        level: 0,
+        slice: 0,
+        origin: [2, 1, 0],
+        size: [4, 3, 1],
+    };
+    guest.send(&device, replace.as_bytes().to_vec());
+    wait_idle(&device, SUBMIT);
+    ring.send_as_guest(&device, asking(obj(1, 1), 100));
+    committed(&platform, 1);
+    let calls = platform.call_log().calls();
+    let replaced = (calls.iter())
+        .position(|c| {
+            c.sel == "replaceRegion:mipmapLevel:slice:withBytes:bytesPerRow:bytesPerImage:"
+        })
+        .expect("no replaceRegion:");
+    assert!(replaced < last_commit(&calls));
 }
 
 /// A library from region chunks is checked against its own process's blocks, whichever process
@@ -6025,7 +8031,7 @@ fn expect_reflection(guest: &mut Guest, obj_id: u64, status: u32) {
 }
 
 /// The platform ending the process at a pipeline's compile or at its function's specialisation
-/// (the Vulkan runtime refusing the compile, which ends the process on the paravirt device)
+/// (the Vulkan runtime refusing the compile, which ends the process outside a refusal scope)
 /// refuses the create in this lane: the reflection is refused, nothing is stored, and the device
 /// goes on, the next creates made
 #[test]
@@ -6052,7 +8058,12 @@ fn a_compile_the_platform_refuses_is_a_refused_reflection() {
     );
     guest.send(&device, compute_pipeline_create(obj(1, 12), obj(1, 10)));
     expect_reflection(&mut guest, obj(1, 12), RGFX_PIPELINE_REFUSED);
-    faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+    faults.at(
+        "MTLLibrary",
+        "newFunctionWithName:constantValues:error:",
+        0,
+        Fault::Crash,
+    );
     guest.send(&device, compute_pipeline_create(obj(1, 13), obj(1, 10)));
     expect_reflection(&mut guest, obj(1, 13), RGFX_PIPELINE_REFUSED);
     assert_eq!(device.decoder_object_count(), 1, "only the library");
@@ -6340,11 +8351,11 @@ fn shared_event_create(obj_id: u64, initial_value: u64) -> Vec<u8> {
 /// A `COMMAND_BUFFER` `cb_obj_id` on queue `queue_obj_id` that signals shared event `event` to 4,
 /// draws with render pipeline `pipeline` in a pass of no attachments, and signals `event` to 5.
 fn render_command_buffer(queue_obj_id: u64, cb_obj_id: u64, pipeline: u64, event: u64) -> Vec<u8> {
-    use reims_graphics::ops::render::{
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
         RgfxOpDrawPrimitives, RgfxOpSetRenderPipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SIGNAL_EVENT,
         RGFX_PASS_FLAG_RT_SIZE, RgfxOpEvent, RgfxOpHeader, RgfxRenderPassDesc,
     };
@@ -6516,16 +8527,16 @@ fn op_of(tag: u16, body: &[u8]) -> (u16, Vec<u8>) {
 /// refused in turn, and its destroy lets the id go.
 #[test]
 fn what_names_a_refused_create_is_dropped_and_its_command_buffer_completes() {
-    use reims_graphics::ops::blit::{
+    use reims_vgpu_graphics::ops::blit::{
         RGFX_OP_BLIT_COPY_TEXTURE_TO_BUFFER, RGFX_OP_BLIT_FILL_BUFFER,
         RgfxBlitOpCopyTextureToBuffer, RgfxBlitOpFillBuffer,
     };
-    use reims_graphics::ops::render::{
+    use reims_vgpu_graphics::ops::render::{
         RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
         RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE, RgfxOpDrawPrimitives, RgfxOpSetFragmentTexture,
         RgfxOpSetRenderPipelineState,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
         RGFX_OP_SIGNAL_EVENT, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE,
         RGFX_RENDER_PASS_COLOR_OFFSET, RgfxOpEvent, RgfxRenderPassColorAttachment,
@@ -6798,10 +8809,8 @@ fn presents_waiting(device: &GraphicsDevice<FakePlatform>, n: usize) {
 
 /// The width of the texture the display shows; `None` for the scanout.
 fn shown_width(device: &GraphicsDevice<FakePlatform>) -> Option<u64> {
-    use reims_vgpu_core::platform::resource::Texture as _;
-    device
-        .control
-        .presented
+    use reims_vgpu_vulkan::core::platform::resource::Texture as _;
+    device.control.presented[0]
         .texture
         .lock()
         .as_ref()
@@ -6880,6 +8889,131 @@ fn a_present_waits_for_the_command_buffer_that_wrote_its_surface() {
     assert_eq!(device.control.pool.favoured(), None);
 }
 
+/// A present shown at its writer's completion, on the platform's thread that runs the buffer's
+/// completion handlers, lets go of the texture the display showed before off that thread: the
+/// release, held here as a driver that takes long to free an import of the guest's pages holds it,
+/// holds up neither the handler nor the present's answer, and comes at the device's next refresh
+#[test]
+fn a_present_shown_at_a_completion_lets_go_of_the_texture_before_off_the_handler_thread() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, mut ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK
+    );
+    let shown = device.control.presented[0]
+        .shown()
+        .expect("the surface shown")
+        .0
+        .id();
+    // The surface again, once buffer 4, which draws it, has finished.
+    ring.publish(command_buffer_at(obj(1, 1), 100, 4));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 1), 4)]);
+    guest.send(&device, present_surface(0x77));
+    let present = guest.seqno;
+    presents_waiting(&device, 1);
+    device.mmio_write(RGFX_REG_DOORBELL.into(), SUBMIT as u32);
+    let ids = committed(&platform, 1);
+
+    let world = Arc::clone(platform.world());
+    let release = HeldCall::new();
+    world.hold_at_release(shown, release.clone());
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::Builder::new()
+        .name("platform-handler".into())
+        .spawn(move || {
+            world.complete(
+                ids[0],
+                CommandBufferStatus::COMPLETED,
+                None,
+                CompleteOn::Caller,
+            );
+            let _ = tx.send(());
+        })
+        .unwrap();
+    assert!(
+        rx.recv_timeout(Duration::from_secs(5)).is_ok(),
+        "the completion handler let go of the texture shown before"
+    );
+    assert_eq!(answer_of(&mut guest, present), RGFX_STATUS_OK);
+    presents_waiting(&device, 0);
+    assert!(
+        release.reached(Duration::from_secs(5)),
+        "the texture shown before was not let go of at a refresh"
+    );
+    release.open();
+    assert_eq!(shown_width(&device), Some(64));
+}
+
+/// A present waits for a writer of a queue created just before it whose handle the host has yet to
+/// make: the device tells the host of the queue before it answers the create, and the guest names
+/// the queue's buffers only after the answer, however late the queue's service thread has the
+/// decoder make the handle. With the service thread of process 1's new queue held there, as a
+/// no-copy buffer of the process being made holds it (`pages_buffers`), a present whose writer is
+/// the queue's first buffer, published on its ring, waits for it; once the thread goes on, the
+/// buffer is taken and committed, and the present is shown, and answered, when it finishes
+#[test]
+fn a_present_waits_for_a_writer_of_a_queue_whose_handle_is_not_yet_made() {
+    const RING_DATA: u32 = 0x1_0000;
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    let (mut guest, _ring) = surface_and_queue(&device);
+    // Process 1's messages so far carried out (the texture over the surface made), and its first
+    // queue's handle made.
+    carried_out_of(&device, &mut guest, 1);
+    let log = platform.call_log();
+    assert!(eventually(|| log.count("newCommandQueue") == 1));
+
+    // Process 1's second queue, answered while its service thread waits for the process's no-copy
+    // buffer before it hands the create to the host.
+    let pages = &device.control.pages_buffers;
+    let held = pages.begin(pages_context(1), 0, device.control.pool.now());
+    let (submit, complete) = (
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x4_0000,
+        RGFX_CONTEXT_ALLOCATIONS_OFFSET + 0x6_0000,
+    );
+    assert_eq!(
+        create_queue(&device, &mut guest, 1, 4, (submit, complete), RING_DATA, 0),
+        RGFX_STATUS_OK
+    );
+    // Its first buffer draws the surface, and the surface is presented.
+    let mut fresh = QueueRing::new(&device, submit, complete, u64::from(RING_DATA));
+    fresh.publish(command_buffer_at(obj(1, 4), 400, 1));
+    write_writers(&device, BLOCK + WRITERS, &[(obj(1, 4), 1)]);
+    guest.send(&device, present_surface(0x77));
+    let world = platform.world();
+    assert!(
+        eventually(|| device.control.presents.waiting() == 1 || shown_width(&device).is_some()),
+        "the present was not carried out"
+    );
+    assert_eq!(shown_width(&device), None, "shown before its writer ran");
+    assert_eq!(device.control.presents.waiting(), 1);
+    assert!(quiet(&guest), "answered before it was shown");
+    assert_eq!(
+        log.count("newCommandQueue"),
+        1,
+        "the new queue's handle was made"
+    );
+
+    // The service thread goes on: the new queue's handle is made and its buffer committed, and
+    // once the buffer finishes the surface shows and the present is answered.
+    drop(held);
+    let ids = committed(&platform, 1);
+    assert_eq!(log.count("newCommandQueue"), 2);
+    presents_waiting(&device, 1);
+    assert!(world.complete(
+        ids[0],
+        CommandBufferStatus::COMPLETED,
+        None,
+        CompleteOn::Caller
+    ));
+    let seqno = guest.seqno;
+    assert_eq!(answer_of(&mut guest, seqno), RGFX_STATUS_OK);
+    assert_eq!(shown_width(&device), Some(64));
+    presents_waiting(&device, 0);
+}
+
 /// A failure the host posts at once, ahead of the buffers before it on its queue, says nothing of
 /// them: a present waiting for the earlier buffer that wrote its surface still waits for that
 /// buffer to finish, and is shown only then
@@ -6925,7 +9059,7 @@ fn a_later_buffer_failed_at_once_shows_no_present_of_an_earlier_writer() {
 /// new layout, the cursor) is on the GPU; once the release is answered, no draw reads the block
 #[test]
 fn a_presented_surface_s_block_waits_for_the_display() {
-    use reims_vgpu_core::platform::command::CommandBuffer as _;
+    use reims_vgpu_vulkan::core::platform::command::CommandBuffer as _;
     let raised = Arc::new(AtomicU32::new(0));
     let (device, platform) = headless_on(&raised);
     let (mut guest, _ring) = surface_and_queue(&device);
@@ -6933,20 +9067,22 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         Arc::clone(&platform),
         &device.control.region,
         &Arc::new(Shown::default()),
-        &device.control.presented,
+        &device.control.presented[0],
     )
     .unwrap();
     // With no window, the present is answered as it is shown.
     let status = answered(&device, &mut guest, present_surface(0x77));
     assert_eq!(status, RGFX_STATUS_OK);
-    let (drawable, _) = device.control.presented.shown().expect("the surface shown");
+    let (drawable, _) = device.control.presented[0]
+        .shown()
+        .expect("the surface shown");
     let rect = reims_vgpu_window::PixelRect {
         x: 0,
         y: 0,
         width: 64,
         height: 64,
     };
-    let (command_buffer, presents) = draw.encode(&drawable, rect).expect("a draw of it");
+    let (command_buffer, presents) = draw.encode(&drawable, rect, None).expect("a draw of it");
     presents.after(&command_buffer);
     no_catch(command_buffer.commit(OnFault::Die));
     let drawing = committed(&platform, 1)[0];
@@ -6969,8 +9105,8 @@ fn a_presented_surface_s_block_waits_for_the_display() {
         "the release was answered while a window draw reads the surface"
     );
     // A draw from here reads nothing of the block: the guest set no scanout either.
-    assert!(device.control.presented.shown().is_none());
-    assert!(draw.encode(&drawable, rect).is_none());
+    assert!(device.control.presented[0].shown().is_none());
+    assert!(draw.encode(&drawable, rect, None).is_none());
 
     let world = platform.world();
     assert!(world.complete(
@@ -7124,7 +9260,7 @@ fn a_present_shows_the_latest_texture_over_its_surface() {
 }
 
 /// The platform dying at its read of a finished command buffer on its own thread (a failure it has
-/// no answer of Metal's for), which ends the process on the paravirt device, fails that command
+/// no answer of Metal's for), which ends the process outside a refusal scope, fails that command
 /// buffer alone, as a GPU error on Metal fails the buffer it struck: its completion is an internal
 /// error, and its context's later work is carried out as any context's, its command buffers,
 /// its creates (its sampler creates and its queue creates among them) and its destroys, as is
@@ -7287,19 +9423,32 @@ fn a_release_the_platform_dies_at_is_refused() {
     assert_eq!(device.decoder_object_count(), 1);
 }
 
-/// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS` and
-/// `HEAP_OVER_PAGES` over it, where
-/// the host's page is the guest's 4 KiB, and says so in `FEATURES_LO`; without one it never does.
+/// With a memory map the device carries out `SURFACE_PAGES`, and `PAGES_BUFFERS`,
+/// `HEAP_OVER_PAGES` and `ICB_SLOTS_IN_PAGES` (`FEATURES_HI` bit 10) over it, and says so in
+/// `FEATURES_LO` and `_HI`: to every guest where the host's page is
+/// the guest's 4 KiB, and on a host of 16 KiB pages only to a guest that takes `PAGES_16K`
+/// (`FEATURES_HI` bit 2), every other reading the features and the device info of a device with
+/// no map; without one it never does.
 /// Every device answers a command buffer's ask for its submission (`CB_SUBMITTED`), orders command
 /// buffers over the IOSurfaces they share (`SURFACE_ORDER`), makes indirect command buffers
 /// (`INDIRECT_COMMAND_BUFFERS`), makes the queues the kext asks unshared on the platform's
 /// unshared queue (`UNSHARED_QUEUES`), tells a producer waiting for room on a full submission
 /// ring of the device's takes (`SUBMIT_ROOM`), reads indirect command buffers' CPU encodes from
 /// slots in the region (`ICB_SLOTS`), lets the guest read the clock its VBLANKs are stamped on
-/// (`HOST_TIME`), and shows the display pipe's colour (`DISPLAY_COLOR`)
+/// (`HOST_TIME`), shows the display pipe's colour (`DISPLAY_COLOR`), posts a waited-for buffer's
+/// `CB_SCHEDULED` at a thread's ask (`SCHEDULED_ASK`, `FEATURES_HI` bit 1), takes the guest's
+/// stamps of its command buffers (`GUEST_TIMES`, `FEATURES_HI` bit 12), and hands the kext the
+/// answers it kept of keyed pipeline creates (`PIPELINE_ANSWERS`, `FEATURES_HI` bit 15). The fake's GPU shares the
+/// CPU's memory, so a device with `SURFACE_PAGES` answers which surfaces need a device cache
+/// (`SURFACE_CACHE_REFUSED`), keeps none of the rest, defers a fresh one of those that would need
+/// one whatever its pages (`SURFACE_DEFERRED_ASK`), within a quarter of its GPU's own memory's
+/// budget, the few pages a process wrote of it without a lock carried in
+/// (`SURFACE_DEFERRED_CARRY`, `FEATURES_HI` bit 0), and has the guest align the surfaces' rows as
+/// its GPU's images take them in place (the device info's `linear_row_alignment`), which a device
+/// of no surface pages leaves as they were
 #[test]
 fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
-    use reims_vgpu_core::testkit::GuestRam;
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
 
     let platform = Arc::new(FakePlatform::new());
     let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
@@ -7319,13 +9468,38 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
-    let want = if platform.vm().page_size() == 4096 {
-        RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_HEAP_OVER_PAGES
-    } else {
-        0
-    };
+    let in_place = RGFX_FEATURE_SURFACE_PAGES
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_HEAP_OVER_PAGES
+        | RGFX_FEATURE_SURFACE_CACHE_REFUSED
+        | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+    let page = platform.vm().page_size();
+    assert!(
+        page == 4096 || page == 16384,
+        "the hosts the library builds for"
+    );
+    let sixteen = page == 16384;
+    let want = if sixteen { 0 } else { in_place };
+    let base = RGFX_FEATURE_CB_SUBMITTED
+        | RGFX_FEATURE_SURFACE_ORDER
+        | RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS
+        | RGFX_FEATURE_UNSHARED_QUEUES
+        | RGFX_FEATURE_SUBMIT_ROOM
+        | RGFX_FEATURE_ICB_SLOTS
+        | RGFX_FEATURE_COMMIT_ORDER
+        | RGFX_FEATURE_HOST_TIME
+        | RGFX_FEATURE_MANAGED_TEXTURE_SLABS
+        | RGFX_FEATURE_MANAGED_BUFFER_SLABS
+        | RGFX_FEATURE_SMALL_ID_CHUNKS
+        | RGFX_FEATURE_DISPLAY_COLOR
+        | RGFX_FEATURE_MESH_PIPELINES
+        | RGFX_FEATURE_SHARED_EVENT_NAMES;
+    let sixteen_bit = if sixteen { RGFX_FEATURE_PAGES_16K } else { 0 };
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
         want | RGFX_FEATURE_CB_SUBMITTED
@@ -7343,12 +9517,95 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MESH_PIPELINES
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
-    assert_eq!(device.mmio_read(RGFX_REG_FEATURES_HI.into()), 0);
-    // The fake's GPU shares the CPU's memory: no caches, so no deferred blocks and no budget.
-    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
-    assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
+    let carries = want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0;
+    let slots_in_pages = if want != 0 {
+        RGFX_FEATURE_ICB_SLOTS_IN_PAGES | RGFX_FEATURE_READ_ONLY_PAGES
+    } else {
+        0
+    };
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+        RGFX_FEATURE_SCHEDULED_ASK
+            | RGFX_FEATURE_DISPLAY_SCALE
+            | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+            | RGFX_FEATURE_DISPLAY_POWER
+            | RGFX_FEATURE_RATE_MAPS
+            | RGFX_FEATURE_FUNCTION_POINTERS
+            | RGFX_FEATURE_DYNAMIC_LIBRARIES
+            | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_PIPELINE_ANSWERS
+            | RGFX_FEATURE_GUEST_TIMES
+            | slots_in_pages
+            | sixteen_bit
+            | if carries {
+                RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+            } else {
+                0
+            }
+    );
+    // The fake's GPU shares the CPU's memory: deferred blocks only where they ask.
+    let budget = if want & RGFX_FEATURE_SURFACE_DEFERRED_ASK != 0 {
+        FAKE_OWN_MEMORY / 4
+    } else {
+        0
+    };
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into())),
+        budget & 0xffff_ffff
+    );
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into())),
+        budget >> 32
+    );
+    let aligned = want & RGFX_FEATURE_SURFACE_PAGES != 0;
+    assert_eq!(
+        u64::from(device_info_of(&device).linear_row_alignment),
+        if aligned {
+            FAKE_LINEAR_ROW_ALIGNMENT
+        } else {
+            0
+        },
+        "the rows of the surfaces that lie in place in their pages"
+    );
+
+    // A guest that takes `PAGES_16K` on a host of 16 KiB pages reads the guest RAM's features,
+    // and the deferred blocks' budget with them; the device info, written before, stays.
+    if sixteen {
+        device.mmio_write(
+            RGFX_REG_DRIVER_FEATURES_HI.into(),
+            u32::try_from(RGFX_FEATURE_PAGES_16K >> 32).unwrap(),
+        );
+        assert_eq!(
+            device.mmio_read(RGFX_REG_FEATURES_LO.into()),
+            in_place | base
+        );
+        assert_eq!(
+            u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+            RGFX_FEATURE_SCHEDULED_ASK
+                | RGFX_FEATURE_DISPLAY_SCALE
+                | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+                | RGFX_FEATURE_DISPLAY_POWER
+                | RGFX_FEATURE_RATE_MAPS
+                | RGFX_FEATURE_FUNCTION_POINTERS
+                | RGFX_FEATURE_DYNAMIC_LIBRARIES
+                | RGFX_FEATURE_PIPELINE_KEYS
+                | RGFX_FEATURE_PIPELINE_ANSWERS
+                | RGFX_FEATURE_GUEST_TIMES
+                | RGFX_FEATURE_ICB_SLOTS_IN_PAGES
+                | RGFX_FEATURE_READ_ONLY_PAGES
+                | RGFX_FEATURE_PAGES_16K
+                | RGFX_FEATURE_SURFACE_DEFERRED_CARRY
+        );
+        assert_eq!(
+            u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()))
+                | u64::from(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into())) << 32,
+            FAKE_OWN_MEMORY / 4
+        );
+        assert_eq!(device_info_of(&device).linear_row_alignment, 0);
+    }
 
     let (device, _) = headless_on(&Arc::new(AtomicU32::new(0)));
+    assert_eq!(device_info_of(&device).linear_row_alignment, 0);
     assert_eq!(
         device.mmio_read(RGFX_REG_FEATURES_LO.into()),
         RGFX_FEATURE_CB_SUBMITTED
@@ -7366,12 +9623,147 @@ fn a_memory_map_gives_the_surface_pages_feature_on_a_guest_sized_page() {
             | RGFX_FEATURE_MESH_PIPELINES
             | RGFX_FEATURE_SHARED_EVENT_NAMES
     );
+    assert_eq!(
+        u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32,
+        RGFX_FEATURE_SCHEDULED_ASK
+            | RGFX_FEATURE_DISPLAY_SCALE
+            | RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA
+            | RGFX_FEATURE_DISPLAY_POWER
+            | RGFX_FEATURE_RATE_MAPS
+            | RGFX_FEATURE_FUNCTION_POINTERS
+            | RGFX_FEATURE_DYNAMIC_LIBRARIES
+            | RGFX_FEATURE_PIPELINE_KEYS
+            | RGFX_FEATURE_PIPELINE_ANSWERS
+            | RGFX_FEATURE_GUEST_TIMES
+    );
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_LO.into()), 0);
     assert_eq!(device.mmio_read(RGFX_REG_DEFERRED_BUDGET_HI.into()), 0);
 }
 
+/// The device offers `DOORBELL_ASKS` only where it can route its queues' plain doorbells: on
+/// Linux, to a host that gives `route_doorbell`. On macOS (QEMU under HVF or TCG, which have no
+/// kernel `ioeventfd`), and to a host with no route function, the bit is not offered, so the
+/// guest rings every doorbell as before it and every write runs through the device's.
+#[test]
+fn doorbell_asks_is_offered_only_where_the_host_routes_doorbells_on_linux() {
+    let offered = |route_doorbell: Option<GraphicsRouteDoorbellFn>| {
+        let config = GraphicsConfig {
+            callbacks: GraphicsCallbacks {
+                route_doorbell,
+                ..GraphicsCallbacks::default()
+            },
+            window: None,
+            memory_map: None,
+            guest_arch: GuestArch::X86_64,
+            doorbell_pages: false,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        word & RGFX_FEATURE_DOORBELL_ASKS != 0
+    };
+    assert!(!offered(None), "offered to a host with no route function");
+    let routes: GraphicsRouteDoorbellFn = Arc::new(|_, _, _| false);
+    assert_eq!(
+        offered(Some(routes)),
+        cfg!(target_os = "linux"),
+        "offered to a host that routes, on Linux alone"
+    );
+}
+
+/// The device offers `DOORBELL_PAGES` where the host maps BAR 4 and hands it its writes, on every
+/// OS, and not otherwise: a guest without it rings every doorbell as before the bit.
+#[test]
+fn doorbell_pages_is_offered_only_where_the_host_maps_bar_4() {
+    let offered = |doorbell_pages: bool| {
+        let config = GraphicsConfig {
+            doorbell_pages,
+            ..GraphicsConfig::default()
+        };
+        let device = GraphicsDevice::with_platform(Arc::new(FakePlatform::new()), config).unwrap();
+        let word = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+        word & RGFX_FEATURE_DOORBELL_PAGES != 0
+    };
+    assert!(!offered(false), "offered to a host that maps no BAR 4");
+    assert!(offered(true), "not offered to a host that maps BAR 4");
+}
+
+/// A device on a GPU of its own memory with a memory map on a guest-sized page offers the
+/// surfaces' pages with a device cache of each (`SURFACE_CACHE`), deferring fresh ones
+/// (`SURFACE_DEFERRED`, `SURFACE_DEFERRED_CARRY`), and has the guest align the surfaces' rows as
+/// its GPU's linear images take them in place (the device info's `linear_row_alignment`), as a
+/// device on a GPU that shares the CPU's memory does: a texture over a cache in the pages' layout
+/// lies at the guest's rows too. On a host of 16 KiB pages it offers neither to a guest that
+/// takes no `PAGES_16K`, and leaves the rows as they were.
+#[test]
+fn a_gpu_of_its_own_memory_has_the_guest_align_its_surfaces_rows_too() {
+    use reims_vgpu_vulkan::core::testkit::GuestRam;
+
+    let platform = Arc::new(FakePlatform::new());
+    platform.device().set_unified_memory(false);
+    let ram = GuestRam::with_range(0x10_0000, 0x10_0000).unwrap();
+    platform.fake_vm().adopt(&ram);
+    let mut map = crate::MemoryMap::new();
+    for r in ram.ranges() {
+        // SAFETY: the fake RAM stays mapped while the test, which holds it, runs.
+        unsafe {
+            map.push(
+                r.physical_address,
+                r.physical().physical_length,
+                r.host().as_ptr(),
+            );
+        }
+    }
+    let config = GraphicsConfig {
+        memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
+    let sixteen = platform.vm().page_size() == 16384;
+    let low = device.mmio_read(RGFX_REG_FEATURES_LO.into());
+    let high = u64::from(device.mmio_read(RGFX_REG_FEATURES_HI.into())) << 32;
+    let pages = RGFX_FEATURE_SURFACE_PAGES
+        | RGFX_FEATURE_PAGES_BUFFERS
+        | RGFX_FEATURE_HEAP_OVER_PAGES
+        | RGFX_FEATURE_SURFACE_CACHE
+        | RGFX_FEATURE_SURFACE_DEFERRED;
+    let asking = RGFX_FEATURE_SURFACE_CACHE_REFUSED | RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+    assert_eq!(low & (pages | asking), if sixteen { 0 } else { pages });
+    assert_eq!(
+        low & RGFX_FEATURE_MANAGED_AT_OFFSET,
+        RGFX_FEATURE_MANAGED_AT_OFFSET,
+        "two copies of a Managed resource on a GPU of its own memory"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_SURFACE_DEFERRED_CARRY != 0,
+        !sixteen,
+        "a deferral's carried pages"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_ICB_SLOTS_IN_PAGES != 0,
+        !sixteen,
+        "indirect command buffers' slots in a process's own pages"
+    );
+    assert_eq!(
+        high & RGFX_FEATURE_READ_ONLY_PAGES != 0,
+        !sixteen,
+        "pages blocks of memory a process maps read-only"
+    );
+    assert_eq!(
+        u64::from(device_info_of(&device).linear_row_alignment),
+        if sixteen {
+            0
+        } else {
+            FAKE_LINEAR_ROW_ALIGNMENT
+        },
+        "the surfaces' rows at the GPU's linear row alignment"
+    );
+}
+
 /// The deferred blocks' budget is a quarter of the GPU's own memory's where the device offers
-/// `SURFACE_DEFERRED`, and 0 where it does not
+/// `SURFACE_DEFERRED`, or `SURFACE_DEFERRED_ASK` on a GPU that shares the CPU's memory, and 0
+/// where it offers neither
 #[test]
 fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
     let deferred = u64::from(RGFX_FEATURE_SURFACE_CACHE | RGFX_FEATURE_SURFACE_DEFERRED);
@@ -7380,8 +9772,12 @@ fn the_deferred_budget_is_a_quarter_of_the_gpus_own_memory() {
         super::deferred_budget(deferred, 0xcf5c_2c000),
         0xcf5c_2c000 / 4
     );
+    let asking = u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED | RGFX_FEATURE_SURFACE_DEFERRED_ASK);
+    assert_eq!(super::deferred_budget(asking, 16 << 30), 4 << 30);
     let cached = u64::from(RGFX_FEATURE_SURFACE_CACHE);
     assert_eq!(super::deferred_budget(cached, 16 << 30), 0);
+    let refused = u64::from(RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    assert_eq!(super::deferred_budget(refused, 16 << 30), 0);
 }
 
 /// What the poison-fill tests write over the guest's memory before the host answers into it: a
@@ -7715,12 +10111,7 @@ fn a_reset_drops_every_object_the_guest_made() {
             RGFX_STATUS_OK
         );
         guest.send(&device, event_create(obj(2, 1)));
-        for _ in 0..2000 {
-            if device.decoder_object_count() == 5 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
+        eventually(|| device.decoder_object_count() == 5);
         assert_eq!(device.decoder_object_count(), 5);
         assert_eq!(device.graphics_queue_count(), 1);
     };
@@ -7731,12 +10122,7 @@ fn a_reset_drops_every_object_the_guest_made() {
     assert_eq!(texture.len(), 1);
 
     device.reset();
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(
         device.decoder_object_count(),
         0,
@@ -7755,28 +10141,19 @@ fn a_reset_drops_every_object_the_guest_made() {
     assert_ne!(again, texture, "a texture of its own");
 }
 
-/// Waits about 2 s for the decoder to hold `n` objects; whether it came to. A queue's handle is
+/// Waits, [`PATIENCE`] polls at most, for the decoder to hold `n` objects; whether it came to. A queue's handle is
 /// made on its service thread, which may start after the queue's create is answered.
 fn holds_objects(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+    eventually(|| device.decoder_object_count() == n)
 }
 
-/// Waits about 2 s for the decoder's reset, on the control thread, to have dropped every object
+/// Waits, [`PATIENCE`] polls at most, for the decoder's reset, on the control thread, to have dropped every object
 /// of the guest's.
 fn reset_done(device: &GraphicsDevice<FakePlatform>) {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            return;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    panic!("the reset left the guest's objects");
+    assert!(
+        eventually(|| device.decoder_object_count() == 0),
+        "the reset left the guest's objects"
+    );
 }
 
 /// Zeroes a queue's ring headers, as the guest's bundle does before its `QUEUE_CREATE`.
@@ -7903,12 +10280,7 @@ fn a_library_made_across_a_reset_is_not_in_the_new_device_s_cache() {
     device.reset();
     reset_done(&device);
     device.control.pool.release();
-    for _ in 0..2000 {
-        if library_makes(&platform) == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| library_makes(&platform) == 1);
     assert_eq!(library_makes(&platform), 1, "the held make never ran");
     std::thread::sleep(Duration::from_millis(100));
     assert_eq!(
@@ -7950,15 +10322,15 @@ fn an_icb_is_written_through_slots_and_executed_through_the_rings() {
 /// An indirect command buffer made, its command 1 written by the CPU (as slots where `slots`, as
 /// records else), and executed by a command buffer posted after.
 fn icb_through_the_rings(slots: bool) {
-    use reims_graphics::icb::{
+    use reims_vgpu_graphics::icb::{
         RGFX_ICB_OP_DISPATCH_THREADGROUPS, RGFX_ICB_OP_KERNEL_BUFFER, RGFX_ICB_SLOT_ACTION,
         RGFX_ICB_SLOT_BUFFER_0, RgfxIcbBuffer, RgfxIcbComputeSlot, RgfxIcbDispatch, RgfxIcbRecord,
         RgfxIcbSlotBuffer,
     };
-    use reims_graphics::ops::compute::{
+    use reims_vgpu_graphics::ops::compute::{
         RGFX_OP_COMPUTE_EXECUTE_COMMANDS_IN_BUFFER, RgfxComputeOpExecuteCommandsInBuffer,
     };
-    use reims_graphics::ops::{
+    use reims_vgpu_graphics::ops::{
         RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_END, RgfxComputePassDesc, RgfxOpHeader,
     };
     let raised = Arc::new(AtomicU32::new(0));
@@ -8371,12 +10743,13 @@ fn surface_device(
 ) -> (
     GraphicsDevice<FakePlatform>,
     Arc<FakePlatform>,
-    reims_vgpu_core::testkit::GuestRam,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
     u64,
 ) {
     let platform = Arc::new(FakePlatform::new());
     let page = platform.vm().page_size();
-    let ram = reims_vgpu_core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
+    let ram =
+        reims_vgpu_vulkan::core::testkit::GuestRam::with_range(SURFACE_RAM, pages * page).unwrap();
     platform.fake_vm().adopt(&ram);
     let mut map = crate::MemoryMap::new();
     for r in ram.ranges() {
@@ -8393,6 +10766,9 @@ fn surface_device(
         callbacks: GraphicsCallbacks::default(),
         window: None,
         memory_map: Some(map),
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -8462,15 +10838,9 @@ fn buffer_over_surface_pages(obj_id: u64, length: u64) -> Vec<u8> {
     .to_vec()
 }
 
-/// Waits, about 2 s at most, for the decoder to hold `n` objects; whether it did.
+/// Waits, [`PATIENCE`] polls at most, for the decoder to hold `n` objects; whether it did.
 fn objects_become(device: &GraphicsDevice<FakePlatform>, n: usize) -> bool {
-    for _ in 0..2000 {
-        if device.decoder_object_count() == n {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
-    false
+    eventually(|| device.decoder_object_count() == n)
 }
 
 /// The `COMPLETE` `bytes` is: its seqno and status.
@@ -8549,14 +10919,7 @@ fn a_reset_drops_a_surface_pages_not_yet_carried_out() {
     guest.send(&device, surface_pages(&device, page, &[(1, 1)]));
     std::thread::sleep(Duration::from_millis(20));
     device.reset();
-    let mut reset = false;
-    for _ in 0..2000 {
-        if worker.views_of_surfaces().resets() == 1 {
-            reset = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let reset = eventually(|| worker.views_of_surfaces().resets() == 1);
     assert!(reset, "the reset waited for the worker");
     worker.surface_worker().release();
     worker.surface_worker().flush();
@@ -8588,6 +10951,62 @@ fn buffer_over_pages(obj_id: u64, length: u64) -> Vec<u8> {
     }
     .as_bytes()
     .to_vec()
+}
+
+/// Two `BUFFER_OVER_PAGES` over one pages block, as the guest sends for two no-copy buffers over
+/// the same bytes (Apple's OpenCL makes one over its staging pages at each write), lie in
+/// its one view: the view and its import are made once, and a buffer over the view for each. The
+/// block's release is refused while either lives, and answered once both are destroyed
+#[test]
+fn two_buffers_over_one_pages_block_lie_in_its_one_view() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    let mark = platform.call_log().mark();
+
+    guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
+    guest.send(&device, buffer_over_pages(obj(1, 12), 3 * page));
+    assert!(objects_become(&device, 2), "both buffers made");
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    let buffers = made
+        .iter()
+        .filter(|&&s| s == "newBufferWithDescriptor:")
+        .count();
+    assert_eq!(
+        buffers, 3,
+        "the view's import, and a buffer over it for each: {made:?}"
+    );
+    assert_eq!(worker.views_of_surfaces().counts().private, 1, "one view");
+
+    let release = || block_release(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE);
+    assert_eq!(
+        answered(&device, &mut guest, release()),
+        RGFX_STATUS_REFUSED,
+        "both lie in it"
+    );
+    guest.send(&device, object_destroy(obj(1, 11)));
+    assert_eq!(
+        answered(&device, &mut guest, release()),
+        RGFX_STATUS_REFUSED,
+        "the second lies in it"
+    );
+    guest.send(&device, object_destroy(obj(1, 12)));
+    assert_eq!(answered(&device, &mut guest, release()), RGFX_STATUS_OK);
 }
 
 /// A pages block's view, which its first `BUFFER_OVER_PAGES` makes, is made off ring 0's threads:
@@ -8665,6 +11084,77 @@ fn a_pages_block_s_view_is_made_off_ring_0_and_its_context_waits_for_it() {
     assert!(guest.event_now().is_none(), "nothing else answered");
 }
 
+/// A heap over a pages block of several runs, a slab of plain pages, makes the block's view off
+/// ring 0's threads as a no-copy buffer does: while it is being made, ring 0 goes on with another
+/// context's messages, and the heap's context's next message waits for it; then the view and the
+/// heap over it are made, and the message after it. The view is 4 pages, so the heap of 3 rounded
+/// up to Metal's 16 KiB page fits it on a host of 4 KiB pages
+#[test]
+fn a_heap_over_a_pages_block_s_view_is_made_off_ring_0() {
+    let (device, platform, _ram, page) = surface_device(8);
+    let mut guest = Guest::new(&device);
+    guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages(&device, page, &[(5, 2), (1, 2)]);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(&device, pages);
+    let pages_seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (pages_seqno, RGFX_STATUS_OK));
+    let worker = device.control.decoder();
+    worker.surface_worker().flush();
+    worker.surface_worker().hold();
+    let mark = platform.call_log().mark();
+
+    let heap = RgfxHeapOverPages {
+        header: RgfxMsgHeader {
+            r#type: RGFX_CMD_HEAP_OVER_PAGES,
+            size: 0,
+            seqno: 0,
+        },
+        obj_id: obj(1, 11),
+        gpu_address: 0x2_0000_0000,
+        block_offset: SURFACE_BLOCK,
+        block_size: SURFACE_BLOCK_SIZE,
+        size_bytes: 3 * page,
+        options: 0,
+        heap_type: 1,
+    };
+    guest.send(&device, heap.as_bytes().to_vec());
+    guest.send(&device, event_create(obj(2, 10)));
+    assert!(objects_become(&device, 1), "ring 0 went on past it");
+    guest.send(&device, event_create(obj(1, 12)));
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the heap's context waits for its view"
+    );
+    let sels = platform.call_log().sels_since(mark);
+    assert!(
+        !sels.contains(&"newHeapWithDescriptor:"),
+        "no heap made yet: {sels:?}"
+    );
+
+    worker.surface_worker().release();
+    assert!(
+        objects_become(&device, 3),
+        "the heap, then the event after it"
+    );
+    worker.surface_worker().flush();
+    let made = platform.call_log().sels_since(mark);
+    assert!(
+        made.contains(&"newHeapWithDescriptor:"),
+        "the heap over the view: {made:?}"
+    );
+    assert_eq!(worker.views_of_surfaces().counts().private, 1);
+}
+
 /// A command buffer of a context whose no-copy buffer is being made on the surface worker is not
 /// answered at its doorbell, though it asks for its `CB_SUBMITTED` and need wait for nothing
 /// else: the doorbell write returns with nothing on its queue's ring, and the queue's thread
@@ -8691,17 +11181,7 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
         RGFX_STATUS_OK
     );
     let mut ring = QueueRing::new(&device, SUBMIT_OFF, COMPLETE_OFF, u64::from(RING_DATA));
-    for _ in 0..2000 {
-        // SAFETY: as `QueueRing`'s helpers; `consumer_idle` is at 0x80 of the submission ring.
-        let idle = unsafe {
-            AtomicU32::from_ptr(device.region_base().add(SUBMIT_OFF as usize + 0x80).cast())
-                .load(Ordering::SeqCst)
-        };
-        if idle == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    wait_idle(&device, SUBMIT_OFF);
     ring.arm();
     guest.send(&device, block_grant(1, SURFACE_BLOCK, SURFACE_BLOCK_SIZE));
     let mut pages = surface_pages(&device, page, &[(5, 2), (1, 1)]);
@@ -8722,18 +11202,12 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     let mark = platform.call_log().mark();
 
     guest.send(&device, buffer_over_pages(obj(1, 11), 3 * page));
-    let mut handed = false;
-    for _ in 0..2000 {
-        if device
+    let handed = eventually(|| {
+        device
             .control
             .pages_buffers
             .any(std::iter::once(pages_context(context)))
-        {
-            handed = true;
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    });
     assert!(handed, "ring 0 handed the buffer to the worker");
     ring.publish(asking(queue, 100));
     device.mmio_write_taking(RGFX_REG_DOORBELL.into(), SUBMIT_OFF as u32);
@@ -8748,14 +11222,7 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
     assert_eq!(buffers(&platform.call_log().sels_since(mark)), 0);
 
     worker.surface_worker().release();
-    let mut submitted = None;
-    for _ in 0..2000 {
-        if ring.has_event() {
-            submitted = ring.event();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    let submitted = ring.event();
     let posted = RgfxCbSubmitted::read_from_bytes(&submitted.expect("a CB_SUBMITTED")).unwrap();
     assert_eq!(
         (posted.header.r#type, posted.cb_obj_id),
@@ -8767,15 +11234,11 @@ fn a_buffer_of_a_context_making_a_pages_buffer_is_not_answered_at_its_doorbell()
         2,
         "the view's import and the buffer over it, before the command buffer: {made:?}"
     );
-    let mut done = None;
-    for _ in 0..3000 {
+    eventually(|| {
         platform.world().complete_all(CompleteOn::Caller);
-        if ring.has_event() {
-            done = ring.event();
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+        ring.has_event()
+    });
+    let done = ring.event();
     let done = RgfxCbComplete::read_from_bytes(&done.expect("a CB_COMPLETE")).unwrap();
     assert_eq!((done.cb_obj_id, done.status), (100, RGFX_CB_OK));
 }
@@ -8854,13 +11317,10 @@ fn a_close_s_slow_release_of_a_pages_view_holds_up_no_other_context_s_pages() {
     let world = platform.world();
     // The buffer over the view goes once the walks and workers that saw it let it go.
     let mut imports = world.live("MTLBuffer");
-    for _ in 0..2000 {
-        if imports.len() == 1 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
+    eventually(|| {
         imports = world.live("MTLBuffer");
-    }
+        imports.len() == 1
+    });
     assert_eq!(imports.len(), 1, "the view's import alone: {imports:?}");
     let release = HeldCall::new();
     world.hold_at_release(imports[0], release.clone());
@@ -8999,12 +11459,7 @@ fn a_reset_waits_for_a_close_s_slow_release() {
         "the reset went on before the close let go of its sampler"
     );
     release.open();
-    for _ in 0..2000 {
-        if device.decoder_object_count() == 0 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(1));
-    }
+    eventually(|| device.decoder_object_count() == 0);
     assert_eq!(
         device.decoder_object_count(),
         0,
@@ -9014,7 +11469,6 @@ fn a_reset_waits_for_a_close_s_slow_release() {
 }
 
 /// A colour matrix of `rows` for display 0's transaction 1, in one `DISPLAY_COLOR` part.
-#[cfg(target_os = "macos")]
 fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
     let mut bytes = RgfxDisplayColor {
         header: RgfxMsgHeader {
@@ -9038,21 +11492,23 @@ fn color_matrix(rows: [[f32; 4]; 3]) -> Vec<u8> {
     bytes
 }
 
-/// On Metal, a display colour of the identity matrix reads as no colour: the scanout's bytes as
-/// the guest wrote them, its alpha included (a colour pass would make it opaque), with each of
-/// blue, green and red taking all 256 values; a matrix off the identity still draws through the
-/// colour, which swaps red and blue here and makes every pixel opaque
-#[cfg(target_os = "macos")]
+/// On the Vulkan platform, a display colour of the identity matrix reads as no colour: the
+/// scanout's bytes as the guest wrote them, its alpha included (a colour pass would make it
+/// opaque), with each of blue, green and red taking all 256 values; a matrix off the identity
+/// still draws through the colour, which swaps red and blue here and makes every pixel opaque
 #[test]
-fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+fn on_vulkan_an_identity_colour_matrix_reads_as_no_colour() {
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (256usize, 4usize, 1024usize);
@@ -9104,7 +11560,7 @@ fn on_metal_an_identity_colour_matrix_reads_as_no_colour() {
         ]),
     );
     assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
-    assert!(device.control.presented.color().1.is_identity());
+    assert!(device.control.presented[0].color().1.is_identity());
     assert_eq!(read(), guest_pixels, "with the identity matrix");
 
     guest.send(
@@ -9223,7 +11679,7 @@ fn a_read_of_the_display_draws_what_it_shows() {
         answered(&device, &mut guest, present_surface(0x77)),
         RGFX_STATUS_OK
     );
-    let surface = Handle::clone_ref(&device.control.presented.shown().unwrap().0);
+    let surface = Handle::clone_ref(&device.control.presented[0].shown().unwrap().0);
     let mark = log.mark();
     assert_eq!(device.read_display(&mut dst), (mode, Ok(())));
     let copies: Vec<_> = (log.since(mark).into_iter())
@@ -9235,19 +11691,82 @@ fn a_read_of_the_display_draws_what_it_shows() {
     assert!(quiet(&guest), "a read told the guest something");
 }
 
-/// On Metal, the read gives the guest's pixels: a scanout smaller than the mode shows at its top
-/// left, B, G, R and A as the guest wrote them, and the rest of the mode is black
-#[cfg(target_os = "macos")]
+/// While the display's panel is off (`SET_DISPLAY_POWER`), a read of the display clears its
+/// texture to black and reads neither the scanout nor the presented surface; the guest's presents
+/// are answered as with the panel on. Once the panel is on, the read copies the presented
+/// surface again. The guest is told nothing of any read
 #[test]
-fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
-    let platform = reims_vgpu_metal::MetalPlatform::process();
+fn a_read_of_the_display_is_black_while_its_panel_is_off() {
+    let raised = Arc::new(AtomicU32::new(0));
+    let (device, platform) = headless_on(&raised);
+    platform.world().set_auto_complete(Some(CompleteOn::Thread));
+    let log = platform.call_log();
+    let mut dst = vec![7u8; 1920 * 1080 * 4];
+    let (mut guest, _ring) = surface_and_queue(&device);
+    assert_eq!(
+        answered(&device, &mut guest, set_scanout(64, 32, 256)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        answered(&device, &mut guest, present_surface(0x77)),
+        RGFX_STATUS_OK,
+        "a present while the panel is off"
+    );
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let sels = log.sels_since(mark);
+    let count = |sel: &str| sels.iter().filter(|s| **s == sel).count();
+    assert_eq!(
+        count(SCANOUT_BLIT),
+        0,
+        "a read while the panel is off blitted"
+    );
+    assert_eq!(
+        count(SURFACE_COPY),
+        0,
+        "a read while the panel is off copied"
+    );
+    assert_eq!(count("renderCommandEncoderWithDescriptor:"), 1, "the clear");
+    assert_eq!(count("commit"), 1);
+    assert_eq!(count("waitUntilCompleted"), 1);
+    assert!(quiet(&guest), "a read told the guest something");
+
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    let mark = log.mark();
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let sels = log.sels_since(mark);
+    assert_eq!(sels.iter().filter(|s| **s == SURFACE_COPY).count(), 1);
+    assert!(quiet(&guest), "a read told the guest something");
+}
+
+/// On the Vulkan platform, the read gives the guest's pixels: a scanout smaller than the mode
+/// shows at its top left, B, G, R and A as the guest wrote them, and the rest of the mode is black.
+/// While the display's panel is off the read is black all over, and once it is on the scanout's
+/// pixels show again
+#[test]
+fn on_vulkan_a_read_of_the_display_gives_the_scanout_s_pixels() {
+    let platform = crate::singleton::platform();
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: None,
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(platform, config).unwrap();
     let (width, height, stride) = (64usize, 32usize, 256usize);
@@ -9279,6 +11798,291 @@ fn on_metal_a_read_of_the_display_gives_the_scanout_s_pixels() {
     for (x, y) in [(64, 0), (0, 32), (1919, 1079), (100, 100)] {
         assert_eq!(at(x, y), [0, 0, 0, 0xff], "({x}, {y}) is not black");
     }
+
+    assert_eq!(
+        answered(&device, &mut guest, display_power(0)),
+        RGFX_STATUS_OK
+    );
+    dst.fill(7);
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    assert!(
+        dst.chunks(4).all(|p| p == [0, 0, 0, 0xff]),
+        "a read while the panel is off is not black"
+    );
+    assert_eq!(
+        answered(&device, &mut guest, display_power(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(device.read_display(&mut dst), ((1920, 1080), Ok(())));
+    let at = |x: usize, y: usize| &dst[(y * 1920 + x) * 4..][..4];
+    for y in 0..height {
+        for x in 0..width {
+            assert_eq!(at(x, y), pixel(x, y), "({x}, {y}) once the panel is on");
+        }
+    }
+}
+
+/// The pixel the odd-width reads put at `(x, y)`, B, G, R and A: no two alike within 7 rows
+fn odd_width_pixel(x: usize, y: usize) -> [u8; 4] {
+    let v = x * 7 + y * 131;
+    [v as u8, (v >> 8) as u8, (x ^ y) as u8, 0xff]
+}
+
+/// How a read of `width` × `height` pixels, rows of `width * 4` bytes, differs from `want`: the
+/// count and the first, or `None` where every pixel is `want`'s
+fn read_differs(
+    dst: &[u8],
+    (width, height): (usize, usize),
+    want: impl Fn(usize, usize) -> [u8; 4],
+) -> Option<String> {
+    let got = |x: usize, y: usize| <[u8; 4]>::try_from(&dst[(y * width + x) * 4..][..4]).unwrap();
+    let differ: Vec<(usize, usize)> = (0..height)
+        .flat_map(|y| (0..width).map(move |x| (x, y)))
+        .filter(|&(x, y)| got(x, y) != want(x, y))
+        .collect();
+    let &(x, y) = differ.first()?;
+    Some(format!(
+        "{} pixels differ, the first at ({x}, {y}): {:?} for {:?}",
+        differ.len(),
+        got(x, y),
+        want(x, y)
+    ))
+}
+
+/// On the Vulkan platform, a read at a mode of the scanout's size, as a window that size reads,
+/// gives the guest's pixels row for row at widths that are not a multiple of 4, with rows of the
+/// width's bytes or padded to 64 or 256 bytes: through no colour (the blit), a matrix that swaps
+/// red and blue (the colour's fragment), and a post-gamma ramp that inverts every channel (the
+/// table's fragment)
+#[test]
+fn on_vulkan_a_read_at_an_odd_width_gives_the_scanout_row_for_row() {
+    let platform = crate::singleton::platform();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let keep = || {
+        let mut present = RgfxPresentSurface::read_from_bytes(&present_surface(0)).unwrap();
+        present.flags = RGFX_PRESENT_KEEP;
+        present.as_bytes().to_vec()
+    };
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let swap = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ];
+    // Each colour's name, its messages, and what it makes of a pixel.
+    type Colour = (&'static str, Vec<Vec<u8>>, fn([u8; 4]) -> [u8; 4]);
+    let colours: [Colour; 3] = [
+        ("no colour", vec![], |p| p),
+        (
+            "red and blue swapped",
+            vec![color_matrix(swap)],
+            |[b, g, r, _]| [r, g, b, 0xff],
+        ),
+        (
+            "inverted by a ramp",
+            vec![
+                color_matrix(identity),
+                display_color_entries(RGFX_COLOR_POST_GAMMA, &[[1.0; 3], [0.0; 3]]),
+            ],
+            |[b, g, r, _]| [255 - b, 255 - g, 255 - r, 0xff],
+        ),
+    ];
+    let height = 7usize;
+    let mut wrong = Vec::new();
+    for (width, stride) in [
+        (3662usize, 3662usize * 4),
+        (3662, 14656),
+        (3662, 14848),
+        (1831, 7360),
+        (1001, 1001 * 4),
+    ] {
+        // SAFETY: the scanout lies in the device's region, mapped while the device lives.
+        unsafe {
+            let base = device.region_base().add(RGFX_ALLOCATIONS_OFFSET as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let p = odd_width_pixel(x, y);
+                    std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+        }
+        let scanout = set_scanout(width as u32, height as u32, stride as u32);
+        assert_eq!(answered(&device, &mut guest, scanout), RGFX_STATUS_OK);
+        let mode = Mode {
+            width: width as u32,
+            height: height as u32,
+            refresh_mhz: 60_000,
+            scale_120ths: 0,
+        };
+        let read = device.reads[0].at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
+        for (name, messages, want) in &colours {
+            if !messages.is_empty() {
+                for m in messages {
+                    guest.send(&device, m.clone());
+                }
+                assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+            }
+            let mut dst = vec![7u8; width * height * 4];
+            assert_eq!(read.read(&mut dst), ((width as u32, height as u32), Ok(())));
+            let expected = |x: usize, y: usize| want(odd_width_pixel(x, y));
+            if let Some(differ) = read_differs(&dst, (width, height), expected) {
+                wrong.push(format!(
+                    "{width} wide, rows of {stride} bytes, {name}: {differ}"
+                ));
+            }
+        }
+        // No colour again for the next scanout.
+        guest.send(&device, color_matrix(identity));
+        guest.send(&device, display_color_entries(RGFX_COLOR_POST_GAMMA, &[]));
+        assert_eq!(answered(&device, &mut guest, keep()), RGFX_STATUS_OK);
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// On the Vulkan platform, a presented IOSurface at a width that is not a multiple of 4, its rows
+/// padded to 64 bytes as a guest's IOSurface rows are, reads row for row at a mode of its size,
+/// rendered to (shadowed) and read only (in place): copied as the guest wrote it with no colour,
+/// and drawn through a matrix that swaps red and blue
+#[test]
+fn on_vulkan_a_presented_surface_at_an_odd_width_reads_row_for_row() {
+    const RING_DATA: u32 = 0x1_0000;
+    let platform = crate::singleton::platform();
+    let config = GraphicsConfig {
+        callbacks: GraphicsCallbacks::default(),
+        window: None,
+        memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
+    };
+    let device = GraphicsDevice::with_platform(platform, config).unwrap();
+    device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
+    let mut guest = Guest::new(&device);
+    let span = u64::from(RGFX_RING_HEADER_SIZE + RING_DATA);
+    guest.send(&device, block_grant(1, SUBMIT, span));
+    guest.send(&device, block_grant(1, COMPLETE, span));
+    let create = queue_create(1, 1, SUBMIT, COMPLETE, RING_DATA, 0);
+    assert_eq!(answered(&device, &mut guest, create), RGFX_STATUS_OK);
+    guest.send(&device, resource_id_chunk(1, 0));
+    let identity = [
+        [1.0, 0.0, 0.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [0.0, 0.0, 1.0, 0.0],
+    ];
+    let swap = [
+        [0.0, 0.0, 1.0, 0.0],
+        [0.0, 1.0, 0.0, 0.0],
+        [1.0, 0.0, 0.0, 0.0],
+    ];
+    let height = 16usize;
+    let sizes = [(3662usize, 14656usize), (1831, 7360), (1001, 4032)];
+    // MTLTextureUsageShaderRead | RenderTarget, then ShaderRead alone.
+    let cases = [5u32, 1]
+        .into_iter()
+        .flat_map(|usage| sizes.map(|s| (s, usage)));
+    let mut wrong = Vec::new();
+    let mut at = BLOCK;
+    for (i, ((width, stride), usage)) in cases.enumerate() {
+        let n = i as u64;
+        let length = ((stride * height) as u64).next_multiple_of(0x1_0000);
+        guest.send(&device, block_grant(1, at, length));
+        guest.send(
+            &device,
+            buffer_over_host_memory(obj(1, 10 + 2 * n), at, length),
+        );
+        // SAFETY: the surface lies in the block just granted, in the device's region.
+        unsafe {
+            let base = device.region_base().add(at as usize);
+            for y in 0..height {
+                for x in 0..width {
+                    let p = odd_width_pixel(x, y);
+                    std::ptr::copy_nonoverlapping(p.as_ptr(), base.add(y * stride + x * 4), 4);
+                }
+            }
+        }
+        let (create, _) = RgfxTextureCreate::read_from_prefix(&texture_create(0, 0)).unwrap();
+        let id = 0x100 + i as u32;
+        let mut texture = RgfxTextureFromIOSurface {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                size: 0,
+                seqno: 0,
+            },
+            obj_id: obj(1, 11 + 2 * n),
+            resource_id: 1 + n,
+            buffer_obj_id: obj(1, 10 + 2 * n),
+            offset: 0,
+            bytes_per_row: stride as u64,
+            iosurface_id: id,
+            plane: 0,
+            desc: RgfxTextureDescriptor {
+                width: width as u32,
+                height: height as u32,
+                usage,
+                ..create.desc
+            },
+            writers_offset: RGFX_SURFACE_NO_WRITERS,
+        }
+        .as_bytes()
+        .to_vec();
+        texture.resize(RGFX_SURFACE_FACTS_OFFSET as usize, 0);
+        texture.extend_from_slice(
+            RgfxSurfaceFacts {
+                surface_pixel_format: u32::from_be_bytes(*b"BGRA"),
+                plane_count: 0,
+                width: width as u32,
+                height: height as u32,
+                chroma_offset: 0,
+                chroma_bytes_per_row: 0,
+                ycbcr_matrix: RGFX_YCBCR_MATRIX_NONE,
+                reserved_24: 0,
+            }
+            .as_bytes(),
+        );
+        guest.send(&device, texture);
+        let mode = Mode {
+            width: width as u32,
+            height: height as u32,
+            refresh_mhz: 60_000,
+            scale_120ths: 0,
+        };
+        let read = device.reads[0].at_screen(Arc::new(reims_vgpu_graphics::FixedScreen(mode)));
+        for (name, rows, swapped) in [
+            ("no colour", identity, false),
+            ("red and blue swapped", swap, true),
+        ] {
+            guest.send(&device, color_matrix(rows));
+            let present = present_surface(id);
+            assert_eq!(answered(&device, &mut guest, present), RGFX_STATUS_OK);
+            let mut dst = vec![7u8; width * height * 4];
+            assert_eq!(read.read(&mut dst), ((width as u32, height as u32), Ok(())));
+            let want = |x: usize, y: usize| match odd_width_pixel(x, y) {
+                [b, g, r, _] if swapped => [r, g, b, 0xff],
+                p => p,
+            };
+            if let Some(differ) = read_differs(&dst, (width, height), want) {
+                wrong.push(format!(
+                    "{width} wide, rows of {stride} bytes, usage {usage}, {name}: {differ}"
+                ));
+            }
+        }
+        at += length;
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// Queue 1 of process 1 on a headless device, as [`one_queue`] makes it, with both its rings of
@@ -9298,10 +12102,13 @@ fn one_queue_raising(
     let config = GraphicsConfig {
         callbacks: GraphicsCallbacks {
             raise_interrupt: Some(raise),
-            scanout_written: None,
+            ..GraphicsCallbacks::default()
         },
         window: None,
         memory_map: None,
+        guest_arch: GuestArch::X86_64,
+        doorbell_pages: false,
+        ..GraphicsConfig::default()
     };
     let device = GraphicsDevice::with_platform(Arc::clone(&platform), config).unwrap();
     device.mmio_write(RGFX_REG_STATUS.into(), RGFX_STATUS_DRIVER_READY);
@@ -9338,7 +12145,7 @@ fn noting_raises(
 /// reach `value` and asks for its `CB_SUBMITTED`: its records go at its scheduling, from its
 /// submission handler.
 fn waiting_and_asking(queue_obj_id: u64, cb_obj_id: u64, event: u64, value: u64) -> Vec<u8> {
-    use reims_graphics::ops::{RGFX_OP_SUBMITTED, RGFX_OP_WAIT_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SUBMITTED, RGFX_OP_WAIT_EVENT, RgfxOpEvent};
 
     let wait = RgfxOpEvent {
         event_obj_id: event,
@@ -9379,7 +12186,7 @@ fn submitted_then_scheduled(ring: &mut QueueRing, cb_obj_id: u64) {
 /// across its commit: the raise never comes on the committing thread
 #[test]
 fn a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread() {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
 
     let caller = Arc::new(parking_lot::Mutex::new(()));
     let raises = Raises::default();
@@ -9436,7 +12243,7 @@ fn a_foreign_commit_hands_a_decoder_buffer_s_records_to_its_queue_s_thread() {
 /// queue's service thread, which posts them, and raises, once the guest has made room
 #[test]
 fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
-    use reims_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
+    use reims_vgpu_graphics::ops::{RGFX_OP_SIGNAL_EVENT, RgfxOpEvent};
 
     const DATA: u32 = 0x1000;
     const SIGNALS: u64 = 150;
@@ -9452,7 +12259,8 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     );
     guest.send(&device, shared_event_create(obj(1, 7), 0));
     // A buffer that signals the event 150 times: its completion posts each value, 32 bytes, more
-    // than the ring holds, and waits on its completion thread for room the guest does not make.
+    // than the ring holds: what finds no room it hands, with its completion, to the queue's service
+    // thread, which waits for room the guest does not make.
     let signals: Vec<RgfxOpEvent> = (1..=SIGNALS)
         .map(|value| RgfxOpEvent {
             event_obj_id: obj(1, 7),
@@ -9473,6 +12281,8 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     );
     std::thread::sleep(Duration::from_millis(50));
     let full = produced(&ring);
+    let handed = device.handed_over();
+    assert!(handed > 0, "the completion posted onto a full ring");
 
     platform.world().hold_submissions();
     ring.send(&device, waiting_and_asking(obj(1, 1), 101, obj(1, 7), 1000));
@@ -9496,7 +12306,7 @@ fn a_read_of_the_display_calls_nothing_back_and_waits_for_no_full_ring() {
     assert!(read, "the read failed");
     assert_eq!(produced(&ring), full, "posted onto a full ring");
     assert_eq!(
-        device.handed_over(),
+        device.handed_over() - handed,
         2,
         "the buffer's records were not handed over"
     );
@@ -9589,7 +12399,7 @@ fn a_commit_on_the_device_s_thread_posts_a_decoder_buffer_s_records_there() {
 #[ignore = "a measurement, run by hand"]
 #[allow(clippy::disallowed_methods)] // a measurement: the wall clock's time
 fn a_handed_over_record_s_cost() {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     use std::time::Instant;
 
     const ROUNDS: usize = 1000;
@@ -9671,4 +12481,683 @@ fn a_handed_over_record_s_cost() {
     stats("commit call, inline", &commit_us[1]);
     stats("commit to CB_SCHEDULED, handed over", &scheduled_us[0]);
     stats("commit to CB_SCHEDULED, inline", &scheduled_us[1]);
+}
+
+/// A host's hardware video for [`video_caps`]: one HEVC decode, landing its pictures in place at
+/// a layout of its own, and in device caches where `cached`.
+struct CapsVideo {
+    cached: bool,
+}
+
+impl GraphicsVideo<FakePlatform> for CapsVideo {
+    fn caps(&self) -> Vec<RgfxVideoCodecCaps> {
+        vec![RgfxVideoCodecCaps {
+            codec: RGFX_VIDEO_CODEC_HEVC,
+            direction: RGFX_VIDEO_DECODE,
+            ..RgfxVideoCodecCaps::default()
+        }]
+    }
+
+    fn layout(&self, _codec: &RgfxVideoCodecCaps) -> RgfxVideoOutputLayout {
+        RgfxVideoOutputLayout {
+            granularity: [2, 2],
+            alignment: 256,
+            reserved_0c: 0,
+        }
+    }
+
+    fn session(
+        &self,
+        _codec: u32,
+        _direction: u32,
+    ) -> Option<Arc<dyn GraphicsVideoSession<FakePlatform>>> {
+        None
+    }
+
+    fn lands_in_device_caches(&self) -> bool {
+        self.cached
+    }
+}
+
+/// A video that lands pictures in device caches has the guest ask its outputs cached, with no
+/// layout in place, on a device whose kext makes caches of every surface it asks one for
+/// (`SURFACE_CACHE`) and on one whose GPU shares the CPU's memory and keeps caches of the surfaces
+/// whose textures would not lie in place (`SURFACE_CACHE_REFUSED`); a device that makes no cache,
+/// or a video that lands none, answers the layout its pictures land in place at. Either way the
+/// decode entry carries the codec crate's bounds beyond it, HEVC's narrowest tile column.
+#[test]
+fn outputs_are_cached_where_the_kext_makes_caches_and_the_video_lands_in_them() {
+    let refused = u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE_REFUSED);
+    let all = u64::from(RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_SURFACE_CACHE);
+    let in_place = u64::from(RGFX_FEATURE_SURFACE_PAGES);
+    for (features, lands, cached) in [
+        (refused, true, true),
+        (all, true, true),
+        (in_place, true, false),
+        (0, true, false),
+        (refused, false, false),
+        (all, false, false),
+    ] {
+        let caps = video_caps(features, &CapsVideo { cached: lands });
+        let what = format!("features {features:#x}, landing in caches: {lands}");
+        assert_eq!(caps.codec_count, 1, "{what}");
+        assert_eq!(caps.codecs[0].codec, RGFX_VIDEO_CODEC_HEVC, "{what}");
+        assert_eq!(
+            caps.decode[0].min_tile_width,
+            reims_vgpu_video::codec::hevc::MIN_TILE_COLUMN_WIDTH,
+            "{what}"
+        );
+        if cached {
+            assert_eq!(caps.flags, RGFX_VIDEO_CAPS_OUTPUT_CACHED, "{what}");
+            assert_eq!(caps.layouts[0], RgfxVideoOutputLayout::default(), "{what}");
+        } else {
+            assert_eq!(caps.flags, 0, "{what}");
+            assert_eq!(caps.layouts[0].alignment, 256, "{what}");
+        }
+    }
+}
+
+/// The display's scale goes to the guest in 120ths of a pixel a point, rounded to nearest, and as
+/// 0 where the window's backing scale is not a positive number
+#[test]
+fn a_backing_scale_is_told_in_120ths() {
+    for (scale, told) in [
+        (1.0, 120),
+        (1.25, 150),
+        (1.5, 180),
+        (2.0, 240),
+        (2.1, 252),
+        (3.0, 360),
+        (0.0, 0),
+        (-2.0, 0),
+        (f64::NAN, 0),
+        (f64::INFINITY, 0),
+    ] {
+        assert_eq!(scale_in_120ths(scale), told, "{scale}");
+    }
+}
+
+/// What one group of views takes in the grouping tests: udmabuf's defaults.
+const GROUP_LIMITS: reims_vgpu_vulkan::core::platform::os::vm::GroupLimits =
+    reims_vgpu_vulkan::core::platform::os::vm::GroupLimits {
+        runs: 1024,
+        bytes: 64 << 20,
+    };
+
+/// A device of [`surface_device`]'s whose platform groups the pages blocks' views within `limits`
+/// (`decode::surface_pages`, "Group dma-bufs"). Its groups' windows close as the test moves the
+/// platform's clock.
+fn grouping_device(
+    pages: u64,
+    limits: reims_vgpu_vulkan::core::platform::os::vm::GroupLimits,
+) -> (
+    GraphicsDevice<FakePlatform>,
+    Arc<FakePlatform>,
+    reims_vgpu_vulkan::core::testkit::GuestRam,
+    u64,
+) {
+    let made = surface_device(pages);
+    made.1.fake_vm().set_view_groups(Some(limits));
+    made
+}
+
+/// Context `context`'s pages block at `block` of `runs`, given as (page, pages) of guest RAM:
+/// granted, and described by its `SURFACE_PAGES`, answered.
+fn pages_block(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    context: u32,
+    block: u64,
+    page: u64,
+    runs: &[(u64, u64)],
+) {
+    guest.send(device, block_grant(context, block, SURFACE_BLOCK_SIZE));
+    let mut pages = surface_pages_of(device, context, block, page, runs);
+    pages.extend_from_slice(
+        RgfxSurfacePagesCache {
+            flags: RGFX_SURFACE_PAGES_PRIVATE,
+            reserved_04: 0,
+        }
+        .as_bytes(),
+    );
+    guest.send(device, pages);
+    let seqno = guest.seqno;
+    let answer = complete_of(&guest.event().expect("the SURFACE_PAGES' answer"));
+    assert_eq!(answer, (seqno, RGFX_STATUS_OK));
+}
+
+/// A `BUFFER_OVER_PAGES` of `length` bytes over the pages block at `block`, at no GPU address of
+/// the guest's.
+fn buffer_over_pages_of(obj_id: u64, block: u64, length: u64) -> Vec<u8> {
+    let mut message = buffer_over_pages(obj_id, length);
+    let mut m = RgfxBufferOverPages::read_from_bytes(&message).unwrap();
+    m.block_offset = block;
+    message.copy_from_slice(m.as_bytes());
+    message
+}
+
+/// The no-copy buffers the platform made since `mark`: the views' imports and the buffers over
+/// them.
+fn buffers_since(platform: &FakePlatform, mark: u64) -> usize {
+    (platform.call_log().sels_since(mark).iter())
+        .filter(|&&s| s == "newBufferWithDescriptor:")
+        .count()
+}
+
+/// The group of the view of the pages block at `block`, and its offset there, while its
+/// membership lives.
+fn group_of(
+    device: &GraphicsDevice<FakePlatform>,
+    platform: &FakePlatform,
+    block: u64,
+) -> Option<(u64, u64)> {
+    let base = (device.control.decoder().views_of_surfaces())
+        .private_view_base(block)
+        .expect("a view");
+    platform.fake_vm().view_group(base)
+}
+
+/// The blocks of the grouping tests: `n` pages blocks from `first`, each of two pages of guest RAM
+/// apart, the i-th at pages 4i and 4i + 2.
+fn grouped_blocks(
+    device: &GraphicsDevice<FakePlatform>,
+    guest: &mut Guest,
+    context: u32,
+    first: u64,
+    n: u64,
+    page: u64,
+) -> Vec<u64> {
+    let blocks: Vec<u64> = (0..n).map(|i| first + i * 0x4000).collect();
+    for (i, &block) in blocks.iter().enumerate() {
+        let at = 4 * i as u64;
+        pages_block(device, guest, context, block, page, &[(at, 1), (at + 2, 1)]);
+    }
+    device.control.decoder().surface_worker().flush();
+    blocks
+}
+
+/// The no-copy buffers a context makes over its pages blocks' views in a burst share one group
+/// dma-buf (`decode::surface_pages`, "Group dma-bufs"): each view joins its context's group and
+/// nothing is made while the group's window is open; the context's next message on ring 0, which
+/// waits for them and holds the context's lane, closes the group once the three have joined, with
+/// no window waited for: the views lie in one shared file, each at an offset of its own, each
+/// view's import made over its piece, then the buffers over them, then the context's next message
+#[test]
+fn a_burst_of_pages_buffers_of_one_context_shares_one_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 3, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 3));
+    assert!(joined, "the three views joined one group");
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "nothing made while the group's window is open"
+    );
+    assert_eq!(buffers_since(&platform, mark), 0, "no import made yet");
+
+    guest.send(&device, event_create(obj(1, 20)));
+    assert!(
+        objects_become(&device, 4),
+        "the three buffers, then the event, with the platform's clock where it was"
+    );
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        6,
+        "each view's import, and a buffer over it"
+    );
+    let groups: Vec<(u64, u64)> = (blocks.iter())
+        .map(|&b| group_of(&device, &platform, b).expect("in a group"))
+        .collect();
+    assert!(
+        groups.iter().all(|g| g.0 == groups[0].0),
+        "one group: {groups:?}"
+    );
+    let mut offsets: Vec<u64> = groups.iter().map(|g| g.1).collect();
+    offsets.dedup();
+    assert_eq!(offsets.len(), 3, "each view at its own offset: {groups:?}");
+    assert_eq!(platform.fake_vm().groups_made(), 1);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (3, 3, 1));
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+}
+
+/// A lone no-copy buffer's view takes no window: the context's next message on ring 0, which waits
+/// for it on the context's lane, so that no later view can join its group, closes the group of one
+/// at once, and is answered with the platform's clock where it was; the view, alone in its group,
+/// is imported alone (`decode::surface_pages`, "Group dma-bufs")
+#[test]
+fn a_lone_view_s_context_is_answered_without_waiting_for_a_window() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 1, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page),
+    );
+    // A library lookup's miss, answered once the context's messages before it are carried out.
+    carried_out_of(&device, &mut guest, 1);
+    assert_eq!(
+        device.decoder_object_count(),
+        1,
+        "the buffer, before the answer"
+    );
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        2,
+        "the view's import, alone, and the buffer over it"
+    );
+    assert_eq!(group_of(&device, &platform, blocks[0]), None, "alone");
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (1, 0, 0));
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+}
+
+/// A message of the context that waits for its no-copy buffers on ring 0 closes the context's group
+/// only once every view its lane handed over before it has joined: a view whose job has not yet run
+/// joins the same group, and the two lie in one shared file, with the platform's clock where it was
+#[test]
+fn a_waiting_message_closes_its_context_s_group_once_the_views_before_it_joined() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page),
+    );
+    let opened = eventually(|| decoder.views_of_surfaces().forming() == (1, 1));
+    assert!(opened, "the first view opened its context's group");
+    // The second view is handed over, its job held; then the context's next message waits.
+    decoder.surface_worker().hold();
+    guest.send(
+        &device,
+        buffer_over_pages_of(obj(1, 12), blocks[1], 2 * page),
+    );
+    guest.send(&device, event_create(obj(1, 20)));
+    std::thread::sleep(Duration::from_millis(30));
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (1, 1),
+        "the group waits for the view handed over before the message"
+    );
+    assert_eq!(device.decoder_object_count(), 0, "nothing made yet");
+
+    decoder.surface_worker().release();
+    assert!(
+        objects_become(&device, 3),
+        "the two buffers, then the event, with the platform's clock where it was"
+    );
+    decoder.surface_worker().flush();
+    let first = group_of(&device, &platform, blocks[0]).expect("in a group");
+    let second = group_of(&device, &platform, blocks[1]).expect("in a group");
+    assert_eq!(first.0, second.0, "one group");
+    assert_eq!(platform.fake_vm().groups_made(), 1);
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 2, 1));
+}
+
+/// Two contexts' bursts of no-copy buffers over their pages blocks form a group each, never one
+/// group of both: a group's views are one process's
+#[test]
+fn separate_contexts_never_share_a_group() {
+    let (device, platform, _ram, page) = grouping_device(32, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let mine = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let theirs = {
+        let first = SURFACE_BLOCK + 0x10_0000;
+        let blocks: Vec<u64> = (0..2).map(|i| first + i * 0x4000).collect();
+        for (i, &block) in blocks.iter().enumerate() {
+            let at = 16 + 4 * i as u64;
+            pages_block(&device, &mut guest, 2, block, page, &[(at, 1), (at + 2, 1)]);
+        }
+        blocks
+    };
+    let decoder = device.control.decoder();
+    decoder.surface_worker().flush();
+    for (i, (&a, &b)) in mine.iter().zip(&theirs).enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), a, 2 * page),
+        );
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(2, 11 + i as u64), b, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (2, 4));
+    assert!(joined, "a group for each context");
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 4), "the four buffers");
+    decoder.surface_worker().flush();
+    let of = |blocks: &[u64]| -> Vec<u64> {
+        (blocks.iter())
+            .map(|&b| group_of(&device, &platform, b).expect("in a group").0)
+            .collect()
+    };
+    let (mine, theirs) = (of(&mine), of(&theirs));
+    assert_eq!(mine[0], mine[1], "context 1's views share a group");
+    assert_eq!(theirs[0], theirs[1], "context 2's views share a group");
+    assert_ne!(mine[0], theirs[0], "never the other's");
+    assert_eq!(platform.fake_vm().groups_made(), 2);
+}
+
+/// A message over a member's block that comes once the group is sealed and its members' messages
+/// are being carried out waits behind them, on the group's job, never ahead of them: the group
+/// stays until its job has carried out every message, those that joined late among them
+#[test]
+fn a_message_over_a_member_s_block_waits_behind_its_sealed_group_s_messages() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    // The seal makes the two views' imports, then carries out the first member's message, whose
+    // buffer is held.
+    let held = HeldCall::new();
+    platform.faults().at(
+        "MTLDevice",
+        "newBufferWithDescriptor:",
+        2,
+        Fault::Hold(held.clone()),
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(
+        held.reached(Duration::from_secs(60)),
+        "the first member's buffer was not made"
+    );
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 21 + i as u64), block, page),
+        );
+    }
+    std::thread::sleep(Duration::from_millis(50));
+    assert_eq!(
+        device.decoder_object_count(),
+        0,
+        "the later messages wait behind the held one, though the views are made"
+    );
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (1, 2),
+        "the group stays while its messages are carried out"
+    );
+    held.open();
+    assert!(objects_become(&device, 4), "the four buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 2, 1));
+}
+
+/// The device's reset inside a group's window makes nothing of it: its views and its messages go,
+/// the context and its blocks settle, and the window's end makes no import or buffer
+#[test]
+fn a_reset_inside_a_group_s_window_makes_nothing() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 2));
+    assert!(joined, "both views joined");
+
+    device.reset();
+    assert!(eventually(|| decoder.views_of_surfaces().resets() == 1));
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (0, 0),
+        "the group went"
+    );
+    let pages = &device.control.pages_buffers;
+    let keys = || [pages_context(1), blocks[0], blocks[1]].into_iter();
+    assert!(
+        eventually(|| !pages.any(keys())),
+        "the context and blocks settled"
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        0,
+        "no import or buffer made"
+    );
+    assert_eq!(device.decoder_object_count(), 0);
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+}
+
+/// A context's close inside its group's window drops the group: the close is answered with
+/// nothing made, and the window's end makes nothing
+#[test]
+fn a_close_inside_a_group_s_window_drops_the_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    let joined = eventually(|| decoder.views_of_surfaces().forming() == (1, 2));
+    assert!(joined, "both views joined");
+
+    assert_eq!(
+        answered(&device, &mut guest, context_close(1)),
+        RGFX_STATUS_OK
+    );
+    assert_eq!(
+        decoder.views_of_surfaces().forming(),
+        (0, 0),
+        "the group went"
+    );
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        0,
+        "no import or buffer made"
+    );
+    assert_eq!(platform.fake_vm().groups_made(), 0);
+}
+
+/// Where the platform makes no shared file of a group's views, each view's import is made alone,
+/// as without groups; where the runtime refuses a grouped view's piece, that view leaves its group
+/// and its import is made alone, the others' pieces of the group's file
+#[test]
+fn a_refused_group_falls_back_to_an_import_of_each_view() {
+    use reims_vgpu_vulkan::core::testkit::Step;
+
+    let (device, platform, _ram, page) = grouping_device(32, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let decoder = device.control.decoder();
+
+    // No shared file.
+    platform.fake_vm().refuse_view_groups(true);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 2, page);
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 2), "both buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        4,
+        "each view's import, alone, and its buffer"
+    );
+    for &block in &blocks {
+        assert_eq!(group_of(&device, &platform, block), None, "alone");
+    }
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (2, 0, 0));
+
+    // The runtime refuses the first view's piece.
+    platform.fake_vm().refuse_view_groups(false);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK + 0x8000, 2, page);
+    let mark = platform.call_log().mark();
+    for (i, &block) in blocks.iter().enumerate() {
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 21 + i as u64), block, 2 * page),
+        );
+    }
+    assert!(eventually(
+        || decoder.views_of_surfaces().forming() == (1, 2)
+    ));
+    platform
+        .script()
+        .push("newBufferWithDescriptor:", Step::Nil);
+    platform.virtual_clock().advance(Duration::from_millis(1));
+    assert!(objects_become(&device, 4), "both buffers");
+    decoder.surface_worker().flush();
+    assert_eq!(
+        buffers_since(&platform, mark),
+        5,
+        "the refused piece's import, then each view's import and its buffer"
+    );
+    // The surface worker runs the two messages side by side: either view may have joined first,
+    // and taken the refusal.
+    let grouped: Vec<bool> = (blocks.iter())
+        .map(|&block| group_of(&device, &platform, block).is_some())
+        .collect();
+    assert!(
+        grouped == [false, true] || grouped == [true, false],
+        "one view left its group, the other is a piece: {grouped:?}"
+    );
+    let counts = decoder.views_of_surfaces().counts();
+    assert_eq!((counts.private, counts.grouped, counts.groups), (4, 1, 1));
+}
+
+/// A view past 16 MiB takes no group: its import is made at once, as without groups, with no
+/// window waited for
+#[test]
+fn a_view_past_16_mib_takes_no_group() {
+    let page = FakePlatform::new().vm().page_size();
+    let pages = (16 << 20) / page + 1;
+    let (device, platform, _ram, page) = grouping_device(pages, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    pages_block(&device, &mut guest, 1, SURFACE_BLOCK, page, &[(0, pages)]);
+    let decoder = device.control.decoder();
+    decoder.surface_worker().flush();
+    let mark = platform.call_log().mark();
+    guest.send(&device, buffer_over_pages(obj(1, 11), 2 * page));
+    assert!(objects_become(&device, 1), "made with no window waited for");
+    decoder.surface_worker().flush();
+    assert_eq!(buffers_since(&platform, mark), 2);
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    assert_eq!(group_of(&device, &platform, SURFACE_BLOCK), None);
+}
+
+/// A read-only buffer (`MTLResourceOptions` bit 24), which the platform makes over a copy of its
+/// pages, takes no group: its view's import is made at once, as without groups, with no window
+/// waited for
+#[test]
+fn a_read_only_buffer_takes_no_group() {
+    let (device, platform, _ram, page) = grouping_device(16, GROUP_LIMITS);
+    let mut guest = Guest::new(&device);
+    let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 1, page);
+    let decoder = device.control.decoder();
+    let mark = platform.call_log().mark();
+    let mut message = buffer_over_pages_of(obj(1, 11), blocks[0], 2 * page);
+    let mut m = RgfxBufferOverPages::read_from_bytes(&message).unwrap();
+    m.options |= 1 << 24;
+    message.copy_from_slice(m.as_bytes());
+    guest.send(&device, message);
+    assert!(objects_become(&device, 1), "made with no window waited for");
+    decoder.surface_worker().flush();
+    assert_eq!(buffers_since(&platform, mark), 2);
+    assert_eq!(decoder.views_of_surfaces().forming(), (0, 0));
+    assert_eq!(group_of(&device, &platform, blocks[0]), None);
+}
+
+/// A group closes once its views reach the platform's limits for one shared file, its runs or its
+/// bytes, and is sealed then, with no window waited for; the next view opens a group of its own
+#[test]
+fn a_group_closes_at_its_limits() {
+    use reims_vgpu_vulkan::core::platform::os::vm::GroupLimits;
+
+    for what in ["runs", "bytes"] {
+        let (device, platform, _ram, page) = surface_device(16);
+        // Two views of two runs of a page each reach either.
+        let limits = match what {
+            "runs" => GroupLimits {
+                runs: 4,
+                bytes: 64 << 20,
+            },
+            _ => GroupLimits {
+                runs: 1024,
+                bytes: 4 * page,
+            },
+        };
+        platform.fake_vm().set_view_groups(Some(limits));
+        let mut guest = Guest::new(&device);
+        let blocks = grouped_blocks(&device, &mut guest, 1, SURFACE_BLOCK, 3, page);
+        let decoder = device.control.decoder();
+        for (i, &block) in blocks.iter().take(2).enumerate() {
+            guest.send(
+                &device,
+                buffer_over_pages_of(obj(1, 11 + i as u64), block, 2 * page),
+            );
+        }
+        assert!(
+            objects_become(&device, 2),
+            "{what}: sealed at the limit, with no window waited for"
+        );
+        guest.send(
+            &device,
+            buffer_over_pages_of(obj(1, 13), blocks[2], 2 * page),
+        );
+        let opened = eventually(|| decoder.views_of_surfaces().forming() == (1, 1));
+        assert!(opened, "{what}: the next view opens a group");
+        platform.virtual_clock().advance(Duration::from_millis(1));
+        assert!(objects_become(&device, 3), "{what}");
+        decoder.surface_worker().flush();
+        let first = group_of(&device, &platform, blocks[0]).expect("in a group");
+        let second = group_of(&device, &platform, blocks[1]).expect("in a group");
+        assert_eq!(first.0, second.0, "{what}: the two at the limit share one");
+        assert_eq!(
+            group_of(&device, &platform, blocks[2]),
+            None,
+            "{what}: a group of one leaves its view alone"
+        );
+    }
 }

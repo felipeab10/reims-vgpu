@@ -62,11 +62,10 @@
 //!   does. A tile dispatch in it, which only draws were measured against, dies.
 //! - **A pass over a mutable map**, reset or not, that no draw of the guest's took the place of
 //!   ends with a draw of no vertices the guest did not encode ([`no_draw`],
-//!   [`crate::gpu::encode_render`]), as the Metal platform's does. Without a draw call Metal's
+//!   [`crate::gpu::encode_render`]). Without a draw call Metal's
 //!   GPU hangs at it (measured on the M3 Max, macOS 27.0.1: its command buffer fails with code 2
 //!   and stores nothing), and the runtime fails it so too; with the draw, both run it and store
-//!   what it loaded or cleared. A guest's draw takes its place where it takes the Metal
-//!   platform's: at least one whole triangle of a triangle list or strip, once or more, which the
+//!   what it loaded or cleared. A guest's draw takes its place: at least one whole triangle of a triangle list or strip, once or more, which the
 //!   runtime took and counts as the pass's draw call. The draw's pipeline is made only for a pass
 //!   that needs it, at the pass's end, as making it moves identifiers the guest reads: the
 //!   runtime gives a pipeline state made without `supportIndirectCommandBuffers`, as this one
@@ -106,20 +105,19 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
+use crate::core::host::HostPtr;
+use crate::core::platform::Handle;
+use crate::core::platform::rate_map::{RateMap, RateMapDescriptor, RateMapLayerDescriptor};
+use crate::core::platform::types::{MtlCoordinate2D, MtlSize, SizeAndAlign};
+use crate::core::platform::values::RateMapDesc;
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
 use metal2vulkan::bind;
 use metal2vulkan::metal::Mutability;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::rate_map::{RateMap, RateMapDescriptor, RateMapLayerDescriptor};
-use reims_vgpu_core::platform::types::{MtlCoordinate2D, MtlSize, SizeAndAlign};
-use reims_vgpu_core::platform::values::RateMapDesc;
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{
     Policy, created_or_decided, get, hearing, plain, plain_at, refused, send, unrepresentable,
-    unstopped_at,
 };
 use crate::gpu::command::{Progress, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
@@ -483,9 +481,17 @@ impl RateMapObject {
 /// The metallib `build.rs` compiled `no_draw.metal` into: [`no_draw`]'s vertex function.
 const NO_DRAW_LIBRARY: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/no_draw.metallib"));
 
-/// The no-draw pipelines made so far, each with its device's registry ID. Each stays for the life
-/// of the process.
-static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new());
+/// The no-draw pipelines made so far, each with its device's registry ID and the process's device
+/// recoveries when it was made ([`crate::answer::recoveries`]): one made before a recovery, which
+/// the new `VkDevice` refuses (the runtime's `MadeBeforeRecovery`), is made again. Each stays
+/// until the platform lets go of its devices ([`crate::let_go`]).
+static NO_DRAW: Mutex<Vec<(u64, u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new());
+
+/// Takes the no-draw pipelines made so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it makes its own.
+pub(crate) fn take_no_draws() -> Vec<(u64, u64, rt::RenderPipelineState)> {
+    std::mem::take(&mut *NO_DRAW.lock())
+}
 
 /// The pipeline a pass over a mutable map ends with a draw of no vertices through, as the Metal
 /// platform's does (its `gpu::rate_map`), made on the first call for `device`'s registry ID. The
@@ -495,34 +501,33 @@ static NO_DRAW: Mutex<Vec<(u64, rt::RenderPipelineState)>> = Mutex::new(Vec::new
 /// Its vertex function returns nothing ([`NO_DRAW_LIBRARY`]), its rasterization is off, it names
 /// no attachment formats, and its largest vertex amplification count is the device's, which is
 /// 1 on a device without multiview. A refusal of the library, the function or the pipeline dies
-/// at `sel`, as the Metal platform's ends the process where Metal does not make one. Nothing here
-/// stops a thread of a task that ended: the pass's end, which asks for it, stopped one first
-/// (`crate::gpu::encode_render`). The device's caps it reads were read as core started the
-/// device, before any task ran.
+/// at `sel`.
 pub(crate) fn no_draw(sel: &'static str, device: &VulkanDevice) -> rt::RenderPipelineState {
+    use crate::core::platform::device::GpuDevice as _;
     use metal2vulkan::pipeline::{RenderPipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
 
     let id = device.registry_id;
+    let recoveries = crate::answer::recoveries();
     // Held through the make, so two first asks make one.
     let mut made = NO_DRAW.lock();
-    if let Some((_, pipeline)) = made.iter().find(|(r, _)| *r == id) {
+    made.retain(|(r, at, _)| *r != id || *at == recoveries);
+    if let Some((.., pipeline)) = made.iter().find(|(r, ..)| *r == id) {
         return pipeline.clone();
     }
-    let library = unstopped_at(sel, || device.raw.new_library_with_data(NO_DRAW_LIBRARY))
+    let library = plain_at(sel, || device.raw.new_library_with_data(NO_DRAW_LIBRARY))
         .unwrap_or_else(|e| refused(sel, &e));
-    let function = unstopped_at(sel, || library.new_function_with_name("reims_vgpu_no_draw"))
+    let function = plain_at(sel, || library.new_function_with_name("reims_vgpu_no_draw"))
         .unwrap_or_else(|e| refused(sel, &e));
     let mut desc =
         RenderPipelineDescriptor::new(StageSource::Function(function.function_descriptor()));
     desc.rasterization_enabled = false;
     desc.max_vertex_amplification_count =
         u32::try_from(device.caps().max_vertex_amplification_count).unwrap_or(u32::MAX);
-    let pipeline = unstopped_at(sel, || {
+    let pipeline = plain_at(sel, || {
         (device.raw).new_render_pipeline_state(&desc, &rt::PipelineOptions::default())
     })
     .unwrap_or_else(|e| refused(sel, &e));
-    made.push((id, pipeline.clone()));
+    made.push((id, recoveries, pipeline.clone()));
     pipeline
 }
 
@@ -646,6 +651,12 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
         })))
     }
 
+    /// The runtime's: the descriptor's width and height, depth 1, as Metal answers on an M3 Max
+    /// and an M4.
+    fn screen_size(&self) -> MtlSize {
+        mtl_size(plain(|| self.raw.screen_size()))
+    }
+
     /// The runtime's reset, which compiles the descriptor over the map's tables, keeps its
     /// mutability, and encodes again each pass that took the map whose command buffer is not yet
     /// submitted (the module docs); a refusal dies. So does a reset while a pass that took the
@@ -693,10 +704,10 @@ impl RateMap<VulkanPlatform> for VulkanRateMap {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Platform;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -765,6 +776,30 @@ mod tests {
         let site = catch_death(|| unset.physical_to_screen(MtlCoordinate2D { x: 1.0, y: 1.0 }, 0))
             .unwrap_err();
         assert_eq!(site.file, "mapPhysicalToScreenCoordinates:forLayer:");
+    }
+
+    /// A recovery of a device is counted ([`crate::answer::recoveries`]), and the no-draw
+    /// pipeline asked of the device after it is made again on its new `VkDevice`, which refuses
+    /// the one made before it: the kept list then holds one, of the count after the recovery. A
+    /// device of its own, as the recovery moves every user of the device
+    #[test]
+    fn a_recovery_makes_the_no_draw_pipeline_again() {
+        let device =
+            crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let kept = |device: &VulkanDevice| -> Vec<u64> {
+            (NO_DRAW.lock().iter())
+                .filter(|(id, ..)| *id == device.registry_id)
+                .map(|(_, at, _)| *at)
+                .collect()
+        };
+        drop(no_draw("test", &device));
+        let before = crate::answer::recoveries();
+        assert_eq!(kept(&device), [before]);
+        device.raw.recover_for_test().expect("the recovery");
+        let after = crate::answer::recoveries();
+        assert!(after > before, "the recovery was counted");
+        drop(no_draw("test", &device));
+        assert_eq!(kept(&device), [after]);
     }
 
     #[cfg(target_os = "macos")]

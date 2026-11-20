@@ -6,6 +6,15 @@
 //! while that process runs and its command line names the pid file, so a stale file or a reused
 //! pid is never taken for the VM. A VM started from a printed script is found the same way.
 //!
+//! On Windows, QEMU runs with no console, in a process group of its own, and out of reims-ctl's
+//! job where the job lets it go ([`crate::os::spawn_detached`]); its pid counts only while its
+//! program is a QEMU's too ([`crate::os::may_be_qemu`]), as Windows soon gives a freed pid to a
+//! new process. A stop that QMP's `quit` does not end terminates it, with no signal before.
+//!
+//! On Linux, QEMU runs in a systemd user scope of its own, `reims-ctl-NAME.scope`, where the
+//! user's manager answers and outlasts the start ([`launch`]); elsewhere, and where none does, in
+//! the cgroup of the process that starts it, with a warning on Linux.
+//!
 //! QEMU's stdout and stderr go to `logs/qemu.log`, kept for the last five starts
 //! (`qemu.1.log`, ...), the serial console's likewise.
 
@@ -16,7 +25,6 @@ use crate::vm::{DEFAULT_STOP_TIMEOUT, DiskController, Graphics, Vm};
 use anyhow::{Context, Result, bail};
 use serde_json::json;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::os::unix::process::CommandExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -29,69 +37,18 @@ pub fn pid(vm: &Vm) -> Option<i32> {
 /// settings may not read.
 pub fn pid_at(pidfile: &Path) -> Option<i32> {
     let pid: i32 = std::fs::read_to_string(pidfile).ok()?.trim().parse().ok()?;
-    if pid <= 0 || !alive(pid) {
+    if pid <= 0 || !alive(pid) || !crate::os::may_be_qemu(pid) {
         return None;
     }
     let needle = pidfile.as_os_str().as_encoded_bytes();
-    let cmd = cmdline(pid)?;
+    let cmd = crate::os::cmdline(pid)?;
     cmd.windows(needle.len())
         .any(|w| w == needle)
         .then_some(pid)
 }
 
 fn alive(pid: i32) -> bool {
-    // SAFETY: signal 0 only checks the pid.
-    let r = unsafe { libc::kill(pid, 0) };
-    r == 0 || std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM)
-}
-
-#[cfg(target_os = "linux")]
-fn cmdline(pid: i32) -> Option<Vec<u8>> {
-    let b = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    // A zombie's command line is empty.
-    (!b.is_empty()).then_some(b)
-}
-
-#[cfg(target_os = "macos")]
-fn cmdline(pid: i32) -> Option<Vec<u8>> {
-    let mut mib = [libc::CTL_KERN, libc::KERN_PROCARGS2, pid];
-    let mut size: libc::size_t = 0;
-    // SAFETY: a size query; mib names a valid sysctl.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            std::ptr::null_mut(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return None;
-    }
-    let mut buf = vec![0u8; size];
-    // SAFETY: buf holds size bytes.
-    if unsafe {
-        libc::sysctl(
-            mib.as_mut_ptr(),
-            3,
-            buf.as_mut_ptr().cast(),
-            &mut size,
-            std::ptr::null_mut(),
-            0,
-        )
-    } != 0
-    {
-        return None;
-    }
-    buf.truncate(size);
-    Some(buf)
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn cmdline(_pid: i32) -> Option<Vec<u8>> {
-    None
+    crate::os::alive(pid)
 }
 
 pub fn running(vm: &Vm) -> bool {
@@ -103,7 +60,7 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     let c = &vm.config;
     c.check()?;
     if !crate::host::Profile::supported_on(host).contains(&c.profile) {
-        bail!("{} is a {} VM, which {host} cannot run", c.name, c.profile);
+        bail!("{}", crate::host::UNSUPPORTED);
     }
     let need = |p: &Path, what: &str| -> Result<()> {
         if !p.exists() {
@@ -160,14 +117,6 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
                 }
             }
         }
-        Profile::VmappleArm64 => {
-            need(
-                Path::new(qemu::AVPBOOTER),
-                "Virtualization.framework's boot ROM",
-            )?;
-            let v = c.vmapple.as_ref().unwrap();
-            need(&vm.path(&v.aux), "the auxiliary storage")?;
-        }
     }
     if host.os == Os::Linux {
         let kvm = std::fs::OpenOptions::new()
@@ -184,14 +133,60 @@ pub fn preflight(vm: &Vm, host: Host) -> Result<()> {
     Ok(())
 }
 
-/// The reminder where an x86-64 VM's macOS gets installed.
-pub const SET_METAL_ERROR_MODE: &str = "set Metal's error mode once macOS is installed (README)";
-
 /// The host's `vm.max_map_count` (Linux).
 pub fn host_max_map_count() -> Option<u64> {
     std::fs::read_to_string("/proc/sys/vm/max_map_count")
         .ok()
         .and_then(|s| s.trim().parse().ok())
+}
+
+/// The file of MGLRU's thrashing guard (Linux; the kernel's
+/// Documentation/admin-guide/mm/multigen_lru.rst, "Thrashing prevention"): the pages used in the
+/// last that many milliseconds are kept from eviction, and where they can't be kept in memory the
+/// kernel's OOM killer runs. Measured on this project's CachyOS hosts, whose kernel defaults it to
+/// 100: kswapd invoked the global OOM killer with most RAM free, killing a compiler with 19 GiB
+/// free on one, and making 19 of a day's 22 OOM kills on another. A VM's QEMU can be the one
+/// killed; scripts/install-ctl.sh and `reims-ctl doctor` offer to set 0, which turns the guard
+/// off, while memory that does run out still ends in the OOM killer.
+pub const MIN_TTL_FILE: &str = "/sys/kernel/mm/lru_gen/min_ttl_ms";
+
+/// The systemd-tmpfiles line that writes 0 to [`MIN_TTL_FILE`] at each boot, which
+/// scripts/install-ctl.sh shows too.
+pub const MIN_TTL_TMPFILES: &str = "w /sys/kernel/mm/lru_gen/min_ttl_ms - - - - 0";
+
+/// The thrashing guard's milliseconds in `file` ([`MIN_TTL_FILE`]); None where it isn't there.
+pub fn min_ttl_ms(file: &Path) -> Option<u64> {
+    std::fs::read_to_string(file)
+        .ok()
+        .and_then(|s| s.trim().parse().ok())
+}
+
+/// What the thrashing guard at `ms` does to VMs, for a value above 0; None at 0.
+pub fn min_ttl_note(ms: u64) -> Option<String> {
+    (ms > 0).then(|| {
+        format!(
+            "{ms}: where the kernel can't keep the pages used in the last {ms} ms in memory, it \
+             kills a process, which can be a VM's QEMU, even while RAM is free (measured on hosts \
+             at 100, killing builds with most RAM free); 0 turns this off"
+        )
+    })
+}
+
+/// How to keep the thrashing guard off after a restart, and, where it is not `off` yet, how to
+/// turn it off now, as scripts/install-ctl.sh says it.
+pub fn min_ttl_fix(off: bool) -> String {
+    let keep = format!(
+        "the line {MIN_TTL_TMPFILES} in a file in /etc/tmpfiles.d, such as \
+         /etc/tmpfiles.d/reims-ctl-min-ttl.conf"
+    );
+    if off {
+        format!("it's 0 now; {keep}, keeps it at 0 after a restart")
+    } else {
+        format!(
+            "echo 0 | sudo tee {MIN_TTL_FILE} turns it off now, and {keep}, keeps it at 0 after \
+             a restart"
+        )
+    }
 }
 
 /// The `vm.max_map_count` at which an NVIDIA GPU takes all of a guest of `memory_mib` without
@@ -211,14 +206,15 @@ pub fn max_map_count(memory_mib: u64) -> (u64, u64) {
 /// kernel mapping per 4 KiB page, past `vm.max_map_count` at 3840 x 2160 even at the guest's
 /// desktop (docs/qemu.md, "Linux hosts: vm.max_map_count"). None where it opens.
 pub fn udmabuf_problem() -> Option<String> {
-    use std::os::unix::fs::MetadataExt;
     const NODE: &str = "/dev/udmabuf";
     let e = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(NODE)
         .err()?;
-    let group = std::fs::metadata(NODE).ok().map(|m| m.gid());
+    let group = std::fs::metadata(NODE)
+        .ok()
+        .and_then(|m| crate::os::gid(&m));
     let over_ssh = std::env::var_os("SSH_CONNECTION").is_some();
     Some(udmabuf_message(
         &e,
@@ -307,8 +303,10 @@ pub fn map_count_note(n: u64, memory_mib: u64) -> Option<String> {
 /// How to install macOS in an x86-64 VM that has an installer, for the CLI and the interface's
 /// details; None for other VMs. An offline installer, which reims-util names
 /// `…-offline-installer.img`, installs from its script; any other installer boots Recovery,
-/// whose Reinstall macOS installs it. For a disk on NVMe, they first say to move it to SATA
-/// ([`DiskController`]).
+/// whose Reinstall macOS installs it. They name the disk to erase as Disk Utility names it on the
+/// disk's controller ([`DiskController`]). An offline installer holds its release whole, so its
+/// steps say to install with the VM's network off, which keeps macOS's installer from
+/// downloading an update as it installs, and to turn the network back on afterwards.
 pub fn install_steps(vm: &Vm) -> Option<String> {
     let q = vm.config.q35.as_ref()?;
     let installer = q.installer.as_ref()?;
@@ -321,19 +319,32 @@ pub fn install_steps(vm: &Vm) -> Option<String> {
         "pick Reinstall macOS"
     };
     let name = vm.name();
-    let first = match q.disk_controller {
-        DiskController::Ahci => String::new(),
-        DiskController::Nvme => format!(
-            "Its disk is on NVMe, where macOS's installer may find no disk: first move it to \
-             SATA (reims-ctl set {name} --disk-controller ahci, or Disk controller in its edit \
-             form). "
-        ),
+    // Disk Utility names a disk by its model and "Media": ide-hd's model is QEMU HARDDISK, and
+    // QEMU's NVMe controller's QEMU NVMe Ctrl.
+    let media = match q.disk_controller {
+        DiskController::Ahci => "QEMU HARDDISK Media",
+        DiskController::Nvme => "QEMU NVMe Ctrl Media",
+    };
+    let network_off = if offline && vm.config.network.enabled {
+        format!(
+            "Its installer holds the whole release, so turn the VM's network off before you \
+             start it (reims-ctl set {name} --network false, or Network in its edit form): with \
+             a network, macOS's installer can download an update as it installs, a second \
+             download of the release. "
+        )
+    } else {
+        String::new()
+    };
+    let network_on = if offline {
+        format!(" and turn its network back on (reims-ctl set {name} --network)")
+    } else {
+        String::new()
     };
     Some(format!(
-        "{first}To install macOS, start {name}: OpenCore boots its installer into macOS \
-         Recovery. If the VM's disk is new, open Disk Utility, erase it (QEMU HARDDISK Media) as \
-         APFS and quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
-         (reims-ctl eject {name}) and set Metal's error mode (README)."
+        "{network_off}To install macOS, start {name}: OpenCore boots its installer into macOS \
+         Recovery. If the VM's disk is new, open Disk Utility, erase it ({media}) as APFS and \
+         quit Disk Utility. Then {last}. Once macOS is installed, eject the installer \
+         (reims-ctl eject {name}){network_on}."
     ))
 }
 
@@ -348,69 +359,12 @@ pub fn warnings(vm: &Vm, host: Host) -> Vec<String> {
     if graphics == Graphics::ReimsVgpu {
         w.extend(crate::opencore::missing_guest_kexts(vm));
     }
-    if graphics == Graphics::AppleGfx && vm.config.profile == Profile::Q35X86_64 {
-        w.extend(crate::opencore::missing_kext(vm));
-        // docs/qemu.md, "x86-64 macOS guests: Metal's error mode": without it, macOS 26's icon
-        // service ends as it starts, again and again, and the library logs each command it left
-        // queued, which QEMU's log keeps with logs off too. From Recovery, the `cd` expands the
-        // Data volume's name, and `defaults` leaves the file at mode 0600, which the user's
-        // processes cannot read.
-        let n = emptied_entry_lines(&vm.qemu_log());
-        if n >= 3 {
-            w.push(format!(
-                "QEMU's latest log has {n} lines on GPU work left by crashed macOS processes. On \
-                 x86-64 macOS 26 that's most likely its icon service, crashing because Metal's \
-                 error mode isn't set: the desktop can stay on its wallpaper with no menu bar, or \
-                 come up gray with a menu bar but no Dock. To set it, turn its boot selection \
-                 on (press e in reims-ctl, or run reims-ctl update-opencore {} --boot-selection), \
-                 boot Recovery from OpenCore's picker, open Utilities > Terminal and run: cd \
-                 /Volumes/*Data/Library/Preferences && defaults write \"$PWD/.GlobalPreferences\" \
-                 METAL_ERROR_MODE -int 5 && chmod 644 .GlobalPreferences.plist && reboot",
-                vm.name()
-            ));
-        }
-    }
     if host.os == Os::Linux
         && let Some(problem) = udmabuf_problem()
     {
         w.push(problem);
     }
     w
-}
-
-/// How many lines of a QEMU log, since the guest's last reset, name an object entry the guest
-/// had emptied: the library logs them at its warn level when a command of a guest process that
-/// has ended runs, and `device reset` at its info level; reims-ctl turns both on with logs off
-/// too. The TUI asks at every draw, so the count carries on from the bytes already read while the
-/// file is the same (by inode) and has not shrunk.
-fn emptied_entry_lines(log: &Path) -> usize {
-    use std::os::unix::fs::MetadataExt;
-    const EMPTIED: &[u8] = b"has an empty entry";
-    static READ: std::sync::Mutex<(std::path::PathBuf, u64, u64, usize)> =
-        std::sync::Mutex::new((std::path::PathBuf::new(), 0, 0, 0));
-    let Ok(mut f) = std::fs::File::open(log) else {
-        return 0;
-    };
-    let Ok(meta) = f.metadata() else { return 0 };
-    let mut r = READ.lock().unwrap_or_else(|e| e.into_inner());
-    if r.0 != log || r.1 != meta.ino() || r.2 > meta.len() {
-        *r = (log.to_path_buf(), meta.ino(), 0, 0);
-    }
-    let mut buf = Vec::new();
-    if f.seek(SeekFrom::Start(r.2)).is_ok() {
-        let _ = f.take(meta.len() - r.2).read_to_end(&mut buf);
-    }
-    // Whole lines only: the rest is read again once its line ends.
-    let end = buf.iter().rposition(|&b| b == b'\n').map_or(0, |i| i + 1);
-    for l in buf[..end].split(|&b| b == b'\n') {
-        if l.ends_with(b"device reset") {
-            r.3 = 0;
-        } else if l.windows(EMPTIED.len()).any(|w| w == EMPTIED) {
-            r.3 += 1;
-        }
-    }
-    r.2 += end as u64;
-    r.3
 }
 
 /// Keeps the last five of a log: `x.log` becomes `x.1.log`, and so on.
@@ -423,26 +377,6 @@ fn rotate(path: &Path) {
         let _ = std::fs::rename(nth(n), nth(n + 1));
     }
     let _ = std::fs::rename(path, nth(1));
-}
-
-/// Writes the trimmed auxiliary storage a vmapple VM boots, if missing: the image without its
-/// first 16 KiB block (docs/system/arm/vmapple.rst in vendor/qemu).
-pub fn ensure_aux_trimmed(vm: &Vm) -> Result<()> {
-    let Some(trimmed) = vm.aux_trimmed() else {
-        return Ok(());
-    };
-    if trimmed.exists() {
-        return Ok(());
-    }
-    let aux = vm.path(&vm.config.vmapple.as_ref().unwrap().aux);
-    let mut src = std::fs::File::open(&aux).with_context(|| format!("open {}", aux.display()))?;
-    src.seek(SeekFrom::Start(0x4000))?;
-    let tmp = trimmed.with_extension("trimmed.tmp");
-    let mut dst = std::fs::File::create(&tmp)?;
-    std::io::copy(&mut src, &mut dst)?;
-    dst.sync_all()?;
-    std::fs::rename(&tmp, &trimmed)?;
-    Ok(())
 }
 
 pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
@@ -468,6 +402,14 @@ pub fn context(vm: &Vm, host: Host) -> Result<Ctx> {
                  reims-ctl update builds one with GTK"
             );
         }
+    }
+    // QEMU's configure leaves usb-host out where it finds no libusb, as an install before
+    // scripts/install-ctl.sh named it did.
+    if !vm.config.usb.is_empty() && crate::install::has_device(&qemu, "usb-host") == Some(false) {
+        bail!(
+            "this QEMU has no usb-host, which passes USB devices through: reims-ctl update builds \
+             one with it"
+        );
     }
     Ok(Ctx {
         host,
@@ -505,17 +447,9 @@ pub fn invocation_for_print(vm: &Vm, host: Host) -> Result<Invocation> {
     qemu::invocation(vm, &ctx)
 }
 
+/// The local time now in `fmt`, strftime(3)'s form.
 pub fn now_stamp(fmt: &str) -> String {
-    // SAFETY: time and localtime_r fill the structs given; strftime writes at most buf's size.
-    unsafe {
-        let t = libc::time(std::ptr::null_mut());
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&t, &mut tm);
-        let mut buf = [0u8; 64];
-        let f = std::ffi::CString::new(fmt).unwrap();
-        let n = libc::strftime(buf.as_mut_ptr().cast(), buf.len(), f.as_ptr(), &tm);
-        String::from_utf8_lossy(&buf[..n]).into_owned()
-    }
+    crate::os::now_stamp(fmt)
 }
 
 /// Another VM that runs on any writable image `vm` uses in place. QEMU on Linux would refuse the
@@ -571,32 +505,223 @@ fn prepare_run(vm: &Vm) -> Result<std::path::PathBuf> {
     Ok(sock)
 }
 
-/// Makes `d`, a directory for QMP sockets outside the VMs' own, the user's alone (0700) where it
-/// is new, and refuses one that is not a directory, another user owns, or others may write into:
-/// whoever could write there could put a socket of theirs in QMP's place and drive the VM. Some
-/// of them are under `/tmp`, which every user writes into (`paths::short_runtime_dir`).
+/// Makes `d`, a directory for QMP sockets outside the VMs' own, and refuses one others could put
+/// a socket in ([`crate::os::private_dir`]).
 fn private_dir(d: &Path) -> Result<()> {
-    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(d)
-        .with_context(|| format!("create {}", d.display()))?;
-    let m = std::fs::symlink_metadata(d).with_context(|| format!("read {}", d.display()))?;
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
-    if !m.is_dir() || m.uid() != uid || m.mode() & 0o022 != 0 {
-        bail!(
-            "{} is not a directory of this user's that others cannot write into, so it holds no \
-             QMP socket: remove it, or make it so",
-            d.display()
-        );
+    crate::os::private_dir(d)
+}
+
+/// What a start of a stopped VM does to its settings and OpenCore image first, before [`start`]:
+/// an update's change that waited while it ran ([`crate::migrate::at_start`]); then a new image
+/// ([`crate::opencore::renew`]) for one on another device whose image loads reims-vgpu's guest kexts, as an image made for
+/// reims-vgpu does after a change of graphics, without them; and for one on reims-vgpu whose
+/// image holds other builds of them, as one an older reims-ctl made does after an update, with
+/// this reims-ctl's ([`crate::opencore::holds_other_guest_kexts`]). An image reims-vgpu's kexts
+/// lack is warned of instead (`warnings`): the image may be one the user gave, which a new one
+/// would not carry over. Notes go to `progress`, the new image's with what the kexts left in the
+/// guest; warnings are returned, for a start that still runs.
+pub fn prepare(vm: &mut Vm, progress: &mut dyn FnMut(&str)) -> Vec<String> {
+    let mut w = Vec::new();
+    if running(vm) {
+        return w;
     }
-    Ok(())
+    // An update's change that waited while the VM ran (crate::migrate).
+    crate::migrate::at_start(vm, progress);
+    let name = vm.name().to_string();
+    if crate::opencore::holds_unused_guest_kexts(vm) {
+        let graphics = vm.config.graphics().name();
+        progress(&format!(
+            "its OpenCore image loads reims-vgpu's macOS drivers, which {graphics} has no use \
+             for: making it a new one without them, presenting the same Mac"
+        ));
+        match crate::opencore::renew(vm, None, progress) {
+            Ok(s) => progress(s.strip_prefix(&format!("{name}: ")).unwrap_or(&s)),
+            Err(e) => w.push(format!(
+                "{name}'s OpenCore image loads reims-vgpu's macOS drivers, which {graphics} has no \
+                 use for, and a new one without them couldn't be made ({e:#}): reims-ctl \
+                 update-opencore {name} makes it"
+            )),
+        }
+    } else if crate::opencore::holds_other_guest_kexts(vm) {
+        progress(
+            "its OpenCore image holds other builds of reims-vgpu's macOS drivers than this \
+             reims-ctl carries: making it a new one with these, presenting the same Mac",
+        );
+        match crate::opencore::renew(vm, None, progress) {
+            Ok(s) => progress(s.strip_prefix(&format!("{name}: ")).unwrap_or(&s)),
+            Err(e) => w.push(format!(
+                "{name}'s OpenCore image holds other builds of reims-vgpu's macOS drivers than \
+                 this reims-ctl carries, and a new one with these couldn't be made ({e:#}): \
+                 reims-ctl update-opencore {name} makes it"
+            )),
+        }
+    }
+    w
+}
+
+/// The systemd user unit a start runs a VM's QEMU in ([`launch`]): one per VM, so a start of a
+/// VM whose QEMU still runs in it finds the name taken.
+pub fn scope_unit(name: &str) -> String {
+    format!("reims-ctl-{name}.scope")
+}
+
+/// What a start reads of the user's systemd service manager ([`launch`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UserManager {
+    /// `systemd-run` is on the PATH and the user's manager answers on its bus.
+    pub answers: bool,
+    /// The caller runs under that manager (its cgroup is below `user@UID.service`), as a
+    /// desktop's terminal does: a scope there lasts as long as the caller's own processes.
+    pub caller_inside: bool,
+    /// The manager stays after the user's last session ends (`loginctl enable-linger`).
+    pub lingers: bool,
+}
+
+impl UserManager {
+    /// This host's, read now: on Linux by `systemctl --user` and `loginctl`, and none
+    /// elsewhere.
+    #[cfg(not(target_os = "linux"))]
+    pub fn current() -> UserManager {
+        UserManager::default()
+    }
+
+    /// This host's, read now: on Linux by `systemctl --user` and `loginctl`, and none
+    /// elsewhere.
+    #[cfg(target_os = "linux")]
+    pub fn current() -> UserManager {
+        let ok = |program: &str, args: &[&str]| {
+            std::process::Command::new(program)
+                .args(args)
+                .stdin(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .output()
+                .ok()
+                .filter(|o| o.status.success())
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
+        };
+        let answers = ok("systemd-run", &["--version"]).is_some()
+            && ok(
+                "systemctl",
+                &["--user", "show", "--property=Version", "--value"],
+            )
+            .is_some_and(|v| !v.is_empty());
+        let uid = crate::os::uid();
+        let caller_inside = std::fs::read_to_string("/proc/self/cgroup")
+            .is_ok_and(|c| c.contains(&format!("/user@{uid}.service/")));
+        let lingers = ok(
+            "loginctl",
+            &[
+                "show-user",
+                &uid.to_string(),
+                "--property=Linger",
+                "--value",
+            ],
+        )
+        .is_some_and(|v| v == "yes");
+        UserManager {
+            answers,
+            caller_inside,
+            lingers,
+        }
+    }
+}
+
+/// How a start runs a VM's QEMU ([`launch`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Launch {
+    /// In a systemd user scope of its own, the unit named.
+    Scope(String),
+    /// In the cgroup of the process that starts it, as its descendant; on Linux with why no
+    /// scope of its own was taken.
+    Plain(Option<&'static str>),
+}
+
+/// How a start runs `name`'s QEMU on a host whose user manager is `m`. On Linux, in a systemd
+/// user scope of its own ([`scope_unit`]), so the cgroup v2 CPU controller weighs the VM against
+/// other cgroups, not against the processes of the cgroup that started it: there, a build at
+/// nice 0 beside a QEMU that ananicy-cpp gives nice 9 (its `Heavy_CPU` type, as CachyOS has it)
+/// takes nine shares of the CPU for each of QEMU's, and starved an x86-64 macOS guest until it
+/// could not answer an SSH login (docs/qemu.md, "Beside a build"). The scope's weight is the
+/// manager's default, and QEMU keeps its nice and policy, so no host policy changes.
+///
+/// No scope where no user manager answers, nor where the caller runs outside it (an SSH or
+/// console login) and the manager does not linger: that manager stops its units when the user's
+/// last session ends, which would end a VM the login started.
+pub fn launch(name: &str, m: UserManager) -> Launch {
+    if !cfg!(target_os = "linux") {
+        Launch::Plain(None)
+    } else if !m.answers {
+        Launch::Plain(Some("no systemd user manager answers"))
+    } else if !m.caller_inside && !m.lingers {
+        Launch::Plain(Some(
+            "this login runs outside the user's systemd manager, which stops a scope at the \
+             user's last logout unless it lingers (loginctl enable-linger)",
+        ))
+    } else {
+        Launch::Scope(scope_unit(name))
+    }
+}
+
+/// The warning a start under `launch` gives, where QEMU runs in the cgroup that started it on
+/// Linux.
+pub fn launch_note(name: &str, launch: &Launch) -> Option<String> {
+    match launch {
+        Launch::Plain(Some(why)) => Some(format!(
+            "{name}'s QEMU runs in the cgroup of the process that started it, not in a systemd \
+             user scope of its own ({why}): CPU-heavy work in that cgroup, a build among it, \
+             takes the guest's share of the CPU"
+        )),
+        _ => None,
+    }
+}
+
+/// `inv` run as `launch` says: in a scope, through `systemd-run --user --scope`, which moves
+/// itself into the new unit and then executes QEMU in its own process, with the environment it
+/// was given, so QEMU keeps its pid, its environment and its detachment.
+pub fn launched(inv: Invocation, name: &str, launch: &Launch) -> Invocation {
+    let Launch::Scope(unit) = launch else {
+        return inv;
+    };
+    let mut args = vec![
+        "--user".to_owned(),
+        "--scope".to_owned(),
+        "--quiet".to_owned(),
+        "--collect".to_owned(),
+        format!("--unit={unit}"),
+        format!("--description=reims-ctl: {name}'s QEMU"),
+        "--".to_owned(),
+        inv.program.to_string_lossy().into_owned(),
+    ];
+    args.extend(inv.args);
+    Invocation {
+        program: "systemd-run".into(),
+        args,
+        env: inv.env,
+        unset: inv.unset,
+    }
+}
+
+/// Whether the user's systemd unit `unit` is active.
+fn unit_active(unit: &str) -> bool {
+    std::process::Command::new("systemctl")
+        .args(["--user", "is-active", "--quiet", unit])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .is_ok_and(|s| s.success())
+}
+
+/// What [`start`] started.
+#[derive(Debug)]
+pub struct Started {
+    /// QEMU's pid.
+    pub pid: i32,
+    /// A warning about how QEMU runs ([`launch_note`]), for the start's output.
+    pub note: Option<String>,
 }
 
 /// Starts the VM, and returns QEMU's pid once QMP answers.
-pub fn start(vm: &Vm, host: Host) -> Result<i32> {
+pub fn start(vm: &Vm, host: Host) -> Result<Started> {
     if let Some(p) = pid(vm) {
         bail!("{} already runs (pid {p})", vm.name());
     }
@@ -607,11 +732,19 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         );
     }
     preflight(vm, host)?;
-    if vm.config.profile == Profile::VmappleArm64 {
-        ensure_aux_trimmed(vm)?;
-    }
     let ctx = context(vm, host)?;
     let inv = qemu::invocation(vm, &ctx)?;
+    let launch = launch(vm.name(), UserManager::current());
+    if let Launch::Scope(unit) = &launch
+        && unit_active(unit)
+    {
+        bail!(
+            "{}'s QEMU still runs in its systemd user scope {unit}, though its pid file names no \
+             running QEMU: systemctl --user stop {unit} ends it",
+            vm.name()
+        );
+    }
+    let note = launch_note(vm.name(), &launch);
     let sock = prepare_run(vm)?;
 
     let mut log = std::fs::OpenOptions::new()
@@ -625,32 +758,26 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         vm.name(),
         now_stamp("%Y-%m-%d %H:%M:%S %z")
     )?;
+    match (&launch, &note) {
+        (Launch::Scope(unit), _) => writeln!(log, "in the systemd user scope {unit}")?,
+        (_, Some(n)) => writeln!(log, "warning: {n}")?,
+        _ => {}
+    }
     log.write_all(inv.shell_script("the command").as_bytes())?;
     writeln!(log, "----")?;
     let err = log.try_clone()?;
 
-    let mut cmd = inv.command();
+    let run = launched(inv, vm.name(), &launch);
+    let mut cmd = run.command();
     cmd.current_dir(&vm.dir)
         .stdin(std::process::Stdio::null())
         .stdout(log)
         .stderr(err);
-    // SAFETY: only async-signal-safe calls between fork and exec: setsid, fork, _exit.
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            match libc::fork() {
-                -1 => Err(std::io::Error::last_os_error()),
-                0 => Ok(()),
-                _ => libc::_exit(0),
-            }
-        });
-    }
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("run {}", inv.program.display()))?;
-    let _ = child.wait();
+    crate::os::spawn_detached(cmd).with_context(|| format!("run {}", run.program.display()))?;
+    let started = |pid| Started {
+        pid,
+        note: note.clone(),
+    };
 
     let deadline = Instant::now() + Duration::from_secs(60);
     let mut seen = false;
@@ -658,18 +785,26 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
         if let Some(p) = pid(vm) {
             seen = true;
             if qmp::Qmp::connect(&sock, Duration::from_secs(2)).is_ok() {
-                return Ok(p);
+                return Ok(started(p));
             }
         } else if seen || Instant::now() > deadline - Duration::from_secs(50) {
             // QEMU wrote its pid file and exited, or never wrote it.
             std::thread::sleep(Duration::from_millis(200));
             if pid(vm).is_none() {
-                bail!("QEMU exited:\n{}", tail(&vm.qemu_log(), 15));
+                let log = tail(&vm.qemu_log(), 15);
+                let silent = log.lines().last().is_some_and(|l| l.trim() == "----");
+                let note = match mem_available_mib(Path::new("/proc/meminfo")) {
+                    Some(a) if silent && vm.config.profile.memfd_ram(host) => {
+                        format!("\n{}", memory_note(vm.name(), vm.config.memory_mib, a))
+                    }
+                    _ => String::new(),
+                };
+                bail!("QEMU exited:\n{log}{note}");
             }
         }
         if Instant::now() > deadline {
             match pid(vm) {
-                Some(p) => return Ok(p),
+                Some(p) => return Ok(started(p)),
                 None => bail!("QEMU did not start:\n{}", tail(&vm.qemu_log(), 15)),
             }
         }
@@ -679,15 +814,16 @@ pub fn start(vm: &Vm, host: Host) -> Result<i32> {
 
 /// Stops the VM: macOS's Control-Option-Command-Power on the USB keyboard ("quit all apps,
 /// then shut down", which asks about unsaved documents), then, a third of `timeout` in, the
-/// machine's power button (ACPI's on q35, a GPIO on vmapple), and at `timeout` a power-off; with
+/// machine's power button (ACPI's on q35), and at `timeout` a power-off; with
 /// `force`, the power-off at once. With no `timeout` it waits until the guest shuts down, the
 /// button a third of [`DEFAULT_STOP_TIMEOUT`] in, and never powers the VM off: where neither the
 /// keys nor the button reach the guest, it ends with an error instead. `progress` hears each
 /// step.
 ///
-/// The keys come first because the power button alone does not shut a guest down: a macOS 26
-/// vmapple guest did nothing with vmapple's in 90 s, where the keys shut it down in under 6 s
-/// (2026-10-11, M3 Max).
+/// The keys come first: they shut a macOS 26.7.2 guest down within 20 s (2026-11-07, Radeon 780M
+/// host). Neither they nor the button shut down a guest whose Setup Assistant is open, which macOS
+/// opens once on a Mac it has not run on (`create`'s note, `new_mac_note`), so that stop ends in
+/// the power-off, saying why it may have come.
 pub fn stop(
     vm: &Vm,
     force: bool,
@@ -737,10 +873,15 @@ pub fn stop(
             }
             std::thread::sleep(Duration::from_millis(300));
         }
-        progress("the guest did not shut down in time: powering off");
+        progress(NO_SHUTDOWN);
     }
     power_off(vm, p, &mut progress)
 }
+
+/// What a stop says as it powers off a guest that did not shut down in its timeout.
+pub const NO_SHUTDOWN: &str = "the guest did not shut down in time (a question about an unsaved \
+     document, or Setup Assistant, which macOS opens once on a new Mac, holds it up: answer it in \
+     the VM's window): powering off";
 
 fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
     let _ = qmp::run(&vm.qmp_socket(), "quit", None);
@@ -748,17 +889,12 @@ fn power_off(vm: &Vm, p: i32, progress: &mut impl FnMut(&str)) -> Result<()> {
         progress("powered off");
         return Ok(());
     }
-    // SAFETY: p is our QEMU's pid, checked by pid().
-    unsafe { libc::kill(p, libc::SIGTERM) };
-    if wait_gone(p, Duration::from_secs(5)) {
-        progress("powered off (SIGTERM)");
-        return Ok(());
-    }
-    // SAFETY: as above.
-    unsafe { libc::kill(p, libc::SIGKILL) };
-    if wait_gone(p, Duration::from_secs(5)) {
-        progress("killed (SIGKILL)");
-        return Ok(());
+    for (end, ended) in crate::os::ENDS {
+        end(p);
+        if wait_gone(p, Duration::from_secs(5)) {
+            progress(ended);
+            return Ok(());
+        }
     }
     bail!("QEMU (pid {p}) did not exit")
 }
@@ -774,6 +910,36 @@ fn wait_gone(p: i32, t: Duration) -> bool {
     !alive(p)
 }
 
+/// The host's available memory, `MemAvailable` in `file` (`/proc/meminfo`), in MiB; None where it
+/// isn't there.
+pub fn mem_available_mib(file: &Path) -> Option<u64> {
+    std::fs::read_to_string(file)
+        .ok()?
+        .lines()
+        .find_map(|l| l.strip_prefix("MemAvailable:"))
+        .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
+        .map(|kib| kib / 1024)
+}
+
+/// What a start adds where QEMU ended with no error of its own after the command reims-ctl logged
+/// (the log's last line is that command's `----`), as when the kernel ends a process it cannot
+/// give memory: QEMU allocates the VM's RAM whole as it starts on Linux (`qemu`'s module doc), so
+/// a host without that much free memory ends it there.
+pub fn memory_note(name: &str, memory_mib: u64, available_mib: u64) -> String {
+    let gib = |mib: u64| match mib % 1024 {
+        0 => format!("{} GiB", mib / 1024),
+        _ => format!("{:.1} GiB", mib as f64 / 1024.0),
+    };
+    format!(
+        "QEMU ended without an error of its own, as the kernel ends a process it cannot give \
+         memory: {name} needs {} of free memory to start, since QEMU allocates all of its RAM \
+         as it starts, and this host has {} available now. Free some, or give it less with \
+         reims-ctl set {name} --memory SIZE",
+        gib(memory_mib),
+        gib(available_mib)
+    )
+}
+
 /// The last `n` lines of a text file.
 pub fn tail(path: &Path, n: usize) -> String {
     let Ok(mut f) = std::fs::File::open(path) else {
@@ -787,6 +953,106 @@ pub fn tail(path: &Path, n: usize) -> String {
     let text = String::from_utf8_lossy(&buf);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(n)..].join("\n")
+}
+
+/// A QEMU for tests: a process whose command line names `pidfile` and which writes its pid
+/// there once it runs, as QEMU's `-pidfile` does, running `secs` seconds. It returns once the
+/// pid file names it. A pid file the test wrote itself after `spawn` could name a process
+/// whose command line still reads empty: Linux wakes the parent once the child's exec has
+/// replaced its memory, and sets the new program's command line after that.
+#[cfg(all(test, unix))]
+pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> std::process::Child {
+    let mut qemu = std::process::Command::new("sh")
+        .args(["-c", &format!("echo $$ > \"$0\"; sleep {secs}; :")])
+        .arg(pidfile)
+        .spawn()
+        .unwrap();
+    let (id, deadline) = (qemu.id(), Instant::now() + Duration::from_secs(10));
+    let written = || {
+        let s = std::fs::read_to_string(pidfile).unwrap_or_default();
+        s.trim().parse::<u32>().ok() == Some(id)
+    };
+    while !written() {
+        if Instant::now() > deadline || qemu.try_wait().unwrap().is_some() {
+            let _ = qemu.kill();
+            panic!("the test QEMU wrote no pid file at {}", pidfile.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    qemu
+}
+
+/// A QEMU for tests on Windows: a copy of this test binary named as QEMU's programs are
+/// (`os::may_be_qemu`), running only the test `runtime::tests::fake_qemu`, with `pidfile` on its
+/// command line; it writes its pid there, as QEMU's `-pidfile` does, and runs `secs` seconds.
+/// It returns once the pid file names it, and ends with its copy when the [`TestQemu`] drops.
+#[cfg(all(test, windows))]
+pub(crate) fn test_qemu(pidfile: &Path, secs: u32) -> TestQemu {
+    use std::sync::atomic::{AtomicU32, Ordering};
+    static N: AtomicU32 = AtomicU32::new(0);
+    let me = std::env::current_exe().unwrap();
+    let n = N.fetch_add(1, Ordering::Relaxed);
+    let exe = me.with_file_name(format!("qemu-system-test-{}-{n}.exe", std::process::id()));
+    std::fs::copy(&me, &exe).unwrap();
+    let child = std::process::Command::new(&exe)
+        .args(["--exact", "runtime::tests::fake_qemu", "--nocapture"])
+        .arg(pidfile)
+        .env("REIMS_CTL_TEST_QEMU_PIDFILE", pidfile)
+        .env("REIMS_CTL_TEST_QEMU_SECS", secs.to_string())
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut qemu = TestQemu { child, exe };
+    let (id, deadline) = (qemu.id(), Instant::now() + Duration::from_secs(10));
+    let written = || {
+        let s = std::fs::read_to_string(pidfile).unwrap_or_default();
+        s.trim().parse::<u32>().ok() == Some(id)
+    };
+    while !written() {
+        if Instant::now() > deadline || qemu.try_wait().unwrap().is_some() {
+            panic!("the test QEMU wrote no pid file at {}", pidfile.display());
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    qemu
+}
+
+/// [`test_qemu`]'s process on Windows, which ends, its program's copy removed, when this drops.
+#[cfg(all(test, windows))]
+pub(crate) struct TestQemu {
+    child: std::process::Child,
+    exe: std::path::PathBuf,
+}
+
+#[cfg(all(test, windows))]
+impl std::ops::Deref for TestQemu {
+    type Target = std::process::Child;
+
+    fn deref(&self) -> &std::process::Child {
+        &self.child
+    }
+}
+
+#[cfg(all(test, windows))]
+impl std::ops::DerefMut for TestQemu {
+    fn deref_mut(&mut self) -> &mut std::process::Child {
+        &mut self.child
+    }
+}
+
+#[cfg(all(test, windows))]
+impl Drop for TestQemu {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        // Windows keeps a program's file until its process is all gone.
+        for _ in 0..200 {
+            if std::fs::remove_file(&self.exe).is_ok() || !self.exe.exists() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
 }
 
 #[cfg(test)]
@@ -807,6 +1073,56 @@ mod tests {
             "{note}"
         );
         assert!(note.contains("vm.max_map_count=8388608"), "{note}");
+    }
+
+    /// A start QEMU did not survive, with no error of its own, names the memory the VM's RAM
+    /// needs and what the host has available, read from `MemAvailable` as the kernel writes it.
+    #[test]
+    fn a_vm_whose_qemu_ends_silently_is_told_what_its_ram_needs() {
+        let env = crate::testenv::Env::new("meminfo");
+        let file = env.root.join("meminfo");
+        assert_eq!(mem_available_mib(&file), None);
+        std::fs::write(
+            &file,
+            "MemTotal:       32000000 kB\nMemFree:         1000000 kB\nMemAvailable:    3145728 kB\n",
+        )
+        .unwrap();
+        assert_eq!(mem_available_mib(&file), Some(3072));
+        let note = memory_note("mac", 8192, 3584);
+        assert!(
+            note.starts_with("QEMU ended without an error of its own")
+                && note.contains("mac needs 8 GiB of free memory to start")
+                && note.contains("this host has 3.5 GiB available now")
+                && note.contains("reims-ctl set mac --memory SIZE"),
+            "{note}"
+        );
+    }
+
+    /// The thrashing guard is told of above 0 only, read from its file as the kernel writes it,
+    /// and the line that keeps it off is the one scripts/install-ctl.sh shows, for the same file.
+    #[test]
+    fn the_thrashing_guard_is_told_of_above_0_with_its_fix() {
+        let env = crate::testenv::Env::new("min-ttl");
+        let file = env.root.join("min_ttl_ms");
+        assert_eq!(min_ttl_ms(&file), None);
+        std::fs::write(&file, "100\n").unwrap();
+        assert_eq!(min_ttl_ms(&file), Some(100));
+        std::fs::write(&file, "0\n").unwrap();
+        assert_eq!(min_ttl_ms(&file), Some(0));
+        assert_eq!(min_ttl_note(0), None);
+        let note = min_ttl_note(100).unwrap();
+        assert!(note.starts_with("100: "), "{note}");
+        assert!(
+            note.contains("last 100 ms") && note.contains("QEMU"),
+            "{note}"
+        );
+        let fix = min_ttl_fix(false);
+        assert!(fix.contains(&format!("sudo tee {MIN_TTL_FILE}")), "{fix}");
+        assert!(fix.contains(MIN_TTL_TMPFILES), "{fix}");
+        assert!(min_ttl_fix(true).starts_with("it's 0 now"));
+        let script = include_str!("../../../scripts/install-ctl.sh");
+        assert!(script.contains(&format!("min_ttl_file={MIN_TTL_FILE}\n")));
+        assert!(script.contains(&format!("min_ttl_line='{MIN_TTL_TMPFILES}'\n")));
     }
 
     /// The udmabuf message names the group that owns the node, says what to do where root alone
@@ -831,7 +1147,10 @@ mod tests {
         );
         let missing = std::io::Error::from(std::io::ErrorKind::NotFound);
         assert!(udmabuf_message(&missing, None, false).contains("modprobe udmabuf"));
+        #[cfg(unix)]
         let no_module = std::io::Error::from_raw_os_error(libc::ENODEV);
+        #[cfg(windows)]
+        let no_module = std::io::Error::other("no such device");
         let m = udmabuf_message(&no_module, Some((992, "kvm".into())), false);
         assert!(
             m.contains("doesn't open") && m.contains("modprobe udmabuf"),
@@ -848,10 +1167,216 @@ mod tests {
         assert_eq!(group_in(groups, 5), None);
     }
 
+    /// QEMU's invocation for the launch tests: a program, its arguments and what it sets and
+    /// removes of the environment.
+    fn qemu_invocation() -> Invocation {
+        Invocation {
+            program: "/opt/qemu/bin/qemu-system-x86_64".into(),
+            args: ["-name", "kv-26", "-pidfile", "/vms/kv-26/qemu.pid"]
+                .map(String::from)
+                .to_vec(),
+            env: vec![("REIMS_VGPU_LOG".to_owned(), "info".to_owned())],
+            unset: vec!["REIMS_VGPU_WINDOW".to_owned()],
+        }
+    }
+
+    /// A command's program, arguments and environment changes, as [`command_of`] reads them.
+    type CommandParts = (String, Vec<String>, Vec<(String, Option<String>)>);
+
+    /// The program, arguments and environment changes `inv`'s command runs with.
+    fn command_of(inv: &Invocation) -> CommandParts {
+        let cmd = inv.command();
+        let s = |o: &std::ffi::OsStr| o.to_string_lossy().into_owned();
+        let mut envs: Vec<_> = cmd.get_envs().map(|(k, v)| (s(k), v.map(s))).collect();
+        envs.sort();
+        (s(cmd.get_program()), cmd.get_args().map(s).collect(), envs)
+    }
+
+    /// In a scope, the command is `systemd-run --user --scope` with the VM's own unit, then
+    /// QEMU's program and arguments as they were, and QEMU's environment changes on it, which
+    /// systemd-run's own process carries into QEMU; without one, it is QEMU's command as it was.
+    #[test]
+    fn a_scope_runs_qemu_through_systemd_run_under_the_vms_unit() {
+        let plain = command_of(&qemu_invocation());
+        let env = vec![
+            ("REIMS_VGPU_LOG".to_owned(), Some("info".to_owned())),
+            ("REIMS_VGPU_WINDOW".to_owned(), None),
+        ];
+        assert_eq!(plain.0, "/opt/qemu/bin/qemu-system-x86_64");
+        assert_eq!(plain.2, env);
+        let scope = Launch::Scope(scope_unit("kv-26"));
+        let (program, args, envs) = command_of(&launched(qemu_invocation(), "kv-26", &scope));
+        assert_eq!(program, "systemd-run");
+        let mut want: Vec<String> = [
+            "--user",
+            "--scope",
+            "--quiet",
+            "--collect",
+            "--unit=reims-ctl-kv-26.scope",
+            "--description=reims-ctl: kv-26's QEMU",
+            "--",
+            "/opt/qemu/bin/qemu-system-x86_64",
+        ]
+        .map(String::from)
+        .to_vec();
+        want.extend(plain.1.iter().cloned());
+        assert_eq!(args, want);
+        assert_eq!(envs, env);
+        for no_scope in [Launch::Plain(None), Launch::Plain(Some("why"))] {
+            assert_eq!(
+                command_of(&launched(qemu_invocation(), "kv-26", &no_scope)),
+                plain
+            );
+        }
+    }
+
+    /// On Linux a start takes a scope of its own where the user's manager answers and outlasts
+    /// the VM's start: the caller runs under it, or it lingers. Otherwise QEMU runs as before,
+    /// with a warning that says why; elsewhere as before, with none.
+    #[test]
+    fn a_start_takes_a_scope_where_a_user_manager_keeps_it() {
+        let m = |answers, caller_inside, lingers| UserManager {
+            answers,
+            caller_inside,
+            lingers,
+        };
+        let cases = [
+            (m(true, true, false), true),
+            (m(true, false, true), true),
+            (m(true, true, true), true),
+            (m(true, false, false), false),
+            (m(false, true, true), false),
+            (m(false, false, false), false),
+        ];
+        for (manager, scoped) in cases {
+            let launch = launch("kv-26", manager);
+            let note = launch_note("kv-26", &launch);
+            if !cfg!(target_os = "linux") {
+                assert_eq!(launch, Launch::Plain(None), "{manager:?}");
+                assert_eq!(note, None);
+            } else if scoped {
+                assert_eq!(launch, Launch::Scope("reims-ctl-kv-26.scope".to_owned()));
+                assert_eq!(note, None);
+            } else {
+                assert!(matches!(launch, Launch::Plain(Some(_))), "{manager:?}");
+                let note = note.unwrap();
+                assert!(
+                    note.starts_with(
+                        "kv-26's QEMU runs in the cgroup of the process that started it, not in a \
+                         systemd user scope of its own ("
+                    ),
+                    "{note}"
+                );
+                let why = if manager.answers {
+                    "this login runs outside the user's systemd manager"
+                } else {
+                    "no systemd user manager answers"
+                };
+                assert!(note.contains(why), "{note}");
+            }
+        }
+    }
+
+    /// What [`test_qemu`] runs as a QEMU on Windows: this test binary, which writes its pid to
+    /// the file `REIMS_CTL_TEST_QEMU_PIDFILE` names and runs on; in a run of the tests, nothing.
+    #[cfg(windows)]
+    #[test]
+    fn fake_qemu() {
+        if let Some(pidfile) = std::env::var_os("REIMS_CTL_TEST_QEMU_PIDFILE") {
+            let secs = std::env::var("REIMS_CTL_TEST_QEMU_SECS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(30);
+            std::fs::write(pidfile, format!("{}\n", std::process::id())).unwrap();
+            std::thread::sleep(Duration::from_secs(secs));
+        }
+    }
+
+    /// A pid file names a running QEMU only while its process runs, its command line names the
+    /// file and, on Windows, its program is a QEMU's: not once it ends, nor where another file
+    /// names its pid, nor, on Windows, for a process of another program.
+    #[test]
+    fn a_pid_file_names_a_qemu_only_while_it_runs() {
+        let env = crate::testenv::Env::new("pidfile");
+        let pidfile = env.root.join("qemu.pid");
+        let mut qemu = test_qemu(&pidfile, 30);
+        let id = qemu.id() as i32;
+        assert_eq!(pid_at(&pidfile), Some(id));
+        let other = env.root.join("other.pid");
+        std::fs::write(&other, format!("{id}\n")).unwrap();
+        assert_eq!(pid_at(&other), None, "its command line names another file");
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        assert_eq!(pid_at(&pidfile), None, "it ended");
+        // A process of another program whose command line names the file is no QEMU, where
+        // Windows reads its program's name (os::may_be_qemu): this test binary as itself.
+        #[cfg(windows)]
+        {
+            let mut other = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "runtime::tests::fake_qemu", "--nocapture"])
+                .arg(&pidfile)
+                .env("REIMS_CTL_TEST_QEMU_PIDFILE", &pidfile)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let named = || {
+                std::fs::read_to_string(&pidfile).unwrap_or_default().trim()
+                    == other.id().to_string()
+            };
+            while !named() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            let seen = (named(), pid_at(&pidfile));
+            let _ = other.kill();
+            let _ = other.wait();
+            assert_eq!(seen, (true, None));
+        }
+    }
+
     /// A VM does not start on a disk another VM, using it in place too, runs on.
     #[test]
     fn a_vm_does_not_start_on_a_disk_another_runs_on() {
         let env = crate::testenv::Env::new("start-shared");
+        let disk = env.root.join("disk.img");
+        std::fs::write(&disk, "").unwrap();
+        let mut reg = crate::vm::Registry::default();
+        let mut vms = Vec::new();
+        for name in ["a", "b"] {
+            let dir = env.root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            let config = format!(
+                r#"
+                name = "{name}"
+                profile = "q35-x86_64"
+                cpus = 2
+                memory_mib = 4096
+                disk = "{}"
+                [q35]
+                opencore = "opencore.qcow2"
+                firmware_code = "OVMF_CODE.fd"
+                firmware_vars = "OVMF_VARS.fd"
+                "#,
+                crate::testenv::toml_path(&disk)
+            );
+            std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
+            reg.add(name, &dir).unwrap();
+            vms.push(Vm::load(&dir).unwrap());
+        }
+        reg.save().unwrap();
+        // a runs.
+        let mut qemu = test_qemu(&vms[0].pidfile(), 30);
+        let r = start(&vms[1], Host::current());
+        let _ = qemu.kill();
+        let _ = qemu.wait();
+        let e = format!("{:#}", r.unwrap_err());
+        assert!(e.starts_with("a is running on a disk b also uses"), "{e}");
+    }
+
+    /// An additional disk another VM runs on refuses the start the same way.
+    #[test]
+    fn a_vm_does_not_start_on_an_additional_disk_another_runs_on() {
+        let env = crate::testenv::Env::new("start-shared-additional");
         let shared = env.root.join("shared.img");
         std::fs::write(&shared, "").unwrap();
         let mut reg = crate::vm::Registry::default();
@@ -880,21 +1405,16 @@ mod tests {
                 firmware_code = "OVMF_CODE.fd"
                 firmware_vars = "OVMF_VARS.fd"
                 "#,
-                system_disk.display(),
-                shared.display()
+                crate::testenv::toml_path(&system_disk),
+                crate::testenv::toml_path(&shared)
             );
             std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
             reg.add(name, &dir).unwrap();
             vms.push(Vm::load(&dir).unwrap());
         }
         reg.save().unwrap();
-        // a runs: a process whose command line names its pid file, as QEMU's does.
-        let mut qemu = std::process::Command::new("sh")
-            .args(["-c", "sleep 30; :"])
-            .arg(vms[0].pidfile())
-            .spawn()
-            .unwrap();
-        std::fs::write(vms[0].pidfile(), format!("{}\n", qemu.id())).unwrap();
+        // a runs.
+        let mut qemu = test_qemu(&vms[0].pidfile(), 30);
         let r = start(&vms[1], Host::current());
         let _ = qemu.kill();
         let _ = qemu.wait();
@@ -911,13 +1431,14 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
             disk = "disk.img"
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         let vm = Vm {
             dir: d.clone(),
@@ -939,7 +1460,7 @@ mod tests {
     /// qmp_capabilities.
     fn fake_qmp(sock: &Path) -> std::sync::Arc<std::sync::Mutex<Vec<String>>> {
         use std::io::BufRead;
-        let listener = std::os::unix::net::UnixListener::bind(sock).unwrap();
+        let listener = crate::os::UnixListener::bind(sock).unwrap();
         let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let record = seen.clone();
         std::thread::spawn(move || {
@@ -964,6 +1485,7 @@ mod tests {
     /// ends with an error rather than wait for good.
     /// A QMP socket's directory is made the user's alone, and one others may write into is
     /// refused: one made 0755 by an earlier reims-ctl is taken as it is
+    #[cfg(unix)]
     #[test]
     fn a_qmp_socket_directory_others_may_write_into_is_refused() {
         use std::os::unix::fs::PermissionsExt;
@@ -995,29 +1517,21 @@ mod tests {
         std::fs::create_dir_all(&d).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
             disk = "disk.img"
             stop_timeout_secs = 0
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         let vm = Vm {
             dir: d.clone(),
             config: toml::from_str(config).unwrap(),
         };
-        // QEMU: a process whose command line names its pid file, as QEMU's does.
-        let qemu = || {
-            let q = std::process::Command::new("sh")
-                .args(["-c", "sleep 10; :"])
-                .arg(vm.pidfile())
-                .spawn()
-                .unwrap();
-            std::fs::write(vm.pidfile(), format!("{}\n", q.id())).unwrap();
-            q
-        };
+        let qemu = || test_qemu(&vm.pidfile(), 10);
         let mut running = qemu();
         let asked = fake_qmp(&vm.qmp_socket());
         let (tx, rx) = std::sync::mpsc::channel();
@@ -1057,50 +1571,10 @@ mod tests {
         assert!(e.ends_with("a forced stop powers it off"), "{e}");
     }
 
+    /// An x86-64 VM with an installer has install steps, which name the disk to erase as Disk
+    /// Utility names it on the disk's controller, and on NVMe install there as on SATA.
     #[test]
-    fn emptied_entry_lines_count_on_from_what_was_read() {
-        let d = std::env::temp_dir().join(format!("reims-ctl-emptied-{}", std::process::id()));
-        std::fs::create_dir_all(&d).unwrap();
-        let log = d.join("qemu.log");
-        let fault = "reims-vgpu WARN reims_vgpu_core::tasks::local::exec: task 2: exec faulted: \
-                     resource 3 not found: object 3 has an empty entry\n";
-        let append = |s: &str| {
-            let mut f = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&log)
-                .unwrap();
-            f.write_all(s.as_bytes()).unwrap();
-        };
-        assert_eq!(emptied_entry_lines(&log), 0);
-        append("reims-ctl 0.1.0 started t\n");
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        // A line still being written counts once it ends.
-        append(&fault[..40]);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        append(&fault[40..]);
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 3);
-        // The guest's reboot in the same run (as after setting the key from Recovery) counts
-        // from the device's reset.
-        append("reims-vgpu INFO reims_vgpu_core::device::lifecycle: device reset\n");
-        assert_eq!(emptied_entry_lines(&log), 0);
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        // A start's rotation leaves a new file, counted from its start.
-        std::fs::rename(&log, d.join("qemu.1.log")).unwrap();
-        append(&"x".repeat(4096));
-        append("\n");
-        append(fault);
-        assert_eq!(emptied_entry_lines(&log), 1);
-        std::fs::remove_dir_all(&d).unwrap();
-    }
-
-    /// An x86-64 VM with an installer has install steps, which for a disk on NVMe first say to
-    /// move it to SATA.
-    #[test]
-    fn install_steps_move_a_disk_on_nvme_to_sata_first() {
+    fn install_steps_name_the_disk_on_its_controller() {
         let config = r#"
             name = "t"
             profile = "q35-x86_64"
@@ -1119,15 +1593,87 @@ mod tests {
         };
         let steps = install_steps(&vm).unwrap();
         assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
+        assert!(
+            steps.contains("erase it (QEMU HARDDISK Media) as APFS"),
+            "{steps}"
+        );
         let q = vm.config.q35.as_mut().unwrap();
         q.disk_controller = DiskController::Nvme;
         let steps = install_steps(&vm).unwrap();
+        assert!(steps.starts_with("To install macOS, start t:"), "{steps}");
         assert!(
-            steps.starts_with("Its disk is on NVMe")
-                && steps.contains("reims-ctl set t --disk-controller ahci"),
+            steps.contains("erase it (QEMU NVMe Ctrl Media) as APFS"),
             "{steps}"
         );
+        assert!(!steps.contains("--disk-controller"), "{steps}");
         vm.config.q35.as_mut().unwrap().installer = None;
         assert_eq!(install_steps(&vm), None);
+    }
+
+    /// An x86-64 VM's install steps end with ejecting the installer.
+    #[test]
+    fn install_steps_end_with_ejecting_the_installer() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "installer.img"
+        "#;
+        let vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.ends_with("eject the installer (reims-ctl eject t).")
+                && !steps.contains("error mode")
+                && !steps.contains("--network"),
+            "{steps}"
+        );
+    }
+
+    /// An offline installer's steps say to install with the network off, before the VM starts,
+    /// and to turn it back on with the installer ejected; with the network already off, only the
+    /// second.
+    #[test]
+    fn offline_install_steps_install_with_the_network_off() {
+        let config = r#"
+            name = "t"
+            profile = "q35-x86_64"
+            cpus = 2
+            memory_mib = 4096
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
+            installer = "macos-26.6.2-offline-installer.img"
+        "#;
+        let mut vm = Vm {
+            dir: "/vms/t".into(),
+            config: toml::from_str(config).unwrap(),
+        };
+        let off = "turn the VM's network off before you start it (reims-ctl set t --network false";
+        let on = "eject the installer (reims-ctl eject t) and turn its network back on (reims-ctl \
+                  set t --network).";
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            steps.contains(off)
+                && steps.find(off) < steps.find("To install macOS, start t")
+                && steps.ends_with(on),
+            "{steps}"
+        );
+        vm.config.network.enabled = false;
+        let steps = install_steps(&vm).unwrap();
+        assert!(
+            !steps.contains("--network false") && steps.ends_with(on),
+            "{steps}"
+        );
     }
 }

@@ -41,11 +41,35 @@ class RgfxSlabs;
 /// The wire's RgfxTextureDescriptor of `d`: each Metal enum its raw value, the four swizzle
 /// channels one byte each, red lowest (RgfxTexture.mm).
 RgfxTextureDescriptor rgfxTextureDescriptorFromMTL(MTLTextureDescriptor *_Nonnull d);
+
+/// Whether a texture of `d` of memory of its own takes more bytes than `maxLength` (the device's
+/// maxBufferLength; 0 holds none back): every level of every slice and sample, in its format's
+/// blocks, which its allocatedSize answers. The device's newTextureWithDescriptor: answers nil
+/// for one, sending nothing, as the Intel 630 under macOS 26.7.1 answers nil past its
+/// maxBufferLength (oracle_texdesc device: 2 GiB made, a row more nil), as a buffer and a heap
+/// past it are nil there and here; the AMD 5300M makes one of 16 GiB and none of 20 GiB, its
+/// maxBufferLength 3.2 GB (docs/graphics-kext/dgpu-oracle.md, Q24).
+bool rgfxTexturePastLength(MTLTextureDescriptor *_Nonnull d, uint64_t maxLength);
+
+/// The widest texture buffer (MTLTextureTypeTextureBuffer) Metal's descriptor validation takes, in
+/// elements of any format: 268435456 (2^28), what the AMD 5300M and the Intel 630 under macOS
+/// 26.7.1 and the M3 Max under macOS 27.0.1 answer to the device's maxTextureBufferWidth (SPI) and
+/// take at the device's, a Private heap's and a Shared buffer's creators, 1-, 2-, 4-, 8- and
+/// 16-byte formats alike, ending the process one element past it with the width line every type
+/// gives (oracle_texdesc --texbuf, docs/graphics-kext/dgpu-oracle.md, Q24). MoltenVK makes a
+/// texel buffer view's texture so, its width the view's elements.
+constexpr uint64_t kRgfxMaxTextureBufferWidth = uint64_t{1} << 28;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
 
 @interface RgfxTexture : RgfxResource <MTLTexture>
+
+/// MTLTextureSPI's `swizzleKey`, which the system's GL renderer asks of every texture it samples
+/// or draws to: the four channels of `swizzle`, one byte each, red lowest, as Metal's x86 devices
+/// answer it (measured: macOS 26.7.1, an AMD 5300M and an Intel 630: 0x05040302 for the default
+/// swizzle, of any pixel format, and 0x01020202 for a view of red, red, red, one).
+- (uint32_t)swizzleKey;
 
 /// Creates a texture of shape `descriptor`. When `heap` is RGFX_OBJ_NONE the
 /// texture is device-placed (a GPU address is picked); otherwise it lies at
@@ -121,10 +145,6 @@ NS_ASSUME_NONNULL_BEGIN
 /// factory calls it on the texture it made; until then the texture answers Metal's defaults.
 - (void)rgfxTakeDescriptor:(nullable MTLTextureDescriptor *)descriptor;
 
-/// Whether the texture lies over a Managed buffer of one copy (RgfxBuffer's rgfxOneCopy), itself
-/// or as a view of one that does: a synchronize of it has nothing to bring over.
-- (BOOL)rgfxOverOneCopy;
-
 @end
 
 /// Ends the process, with Metal's words, at a descriptor Metal's texture descriptor validation
@@ -132,7 +152,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Intel 630 under macOS 26.7.1 end it at every texture creator (oracle_texdesc at the device's, a
 /// Private heap's and a Shared buffer's; oracle_surftex over an IOSurface; Q12; Q20): one
 /// assertion listing every rule broken, a line each: a width, height, depth or array length of 0
-/// or past what the type takes (16384 a side, 2048 for a 3D texture's and an array's), a format
+/// or past what the type takes (16384 a side, 2048 for a 3D texture's and an array's, and a
+/// texture buffer's width kRgfxMaxTextureBufferWidth, at every creator alike), a format
 /// the device lacks (Invalid, the three-channel formats, the packed 16-bit ones, sRGB R8 and RG8,
 /// ASTC, ETC2, EAC, PVRTC, the XR10 formats, Unspecialized, every two-plane one, and
 /// Depth24Unorm_Stencil8 and X24_Stencil8 as the lane answers no Depth24Stencil8, as the Intel 630
@@ -144,13 +165,52 @@ NS_ASSUME_NONNULL_BEGIN
 /// Managed storage, Memoryless storage and a storage mode Metal has no name for, and usage bit
 /// 0x80. A type past MTLTextureTypeTextureBuffer ends it with no words, as there. The device's, the heaps' and a buffer's texture creators, by the public form and the
 /// linear and tiled SPI, and the creator over an IOSurface, call it before they send the host
-/// anything; it returns for any other descriptor.
+/// anything; it returns for any other descriptor. Where `device` is an Apple GPU
+/// (rgfxAppleGPU), the rules are the M3 Max's, which differ in the formats it lacks, the
+/// multisample formats and the storage it takes, and its compressed formats (RgfxTexture.mm).
 void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLDevice> device = nil);
+
+/// Whether Metal's rules for `device` are an Apple GPU's: where `device` answers an Apple family
+/// (Apple7, every Apple-silicon Mac's), and in an arm64 guest where it is the guest's device
+/// (RgfxAppleRulesDevice), whatever families it answers, as every GPU an arm64 Mac has is Apple's.
+/// False for nil.
+bool rgfxAppleGPU(id<MTLDevice> _Nullable device);
+
+/// Ends the process, with the M3 Max's words, at a texture of a depth or stencil format over a
+/// buffer's bytes, by the public newTextureWithDescriptor:offset:bytesPerRow: and the linear SPI,
+/// where `device` is an Apple GPU (rgfxAppleGPU): the M3 Max under macOS 27.0.1 with no validation
+/// layer ends it at Depth16Unorm, Depth32Float, Stencil8, Depth32Float_Stencil8 and X32_Stencil8
+/// in Shared storage over a Shared buffer, after the descriptor's validation, which takes them
+/// ("Linear texture: cannot create compressed, depth, or stencil textures", oracle_bundle Apple
+/// buftex.depth*, linear.depth, 11-13). The x86 Macs end it at the descriptor's validation, at
+/// the storage (rgfxEndAtInvalidTextureDescriptor). It returns for any other texture.
+void rgfxEndAtLinearDepthStencil(MTLTextureDescriptor *descriptor, id<MTLDevice> _Nullable device);
+
+/// Whether `format` is a block-compressed format the device has: BC1 to BC7, and on an Apple GPU
+/// (rgfxAppleGPU) PVRTC, EAC, ETC2 and ASTC too.
+bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> _Nullable device);
+
+/// Whether the device's and a heap's texture creators answer nil for `descriptor`, past Metal's
+/// validation, sending nothing: on an Apple GPU, a two-plane Y'CbCr or RGB format or Unspecialized
+/// (263), as the M3 Max under macOS 27.0.1 answers at both (oracle_texdesc device and heap,
+/// fmt.ycbcr500 and fmt.unspecialized). The two-plane XR10 formats, RGB10A8_2P_XR10 (550) and its
+/// sRGB twin (551), are made: Metal on the M3 Max makes a texture of either of its own memory, as
+/// the Vulkan platform's tests that compare theirs with Metal's make them
+/// (two_plane_xr10_fills_off_a_surface_are_metals, heap_texture_sizes_are_metals), and 14.6.1's
+/// WindowServer, on a display that answers extended range, flattens a window's layers into a
+/// Private one of usage ShaderRead and RenderTarget and ends the process at a nil (read from
+/// SkyLight's determine_required_pixel_format and MetalBacking::PrepareForUse). A buffer's
+/// creator (`overBuffer`) answers nil for them too, as the Vulkan platform makes no texture of
+/// one over a buffer. The x86 Macs end the process at each of them in the validation.
+bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
+                                id<MTLDevice> _Nullable device, bool overBuffer = false);
 
 /// Ends the process, with Metal's words, where a heap's texture creator ends it after the
 /// descriptor's validation, as the AMD 5300M and the Intel 630 under macOS 26.7.1 end it at a
-/// Private heap (oracle_texdesc heap): a descriptor of another storage mode than the heap's.
-void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode);
+/// Private heap (oracle_texdesc heap): a descriptor of another storage mode than the heap's, but,
+/// on an Apple GPU, a Memoryless one, which the M3 Max makes there.
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode,
+                                  id<MTLDevice> device = nil);
 
 /// Ends the process, with Metal's words, where `minimumLinearTextureAlignmentForPixelFormat:` ends
 /// it on the x86-64 Macs, and returns for the 64 raw formats both answer (256), alike on the AMD
@@ -164,7 +224,22 @@ void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMo
 /// EAC, ETC2, ASTC, the packed 16-bit ones, D24S8 and X24S8 as the lane answers no
 /// Depth24Stencil8, as the Intel 630 does, Unspecialized, the XR10 formats, the Y'CbCr ones, and
 /// values no format has).
-void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
+/// On an Apple GPU (`device`, rgfxAppleGPU), the M3 Max's rules under macOS 27.0.1 with no
+/// validation layer (oracle_bundle Apple linalign, 11-13, the same raw values): it answers 175
+/// values, among them those the x86 Macs lack but Invalid, D24S8 and X24S8 (B5G6R5, A1BGR5, ABGR4,
+/// sRGB R8 and RG8, Unspecialized, the two-plane and XR10 formats) and values of no name in the SDK
+/// (26, 44, 66, 116, 501, 504, 521, 524, 546 to 548, 560, 562 to 613 and 615 to 629); it ends the
+/// process at every compressed format it has (PVRTC, EAC, ETC2 and ASTC too, and 185, 191, 203,
+/// 209, 221 and 227) with the compressed words, at 651 and 652 too with the depth/stencil words,
+/// and at every other value as Invalid (rgfxLinearAlignmentAnswer).
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format, id<MTLDevice> _Nullable device = nil);
+
+/// What minimumLinearTextureAlignmentForPixelFormat: does at `format` on `device`
+/// (rgfxEndAtUnalignableLinearFormat): answers it, or ends the process as at a compressed format,
+/// a depth or stencil one, or one the device lacks (Invalid).
+enum class RgfxLinearAlignmentAnswer { kAnswered, kCompressed, kDepthStencil, kInvalid };
+RgfxLinearAlignmentAnswer rgfxLinearAlignmentAnswer(MTLPixelFormat format,
+                                                    id<MTLDevice> _Nullable device = nil);
 
 /// Ends the process, with Metal's words, where newTextureWithDescriptor:iosurface:plane: ends it on
 /// the AMD 5300M and the Intel 630 under macOS 26.7.1 (oracle_surftex, docs/graphics-kext/
@@ -173,23 +248,41 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format);
 /// Then over a surface without planes: at a type other than 2D or TextureBuffer, a depth other than 1, more
 /// than one level, rows wider than the surface's bytesPerRow (a compressed or 4:2:2 format's
 /// counted in its blocks), a depth or stencil format, a plane other than 0, and more rows than
-/// the surface's. The device's creator calls it before it sends the host anything; it returns for
-/// any other texture, which the creator makes, or answers nil for (RgfxIOSurfaceTexture).
+/// the surface's. Over a plane of a surface with planes, on an Apple GPU (rgfxAppleGPU), at a
+/// Cube or CubeArray type, as the M3 Max under macOS 27.0.1 ends it at a plane of a one-plane
+/// BGRA surface and the luma plane of a 420v one ("carriesComplexTexture || numFaces == 1",
+/// oracle_surftex Apple), where the x86 Macs make it. The device's creator calls it before it
+/// sends the host anything; it returns for any other texture, which the creator makes, or answers
+/// nil for (rgfxSurfaceMakesNoTextureOf, RgfxIOSurfaceTexture).
 void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceRef surface,
                                     NSUInteger plane, id<MTLDevice> device = nil);
+
+/// Whether newTextureWithDescriptor:iosurface:plane: answers nil for `descriptor`, past what it
+/// ends the process at (rgfxEndAtInvalidSurfaceTexture), sending nothing: on an Apple GPU
+/// (rgfxAppleGPU), a compressed format it has (rgfxBlockCompressedFormat: BC, PVRTC, EAC, ETC2,
+/// ASTC), and a two-plane format of 4:2:0 or 4:2:2 chroma of an odd width or height that is a
+/// render target or that a shader writes, as the M3 Max under macOS 27.0.1 answers over a surface
+/// without planes, a one-plane surface's plane and either plane of a 420v surface (oracle_surftex
+/// Apple, Q20); 4:4:4 and XR10 ones it makes. The x86 Macs make a BC texture wherever its rows fit
+/// and end the process at every two-plane format (rgfxEndAtInvalidTextureDescriptor).
+bool rgfxSurfaceMakesNoTextureOf(MTLTextureDescriptor *_Nullable descriptor,
+                                 id<MTLDevice> _Nullable device);
 
 /// Ends the process, with Metal's words, at a view of a texture in `from`, of `fromType`,
 /// `levelCount` levels and `sliceCount` slices, that Metal's validation ends it at on the AMD 5300M
 /// and the Intel 630 under macOS 26.7.1 with no validation layer (oracle_bundle view.*): in no
-/// format (MTLPixelFormatInvalid, which the M3 Max under macOS 27.0.1 answers nil for); in a
+/// format (MTLPixelFormatInvalid), but where `device` is an Apple GPU (rgfxAppleGPU), as the M3
+/// Max under macOS 27.0.1 answers nil for it (oracle_bundle Apple view.noformat, 11-13); in a
 /// format of one texel a block of other bytes than the texture's (RGBA16Float in RGBA8Unorm); and,
 /// for a view naming its type, levels and slices (`subrange`), levels or slices past the
 /// texture's, a type of another family (a 2D texture as 3D), or a cube's slices not a multiple of
-/// six, as the M3 Max's does. It returns for any other view, among them those the oracles did not
-/// measure (empty ranges, other slice counts, compressed formats), which the bundle answers nil.
+/// six. The M3 Max ends the process at each of these in the same words (oracle_bundle Apple
+/// view.*, 11-13). It returns for any other view, among them those the oracles did not measure
+/// (empty ranges, other slice counts, compressed formats), which the bundle answers nil.
 void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
                             uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
-                            NSRange levels, NSRange slices, bool subrange);
+                            NSRange levels, NSRange slices, bool subrange,
+                            id<MTLDevice> _Nullable device = nil);
 
 /// A device whose linear texture alignment the bundle's own callers ask without
 /// `minimumLinearTextureAlignmentForPixelFormat:`, which ends the process at some formats
@@ -197,6 +290,17 @@ void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64
 @protocol RgfxLinearAlignmentSource <NSObject>
 - (NSUInteger)rgfxLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format;
 @end
+
+#if defined(__arm64__)
+/// The device of an arm64 guest (RgfxMetalDevice), whose texture rules are an Apple GPU's
+/// (rgfxAppleGPU) though it answers no Apple family while the host lets it answer none
+/// (device_info.rs, cap_apple_families): an arm64 Mac's GPU is always Apple's, and the guest's
+/// frameworks make what an Apple GPU takes, such as a texture of a two-plane format, which the
+/// x86 Macs' rules end the process at.
+@protocol RgfxAppleRulesDevice <NSObject>
+- (BOOL)rgfxAppleRules;
+@end
+#endif
 
 NS_ASSUME_NONNULL_END
 

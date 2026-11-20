@@ -7,7 +7,6 @@ mod dist;
 mod header;
 mod lint;
 mod metallibs;
-mod smoke;
 mod tools;
 mod util;
 
@@ -37,7 +36,7 @@ const COMMANDS: &[Command] = &[
     },
     Command {
         name: "dist",
-        about: "the library as a plain library in target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h, reims-vgpu.pc and the option ROM built from firmware/; --profile <p>, --out DIR, --platform vulkan (the proof of concept, in target/dist-vulkan)",
+        about: "the library as a plain library in target/dist-vulkan: libreims_vgpu.a and the shared library, reims_vgpu.h and reims-vgpu.pc; --profile <p>, --out DIR, --platform vulkan (the only platform, kept for the builds that name it)",
         run: dist::cmd_dist,
     },
     Command {
@@ -46,13 +45,8 @@ const COMMANDS: &[Command] = &[
         run: metallibs::cmd_metallibs,
     },
     Command {
-        name: "smoke",
-        about: "a guest workload linked statically with the dist tree's library, as QEMU links it, against its expected values; --dist <dir>",
-        run: smoke::cmd_smoke,
-    },
-    Command {
         name: "check",
-        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64",
+        about: "testkit, header --check, the records of the prebuilt option ROM and guest kexts (make -C firmware prebuilt-check, make -C guest prebuilt-check), rustfmt, clippy, cargo nextest and the doc-tests; on a Mac, also clippy for x86-64 Linux and, where Rosetta runs x86-64 code, core's tests as x86-64; off Windows, clippy for x86-64 Windows",
         run: cmd_check,
     },
 ];
@@ -108,7 +102,7 @@ fn show(name: &str, rep: &lint::Report) -> bool {
 
 fn cmd_testkit(_args: &[String]) -> Res<bool> {
     let root = repo_root();
-    let lib = read(&root.join("crates/reims-vgpu-core/src/lib.rs"))?;
+    let lib = read(&root.join("crates/reims-vgpu-vulkan/src/core.rs"))?;
     let mut manifests = Vec::new();
     for p in util::walk(&root.join("crates"), &["Cargo.toml"]) {
         manifests.push((util::rel(&p, &root), read(&p)?));
@@ -151,23 +145,24 @@ fn make(args: &[&str]) -> Res<bool> {
     Ok(status.success())
 }
 
-/// The features `check` tests with: every feature of the workspace's crates but the C API's
-/// `vulkan`, which makes every handle of the C API the Vulkan platform's, so that the pins and
-/// the C harness, which drive the product's C API, would run on that platform instead
-/// (architecture 13.1). Clippy lints with every feature as well, the C API's on Vulkan among them.
-const TESTED_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan";
-
-/// The features on Linux, where the Vulkan platform is the only one, the C API's included.
-const LINUX_FEATURES: &str =
-    "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan";
+/// The features `check` tests with: the testkits, and the `vulkan` features, which change
+/// nothing now that the Vulkan platform is the library's only one, and which the builds that name
+/// them keep. Clippy lints with every feature as well.
+const TESTED_FEATURES: &str =
+    "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,reims-vgpu-c/vulkan";
 
 /// The Linux the library ships for, which a Mac type-checks.
 const LINUX_TARGET: &str = "x86_64-unknown-linux-gnu";
 
-/// The features a Mac type-checks Linux with: [`LINUX_FEATURES`], and SDL's sources left
-/// unbuilt, as a Mac has no Linux C toolchain for them and nothing links.
-const LINUX_CHECK_FEATURES: &str = "reims-vgpu-core/testkit,reims-vgpu/testkit,reims-vgpu/vulkan,\
-    reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
+/// The Windows the library is being brought up on (AGENTS.md), which every other OS
+/// type-checks.
+const WINDOWS_TARGET: &str = "x86_64-pc-windows-gnullvm";
+
+/// The features another OS's target is type-checked with ([`LINUX_TARGET`] on a Mac,
+/// [`WINDOWS_TARGET`] off Windows): [`TESTED_FEATURES`], and SDL's sources left unbuilt, as the
+/// host has no C toolchain for that target and nothing links.
+const CROSS_CHECK_FEATURES: &str = "reims-vgpu-vulkan/testkit,reims-vgpu/testkit,\
+    reims-vgpu/vulkan,reims-vgpu-c/vulkan,reims-vgpu-window/sdl-no-link";
 
 /// The variable jemalloc's build script (`tikv-jemalloc-sys`, the C API's allocator on
 /// [`LINUX_TARGET`]) reads for that target as a library to link in place of the one it builds. A
@@ -187,6 +182,10 @@ fn empty_archive() -> Res<std::path::PathBuf> {
 
 /// The macOS core's tests run as under Rosetta, with the x86-64 guest's pages.
 const X86_64_MACOS_TARGET: &str = "x86_64-apple-darwin";
+
+/// core's tests, which run as [`X86_64_MACOS_TARGET`] too: the Vulkan crate's unit tests in its
+/// `core` module, a nextest filter over the crate's library (`-p reims-vgpu-vulkan --lib`).
+const CORE_TESTS: &str = "test(/^core::/)";
 
 /// Whether this Mac runs x86-64 code: an x86-64 `true` run under `arch -x86_64` exits 0, which
 /// it does where Rosetta is installed (and on an Intel Mac); without Rosetta the launch fails.
@@ -210,11 +209,7 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     ok &= make(&["-C", "firmware", "prebuilt-check"])?;
     ok &= make(&["-C", "guest", "prebuilt-check"])?;
     if !flag(args, "--no-cargo") {
-        let features = if cfg!(target_os = "linux") {
-            LINUX_FEATURES
-        } else {
-            TESTED_FEATURES
-        };
+        let features = TESTED_FEATURES;
         ok &= cargo(&["fmt", "--all", "--check"])?;
         let clippy = |more: &[&str], env: &[(&str, &std::path::Path)]| {
             let mut args = vec!["clippy", "--workspace", "--all-targets"];
@@ -232,8 +227,21 @@ fn cmd_check(args: &[String]) -> Res<bool> {
             // and nothing links.
             let jemalloc = empty_archive()?;
             ok &= clippy(
-                &["--target", LINUX_TARGET, "--features", LINUX_CHECK_FEATURES],
+                &["--target", LINUX_TARGET, "--features", CROSS_CHECK_FEATURES],
                 &[(LINUX_JEMALLOC_OVERRIDE, &jemalloc)],
+            )?;
+        }
+        if !cfg!(target_os = "windows") {
+            // Every Windows file, type-checked from the Mac or Linux as Linux's are from the
+            // Mac: nothing else here builds for Windows, which links no jemalloc.
+            ok &= clippy(
+                &[
+                    "--target",
+                    WINDOWS_TARGET,
+                    "--features",
+                    CROSS_CHECK_FEATURES,
+                ],
+                &[],
             )?;
         }
         ok &= cargo(&[
@@ -250,10 +258,13 @@ fn cmd_check(args: &[String]) -> Res<bool> {
                     "nextest",
                     "run",
                     "-p",
-                    "reims-vgpu-core",
+                    "reims-vgpu-vulkan",
+                    "--lib",
                     "--target",
                     X86_64_MACOS_TARGET,
                     "--no-fail-fast",
+                    "-E",
+                    CORE_TESTS,
                 ])?;
             } else {
                 println!(
@@ -267,4 +278,27 @@ fn cmd_check(args: &[String]) -> Res<bool> {
     }
     println!("check: {}", if ok { "ok" } else { "FAILED" });
     Ok(ok)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A target the check type-checks that the toolchain file does not install fails the check
+    /// on a host that never added it by hand.
+    #[test]
+    fn the_cross_checked_targets_are_in_the_toolchain_file() {
+        let toolchain = read(&repo_root().join("rust-toolchain.toml")).unwrap();
+        let targets = toolchain
+            .split_once("targets = [")
+            .and_then(|(_, rest)| rest.split_once(']'))
+            .map(|(list, _)| list)
+            .expect("rust-toolchain.toml lists its targets");
+        for target in [LINUX_TARGET, WINDOWS_TARGET, X86_64_MACOS_TARGET] {
+            assert!(
+                targets.contains(&format!("\"{target}\"")),
+                "{target} in {targets}"
+            );
+        }
+    }
 }

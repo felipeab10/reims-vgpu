@@ -3,10 +3,10 @@
 
 use std::time::Duration;
 
+use crate::core::platform::event::{Notification, SharedEvent};
+use crate::core::raise::RaiseResult;
+use crate::core::rt::BlockEnv;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::event::{Notification, SharedEvent};
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::rt::BlockEnv;
 
 use crate::answer::plain;
 use crate::platform::{Obj, VulkanPlatform};
@@ -17,24 +17,14 @@ pub type VulkanEvent = Obj<rt::Event>;
 /// `id<MTLSharedEvent>`.
 pub type VulkanSharedEvent = Obj<rt::SharedEvent>;
 
-/// `MTLSharedEventHandle *`: in this process only, as the runtime's handle is.
-pub type VulkanSharedEventHandle = Obj<rt::SharedEventHandle>;
-
 /// `MTLSharedEventListener *`.
 pub type VulkanSharedEventListener = Obj<rt::SharedEventListener>;
 
 impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
-    /// A handle of this process: the runtime's handles open in the process that made them.
-    fn new_shared_event_handle(&self) -> Option<VulkanSharedEventHandle> {
-        Some(Obj::new(plain(|| {
-            rt::SharedEvent::new_shared_event_handle(self)
-        })))
-    }
-
     /// The value becomes at least `signaled_value`; the runtime refuses no value.
     fn set_signaled_value(&self, signaled_value: u64) -> RaiseResult<()> {
         // evset: event, value: the guest's or the device's host set
-        reims_vgpu_core::trace::event(
+        crate::core::trace::event(
             "evset",
             &[crate::gpu::command::event_id(self), signaled_value],
         );
@@ -70,13 +60,13 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
         block: Notification,
     ) -> RaiseResult<()> {
         #[cfg(test)]
-        let slot = reims_vgpu_core::testkit::capture::current_slot();
+        let slot = crate::core::testkit::capture::current_slot();
         let notification: rt::SharedEventNotification =
             Box::new(move |_event: &rt::SharedEvent, _value: u64| {
                 // A callout on the runtime's thread: marked ours, so a panic here aborts.
                 let _env = BlockEnv::foreign();
                 #[cfg(test)]
-                reims_vgpu_core::testkit::capture::with_slot(slot, block);
+                crate::core::testkit::capture::with_slot(slot, block);
                 #[cfg(not(test))]
                 block();
             });
@@ -87,7 +77,7 @@ impl SharedEvent<VulkanPlatform> for VulkanSharedEvent {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::device::GpuDevice;
+    use crate::core::platform::device::GpuDevice;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -108,7 +98,7 @@ mod tests {
     /// thread, and once only; at once for a value reached already
     #[test]
     fn notify_listener_runs_once_the_value_is_reached() {
-        use reims_vgpu_core::platform::Platform as _;
+        use crate::core::platform::Platform as _;
         let listener = crate::platform::tests::platform().new_shared_event_listener();
         let e = dev().new_shared_event().unwrap();
         let (ran, runs) = std::sync::mpsc::channel();

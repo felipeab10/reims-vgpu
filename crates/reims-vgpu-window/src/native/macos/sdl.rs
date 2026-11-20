@@ -36,7 +36,7 @@ use objc2::rc::Retained;
 use objc2_app_kit::{NSWindow, NSWindowOcclusionState, NSWindowStyleMask};
 use objc2_foundation::NSRect;
 use objc2_quartz_core::CAMetalLayer;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::os::msg;
 use sdl3_sys::everything::*;
 
 pub(crate) use self::input::{Input, key_input_captured, quit_requested, release_key_input, takes};
@@ -116,14 +116,9 @@ fn restyle(window: &NSWindow, style: NSWindowStyleMask) {
     }
 }
 
-/// Makes SDL's Metal view in `sdl`, sets its layer up for `window`'s sink, and hands the render
-/// thread the layer. `None` where SDL makes no view.
+/// Makes SDL's Metal view in `sdl`, sets its layer up, and hands `window`'s render thread the
+/// layer. `None` where SDL makes no view.
 fn attach_layer(window: &Window, sdl: *mut SDL_Window) -> Option<SDL_MetalView> {
-    let sink = window.sink();
-    let device = sink.as_ref().and_then(|sink| sink.device());
-    let framebuffer_only = sink.as_ref().is_none_or(|sink| sink.render_target_only());
-    // Let go of the sink as soon as it has answered, as AppKit's window does.
-    drop(sink);
     // SAFETY: SDL's window, made with `SDL_WINDOW_METAL`, on the main thread.
     let view = unsafe { SDL_Metal_CreateView(sdl) };
     if view.is_null() {
@@ -139,7 +134,7 @@ fn attach_layer(window: &Window, sdl: *mut SDL_Window) -> Option<SDL_MetalView> 
         unsafe { SDL_Metal_DestroyView(view) };
         return None;
     };
-    configure_layer(layer, device.as_deref(), framebuffer_only);
+    configure_layer(layer);
     window.surface().set_layer(LayerRef::new(layer));
     Some(view)
 }
@@ -171,13 +166,7 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, taken: &[Frame]) -> O
         appkit::screen_frame(screen.as_deref())
     } else {
         let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
-        appkit::windowed_frame(
-            screen.as_deref(),
-            mode,
-            window.guest_scale(mode),
-            taken,
-            mtm,
-        )
+        appkit::windowed_frame(screen.as_deref(), mode, taken, mtm)
     };
     let title = c_string(window.title());
     let flags =
@@ -206,6 +195,9 @@ pub(crate) fn open(window: &Arc<Window>, borderless: bool, taken: &[Frame]) -> O
     msg::get("setFrame:display:", || {
         ns_window.setFrame_display(frame, false);
     });
+    if !borderless {
+        appkit::step_resizes(&ns_window);
+    }
     let Some(metal_view) = attach_layer(window, sdl) else {
         destroy();
         return None;
@@ -243,8 +235,7 @@ pub(crate) fn follow(shell: &mut Shell, mode: (u16, u16), taken: &[Frame]) {
     };
     let ns_window = &shell.os.ns_window;
     let frame = msg::get("frame", || ns_window.frame());
-    let resized =
-        appkit::followed_frame(ns_window, mode, shell.window.guest_scale(mode), taken, mtm);
+    let resized = appkit::followed_frame(ns_window, mode, taken, mtm);
     if resized != frame {
         msg::get("setFrame:display:", || {
             ns_window.setFrame_display(resized, true);

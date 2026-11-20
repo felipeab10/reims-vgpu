@@ -1,23 +1,20 @@
 //! The tests of `encode_compute` that compare with Metal on this host: macOS only.
 
-use reims_vgpu_core::platform::resource::ComputePipeline;
-use reims_vgpu_metal::MetalPlatform;
+use crate::core::platform::resource::ComputePipeline;
+use crate::platform::VulkanPlatform;
 
 use super::*;
 
-const TGSTATIC: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/compute_tgstatic.metallib");
+const TGSTATIC: &[u8] = include_bytes!("../../../../../../tests/shaders/compute_tgstatic.metallib");
 
-const CONSTANT: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/fc.metallib");
+const CONSTANT: &[u8] = include_bytes!("../../../../../../tests/shaders/fc.metallib");
 
-const TRUNCATED: &[u8] =
-    include_bytes!("../../../../../../tests/suite/fixtures/shaders/kernel_trunc.metallib");
+const TRUNCATED: &[u8] = include_bytes!("../../../../../../tests/shaders/kernel_trunc.metallib");
 
 /// A pipeline's answers, in the trait's order but the ID: ID, imageblock length of 8×8,
 /// largest threadgroup, resource index, static threadgroup memory, ICB support, execution
 /// width.
-fn answers<P: ComputePipeline>(p: &P) -> (u64, u64, u64, u64, u64, bool, u64) {
+fn answers<P: ComputePipeline<VulkanPlatform>>(p: &P) -> (u64, u64, u64, u64, u64, bool, u64) {
     (
         p.gpu_resource_id(),
         p.imageblock_memory_length(MtlSize::new(8, 8, 1)).unwrap(),
@@ -50,15 +47,6 @@ fn libraries_and_functions() {
         assert_eq!((e.domain.as_str(), e.code), ("MTLLibraryErrorDomain", 1));
         assert!(e.description.contains("\"Invalid library file\""), "{e:?}");
     }
-    // Metal's text may say more ("Invalid library file (unexpected end of file)").
-    let Some(metal) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    for bytes in refused {
-        let e = metal.new_library(bytes).unwrap().unwrap_err();
-        assert_eq!((e.domain.as_str(), e.code), ("MTLLibraryErrorDomain", 1));
-        assert!(e.description.contains("\"Invalid library file"), "{e:?}");
-    }
 }
 
 /// A pipeline of a function answers its getters as Metal's does on this host; a nil function
@@ -77,16 +65,8 @@ fn pipelines_of_functions() {
         .map(|&(bytes, name)| answers(&pipeline(bytes, name)))
         .collect();
     assert_eq!(ours[2].4, 256, "tg_static's 64 words");
-    if let Some(metal) = MetalPlatform::system_default_device() {
-        for (&(bytes, name), ours) in kernels.iter().zip(&ours) {
-            let lib = metal.new_library(bytes).unwrap().unwrap().unwrap();
-            let f = lib.new_function(OnFault::Return, name).unwrap().unwrap();
-            let p = metal
-                .new_compute_pipeline_state_for_function(Some(&f))
-                .unwrap()
-                .unwrap();
-            assert_eq!(*ours, answers(&p), "{name}");
-        }
+    for (&(_, name), ours) in kernels.iter().zip(&ours) {
+        crate::metal_check!(name, ours);
     }
     let sel = "newComputePipelineStateWithFunction:error:";
     let site = catch_death(|| dev().new_compute_pipeline_state_for_function(None)).unwrap_err();
@@ -132,7 +112,7 @@ fn encoders_of_pass_descriptors() {
     assert_eq!(words(&out), [2, 3, 4, 5]);
     /// An encoder of `dispatch_type` of a pass descriptor on `d` that names a nil resource
     /// in its residency and adds one to 4 words: its output, once it completed.
-    fn unknown_type<P: reims_vgpu_core::platform::Platform>(
+    fn unknown_type<P: crate::core::platform::Platform>(
         d: &P::Device,
         dispatch_type: u64,
     ) -> Vec<u32> {
@@ -192,18 +172,11 @@ fn encoders_of_pass_descriptors() {
         // SAFETY: the Shared buffer's 4 words, read after the GPU's writes completed.
         unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u32>(), 4) }.to_vec()
     }
-    let metal = MetalPlatform::system_default_device();
     for dispatch_type in [2, 3, 7, 0x8000_0000, 0xffff_ffff] {
         assert_eq!(
             unknown_type::<VulkanPlatform>(&dev(), dispatch_type),
             [2, 3, 4, 5]
         );
-        if let Some(md) = &metal {
-            assert_eq!(
-                unknown_type::<MetalPlatform>(md, dispatch_type),
-                [2, 3, 4, 5]
-            );
-        }
     }
     let site = catch_death(|| {
         command_buffer().compute_encoder_for_pass(&ComputePassDesc {
@@ -225,6 +198,9 @@ enum Part {
     Blit,
     Signal,
     Wait,
+    /// The command buffer cut into parts there (`CommandBuffer::split`), the unit going on in
+    /// the next.
+    Split,
 }
 
 /// A dispatch of `add_one` over 4 words, or none.
@@ -237,9 +213,9 @@ enum Dispatch {
 }
 
 /// `parts` in one command buffer on `d`, committed: the 4 words `add_one` wrote.
-fn unit<P: reims_vgpu_core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Vec<u32> {
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+fn unit<P: crate::core::platform::Platform>(d: &P::Device, parts: &[Part]) -> Vec<u32> {
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
 
     let lib = d.new_library(ADD).unwrap().unwrap().unwrap();
     let f = lib
@@ -265,7 +241,7 @@ fn unit<P: reims_vgpu_core::platform::Platform>(d: &P::Device, parts: &[Part]) -
     let arguments = buffer(&[1, 1, 1, 0, 4, 1, 1, 4, 1, 1]);
     let event = d.new_shared_event().unwrap();
     event.set_signaled_value(5).unwrap();
-    let cb = d
+    let mut cb = d
         .new_command_queue()
         .unwrap()
         .command_buffer(OnFault::Return)
@@ -274,6 +250,10 @@ fn unit<P: reims_vgpu_core::platform::Platform>(d: &P::Device, parts: &[Part]) -
     for part in parts {
         let (dispatch_type, dispatch) = match *part {
             Part::Encoder(dispatch_type, dispatch) => (dispatch_type, dispatch),
+            Part::Split => {
+                cb = cb.split(OnFault::Return).unwrap().expect("a part");
+                continue;
+            }
             Part::Blit => {
                 let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
                 blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
@@ -340,18 +320,23 @@ fn unit<P: reims_vgpu_core::platform::Platform>(d: &P::Device, parts: &[Part]) -
 /// neither serial nor concurrent counts as serial, the first encoder counts with no dispatch,
 /// and later indirect dispatches go on. A blit encoder, an event signal or wait between, a
 /// unit's indirect dispatch of the first's type, and a direct dispatch of another type go on,
-/// as on Metal
+/// as on Metal. A command buffer cut into parts between the encoders answers as it would whole:
+/// the unit goes on in the next part
 #[test]
 fn a_units_first_indirect_dispatch_of_another_type_dies() {
     use Dispatch::{Direct, GroupsIndirect as Groups, Nothing, ThreadsIndirect as Threads};
-    use Part::{Blit, Encoder, Signal, Wait};
+    use Part::{Blit, Encoder, Signal, Split, Wait};
 
     const SERIAL: Option<u64> = None;
     const CONCURRENT: Option<u64> = Some(1);
     let groups =
         "dispatchThreadgroupsWithIndirectBuffer:indirectBufferOffset:threadsPerThreadgroup:";
     let threads = "dispatchThreadsWithIndirectBuffer:indirectBufferOffset:";
-    let dies: [(&[Part], &str); 7] = [
+    let dies: [(&[Part], &str); 8] = [
+        (
+            &[Encoder(CONCURRENT, Direct), Split, Encoder(SERIAL, Groups)],
+            groups,
+        ),
         (
             &[Encoder(CONCURRENT, Direct), Encoder(SERIAL, Groups)],
             groups,
@@ -389,7 +374,8 @@ fn a_units_first_indirect_dispatch_of_another_type_dies() {
         let site = catch_death(|| unit::<VulkanPlatform>(&dev(), parts)).unwrap_err();
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{parts:?}");
     }
-    let goes_on: [&[Part]; 11] = [
+    let goes_on: [&[Part]; 12] = [
+        &[Encoder(SERIAL, Direct), Split, Encoder(SERIAL, Groups)],
         &[Encoder(CONCURRENT, Groups), Encoder(SERIAL, Direct)],
         &[Encoder(CONCURRENT, Direct), Encoder(CONCURRENT, Groups)],
         &[Encoder(SERIAL, Direct), Encoder(SERIAL, Groups)],
@@ -414,15 +400,11 @@ fn a_units_first_indirect_dispatch_of_another_type_dies() {
             Encoder(CONCURRENT, Groups),
         ],
     ];
-    let metal = MetalPlatform::system_default_device();
     for parts in goes_on {
         assert_eq!(
             unit::<VulkanPlatform>(&dev(), parts),
             [2, 3, 4, 5],
             "{parts:?}"
         );
-        if let Some(md) = &metal {
-            assert_eq!(unit::<MetalPlatform>(md, parts), [2, 3, 4, 5], "{parts:?}");
-        }
     }
 }

@@ -49,10 +49,10 @@ use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::core::platform::icb::IndirectCommandBuffer as _;
 use metal2vulkan::metal::PrimitiveType;
 use metal2vulkan::pipeline::CommandWrites;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
 
 use crate::answer::{get, plain, unrepresentable};
 use crate::gpu::command::Progress;
@@ -155,8 +155,7 @@ impl Execution {
     /// The check the runtime's host step runs on each command it records of this execution,
     /// where its commit reads nothing (the module docs); `None` where no death could ask of its
     /// commands, which leaves the runtime its other paths. It dies where [`Execution::check`]
-    /// would, at `commit`, on the scheduler's thread, a thread of no isolated task's: the death
-    /// ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
+    /// would, at `commit`, on the scheduler's thread: the death ends the process there, as `fatal` does outside the tests' in-process capture, and unwinds
     /// nothing into the runtime. A death test's child runs without that capture, as production.
     /// With it, what the check looks for: draws of points where a state sizes them. An execution
     /// of a range
@@ -326,27 +325,27 @@ impl Drop for Read {
 
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Handle as _;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::IcbDesc;
+    use crate::core::raise::OnFault;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::metal::PixelFormat;
     use metal2vulkan::pipeline::{
         ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
     };
-    use reims_vgpu_core::platform::Handle as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::icb::{IcbRenderCmd, IndirectRenderCommand as _};
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::VulkanDevice;
     use crate::gpu::device::tests::dev;
     use crate::gpu::resource::VulkanRenderPipeline;
 
-    const VERT: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/vert.metallib");
-    const FRAG: &[u8] = include_bytes!("../../../../../tests/suite/fixtures/shaders/frag.metallib");
+    const VERT: &[u8] = include_bytes!("../../../../../tests/shaders/vert.metallib");
+    const FRAG: &[u8] = include_bytes!("../../../../../tests/shaders/frag.metallib");
 
     /// `tri_vert` and `tri_frag` into `BGRA8Unorm`, with indirect command buffer support: its
     /// vertex function writes no `[[point_size]]`, of no input primitive topology class.

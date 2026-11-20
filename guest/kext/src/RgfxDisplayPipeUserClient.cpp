@@ -9,6 +9,7 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxPipeColor.hpp"
 #include "RgfxPipeNotifications.hpp"
+#include "RgfxTrace.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOMemoryDescriptor.h>
@@ -22,7 +23,7 @@ namespace {
 
 // The argument structures' sizes.
 constexpr UInt32 kNotifySize = 0x18;
-constexpr UInt32 kTransactionSize = 0x118;
+constexpr UInt32 kTransactionSize = kRgfxPipeTransactionBytes;
 constexpr UInt32 kWaitSize = 0xc;
 constexpr UInt32 kScalerSize = 24;
 
@@ -56,14 +57,12 @@ const char *const kEntitlement = "com.apple.private.hid.client.event-monitor";
 // The accelerator id the association returns: our one accelerator.
 constexpr UInt64 kAcceleratorId = 1;
 
-// The calls logged in full (sizes, the registrations' and transactions' fields); after that,
-// every 600th transaction.
+// The calls logged in full (sizes, the registrations' and transactions' fields), the first a boot:
+// a transaction comes at every frame, so none after them is logged (docs/conventions.md).
 constexpr UInt32 kLogFirst = 48;
-constexpr UInt32 kLogEvery = 600;
 // The transactions with no cookie logged, per client.
 constexpr UInt32 kLogUnnotified = 8;
-// The colour calls logged in full (header fields, first and last entries), per client; after
-// that, every kLogEvery-th.
+// The colour calls logged in full (header fields, first and last entries), per client.
 constexpr UInt32 kLogColor = 32;
 
 inline UInt32 rd32(const UInt8 *p, UInt32 off)
@@ -115,6 +114,7 @@ bool RgfxDisplayPipeUserClient::initWithTask(task_t owningTask, void *securityID
 	nextTransaction = 0;
 	begun = 0;
 	completed = 0;
+	completionWords = 0;
 	logged = 0;
 	unnotifiedLogged = 0;
 	transactions = Transactions();
@@ -207,7 +207,7 @@ IOReturn RgfxDisplayPipeUserClient::externalMethod(uint32_t selector,
 		/* 5 */ { nullptr, 0, 0, 0, 0 },
 		/* 6 */ { nullptr, 0, 0, 0, 0 },
 		/* 7 */ { &RgfxDisplayPipeUserClient::sSeven, 0, 0, 0, 0 },
-		/* 8 */ { &RgfxDisplayPipeUserClient::sSubmit, 0, kTransactionSize, 0, 0 },
+		/* 8 */ { &RgfxDisplayPipeUserClient::sSubmit, 0, kIOUCVariableStructureSize, 0, 0 },
 		/* 9 */ { &RgfxDisplayPipeUserClient::sWait, 0, kWaitSize, 0, 0 },
 	};
 	if (logged < kLogFirst) {
@@ -378,8 +378,10 @@ IOReturn RgfxDisplayPipeUserClient::sRequestNotify(OSObject *target, void *,
 		}
 		return kIOReturnSuccess;
 	}
-	IOLog("RGFX pipe: notify kind %u: %016llx %016llx %016llx\n", kind, rd64(in, 0), rd64(in, 8),
-	      rd64(in, 16));
+	static char notifySite;
+	if (rgfxFirstCalls(&notifySite, kind, 1))
+		IOLog("RGFX pipe: notify kind %u: %016llx %016llx %016llx\n", kind, rd64(in, 0),
+		      rd64(in, 8), rd64(in, 16));
 	IOLockLock(self->lock);
 	if (self->registered) {
 		IOLockUnlock(self->lock);
@@ -482,7 +484,7 @@ IOReturn RgfxDisplayPipeUserClient::sGamma(OSObject *target, void *, IOExternalM
 		self->staged[slot] = {entries, args.count, true};
 		entries = nullptr;
 	}
-	const bool log = self->colorLogged < kLogColor || (begun && begun % kLogEvery == 0);
+	const bool log = self->colorLogged < kLogColor;
 	if (self->colorLogged < kLogColor)
 		self->colorLogged++;
 	IOLockUnlock(self->lock);
@@ -512,15 +514,37 @@ IOReturn RgfxDisplayPipeUserClient::sSubmit(OSObject *target, void *, IOExternal
 	RgfxDisplayPipeUserClient *self = OSDynamicCast(RgfxDisplayPipeUserClient, target);
 	if (!self || !self->associated || !self->framebuffer)
 		return kIOReturnNotAttached;
-	UInt8 buf[kTransactionSize];
-	const UInt8 *t = structIn(a, buf, kTransactionSize);
-	if (!t)
+	// 0x118 bytes, or macOS 11's 0x108 (RgfxPipeNotifications.hpp), read as 0x118 with zeros past
+	// its end.
+	const UInt32 bytes = a->structureInput ? a->structureInputSize
+	                     : a->structureInputDescriptor
+	                         ? static_cast<UInt32>(a->structureInputDescriptor->getLength())
+	                         : 0;
+	if (bytes != kTransactionSize && bytes != kRgfxPipeTransactionBytesShort)
 		return kIOReturnBadArgument;
+	UInt8 buf[kTransactionSize] = {};
+	const UInt8 *in = structIn(a, buf, bytes);
+	if (!in)
+		return kIOReturnBadArgument;
+	if (in != buf)
+		memcpy(buf, in, bytes);
+	const UInt8 *t = buf;
+	// The client's completions take the count its first transaction's size and the family pick.
+	IOLockLock(self->lock);
+	if (!self->completionWords) {
+		self->completionWords =
+		    rgfxPipeCompletionCount(bytes, self->framebuffer->assignedLengthExported());
+		IOLog("RGFX pipe: %u-byte transactions, family %s the assigned length: completions of %u "
+		      "words\n",
+		      bytes, self->framebuffer->assignedLengthExported() ? "exports" : "lacks",
+		      self->completionWords);
+	}
+	IOLockUnlock(self->lock);
 	UInt32 id = rd32(t, kTxnId);
 	UInt32 planeType = rd32(t, kTxnPlane0 + kPlaneType);
 	UInt32 surface = rd32(t, kTxnPlane0 + kPlaneSurface);
 	UInt64 cookie = rd64(t, kTxnCookie);
-	bool log = id <= kLogFirst / 4 || id % kLogEvery == 0;
+	bool log = id <= kLogFirst / 4;
 	if (log) {
 		UInt64 dirty = rd64(t, kTxnDirty);
 		// The time asked for, in microseconds from now (0 where it asks for none).
@@ -554,7 +578,9 @@ IOReturn RgfxDisplayPipeUserClient::submit(const UInt8 *t, UInt32 id, UInt32 pla
 		if (IOLockSleepDeadline(lock, &completed, deadline, THREAD_UNINT) == THREAD_TIMED_OUT &&
 		    !transactions.hasRoom()) {
 			IOLockUnlock(lock);
-			IOLog("RGFX pipe: transaction %u: no room in 5 s, not sent\n", id);
+			static char site;
+			if (rgfxFirstCalls(&site, 0, 1))
+				IOLog("RGFX pipe: transaction %u: no room in 5 s, not sent\n", id);
 			return kIOReturnTimeout;
 		}
 	}
@@ -587,7 +613,9 @@ IOReturn RgfxDisplayPipeUserClient::post(const UInt8 *t, UInt32 id, UInt32 plane
 	if (displayColor) {
 		const IOReturn c = postColor(t, id, &colored);
 		if (c != kIOReturnSuccess) {
-			IOLog("RGFX pipe: transaction %u: its colour not sent: 0x%x\n", id, c);
+			static char site;
+			if (rgfxFirstCalls(&site, static_cast<UInt32>(c), 1))
+				IOLog("RGFX pipe: transaction %u: its colour not sent: 0x%x\n", id, c);
 			return c;
 		}
 	}
@@ -633,7 +661,9 @@ IOReturn RgfxDisplayPipeUserClient::post(const UInt8 *t, UInt32 id, UInt32 plane
 	}
 	if (r != kIOReturnSuccess) {
 		IOLockUnlock(lock);
-		IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
+		static char site;
+		if (rgfxFirstCalls(&site, static_cast<UInt32>(r), 1))
+			IOLog("RGFX pipe: transaction %u: PRESENT_SURFACE not sent: 0x%x\n", id, r);
 		return r;
 	}
 	// Done at the host's answer: the display shows its surface, or its colour, from then.
@@ -671,7 +701,7 @@ IOReturn RgfxDisplayPipeUserClient::postColor(const UInt8 *t, UInt32 id, bool *s
 		r = framebuffer->postDisplayColor(id, RGFX_COLOR_MATRIX, kRgfxMatrixRows,
 		                                  t + kRgfxTxnMatrix);
 		*sent = true;
-		if (colorLogged < kLogColor || id % kLogEvery == 0) {
+		if (colorLogged < kLogColor) {
 			colorLogged += colorLogged < kLogColor ? 1 : 0;
 			IOLog("RGFX pipe: transaction %u: colour matrix %08x %08x %08x %08x / %08x %08x %08x "
 			      "%08x / %08x %08x %08x %08x\n",
@@ -730,10 +760,10 @@ void RgfxDisplayPipeUserClient::completeLocked(const Transactions::Completion &c
 {
 	if (c.id > completed)
 		completed = c.id;
-	if (c.notified && registered) {
-		io_user_reference_t words[kRgfxPipeCompletionWords];
-		rgfxPipeCompletionWords(words, c.cookie, c.id, time);
-		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, kRgfxPipeCompletionWords);
+	if (c.notified && registered && completionWords) {
+		io_user_reference_t words[kRgfxPipeCompletionWordsMax];
+		rgfxPipeCompletionWords(words, completionWords, c.cookie, c.id, time);
+		sendAsyncResult64(transactionRef, kIOReturnSuccess, words, completionWords);
 	}
 	IOLockWakeup(lock, &completed, false);
 }

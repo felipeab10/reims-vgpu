@@ -12,7 +12,7 @@
 //!   (MoltenVK 1.4.1 among them). Such a refusal is one, its line naming the copy's shape
 //!   (`buffer_copy_shape`).
 //! - **`fillBuffer:range:pattern4:`** is the runtime's `fill_buffer_pattern4`, which writes the
-//!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_the_metal_platforms`,
+//!   pattern as Metal does ([`crate::gpu::fill`]'s docs; `pattern_fills_are_metals`,
 //!   over more than the runtime stages at once).
 //! - **The private texture fills** (the two `fillTexture:...`) are the runtime's: a bytes fill
 //!   its `fill_texture` of the pattern, a colour fill its colour fill, which fills the texel it
@@ -20,42 +20,42 @@
 //!   buffer outside the Metal address space, at the level and slice and in the region
 //!   [`crate::gpu::fill::place`] gives (a texture buffer's as the call gives them, the bytes
 //!   of its buffer written from the region's `x` whatever the level, slice and row, the pattern
-//!   running across them past the width, `texture_buffer_fills_are_the_metal_platforms` and
+//!   running across them past the width, `texture_buffer_fills_within_a_texel_are_metals` and
 //!   `texture_buffer_fills_metal_streams_are_metals`); a fill that writes nothing encodes
 //!   nothing. They write
-//!   what Metal's fill writes on this host (`texture_fills_are_the_metal_platforms`, of colour
+//!   what Metal's fill writes on this host (`texture_fills_are_metals`, of colour
 //!   and depth formats, levels, slices, cube faces, 3D depths, cut regions and a fill larger than
 //!   the runtime stages at once) and:
 //!   - a compressed format's blocks, each the pattern cut at its bytes or repeated to them, the
 //!     region counting blocks, which the runtime cuts at the level's blocks (the cut `place`
 //!     makes, at the level's texels, is no tighter): BC, 4 by 4 ASTC, ETC2 and EAC
-//!     (`fills_the_runtime_writes_are_the_metal_platforms`), PVRTC at the suite's shape, of a
-//!     shareable texture (`pvrtc_fills_are_the_metal_platforms`), and ASTC of HDR blocks and
-//!     of other blocks (`astc_hdr_fills_are_the_metal_platforms`,
-//!     `astc_fills_of_other_blocks_are_the_metal_platforms`);
+//!     (`fills_the_runtime_writes_are_metals`), PVRTC at the suite's shape, of a
+//!     shareable texture (`pvrtc_fills_are_metals`), and ASTC of HDR blocks and
+//!     of other blocks (`astc_hdr_fills_are_metals`,
+//!     `astc_fills_of_other_blocks_are_metals`);
 //!   - a 4:2:2 format's texels, 2 bytes each (`GBGR422`,
-//!     `fills_the_runtime_writes_are_the_metal_platforms`, and `BGRG422`,
-//!     `bgrg422_fills_are_the_metal_platforms`);
+//!     `fills_the_runtime_writes_are_metals`, and `BGRG422`,
+//!     `bgrg422_fills_are_metals`);
 //!   - a stencil format's texels, 1 byte each (`Stencil8`,
-//!     `fills_the_runtime_writes_are_the_metal_platforms`, and `X32_Stencil8`'s stencil,
-//!     `x32_stencil8_fills_are_the_metal_platforms`); `Depth32Float_Stencil8`'s depth, its
+//!     `fills_the_runtime_writes_are_metals`, and `X32_Stencil8`'s stencil,
+//!     `x32_stencil8_fills_are_metals`); `Depth32Float_Stencil8`'s depth, its
 //!     stencil kept (`depth32_stencil8_fills_keep_the_stencil_as_metals`);
 //!   - a two-plane XR10 texture's (550, 551) colour words in plane 0, the alpha bytes kept: over
 //!     a surface's planes at Metal's blit rows
 //!     (`a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals`); in a placement heap's
 //!     bytes, of one level, at Metal's blit rows, which overlap where the width is no multiple of
-//!     4 (`two_plane_fills_in_a_heap_are_the_metal_platforms`); and of its own memory, of one
+//!     4 (`two_plane_fills_in_a_heap_are_metals`); and of its own memory, of one
 //!     level a multiple of 4 wide, at its rows
-//!     (`two_plane_xr10_fills_off_a_surface_are_the_metal_platforms`, the alpha kept
+//!     (`two_plane_xr10_fills_off_a_surface_are_metals`, the alpha kept
 //!     `two_plane_fills_off_a_surface_keep_the_alpha_as_metals`).
 //!
 //!   It fills every texture type [`crate::gpu::fill::place`] measured, a compressed cube and
-//!   cube array too (`compressed_cube_fills_are_the_metal_platforms`). The runtime fills the
+//!   cube array too (`compressed_cube_fills_are_metals`). The runtime fills the
 //!   rest of the formats Metal fills too: a two-plane XR10 texture of its own memory at any width
 //!   and level count, and a heap's of more than one level or slice, at level 0 of the slice's
 //!   words, rows `max(16, ⌊4 w / 16⌋ · 16)` bytes apart; the YCbCr and padded formats of a
 //!   texture over a surface or memory (`fills_of_ycbcr_and_padded_textures_are_metals`); and a
-//!   multisample texture's samples (`multisample_fills_are_the_metal_platforms`). It refuses a
+//!   multisample texture's samples (`multisample_fills_are_metals`). It refuses a
 //!   multisample texture's fill only where the device cannot run its sample copies (sample-rate
 //!   shading, an integer attachment at the sample count), which dies naming the refusal.
 //! - **A colour fill** is the runtime's colour fill, which packs the colour in the call's pixel
@@ -63,7 +63,7 @@
 //!   a pattern (above), at the level and slice and in the region `place` gives. A colour in a
 //!   format of [`crate::gpu::fill::OWN_FORMAT_PACKED`] (a bfloat format, an extended-range
 //!   `_sRGB` twin, an RGBX format) into a texture of another format is filled, relayed, and dies
-//!   in strict mode (`colours_the_runtime_packs_are_the_metal_platforms`): a twin's bytes there
+//!   in strict mode (`colours_the_runtime_packs_are_metals`): a twin's bytes there
 //!   follow no rule measured on Metal, and a bfloat or RGBX colour's were not compared, where the
 //!   runtime repeats the packed texel. A colour in a format Metal packs none in fills the bytes
 //!   of the command buffer's last packed texel, as Metal's do ([`crate::gpu::fill`]).
@@ -86,10 +86,10 @@
 //!   the whole level by a region and by `copyFromTexture:sourceSlice:sourceLevel:toTexture:...`,
 //!   and regions of any origin and width, between textures of one width and of two, whose widths
 //!   are a multiple of 16, of 4 or of neither, of the default storage, `Private`, and a placement
-//!   heap's (measured on the M3 Max: `two_plane_xr10_blits_are_the_metal_platforms`,
-//!   `two_plane_xr10_copies_of_any_region_are_the_metal_platforms`). Their copies to and from a
+//!   heap's (measured on the M3 Max: `two_plane_xr10_blits_are_metals`,
+//!   `two_plane_xr10_copies_of_any_region_are_metals`). Their copies to and from a
 //!   buffer move plane 0's colour words, as Metal's do on this host
-//!   (`two_plane_xr10_copies_are_the_metal_platforms`). Where the runtime's answer is not Metal's
+//!   (`two_plane_xr10_copies_are_metals`). Where the runtime's answer is not Metal's
 //!   measured one, it announces so, which is relayed, a death in strict mode (`TwoPlaneTextureCopy`
 //!   and `TwoPlaneBufferBlit`, [`crate::answer::DIES`]): a copy within one texture, of a texture of
 //!   more than one level or slice, of rows that overlap in the destination, of a texture narrower
@@ -102,7 +102,7 @@
 //!   (`two-plane-buffer-blit-order`, [`crate::answer`]). A copy into a
 //!   heap's texture writes the heap's bytes at Metal's blit rows, as Metal's blit does, the bytes
 //!   outside its texels and past its alpha plane over the heap's other resources included
-//!   (`two_plane_copies_into_a_heap_are_the_metal_platforms`).
+//!   (`two_plane_copies_into_a_heap_are_metals`).
 //! - **Bytes past a buffer's end** in a copy between it and a texture: the runtime reads a
 //!   no-copy buffer's to the end of its pages, as Metal reads them, and refuses another buffer's,
 //!   which dies, where Metal copies bytes no one wrote.
@@ -113,16 +113,16 @@ use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 
+use crate::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
+use crate::core::platform::icb::IndirectCommandBuffer as _;
+use crate::core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::{Mutex, ReentrantMutex};
 use metal2vulkan::metal::PixelFormat;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
-use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::{Mutex, ReentrantMutex};
 
 use crate::answer::{
-    Policy, decide, metal_aborts, plain, send, send_describing, unrepresentable, unstopped_at,
+    Policy, decide, metal_aborts, plain, plain_at, send, send_describing, unrepresentable,
 };
 use crate::gpu::command::{CommandBufferObject, Failing, Progress, VulkanCommandBuffer};
 use crate::gpu::fill;
@@ -205,6 +205,16 @@ impl<E> EncoderObject<E> {
         }
     }
 
+    /// Tells its command buffer that this encoder, a render pass, stores an attachment into
+    /// read-only memory the runtime copies, at which Metal's GPU faults it
+    /// ([`CommandBufferObject::faults_at_read_only_store`]); nothing once core let go of the
+    /// command buffer, which it can then commit no more.
+    pub(crate) fn faults_at_read_only_store(&self) {
+        if let Some(cb) = Obj::upgrade(&self.command_buffer) {
+            cb.faults_at_read_only_store(self.at);
+        }
+    }
+
     /// Its command buffer's progress, for `sel` ([`CommandBufferObject::progress`]); none once
     /// core let go of the command buffer, which it can then commit no more.
     pub(crate) fn progress(&self, sel: &'static str) -> Option<Arc<Progress>> {
@@ -258,17 +268,14 @@ impl<E> EncoderObject<E> {
     }
 
     /// `endEncoding`, `end` the runtime's, whose refusal dies at `sel`, as Metal raises at none,
-    /// as does a degradation of [`crate::answer::DIES`] it announces. The task's end is checked
-    /// once, before the encoder is taken: a thread of an ended task stops with the encoder in
-    /// place, untouched, as Metal's is left (`stop_if_task_ended`), and none stops while it holds
-    /// the encoder taken, whose drop would abandon its command buffer.
+    /// as does a degradation of [`crate::answer::DIES`] it announces.
     pub fn end(
         &self,
         sel: &'static str,
         end: impl FnOnce(E) -> Result<(), rt::Error>,
     ) -> RaiseResult<()> {
         let e = plain(|| self.take(sel));
-        unstopped_at(sel, || end(e)).or_else(|err| decide(sel, Policy::Dies, err))
+        plain_at(sel, || end(e)).or_else(|err| decide(sel, Policy::Dies, err))
     }
 }
 
@@ -289,12 +296,16 @@ pub type VulkanBlitEncoder = Obj<EncoderObject<Box<rt::BlitCommandEncoder>>>;
 
 /// What the encoder's lines name [`BlitEncoder::copy_from_guest_ram`] by: no selector of Metal's
 /// does.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", windows))]
 const GUEST_RAM_TO_BUFFER: &str = "copyFromGuestRam:toBuffer:destinationOffset: (no Metal)";
 
+/// What they name [`BlitEncoder::copy_from_guest_ram_at`] by.
+#[cfg(any(target_os = "linux", windows))]
+const GUEST_RAM_RUNS_TO_BUFFER: &str = "copyFromGuestRamRuns:toBuffer: (no Metal)";
+
 /// What they name [`BlitEncoder::copy_to_guest_ram`] by.
-#[cfg(target_os = "linux")]
-const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:sourceOffset:toGuestRam: (no Metal)";
+#[cfg(any(target_os = "linux", windows))]
+const BUFFER_TO_GUEST_RAM: &str = "copyFromBuffer:toGuestRamRuns: (no Metal)";
 
 /// A raw `MTLBlitOption` of a copy between a buffer and a texture, sent with `sel`: none, depth
 /// or stencil of a combined texture, or a PVRTC texture's blocks row by row. The runtime copies
@@ -318,10 +329,7 @@ fn some<'a, T>(sel: &'static str, object: Option<&'a T>, what: &str) -> &'a T {
 }
 
 /// The indices `r` names, for `sel`; a range whose end passes `u64::MAX` dies.
-fn indices(
-    sel: &'static str,
-    r: reims_vgpu_core::platform::types::NsRange,
-) -> std::ops::Range<u64> {
+fn indices(sel: &'static str, r: crate::core::platform::types::NsRange) -> std::ops::Range<u64> {
     range(r).unwrap_or_else(|| unrepresentable(sel, &format!("the range {r:?}")))
 }
 
@@ -338,7 +346,7 @@ impl VulkanBlitEncoder {
         sel: &'static str,
         texture: &VulkanTexture,
         (level, slice, region): (u64, u64, MtlRegion),
-        bytes: reims_vgpu_core::platform::HostRange<'_>,
+        bytes: crate::core::platform::HostRange<'_>,
     ) -> RaiseResult<()> {
         let raw = texture.copied(sel);
         let shape = plain(|| fill::Shape {
@@ -453,66 +461,6 @@ fn fill_place(
     ))
 }
 
-/// What a blit `cmd` writes: its destination's memory, as a bind keeps it
-/// ([`crate::gpu::writes::Bound`]).
-fn written_memory(cmd: &BlitCmd<'_, VulkanPlatform>) -> crate::gpu::writes::Bound {
-    use crate::gpu::writes::{buffer_bound, texture_bound};
-    let texture = |t: Option<&VulkanTexture>| t.map(|t| texture_bound(t)).unwrap_or_default();
-    let buffer = |b: Option<&crate::gpu::resource::VulkanBuffer>| {
-        b.map(|b| buffer_bound(b)).unwrap_or_default()
-    };
-    match cmd {
-        BlitCmd::CopyBufferToTexture {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureRegion {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureRegionOptions {
-            destination_texture,
-            ..
-        }
-        | BlitCmd::CopyTextureSlices {
-            destination_texture,
-            ..
-        } => texture(Some(destination_texture)),
-        BlitCmd::CopyBufferToTextureOptions {
-            destination_texture,
-            ..
-        } => texture(*destination_texture),
-        BlitCmd::CopyBufferToBuffer {
-            destination_buffer, ..
-        }
-        | BlitCmd::CopyTextureToBufferOptions {
-            destination_buffer, ..
-        } => buffer(*destination_buffer),
-        BlitCmd::CopyTextureToBuffer {
-            destination_buffer, ..
-        } => buffer(Some(destination_buffer)),
-        BlitCmd::FillBuffer { buffer: b, .. } | BlitCmd::FillBufferPattern4 { buffer: b, .. } => {
-            buffer(Some(b))
-        }
-        BlitCmd::FillTexture { texture: t, .. }
-        | BlitCmd::FillTextureColor { texture: t, .. }
-        | BlitCmd::InvalidateCompressedTexture { texture: t }
-        | BlitCmd::InvalidateCompressedTextureSlice { texture: t, .. } => texture(Some(t)),
-        BlitCmd::GenerateMipmaps { texture: t } => texture(*t),
-        _ => Default::default(),
-    }
-}
-
-/// Whether Metal's GPU drops `cmd`'s write into a surface whose GPU writes never reach its
-/// memory at every extent measured, as this platform's does, which sends it: a fill of a buffer
-/// on the surface, and a copy into one from another buffer (`crate::os::dropped_write`).
-fn dropped_at_every_extent(cmd: &BlitCmd<'_, VulkanPlatform>) -> bool {
-    matches!(
-        cmd,
-        BlitCmd::FillBuffer { .. } | BlitCmd::CopyBufferToBuffer { .. }
-    )
-}
-
 /// The most commands past an indirect command buffer's end a copy was measured to write
 /// ([`overrun_measured`]).
 const OVERRUN_MEASURED: u64 = 63;
@@ -534,80 +482,6 @@ fn overrun_measured(
     into: Option<crate::gpu::icb::OverrunShape>,
 ) -> bool {
     into.is_some() && from == (into, size) && count <= size && to < size && past <= OVERRUN_MEASURED
-}
-
-/// The widest and tallest region of a blit into a texture made on a surface whose GPU writes
-/// never reach its memory that Metal's GPU was measured to drop at every origin
-/// ([`dropped_where_measured`]).
-const DROPPED_EXTENT: u64 = 8;
-
-/// The fewest bytes a row of such a surface held where Metal's GPU was measured to drop those
-/// blits ([`dropped_where_measured`]).
-const DROPPED_ROW_BYTES: u64 = 256;
-
-/// Whether Metal's GPU drops `cmd`, a blit's copy from a buffer or colour fill into a texture
-/// made on a surface whose GPU writes never reach its memory, where it was measured to, as this
-/// platform's does, which sends it: into a `BGRA8Unorm` 2D texture made on the surface (not a
-/// view), at level 0 and slice 0, a region inside the level of 1 to 8 texels each way, on a
-/// surface whose rows hold 256 bytes or more. Measured on this host (macOS 26.7, M3 Max, one case
-/// a process, two runs: `tests/client_direction.rs`'s `sweep`), on surfaces of 64 by 16 and 256
-/// by 256 texels at origins 0,0, 1,1 and 40,10 or 150,200: every region of 1 to 8 texels each way
-/// was dropped, the command buffer completing and the guest's pages unchanged. A row of 16 texels
-/// or more faults the command buffer at some origins (16 at 0,0, 24 at 40,10, 32 at 1,1) and is
-/// dropped at others; a region of more than 8 rows, a smaller surface, another format and every
-/// other blit into such a texture were not measured, and die ([`crate::os::dropped_write`]).
-fn dropped_where_measured(cmd: &BlitCmd<'_, VulkanPlatform>) -> bool {
-    let (texture, level, slice, region) = match cmd {
-        BlitCmd::CopyBufferToTexture {
-            destination_texture,
-            destination_slice,
-            destination_level,
-            destination_origin,
-            source_size,
-            ..
-        } => (
-            *destination_texture,
-            *destination_level,
-            *destination_slice,
-            MtlRegion {
-                origin: *destination_origin,
-                size: *source_size,
-            },
-        ),
-        BlitCmd::FillTextureColor {
-            texture,
-            level,
-            slice,
-            region,
-            ..
-        } => (*texture, *level, *slice, *region),
-        _ => return false,
-    };
-    let Some(plane) = texture.plane.filter(|_| texture.surface.is_some()) else {
-        return false;
-    };
-    let (format, ty, width, height, view) = plain(|| {
-        let raw = &texture.raw;
-        (
-            raw.pixel_format(),
-            raw.texture_type(),
-            raw.width(),
-            raw.height(),
-            raw.parent_texture().is_some(),
-        )
-    });
-    let (origin, size) = (region.origin, region.size);
-    let inside = |at: u64, extent: u64, end: u64| {
-        (1..=DROPPED_EXTENT).contains(&extent) && at.checked_add(extent).is_some_and(|e| e <= end)
-    };
-    format == metal2vulkan::metal::PixelFormat::BGRA8Unorm
-        && ty == metal2vulkan::metal::TextureType::Type2D
-        && !view
-        && (level, slice) == (0, 0)
-        && (origin.z, size.depth) == (0, 1)
-        && inside(origin.x, size.width, width)
-        && inside(origin.y, size.height, height)
-        && plane.bytes_per_row >= DROPPED_ROW_BYTES
 }
 
 /// What the line of a refused copy between a buffer and `texture` names of it: the texture's
@@ -639,8 +513,8 @@ fn buffer_copy_shape(
 }
 
 impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
-    /// On Linux, through the RAM the destination's device uses that holds every run
-    /// (`os/linux/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
+    /// On Linux and Windows, through the RAM the destination's device uses that holds every run
+    /// (`os/host_ram.rs`), where the runtime copies by runs: a first use of Metal's device,
     /// as a blit's copy is. False, with nothing encoded, where no such RAM holds them or the
     /// runtime refuses the copy; never on macOS.
     fn copy_from_guest_ram(
@@ -650,11 +524,11 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         destination: &VulkanBuffer,
         destination_offset: u64,
     ) -> RaiseResult<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let device = &destination.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs))
+                .then(|| crate::os::ram_over(device, runs.iter()))
                 .flatten()
             else {
                 return Ok(false);
@@ -665,9 +539,39 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
             });
             Ok(copied.is_ok())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
             let _ = (runs, destination, destination_offset);
+            Ok(false)
+        }
+    }
+
+    /// As [`Self::copy_from_guest_ram`], each run to its own byte of `destination` (the runtime's
+    /// `copy_runs_from_host_ram`).
+    fn copy_from_guest_ram_at(
+        &self,
+        _on: OnFault,
+        runs: &[(u64, std::ops::Range<u64>)],
+        destination: &VulkanBuffer,
+    ) -> RaiseResult<bool> {
+        #[cfg(any(target_os = "linux", windows))]
+        {
+            let device = &destination.device.raw;
+            let Some(ram) = (crate::os::copies_guest_ram(device))
+                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
+                .flatten()
+            else {
+                return Ok(false);
+            };
+            metal_space::first_use(FirstUse::BlitCommand);
+            let copied = self.with(GUEST_RAM_RUNS_TO_BUFFER, |e| {
+                crate::os::copy_runs_from_host_ram(e, &ram, runs, &destination.raw)
+            });
+            Ok(copied.is_ok())
+        }
+        #[cfg(not(any(target_os = "linux", windows)))]
+        {
+            let _ = (runs, destination);
             Ok(false)
         }
     }
@@ -677,27 +581,26 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
         &self,
         _on: OnFault,
         source: &VulkanBuffer,
-        source_offset: u64,
-        runs: &[std::ops::Range<u64>],
+        runs: &[(u64, std::ops::Range<u64>)],
     ) -> RaiseResult<bool> {
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", windows))]
         {
             let device = &source.device.raw;
             let Some(ram) = (crate::os::copies_guest_ram(device))
-                .then(|| crate::os::ram_over(device, runs))
+                .then(|| crate::os::ram_over(device, runs.iter().map(|(_, run)| run)))
                 .flatten()
             else {
                 return Ok(false);
             };
             metal_space::first_use(FirstUse::BlitCommand);
             let copied = self.with(BUFFER_TO_GUEST_RAM, |e| {
-                crate::os::copy_to_host_ram(e, &source.raw, source_offset, &ram, runs)
+                crate::os::copy_to_host_ram(e, &source.raw, &ram, runs)
             });
             Ok(copied.is_ok())
         }
-        #[cfg(not(target_os = "linux"))]
+        #[cfg(not(any(target_os = "linux", windows)))]
         {
-            let _ = (source, source_offset, runs);
+            let _ = (source, runs);
             Ok(false)
         }
     }
@@ -708,19 +611,11 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
     /// ([`FirstUse::TilerBlit`]).
     fn encode(&self, _on: OnFault, cmd: BlitCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
-        let written = written_memory(&cmd);
         if let Some(options) = self.aborts {
             metal_aborts(
                 sel,
                 &format!("a blit encoder's first command under protection options {options}"),
             );
-        }
-        if written.kept.holds() {
-            crate::gpu::writes::kept_write(sel, "a blit's write into");
-        }
-        let dropped = written.dropped;
-        if dropped && !dropped_at_every_extent(&cmd) && !dropped_where_measured(&cmd) {
-            crate::os::dropped_write(sel, "a blit's write into");
         }
         match &cmd {
             BlitCmd::EndEncoding => {}
@@ -1145,13 +1040,13 @@ impl BlitEncoder<VulkanPlatform> for VulkanBlitEncoder {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize, NsRange};
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::command::{CommandBuffer, CommandQueue};
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::{MtlOrigin, MtlSize, NsRange};
+    use crate::core::platform::values::TextureDesc;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
@@ -1169,40 +1064,6 @@ mod tests {
         let length = usize::try_from(b.length()).unwrap();
         // SAFETY: a Shared buffer's bytes, read after the GPU's writes completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), length) }.to_vec()
-    }
-
-    /// endEncoding in a thread of an isolated task that has ended stops before it takes the
-    /// encoder, which stays in place, untouched, for the blit and the compute encoder alike, as
-    /// Metal's is left
-    #[test]
-    fn an_ended_tasks_end_encoding_leaves_the_encoder() {
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::tasks::isolation::TaskLife;
-
-        let cb = buffer();
-        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            blit.encode(OnFault::Return, BlitCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            blit.raw.lock().borrow().is_some(),
-            "the blit encoder was taken"
-        );
-        let cb = buffer();
-        let compute = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            compute.encode(OnFault::Return, ComputeCmd::EndEncoding)
-        });
-        assert!(stopped.is_none());
-        assert!(
-            compute.raw.lock().borrow().is_some(),
-            "the compute encoder was taken"
-        );
     }
 
     /// Fills and copies between buffers and a texture land on the GPU: a fill, an empty fill and
@@ -1313,10 +1174,12 @@ mod tests {
 
     /// A copy with no blit option between a buffer and a Depth32Float_Stencil8 texture copies
     /// its depth, 4 bytes a texel, both ways, as Metal's does on this host (the same bytes, with
-    /// the stencil left 0). A device that may clamp a depth outside `[0, 1]` (neither
-    /// `VK_EXT_depth_range_unrestricted` nor the runtime's `DepthImageKeepsValuesOutsideUnitRange`:
-    /// ANV) dies at the upload in strict mode, naming `restricted-depth-upload`, and copies depths
-    /// in `[0, 1]` both ways, by default, where any other device copies any bytes
+    /// the stencil left as it was). The stencil is written first, by a stencil-only upload: a new
+    /// texture's never-written stencil reads what its memory held before, which on an RX 550
+    /// (RADV) was an earlier process's bytes. A device without `VK_EXT_depth_range_unrestricted`,
+    /// which clamps a depth outside `[0, 1]` (ANV, and MoltenVK), dies at the upload in strict
+    /// mode, naming `restricted-depth-upload`, and copies depths in `[0, 1]` both ways, by
+    /// default, where any other device copies any bytes
     #[test]
     fn no_option_copies_a_combined_textures_depth() {
         use metal2vulkan::device::VkExtension;
@@ -1324,11 +1187,9 @@ mod tests {
                               sourceSize:toTexture:destinationSlice:destinationLevel:\
                               destinationOrigin:";
         let d = dev();
-        let keeps = (d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted)
-            || (d.raw.properties().driver_facts)
-                .contains(&rt::DriverFact::DepthImageKeepsValuesOutsideUnitRange);
+        let keeps = (d.raw.enabled().extensions).contains(&VkExtension::ExtDepthRangeUnrestricted);
         let desc = crate::platform::tests::platform().texture_descriptor(
-            &reims_vgpu_core::platform::values::TextureDesc {
+            &crate::core::platform::values::TextureDesc {
                 pixel_format: 260,
                 width: 4,
                 height: 4,
@@ -1338,6 +1199,12 @@ mod tests {
             },
         );
         let t = d.new_texture(OnFault::Return, &desc).unwrap().unwrap();
+        let seed: Vec<u8> = (0..16u8)
+            .map(|i| i.wrapping_mul(13).wrapping_add(0x40))
+            .collect();
+        let seeds = shared(16);
+        // SAFETY: the buffer's Shared bytes, written before any command uses them.
+        unsafe { std::ptr::copy_nonoverlapping(seed.as_ptr(), seeds.contents().as_ptr(), 16) };
         let source = shared(128);
         let p: Vec<u8> = if keeps {
             (0..128u8)
@@ -1354,6 +1221,19 @@ mod tests {
         let (depth, stencil, none) = (shared(64), shared(16), shared(128));
         let cb = buffer();
         let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        let stencil_up = BlitCmd::CopyBufferToTextureOptions {
+            source_buffer: Some(&seeds),
+            source_offset: 0,
+            source_bytes_per_row: 4,
+            source_bytes_per_image: 16,
+            source_size: MtlSize::new(4, 4, 1),
+            destination_texture: Some(&t),
+            destination_slice: 0,
+            destination_level: 0,
+            destination_origin: MtlOrigin::new(0, 0, 0),
+            options: 2,
+        };
+        e.encode(OnFault::Return, stencil_up).unwrap();
         let up = || BlitCmd::CopyBufferToTexture {
             source_buffer: &source,
             source_offset: 0,
@@ -1395,7 +1275,7 @@ mod tests {
             .flat_map(|r| p[32 * r..32 * r + 16].to_vec())
             .collect();
         assert_eq!(bytes(&depth), rows);
-        assert_eq!(bytes(&stencil), [0; 16]);
+        assert_eq!(bytes(&stencil), seed);
         let padded: Vec<u8> = rows
             .chunks(16)
             .flat_map(|row| row.iter().copied().chain([0; 16]))
@@ -1414,8 +1294,8 @@ mod tests {
     /// them in an order that varies from run to run. Each case's last blit is the one that dies
     #[test]
     fn two_plane_xr10_blits_metal_was_not_measured_at_die() {
-        use reims_vgpu_core::platform::resource::Heap as _;
-        use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+        use crate::core::platform::resource::Heap as _;
+        use crate::core::platform::values::{HeapDesc, OptionSet};
         let d = dev();
         let p = crate::platform::tests::platform();
         let made = |desc: TextureDesc| {
@@ -1461,7 +1341,6 @@ mod tests {
                 size: 1 << 20,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             })
             .unwrap()
@@ -1569,7 +1448,7 @@ mod tests {
                 cb.wait_until_completed(OnFault::Return).unwrap();
             })
             .unwrap_err();
-            let abort = reims_vgpu_core::raise::death::DeathKind::Abort;
+            let abort = crate::core::raise::death::DeathKind::Abort;
             assert_eq!((site.kind, site.file), (abort, sel), "{case}");
         }
     }

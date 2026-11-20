@@ -17,9 +17,9 @@ use std::sync::atomic::AtomicU32;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::clock::{Clock, Deadline, MonoTime};
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock, Deadline, MonoTime};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// How long a waiting command buffer goes unfinished before the log names it.
 pub(crate) const WAIT_LOGGED_AFTER: Duration = Duration::from_secs(5);
@@ -48,10 +48,11 @@ pub(crate) struct WaitingBuffer {
 }
 
 impl WaitingBuffer {
-    /// The buffer finished (its completed handler ran): the log says so where it named the wait.
+    /// The buffer finished (its completed handler ran): the log says so at debug where it named
+    /// the wait.
     pub(crate) fn finished(&self) {
         if self.state.swap(FINISHED, Ordering::SeqCst) == LOGGED {
-            log::info!(
+            log::debug!(
                 target: "reims_vgpu::graphics",
                 "{} finished after waiting for {}",
                 self.named(),
@@ -233,19 +234,14 @@ fn run<P: Platform>(shared: &Shared<P>) {
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 
-    /// Polls `done` for up to two seconds of real time: the watcher runs on a thread of its own.
+    /// Polls `done` in real time as the graphics tests do
+    /// ([`crate::graphics::tests::eventually`]): the watcher runs on a thread of its own.
     fn eventually(done: impl Fn() -> bool) -> bool {
-        for _ in 0..2000 {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        done()
+        crate::graphics::tests::eventually(done)
     }
 
     /// A buffer still waiting at its deadline is logged; one that finished first is not, and

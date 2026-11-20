@@ -23,7 +23,7 @@
  * render-encoder op bodies (`RgfxOp*`), the compute-encoder op bodies
  * (`RgfxComputeOp*`) and the blit-encoder op bodies (`RgfxBlitOp*`), together with
  * the pass and element records, all come from the committed header
- * (`reims_graphics_wire.h`), generated from the crates/reims-graphics/src/ops
+ * (`reims_graphics_wire.h`), generated from the crates/reims-vgpu-graphics/src/ops
  * modules. The
  * op structs carry a per-group prefix because several names (`UpdateFence`,
  * `WaitForFence`, `ExecuteCommandsInBuffer`, ...) recur across the render, compute
@@ -73,9 +73,10 @@ protected:
 };
 
 /// The kinds of render state an encoder sets that Metal gives a defined default at each
-/// encoder's start (MTLRenderCommandEncoder.h), each with the op that sets it: what a parallel
-/// pass sets back between its sub-encoders (RgfxEncoder::appendSegment). Bindings are not among
-/// them: a function that reads an index nothing was bound at is outside Metal's contract.
+/// encoder's start (MTLRenderCommandEncoder.h; for the two SPI setters, what an encoder draws
+/// before any call), each with the op that sets it: what a parallel pass sets back between its
+/// sub-encoders (RgfxEncoder::appendSegment). Bindings are not among them: a function that reads
+/// an index nothing was bound at is outside Metal's contract.
 enum : uint32_t {
 	kRgfxRenderStateCullMode = 1u << 0,          // None
 	kRgfxRenderStateFrontFacing = 1u << 1,       // Clockwise
@@ -88,8 +89,16 @@ enum : uint32_t {
 	kRgfxRenderStateScissor = 1u << 8,           // the target's size
 	kRgfxRenderStateDepthStencil = 1u << 9,      // nil: the default depth-stencil state
 	kRgfxRenderStateVisibility = 1u << 10,       // Disabled, offset 0
-	kRgfxRenderStateTessellationScale = 1u << 11 // 1.0
+	kRgfxRenderStateTessellationScale = 1u << 11, // 1.0
+	kRgfxRenderStatePrimitiveRestart = 1u << 12,  // strips restart at their index type's all-ones index
+	kRgfxRenderStateProvokingVertex = 1u << 13    // mode 0: the first vertex
 };
+
+/// The index of a setPrimitiveRestartEnabled:index: op that sets an encoder's indexed strips back
+/// to restarting at their index type's all-ones index, as before any call: a 16-bit strip
+/// restarts at the lesser of the index and 0xffff, a 32-bit one at the index (measured on an
+/// Intel UHD 630, macOS 26.7.1, and the host's runtime's on an M4).
+constexpr uint64_t kRgfxRestartAtAllOnes = 0xffffffffu;
 
 /// The size of a render pass's target, which Metal's default viewport and scissor rectangle
 /// cover: what a parallel pass's sub-encoder starts from (RgfxEncoder::appendSegment).
@@ -103,12 +112,18 @@ struct RgfxRenderTargetSize {
 /// at a time, between a `begin*` and `endEncoder`; the op methods are called while
 /// the matching encoder is open, as the host's walk expects (`decode::cmdbuf`).
 ///
-/// The message is written once, where it is posted from: a buffer of the builder's own while
-/// it fits its queue's ring, else, once it outgrows the ring, a block of the queue's region
-/// pool (setMessageBlocks), where it grows by doubling and from which the host reads it with no
-/// copy of the guest's. Each op takes its whole length at once (a pointer bump) and is stored
-/// with fixed-size copies. Room before the header takes the SURFACE_USE ops a commit puts
-/// first (prependSurfaceUses), so they move nothing.
+/// The message is built in a buffer of the builder's own, write-back memory, and posted from
+/// there on its queue's ring where it fits, else copied once, whole, into a block of the queue's
+/// region pool (setMessageBlocks), which the ring names. It is not built in the block: the
+/// block is write-combined where the kext maps it so, loads there are uncached, and on an AMD
+/// host, which applies the guest's memory type, a write-combined store still pending stalls the
+/// thread's next locked instruction until it drains. Measured with encode_probe on a 26.7.2
+/// guest of a Ryzen host (RTX 3090): setRenderPipelineState took 108 ns a call in a 10000-call
+/// buffer built in its block, and 21.6 ns in a 400-call one on the ring; a setVertexBuffer
+/// between a CFRetain and a CFRelease, 103 and 17.1 ns. Each op takes its whole length at once
+/// (a pointer bump) and is stored with fixed-size copies. Room before the header takes the
+/// SURFACE_USE ops a commit puts first (prependSurfaceUses), so they move nothing, and the
+/// commit's copy into a block starts at the message, not at that room.
 ///
 /// A segment (SegmentOf) is a stream of ops alone, with no header: a parallel render pass's
 /// sub-encoder writes one of its own, on its own thread, and the pass joins them into its
@@ -138,28 +153,31 @@ public:
 	RgfxEncoder(const RgfxEncoder &) = delete;
 	RgfxEncoder &operator=(const RgfxEncoder &) = delete;
 
-	/// Where the message moves once it no longer fits the ring: `blocks`, taking a block of at
-	/// least `hint` bytes first (the queue's guess of the message's size). A message starts in
-	/// a buffer of the builder's own whatever the guess, so one that fits the ring rides it; it
-	/// is copied once, when it outgrows the ring, at most the ring's half.
+	/// Where the message is copied at the commit where it does not fit the ring: a block of
+	/// `blocks`. The builder's buffer grows to `hint` bytes (the queue's guess of the message's
+	/// size) as the message outgrows the ring, so a large one is not copied at each doubling; it
+	/// starts no larger than the ring's half whatever the guess, so one that fits the ring rides
+	/// it.
 	void setMessageBlocks(std::shared_ptr<RgfxMessageBlocks> blocks, uint64_t hint)
 	{
 		m_blocks = std::move(blocks);
-		m_blockHint = hint;
+		m_sizeHint = hint;
 	}
 
 	// --- framing --------------------------------------------------------------
 
 	/// Opens a render encoder for `desc` and its `color_count`
 	/// [`RgfxRenderPassColorAttachment`] records, then the pass's sample positions where
-	/// `positions` is not null, then its visibility result buffer where `visibility` is not null.
-	/// `desc.color_count` is set from `color_count`, `RGFX_PASS_FLAG_SAMPLE_POSITIONS` from
-	/// `positions` and `RGFX_PASS_FLAG_VISIBILITY_RESULT` from `visibility`, so each always agrees
-	/// with what follows.
+	/// `positions` is not null, then its visibility result buffer where `visibility` is not null,
+	/// then its rasterization rate map where `rate_map` is not null. `desc.color_count` is set
+	/// from `color_count`, `RGFX_PASS_FLAG_SAMPLE_POSITIONS` from `positions`,
+	/// `RGFX_PASS_FLAG_VISIBILITY_RESULT` from `visibility` and `RGFX_PASS_FLAG_RATE_MAP` from
+	/// `rate_map`, so each always agrees with what follows.
 	void beginRenderPass(RgfxRenderPassDesc desc, const RgfxRenderPassColorAttachment *colors,
 	                     uint32_t color_count,
 	                     const RgfxRenderPassSamplePositions *positions = nullptr,
-	                     const RgfxRenderPassVisibility *visibility = nullptr);
+	                     const RgfxRenderPassVisibility *visibility = nullptr,
+	                     const RgfxRenderPassRateMap *rate_map = nullptr);
 	/// Opens a compute encoder for Metal's default pass (empty body).
 	void beginComputePass();
 	/// Opens a compute encoder whose pass sets `MTLDispatchType` `dispatch_type`.
@@ -388,6 +406,10 @@ public:
 	void computeSetSamplerStatesLodClamps(
 	    uint64_t location, const RgfxComputeSamplerLodBinding *samplers,
 	    uint32_t count);
+	void computeSetVisibleFunctionTable(RgfxObjId table, uint64_t index);
+	void computeSetVisibleFunctionTables(uint64_t location,
+	                                     const RgfxComputeVisibleFunctionTableBinding *tables,
+	                                     uint32_t count);
 	void computeSetThreadgroupMemoryLength(uint64_t length, uint64_t index);
 	void computeSetStageInRegion(uint64_t origin_x, uint64_t origin_y, uint64_t origin_z,
 	                             uint64_t width, uint64_t height, uint64_t depth);
@@ -511,23 +533,41 @@ public:
 
 	/// Sets `op_bytes` and posts the command buffer, waiting for room
 	/// (RgfxRingWriter::post, `whileWaiting` called as it waits): on the ring where the message
-	/// fits it (fitsRing()), else as a COMMAND_BUFFER_IN_REGION naming its block, the one it was
-	/// built in, or one taken now from setMessageBlocks's pool, into which it is copied. The
+	/// fits it (fitsRing()), else as a COMMAND_BUFFER_IN_REGION naming a block taken now from
+	/// setMessageBlocks's pool, into which it is copied, the message from the block's start. The
 	/// block must stay the process's until the buffer completes: it goes to `*held` (when not
 	/// null) before the message is posted, whether or not the post succeeds, and its holder
 	/// gives it back to the pool then; else the builder holds it until it goes. Returns whether the message was posted: false for one no block could be had for,
 	/// or too long for a header's `size`. On success `*out_seqno` (when not null) holds the
 	/// stamped seqno, which the completion carries. `beforePublish` gets the seqno before the
 	/// host can see the buffer (RgfxRingWriter::tryPost), so its completion is expected first.
+	/// `via` (when not null) hands the publish to the control ring's held messages
+	/// (RgfxRingWriter::tryPost): false, with `via->refused`, where a held message the buffer may
+	/// name was refused.
 	bool finish(uint64_t *out_seqno = nullptr, const std::function<void()> &whileWaiting = {},
 	            const std::function<void(uint64_t)> &beforePublish = {},
-	            RgfxMessageBlock *held = nullptr);
+	            RgfxMessageBlock *held = nullptr, RgfxPublishVia *via = nullptr);
 
 	/// Whether the finished message goes on the ring (RgfxRingWriter::fits), not in a block.
 	bool fitsRing() const;
 
-	/// The finished message's length: the header, the op stream and the surface uses before it.
-	uint64_t messageSize() const { return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes(); }
+	/// Whether the op stream's last op is the buffer's ask for its submission (appendSubmitted),
+	/// which the host answers at the doorbell where it need wait for nothing.
+	bool endsInAsk() const
+	{
+		RgfxOpHeader last = {};
+		if (static_cast<size_t>(m_cur - m_ops) < sizeof(last))
+			return false;
+		std::memcpy(&last, m_cur - sizeof(last), sizeof(last));
+		return last.tag == RGFX_OP_SUBMITTED && last.len == sizeof(last);
+	}
+
+	/// The finished message's length: the header, the op stream and the surface uses before it,
+	/// and the guest's times finish() puts first (stampGuestTimes).
+	uint64_t messageSize() const
+	{
+		return RGFX_COMMAND_BUFFER_OPS_OFFSET + opBytes() + (m_timesPending ? kGuestTimesBytes : 0);
+	}
 
 	/// The bytes the message holds before it grows.
 	size_t capacity() const
@@ -535,7 +575,8 @@ public:
 		return static_cast<size_t>(m_end - m_ops) + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix;
 	}
 
-	/// Whether the message is being built in a block of the region pool (setMessageBlocks).
+	/// Whether the builder holds the block of the region pool its finished message was copied
+	/// into (finish, with no holder given).
 	bool inBlock() const { return m_inBlock; }
 
 	/// The op-stream bytes appended so far (the message size less the header).
@@ -587,6 +628,20 @@ public:
 	/// Puts one RGFX_OP_COMMIT_ORDER naming `waits` (`count` of them) before the op stream's first
 	/// op, as prependSurfaceOrder does; nothing where `count` is 0.
 	void prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t count);
+	/// Where the device's word holds RGFX_FEATURE_GUEST_TIMES: the finished stream starts with
+	/// RGFX_OP_GUEST_TIMES (the last op put first, by finish), the buffer made at `beganNs`, the
+	/// guest's clock (rgfxGuestClockNs), committed as noteCommitted says, and posted as its message
+	/// goes on the ring (RgfxRingWriter::tryPost's `stampAt`; for a message in a block, written
+	/// into the block under the ring's lock). Set as the buffer is made.
+	void stampGuestTimes(uint64_t beganNs)
+	{
+		m_timesPending = true;
+		m_times.began_ns = beganNs;
+	}
+	/// Whether the buffer's stream will start with the guest's times (stampGuestTimes).
+	bool stampsGuestTimes() const { return m_timesPending; }
+	/// The commit was entered at `committedNs`, the guest's clock.
+	void noteCommitted(uint64_t committedNs) { m_times.committed_ns = committedNs; }
 	/// Where the command buffer keeps the objects its encoders name, as Metal's command buffer
 	/// with retained references keeps what it encodes: `keep(context, object)` for each one
 	/// (once for a run of the same object), from the encode until the buffer completes or goes.
@@ -661,6 +716,10 @@ private:
 	uint8_t *prependRoom(size_t bytes);
 	/// The bytes before the header a commit's surface uses take with no move: 64 of them.
 	static constexpr size_t kHeadroom = 64 * (RGFX_OP_BODY_OFFSET + sizeof(RgfxOpSurfaceUse));
+	/// The bytes the guest's times take in the stream.
+	static constexpr size_t kGuestTimesBytes = RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes);
+	/// Puts the guest's times first where they are to go (stampGuestTimes), once: whether it did.
+	bool prependGuestTimes();
 
 	// Takes `n` bytes at the stream's end (growing it where it has less room) and answers them.
 	__attribute__((always_inline)) uint8_t *reserve(size_t n)
@@ -699,17 +758,25 @@ private:
 		appendOp(tag, &body, sizeof(T));
 	}
 	// Appends an array-tailed op: `head` (`head_n` bytes) then `count` elements of
-	// `stride` bytes at `elems`; len = 8 + head_n + count*stride.
-	void appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
-	                   uint32_t count, size_t stride);
-	// Makes room for `n` more bytes: a larger buffer of the builder's own, or a block of the
-	// region pool once the message outgrows the ring, its bytes so far copied there once.
+	// `stride` bytes at `elems`; len = 8 + head_n + count*stride. Inline, so a caller's
+	// constant sizes make its copies plain stores: a bind of one element (setBuffer:,
+	// setSamplerState:) is one of these.
+	__attribute__((always_inline)) void appendArrayOp(uint16_t tag, const void *head,
+	                                                  size_t head_n, const void *elems,
+	                                                  uint32_t count, size_t stride)
+	{
+		const size_t tail = static_cast<size_t>(count) * stride;
+		uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + head_n + tail);
+		putHeader(at, tag, RGFX_OP_BODY_OFFSET + head_n + tail);
+		std::memcpy(at + RGFX_OP_BODY_OFFSET, head, head_n);
+		if (count == 1)
+			std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, stride);
+		else if (tail != 0)
+			std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
+	}
+	// Makes room for `n` more bytes: a larger buffer of the builder's own, the bytes so far
+	// moved there.
 	void grow(size_t n);
-	// Moves the bytes so far to a block of at least `size` bytes; false, nothing moved, where
-	// none was had.
-	bool moveToBlock(size_t size);
-	// Moves the bytes so far to a buffer of the builder's own of `size` bytes.
-	void moveToHeap(size_t size);
 	// Gives back the block the builder holds, if any.
 	void giveBackBlock();
 	// A video decode op of `tag`: its header, the `n` bytes of its body at `body`, then the
@@ -730,19 +797,23 @@ private:
 
 	RgfxRingWriter *m_ring; // null for a segment
 	RgfxCommandBuffer m_head;
-	// The storage: a buffer of the builder's own (malloc) or a region block (m_inBlock), from
-	// m_store, m_end the end; the op stream from m_ops (kHeadroom and the header before it,
-	// none for a segment) to m_cur. The surface uses and the surface order put first lie in the
-	// m_prefix bytes before m_ops (prependRoom).
+	// The storage: a buffer of the builder's own (malloc), or after finish the region block the
+	// message was copied into (m_inBlock), from m_store, m_end the end; the op stream from m_ops
+	// (kHeadroom and the header before it in the builder's buffer, the header alone in the
+	// block, none for a segment) to m_cur. The surface uses and the surface order put first lie
+	// in the m_prefix bytes before m_ops (prependRoom).
 	uint8_t *m_store = nullptr;
 	uint8_t *m_ops = nullptr;
 	uint8_t *m_cur = nullptr;
 	uint8_t *m_end = nullptr;
 	size_t m_prefix = 0;
 	bool m_inBlock = false;
+	// The guest's times, to go first at finish while pending (stampGuestTimes).
+	bool m_timesPending = false;
+	RgfxOpGuestTimes m_times = {};
 	RgfxMessageBlock m_block = {};
 	std::shared_ptr<RgfxMessageBlocks> m_blocks;
-	uint64_t m_blockHint = 0;
+	uint64_t m_sizeHint = 0;
 	uint32_t m_renderStateSet = 0;
 	uint64_t m_keepStamp;
 	std::vector<std::shared_ptr<void>> m_surfaceWrites;

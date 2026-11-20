@@ -7,8 +7,8 @@
 #                 MSI_CORPUS_ODD, MSI_QEMU_SUBPROJECTS, MSI_QEMU_SEED)
 #   lg/bin/       the gate's host scripts (msi-*.sh and the rest), as the gate has them
 #   lg/post-probes/  the probes the correctness boot runs last (lane-gate.sh --post-probes), if any
-#   lg/ship/      what the Mac built: payload/ (guest-run.sh and its tools), kexts/ (the loader's
-#                 kexts), RgfxGate.kext, reims-graphics.bundle.tgz, and qemu.bundle (vendor/qemu's
+#   lg/ship/      what the Mac built: payload/ (guest-run.sh and its tools), kexts/ (Graft and
+#                 ReimsGraphics), RgfxGate.kext, reims-graphics.bundle.tgz, and qemu.bundle (vendor/qemu's
 #                 commits that MSI_QEMU_SEED lacks, a git bundle of refs/heads/lane-gate)
 # The candidate's own tree is not in the commit: its parent is the candidate, which the job takes
 # with `git archive` from the workspace's repository.
@@ -81,7 +81,7 @@ do_corpus() {  # the decode streams and references, copied again wherever their 
 }
 do_stage() {  # the candidate's tree, and vendor/qemu's source where the host has none yet
   rm -rf "$MSI_GATE/stage" && mkdir -p "$MSI_GATE/stage"
-  git -C "$WS" archive --format=tar "$SHA" -- . ':(exclude)tests/suite/expected' | tar -C "$MSI_GATE/stage" -xmf -
+  git -C "$WS" archive --format=tar "$SHA" -- . | tar -C "$MSI_GATE/stage" -xmf -
   local Q=$MSI_GATE/qemu/$QC G=$MSI_GATE/qemu-git
   if [[ ! -f $Q/src/configure ]]; then
     # A bare clone sharing MSI_QEMU_SEED's objects, with the commits it lacks from the bundle.
@@ -107,12 +107,15 @@ do_msi_build() {
   fi
   bash "$MR/bin/msi-build.sh" "$MSI_GATE" "$MSI_GATE/tree" "$MSI_GATE/stage" "$QC" "$MSI_QEMU_SUBPROJECTS" | tee "$OUT/msi-build.txt"
   grep -q MSI_BUILD_OK "$OUT/msi-build.txt"
-  local q r
+  local q r p
   q=$(awk '$1 == "BUILT" && $2 == "qemu" {print $3}' "$OUT/msi-build.txt")
   r=$(awk '$1 == "BUILT" && $2 == "rom" {print $3}' "$OUT/msi-build.txt")
+  p=$(awk '$1 == "BUILT" && $2 == "probe" {print $3}' "$OUT/msi-build.txt")
   # QEMU finds its firmware and option ROMs (kvmvapic.bin, efi-virtio.rom) in qemu-bundle/ beside
   # its binary: the build's bundle holds links into the commit's source tree, which stays.
+  # The boots ask an NVIDIA GPU's decoders with nvidia-probe, beside QEMU (msi-boot.sh).
   cp --reflink=auto "$q" "$MR/qemu-system-x86_64" && cp "$r" "$MR/ReimsGraphics.rom" &&
+    cp "$p" "$MR/nvidia-probe" &&
     rm -rf "$MR/qemu-bundle" && mkdir -p "$MR/qemu-bundle/usr/local/share" &&
     cp -a "$(dirname "$q")/qemu-bundle/usr/local/share/qemu" "$MR/qemu-bundle/usr/local/share/" &&
     test -e "$MR/qemu-bundle/usr/local/share/qemu/efi-virtio.rom"

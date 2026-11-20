@@ -1,0 +1,39 @@
+//! The reims-graphics device (PCI 1234:5247), the GPU x86-64 macOS guests drive through our own
+//! kexts and Metal bundle (`docs/graphics-kext/design.md`): its wire format and its host side.
+//! `reims-vgpu` decodes the Metal calls the guest sends over it and runs them on the platform.
+//!
+//! - [`wire`] is the format the guest and the host share: the registers, the region's layout,
+//!   the rings and the control commands and events. cbindgen writes it into
+//!   `include/reims_graphics_wire.h`, which the guest's kext and option ROM include.
+//! - [`ops`] is the command-buffer op stream in that format: the `COMMAND_BUFFER` message and the
+//!   encoder ops (begin/end, and the render, compute and blit groups) the guest serialises.
+//! - [`icb`] is the records of an `ICB_WRITE`: the CPU's encodes into an indirect command
+//!   buffer, in that format too.
+//! - [`Device`] is the host side, as the host's process runs it: the region (BAR 2), the
+//!   registers (BAR 0), the control ring's thread and the display's refresh thread, over the
+//!   host's callbacks ([`Host`]) and what shows the display ([`Screen`]). `reims-vgpu` shows it
+//!   in a window of the library's, and the C API hands it to QEMU's `reims-graphics-pci`.
+//! - `ring` is the host's two ends of a ring, `control` the commands, [`display`] the display's
+//!   modes, scanout and cursor, and [`region`] the region's memory.
+//! - [`keep`] is how long the device's pools of threads, and the host's, keep a thread with
+//!   nothing to do.
+
+mod clock;
+mod control;
+pub mod device;
+pub mod display;
+pub mod icb;
+pub mod keep;
+pub mod managed;
+pub mod ops;
+pub mod region;
+mod ring;
+mod wake;
+pub mod wire;
+
+pub use device::{
+    CompleteAnswer, CompletionPoster, Device, DoorbellAt, Host, PresentAnswer, QueueClaim,
+    REGION_SIZE, RingDegradation, Then,
+};
+pub use display::{CursorImage, FixedScreen, Mode, Scanout, Screen};
+pub use wake::RawDoorbell;

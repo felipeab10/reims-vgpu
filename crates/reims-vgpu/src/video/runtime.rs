@@ -4,27 +4,32 @@
 //! - **A thread** is a worker of the platform's ([`Threads::spawn_worker`]), as a serial queue's
 //!   is: a session's thread runs the messages of its queue one at a time, as a queue's worker
 //!   runs its blocks. It is named as the video crate asks, has a worker's 512 KiB of stack, and
-//!   takes the hints the platform gives a thread that is not a FIFO thread (on Linux it drops
-//!   those it inherited from the thread that started it). Its body runs marked as the
+//!   takes the hints the platform gives a queue's worker (on Linux it drops those it inherited
+//!   from the thread that started it). Its body runs marked as the
 //!   library's ([`enter_ours`]), so that a panic on it ends the process before anything
 //!   unwinds, as on every thread of the library's (architecture 6.5). The platform starts every
 //!   thread it is asked for, or ends the process, so a video crate never meets the refusal it
 //!   handles from std's threads.
 //! - **The clock** is the platform's monotonic clock, and a wait is the platform's
 //!   [`Clock::wait_until`] on a deadline on it: a bound counts the time the host sleeps, as the
-//!   platform's own bounds do, and a test's virtual clock is a session's too. A backend the
-//!   device opens waits for its GPU on the same clock, so a test on a virtual clock opens none
-//!   (`VideoDevice::without_backend`), and one that opens the host's gives it std's runtime.
+//!   platform's own bounds do, and a test's virtual clock is a session's too. A backend waits
+//!   for its GPU on the same clock, so a test on a virtual clock opens none.
+//! - **A step** around a thread's job ([`Runtime::exit_step`]) is a step of the library's exit
+//!   gate ([`reims_vgpu_vulkan::exit_gate`]): the process's exit waits for the calls into the
+//!   hardware's libraries in progress, and refuses the next. The gate's hook is registered again
+//!   as a video crate loads a driver ([`Runtime::arm_exit`]: a VA display's, as it opens, and the
+//!   NVIDIA arm's libraries, as each loads and as `cuInit` runs), so it runs before that driver's
+//!   exit-time destructors.
 
 use std::sync::Arc;
 
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
+use reims_vgpu_video::core::runtime::{ExitStep, MonoTime, Rings, Runtime, TimedOut};
+use reims_vgpu_video::core::sync::{Condvar, MutexGuard};
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::os::{Clock as _, Deadline, MonoTime as CoreTime};
 #[cfg(doc)]
-use reims_vgpu_core::platform::os::{Clock, Threads};
-use reims_vgpu_core::rt::enter_ours;
-use reims_vgpu_video_core::runtime::{MonoTime, Rings, Runtime, TimedOut};
-use reims_vgpu_video_core::sync::{Condvar, MutexGuard};
+use reims_vgpu_vulkan::core::platform::os::{Clock, Threads};
+use reims_vgpu_vulkan::core::rt::enter_ours;
 
 /// `P` as a video crate's runtime (module doc).
 pub(crate) struct PlatformRuntime<P: Platform>(Arc<P>);
@@ -52,6 +57,15 @@ impl<P: Platform> Runtime for PlatformRuntime<P> {
         MonoTime::from_nanos(self.0.clock().now_mono().as_nanos())
     }
 
+    fn exit_step(&self) -> Option<ExitStep> {
+        let step = reims_vgpu_vulkan::exit_gate::step()?;
+        Some(ExitStep::of(Box::new(step)))
+    }
+
+    fn arm_exit(&self) {
+        reims_vgpu_vulkan::exit_gate::arm();
+    }
+
     fn wait_until(
         &self,
         cv: &Condvar,
@@ -67,9 +81,9 @@ impl<P: Platform> Runtime for PlatformRuntime<P> {
 mod tests {
     use std::time::Duration;
 
-    use reims_vgpu_core::rt::is_our_thread;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_video_core::runtime::{Bell, StdRuntime, Unanswered, answer};
+    use reims_vgpu_video::core::runtime::{Bell, StdRuntime, Unanswered, answer};
+    use reims_vgpu_vulkan::core::rt::is_our_thread;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
 
     use super::*;
 

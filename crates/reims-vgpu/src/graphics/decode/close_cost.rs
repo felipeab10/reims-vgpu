@@ -3,10 +3,10 @@
 //! `CLOSE_COST_COUNT` objects of one kind (1000 by default) and puts them in a context's table, as
 //! their creates do, then closes the context, timing the thread's CPU time and the wall time
 //! between. On the fake platform, whose objects cost next to nothing to let go of, the figures are
-//! the decoder's own an object; on the Vulkan and Metal platforms they add the platform's release
+//! the decoder's own an object; on the Vulkan platform they add the platform's release
 //! and its driver's. Each kind runs once to warm up, then [`REPS`] times, and the median of each
-//! figure is printed. A measurement, run by hand in a release build holding the host's GPU
-//! (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! figure is printed. A measurement, run by hand in a release build, in a potluck job holding the
+//! host's GPU (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E 'test(close_cost)'
 //! --no-capture`); `CLOSE_COST_KINDS` names the kinds to run, a comma-separated list of
 //! [`KINDS`]' names, every one by default.
@@ -18,16 +18,16 @@
 use std::sync::Arc;
 use std::time::Instant;
 
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_OVER_HOST_MEMORY, RGFX_CMD_QUEUE_CREATE, RGFX_CONTEXT_ALLOCATIONS_OFFSET,
     RGFX_CURSOR_SPAN, RgfxBufferOverHostMemory, RgfxMsgHeader, RgfxQueueCreate,
 };
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::values::{RenderPipelineDesc, SamplerDesc, TextureDesc};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
-use super::draw_cost::{counts, fixture, spread};
+use super::draw_cost::{counts, fixture, spread, test_shaders};
 use super::{GraphicsDecoder, ObjHandle};
 use crate::platform::ApiPlatform;
 
@@ -110,7 +110,7 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
     let platform = P::process();
     let device = platform.metal_device(None).unwrap();
     let region_size = RGFX_CONTEXT_ALLOCATIONS_OFFSET + n * HOST_LENGTH + RGFX_CURSOR_SPAN;
-    let region = reims_graphics::region::Region::new(region_size as usize).unwrap();
+    let region = crate::platform::test_region(&*platform, region_size as usize);
     let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::new(region));
     let o = OnFault::Die;
     let pipeline_functions = match kind {
@@ -121,14 +121,13 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
         _ => None,
     };
     let kernel = matches!(kind, Kind::ComputePipeline).then(|| {
-        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/suite/fixtures/shaders/compute_add.metallib");
+        let path = test_shaders().join("compute_add.metallib");
         let library = device
             .new_library(&std::fs::read(path).unwrap())
             .unwrap()
             .unwrap()
             .unwrap();
-        reims_vgpu_core::platform::resource::Library::new_function(&library, o, "add_one")
+        reims_vgpu_vulkan::core::platform::resource::Library::new_function(&library, o, "add_one")
             .unwrap()
             .unwrap()
     });
@@ -188,7 +187,6 @@ fn made<P: ApiPlatform>(kind: Kind, n: u64) -> (GraphicsDecoder<P>, P::Device) {
                             vertex,
                             fragment,
                             color0_pixel_format: BGRA8,
-                            blend_over: false,
                             resource_index: None,
                         })
                         .unwrap()
@@ -266,21 +264,12 @@ fn measure<P: ApiPlatform>(platform: &str) {
 #[test]
 #[ignore = "a measurement, run by hand in a release build: prints a close's cost an object"]
 fn on_fake_close_cost() {
-    measure::<reims_vgpu_core::testkit::FakePlatform>("the fake platform");
+    measure::<reims_vgpu_vulkan::core::testkit::FakePlatform>("the fake platform");
 }
 
 /// On the Vulkan platform: the decoder's, the platform's and the runtime's.
-#[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
 fn on_vulkan_close_cost() {
     measure::<reims_vgpu_vulkan::VulkanPlatform>("vulkan");
-}
-
-/// On the Metal platform: the decoder's, the platform's and Metal's.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a close's cost an object"]
-fn on_metal_close_cost() {
-    measure::<reims_vgpu_metal::MetalPlatform>("metal");
 }

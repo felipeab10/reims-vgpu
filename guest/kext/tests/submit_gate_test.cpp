@@ -60,6 +60,40 @@ int main()
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_QUEUE_CREATE), "QUEUE_CREATE does not route");
 	check(!rgfxSubmitRoutesQueueDestroy(RGFX_CMD_BLOCK_RELEASE), "BLOCK_RELEASE does not route");
 
+	// SubmitBatch takes destroys, the creates no one waits for that name no block, and a Managed
+	// buffer's modified range, each of its one size: messages no one waits for, which name no
+	// block (spans_test), so the batch needs neither answers nor pins; a create is followed by
+	// its destroy where a close came since the check. A texture over an IOSurface, which a
+	// present waits for, and every other type, accepted by Submit or not, go one call at a time.
+	struct Taken {
+		uint32_t type;
+		uint32_t size;
+		bool makes;
+	};
+	const Taken taken[] = {
+		{RGFX_CMD_OBJECT_DESTROY, sizeof(RgfxObjectDestroy), false},
+		{RGFX_CMD_BUFFER_AT_OFFSET, sizeof(RgfxBufferAtOffset), true},
+		{RGFX_CMD_TEXTURE_CREATE, sizeof(RgfxTextureCreate), true},
+		{RGFX_CMD_TEXTURE_VIEW, sizeof(RgfxTextureView), true},
+		{RGFX_CMD_MANAGED_TEXTURE_CREATE, sizeof(RgfxManagedTextureCreate), true},
+		{RGFX_CMD_MANAGED_BUFFER_CREATE, sizeof(RgfxManagedBufferCreate), true},
+		{RGFX_CMD_BUFFER_DID_MODIFY_RANGE, sizeof(RgfxBufferDidModifyRange), false},
+	};
+	for (const Taken &t : taken) {
+		check(rgfxSubmitBatchSize(t.type) == t.size, "SubmitBatch takes the type, of its size");
+		check(rgfxSubmitAdmitted(t.type) && rgfxSubmitMakes(t.type) == t.makes,
+		      "a batched message is one Submit takes, making an object where a create");
+	}
+	check(rgfxSubmitBatchSize(RGFX_CMD_TEXTURE_FROM_IOSURFACE) == 0,
+	      "SubmitBatch does not take a texture over an IOSurface");
+	for (uint32_t type = 0; type <= RGFX_CMD_CONTEXT_CLOSE + 64; type++) {
+		bool listed = false;
+		for (const Taken &t : taken)
+			listed = listed || t.type == type;
+		if (!listed)
+			check(rgfxSubmitBatchSize(type) == 0, "SubmitBatch takes no other type");
+	}
+
 	// Which accepted types make an object a destroy then drops: every type of the accepted
 	// range is decided here, so a new wire type has to be placed.
 	const uint32_t makes[] = {
@@ -73,12 +107,16 @@ int main()
 	    RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_VIDEO_SESSION_CREATE,
 	    RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_BUFFER_MANAGED_AT_OFFSET,
 	    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_MANAGED_BUFFER_CREATE,
-	    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE,
+	    RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_RATE_MAP_CREATE,
+	    RGFX_CMD_FUNCTION_HANDLE_CREATE, RGFX_CMD_FUNCTION_TABLE_CREATE,
+	    RGFX_CMD_DYNAMIC_LIBRARY_CREATE,
 	};
 	const uint32_t makesNone[] = {
 	    RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_BUFFER_DID_MODIFY_RANGE, RGFX_CMD_TEXTURE_REPLACE_REGION,
 	    RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_CMD_ARGUMENT_LAYOUT,
-	    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_ICB_WRITE,
+	    RGFX_CMD_SHARED_EVENT_SET_VALUE, RGFX_CMD_ICB_WRITE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
+	    RGFX_CMD_RATE_MAP_RESET, RGFX_CMD_RATE_MAP_QUERY, RGFX_CMD_FUNCTION_TABLE_SET,
+	    RGFX_CMD_ICB_SLOTS_IN_PAGES,
 	};
 	for (uint32_t t : makes)
 		check(rgfxSubmitAdmitted(t) && rgfxSubmitMakes(t), "a create makes an object");
@@ -93,7 +131,8 @@ int main()
 			listed |= t == type;
 		if (type <= RGFX_CMD_BUFFER_OVER_PAGES || type == RGFX_CMD_BUFFER_MANAGED_AT_OFFSET ||
 		    type == RGFX_CMD_HEAP_OVER_PAGES || type == RGFX_CMD_MANAGED_BUFFER_CREATE ||
-		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE)
+		    type == RGFX_CMD_MESH_RENDER_PIPELINE_CREATE || type == RGFX_CMD_TEXTURE_DID_MODIFY_DATA ||
+		    (type >= RGFX_CMD_RATE_MAP_CREATE && type <= RGFX_CMD_ICB_SLOTS_IN_PAGES))
 			check(listed, "every wire type of the accepted range is placed");
 		else if (!listed)
 			check(!rgfxSubmitMakes(type), "a type the wire does not name makes none");

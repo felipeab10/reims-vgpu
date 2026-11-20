@@ -5,23 +5,29 @@ of work around them, and [architecture.md](architecture.md) section 17
 repeats the ones code cites.
 
 - **Names say what things mean**: `Raise`, `Held`, `SerialQueue`,
-  `define_task`, `present_mapped_surface`.
+  `HostRange`.
   - No `PG` prefixes, no Objective-C class names, no
     `dealloc`/`init_with_*` names, and no selector-keyword method names.
   - No `_locked`/public pairs unless both are called.
   - The threads, queues and Metal object labels the library makes are
-    `reims-vgpu.<role>` (`reims-vgpu.fifo`, `reims-vgpu.display-present`).
+    `reims-vgpu.<role>` (`reims-vgpu.graphics-control`,
+    `reims-vgpu.display-present`).
     They are diagnostics: no host or guest reads them.
-- **Modules** are named by responsibility (`device/lifecycle.rs`,
-  `tasks/shared.rs`, `remote/device_link.rs`, `gpu_task/`), never after
-  `-init`, `PGBaseTask` or a delegate class. One module style: `foo.rs`
-  beside `foo/` (D44).
+- **Modules** are named by responsibility (`graphics/decode/cmdbuf.rs`,
+  `memory/mapping.rs`, `display/pipeline.rs`), never after `-init` or an
+  Objective-C class. One module style: `foo.rs` beside `foo/` (D44).
 - **Code for one OS** goes in files of its own (the window crate's
-  `native/macos/` and `native/linux/`, the Vulkan crate's `os/macos.rs`
-  and `os/linux.rs`, the C API's `ffi/catch/{macos,linux}.rs`), which the
-  module above them picks with `#[cfg(target_os = ...)]`, rather than in
-  `cfg`s spread through shared code. It sits in the crates both OSes share:
-  no crate is one OS's. A file both OSes share is the exception, where
+  `native/macos/`, `native/linux/` and `native/windows.rs`, the Vulkan
+  crate's `os/macos.rs`, `os/linux.rs` and `os/windows.rs`, the graphics
+  crate's `clock/`, `region/` and `wake/`, each `unix.rs` and `windows.rs`,
+  the C API's `ffi/catch/{macos,linux}.rs`, Linux's of which Windows
+  takes), which the module above them picks with `#[cfg(target_os = ...)]`
+  (or `unix` and `windows`), rather than in `cfg`s spread through shared
+  code. Code some OSes share and others do not
+  goes in a module of its own that the index picks for those OSes (the
+  window crate's `native/sdl_thread/`, SDL on the library's own thread, for
+  Linux and Windows). It sits in the crates both OSes share: no crate is one
+  OS's. A file both OSes share is the exception, where
   splitting cannot be avoided, and keeps its `cfg`s to a few whole items;
   index files that pick modules are exempt.
 - **The Vulkan platform** answers as Metal does through metal2vulkan's
@@ -36,9 +42,9 @@ repeats the ones code cites.
     `VK_NV_linear_color_attachment`.
   - **Stalls are fixed on the Vulkan side**: in this crate (caches, their
     keys, when states are made) and in the runtime (translation speed,
-    sharing, making ahead), never by making core or the FIFO non-blocking,
-    or by deferring or reordering their waits, since the guest sees where
-    they wait. Compiles run concurrently only inside the synchronous wait
+    sharing, making ahead), never by making core or the device's lanes
+    non-blocking, or by deferring or reordering their waits, since the guest
+    sees where they wait. Compiles run concurrently only inside the synchronous wait
     that needs them, which joins every one before it returns: nothing
     compiles in the background, and nothing is deferred or released early.
     Nothing the guest sees (IDs, addresses, stamps, reflection order, shared
@@ -47,13 +53,20 @@ repeats the ones code cites.
   - **Speed comes from what every run gets**: fewer and smaller pipelines,
     sharing, concurrency inside a wait. Nothing is loaded or ordered by what
     an earlier run drew, and no measurement starts from a cache seeded for
-    it.
+    it. Two stores stand in for Metal's own caches across runs, as a Mac
+    keeps its compiled pipelines on disk: the runtime's pipeline records
+    (`crates/reims-vgpu-vulkan/src/records.rs`), across a host's processes,
+    and the device's kept pipeline answers
+    (`crates/reims-vgpu/src/graphics/answers.rs`), across boots. Each holds
+    only what the platform or the device gave before, under the identity of
+    what decides it, so it changes no value the guest reads, only how soon
+    the guest has it; neither is ever seeded for a measurement.
   - **A workaround for the OS or a driver** lives in the runtime's code that
     calls it, never in core or the library's threads: a compile the system
     runs at its caller's priority is raised by the runtime, not by raising
-    the FIFO thread's.
+    the library's threads'.
   - **What Metal does is the runtime's to build**, its private API
-    included; what only the paravirtual device has is this crate's. A gap
+    included; what only our device has is this crate's. A gap
     in the runtime goes to it with a repro (the call, its descriptor or
     arguments, the error or the difference from Metal, the device) rather
     than being patched around here.
@@ -62,15 +75,11 @@ repeats the ones code cites.
     proposed upstream, and the workaround lives here or in the runtime. A
     mark in the runtime that pays off only once upstream takes a fix stays
     if it changes nothing on the stock release.
-  - **Core changes as little as the Vulkan and Linux work allows**: it is
-    the Metal product's too, and stable there.
 - **Closed internal value sets are enums**, converted with `TryFrom<u32>` at
   the guest edge. A raw integer is kept only where the guest can write any
-  value. There are no `pub mod x { pub const … }` integer-enum modules: the
-  device's `RunState`, for one, is an enum in an `AtomicU8`-backed cell.
+  value. There are no `pub mod x { pub const … }` integer-enum modules.
 - **Refcounts**: a type whose drop has an observable effect (a Metal object,
-  an IOSurface, a host block, a device or display handle) never implements
-  `Clone`. Another reference is taken with `.clone_ref()`, everywhere, API
+  a host block, a device or display handle) never implements `Clone`. Another reference is taken with `.clone_ref()`, everywhere, API
   types included (D6). A derive that would copy one does not compile.
 - **Order-bearing types** have an explicit `Drop` that takes their parts in
   the order the API shows (architecture 15.3). Field declaration order is
@@ -78,16 +87,65 @@ repeats the ones code cites.
 - **Never guess a name** for guest records, the wire and copies of Metal
   structs. A field whose meaning nothing states is `field_xx` (its byte
   offset in lowercase hex), and a name that is ours carries
-  `// name is ours: <evidence>`. Guest-ABI names follow
-  [docs/testing.md](testing.md) section 6.
+  `// name is ours: <evidence>`.
 - **An odd behaviour** the guest or host can see carries a doc comment at
   the code that says what it is, and a test named for the behaviour
-  (`teardown_with_a_doorbell_owed_dies`). It is kept as it is: changing it
-  is a deliberate change of behaviour, which re-records what it alters
-  (architecture 13).
+  (`denormal_depths_store_and_compare_as_metals`). It is kept as it is:
+  changing it is a deliberate change of behaviour, in a commit of its own
+  that changes its test.
 - **Comments** say why, in terms of what the guest or host observes ("the
-  stamp is in guest memory before its interrupt"), and may name a scenario
-  or test.
+  stamp is in guest memory before its interrupt"), and may name a test.
+- **Each degradation is logged once per boot, then counted.** A
+  degradation, fallback, refusal or unsupported case writes its first line
+  of each kind, and counts the rest:
+  - The library's logger (`reims_vgpu_vulkan::core::logging`) writes a warn
+    or error line, and an info line that names a `kind`, once per kind: the
+    first at its level, each later one at debug, counted. The kind is the
+    call site, and the class of the cause where the site names one,
+    `log::warn!(target: "…", kind:% = error; "…: {error}")`: the cause's
+    text up to its first digit, quote or `;`. A site with one cause names
+    none.
+  - The runtime's degradations, inexact values and the driver's error
+    messages are relayed on stderr the first time alone of each kind
+    (`answer`), and counted.
+  - At each reset of the device and at the process's exit, two lines give
+    the counts. `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`,
+    on stderr, sorted by code, is every kind relayed or counted since the
+    process began: the runtime's degradation codes
+    (`metal2vulkan-degrade-…`), `inexact-…`, `out-of-host-memory`, the
+    driver's message id names, and the reims-graphics device's completion
+    rings' (`control-ring-full`, `control-ring-post-waited`,
+    `vblank-dropped`, `queue-ring-full`, `queue-ring-post-waited`) and its
+    decoder's (`two-ranges-kept-whole`, a command buffer dealt to two
+    threads that the platform kept whole at a chunk's end, which fails at
+    its stand-in); a boot's degradations are read from its last such
+    line. `reims-vgpu INFO reims_vgpu_vulkan::core::logging: lines
+    repeated since the last count: <n> more of <file>:<line>[ [<kind>]]
+    (<target>: <the first line's message>); …` is how many lines of each
+    kind the logger wrote at debug since its last such line.
+  - No line at info or above fires per present, frame, draw, command
+    buffer, ring message, interrupt or other per-event path: such a line is
+    debug or trace, under a target of its own where a tool counts it
+    (`reims_vgpu::graphics::shown`, `::library` and `::queues`, which the
+    lane gate's boots log at debug). Info keeps state changes (modes, the
+    display between the scanout and a surface, starts and stops, a new kind
+    of degradation) and summaries, at most once a minute.
+  - QEMU's `reims-graphics-pci` says a failure the guest can repeat with
+    `error_report_once`.
+  - The guest's kexts log a failure a caller can repeat once a boot per
+    kind (`rgfxFirstCalls`, `guest/kext/src/RgfxTrace.hpp`), and the Metal
+    bundle once a process per kind (`rgfxLogFirst`,
+    `guest/bundle/src/RgfxLogOnce.hpp`); the kind is the site, and a status,
+    selector or reason where the site has several. Their summaries (the
+    rings' room, the releases, the dormant blocks, the swaps, the surface
+    copies) come at most once a minute, and a bring-up trace logs its first
+    calls alone.
+    The bundle's os_log lines go to its own subsystem,
+    `ai.aneesiqbal.reims-graphics`, category `bundle` (`RgfxLog.hpp`), so
+    `log config --subsystem ai.aneesiqbal.reims-graphics` sets the level
+    they are kept and persisted at; its NSLog lines are at the default
+    level, which the log store keeps, and carry no subsystem. Both start
+    `RGFX:`.
 - Tests sit in `mod tests` beside the code and are named by behaviour.
 - **Integers**: std spells wrapping, overflowing, widening and sign
   reinterpretation (`wrapping_add`, `overflowing_mul`, `u64::from`,
@@ -107,7 +165,7 @@ repeats the ones code cites.
 - Default rustfmt. A lint is lowered with `#[expect(lint, reason = "…")]` on
   the narrowest item, in place of an `allow` with a comment.
 - **The option ROM's C** (`firmware/`) follows EDK2's style and the UEFI
-  specification's names instead (architecture 11.4). Its register macros
-  carry the device's names (`REIMS_VGPU_REG_EFI_ENABLE`, `EfiEnable`).
+  specification's names instead (architecture 11.4). Its registers carry
+  the wire header's names (`RGFX_REG_DOORBELL`).
 - Branches are prefixed `steelbrain/`. Commits follow AGENTS.md (emoji
   prefix, imperative, 72-column subject, body wrapped at 80 explaining why).

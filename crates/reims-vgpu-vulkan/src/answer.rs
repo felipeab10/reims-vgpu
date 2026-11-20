@@ -1,5 +1,5 @@
-//! The answer layer: where the runtime's typed errors become core's outcomes, as the metal
-//! crate's message layer (`reims_vgpu_metal::msg`) decides a raise inside Metal.
+//! The answer layer: where the runtime's typed errors become core's outcomes, as Metal decides a
+//! raise inside its own calls.
 //!
 //! Every runtime call core asks for runs here, named by the Metal selector it stands for, which a
 //! raise and a death name:
@@ -41,30 +41,26 @@
 //! **A call Metal never returns from** parks the calling thread for good ([`hang`]), as the
 //! contract keeps a hang a hang.
 //!
-//! **A write the runtime refuses where Metal's GPU writes it** dies at the command: a
-//! dispatch's or a draw's write through a texture over a surface of the 4:4:4 two-plane YCbCr
-//! formats whose writes the runtime does not store as Metal does, the `_sRGB` twins 523 and 527
-//! ([`crate::gpu::ycbcr::refused_write`]). The runtime stores the writes of 503, 507, 542 and
-//! 545 into the surface's planes as Metal's GPU does, drops those of the packed 510 and 530 as
-//! Metal's GPU drops them on this host, and refuses
-//! where the command is encoded the writes of those it does not store: through a texture over
-//! plane 1, which dies there naming the refusal (`writes_of_444_textures_over_plane_1_die`), and
-//! through a slot that also reads the texture, or by a command that writes the planes through the
-//! texture and another way, which the runtime refuses alike.
-//!
-//! **A task that has ended sends nothing**, as on the Metal platform: before every call, a thread
-//! running the work of an isolated task that died or was invalidated stops
-//! (`stop_if_task_ended`).
+//! **A write the runtime refuses where Metal's GPU writes it** dies at the command. The runtime
+//! stores the writes of 503, 507, 542 and 545 into the surface's planes as Metal's GPU does,
+//! drops those of the packed 510 and 530 as Metal's GPU drops them on this host
+//! ([`crate::gpu::ycbcr`], "Writes"), and refuses where the command is encoded the writes of
+//! those it does not store: through a texture over plane 1, which dies there naming the refusal
+//! (`writes_of_444_textures_over_plane_1_die`), and through a slot that also reads the texture,
+//! or by a command that writes the planes through the texture and another way, which the runtime
+//! refuses alike.
 //!
 //! **A degradation of a kind [`DIES`] lists is relayed, and dies in strict mode** ([`notice`],
-//! the runtime's message sink), but those of [`DIES_BY_DEFAULT`], which die in either mode: the
-//! runtime announces each kind of degradation once per device, but these kinds at every
-//! occurrence in strict and census mode, and those of [`DIES_BY_DEFAULT`] in every mode
+//! the runtime's message sink): the runtime announces each kind of degradation once per device,
+//! but these kinds at every occurrence in strict and census mode
 //! (`DeviceOptions::announce_each`, [`crate::platform`]).
-//! By default the process goes on: the first occurrence of each kind writes the runtime's line,
-//! and each occurrence announced is counted ([`relayed_counts`]), as a native device's relay is
-//! (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a death of its
-//! own). **Strict mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
+//! By default the process goes on, whatever the kind: the first occurrence of each kind writes
+//! the runtime's line, and each occurrence announced is counted ([`relayed_counts`]), as a native
+//! device's relay is (docs/accuracy-ledger.md: a difference from Metal's answer is logged, never a
+//! death of its own; the process ends only where Metal ends it, or where an operation cannot run
+//! at all). No kind dies by default: where Metal goes on, a death is no more Metal's answer than
+//! the difference the runtime relays (`released_command_states_are_relayed_by_default`). **Strict
+//! mode** ([`strict`], `REIMS_VGPU_STRICT=1`, read once per process) restores the
 //! deaths, for tests and audits: the call that announced it dies once it returns, at its selector,
 //! naming the notice, and a notice announced on a thread outside every call here (the runtime's
 //! scheduler thread, at a host step) dies where it is announced. Where a kind's docs below say it
@@ -73,13 +69,12 @@
 //!
 //! **A difference this platform finds itself** ([`Inexact`], [`inexact`]): a value it computes
 //! otherwise than Metal, which no runtime notice announces as a death (a `half` colour output's
-//! blend, a bfloat attachment's codes, a `textureWriteRoundingMode` the
-//! runtime does not take), or an answer it gives otherwise (a texture of protection options made
-//! unprotected, the identifier of a pipeline state made with indirect command buffer support, and
-//! of an indirect command buffer made after encoders whose take of Metal's range the runtime does
-//! not model), is relayed alike, its first occurrence
-//! writing a line naming the kind, and dies in strict mode. A death where Metal itself ends the
-//! process, or where the runtime cannot perform the call at all, is a death in either mode.
+//! blend, a bfloat attachment's codes), or an answer it gives otherwise (a texture of protection
+//! options made unprotected, the identifier of a pipeline state made with indirect command buffer
+//! support, and of an indirect command buffer made after encoders whose take of Metal's range the
+//! runtime does not model), is relayed alike, its first occurrence writing a line naming the kind,
+//! and dies in strict mode. A death where Metal itself ends the process, or where the runtime
+//! cannot perform the call at all, is a death in either mode.
 //!
 //! **On a native device** (off macOS, a driver other than MoltenVK, [`native`]), the kinds of
 //! [`native::NATIVE_RELAYED`] are relayed in strict mode too, each with its ground, the first
@@ -93,22 +88,20 @@
 //! says on stderr, once per process as it turns on, that the run is not faithful to Metal. On
 //! macOS the variable is ignored: every such degradation dies there.
 //!
-//! **Every death here ends the process**, one inside an isolated task's own call included: each
-//! is a platform death (`DeathId::Platform`), which core's isolation leaves to the process, as it
-//! leaves a crash inside Metal (`reims_vgpu_core::tasks::isolation::life`), and every task's work
-//! runs on the one runtime device and its scheduler thread. The runtime catches a panic in its
+//! **Every death here is a platform death** (`DeathId::Platform`): it ends the process, or, inside
+//! a refusal scope, refuses the op that met it. The runtime catches a panic in its
 //! sink, which only the test capture's death is: under the capture, a notice kept before it died
 //! dies again at the thread's next call here.
 //!
 //! **A degradation of a kind [`HEARD`] lists is heard** by the call here it is announced inside
 //! ([`hearing`]), at every occurrence too: the call dies where an answer it gives would differ
-//! from Metal's, and otherwise goes on, the notice relayed (the first time alone, for
-//! [`RELAYED_ONCE`]'s kinds).
+//! from Metal's, and otherwise goes on, the notice relayed the first time alone and counted
+//! ([`RELAYED_ONCE`]).
 //!
 //! **Every other kind is relayed**: it goes to stderr as the runtime writes it without a sink
 //! ([`relay`]), as every other message of the runtime's own does (its pipeline-creation log among
 //! them; a `Verbose` one, which the runtime gives a sink alone, goes to the log at debug), each
-//! line naming its kind. Each is relayed for one of these reasons, named at the kind
+//! line naming its kind, and is counted. Each is relayed for one of these reasons, named at the kind
 //! in the placement test (`every_degradation_kind_is_placed_once`):
 //! - Metal's answer at a cost Metal does not pay, in time or memory (the performance kinds);
 //! - measured equal to Metal's answer on this host;
@@ -135,12 +128,11 @@
 use std::cell::{Cell, RefCell};
 use std::ptr::NonNull;
 
+use crate::core::platform::types::NsErrorText;
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::{OnFault, Raise, RaiseResult};
 use metal2vulkan_runtime as rt;
 use metal2vulkan_runtime::Error;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
-use reims_vgpu_core::tasks::isolation::life::stop_if_task_ended;
 
 pub mod census;
 pub mod native;
@@ -182,7 +174,7 @@ pub enum Nil {
     /// None: every refusal is decided as [`send`] decides it.
     Never,
     /// A buffer's length or memory: a length of 0 or past the device's largest buffer, no memory
-    /// for it, or a pinned address the space cannot honour (measured on the Metal platform:
+    /// for it, or a pinned address the space cannot honour (measured on Metal on the M3 Max:
     /// `newBufferWithLength:options:` of `u64::MAX`, and a no-copy buffer of length 0 or 2^46,
     /// answer nil).
     BufferLength,
@@ -193,10 +185,10 @@ pub enum Nil {
     /// No memory for a shared texture: one of storage other than `Private` is an [`Error::Nil`].
     StorageMode,
     /// A heap's size or memory: a size of 0, no memory for it, or a pinned address the space
-    /// cannot honour (measured on the Metal platform: a heap of size 0 is nil).
+    /// cannot honour (measured on Metal on the M3 Max: a heap of size 0 is nil).
     Heap,
     /// Where a resource is placed in a heap: an offset off the resource's alignment, bytes past
-    /// the heap's end, or no memory for it (measured on the Metal platform: a buffer at an offset
+    /// the heap's end, or no memory for it (measured on Metal on the M3 Max: a buffer at an offset
     /// off 256 bytes, and a buffer or texture past the heap's end, are nil).
     Placed,
 }
@@ -226,8 +218,15 @@ pub fn send<T>(
     policy: Policy,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    stop_if_task_ended();
-    inside(Some(sel), call).or_else(|e| decide(sel, policy, e))
+    inside(Some(sel), boxed(call)).or_else(|e| decide(sel, policy, *e))
+}
+
+/// `call`, its refusal boxed for [`inside`]'s frames to carry: the runtime's `Result<(), Error>`
+/// is 112 bytes (measured at metal2vulkan 0c0cdf0b12), which each frame would move, where an
+/// answer with its refusal boxed is its value and one pointer. Only a refusal allocates.
+#[inline]
+fn boxed<T>(call: impl FnOnce() -> Result<T, Error>) -> impl FnOnce() -> Result<T, Box<Error>> {
+    move || call().map_err(Box::new)
 }
 
 /// [`send`], the line of a death or a raise also carrying what `describe` says of the call
@@ -238,8 +237,8 @@ pub fn send_describing<T>(
     describe: impl FnOnce() -> String,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<T> {
-    stop_if_task_ended();
-    inside(Some(sel), call).or_else(|e| decide_describing(sel, policy, e, Some(&describe())))
+    inside(Some(sel), boxed(call))
+        .or_else(|e| decide_describing(sel, policy, *e, Some(&describe())))
 }
 
 /// Runs `call`, the runtime's form of `sel`, whose every refusal dies at the call.
@@ -253,25 +252,17 @@ pub fn get_describing<T>(
     descriptor: Option<&str>,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> T {
-    stop_if_task_ended();
     got(sel, descriptor, call)
 }
 
-/// [`get`] without the check of the task's end before `call`: for a call no thread may stop
-/// before, as one made while the runtime's encoder just made is not in its handle yet
-/// (`crate::gpu::command`'s `CommandBufferObject::tiler_work`).
-pub fn unstopped_get<T>(sel: &'static str, call: impl FnOnce() -> Result<T, Error>) -> T {
-    got(sel, None, call)
-}
-
-/// [`get_describing`]'s call, after its check of the task's end.
+/// [`get_describing`]'s call.
 fn got<T>(
     sel: &'static str,
     descriptor: Option<&str>,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> T {
-    inside(Some(sel), call).unwrap_or_else(|e| {
-        match decide_describing::<T>(sel, Policy::Fatal, e, descriptor) {
+    inside(Some(sel), boxed(call)).unwrap_or_else(|e| {
+        match decide_describing::<T>(sel, Policy::Fatal, *e, descriptor) {
             Ok(v) => v,
             Err(r) => r.fatal(),
         }
@@ -282,20 +273,12 @@ fn got<T>(
 /// [`DIES`] announced inside it dies at the kind's code. A call that stands for a selector is
 /// [`plain_at`]'s.
 pub fn plain<T>(call: impl FnOnce() -> T) -> T {
-    stop_if_task_ended();
     inside(None, call)
 }
 
 /// Runs `call`, the runtime's form of `sel`, whose result the caller decides: a degradation of
 /// [`DIES`] announced inside it dies at `sel`, as one inside [`send`]'s call does.
 pub fn plain_at<T>(sel: &'static str, call: impl FnOnce() -> T) -> T {
-    stop_if_task_ended();
-    inside(Some(sel), call)
-}
-
-/// [`plain_at`] without the check of the task's end before `call`: for a call no thread may stop
-/// before, as one holding an encoder it took ([`crate::gpu::encode_blit::EncoderObject::end`]).
-pub fn unstopped_at<T>(sel: &'static str, call: impl FnOnce() -> T) -> T {
     inside(Some(sel), call)
 }
 
@@ -308,8 +291,7 @@ pub fn create<T>(
     nil: Nil,
     call: impl FnOnce() -> Result<T, Error>,
 ) -> RaiseResult<Option<T>> {
-    stop_if_task_ended();
-    match inside(Some(sel), call) {
+    match inside(Some(sel), boxed(call)).map_err(|e| *e) {
         Ok(v) => Ok(Some(v)),
         Err(Error::Nil(_)) => Ok(None),
         Err(e) if nil.covers(&e) => Ok(None),
@@ -335,11 +317,11 @@ pub fn created_or_decided<T>(
 /// announced at every occurrence:
 /// - `ReleasedCommandState`: an execution of an indirect command whose record the GPU wrote
 ///   naming a state of its kind the program released whose program the buffer does not keep
-///   (released before any command buffer that may write the buffer's records was encoded, or
-///   past its ID's last four holders), which runs nothing where Metal runs the released state's
-///   program; and, at a host step of records the GPU may write, one naming the ID of the state
-///   the CPU set, released, where the GPU could write the records while another state held the
-///   ID, which runs the set state's program where Metal runs the other's for the GPU's write.
+///   (released while no indirect command buffer of the device lived, or past its ID's last four
+///   holders), which runs nothing where Metal runs the released state's program; the device
+///   keeps the program of each freed ID's last holder while an indirect command buffer of it
+///   lives, and a record whose pipeline a kernel wrote runs the state that held the ID as the GPU
+///   last could write it, as Metal's does, both unannounced.
 ///   Announced by the execution alone: at `commit` for records the CPU
 ///   wrote, a pass whose pipelines were still being made then included, which `commit` waits for
 ///   before it records the pass; and for records the GPU may write or a range a buffer holds, at
@@ -385,27 +367,12 @@ pub fn created_or_decided<T>(
 ///   encoding thread, inside its call, which dies at its selector, as `YCbCrFilterNotExact` is.
 ///   It dies on every device, a native one included: Apple's blend arithmetic for those forms is
 ///   not measured, and the exact form is a measured one or the blend in the function;
-/// - `EncodedUseRebound`: a command buffer's command named a buffer or heap over the guest's
-///   pages that was rebound (a replace, `crate::gpu::backing`) after the command was encoded and
-///   before the command buffer's first submission, in an encoder the rebind could not encode again
-///   (a compute encoder of the runtime's command predication that shares its unit, holds a loop
-///   or leaves work out, which no record of ours reaches, a render pass that executes an indirect
-///   command buffer, which the runtime records later, or whose end captured its draws' tile
-///   reach, a call that answers otherwise than at its encoding; every other compute, blit and
-///   render encoder, one with a pipeline still being made at the commit among them, it encodes
-///   again over the new pages, as Metal runs it, a call refused at its
-///   encoding refused again and the calls after it running, and a resource state encoder takes no
-///   pages), and neither the submission check nor the failure the command buffer was committed with
-///   (`commit_failed`) failed the submission holding it: the runtime runs nothing of that
-///   submission and fails the command buffer, where Metal runs the command over the pages the
-///   object lies in as it submits. A command buffer an earlier submission failed already (a use
-///   detached behind an event wait, Metal's code 8) keeps that code. A submission the check fails
-///   keeps that code and announces nothing. Announced once per device, whatever `announce_each`
-///   says, as the submission is made, on the thread that makes it: the runtime's scheduler thread,
-///   outside every call here, or a thread inside a later command buffer's `commit`, in which the
-///   runtime submits every batch ready then. It dies there and ends the process. The failure it
-///   leaves dies where it is first read too (`crate::gpu::command`), so a later one, which the
-///   device does not announce again, dies;
+/// - `EncodedUseRebound`: a command buffer's command named a buffer or heap the runtime rebound
+///   to new pages after the command was encoded, in an encoder it could not encode again, where
+///   Metal runs the command over the pages the object lies in as it submits. No call of this
+///   platform rebinds a buffer or heap, so the runtime announces it for none; it stays placed for
+///   the runtime's kind, and a failure it left would die where it is first read, unanswered
+///   (`crate::gpu::command`);
 /// - `ZeroLayerMapAfterRelease`: a draw in a pass over a rasterization rate map of no layers made
 ///   after the device released a map of layers, which writes nothing where Metal draws rows of
 ///   the pass. Announced at the draw, inside its call, which dies at its selector. No draw over a
@@ -429,6 +396,10 @@ pub fn created_or_decided<T>(
 ///   clips, which stores a depth the bias takes past `[0, 1]` unclamped, where Metal stores 0
 ///   or 1. Announced at the draw, inside its call, which dies at its selector. MoltenVK does not
 ///   enable the extension, so no draw here reaches it;
+/// - `RestrictedDepthUpload` and the note `RestrictedDepthRange`: a `Depth32Float` value outside
+///   `[0, 1]` on a device without `VK_EXT_depth_range_unrestricted`, MoltenVK included, which
+///   stores it clamped where Metal keeps it. Announced inside the call that meets it (an upload;
+///   for the note, a draw binding a pipeline that compares depth), which dies at its selector;
 /// - the kinds whose answer this host's driver gives as Metal's, which another device's may not,
 ///   so that no device here announces them, each dying where a device announces it, inside the
 ///   guest's call that met it (a draw, a pass, an upload, a resource's or the device's creation;
@@ -438,9 +409,6 @@ pub fn created_or_decided<T>(
 ///     deviations `MetalDepth16BiasedStores` and `MetalDepth16Stores`), where another device
 ///     biases, converts and rounds the depth by its own rules. Each is announced at the draw or
 ///     the pass;
-///   - `RestrictedDepthUpload` and the note `RestrictedDepthRange`, a `Depth32Float` value outside
-///     `[0, 1]` that a device stores clamped, which MoltenVK keeps
-///     (`DepthImageKeepsValuesOutsideUnitRange`);
 ///   - `UnmeasuredResolve`, a resolve past 4 samples, of a texture neither this device nor Metal's
 ///     here makes;
 ///   - `MoltenVkArgumentBuffersUnread` and the note
@@ -553,25 +521,12 @@ pub fn created_or_decided<T>(
 ///   do not alias the heap's bytes as Metal's do: a depth or stencil image a driver lays apart
 ///   from its memory (MoltenVK, the runtime's `DepthStencilImagesLieApart`), where the runtime
 ///   keeps no shadow of it in the heap's bytes, or a colour image a driver may compress (ANV's
-///   `CompressedImagesHideAliasedWrites`, which no device here has). A write through a buffer
+///   `CompressedImagesHideAliasedWrites`, the Iris Xe's), where the texture takes neither an image
+///   of host-transfer usage nor a linear one, and is not one the runtime keeps compressed as Metal
+///   does (`HeapTextureCompressed`, relayed). A write through a buffer
 ///   or texture over its bytes changes none of its texels, or not all, and its writes change
 ///   none of those resources' bytes. Announced inside the heap's creator of the texture, which
 ///   dies at its selector;
-/// - `HeapTextureCompressed`: on a driver whose compressed images may keep their texels apart
-///   from the memory they are bound to (ANV's `CompressedImagesHideAliasedWrites`), under the
-///   runtime's `HeapCompressionPolicy::Compressed`, a heap's colour texture that Metal keeps
-///   losslessly compressed too (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView`
-///   or `ShaderAtomic` usage, 16 texels or more a side), made as the driver's compressed image: a
-///   write through a buffer or texture over its bytes may leave its texels as they were, where
-///   Metal's texture reads opaque magenta (`0xffff00ff`) in every texel of drawn content the write
-///   covered and the written bytes where it held only a clear (an M3 Max), and its own writes may
-///   show in those bytes compressed otherwise than Metal's. Every device here takes
-///   `HeapCompressionPolicy::Uncompressed` ([`crate::platform`]'s `exact_policy`), which makes its
-///   image one the driver keeps uncompressed in the heap's bytes, where the device can (else
-///   `HeapTextureHidesAliasedWrites`), so the runtime announces it for none of them. No device on
-///   Metal announces it, and a native device does not relay it: a texture's layout is neither
-///   maths nor sampling. Announced inside the heap's creator of the texture, which would die at
-///   its selector;
 /// - a resource a function may reach through its ID or address without the command naming it,
 ///   which the read would find other than Metal's, each announced where the reach becomes
 ///   possible, not where a function reads it, inside the call that makes it possible, which
@@ -593,7 +548,8 @@ pub fn created_or_decided<T>(
 ///     commit;
 ///   - `DetachedStorageKeepsWrites`: a storage texture over detached bytes a committed command
 ///     buffer's heap set reaches, whose unnamed storage reads read what an earlier such write
-///     left, where Metal drops those writes and reads zero. Announced at `commit`;
+///     left, where Metal drops those writes and reads zero. Announced at `commit`; no call of
+///     this platform detaches bytes, so the runtime announces it for none;
 /// - what a pass or a copy leaves in its texture otherwise than Metal, each announced inside the
 ///   call that encodes it, which dies at its selector:
 ///   - `MixedDepthStencilResolve`: a pass that stores and resolves one texture's depth beside
@@ -637,6 +593,12 @@ pub fn created_or_decided<T>(
 ///   32, where the device filters with its largest (16), so a footprint more than 16 times as
 ///   long as it is wide reads a coarser level. Announced at the state's creation, which dies at
 ///   its selector;
+/// - `CappedLodBias`: a sampler state's `lodBias` on a device that presents an Intel or AMD Mac,
+///   past the device's `maxSamplerLodBias`, a NaN, or any bias on a device that withholds
+///   `samplerMipLodBias`, which the device samples with the bias within its limit (none for a NaN
+///   or where withheld), where the Mac's GPU adds the whole bias to each sample's level of detail
+///   (docs/graphics-kext/dgpu-oracle.md, Q14), so a sample can read another level. Announced at
+///   the state's creation, which dies at its selector;
 /// - `NotMipmappedAnisotropicSampler` and the note `NotMipmappedAnisotropicFilter`: on a device
 ///   that samples through Metal's own sampler (MoltenVK on Apple's GPU), a sampler state, or a
 ///   constexpr sampler a sample at an implicit level or with gradients goes through, with
@@ -742,6 +704,13 @@ pub fn created_or_decided<T>(
 ///   other blends are Metal's, exact).
 ///   Announced at each draw that binds the pipeline's variant, inside its call, which dies at its
 ///   selector;
+/// - the note `UnorderedFetchWithinDraw`: on a device with neither rasterization-order colour
+///   attachment access nor the pixel interlock (the runtime names Honeykrisp on Apple's M2 Pro),
+///   a fragment function's read of a colour attachment, through its input attachment ordered
+///   after the draws before by a barrier between them but not after an overlapping earlier
+///   fragment of its own draw, which Metal orders in primitive order: such a fragment may read
+///   the texel from before that fragment wrote it. Announced at the state's creation, which dies
+///   at its selector;
 /// - the note `LinkedSamplerNumbering`: the constexpr sampler IDs of a stage that links visible
 ///   functions, where the runtime does not number them as Metal does. It notes a stage that
 ///   links two or more with constexpr samplers, whose order Metal itself does not decide (two
@@ -750,10 +719,9 @@ pub fn created_or_decided<T>(
 ///   can hold whose samplers the runtime cannot read, which Metal numbers and the runtime does
 ///   not, so every sampler state made while the state lives may answer another `gpuResourceID`.
 ///   One linked function alone, of `functions` or `privateFunctions`, called or not, is
-///   numbered as Metal numbers it and noted for nothing. One note
-///   covers them all, so it dies. No guest form here links a function: no serialized key
-///   carries one, and a dynamic library's import is refused. Announced at each draw or dispatch
-///   that binds the pipeline's variant, inside its call, which dies at its selector;
+///   numbered as Metal numbers it and noted for nothing. One note covers them all, so it dies. A
+///   dynamic library's import is refused. Announced at each draw or dispatch that binds the
+///   pipeline's variant, inside its call, which dies at its selector;
 /// - the note `PixelSamplerScaling`: a stage that samples through a pixel-coordinate sampler where
 ///   none of the runtime's exact paths reaches and the device filters a coordinate the runtime
 ///   scaled: a linear sample or gather through a sampler state bound at a slot, a linear sample of
@@ -799,7 +767,7 @@ pub fn created_or_decided<T>(
 ///   load or a blit reads only its region; a copy of one aspect of a `Depth32Float_Stencil8`
 ///   texture writes that aspect alone. So a guest that copies a buffer into a new multisampled
 ///   `Depth32Float` target and reads it with no clearing pass between reads Metal's texels
-///   (`encode_blit`'s `multisampled_depth_and_stencil_buffer_copies_are_the_metal_platforms`). A
+///   (`encode_blit`'s `multisampled_depth_and_stencil_buffer_copies_are_metals`). A
 ///   pass's clear counts as a write, as the pass ends, only where it reaches the texture: an
 ///   attachment the pass renders itself, or one it renders through a stand-in or a separate
 ///   depth or stencil scratch that it stores. A new separate depth or stencil texture, or a
@@ -826,23 +794,26 @@ pub fn created_or_decided<T>(
 ///   the hardware forces the difference, and the blend is not in the function's own arithmetic,
 ///   whose fast-math rewrites `FastMathRewrites` covers. It dies on every device. Announced at
 ///   each draw that binds the state's variant, inside its call, which dies at its selector;
-/// - `PrivateResourceOption`: a resource made with `MTLResourceOptions` bit 24, a private option
-///   Metal takes, which the runtime makes as without it: on Metal a no-copy buffer made with it
-///   keeps the GPU's writes from the CPU (the runtime's probe `nc_bit24`), where the runtime's
-///   reach the CPU. On macOS the runtime imports a no-copy buffer's or heap's pages of the option
-///   through a read-only view of them, which drops the GPU's writes as Metal's does, and
-///   announces nothing there; it announces a heap of its own memory, an indirect command buffer
-///   and, off macOS, the no-copy ones. A device can hold the GPU's writes in memory of its own,
-///   apart from the guest's pages, so nothing in the hardware forces the difference, and it dies
-///   on every device. Announced where the resource is made, inside the creator, which dies at its
-///   selector;
+/// - `PrivateResourceOption`: a heap of the runtime's own memory (a guest's `Private` heap) or an
+///   indirect command buffer made with `MTLResourceOptions` bit 24, a private option Metal takes,
+///   which the runtime makes as without it, the GPU's writes reaching its memory. The M3 Max keeps
+///   the GPU's writes from such memory, a kernel's records of such a buffer among them, and faults
+///   a render pass's store-out into it; the Radeon Pro 5300M and the UHD Graphics 630 write it as
+///   without the bit, a `Private` heap's textures and a kernel's records included
+///   (docs/graphics-kext/dgpu-oracle.md Q38 and Q44). A no-copy buffer or heap of the bit
+///   announces nothing: the runtime imports its pages through a read-only view of them on macOS
+///   and over a copy of them off it, each dropping the GPU's writes as the M3 Max's does. A device
+///   can hold the GPU's writes in memory of its own, so nothing in the hardware forces the
+///   difference, and it dies on every device. Announced where the resource is made, inside the
+///   creator, which dies at its selector;
 /// - `StaleDetachedReach`: a command buffer that bound a heap set, whose commands may reach a
 ///   texture through its ID without naming it, submitted while the texture's bytes were
 ///   detached after a submitted command buffer made them resident: a read that does not name
 ///   it reads zeros, where Metal's reads the pages the guest gave back. Those pages hold what
 ///   they held until the guest writes them again, so Metal's answer is one value, and no fact of
 ///   the hardware forces the difference, so it dies on every device. Announced once per device,
-///   at the first such submission, inside its call, which dies at its selector;
+///   at the first such submission, inside its call, which dies at its selector; no call of this
+///   platform detaches bytes, so the runtime announces it for none;
 /// - `CrossClassTextureNeutral`: a draw or dispatch binding, at a texture slot declared of
 ///   another numeric class (`float` or `half`, `int`, `uint`) than its texture's format, one the
 ///   runtime has no exact answer for (a storage slot, a texture buffer, a multisampled, sparse,
@@ -888,7 +859,11 @@ pub fn created_or_decided<T>(
 ///   format on one without ETC2, which the runtime holds in a carrier, its reads, samples and
 ///   gathers reading a decoded twin of compact codes: an ASTC channel the 8-bit code nearest
 ///   Metal's 12-bit value, at most 1/510 off it, an EAC 11-bit one the 16-bit normalized code
-///   nearest Metal's value, at most half a 16-bit step off it. Apple's GPUs have the formats, so no device on
+///   nearest Metal's value, at most half a 16-bit step off it; and on MoltenVK a `GBGR422` or
+///   `BGRG422` texture over a surface plane or a buffer, which takes the device's own Y'CbCr
+///   conversion, within a code of Metal's decode (metal2vulkan's measurement on the M3 Max),
+///   announced at the first dispatch that reads it, where other devices decode the pairs by
+///   Metal's rules. Apple's GPUs have the formats, so no device on
 ///   Metal announces it; a native device relays it, the runtime's default sampling off Apple's
 ///   GPUs, as the class of a native device's own maths and sampling
 ///   ([`native::NATIVE_RELAYED`]). Announced where the texture is made, inside its creator's
@@ -917,8 +892,8 @@ pub fn created_or_decided<T>(
 ///   keep-alive: with one, it runs the deallocator at the release, as Metal's, and the import
 ///   keeps the keep-alive, which keeps the pages mapped, until it is freed, wherever they are held
 ///   (an image over them holding their import, a live buffers' table that lists them, MoltenVK's
-///   freed memory waiting for the batches in flight), and announces nothing. Every no-copy buffer,
-///   heap and rebind this platform makes gives one ([`crate::gpu::backing::keep_alive`]), so the
+///   freed memory waiting for the batches in flight), and announces nothing. Every no-copy buffer
+///   and heap this platform makes gives one ([`crate::gpu::backing::keep_alive`]), so the
 ///   runtime announces it for none of them. Announced once per device, on the thread that lets go
 ///   of the buffer, inside its release here or on one of the runtime's as a command buffer
 ///   completes, outside every call here: it dies where it is announced;
@@ -937,22 +912,21 @@ pub fn created_or_decided<T>(
 ///   the hardware forces it, so a native device does not relay it. Announced once per device
 ///   whatever `announce_each` asks, on the runtime's scheduler thread, outside every call here: it
 ///   would die where it is announced;
-/// - `DrawDroppedStillMaking` and `DispatchDroppedStillMaking`: under the runtime's
-///   `PipelineWaitPolicy::Bounded`, its default, a draw, compute dispatch or tile dispatch whose
-///   `VkPipeline` the driver was still making 4.5 s after its command buffer's commit ran nothing,
-///   the command buffer running on, where Metal's draw renders and its dispatch writes: a cold
-///   compile (seconds on MoltenVK with a cold Metal compiler service) then costs that command's
-///   work, not a stall past the guest's 10 s check of its FIFO. A strict process takes
-///   `PipelineWaitPolicy::Exact` ([`crate::platform`]'s device options), which waits until the
-///   pipeline is made, so a strict run, this crate's tests among them, never dies of a slow
-///   compile. Announced where the command is recorded: in the commit, or the command buffer's
-///   host step;
 /// - `DrawDroppedUnmade`: a draw whose `VkPipeline` the driver failed to make after the draw
 ///   returned ran nothing, the command buffer running on, where Metal's draw renders, and Metal
 ///   fails the state's creation instead. Announced where the draw is recorded: in the commit, or
 ///   the command buffer's host step;
-/// - six kinds no device on Metal announces, each dying where a device announces it, at its
+/// - seven kinds no device on Metal announces, each dying where a device announces it, at its
 ///   selector, as no fact of the hardware forces it:
+///   - `VisibilityPastEarlyMask`: a draw under a visibility result (`Counting` or `Boolean`)
+///     whose fragment function declares `[[early_fragment_tests]]` and writes its sample mask,
+///     on a device that does not state `earlyFragmentMultisampleCoverageAfterSampleCounting`
+///     (the runtime's measurement: ANV on the Iris Xe), where Vulkan lets the mask come before
+///     sample counting: the result may leave out the samples the mask drops, which Metal counts
+///     under early tests, a `Counting` one counting fewer and a `Boolean` one reading 0 where
+///     Metal's passed. A second draw of each counted draw without the mask and its writes would
+///     count as Metal does, which the runtime has not built. Announced at the draw, inside its
+///     call;
 ///   - `VisibilityCountPerColor`: a draw counted by a `Counting` visibility result whose
 ///     fragment variant writes more than one colour attachment, on a device whose driver counts
 ///     each sample once per colour output (the runtime's `OcclusionCountPerColorOutput`: ANV),
@@ -1174,7 +1148,10 @@ pub fn created_or_decided<T>(
 ///   and `DevicePackConversion`, its `air.pack` and `air.unpack` of a normalized format), its
 ///   rounding of a `half` result (`NativeHalfConversion` and `NativeHalfQuantize`), its sampling
 ///   (`DeviceSampling` and `DeviceTexelConversion`), its vertex input's conversion of a normalized
-///   attribute (`DeviceVertexConversion`) and its alpha to coverage (`DeviceAlphaCoverage`). On a
+///   attribute (`DeviceVertexConversion`), its alpha to coverage (`DeviceAlphaCoverage`) and its
+///   logic operation on a 10-bit or signed normalized attachment's own codes
+///   (`NativeLogicOperation`), and its own 8-bit float, which a tensor's 8-bit float element widens
+///   through (`NativeFloat8`). On a
 ///   device that runs on Metal (MoltenVK) the runtime answers most as Metal's own functions,
 ///   sampler and conversions, which announce nothing there, and one announced there dies (its
 ///   filter of a two-plane YCbCr texture announces `YCbCrFilterNotExact` instead). The runtime
@@ -1238,6 +1215,13 @@ pub fn created_or_decided<T>(
 ///   own. Such draws died before the runtime drew triangles' edges as bands (`DeviceWideLines` or
 ///   `LinesAtNearestWidth`), so placing it here ends no run that went on. Announced at each such
 ///   draw, inside its call, which dies at its selector;
+/// - `TrianglePointSize`: a draw of triangles in fill mode `Points` (`setTriangleFillMode:` 2,
+///   which Apple's GL renderer sends for `glPolygonMode(GL_POINT)` on the Intel and Apple GPUs'
+///   settings) under a render pipeline state whose vertex function writes `[[point_size]]`, whose
+///   vertices the device draws as points of the size the function writes, where Metal draws one
+///   pixel whatever it writes (measured on an Apple M3 Max). A function that writes none draws
+///   points of one pixel and announces nothing. Announced at each such draw, inside its call,
+///   which dies at its selector, as the device's own wide lines (`DeviceWideLines`) do;
 /// - `DeviceLineTies`: a draw of lines, or of a triangle's edges in fill mode `Lines`, that the
 ///   device's own lines draw at width 1 (Metal's default width, or the nearest width a device
 ///   without `wideLines` draws), on a driver not measured to break a tie as Metal does (the
@@ -1273,6 +1257,13 @@ pub fn created_or_decided<T>(
 ///   of at least sixteenths and clamps to the device's range, where Metal's grid and range are not
 ///   measured. Such reads died before the runtime lowered Metal's `interpolant` inputs, so placing
 ///   it here ends no run that went on. Announced at each draw that binds such a pipeline;
+/// - the note `ExtrapolatedInterpolation`: a fragment function's perspective interpolant read at
+///   a sample or an offset on a device whose driver extrapolates it from the pixel centre along
+///   the quad's coarse derivatives (the runtime's `PerspectiveReadsExtrapolated`: RADV, measured
+///   on the Radeon 780M within 0.005 of that form), where Metal's read is not extrapolated.
+///   Vulkan states no precision for interpolation. Before the runtime named it, such reads went
+///   on unannounced, so by default it ends no run that went on. Announced at each draw that binds
+///   such a pipeline;
 /// - `PredicationWordPastBuffer`: a command predication record of the runtime's whose condition
 ///   word lies past its buffer's end, past the 256 bytes Metal rounds a lone buffer up to, or past
 ///   the end of the heap the buffer lies in, which reads zero where Metal reads what its own
@@ -1284,19 +1275,47 @@ pub fn created_or_decided<T>(
 ///   them, and whose later levels lie apart from the heap's bytes, a 1D array's GPU reads reading
 ///   each texel, where Metal's paths address those texels at bytes that differ by path. Announced
 ///   inside the heap's creator of the texture, which dies at its selector;
-/// - `ReadOnlyPagesWritten`: a no-copy buffer, heap or rebind over pages the process maps
-///   read-only, imported as dma-bufs of its pages, whose GPU writes reach the pages, where after
-///   Metal's the CPU reads them as they were. Announced inside the call that makes it, which dies
-///   at its selector. This platform gives the runtime a writable twin of read-only pages on Linux
-///   (`crate::os`'s import), whose writes die where they are encoded, so no call here reaches it;
-/// - `CopiedHostPages`: a no-copy buffer, heap or rebind made over a copy of the guest's pages in
+/// - `CopiedHostPages`: a no-copy buffer or heap made over a copy of the guest's pages in
 ///   memory of the device's own, as their import failed (out of memory, or a driver out of the
 ///   mappings the host's kernel allows), or the views' gate refused it on Linux, where mapping the
 ///   pages from their files would have run the views of memory within the headroom of their
-///   budget of kernel mappings (`crate::os`'s import gate), which each commit fills from the
-///   pages and each completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU
-///   write the CPU reads before the batch completes, is not seen, where Metal's GPU uses the pages
-///   themselves. Announced inside the call that makes it, which dies at its selector.
+///   budget of kernel mappings, or the pages are a guest's read-only object's (a heap or no-copy
+///   buffer made with `MTLResourceOptions` bit 24, pages mapped
+///   read-only), whose copy drops the GPU's writes, as Metal's GPU drops them (`crate::os`'s
+///   import gate, `crate::gpu::writes`), which each commit fills from the pages and each
+///   completion writes back: a CPU write the GPU reads mid-command-buffer, or a GPU write the CPU
+///   reads before the batch completes, is not seen, where Metal's GPU uses the pages themselves.
+///   Announced inside the call that makes it, which dies at its selector;
+/// - `SurfaceTexelsTail`: a colour texture over a plane of a surface with planes whose texels run
+///   past the buffer standing for the surface, or a colour 2D array of more than one slice over
+///   such a plane, whose texels past the surface (the array's slices past its first) lie in a
+///   tail of the texture's own, zero when made, which every path reads and writes alike, where
+///   Metal lays them out in no one place: its blits read zeros there, its kernels zeros and,
+///   32 KiB past the plane, the plane's rows again, and its writes change no byte of the surface
+///   (the runtime's `probes/surface_texture_envelope.m` on the M3 Max). Announced inside the
+///   creator of the texture over the surface, which dies at its selector;
+/// - `SurfaceTexelsApart`: a colour 2D texture of more than one level, a 3D texture or a 2D
+///   multisample one over a plane of a surface with planes, made in memory of its own, zero when
+///   made, which no byte of the surface reaches, where Metal lays out its texels, its first
+///   level's and slice's among them, in no one place on the M3 Max, and the x86 Macs keep its
+///   first level and slice over the plane. Announced inside the creator of the texture over the
+///   surface, which dies at its selector;
+/// - `HeapOnePlaneLayout`: a heap's texture of one of the one-plane YCbCr formats the runtime
+///   holds for copies alone, a 2D texture or array of more than one row whose row is under 16
+///   bytes, laid one packed row apart where Metal's blits lay its rows 16 bytes apart, or a
+///   mipmapped or 3D texture, laid apart from the heap's bytes where Metal lays its texels at
+///   bytes that differ by path: its size answers are Metal's and its copies read what they
+///   wrote, but a buffer over the heap meets its texels at other bytes than on Metal. Announced
+///   inside the heap's creator of the texture, which dies at its selector;
+/// - `InterlockedBufferOrder`: a render pipeline state whose fragment function writes a storage
+///   buffer of set 0 inside its interlock (a raster order group's buffer, or one a function that
+///   reads its colour attachment writes), on a driver that orders such a buffer between
+///   overlapping fragments only where set 0 is pushed (MoltenVK, the runtime's
+///   `InterlockedBoundBuffersUnordered`), where its set 0 is bound instead (the device has no
+///   push command, set 0 is no push layout's, or a stage reads a buffer's length): a fragment may
+///   read the buffer as it was before an earlier overlapping fragment of the draw wrote it, where
+///   Metal orders it after every earlier fragment of the pixel. Announced at each draw that binds
+///   the pipeline's variant, inside its call, which dies at its selector.
 ///
 /// Every kind not listed here or in [`HEARD`] is relayed, those the guest sees included, each for
 /// one of the reasons the module's docs give: logged once per device and not dying. Each relayed
@@ -1305,7 +1324,7 @@ pub fn created_or_decided<T>(
 /// is placed; a kind whose answer the runtime states is Metal's (`rt::Exactness::Exact`: a
 /// performance or validity kind) or one of Metal's where Metal's own is not one value
 /// (`rt::Exactness::OneOfMetals`) is placed by that statement.
-pub const DIES: [rt::Degradation; 141] = [
+pub const DIES: [rt::Degradation; 148] = [
     rt::Degradation::ReleasedCommandState,
     rt::Degradation::TwoPlaneTextureCopy,
     rt::Degradation::TwoPlaneBufferBlit,
@@ -1331,6 +1350,7 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::ViewBaseTexelOffset,
     rt::Degradation::DeviceInterpolation,
     rt::Degradation::DeviceInterpolationOffset,
+    rt::Degradation::ExtrapolatedInterpolation,
     rt::Degradation::QuadsSplitByClipping,
     rt::Degradation::VertexSimdgroupGrouping,
     rt::Degradation::FragmentSimdgroupGrouping,
@@ -1348,7 +1368,6 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::AttachmentReadInPlace,
     rt::Degradation::HeapDepthStencilApart,
     rt::Degradation::HeapTextureHidesAliasedWrites,
-    rt::Degradation::HeapTextureCompressed,
     rt::Degradation::UnlistedArgumentSampler,
     rt::Degradation::UnreadableHandleTexture,
     rt::Degradation::UnnamedTextureUnviewable,
@@ -1361,6 +1380,7 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::SharedExponentKept,
     rt::Degradation::DeviceRoundedResolve,
     rt::Degradation::CappedAnisotropy,
+    rt::Degradation::CappedLodBias,
     rt::Degradation::NotMipmappedAnisotropicSampler,
     rt::Degradation::NotMipmappedAnisotropicFilter,
     rt::Degradation::CombinedArchiveStages,
@@ -1392,9 +1412,8 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::HeapTextureLargerThanMetal,
     rt::Degradation::HostDeallocatorDelayed,
     rt::Degradation::GroupedCompletion,
-    rt::Degradation::DrawDroppedStillMaking,
-    rt::Degradation::DispatchDroppedStillMaking,
     rt::Degradation::DrawDroppedUnmade,
+    rt::Degradation::VisibilityPastEarlyMask,
     rt::Degradation::VisibilityCountPerColor,
     rt::Degradation::ColorAttachmentGroups,
     rt::Degradation::DevicePointSize,
@@ -1434,19 +1453,26 @@ pub const DIES: [rt::Degradation; 141] = [
     rt::Degradation::DevicePackConversion,
     rt::Degradation::DeviceVertexConversion,
     rt::Degradation::DeviceAlphaCoverage,
+    rt::Degradation::NativeLogicOperation,
+    rt::Degradation::NativeFloat8,
     rt::Degradation::ProvokingVertexLines,
     rt::Degradation::ProvokingVertexUnmatched,
     rt::Degradation::DeviceWideLines,
     rt::Degradation::LinesAtNearestWidth,
     rt::Degradation::WideEdgeDepthBias,
+    rt::Degradation::TrianglePointSize,
     rt::Degradation::DeviceLineTies,
     rt::Degradation::DeviceSubpixelSnap,
     rt::Degradation::PredicationWordPastBuffer,
     rt::Degradation::HeapTwoPlaneLayout,
-    rt::Degradation::ReadOnlyPagesWritten,
     rt::Degradation::CopiedHostPages,
+    rt::Degradation::SurfaceTexelsTail,
+    rt::Degradation::SurfaceTexelsApart,
+    rt::Degradation::HeapOnePlaneLayout,
     rt::Degradation::CoverageReadsRoundedAlpha,
     rt::Degradation::UnmeasuredFetchBlend,
+    rt::Degradation::UnorderedFetchWithinDraw,
+    rt::Degradation::InterlockedBufferOrder,
 ];
 
 /// The degradations a creator here learns of, announced at every occurrence too, which do not
@@ -1458,7 +1484,8 @@ pub const DIES: [rt::Degradation; 141] = [
 ///   `HeapTwoPlaneLayout` instead, of [`DIES`]), announced on the caller's thread inside the
 ///   placement's call, which dies where a buffer or texture of the heap that lives
 ///   shares a byte with it: the heap's cover, the buffer over all of it core makes with each
-///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]);
+///   heap, included, so in every heap core makes ([`crate::gpu::resource::Placements`]). Relayed
+///   the first time alone ([`RELAYED_ONCE`]);
 /// - `OptimizedDepthStencilTexture`, a depth or stencil texture without
 ///   `allowGPUOptimizedContents`, whose layout MoltenVK keeps GPU-optimized: the runtime sizes it
 ///   as Metal's texture with the property on, larger than Metal's with it off (16512 bytes for a 64
@@ -1475,9 +1502,8 @@ pub const DIES: [rt::Degradation; 141] = [
 ///   ([`crate::gpu::device`]). A placement that depends on the runtime's size dies: a heap's
 ///   placement that hears it dies where it answers nil inside the heap and Metal's smaller size
 ///   fits there or is not modelled (where Metal's does not fit either, the nil is Metal's),
-///   where it is made but Metal answers nil or a size the runtime's falls short of, and in a heap
-///   over no address ranges at every shape (`crate::gpu::resource::HeapObject`'s placement).
-///   Elsewhere the heap keeps the texture apart: a placement over a byte of it dies while it lives,
+///   where it is made but Metal answers nil or a size the runtime's falls short of
+///   (`crate::gpu::resource::HeapObject`'s placement). The heap keeps the texture apart: a placement over a byte of it dies while it lives,
 ///   and so does such a texture placed over a byte of a buffer or texture that lives, or while its
 ///   heap's cover lives, the buffer over all of the heap's bytes core makes with each heap, whose
 ///   bytes the guest reads with no call to die at (`crate::gpu::resource::Placements`). A heap's
@@ -1503,19 +1529,12 @@ pub const DIES: [rt::Degradation; 141] = [
 ///   driver's layout (any colour image on a driver other than MoltenVK, a depth or stencil image
 ///   the runtime does not tile), a shadow of the bytes in rows, a multisample texture (but a colour
 ///   one Metal keeps uncompressed on MoltenVK, whose multisample colour images the runtime measured
-///   lying as Metal's heap textures), or a layout not measured. In a heap over no address ranges,
-///   core's legacy heap, whose bytes core copies to and from the guest's pages, it is relayed alone
-///   ([`crate::gpu::resource::Placements`]). Its reads, writes and copies are Metal's, but its
-///   bytes in the heap are the runtime's layout, where Metal's are its tiles, so a buffer or
-///   texture over them would meet other bytes than on Metal. Announced at each such texture, inside
-///   `newTextureWithDescriptor:offset:`, which hears it. Over the guest's pages the heap keeps it
-///   apart, as an optimized one: a buffer or texture placed over a byte of it while it lives dies
-///   at its placement, and so does such a texture placed over a byte of a buffer or texture that
-///   lives, or while its heap's cover lives, the buffer over all of the heap's bytes core makes
-///   with each heap, so in every heap core makes: the cover's bytes and the guest's pages under
-///   them would hold the runtime's layout where Metal's hold its tiles, which the guest reads with
-///   no call to die at (`crate::gpu::resource::Placements`). Relayed the first time alone
-///   ([`RELAYED_ONCE`]), where nothing shares its bytes;
+///   lying as Metal's heap textures), or a layout not measured. Its reads, writes and copies are
+///   Metal's, but its bytes in the heap are the runtime's layout, where Metal's are its tiles, so a
+///   buffer or texture over them meets other bytes than on Metal. Announced at each such texture,
+///   inside `newTextureWithDescriptor:offset:`, which hears it. Every heap keeps it among its
+///   other resources, as Metal's (`crate::gpu::resource::Placements`). Relayed the first time
+///   alone ([`RELAYED_ONCE`]);
 /// - `HeapTextureLosslessLayout`, a texture in a heap over the guest's pages that Metal keeps
 ///   losslessly compressed, whose bytes on Metal are no layout of its texels: a single-sample one
 ///   laid out in its uncompressed tiles, which guests make by the tens of thousands a boot, and a
@@ -1523,17 +1542,13 @@ pub const DIES: [rt::Degradation; 141] = [
 ///   move them to and from a buffer, its image in memory of its own, the heap's bytes keeping what
 ///   they held. The runtime announces it too of a depth or stencil texture it lays out in Metal's
 ///   uncompressed tiles in any heap on MoltenVK, and of such a texture in a heap over the device's
-///   memory, its image there of the runtime's usage, which need not be compressed as Metal's: in
-///   a heap over no address ranges, core's legacy heap, it is relayed alone
-///   ([`crate::gpu::resource::Placements`]). Its reads, writes, resolves and copies are Metal's:
-///   only another resource over its bytes meets other bytes. Announced at each such texture,
-///   inside `newTextureWithDescriptor:offset:`, which hears it. A single-sample one is made and the
-///   notice relayed, the first time alone ([`RELAYED_ONCE`]), pending a decision. A multisample
-///   one over the guest's pages is made too, and relayed as [`Inexact::HeapLayout`] (in strict
-///   mode it dies there, named): where its image lies in memory of its own, a buffer or texture
-///   over its bytes, which on Metal sees and changes them, would neither see nor change it. The
-///   notice does not tell that one from one whose samples lie in the heap's bytes, which a
-///   buffer over them meets uncompressed, as a single-sample one's texels: both relay so;
+///   memory, its image there of the runtime's usage, which need not be compressed as Metal's. Its
+///   reads, writes, resolves and copies are Metal's: only another resource over its bytes meets
+///   other bytes. Announced at each such texture, inside `newTextureWithDescriptor:offset:`, which
+///   hears it. Each is made and the notice relayed, the first time alone ([`RELAYED_ONCE`]),
+///   pending a decision, in every heap ([`crate::gpu::resource::Placements`]): a multisample one
+///   whose image lies in memory of its own among them, which a buffer or texture over its bytes,
+///   on Metal seeing and changing them, neither sees nor changes;
 /// - `UnmeasuredHeapTextureSize`, a texture whose layout in Metal's heaps the runtime does not
 ///   model, whose size and alignment it answers as its device's image's, larger or smaller than
 ///   Metal's: the runtime names 8 samples, whose layout it does not measure, but no texture of 8
@@ -1580,31 +1595,39 @@ pub const HEARD: [rt::Degradation; 7] = [
     rt::Degradation::HalfOutputPrecision,
 ];
 
-/// The kinds of [`HEARD`] the runtime would announce once per device but for `announce_each`,
-/// which asks for each occurrence only so a call here can hear it: relayed the first time alone,
-/// as without a sink, so a guest's every pass does not log one ([`notice`]).
-const RELAYED_ONCE: [rt::Degradation; 6] = [
-    rt::Degradation::OptimizedDepthStencilTexture,
-    rt::Degradation::RasterizationRateMap,
-    rt::Degradation::HeapTextureUntiledLayout,
-    rt::Degradation::HeapTextureLosslessLayout,
-    rt::Degradation::UnmeasuredHeapTextureSize,
-    rt::Degradation::HalfOutputPrecision,
-];
+/// The kinds the runtime would announce once per device but for `announce_each`, which asks for
+/// each occurrence only so a call here can hear it: every kind of [`HEARD`], relayed the first
+/// time alone, as without a sink, so a guest's every pass or texture does not log one, and
+/// counted ([`notice`], [`degradation_counts`]).
+const RELAYED_ONCE: [rt::Degradation; HEARD.len()] = HEARD;
 
-/// The kinds of [`RELAYED_ONCE`] this process relayed, a bit each at the kind's place there: a
-/// notice of one is announced at every occurrence (a heap's texture, a draw's bind), on whatever
-/// thread meets it, so no lock is taken for it.
-static RELAYED_KINDS: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
-const _: () = assert!(RELAYED_ONCE.len() <= 8, "a bit of RELAYED_KINDS each");
+/// How many notices of each kind of [`RELAYED_ONCE`] this process had, at the kind's place there:
+/// a notice of one is announced at every occurrence (a heap's texture, a draw's bind), on
+/// whatever thread meets it, so no lock is taken for it.
+static RELAYED_ONCE_COUNTS: [std::sync::atomic::AtomicU64; RELAYED_ONCE.len()] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; RELAYED_ONCE.len()];
 
 /// Whether `kind` is of [`RELAYED_ONCE`] and this is the process's first notice of it, which is
-/// relayed ([`RELAYED_KINDS`]).
+/// relayed, counting it ([`RELAYED_ONCE_COUNTS`]).
 fn first_relayed_once(kind: rt::Degradation) -> Option<bool> {
     use std::sync::atomic::Ordering;
     let at = RELAYED_ONCE.iter().position(|&k| k == kind)?;
-    let bit = 1u8 << at;
-    Some(RELAYED_KINDS.fetch_or(bit, Ordering::Relaxed) & bit == 0)
+    Some(RELAYED_ONCE_COUNTS[at].fetch_add(1, Ordering::Relaxed) == 0)
+}
+
+/// The kinds neither of [`DIES`] nor of [`HEARD`] the runtime announced in this process, each
+/// with how many times: once per device, as the runtime announces them, but in the modes that
+/// announce each occurrence ([`notice`]).
+static ANNOUNCED: crate::core::sync::Mutex<Vec<(rt::Degradation, u64)>> =
+    crate::core::sync::Mutex::new(Vec::new());
+
+/// Counts a notice of `kind`, neither of [`DIES`] nor of [`HEARD`] ([`ANNOUNCED`]).
+fn count_announced(kind: rt::Degradation) {
+    let mut announced = ANNOUNCED.lock();
+    match announced.iter_mut().find(|(k, _)| *k == kind) {
+        Some((_, n)) => *n += 1,
+        None => announced.push((kind, 1)),
+    }
 }
 
 /// What every call here reads of this thread on its way in and out ([`inside`]): one lookup of
@@ -1645,6 +1668,7 @@ fn keep_pending(notice: &rt::DegradeNotice) {
 }
 
 /// The notice this thread keeps for a call here to die at, taken: `None` where it keeps none.
+#[inline]
 fn take_pending(calls: &Calls) -> Option<rt::DegradeNotice> {
     if !calls.pending.replace(false) {
         return None;
@@ -1660,11 +1684,16 @@ fn depth() -> u32 {
 /// Whether this process dies at a difference from Metal's answer it could go on past: a
 /// degradation of [`DIES`] or one of [`Inexact`] (the module's docs). `REIMS_VGPU_STRICT` set to
 /// `1`, read once per process, turns it on; by default the process relays them and goes on. A
-/// test of this crate runs strict, but where the tests' `relaxed` runs it on its thread.
+/// test of this crate runs strict, but where the tests' `relaxed` runs it on its thread, or their
+/// `relaxed_process` on every thread.
 pub fn strict() -> bool {
     #[cfg(test)]
     if let Some(strict) = TEST_STRICT.with(Cell::get) {
         return strict;
+    }
+    #[cfg(test)]
+    if TEST_RELAXED_PROCESS.load(std::sync::atomic::Ordering::Acquire) {
+        return false;
     }
     strict_process()
 }
@@ -1696,6 +1725,33 @@ pub(crate) fn relaxed<T>(call: impl FnOnce() -> T) -> T {
         }
     }
     let _restore = Restore(TEST_STRICT.with(|s| s.replace(Some(false))));
+    call()
+}
+
+/// Whether every thread of the process runs under the default, not strict, but where a thread's
+/// own strictness says otherwise ([`relaxed_process`]).
+#[cfg(test)]
+static TEST_RELAXED_PROCESS: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Runs `call` with the notices of every thread of the process under the default, not strict:
+/// [`relaxed`] for a test of what the process does without `REIMS_VGPU_STRICT` where the runtime
+/// announces on a thread of its own, outside every call here (a host step's, on its scheduler
+/// thread). A thread that runs [`relaxed`] or a strictness of its own keeps it. Process-wide, so
+/// sound only where the process runs one test: nextest runs each test in a process of its own
+/// (which `gpu::device::tests::metal_tests` and `core::trace` rely on too), where no other test's
+/// notice meets the default meanwhile.
+#[cfg(test)]
+pub(crate) fn relaxed_process<T>(call: impl FnOnce() -> T) -> T {
+    use std::sync::atomic::Ordering;
+    /// Puts back the process's strictness on drop, an unwinding call's included.
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            TEST_RELAXED_PROCESS.store(self.0, Ordering::Release);
+        }
+    }
+    let _restore = Restore(TEST_RELAXED_PROCESS.swap(true, Ordering::AcqRel));
     call()
 }
 
@@ -1743,11 +1799,11 @@ pub fn hearing<T>(call: impl FnOnce() -> T) -> (T, Vec<rt::Degradation>) {
 }
 
 /// Runs `call`, a probe of the device's own outside any guest's work (`crate::os`'s
-/// `learn_view_imports`), with what the runtime announces on this thread inside it heard by no
-/// one: neither relayed, counted, kept nor dying. A kind the runtime announces once per device
-/// is announced at every occurrence where a probe may meet it ([`crate::platform`]'s
-/// `announced_each`), so that the probe's takes no later occurrence's line.
-#[cfg(target_os = "linux")]
+/// `learn_view_imports`, on Linux), or a device's own made and dropped for one
+/// (`crate::device_choice`'s timing), with what the runtime announces on this thread inside it
+/// heard by no one: neither relayed, counted, kept nor dying. A kind the runtime announces once
+/// per device is announced at every occurrence where a probe of the process's device may meet it
+/// ([`crate::platform`]'s `announced_each`), so that the probe's takes no later occurrence's line.
 pub(crate) fn unheard<T>(call: impl FnOnce() -> T) -> T {
     /// Puts back the outer state on drop, an unwinding call's included.
     struct Restore(bool);
@@ -1774,13 +1830,15 @@ fn inside<T>(sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
 /// [`inside`], of this thread's `calls`.
 #[inline]
 fn inside_of<T>(calls: &Calls, sel: Option<&'static str>, call: impl FnOnce() -> T) -> T {
-    /// Leaves the call on drop, an unwinding one included, whose notice it drops.
+    /// Leaves the call on drop, an unwinding one included, whose notice it drops. Inlined, as
+    /// every runtime call here leaves through it.
     struct Leave<'a> {
         calls: &'a Calls,
         /// Whether the call returned.
         returned: bool,
     }
     impl Drop for Leave<'_> {
+        #[inline]
         fn drop(&mut self) {
             self.calls.depth.set(self.calls.depth.get() - 1);
             if !self.returned {
@@ -1812,7 +1870,7 @@ pub(crate) struct Run<'a> {
     heard: NonNull<Vec<rt::Degradation>>,
 }
 
-/// Runs `run`, whose runtime calls go through [`Run::at`]: each as [`unstopped_at`] runs it, and
+/// Runs `run`, whose runtime calls go through [`Run::at`]: each as [`inside`] runs it, and
 /// what the runtime announces inside each heard as by a [`hearing`] around them all, for the run
 /// to read between them ([`Run::heard`], [`Run::heard_since`]). A hearing inside the run hears
 /// what is announced inside it, as one inside another does.
@@ -1831,7 +1889,7 @@ pub(crate) fn run<T>(run: impl FnOnce(&Run<'_>) -> T) -> T {
 }
 
 impl Run<'_> {
-    /// Runs `call`, the runtime's form of `sel`, as [`unstopped_at`] does.
+    /// Runs `call`, the runtime's form of `sel`, as [`inside`] does.
     #[inline]
     pub(crate) fn at<T>(&self, sel: &'static str, call: impl FnOnce() -> T) -> T {
         inside_of(self.calls, Some(sel), call)
@@ -1867,27 +1925,11 @@ fn noticed_inside(sel: Option<&'static str>, notice: &rt::DegradeNotice) {
     }
 }
 
-/// The kinds of [`DIES`] that die by default too, not only in strict mode, as the guest or the
-/// host would otherwise go on past a break of what it relies on, which no log line repairs:
-/// - `ReleasedCommandState`: a command whose record the GPU wrote naming a released state whose
-///   program the buffer does not keep runs nothing, and one naming the ID of a released state the
-///   CPU set, which another state held while the GPU could write the record, runs the set state's
-///   program, where Metal runs the state the GPU's write named in both;
-/// - `PrivateResourceOption`: the GPU's writes reach the guest's pages, which Metal's never do
-///   for such a resource (announced off macOS for no-copy memory, as `DIES` says);
-/// - `HostDeallocatorDelayed`: the deallocator, which the host sees as the release, runs after
-///   the release, out of the host's release order.
-pub const DIES_BY_DEFAULT: [rt::Degradation; 3] = [
-    rt::Degradation::ReleasedCommandState,
-    rt::Degradation::PrivateResourceOption,
-    rt::Degradation::HostDeallocatorDelayed,
-];
-
 /// What [`notice`] does with a degradation of [`DIES`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Fate {
-    /// Strict mode ([`strict`]), or a kind of [`DIES_BY_DEFAULT`]: it dies at the call it was
-    /// announced inside, or where it was announced outside every call.
+    /// Strict mode ([`strict`]): it dies at the call it was announced inside, or where it was
+    /// announced outside every call.
     Dies,
     /// A native device relays it ([`native::NATIVE_RELAYED`]): counted, the first relayed.
     RelayedNatively,
@@ -1904,7 +1946,7 @@ fn fate(kind: rt::Degradation, placement: native::Placement, census: bool, stric
         Fate::RelayedNatively
     } else if census {
         Fate::Counted
-    } else if strict || DIES_BY_DEFAULT.contains(&kind) {
+    } else if strict {
         Fate::Dies
     } else {
         Fate::Relayed
@@ -1927,9 +1969,23 @@ pub fn trace_degradations() -> bool {
     *ON
 }
 
+/// The recoveries of a device the runtime announced in this process (`DeviceRecovered`, each of
+/// its announcements, whichever device's and whoever hears it), which [`recoveries`] answers.
+static RECOVERIES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// How many recoveries of a device the runtime announced in this process so far ([`notice`]): a
+/// device whose `VkDevice` was lost made a new one, and the objects made before it that it does
+/// not carry are refused there (`MadeBeforeRecovery`) or read zero (a `Private` buffer's
+/// contents). The host's own kept objects are made again once it changes
+/// (`GpuDevice::recoveries`). Process-wide: the announcement names no device, so a recovery of
+/// any device of the process counts for each.
+pub(crate) fn recoveries() -> u64 {
+    RECOVERIES.load(std::sync::atomic::Ordering::Acquire)
+}
+
 /// The kinds the trace saw, which the runtime announces once without it.
-static TRACED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+static TRACED_KINDS: crate::core::sync::Mutex<Vec<rt::Degradation>> =
+    crate::core::sync::Mutex::new(Vec::new());
 
 /// The runtime's message sink (`DeviceOptions::messages`, [`crate::platform`]): a degradation
 /// of [`DIES`] is relayed and counted, or in strict mode kept for the call here it was announced
@@ -1938,19 +1994,23 @@ static TRACED_KINDS: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
 /// of [`HEARD`] is kept for the
 /// [`hearing`] it was announced inside; every other message, and every one of [`HEARD`] too,
 /// goes to [`relay`], to stderr (a `Verbose` one of the runtime's own to the log at debug), but
-/// a kind of [`RELAYED_ONCE`] after its first.
+/// a kind of [`RELAYED_ONCE`] after its first. Each degradation relayed is counted
+/// ([`degradation_counts`]).
 pub fn notice(message: &rt::DebugMessage) {
     let Some(notice) = &message.degradation else {
         relay(message);
         return;
     };
+    if notice.degradation == rt::Degradation::DeviceRecovered {
+        RECOVERIES.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
     if UNHEARD.with(Cell::get) {
         return;
     }
-    if trace_degradations() && reims_vgpu_core::trace::on() {
+    if trace_degradations() && crate::core::trace::on() {
         let kind = notice.degradation;
         // deg: an occurrence of a degradation, its code
-        reims_vgpu_core::trace::event_text("deg", &[], kind.code());
+        crate::core::trace::event_text("deg", &[], kind.code());
         // A kind announced once without the trace goes on only at its first occurrence.
         if !DIES.contains(&kind) && !HEARD.contains(&kind) {
             let mut seen = TRACED_KINDS.lock();
@@ -1966,8 +2026,10 @@ pub fn notice(message: &rt::DebugMessage) {
         }
         #[cfg(test)]
         RELAYED.lock().push(notice.degradation);
-        if first_relayed_once(notice.degradation) == Some(false) {
-            return;
+        match first_relayed_once(notice.degradation) {
+            Some(false) => return,
+            Some(true) => {}
+            None => count_announced(notice.degradation),
         }
         relay(message);
         return;
@@ -2021,8 +2083,8 @@ fn hear(kind: rt::Degradation) {
 /// The degradations not of [`DIES`] the runtime announced in this process, in order, which
 /// [`notice`] relays and a test reads.
 #[cfg(test)]
-pub(crate) static RELAYED: reims_vgpu_core::sync::Mutex<Vec<rt::Degradation>> =
-    reims_vgpu_core::sync::Mutex::new(Vec::new());
+pub(crate) static RELAYED: crate::core::sync::Mutex<Vec<rt::Degradation>> =
+    crate::core::sync::Mutex::new(Vec::new());
 
 /// The least severity the sink hears of the messages that are no degradation
 /// (`MessageSink::with_least_severity`): `Verbose` where the log takes this module's debug lines,
@@ -2046,14 +2108,64 @@ pub(crate) fn least_severity() -> rt::MessageSeverity {
 /// has not measured is made).
 const RUNTIME_MESSAGES: &str = "metal2vulkan-";
 
-/// Writes `message`, which the runtime gave the sink, on stderr ([`relay_to`]).
+/// Writes `message`, which the runtime gave the sink, on stderr ([`relay_to`]): a driver's or a
+/// layer's the first time alone of its id name and the class of its text
+/// (`core::logging::class`), the later ones counted ([`DRIVER_SAID`]), as one comes at each call
+/// that meets its cause.
 fn relay(message: &rt::DebugMessage) {
+    if !message.id_name.starts_with(RUNTIME_MESSAGES)
+        && message.severity == rt::MessageSeverity::Error
+        && !DRIVER_SAID.lock().first(&message.id_name, &message.text)
+    {
+        return;
+    }
     relay_to(
         &mut std::io::stderr(),
         message.severity,
         &message.id_name,
         &message.text,
     );
+}
+
+/// The driver's and layers' messages [`relay`] took, by id name and the class of their text.
+static DRIVER_SAID: crate::core::sync::Mutex<Said> = crate::core::sync::Mutex::new(Said::new());
+
+/// Messages by id name and the class of their text (`core::logging::class`), each with how many
+/// came, in the order of their first.
+struct Said(Vec<(String, String, u64)>);
+
+impl Said {
+    const fn new() -> Said {
+        Said(Vec::new())
+    }
+
+    /// Counts a message of `id_name` and `text`: whether it is the first of its id name and
+    /// class.
+    fn first(&mut self, id_name: &str, text: &str) -> bool {
+        let class = crate::core::logging::class(text);
+        match (self.0.iter_mut()).find(|(id, c, _)| id == id_name && c == class) {
+            Some((_, _, n)) => {
+                *n += 1;
+                false
+            }
+            None => {
+                self.0.push((id_name.to_owned(), class.to_owned(), 1));
+                true
+            }
+        }
+    }
+
+    /// Each id name with how many messages of it came, of every class.
+    fn counts(&self) -> Vec<(String, u64)> {
+        let mut counts: Vec<(String, u64)> = Vec::new();
+        for (id, _, n) in &self.0 {
+            match counts.iter_mut().find(|(i, _)| i == id) {
+                Some((_, all)) => *all += n,
+                None => counts.push((id.clone(), *n)),
+            }
+        }
+        counts
+    }
 }
 
 /// Writes `text`, a message of `severity` and id name `id_name` the runtime gave the sink, on `w`
@@ -2129,7 +2241,7 @@ pub fn decide_describing<T>(
 }
 
 /// The domain of every `NSError` this platform answers but a mesh render pipeline's of a stage
-/// function of another stage's type, which is the compiler's, as on the Metal platform
+/// function of another stage's type, which is the compiler's
 /// (`crate::gpu::states::wrong_mesh_stage`): Metal's is its driver's name, which differs between
 /// GPU families, and only core's log line reads it ([`crate::gpu::states`]' module docs).
 pub const RUNTIME_DOMAIN: &str = "metal2vulkan-runtime";
@@ -2154,8 +2266,8 @@ pub fn refused(sel: &'static str, e: &Error) -> ! {
 /// The line of the last death [`dies`] made in this process, which a test reads: the test
 /// capture takes a death before its line is written.
 #[cfg(test)]
-pub(crate) static LAST_LINE: reims_vgpu_core::sync::Mutex<Option<String>> =
-    reims_vgpu_core::sync::Mutex::new(None);
+pub(crate) static LAST_LINE: crate::core::sync::Mutex<Option<String>> =
+    crate::core::sync::Mutex::new(None);
 
 /// The death at `sel` of [`refused`], [`metal_aborts`] and [`unrepresentable`], its line
 /// `line`.
@@ -2343,9 +2455,6 @@ pub enum Inexact {
     /// A bfloat attachment loaded and stored by a pass that draws, whose codes the runtime moves
     /// through `half` otherwise than Metal's tile store.
     BfloatLoaded,
-    /// A colour attachment write under `textureWriteRoundingMode` 2 the runtime is not measured
-    /// to store as Metal does: a resolve at a sample count nothing measured.
-    WriteRounding,
     /// A heap texture's size, alignment or bytes in the heap the runtime answers or lays out as
     /// its device's image, where Metal's are not measured or are its own: a texture is made, and
     /// its size answered, by the runtime's.
@@ -2403,10 +2512,9 @@ pub enum Inexact {
 
 impl Inexact {
     /// Every kind, once.
-    pub const ALL: [Self; 13] = [
+    pub const ALL: [Self; 12] = [
         Self::HalfOutputBlend,
         Self::BfloatLoaded,
-        Self::WriteRounding,
         Self::HeapLayout,
         Self::RateMap,
         Self::FillFormat,
@@ -2424,7 +2532,6 @@ impl Inexact {
         match self {
             Self::HalfOutputBlend => "inexact-half-output-blend",
             Self::BfloatLoaded => "inexact-bfloat-loaded",
-            Self::WriteRounding => "inexact-write-rounding",
             Self::HeapLayout => "inexact-heap-layout",
             Self::RateMap => "inexact-rate-map",
             Self::FillFormat => "inexact-fill-format",
@@ -2505,12 +2612,16 @@ pub fn relays_gap(e: &Error) -> bool {
 /// [`Inexact::RefusedCreate`], counted ([`inexact_counts`]) and the process's first of the kind
 /// writing a line on stderr naming the refusal and `descriptor` ([`refusal_describing`]). The
 /// creator then answers nil, a pipeline or library creator with [`error_text`] as its
-/// `NSError`. `false` in strict mode and for every other refusal, which the creator decides as
-/// before: a death at `sel`.
+/// `NSError`, and the relay is noted for core on the creator's thread
+/// ([`crate::core::platform::device::note_relayed_gap`]), which faults the work that names a
+/// function so refused where Metal would end the process at the nil one create later. `false` in
+/// strict mode and for every other refusal, which the creator decides as before: a death at
+/// `sel`.
 pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool {
     if !relays_gap(e) {
         return false;
     }
+    crate::core::platform::device::note_relayed_gap();
     if counted_first(Inexact::RefusedCreate) {
         let line = format!(
             "reims-vgpu: {sel}: {}; answered nil, relayed ({}), the first of its kind: \
@@ -2523,15 +2634,19 @@ pub fn relay_gap(sel: &'static str, e: &Error, descriptor: Option<&str>) -> bool
     true
 }
 
-/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+/// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
+/// on Linux and Windows).
 static OUT_OF_HOST_MEMORY: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// A map, a file or memory that this platform's host refused at `call` for want of mappings
-/// (`vm.max_map_count`), of open files or of memory, where Metal's call needs none: in strict
+/// (Linux's `vm.max_map_count`), of open files, of memory or of commit charge (Windows's), where
+/// Metal's call needs none: in strict
 /// mode the process ends there, naming `detail`, as it did before; by default the caller answers
 /// as Metal's call does when memory runs out (`KERN_NO_SPACE`, no memory, a nil object), and the
-/// answer is counted ([`out_of_host_memory_count`]) and logged at the first and at each power of
-/// two. `detail` is asked only for a line.
+/// answer is counted ([`out_of_host_memory_count`], [`degradation_counts`]) and logged at the
+/// first, and at each power of two, at debug after the first (`core::logging`'s once per kind).
+/// `detail` is asked only for a line.
+#[cfg(any(target_os = "linux", windows))]
 pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> String) {
     use std::sync::atomic::Ordering;
     if strict() {
@@ -2554,9 +2669,29 @@ pub(crate) fn out_of_host_memory(call: &'static str, detail: impl FnOnce() -> St
     }
 }
 
-/// How many times this process answered a call as when memory runs out ([`out_of_host_memory`]).
+/// How many times this process answered a call as when memory runs out (`out_of_host_memory`,
+/// on Linux and Windows; none on macOS).
 pub fn out_of_host_memory_count() -> u64 {
     OUT_OF_HOST_MEMORY.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The kinds a caller outside this crate counts by code ([`count_kind`]), each with how many
+/// times: `reims-vgpu`'s, as its reims-graphics device tells it of its completion rings
+/// (`control-ring-full`, `control-ring-post-waited`, `vblank-dropped`, `queue-ring-full`,
+/// `queue-ring-post-waited`), and as its decoder keeps a buffer dealt to two threads whole
+/// (`two-ranges-kept-whole`).
+static COUNTED: crate::core::sync::Mutex<Vec<(&'static str, u64)>> =
+    crate::core::sync::Mutex::new(Vec::new());
+
+/// Counts one more of the kind of code `code`, kept outside this crate, which
+/// [`degradation_counts`] gives with the rest. Its line is the caller's to log, once per kind
+/// (docs/conventions.md).
+pub fn count_kind(code: &'static str) {
+    let mut counted = COUNTED.lock();
+    match counted.iter_mut().find(|(c, _)| *c == code) {
+        Some((_, n)) => *n += 1,
+        None => counted.push((code, 1)),
+    }
 }
 
 /// Each kind of [`Inexact`] this process relayed, with how many times.
@@ -2566,6 +2701,80 @@ pub fn inexact_counts() -> Vec<(Inexact, u64)> {
         .map(|(&k, c)| (k, c.load(Ordering::Relaxed)))
         .filter(|&(_, n)| n > 0)
         .collect()
+}
+
+/// Each kind this process relayed or counted, with how many times, by its code: the degradations
+/// of [`DIES`] relayed ([`relayed_counts`]) or relayed natively (`native::counts`), those of
+/// [`RELAYED_ONCE`] and the others the runtime announced, the kinds of [`Inexact`]
+/// ([`inexact_counts`]), the calls answered as when memory runs out (`out-of-host-memory`,
+/// [`out_of_host_memory_count`]), the driver's and layers' messages relayed, by id name
+/// ([`relay`]), and the kinds counted outside this crate ([`count_kind`]). Sorted by code, a code
+/// met twice summed.
+pub fn degradation_counts() -> Vec<(String, u64)> {
+    use std::sync::atomic::Ordering;
+    let code = |(k, n): (rt::Degradation, u64)| (k.code().to_owned(), n);
+    let mut all: Vec<(String, u64)> = (relayed_counts().into_iter().map(code))
+        .chain(native::counts().into_iter().map(code))
+        .chain(
+            (RELAYED_ONCE.iter().zip(&RELAYED_ONCE_COUNTS))
+                .map(|(&k, c)| code((k, c.load(Ordering::Relaxed)))),
+        )
+        .chain(ANNOUNCED.lock().iter().copied().map(code))
+        .chain((inexact_counts().into_iter()).map(|(k, n)| (k.code().to_owned(), n)))
+        .chain(std::iter::once((
+            "out-of-host-memory".to_owned(),
+            out_of_host_memory_count(),
+        )))
+        .chain(DRIVER_SAID.lock().counts())
+        .chain(COUNTED.lock().iter().map(|&(c, n)| (c.to_owned(), n)))
+        .filter(|&(_, n)| n > 0)
+        .collect();
+    all.sort();
+    all.dedup_by(|later, kept| {
+        let same = later.0 == kept.0;
+        if same {
+            kept.1 += later.1;
+        }
+        same
+    });
+    all
+}
+
+/// The line of `counts` ([`degradation_counts`]), with its newline:
+/// `reims-vgpu: degradation counts: <code> <n>, <code> <n>, …`; `None` for none.
+fn counts_line(counts: &[(String, u64)]) -> Option<String> {
+    if counts.is_empty() {
+        return None;
+    }
+    let counts: Vec<String> = counts.iter().map(|(c, n)| format!("{c} {n}")).collect();
+    Some(format!(
+        "reims-vgpu: degradation counts: {}\n",
+        counts.join(", ")
+    ))
+}
+
+/// The line [`write_counts`] last wrote.
+static COUNTS_WRITTEN: crate::core::sync::Mutex<String> =
+    crate::core::sync::Mutex::new(String::new());
+
+/// Writes, on stderr, the line of the process's [`degradation_counts`] since it began, where any
+/// and where they changed since this last wrote them: `reims-vgpu: degradation counts: <code>
+/// <n>, …` ([`counts_line`]), the line the codes of a boot's degradations are read from; and the
+/// log's count of the lines it wrote at debug after their kind's first
+/// ([`crate::core::logging::write_repeats`]). A device's reset and the process's exit write them
+/// (`reims-vgpu`'s reset, [`crate::exit_gate`]).
+pub fn write_counts() {
+    crate::core::logging::write_repeats();
+    let Some(line) = counts_line(&degradation_counts()) else {
+        return;
+    };
+    let mut written = COUNTS_WRITTEN.lock();
+    if *written == line {
+        return;
+    }
+    // One write, so the line never interleaves with another thread's.
+    let _ = std::io::Write::write_all(&mut std::io::stderr(), line.as_bytes());
+    *written = line;
 }
 
 /// Parks this thread for good, where Metal's call never returns: a wait Metal never returns
@@ -2584,9 +2793,9 @@ pub fn hang() -> ! {
 pub(crate) fn dies_of<T>(
     kind: rt::Degradation,
     call: impl FnOnce() -> T,
-) -> reims_vgpu_core::raise::death::DeathSite {
+) -> crate::core::raise::death::DeathSite {
     *LAST_LINE.lock() = None;
-    let Err(site) = reims_vgpu_core::testkit::capture::catch_death(call) else {
+    let Err(site) = crate::core::testkit::capture::catch_death(call) else {
         panic!("it did not die, where {} dies", kind.code());
     };
     let line = LAST_LINE.lock().take().unwrap_or_default();
@@ -2601,9 +2810,10 @@ pub(crate) fn dies_of<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::core::platform::device::relaying_gaps;
+    use crate::core::raise::{Origin, RaiseId};
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan_runtime::{Invalid, Problem, RuntimeGap};
-    use reims_vgpu_core::raise::{Origin, RaiseId};
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     fn invalid() -> Error {
         Error::Invalid(Invalid::new("fill_buffer", Problem::StorageMode))
@@ -2670,6 +2880,61 @@ mod tests {
                 "{creation}\n{validation}\n{late}\n{evicted}\n{unwritten}\n{compile}\n{degraded}\n"
             )
         );
+    }
+
+    /// A driver's message is relayed the first time alone of its id name and the class of its
+    /// text, the later ones counted by id name
+    #[test]
+    fn a_drivers_message_is_relayed_once_per_id_name_and_class() {
+        let mut said = Said::new();
+        let failed = |code: u32| format!("VK_ERROR_INITIALIZATION_FAILED: compile failed ({code})");
+        assert!(said.first("mvk-error", &failed(3)));
+        assert!(!said.first("mvk-error", &failed(4)), "the same class");
+        assert!(said.first("mvk-error", "VK_ERROR_OUT_OF_DEVICE_MEMORY: no memory"));
+        assert!(said.first("VUID-x", &failed(3)), "another id name");
+        assert_eq!(
+            said.counts(),
+            [("mvk-error".to_owned(), 3), ("VUID-x".to_owned(), 1)]
+        );
+    }
+
+    /// Every kind of [`HEARD`] is relayed the first time alone, and counted: the counts name it
+    /// by its code, and the counts' line names each code with its count
+    #[test]
+    fn heard_kinds_are_relayed_once_and_counted() {
+        assert_eq!(RELAYED_ONCE, HEARD);
+        let kind = rt::Degradation::HeapTwoPlaneTexture;
+        let before = (degradation_counts().into_iter())
+            .find(|(c, _)| c == kind.code())
+            .map_or(0, |(_, n)| n);
+        let first = first_relayed_once(kind);
+        assert_eq!(first, Some(before == 0));
+        assert_eq!(first_relayed_once(kind), Some(false));
+        let after = (degradation_counts().into_iter()).find(|(c, _)| c == kind.code());
+        assert_eq!(after, Some((kind.code().to_owned(), before + 2)));
+
+        assert_eq!(counts_line(&[]), None);
+        assert_eq!(
+            counts_line(&[
+                ("inexact-heap-layout".to_owned(), 3),
+                ("out-of-host-memory".to_owned(), 1)
+            ])
+            .as_deref(),
+            Some("reims-vgpu: degradation counts: inexact-heap-layout 3, out-of-host-memory 1\n")
+        );
+    }
+
+    /// A kind counted outside this crate by its code ([`count_kind`]) is in the degradation
+    /// counts with how many times it was counted, as the reims-graphics device's control
+    /// completion ring's kinds reach the counts' line
+    #[test]
+    fn a_kind_counted_by_code_is_in_the_degradation_counts() {
+        let code = "test-counted-by-code";
+        let counted = || (degradation_counts().into_iter()).find(|(c, _)| c == code);
+        assert_eq!(counted(), None);
+        count_kind(code);
+        count_kind(code);
+        assert_eq!(counted(), Some((code.to_owned(), 2)));
     }
 
     /// Every kind of degradation the runtime has is placed here once: it dies ([`DIES`]), a
@@ -2755,16 +3020,22 @@ mod tests {
         // A recorded near-equivalent of Metal's answer (`rt::Exactness::NearEquivalent`), or work
         // the runtime fails instead (`FailsInstead`): relayed and logged, each for one of the
         // module's reasons, named below.
-        // - `UncalibratedGpuTimes`, `UntimedCommandBuffer` and `GpuTimesFromHost`: a command
-        //   buffer's GPU times, which only the graphics lane's guest sees, as the length of the
-        //   buffer's run (its bundle's `GPUEndTime` less `GPUStartTime`, the end where the
-        //   completion reached the guest), and debug lines read. `gpu_times_from_host`
-        //   (`crate::platform`'s `device_options`) leaves the first two unreachable, and makes
-        //   the run's length the time from the end of its submission, or the end of its queue's
-        //   run before it, to the runtime's seeing it complete: within Metal's envelope of a
-        //   run's length, which counts from the GPU's start. VM boots relay `GpuTimesFromHost`,
-        //   which the runtime also takes on MoltenVK 1.4.1 whatever the option (its
-        //   `TimestampsWaitForEveryQueue`).
+        // - `UncalibratedGpuTimes`, `LooselyCalibratedGpuTimes`, `UntimedCommandBuffer` and
+        //   `GpuTimesFromHost`: a command buffer's GPU times, which only the graphics lane's guest
+        //   sees, as the length of the buffer's run (its bundle's `GPUEndTime` less
+        //   `GPUStartTime`, the end where the completion reached the guest), and debug lines read.
+        //   `LooselyCalibratedGpuTimes` places both times by a calibration reading whose stated
+        //   deviation stayed above 20 us, the duration between them exact, so the run's length
+        //   is unchanged. `UncalibratedGpuTimes` (a device without calibrated timestamps, or a
+        //   calibration that would place the times outside the buffer's life) places the end where
+        //   the runtime saw the buffer complete, the duration exact. `UntimedCommandBuffer` (every
+        //   slot of the device's timestamp pools held, and no pool more) answers no times, which
+        //   the device posts as 0. `GpuTimesFromHost`, which the runtime takes on MoltenVK 1.4.1
+        //   (its `TimestampsWaitForEveryQueue`), and on a queue family that writes no timestamps,
+        //   makes the run's length the time from the end of its submission, or the end of its
+        //   queue's run before it, to the runtime's seeing it complete: within Metal's envelope
+        //   of a run's length, which counts from the GPU's start. `crate::platform`'s
+        //   `device_options` leaves the runtime's default, the GPU's own timestamps.
         // - `UnmeasuredUniqueIdentifier`: the difference dies where it shows. The runtime
         //   announces it where a call answers an identifier it has not measured to be Metal's
         //   number: a state's with indirect command buffer support, which this platform reads as
@@ -2799,6 +3070,17 @@ mod tests {
         //   leave unused made canonical and a bfloat code moved through `half`: each draw
         //   announces `ExtendedRangeBitsKept`. A bfloat attachment's codes are values, so a draw in
         //   a pass that loads and stores one dies first (`encode_render`'s `bfloat_loaded`).
+        // - `DontCareUnstoredLoad`: the texels a pass's draws read of an attachment it loads
+        //   `DontCare` and does not store, left to the driver's `DONT_CARE` load where the driver
+        //   is not measured to clear it no slower, where an M3's draws read zero or the clear
+        //   value. Metal leaves a `DontCare` load's contents undefined, and the pass keeps none of
+        //   the attachment's texels, as it stores none.
+        // - `VertexFetchMayWrap`: an element a draw's `uint` indices or indirect arguments name
+        //   2^32 bytes or more past a vertex buffer's bind offset, on lavapipe, whose
+        //   fixed-function fetch wraps there, where Metal reads zero past the buffer's end. A
+        //   policy's default, as `DontCareUnstoredLoad` is: `vertex_reach` of `EXACT_FORMS`
+        //   selects the exact form, which pulls such a layout, at its cost in the accuracy
+        //   ledger. No other driver differs.
         // - `DrawnDepthCopy`: a copy into a multisampled depth texture, or a pass's copies of a
         //   separate depth texture through its scratch image, which a fragment-depth draw writes
         //   where Metal copies the bytes: no copy of the device keeps a multisampled depth's
@@ -2845,11 +3127,12 @@ mod tests {
         //   otherwise than Metal's, which keeps it and compares a positive one above zero and a
         //   negative one not below zero. Announced once per device, where
         //   the denormal may be stored, not where a depth test or a read meets one. Grounds:
-        //   - this host's answer, measured equal to Metal's: MoltenVK keeps a denormal in a depth
-        //     image on the M3 Max (the runtime's `DepthImageKeepsDenormals`),
-        //     and its depth test compares one as Metal's does there, positive and negative,
-        //     written by a blit or a pass's clear, under every compare function but `Never` and
-        //     `Always` (`serialized::draws`'
+        //   - this host's answer, measured equal to Metal's: MoltenVK keeps a positive denormal
+        //     in a depth image on the M3 Max (the runtime's `DepthImageKeepsDenormals`),
+        //     and its depth test compares one as Metal's does there, written by a blit or a pass's
+        //     clear, under every compare function but `Never` and `Always`; a negative one a blit
+        //     writes is stored as 0, the upload's clamp into `[0, 1]` (`RestrictedDepthUpload`)
+        //     (`gpu::depth_denormals`'
         //     `denormal_depths_store_and_compare_as_metals`, which announces the kind); the
         //     runtime measured that depth test on an Apple M4 alone (`DepthTestKeepsDenormals`),
         //     so it announces the kind on this host too;
@@ -2882,11 +3165,38 @@ mod tests {
         //   writes 1, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 the samples that
         //   passed, as the runtime records), so no one nonzero value is Metal's; 0 where none
         //   passed, as Metal's.
-        const PRECISION: [D; 12] = [
+        // - `HeapTextureCompressed`: a heap's colour texture that Metal keeps losslessly
+        //   compressed (`allowGPUOptimizedContents`, no `ShaderWrite`, `PixelFormatView` or
+        //   `ShaderAtomic` usage, 16 texels or more a side), in a heap of the device's own memory,
+        //   made as the driver's compressed image on a driver whose compressed images may keep
+        //   their texels apart from the memory they are bound to (ANV's
+        //   `CompressedImagesHideAliasedWrites`, the Iris Xe's), under the runtime's default
+        //   `HeapCompressionPolicy::Compressed`, which [`crate::platform`]'s `exact_policy` keeps.
+        //   A write through a buffer or texture over its bytes may leave its texels as they were,
+        //   and its own writes may show in those bytes compressed otherwise than Metal's. Metal's
+        //   own answer there is not one value: its compressed texture shows no such write as
+        //   written either, an M3 Max's reading opaque magenta (`0xffff00ff`) in every texel of
+        //   drawn content a buffer's fill over its bytes covered and the fill's bytes where it held
+        //   only a clear (the runtime's measurement), and Apple documents no layout of a texture's
+        //   bytes in a heap. Announced inside the heap's creator of the texture.
+        // - `LineWriteBack`: a render target over host pages that takes its image in place where
+        //   its rows' padding is free, its renders' check failed for those rows' ends, and the
+        //   device's own copies lose the same padding: the device writes back the whole line of
+        //   host memory it fetched (64 bytes on the Iris Xe, the runtime's measurement), so a CPU
+        //   write to a row's padding inside the line that holds the row's last texel is lost while
+        //   a pass, a kernel store or a blit writes that line; rows that end on a line are never
+        //   touched, and a pass that writes no texel changes nothing. Metal's device leaves the
+        //   padding as the CPU wrote it. A shadow of the texture loses the same bytes on such a
+        //   device, so in place costs nothing a shadow would keep. Announced once per device that
+        //   takes a texture in place by that rule.
+        const PRECISION: [D; 17] = [
             D::UncalibratedGpuTimes,
+            D::LooselyCalibratedGpuTimes,
             D::UntimedCommandBuffer,
             D::GpuTimesFromHost,
             D::DontCareLoadTiles,
+            D::DontCareUnstoredLoad,
+            D::VertexFetchMayWrap,
             D::ExtendedRangeBitsKept,
             D::DrawnDepthCopy,
             D::UnnamedShadowedTexture,
@@ -2895,6 +3205,8 @@ mod tests {
             D::DeviceFilteredMipmaps,
             D::FloatTininessAfterRounding,
             D::DeviceBooleanVisibility,
+            D::HeapTextureCompressed,
+            D::LineWriteBack,
         ];
         // A pipeline stage's precision notes, each arithmetic, filtering or ordering of the device
         // that its documentation says can differ from Metal's: relayed, but those [`DIES`] and
@@ -3014,13 +3326,15 @@ mod tests {
                 D::DevicePackConversion,
                 D::DeviceVertexConversion,
                 D::DeviceAlphaCoverage,
+                D::NativeLogicOperation,
+                D::NativeFloat8,
             ]
         );
         // These stay deaths on native devices too, as neither a fact of the device nor the
         // class of the device's own maths and sampling covers them: two precision notes
         // are other values, not other bits, the next two are where Apple's compiler places or
         // speculates an operation, Metal's rule for tessellation factors is not read, blending,
-        // storage, an attachment's memory read in place, a heap texture's compressed image, a
+        // storage, an attachment's memory read in place, a
         // pass's tile store and when a command buffer is seen complete are neither maths nor
         // sampling, the anisotropic emulation is a fitted model, and the band's corners are the
         // runtime's own, whose snap to Metal's grid the hardware allows (`DeviceSubpixelSnap`).
@@ -3036,7 +3350,6 @@ mod tests {
             D::AnisotropicFilter,
             D::TessellationWinding,
             D::TessellationFactorEdgeCases,
-            D::HeapTextureCompressed,
             D::SnormMinimumKept,
             D::SharedExponentKept,
             D::GroupedCompletion,
@@ -3067,7 +3380,9 @@ mod tests {
     /// on a native device the kinds of `native::NATIVE_RELAYED` are relayed and every other one
     /// dies; census mode counts and relays what would die, and leaves a native relay a native
     /// relay. By default every kind is relayed, counted, on every device, and the process goes
-    /// on, but those of `DIES_BY_DEFAULT`, which die
+    /// on: none dies by default, those that break what the guest or the host relies on included
+    /// (a command run otherwise than Metal's, a resource's writes reaching its memory, a
+    /// deallocator run late), as Metal goes on there too
     #[test]
     fn a_kind_of_dies_is_placed_by_the_device_class() {
         use native::Placement::{Native, OnMetal};
@@ -3075,11 +3390,7 @@ mod tests {
             let natively = native::relayed(kind);
             assert_eq!(fate(kind, OnMetal, false, true), Fate::Dies, "{kind:?}");
             assert_eq!(fate(kind, OnMetal, true, true), Fate::Counted, "{kind:?}");
-            let by_default = if DIES_BY_DEFAULT.contains(&kind) {
-                Fate::Dies
-            } else {
-                Fate::Relayed
-            };
+            let by_default = Fate::Relayed;
             assert_eq!(fate(kind, OnMetal, false, false), by_default, "{kind:?}");
             assert_eq!(fate(kind, OnMetal, true, false), Fate::Counted, "{kind:?}");
             let (native, census, relayed) = if natively {
@@ -3115,12 +3426,23 @@ mod tests {
         assert_eq!(fate(scale, OnMetal, false, true), Fate::Dies);
         assert_eq!(fate(scale, Native, false, false), Fate::Relayed);
         assert_eq!(fate(scale, OnMetal, false, false), Fate::Relayed);
-        // A kind whose difference breaks what the guest or host relies on dies by default too,
-        // on every device; each is one of DIES, and none a native relay.
-        for kind in DIES_BY_DEFAULT {
+        // The kinds that died by default until now, whose difference breaks what the guest or the
+        // host relies on, are relayed by default on every device, and die in strict mode: none is
+        // a native relay.
+        for kind in [
+            rt::Degradation::ReleasedCommandState,
+            rt::Degradation::PrivateResourceOption,
+            rt::Degradation::HostDeallocatorDelayed,
+        ] {
             assert!(DIES.contains(&kind) && !native::relayed(kind), "{kind:?}");
-            assert_eq!(fate(kind, OnMetal, false, false), Fate::Dies, "{kind:?}");
-            assert_eq!(fate(kind, Native, false, false), Fate::Dies, "{kind:?}");
+            for placement in [OnMetal, Native] {
+                assert_eq!(
+                    fate(kind, placement, false, false),
+                    Fate::Relayed,
+                    "{kind:?}"
+                );
+                assert_eq!(fate(kind, placement, false, true), Fate::Dies, "{kind:?}");
+            }
         }
     }
 
@@ -3153,7 +3475,6 @@ mod tests {
             match kind {
                 Inexact::HalfOutputBlend
                 | Inexact::BfloatLoaded
-                | Inexact::WriteRounding
                 | Inexact::HeapLayout
                 | Inexact::RateMap
                 | Inexact::FillFormat
@@ -3183,7 +3504,7 @@ mod tests {
         relaxed(|| inexact("sel:", Inexact::HeapLayout, || "a value".into()));
         assert_eq!(counted(), before + 2);
         *LAST_LINE.lock() = None;
-        let site = reims_vgpu_core::testkit::capture::catch_death(|| {
+        let site = crate::core::testkit::capture::catch_death(|| {
             inexact("sel:", Inexact::HeapLayout, || "a value".into());
         })
         .unwrap_err();
@@ -3244,10 +3565,10 @@ mod tests {
     /// `two_plane_xr10_blits_metal_was_not_measured_at_die`)
     #[test]
     fn a_call_that_unwinds_lets_its_notice_go() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
         let d = crate::gpu::device::tests::dev();
         let desc = crate::platform::tests::platform().texture_descriptor(&TextureDesc {
             pixel_format: 550,
@@ -3295,10 +3616,10 @@ mod tests {
     /// The copy of `a_call_that_unwinds_lets_its_notice_go` announces `TwoPlaneTextureCopy`
     #[test]
     fn a_kind_of_dies_is_relayed_and_counted_by_default() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
         let kind = rt::Degradation::TwoPlaneTextureCopy;
         let counted = || {
             (relayed_counts().into_iter())
@@ -3588,7 +3909,9 @@ mod tests {
             ),
             (
                 "newDepthStencilStateWithDescriptor:",
-                Error::NotImplemented(RuntimeGap::IndirectRenderCommands),
+                Error::NotImplemented(RuntimeGap::IndirectRenderCommands(
+                    metal2vulkan_runtime::IndirectRule::CommandRenderStates,
+                )),
             ),
             (
                 "newTextureWithDescriptor:",
@@ -3598,8 +3921,11 @@ mod tests {
         for (sel, e) in gaps {
             let before = refused_creates();
             let refused = || Err::<(), _>(e.clone());
-            let made = relaxed(|| create(sel, Policy::Dies, Nil::Never, refused));
+            let (made, noted) =
+                relaying_gaps(|| relaxed(|| create(sel, Policy::Dies, Nil::Never, refused)));
             assert_eq!(made, Ok(None), "{sel}");
+            // Noted for core, which faults the work naming a function so refused
+            assert!(noted, "{sel}");
             assert_eq!(refused_creates(), before + 1, "{sel}");
             *LAST_LINE.lock() = None;
             let site = catch_death(|| create(sel, Policy::Dies, Nil::Never, refused)).unwrap_err();
@@ -3621,6 +3947,21 @@ mod tests {
         .unwrap_err();
         assert_eq!(site.file, "newTextureWithDescriptor:");
         assert_eq!(refused_creates(), before);
+        // Metal's nil is no gap
+        let (made, noted) = relaying_gaps(|| {
+            create(
+                "newTextureWithDescriptor:",
+                Policy::Dies,
+                Nil::Never,
+                || {
+                    Err::<(), _>(Error::Nil(metal2vulkan_runtime::Nil::new(
+                        "new_texture",
+                        Problem::StorageMode,
+                    )))
+                },
+            )
+        });
+        assert_eq!((made, noted), (Ok(None), false));
     }
 
     /// An unbuilt method, and a value the runtime cannot hold, die naming the selector
@@ -3637,6 +3978,39 @@ mod tests {
             (site.kind, site.file),
             (DeathKind::Abort, "setPixelFormat:")
         );
+    }
+
+    /// The same death inside a refusal scope (the graphics lane's op) is the op's refusal, never
+    /// the process's and never silence: `refusing` answers `Err` with the death's id and the line
+    /// the process would have died with, and the thread goes on to the next op. This is the path
+    /// the device's nil-function creator leans on (`gpu::device`,
+    /// `new_compute_pipeline_state_for_function`): a `None` function the runtime has no form for
+    /// refuses the task that named it, and the host lives
+    #[test]
+    fn an_unrepresentable_in_a_scope_refuses_the_op_and_the_process_lives() {
+        use crate::core::raise::refusals::{is_refusing, refusing};
+        let sel = "newComputePipelineStateWithFunction:error:";
+        let refusal = refusing(|| unrepresentable(sel, "a nil function")).unwrap_err();
+        assert_eq!(
+            refusal.id,
+            DeathId::Platform {
+                kind: DeathKind::Abort,
+                call: sel
+            }
+        );
+        assert_eq!(
+            refusal.detail.as_deref(),
+            Some("the Vulkan runtime cannot hold a nil function")
+        );
+        // Not silence: the refusal carries the call and the line, as the process's death would
+        assert_eq!(
+            refusal.to_string(),
+            "platform call newComputePipelineStateWithFunction:error:: \
+             the Vulkan runtime cannot hold a nil function"
+        );
+        // The scope is left, and the thread runs the next op: nothing ended
+        assert!(!is_refusing());
+        assert_eq!(refusing(|| 7).unwrap(), 7);
     }
 
     /// A runtime error as an NSError carries the runtime's text

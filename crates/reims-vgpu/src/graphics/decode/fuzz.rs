@@ -18,30 +18,33 @@
 //! The command buffer target also checks what the decoder tells its guest of a command buffer: one
 //! it carried out (`Ok(Ok(()))`) gets exactly one completion, and one it did not gets none from the
 //! decoder (the device posts its failure: `GraphicsDevice::report`), so no buffer is answered twice
-//! or left without an answer; and a stream holding an op of a tag no group decodes is never
-//! carried out. The answer target checks that a command buffer answered on a doorbell's thread is
-//! carried out as one its queue's thread takes unanswered: the same platform calls in the same
-//! order, so the same commits, and the same outcomes and records, in the same order.
+//! or left without an answer; and a stream holding an op of a tag the wire does not name, which no
+//! group decodes, is never carried out. The answer target checks that a command buffer answered
+//! on a doorbell's thread is carried out as one its queue's thread takes unanswered: the same
+//! platform calls in the same order, so the same commits, and the same outcomes and records, in
+//! the same order.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use reims_graphics::ops::{
-    RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_ENCODER_BEGIN_COMPUTE,
-    RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_OP_SUBMITTED, RGFX_PASS_FLAG_RT_SIZE,
-    RgfxCommandBuffer, RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+use reims_vgpu_graphics::ops::{
+    RGFX_COMMAND_BUFFER_OPS_OFFSET, RGFX_OP_COMMIT_ORDER, RGFX_OP_ENCODER_BEGIN_BLIT,
+    RGFX_OP_ENCODER_BEGIN_COMPUTE, RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END,
+    RGFX_OP_GUEST_TIMES, RGFX_OP_SIGNAL_EVENT, RGFX_OP_SUBMITTED, RGFX_OP_SURFACE_ORDER,
+    RGFX_OP_SURFACE_USE, RGFX_OP_WAIT_EVENT, RGFX_PASS_FLAG_RT_SIZE, RgfxCommandBuffer,
+    RgfxOpHeader, RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
 };
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_CREATE, RGFX_CMD_COMMAND_BUFFER, RGFX_CMD_EVENT_CREATE, RGFX_CMD_FENCE_CREATE,
     RGFX_CMD_QUEUE_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_TEXTURE_CREATE,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_EVT_CB_SCHEDULED, RgfxBufferCreate,
     RgfxCbScheduled, RgfxMsgHeader, RgfxObjectCreate, RgfxQueueCreate, RgfxSharedEventCreate,
     RgfxTextureCreate, RgfxTextureDescriptor,
 };
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::testkit::FakePlatform;
-use reims_vgpu_core::testkit::objects::CompleteOn;
+use reims_vgpu_vulkan::core::sync::Mutex;
+use reims_vgpu_vulkan::core::testkit::FakePlatform;
+use reims_vgpu_vulkan::core::testkit::objects::CompleteOn;
 use zerocopy::{FromBytes, IntoBytes};
 
 use super::{DecodeError, GraphicsDecoder, ObjHandle, refusing};
@@ -308,8 +311,45 @@ fn mutated(rng: &mut Rng, from: &[u8]) -> Vec<u8> {
     m
 }
 
-/// The highest tag each op group decodes: framing, render, compute, blit, video.
-const LAST_TAG: [u16; 5] = [0x0009, 0x104f, 0x201d, 0x3019, 0x4000];
+/// The wire's op modules (reims-vgpu-graphics's `ops`), whose `pub const RGFX_OP_…: u16` lines
+/// name every op tag, the groups' own (`RGFX_OP_GROUP_…`) aside.
+const OP_SOURCES: [&str; 5] = [
+    include_str!("../../../../reims-vgpu-graphics/src/ops.rs"),
+    include_str!("../../../../reims-vgpu-graphics/src/ops/render.rs"),
+    include_str!("../../../../reims-vgpu-graphics/src/ops/compute.rs"),
+    include_str!("../../../../reims-vgpu-graphics/src/ops/blit.rs"),
+    include_str!("../../../../reims-vgpu-graphics/src/ops/video.rs"),
+];
+
+/// The highest tag the wire names in each op group (framing, render, compute, blit, video), read
+/// from the op modules' own constants ([`OP_SOURCES`]), so an op added to a group is in its range
+/// as it is written. A tag in a group of its own panics here, for a slot to be added.
+fn last_tags() -> &'static [u16; 5] {
+    static LAST: OnceLock<[u16; 5]> = OnceLock::new();
+    LAST.get_or_init(|| {
+        let mut last = [0u16; 5];
+        for line in OP_SOURCES.iter().flat_map(|source| source.lines()) {
+            let Some(rest) = line.trim_start().strip_prefix("pub const RGFX_OP_") else {
+                continue;
+            };
+            let Some((name, value)) = rest.split_once(": u16 = ") else {
+                continue;
+            };
+            if name.starts_with("GROUP_") {
+                continue;
+            }
+            let hex = value
+                .trim_end_matches(';')
+                .trim_start_matches("0x")
+                .replace('_', "");
+            let tag = u16::from_str_radix(&hex, 16)
+                .unwrap_or_else(|_| panic!("RGFX_OP_{name}'s value {value} is not a hex literal"));
+            let group = usize::from(tag >> 12);
+            last[group] = last[group].max(tag);
+        }
+        last
+    })
+}
 
 /// One op: its header (its `len` the op's, one in sixteen another) and `body`.
 fn op(rng: &mut Rng, tag: u16, body: &[u8]) -> Vec<u8> {
@@ -326,18 +366,20 @@ fn op(rng: &mut Rng, tag: u16, body: &[u8]) -> Vec<u8> {
 /// A tag of `group` (0 framing, 1 render, ...): one it decodes, or one in sixteen past its last.
 fn tag_of(rng: &mut Rng, group: u16) -> u16 {
     let base = group << 12;
-    let last = LAST_TAG[group as usize] - base;
+    let last = last_tags()[group as usize] - base;
+    // Framing has no tag 0.
+    let first = u16::from(group == 0);
     if rng.one_in(16) {
         base + last + 1 + rng.below(0x40) as u16
     } else {
-        base + rng.below(u64::from(last) + 1) as u16 + u16::from(group == 0)
+        base + first + rng.below(u64::from(last - first) + 1) as u16
     }
 }
 
-/// Whether `tag` is one no group decodes.
+/// Whether `tag` is one the wire does not name ([`last_tags`]), which no group decodes.
 fn unknown(tag: u16) -> bool {
     let group = (tag >> 12) as usize;
-    group >= LAST_TAG.len() || tag > LAST_TAG[group] || tag == 0
+    group >= last_tags().len() || tag > last_tags()[group] || tag == 0
 }
 
 /// A render pass over texture 4 (colour, clear then store), 256 × 256.
@@ -363,19 +405,31 @@ fn render_pass() -> Vec<u8> {
     body
 }
 
-/// A fuzzed op stream. Most streams open
+/// A fuzzed op stream. Half of them start with the guest's times of fuzzed stamps
+/// (`GUEST_TIMES`), as the bundle puts them first. Most streams open
 /// one encoder as the bundle does (a render pass over texture 4, a compute or a blit pass), then
 /// carry fuzzed ops of its group, then end it; the rest are fuzzed ops of any group, framing ops
 /// among them. No stream waits for an event or uses an IOSurface's device cache, so each buffer
 /// the decoder carries out completes at its commit.
 fn op_stream(rng: &mut Rng) -> Vec<u8> {
     let mut ops = Vec::new();
+    if rng.one_in(2) {
+        let times = words(rng, 3);
+        ops.extend(op(rng, RGFX_OP_GUEST_TIMES, &times));
+    }
     let fuzzed = |rng: &mut Rng, group: u16, ops: &mut Vec<u8>| {
         let mut tag = tag_of(rng, group);
-        // Framing's event and surface ops wait or fill, so a buffer that holds one need not
-        // complete at its commit: none here.
-        if group == 0 && matches!(tag, 5..=7) {
-            tag = 8;
+        // Framing's event, surface and order ops wait or fill, so a buffer that holds one need
+        // not complete at its commit: none here.
+        if matches!(
+            tag,
+            RGFX_OP_SIGNAL_EVENT
+                | RGFX_OP_WAIT_EVENT
+                | RGFX_OP_SURFACE_USE
+                | RGFX_OP_SURFACE_ORDER
+                | RGFX_OP_COMMIT_ORDER
+        ) {
+            tag = RGFX_OP_SUBMITTED;
         }
         let n = match rng.below(4) {
             0 => rng.below(3),
@@ -543,7 +597,7 @@ impl Outcomes {
     fn add<E>(
         &mut self,
         r#type: u32,
-        outcome: &reims_vgpu_core::raise::RaiseResult<Result<(), E>>,
+        outcome: &reims_vgpu_vulkan::core::raise::RaiseResult<Result<(), E>>,
     ) {
         let r#type = if (0x200..0x400).contains(&r#type) {
             r#type
@@ -759,7 +813,7 @@ fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
                         });
                     answered += u64::from(yes);
                 }
-                let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue)));
+                let begun = refusing(|| dec.begin_taken(&device, &m, Some(queue), false));
                 let outcome = match begun {
                     Ok(Ok(begun)) => refusing(|| dec.finish_command_buffer(&device, &m, begun)),
                     Ok(Err(e)) => Ok(Err(e)),
@@ -795,5 +849,24 @@ fn an_answer_at_the_doorbell_keeps_the_order_of_a_take() {
             "no command buffer of {} cases was answered",
             cases.end
         );
+    }
+}
+
+/// The tags the fuzz counts as known are the wire's own ([`last_tags`]): each group holds some, the
+/// tag past each group's last is unknown, and framing's reaches the ops the walk takes or steps
+/// past after `ENCODER_BEGIN_VIDEO` (`SURFACE_ORDER`, `COMMIT_ORDER`, `GUEST_TIMES`).
+#[test]
+fn the_known_tags_are_the_wire_s() {
+    let last = last_tags();
+    for (group, &tag) in last.iter().enumerate() {
+        assert_eq!(usize::from(tag >> 12), group, "{last:#x?}");
+        assert!(!unknown(tag) && unknown(tag + 1), "{last:#x?}");
+    }
+    for tag in [
+        RGFX_OP_SURFACE_ORDER,
+        RGFX_OP_COMMIT_ORDER,
+        RGFX_OP_GUEST_TIMES,
+    ] {
+        assert!(!unknown(tag), "{tag:#x}");
     }
 }

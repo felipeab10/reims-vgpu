@@ -27,6 +27,7 @@
 #include <vector>
 
 #include "RgfxAirArguments.hpp" // RgfxAirFunction
+#include "RgfxClMode.hpp"         // RgfxClBindings
 #include "RgfxSerializer.hpp"   // RgfxLinkedFunctionRef
 #endif
 
@@ -122,16 +123,25 @@ typedef struct {
 /// The shadow `rgfxSetShadow:` set; nil for none.
 - (nullable id<MTLFunction>)rgfxShadow;
 
-/// The shadow, made where there is none of the library's shadow by entry point, for a function made
-/// with no constant values (its own, as Metal's library answers newFunctionWithName:, measured:
-/// macOS 27); nil where it was made with values or its library has no shadow.
+/// Sets the constant values the function was made with (`newFunctionWithName:constantValues:`
+/// and `newFunctionWithDescriptor:`), which its shadow is made with (rgfxShadowOrMake). Copied.
+- (void)rgfxSetShadowConstantValues:(nullable MTLFunctionConstantValues *)values;
+
+/// The shadow, made where there is none from the library's shadow: by entry point, as Metal's
+/// library answers newFunctionWithName: (measured: macOS 27), for a function made with no
+/// constant values and no specialized name; else by a descriptor of the entry point, the constant
+/// values and the specialized name, as the stitch of a function MPS specialises needs it (measured:
+/// macOS 26.6.1 on the RTX 5080 host, Metal's own library on this device makes it and stitches
+/// it). nil where the library has no shadow, or Metal's own library made no such function, which
+/// is logged once.
 - (nullable id<MTLFunction>)rgfxShadowOrMake;
 
 /// The library the function was made from; nil where it was made without one.
 - (nullable RgfxResource *)rgfxLibrary;
-/// The reflection of the buffer the function takes at `bufferIndex`: that binding of its library's
-/// reflection of it (newArgumentEncoderWithBufferIndex:reflection:); nil, logged, where there is
-/// none.
+/// The reflection of the buffer the function takes at `bufferIndex`
+/// (newArgumentEncoderWithBufferIndex:reflection:): that binding as its pipelines reflect it, built
+/// from its AIR (RgfxStageReflectionOf), else that binding of its library's reflection of it; nil,
+/// logged, where there is neither.
 - (nullable MTLArgument *)rgfxArgumentOfBufferAtIndex:(NSUInteger)bufferIndex;
 
 #ifdef __cplusplus
@@ -148,7 +158,25 @@ typedef struct {
 /// empty array for one that is not stitchable; Metal's own function answers where it is null, or
 /// of a type the reader does not know.
 - (void)rgfxSetAirVisible:(std::shared_ptr<const RgfxAirVisible>)visible;
+/// Marks the function as a kernel's of OpenCL mode (newFunctionWithPluginData:bitcodeType: of 2):
+/// what its pipelines bind, which their reflection follows (RgfxClMode.hpp), and the plugin data
+/// it was made with, which `pluginData` answers.
+- (void)rgfxSetClBindings:(std::shared_ptr<const RgfxClBindings>)bindings pluginData:(NSData *)pluginData;
+/// What `rgfxSetClBindings:pluginData:` set; null for any other function.
+- (std::shared_ptr<const RgfxClBindings>)rgfxClBindings;
 #endif
+
+/// The function a pipeline of OpenCL mode is made of, which the GL renderer asks of each kernel
+/// of an OpenCL program it builds (GLDComputeProgramRec::createKernel, with 32 bytes of plugin data
+/// and bitcodeType 2; read from its code, measured: macOS 26.7.1). Metal answers a new function of
+/// the same name and stage holding the plugin data, and Metal links the kernel for OpenCL mode as
+/// it makes the pipeline. Ours is a new function of the same entry point, with the plugin return
+/// data Metal's has (RgfxGLPluginReturnData, RgfxClMode.hpp); the host links the kernel
+/// (RGFX_COMPUTE_PIPELINE_OPENCL_MODE). nil, logged once per reason, where the plugin data or
+/// bitcodeType is not the renderer's, the host makes no pipeline of OpenCL mode
+/// (RGFX_FEATURE_OPENCL_MODE), or the kernel binds what the rule does not cover. bitcodeType is an
+/// unsigned char, as Metal's (measured type on the M3 Max, macOS 27).
+- (nullable id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType;
 
 /// The function SPI RenderBox reads as it keys its pipelines: the SHA-256 of the function's
 /// bitcode, valid for the function's life (measured type: r^{?=[32C]}16@0:8).
@@ -178,6 +206,12 @@ struct RgfxLinkedFunctionList {
 	std::vector<RgfxLinkedFunctionRef> refs;
 	std::deque<std::string> groups;
 };
+
+/// `function` as a pipeline's linked function names it, in list `list` (an RGFX_LINKED_*) and,
+/// for RGFX_LINKED_GROUP, group `group`: its library, name, constants, options and
+/// specializedName, each pointing into `function`, which outlives the reference.
+RgfxLinkedFunctionRef RgfxLinkedFunctionRefOf(RgfxFunction *function, uint32_t list,
+                                              const char *_Nullable group);
 
 /// Appends `linked`'s functions to `out` in the wire's order: its functions, its
 /// binary functions, each group's in the order of their names, then its private

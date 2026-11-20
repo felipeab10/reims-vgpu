@@ -1,17 +1,26 @@
-//! What a window's render thread presents through where the display's sink presents the frames
-//! itself, over a Vulkan swapchain of the window's surface: on Linux always, on macOS on the
-//! Vulkan platform (`FrameSink::presents`). The sink makes a [`Presenter`] over the window
-//! ([`VulkanTarget`]: SDL's window on Linux, the window's `CAMetalLayer` on macOS), and the render
-//! thread has it draw each frame ([`Presenting`]).
+//! What a window's render thread presents through: the display's sink presents the frames itself,
+//! over a Vulkan swapchain of the window's surface, on either OS. The sink makes a [`Presenter`]
+//! over the window ([`VulkanTarget`]: SDL's window on Linux, the window's `CAMetalLayer` on macOS),
+//! and the render thread has it draw each frame ([`Presenting`]).
 //!
 //! **The presenter's life.** At its first draw the render thread asks the sink for a presenter;
 //! without one (no swapchain on this host) it never draws, and the window stays empty. Each draw
 //! has the presenter draw the current frame into its next image and present it
 //! ([`Presenter::draw`]): taking the image is the pacing, at the screen's own rate. Where no image
 //! came in time the render thread tries again after [`RETRY`]. A presenter that can draw no more
-//! ([`Drawn::Ended`]: its surface is lost) is let go, and the next draw asks the sink for a new
-//! one, up to [`RENEWALS`] times in a row without a frame presented; the window then stays as it
-//! is.
+//! ([`Drawn::Ended`]: its surface is lost, or its GPU device recovered) is let go, and the next
+//! draw asks the sink for a new one, up to [`RENEWALS`] times in a row without a frame presented;
+//! the window then stays as it is.
+//!
+//! **A parked presenter.** Where the GPU's work stopped with no loss from its driver and the
+//! runtime recovered on a new `VkDevice`, the old one parked (`reims_vgpu_vulkan::swapchain`, "A
+//! parked `VkDevice`"), the presenter can draw no more and its swapchain holds the window's
+//! surface for good ([`Drawn::Parked`]): it is let go, leaving its objects as they are, and no
+//! presenter is made over that window again. The render thread takes the park
+//! ([`Presenting::take_parked`]) and has its OS open a new window for the display, whose new
+//! surface the next presenter is made over, counted as a renewal as an ended one is: on Linux a
+//! new SDL window, the old one hidden and kept, never destroyed, under the old swapchain
+//! (`crate::sdl::shell::park`). On macOS nothing takes it, and the window stays as it is.
 
 use std::time::Duration;
 
@@ -43,20 +52,37 @@ pub enum Drawn {
     /// The presenter can draw no more: the render thread asks the sink for a new one at its next
     /// draw (the module doc).
     Ended,
+    /// The presenter can draw no more, and its swapchain holds the window's surface for good, its
+    /// GPU device parked: the next presenter needs a new window (the module doc, "A parked
+    /// presenter").
+    Parked,
 }
 
 /// What a window's render thread presents through: the sink's, over the window's swapchain.
 pub trait Presenter: Send {
     /// Draws the display's current frame into the next image of `drawable` pixels (width,
-    /// height), over `region` of it, clearing the rest, with `cursor` over it where the window
-    /// draws the guest's cursor, and presents it. Blocks only for the next image, up to a few
-    /// frames.
+    /// height), `scale` of them a point of the window's screen, over `region` of it, clearing the
+    /// rest, with `cursor` over it where the window draws the guest's cursor, and presents it.
+    /// Blocks only for the next image, up to a few frames.
     fn draw(
         &mut self,
         drawable: (u64, u64),
+        scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> Drawn;
+}
+
+/// What draws a display's current frame into a window: `reims-vgpu`'s, over the display. It holds
+/// the display weakly: a window never keeps its display alive, except for a frame in flight, as
+/// any frame does. It draws through a presenter of its own over the window's Vulkan surface
+/// ([`FrameSink::presenter`]): of SDL's window on Linux, of the window's `CAMetalLayer` on macOS,
+/// whose swapchain takes the layer's drawables and sets the layer up for them.
+pub trait FrameSink: Send + Sync {
+    /// A presenter over `target`, the window: one that makes the window's Vulkan surface on the
+    /// sink's instance and a swapchain over it. `None` where there is none (the display has ended,
+    /// or this host has no swapchain): the window then stays empty.
+    fn presenter(&self, target: &dyn VulkanTarget) -> Option<Box<dyn Presenter>>;
 }
 
 /// What makes a window's Vulkan surface, on its render thread: on Linux SDL's window, on macOS
@@ -70,6 +96,14 @@ pub trait VulkanTarget {
         get_instance_proc_addr: vk::PFN_vkGetInstanceProcAddr,
         instance: vk::Instance,
     ) -> Option<vk::SurfaceKHR>;
+
+    /// The GPU the host's compositor composites the window on, as its DRM node's major and minor
+    /// numbers: on Linux under Wayland the main device of the window's surface's dma-buf feedback
+    /// (`native/linux/feedback.rs`). `None` where the window system does not say, as on X11,
+    /// Windows and macOS: the window then presents from the runtime's own GPU.
+    fn compositor_device(&self) -> Option<(u32, u32)> {
+        None
+    }
 }
 
 /// A render thread's presenter, made of the sink at the first draw and made again after one ends,
@@ -83,12 +117,28 @@ pub(crate) struct Presenting {
     ended: bool,
     /// The presenters made again since the last frame presented.
     renewals: Renewals,
+    /// The last presenter was parked: none is made again over its window ([`Drawn::Parked`]).
+    parked: bool,
 }
 
 impl Presenting {
-    /// Whether the next draw needs a presenter made first ([`Presenting::make`]).
+    /// Whether the next draw needs a presenter made first ([`Presenting::make`]): not after a
+    /// park, until the render thread has taken it for a new window ([`Presenting::take_parked`]).
     pub(crate) fn needs_presenter(&self) -> bool {
-        !self.ended && self.presenter.is_none()
+        !self.ended && !self.parked && self.presenter.is_none()
+    }
+
+    /// Whether the last presenter was parked, once: the render thread then has a new window
+    /// opened, over which the next presenter is made (the module doc, "A parked presenter").
+    #[cfg_attr(
+        all(not(any(target_os = "linux", target_os = "windows")), not(test)),
+        expect(
+            dead_code,
+            reason = "only the SDL thread's render thread opens a new window (Linux, Windows)"
+        )
+    )]
+    pub(crate) fn take_parked(&mut self) -> bool {
+        std::mem::take(&mut self.parked)
     }
 
     /// Makes the presenter with `make`, the sink's: where it makes none, the window stays as it
@@ -98,12 +148,13 @@ impl Presenting {
         self.ended |= self.presenter.is_none();
     }
 
-    /// Has the presenter draw the current frame into an image of `drawable` pixels over
-    /// `region`, with `cursor` over it: whether to draw again after [`RETRY`] (no image came in
-    /// time). Nothing without a presenter.
+    /// Has the presenter draw the current frame into an image of `drawable` pixels, `scale` of
+    /// them a point, over `region`, with `cursor` over it: whether to draw again after [`RETRY`]
+    /// (no image came in time). Nothing without a presenter.
     pub(crate) fn draw(
         &mut self,
         drawable: (u64, u64),
+        scale: f64,
         region: PixelRect,
         cursor: Option<&DrawnCursor>,
     ) -> bool {
@@ -113,9 +164,11 @@ impl Presenting {
         let Some(presenter) = self.presenter.as_mut() else {
             return false;
         };
-        let drawn = presenter.draw(drawable, region, cursor);
-        if drawn == Drawn::Ended {
+        let drawn = presenter.draw(drawable, scale, region, cursor);
+        if matches!(drawn, Drawn::Ended | Drawn::Parked) {
+            // A parked presenter's end leaves its objects as they are (the module doc).
             self.presenter = None;
+            self.parked = drawn == Drawn::Parked;
         }
         if !self.renewals.after(drawn) {
             log::warn!(
@@ -138,7 +191,7 @@ impl Renewals {
     fn after(&mut self, drawn: Drawn) -> bool {
         match drawn {
             Drawn::Presented => self.0 = 0,
-            Drawn::Ended => self.0 = self.0.saturating_add(1),
+            Drawn::Ended | Drawn::Parked => self.0 = self.0.saturating_add(1),
             Drawn::Nothing | Drawn::Retry => {}
         }
         self.0 <= RENEWALS
@@ -158,6 +211,7 @@ mod tests {
         fn draw(
             &mut self,
             _drawable: (u64, u64),
+            _scale: f64,
             _region: PixelRect,
             _cursor: Option<&DrawnCursor>,
         ) -> Drawn {
@@ -203,16 +257,46 @@ mod tests {
         assert!(p.needs_presenter());
         p.make(|| scripted(&[Drawn::Retry, Drawn::Presented, Drawn::Ended]));
         assert!(!p.needs_presenter());
-        assert!(p.draw((4, 4), REGION, None), "no image: a retry");
-        assert!(!p.draw((4, 4), REGION, None));
-        assert!(!p.draw((4, 4), REGION, None));
+        assert!(p.draw((4, 4), 1.0, REGION, None), "no image: a retry");
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
         assert!(p.needs_presenter(), "an ended presenter is made again");
         p.make(|| None);
         assert!(
             !p.needs_presenter(),
             "no presenter: the window stays as it is"
         );
-        assert!(!p.draw((4, 4), REGION, None));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
+    }
+
+    /// A parked presenter is let go, and no presenter is made over its window again: once the
+    /// render thread takes the park, for a new window, the next draw makes one, counted as a
+    /// renewal as an ended one is; an ended presenter, its device lost, is made again at once
+    /// over the same window
+    #[test]
+    fn a_parked_presenter_asks_for_a_new_window() {
+        let mut p = Presenting::default();
+        p.make(|| scripted(&[Drawn::Parked]));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(p.presenter.is_none(), "the parked presenter is let go");
+        assert!(!p.needs_presenter(), "none over the parked window");
+        assert!(!p.draw((4, 4), 1.0, REGION, None), "nothing draws");
+        assert!(p.take_parked(), "taken once");
+        assert!(!p.take_parked());
+        assert!(p.needs_presenter(), "the new window's presenter");
+        p.make(|| scripted(&[Drawn::Ended]));
+        assert!(!p.draw((4, 4), 1.0, REGION, None));
+        assert!(
+            !p.take_parked(),
+            "an ended presenter asks for no new window"
+        );
+        assert!(p.needs_presenter(), "made again over the same window");
+        assert_eq!(p.renewals.0, 2, "a park counts as a renewal");
+        let mut r = Renewals::default();
+        for _ in 0..RENEWALS {
+            assert!(r.after(Drawn::Parked));
+        }
+        assert!(!r.after(Drawn::Parked), "the window stays as it is");
     }
 
     /// Presenters that end too many times in a row leave the window as it is
@@ -222,7 +306,7 @@ mod tests {
         for _ in 0..=RENEWALS {
             assert!(p.needs_presenter());
             p.make(|| scripted(&[Drawn::Ended]));
-            p.draw((4, 4), REGION, None);
+            p.draw((4, 4), 1.0, REGION, None);
         }
         assert!(!p.needs_presenter());
     }

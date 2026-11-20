@@ -8,7 +8,7 @@
 #include <algorithm>
 #include <iterator>
 
-#include <os/log.h>
+#include "RgfxLog.hpp"
 
 namespace {
 uint64_t alignUp(uint64_t value, uint64_t align)
@@ -47,11 +47,26 @@ uint64_t RgfxIdSpace::allocResourceId()
 	// Every id the process holds is in use: one more chunk. The source is called
 	// with the lock held, so two threads that run out at once take one chunk.
 	const uint64_t pool = uint64_t{RGFX_RESOURCE_ID_SMALL_CHUNKS} * RGFX_RESOURCE_ID_SMALL_CHUNK;
-	const uint64_t size = m_chunkIds;
+	uint64_t size = m_chunkIds;
 	uint64_t first = 0;
 	if (m_chunkSource != nullptr) {
-		if (!m_chunkSource(m_chunkSourceContext, &first))
+		uint64_t granted = 0;
+		if (!m_chunkSource(m_chunkSourceContext, &first, &granted))
 			return 0;
+		// The chunk holds the ids its grant says, whatever size this process took the
+		// device's features to give: a process whose features query a sandbox refused took
+		// chunks of 64 where the kext granted 16, and named ids no chunk of its held
+		// (measured: Safari's WebContent on macOS 12.7.6, BadResourceId at the host).
+		if (granted != 0) {
+			if (granted % RGFX_RESOURCE_ID_SMALL_CHUNK != 0 || granted > RGFX_RESOURCE_ID_CHUNK) {
+				os_log_error(rgfxLog(),
+				             "RGFX: a resource-id chunk of %llu ids from the kext is no chunk; "
+				             "no texture",
+				             (unsigned long long)granted);
+				return 0;
+			}
+			size = granted;
+		}
 	} else {
 		if ((uint64_t{m_nextLocalChunk} + 1) * size > pool)
 			return 0;
@@ -158,7 +173,7 @@ uint64_t RgfxIdSpace::allocAddress(uint64_t size, uint64_t align)
 		uint64_t live = 0;
 		for (const auto &pick : m_livePicks)
 			live += pick.second;
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: no GPU address left for %llu bytes: %llu MiB of the context's range "
 		             "in %llu picks",
 		             (unsigned long long)size, (unsigned long long)(live >> 20),

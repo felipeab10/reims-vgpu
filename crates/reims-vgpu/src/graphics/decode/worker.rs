@@ -18,7 +18,7 @@
 //! `<name>-<i>`. A thread is started when a key's job finds none waiting, and ends once it has
 //! waited [`KEEP`] with nothing to do; a key's job wakes one waiting thread, never more, the one
 //! that went idle last, so the threads a steady load runs at once take its jobs and stay through
-//! its pauses, and those only a burst ran wait longest and go (`reims_graphics::keep`). A key
+//! its pauses, and those only a burst ran wait longest and go (`reims_vgpu_graphics::keep`). A key
 //! whose job finds every thread busy waits for the next free one, behind the keys that were
 //! waiting before it, and is counted (a cap hit, logged at debug); a thread runs a job of each
 //! waiting key in turn. Where no thread can be started, the job runs where it is handed over.
@@ -27,7 +27,12 @@
 //!   its block's or its context's still being made) are their block's, as are a released block's
 //!   views and its device cache's let-go; an over-view buffer's drop at its destroy is its
 //!   block's, or its id's where it has none. A view's mapping, let go of there wherever the
-//!   view's last hold goes, is under a key of its own (`surface_pages::TEARDOWN`).
+//!   view's last hold goes, is under a key of its own (`surface_pages::TEARDOWN`). The seal of a
+//!   group of pages blocks' views (`surface_pages`, "Group dma-bufs") is under its context's key
+//!   (`GraphicsControl::seal_group`): it waits for the group's window, at most
+//!   `surface_pages::GROUP_WINDOW`, never for another key's job, then carries out the messages
+//!   its members' jobs left it; a later message of a member's block joins them there, or waits
+//!   for them on its ring (`GraphicsControl::pages_buffers`), never on the worker.
 //! - The ICB worker's (`reims-vgpu.icb-create-<i>`) key is the buffer's context: a process's
 //!   `ICB_CREATE`s are made in its ring order, other processes' beside them.
 //! - The closes' worker's (`reims-vgpu.graphics-closes-<i>`) key is the closed context: a
@@ -61,9 +66,9 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 
-use reims_graphics::keep::{KEEP, Keep};
-use reims_vgpu_core::platform::os::MonoTime;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_graphics::keep::{KEEP, Keep};
+use reims_vgpu_vulkan::core::platform::os::MonoTime;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 /// The most threads a [`Worker`] runs.
 pub(crate) const POOL_THREADS: usize = 4;
@@ -532,7 +537,7 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use reims_graphics::keep::TestClock;
+    use reims_vgpu_graphics::keep::TestClock;
 
     use super::*;
 
@@ -701,15 +706,10 @@ mod tests {
         );
     }
 
-    /// Waits about 10 s for `done`.
+    /// Waits for `done` as the graphics tests wait ([`crate::graphics::tests::eventually`]),
+    /// failing with `what` where it never came.
     fn until(what: &str, done: impl Fn() -> bool) {
-        for _ in 0..10_000 {
-            if done() {
-                return;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        panic!("{what}");
+        assert!(crate::graphics::tests::eventually(done), "{what}");
     }
 
     /// A worker whose threads wait [`KEEP`] of `clock`'s time for a job.

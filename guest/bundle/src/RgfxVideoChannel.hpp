@@ -31,12 +31,24 @@ namespace rgfx::video {
 /// or the host's hardware lacks the codec.
 const RgfxVideoCodecCaps *hostCodec(uint32_t codec, uint32_t direction);
 
+/// What the host's decoder of `codec` refuses beyond its caps (RgfxVideoCaps::decode): the
+/// narrowest HEVC tile column it decodes. All zero where it names no bound, the process has no
+/// device of ours, or the host lacks the codec.
+RgfxVideoDecodeCaps decodeCaps(uint32_t codec);
+
 /// The least alignment, in bytes, of the first byte and the row pitch of each plane of an output
 /// surface of samples of `sampleBytes` bytes (1: NV12, 2: P010): the larger of the alignment the
 /// process's device takes for a linear texture of each plane's format, as the textures the decode
 /// lands through are, and the 4 bytes of the host's copy into the planes. 0 where the process has
 /// no device of ours, or for another sample size.
 uint32_t outputPlaneAlignment(uint32_t sampleBytes);
+
+/// How the host lands a decode of `codec` in place, in an output surface's planes
+/// (RgfxVideoCaps::layouts): the granularity it writes whole coded rows and columns in, and the
+/// alignment of the planes it writes so. All zero where the host lands the codec's pictures by a
+/// copy of their crop alone, the layout is past what a surface takes, or the process has no device
+/// of ours.
+RgfxVideoOutputLayout outputLayout(uint32_t codec);
 
 /// A session on the host, its queue, and the textures it made over output surfaces.
 struct Session;
@@ -62,6 +74,8 @@ void forgetOutputs(Session *session);
 /// textures over the whole planes; at its place for an HEIF grid's tile in its canvas, through
 /// textures of its crop there, which lies inside the planes. A place off (0, 0) is of even
 /// samples, and each plane's first byte there is at the alignment outputPlaneAlignment answers.
+/// For a frame of its own, the op names the rows the surface's planes hold (output_rows), which
+/// the host may decode the whole coded picture into in place (outputLayout).
 struct Decode {
 	const uint8_t *bytes;
 	size_t size;
@@ -78,6 +92,12 @@ void *decode(Session *session, const Decode &decode);
 
 /// Where the work `token` names is: 0 running, 1 done, -1 failed.
 int tokenStatus(void *token);
+
+/// Waits until the work `token` names is done, and says how it went: 1 done, -1 failed.
+int waitToken(void *token);
+
+/// Holds `token` once more, until a releaseToken of it: `token` (null: nothing).
+void *retainToken(void *token);
 
 /// Lets go of `token` (null: nothing).
 void releaseToken(void *token);

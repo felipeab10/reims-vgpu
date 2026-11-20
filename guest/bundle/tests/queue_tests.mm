@@ -9,6 +9,7 @@
 #import <Foundation/Foundation.h>
 #import <IOSurface/IOSurface.h>
 #import <Metal/Metal.h>
+#import <objc/message.h>
 
 #include <algorithm>
 #include <atomic>
@@ -29,10 +30,14 @@
 
 #import "RgfxBuffer.h"
 #import "RgfxCommandObjects.h"
+#import "RgfxEvent.h"
+#import "RgfxFunction.h"
 #import "RgfxIOSurface.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxResidencySet.h"
 #import "RgfxResource.h"
 #import "RgfxSharedEvent.h"
+#import "RgfxUnsupported.h"
 
 #include "RgfxCompletionThread.hpp"
 #include "RgfxObjectModel.hpp"
@@ -58,6 +63,183 @@ int rgfxQueueTimings(int rounds);
 @end
 
 @implementation QueueTestHandle
+@end
+
+// A handle that answers its pixel format, as a fill from a color asks the texture's.
+@interface QueueTestFormatHandle : QueueTestHandle
+@end
+
+@implementation QueueTestFormatHandle
+- (MTLPixelFormat)pixelFormat
+{
+	return MTLPixelFormatBGRA8Unorm;
+}
+@end
+
+// A handle that answers the resource SPI as the bundle's buffers and textures do
+// (RGFX_RESOURCE_SPI).
+@interface QueueTestSpiHandle : QueueTestHandle
+- (BOOL)isComplete;
+- (BOOL)isWriteComplete;
+- (void)waitUntilComplete;
+@end
+
+@implementation QueueTestSpiHandle
+RGFX_RESOURCE_SPI
+@end
+
+// The command-buffer SPI the guest's frameworks send (MTLCommandBufferSPI), as the AMD 5300M's and
+// the Intel 630's buffers answer it.
+@protocol QueueTestCommandBufferSPI
+- (void)__waitUntilScheduledAsync:(void (^)(id<MTLCommandBuffer>))block;
+- (void)__waitUntilCompletedAsync:(void (^)(id<MTLCommandBuffer>))block;
+- (id)privateData;
+- (void)setPrivateData:(id)privateData;
+- (NSUInteger)privateDataOffset;
+- (void)setPrivateDataOffset:(NSUInteger)offset;
+- (id)privateLoggingBuffer;
+- (void)setPrivateLoggingBuffer:(id)buffer;
+- (BOOL)sharedIndirectionTable;
+- (void)setSharedIndirectionTable:(BOOL)shared;
+- (BOOL)isProfilingEnabled;
+- (void)setProfilingEnabled:(BOOL)enabled;
+- (NSDictionary *)profilingResults;
+- (NSUInteger)getListIndex;
+- (id)deadlineProfile;
+- (void *)debugBufferContentsWithLength:(NSUInteger *)length;
+- (void)setLogs:(id)logs;
+- (id)sampledBlitCommandEncoder:(uintptr_t)programInfoBuffer capacity:(NSUInteger)capacity;
+- (id)sampledComputeCommandEncoderWithProgramInfoBuffer:(uintptr_t)programInfoBuffer
+                                               capacity:(NSUInteger)capacity;
+- (void)configWithCommandBufferDescriptor:(MTLCommandBufferDescriptor *)descriptor;
+- (void)setResponsibleTaskIDs:(const int *)taskIDs count:(NSUInteger)count;
+- (void)useInternalResidencySet:(id)residencySet;
+- (void)useInternalResidencySets:(const id _Nonnull[_Nonnull])residencySets count:(NSUInteger)count;
+@end
+
+// The command-buffer SPI an Apple GPU's buffers answer, and an arm64 guest's.
+@protocol QueueTestScheduledSignalSPI
+- (void)encodeSignalEventScheduled:(id<MTLEvent>)event value:(uint64_t)value;
+@end
+
+// The command-queue SPI members the queue answers (RgfxCommandQueue, MTLCommandQueueSPI).
+@protocol QueueTestCommandQueueSPI
+- (NSUInteger)qosLevel;
+- (dispatch_queue_t)commitQueue;
+- (BOOL)commitSynchronously;
+- (BOOL)commitsWithQoS;
+- (BOOL)disableCrossQueueHazardTracking;
+- (BOOL)isOpenGLQueue;
+- (dispatch_queue_t)completionQueue;
+- (int)backgroundTrackingPID;
+- (void)setBackgroundTrackingPID:(int)pid;
+- (BOOL)executionEnabled;
+- (BOOL)skipRender;
+- (BOOL)isProfilingEnabled;
+- (void)setProfilingEnabled:(BOOL)enabled;
+- (BOOL)isStatEnabled;
+- (void)setStatOptions:(NSUInteger)options;
+- (void)setStatLocations:(NSUInteger)locations;
+- (NSUInteger)StatOptions;
+- (NSUInteger)getStatOptions;
+- (NSUInteger)StatLocations;
+- (NSUInteger)getStatLocations;
+- (NSUInteger)numRequestedCounters;
+- (void)setNumRequestedCounters:(NSUInteger)count;
+- (NSUInteger)numInternalSampleCounters;
+- (void)setNumInternalSampleCounters:(NSUInteger)count;
+- (NSMutableDictionary *)counterInfo;
+- (void)setCounterInfo:(NSMutableDictionary *)info;
+- (NSArray *)availableCounters;
+- (NSArray *)getRequestedCounters;
+- (int)requestCounters:(NSArray *)counters;
+- (NSArray *)subdivideCounterList:(NSArray *)list;
+- (void)dispatchAvailableCompletionNotifications;
+- (void)finish;
+@end
+
+// The setters of Metal's queue descriptor's internal subclass, which the Mac's descriptor is.
+@protocol QueueTestQueueDescriptorSPI
+- (void)setQosLevel:(NSUInteger)level;
+- (void)setCommitQueue:(dispatch_queue_t)queue;
+- (void)setCommitSynchronously:(BOOL)value;
+- (void)setCommitsWithQoS:(BOOL)value;
+- (void)setDisableCrossQueueHazardTracking:(BOOL)value;
+- (void)setIsOpenGLQueue:(BOOL)value;
+- (void)setCompletionQueue:(dispatch_queue_t)queue;
+@end
+
+// The members of Metal's encoders' SPI the bundle's encoders answer (src/RgfxCommandObjects.mm).
+@protocol QueueTestEncoderSPI
+- (id)endEncodingAndRetrieveProgramAddressTable;
+- (void)insertSplit;
+@end
+@protocol QueueTestRenderEncoderSPI <QueueTestEncoderSPI>
+- (void)addSplitHandler:(void (^)(void))handler;
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer
+                          atIndex:(NSUInteger)index
+                           stages:(NSUInteger)stages;
+- (void)setVertexAmplificationMode:(NSUInteger)mode value:(NSUInteger)value;
+@end
+@protocol QueueTestComputeEncoderSPI <QueueTestEncoderSPI>
+- (void)encodeStartIf:(id<MTLBuffer>)buffer
+                offset:(NSUInteger)offset
+            comparison:(MTLCompareFunction)comparison
+        referenceValue:(uint32_t)referenceValue;
+- (void)encodeStartElse;
+- (BOOL)encodeEndIf;
+- (void)encodeStartDoWhile;
+- (BOOL)encodeEndDoWhile:(id<MTLBuffer>)buffer
+                  offset:(NSUInteger)offset
+              comparison:(MTLCompareFunction)comparison
+          referenceValue:(uint32_t)referenceValue;
+- (void)setThreadgroupDistributionMode:(NSInteger)mode;
+- (void)setThreadgroupDistributionModeWithClusterGroupIndex:(uint32_t)index;
+- (void)setThreadgroupPackingDisabled:(BOOL)disabled;
+- (void)setToolsDispatchBufferSPI:(NSUInteger)buffer atIndex:(NSUInteger)index;
+- (id)newKernelDebugInfo;
+@end
+@protocol QueueTestBlitEncoderSPI <QueueTestEncoderSPI>
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture;
+- (void)invalidateCompressedTexture:(id<MTLTexture>)texture
+                              slice:(NSUInteger)slice
+                              level:(NSUInteger)level;
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor;
+- (void)optimizeContentsForTexture:(id<MTLTexture>)texture
+                 readAccessPattern:(NSInteger)readAccessPattern
+                      readAccessor:(NSInteger)readAccessor
+                             slice:(NSUInteger)slice
+                             level:(NSUInteger)level;
+- (void)fillBuffer:(id<MTLBuffer>)buffer range:(NSRange)range pattern4:(uint32_t)pattern;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              bytes:(const void *)bytes
+             length:(NSUInteger)length;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color;
+- (void)fillTexture:(id<MTLTexture>)texture
+              level:(NSUInteger)level
+              slice:(NSUInteger)slice
+             region:(MTLRegion)region
+              color:(MTLClearColor)color
+        pixelFormat:(MTLPixelFormat)pixelFormat;
+@end
+@protocol QueueTestParallelEncoderSPI <QueueTestEncoderSPI>
+- (id)sampledRenderCommandEncoderWithProgramInfoBuffer:(void *)programInfoBuffer
+                                               capacity:(NSUInteger)capacity;
+- (BOOL)separateCommits;
+- (void)setSeparateCommits:(BOOL)separateCommits;
+@end
+// The function SPI member every x86 Mac's function ends the process at.
+@protocol QueueTestFunctionSPI
+- (id)functionHandle;
 @end
 
 namespace {
@@ -269,6 +451,163 @@ void test_encoder_keeps_its_buffer_until_it_ends()
 	CHECK(weakCB == nil);
 }
 
+// Whether `body` raises an unrecognized selector, as Metal's base encoders do for the SPI members
+// they leave to their subclasses.
+bool raisesUnrecognized(void (^body)(void))
+{
+	@try {
+		body();
+	} @catch (NSException *e) {
+		return [e.name isEqualToString:NSInvalidArgumentException] &&
+		       [e.reason containsString:@"unrecognized selector"];
+	}
+	return false;
+}
+
+// The encoders' SPI members (src/RgfxCommandObjects.mm): what Metal's base encoders raise an
+// unrecognized selector for, these raise; the ones that end an encoding end it, answering no
+// program address table, and so release the buffer, as endEncoding does; the conditionals and
+// loops the GPU would evaluate close as none was open; a split handler is never called; and a
+// parallel pass makes no sampling sub-encoder.
+void test_encoder_spi_members()
+{
+	Queue q;
+	auto ends = [&](id (^make)(id<MTLCommandBuffer>)) {
+		__weak id<MTLCommandBuffer> weakCB = nil;
+		id enc = nil;
+		@autoreleasepool {
+			id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+			weakCB = cb;
+			enc = make(cb);
+		}
+		CHECK(weakCB != nil);
+		id table = @"not asked";
+		@autoreleasepool {
+			table = [(id<QueueTestEncoderSPI>)enc endEncodingAndRetrieveProgramAddressTable];
+		}
+		CHECK(table == nil);
+		CHECK(weakCB == nil);
+	};
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb renderCommandEncoderWithDescriptor:pass()];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb computeCommandEncoder];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb blitCommandEncoder];
+	});
+	ends(^id(id<MTLCommandBuffer> cb) {
+		return [cb parallelRenderCommandEncoderWithDescriptor:pass()];
+	});
+
+	@autoreleasepool {
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestRenderEncoderSPI> render =
+		    (id<QueueTestRenderEncoderSPI>)[cb renderCommandEncoderWithDescriptor:pass()];
+		__block bool called = false;
+		[render addSplitHandler:^{
+			called = true;
+		}];
+		CHECK(raisesUnrecognized(^{
+			[render insertSplit];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[render setToolsDispatchBufferSPI:0 atIndex:0 stages:1];
+		}));
+		[render setVertexAmplificationMode:1 value:2];
+		[(id<MTLRenderCommandEncoder>)render endEncoding];
+		CHECK(!called);
+
+		id<QueueTestComputeEncoderSPI> compute =
+		    (id<QueueTestComputeEncoderSPI>)[cb computeCommandEncoder];
+		[compute encodeStartIf:handle(7) offset:0 comparison:MTLCompareFunctionEqual referenceValue:1];
+		[compute encodeStartElse];
+		CHECK(![compute encodeEndIf]);
+		[compute encodeStartDoWhile];
+		CHECK(![compute encodeEndDoWhile:handle(7)
+		                          offset:0
+		                      comparison:MTLCompareFunctionEqual
+		                  referenceValue:1]);
+		[compute setThreadgroupDistributionMode:1];
+		[compute setThreadgroupDistributionModeWithClusterGroupIndex:2];
+		CHECK(raisesUnrecognized(^{
+			[compute setThreadgroupPackingDisabled:YES];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[compute setToolsDispatchBufferSPI:0 atIndex:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[compute insertSplit];
+		}));
+		CHECK([compute newKernelDebugInfo] == nil);
+		[(id<MTLComputeCommandEncoder>)compute endEncoding];
+
+		id<QueueTestBlitEncoderSPI> blit = (id<QueueTestBlitEncoderSPI>)[cb blitCommandEncoder];
+		id<MTLTexture> texture = (id<MTLTexture>)handle(42);
+		CHECK(raisesUnrecognized(^{
+			[blit invalidateCompressedTexture:texture];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit invalidateCompressedTexture:texture slice:0 level:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit optimizeContentsForTexture:texture readAccessPattern:0 readAccessor:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit optimizeContentsForTexture:texture readAccessPattern:0 readAccessor:0 slice:0 level:0];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit insertSplit];
+		}));
+		// Each fill raises, those from a color at the fill from bytes they come to.
+		const MTLRegion region = MTLRegionMake2D(0, 0, 1, 1);
+		const uint32_t word = 0;
+		CHECK(raisesUnrecognized(^{
+			[blit fillBuffer:(id<MTLBuffer>)handle(43) range:NSMakeRange(0, 4) pattern4:7];
+		}));
+		CHECK(raisesUnrecognized(^{
+			[blit fillTexture:texture level:0 slice:0 region:region bytes:&word length:4];
+		}));
+		id<MTLTexture> formatted = (id<MTLTexture>)[[QueueTestFormatHandle alloc] initWithObjId:44
+		                                                                                 device:nil
+		                                                                             serializer:nullptr];
+		for (int withFormat = 0; withFormat < 2; withFormat++) {
+			NSString *reason = nil;
+			@try {
+				if (withFormat)
+					[blit fillTexture:formatted
+					            level:0
+					            slice:0
+					           region:region
+					            color:MTLClearColorMake(1, 0, 0, 1)
+					      pixelFormat:MTLPixelFormatBGRA8Unorm];
+				else
+					[blit fillTexture:formatted
+					            level:0
+					            slice:0
+					           region:region
+					            color:MTLClearColorMake(1, 0, 0, 1)];
+			} @catch (NSException *e) {
+				reason = e.reason;
+			}
+			CHECK([reason containsString:@"fillTexture:level:slice:region:bytes:length:"]);
+		}
+		[(id<MTLBlitCommandEncoder>)blit endEncoding];
+
+		id<QueueTestParallelEncoderSPI> parallel =
+		    (id<QueueTestParallelEncoderSPI>)[cb parallelRenderCommandEncoderWithDescriptor:pass()];
+		CHECK([parallel sampledRenderCommandEncoderWithProgramInfoBuffer:nullptr capacity:0] == nil);
+		CHECK(![parallel separateCommits]);
+		[parallel setSeparateCommits:YES];
+		CHECK(![parallel separateCommits]);
+		CHECK(raisesUnrecognized(^{
+			[parallel insertSplit];
+		}));
+		[(id<MTLParallelRenderCommandEncoder>)parallel endEncoding];
+	}
+}
+
 // Runs the case `name` of rgfxQueueDiesCase in a process of its own: it must end the process
 // (SIGABRT) with `words` on stderr.
 void checkDies(const char *name, const char *words)
@@ -334,6 +673,9 @@ void test_handlers_after_commit_end_the_process()
 	checkDies("scheduled-after-commit", scheduled);
 	checkDies("scheduled-after-completion", scheduled);
 	checkDies("present-after-commit", scheduled);
+	// A function's functionHandle, as Metal's base function's on every x86 Mac.
+	checkDies("function-handle",
+	          "-[_MTLFunction functionHandle]: failed assertion `Driver needs to override this'");
 
 	// Added before the commit, each runs once, in the order added.
 	Queue q(true);
@@ -872,16 +1214,101 @@ void test_submitted_waits_for_the_buffers_before()
 				taken++;
 			}
 		});
+		// The wait is counted from before a's commit is scheduled, so it is at least the 50 ms
+		// before it however late this thread gets to the call.
+		const auto start = std::chrono::steady_clock::now();
 		std::thread late([a] {
 			std::this_thread::sleep_for(std::chrono::milliseconds(50));
 			[a commit];
 		});
-		const auto start = std::chrono::steady_clock::now();
 		CHECK([(id<MTLCommandBufferSPI>)b commitAndWaitUntilSubmitted]);
 		CHECK(std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(40));
 		late.join();
 		host.join();
 		CHECK((order == std::vector<uint64_t>{objId(a), objId(b)}));
+	}
+}
+
+// A resource answers isComplete and isWriteComplete NO, and its waitUntilComplete waits, while a
+// command buffer that names it is submitted and its completion is yet to be taken: the Intel
+// 630's answers once the buffer is scheduled, for any use (docs/graphics-kext/dgpu-oracle.md,
+// Q26). Before (encoded, or committed and not yet submitted) it answers YES at once, as all three
+// Macs do, and so does a resource no buffer in flight names. Apple's GL renderer reads a texture
+// back with getBytes: after its waitUntilComplete, behind a draw committed on another queue with
+// unretained references, as this one is: answered at once, the read saw the texture as it was
+// before the draw (macOS 11.7.11's Safari WebGL on a 780M host). The wait ends at the
+// completion's take, not behind an earlier buffer's handler on its queue, as the 630's returns
+// with the buffer still Scheduled.
+void test_resources_wait_for_their_buffers_in_flight()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		auto spiHandle = [](uint64_t objId) {
+			return [[QueueTestSpiHandle alloc] initWithObjId:objId device:nil serializer:nullptr];
+		};
+		auto draw = [](id<MTLCommandBuffer> cb, id<MTLTexture> target) {
+			MTLRenderPassDescriptor *rp = [MTLRenderPassDescriptor renderPassDescriptor];
+			rp.colorAttachments[0].texture = target;
+			[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+		};
+		QueueTestSpiHandle *drawn = spiHandle(51), *other = spiHandle(52);
+		id<MTLCommandBuffer> cb = [q.queue commandBufferWithUnretainedReferences];
+		draw(cb, (id<MTLTexture>)drawn);
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		[cb commit];
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		[cb waitUntilScheduled];
+		CHECK(![drawn isComplete] && ![drawn isWriteComplete]);
+		CHECK([other isComplete] && [other isWriteComplete]);
+		[other waitUntilComplete];
+		std::atomic<bool> waited{false};
+		dispatch_semaphore_t done = dispatch_semaphore_create(0);
+		std::thread waiter([&] {
+			[drawn waitUntilComplete];
+			waited.store(true);
+			dispatch_semaphore_signal(done);
+		});
+		CHECK(waitFor(done, 0.1) != 0 && !waited.load());
+		hostComplete(q, *driven.kext, seqno, cb);
+		CHECK(waitFor(done, 5) == 0);
+		waiter.join();
+		CHECK([drawn isComplete] && [drawn isWriteComplete]);
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+
+		// Behind a buffer of its queue whose completed handler has not returned, the wait ends at
+		// the take of its own buffer's completion, with that buffer not yet complete.
+		dispatch_semaphore_t release = dispatch_semaphore_create(0);
+		id<MTLCommandBuffer> first = [q.queue commandBuffer];
+		[first addCompletedHandler:^(id<MTLCommandBuffer>) {
+			dispatch_semaphore_wait(release, DISPATCH_TIME_FOREVER);
+		}];
+		[first commit];
+		const uint64_t firstSeqno = nextSeqno(q);
+		id<MTLCommandBuffer> second = [q.queue commandBuffer];
+		draw(second, (id<MTLTexture>)drawn);
+		[second commit];
+		const uint64_t secondSeqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, firstSeqno, first);
+		hostScheduled(q, *driven.kext, secondSeqno, second);
+		[second waitUntilScheduled];
+		CHECK(![drawn isComplete]);
+		hostComplete(q, *driven.kext, firstSeqno, first);
+		hostComplete(q, *driven.kext, secondSeqno, second);
+		std::thread late([&] {
+			[drawn waitUntilComplete];
+			dispatch_semaphore_signal(done);
+		});
+		CHECK(waitFor(done, 5) == 0);
+		late.join();
+		CHECK(second.status != MTLCommandBufferStatusCompleted);
+		dispatch_semaphore_signal(release);
+		[second waitUntilCompleted];
+		CHECK(first.status == MTLCommandBufferStatusCompleted &&
+		      second.status == MTLCommandBufferStatusCompleted);
 	}
 }
 
@@ -930,7 +1357,7 @@ struct Blocks {
 };
 
 // The process's one chunk of resource ids, for the textures a test makes.
-bool oneIdChunk(void *context, uint64_t *first)
+bool oneIdChunk(void *context, uint64_t *first, uint64_t *ids)
 {
 	int *calls = static_cast<int *>(context);
 	if ((*calls)++ != 0)
@@ -967,7 +1394,8 @@ void test_in_place_writes_retire_at_the_take()
 		IOSurfaceRef copied = nullptr;
 		std::vector<uint8_t> copiedAtRetire;
 		static RgfxRegion::PagesAnswer pages(void *c, const void *, uint64_t, uint64_t,
-		                                     uint32_t surfaceId, bool, uint64_t *offset,
+		                                     uint32_t surfaceId, bool,
+		                                     const RgfxSurfacePagesLayout *, uint64_t *offset,
 		                                     uint64_t *serial, bool *fresh, bool *cached)
 		{
 			Source *src = static_cast<Source *>(c);
@@ -1266,10 +1694,11 @@ void test_no_copy_write_backs_land_at_the_take()
 }
 
 // A command buffer let go with no completion gives back the region block its message lies in, as
-// its completion does: one encoded past what its queue's ring takes and never committed, and one
-// posted out of line on a queue whose completion ring nothing reads. Buffer after buffer reuse
-// one block, and the queue's going gives it back to the region. (A buffer let go so used to keep
-// its block, and the region lost one a buffer.)
+// its completion does: one posted out of line on a queue whose completion ring nothing reads.
+// Buffer after buffer reuse one block, and the queue's going gives it back to the region; one
+// encoded past what its queue's ring takes and never committed takes none, its message copied
+// into a block only at the commit. (A buffer let go so used to keep its block, and the region
+// lost one a buffer.)
 void test_buffers_let_go_give_their_blocks_back()
 {
 	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
@@ -1299,7 +1728,7 @@ void test_buffers_let_go_give_their_blocks_back()
 				(void)encode();
 			}
 		}
-		CHECK(blocks.made <= 1);
+		CHECK(blocks.made == 0);
 		for (int i = 0; i < n; i++) {
 			@autoreleasepool {
 				id<MTLCommandBuffer> cb = encode();
@@ -1318,10 +1747,24 @@ void test_buffers_let_go_give_their_blocks_back()
 
 } // namespace
 
+#if defined(__arm64__)
+int rgfxQueueDiesScheduledPlain();
+#endif
+
 int rgfxQueueDiesCase(const char *name)
 {
+#if defined(__arm64__)
+	if (std::strcmp(name, "scheduled-signal-plain") == 0)
+		return rgfxQueueDiesScheduledPlain();
+#endif
 	signal(SIGABRT, [](int) { _exit(kAborted); });
 	@autoreleasepool {
+		if (std::strcmp(name, "function-handle") == 0) {
+			// It ends the process before anything of the function is read.
+			id function = [RgfxFunction alloc];
+			[(id<QueueTestFunctionSPI>)function functionHandle];
+			return 0;
+		}
 		Queue q(true);
 		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
 		if (std::strcmp(name, "enqueue-twice") == 0) {
@@ -1360,6 +1803,21 @@ int rgfxQueueDiesCase(const char *name)
 	}
 	return 0;
 }
+
+#if defined(__arm64__)
+// A scheduled signal of a plain event, on a buffer not yet committed: it ends the process.
+int rgfxQueueDiesScheduledPlain()
+{
+	signal(SIGABRT, [](int) { _exit(kAborted); });
+	@autoreleasepool {
+		Queue q(true);
+		id<MTLCommandBuffer> cb = [q.queue commandBufferWithUnretainedReferences];
+		RgfxEvent *plain = [RgfxEvent eventWithDevice:nil serializer:&q.ser];
+		[(id<QueueTestScheduledSignalSPI>)cb encodeSignalEventScheduled:plain value:1];
+	}
+	return 0;
+}
+#endif
 
 // A command buffer's signal of a shared event that the host posts while the buffer runs, ahead of
 // its CB_SCHEDULED, reaches the process through the completion thread: a thread waiting on the
@@ -1512,10 +1970,630 @@ int rgfxQueueTimings(int rounds)
 	return 0;
 }
 
+namespace {
+
+// The waits Metal's Swift overlay awaits (scheduled(), completed()): a block given before the
+// buffer gets there runs after its handlers of that stage, in the order given, on the queue's
+// completion queue; one given after runs at once, on the caller's thread.
+void test_async_waits_run_after_their_handlers()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		std::mutex lock;
+		std::mutex *logLock = &lock;
+		std::vector<std::string> log;
+		std::vector<std::string> *logp = &log;
+		auto note = [logLock, logp](const char *what) {
+			std::lock_guard<std::mutex> hold(*logLock);
+			logp->push_back(what);
+		};
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestCommandBufferSPI> spi = (id<QueueTestCommandBufferSPI>)cb;
+		CHECK([cb respondsToSelector:@selector(__waitUntilScheduledAsync:)] &&
+		      [cb respondsToSelector:@selector(__waitUntilCompletedAsync:)]);
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			CHECK(x == cb && x.status == MTLCommandBufferStatusCompleted);
+			note("wc1");
+		}];
+		[spi __waitUntilScheduledAsync:^(id<MTLCommandBuffer> x) {
+			CHECK(x == cb);
+			note("ws1");
+		}];
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("s");
+		}];
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("c");
+		}];
+		[cb commit];
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			note("wc2");
+		}];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		for (int i = 0; i < 5000; i++) {
+			{
+				std::lock_guard<std::mutex> hold(lock);
+				if (log.size() >= 5)
+					break;
+			}
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		}
+		{
+			std::lock_guard<std::mutex> hold(lock);
+			std::vector<std::string> want = {"s", "ws1", "c", "wc1", "wc2"};
+			CHECK(log == want);
+		}
+		bool ranHere = false;
+		bool *ranp = &ranHere;
+		[spi __waitUntilScheduledAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			*ranp = true;
+		}];
+		CHECK(ranHere);
+		ranHere = false;
+		[spi __waitUntilCompletedAsync:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			*ranp = true;
+		}];
+		CHECK(ranHere);
+	}
+}
+
+// Whether `body` raises the NSInvalidArgumentException of a counted set given nil to insert, as
+// Metal's queue and command buffer raise at a nil residency set (measured: the M3 Max, macOS
+// 27.0.1, oracle_residency).
+bool raisesInsertingNil(void (^body)(void))
+{
+	@try {
+		body();
+	} @catch (NSException *e) {
+		return [e.name isEqualToString:NSInvalidArgumentException] &&
+		       [e.reason isEqualToString:@"*** -[NSCountedSet addObject:]: attempt to insert nil"];
+	}
+	return false;
+}
+
+// The SPI's state a buffer keeps, as Metal's base buffer keeps it, and the answers a fresh buffer
+// of the AMD 5300M's and the Intel 630's gives; profilingResults times each stage the buffer
+// reached while profiling was enabled, under Metal's keys.
+void test_command_buffer_spi_state()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		id<QueueTestCommandBufferSPI> spi = (id<QueueTestCommandBufferSPI>)cb;
+		CHECK(spi.privateData == nil && spi.privateDataOffset == 0 && spi.privateLoggingBuffer == nil);
+		CHECK(!spi.sharedIndirectionTable && !spi.isProfilingEnabled && spi.profilingResults == nil);
+		CHECK(spi.getListIndex == 0 && spi.deadlineProfile == nil);
+		NSUInteger length = 7;
+		CHECK([spi debugBufferContentsWithLength:&length] == nullptr && length == 0);
+		CHECK([spi sampledBlitCommandEncoder:0 capacity:16] == nil &&
+		      [spi sampledComputeCommandEncoderWithProgramInfoBuffer:0 capacity:16] == nil);
+		NSObject *data = [NSObject new];
+		spi.privateData = data;
+		spi.privateDataOffset = 48;
+		spi.privateLoggingBuffer = data;
+		spi.sharedIndirectionTable = YES;
+		CHECK(spi.privateData == data && spi.privateDataOffset == 48 &&
+		      spi.privateLoggingBuffer == data && spi.sharedIndirectionTable);
+		NSArray *logs = @[];
+		[spi setLogs:logs];
+		CHECK((id)cb.logs == logs);
+		[spi configWithCommandBufferDescriptor:[MTLCommandBufferDescriptor new]];
+		const int tasks[] = {1, 2};
+		[spi setResponsibleTaskIDs:tasks count:2];
+		// Metal's own residency sets are used as the caller's: none, and nothing logged; nil
+		// raises where the device makes sets, as on the M3 Max (oracle_residency's
+		// cb-use-internal-nil).
+		id noSets[1] = {nil};
+		[spi useInternalResidencySets:noSets count:0];
+#if RgfxMakesResidencySets
+		CHECK(raisesInsertingNil(^{
+			[spi useInternalResidencySet:nil];
+		}));
+#else
+		[spi useInternalResidencySet:nil];
+#endif
+		CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySet:)) &&
+		      !RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySets:count:)));
+		[spi setProfilingEnabled:YES];
+		CHECK(spi.isProfilingEnabled);
+		[cb commit];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		NSDictionary *results = spi.profilingResults;
+		NSArray *keys = @[
+			@"MTLCommandBufferCreationTime", @"MTLCommandBufferEnqueueTime", @"MTLCommandBufferCommitTime",
+			@"MTLCommandBufferSubmitToKernelTime", @"MTLCommandBufferKernelScheduledTime",
+			@"MTLCommandBufferSubmitToHWTime", @"MTLCommandBufferCompletionInterruptTime",
+			@"MTLCommandBufferKernelCompleteTime", @"MTLCommandBufferCompletionHandlerEnqueueTime",
+			@"MTLCommandBufferCompletionHandlerExecutionTime"
+		];
+		CHECK(results.count == keys.count);
+		uint64_t last = 0;
+		for (NSString *key in keys) {
+			const uint64_t at = [results[key] unsignedLongLongValue];
+			CHECK(at != 0 && at >= last);
+			last = at;
+		}
+	}
+}
+
+// The SPI's state a queue keeps, as Metal's base queue keeps it, and what a fresh queue of the AMD
+// 5300M's and the Intel 630's answers; buffers made once the queue profiles profile, as Metal's
+// take the switch from their queue as they are made.
+void test_command_queue_spi_state()
+{
+	@autoreleasepool {
+		Queue q(true);
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		CHECK(spi.qosLevel == 2 && spi.commitQueue == nil && !spi.commitSynchronously &&
+		      !spi.commitsWithQoS && !spi.disableCrossQueueHazardTracking && !spi.isOpenGLQueue);
+		CHECK(spi.backgroundTrackingPID == getpid() && spi.executionEnabled && !spi.skipRender);
+		CHECK(!spi.isProfilingEnabled && !spi.isStatEnabled && spi.StatOptions == 0 &&
+		      spi.getStatLocations == 0 && spi.numRequestedCounters == 0 &&
+		      spi.numInternalSampleCounters == 0 && spi.counterInfo == nil);
+		CHECK(spi.availableCounters != nil && spi.availableCounters.count == 0 &&
+		      spi.getRequestedCounters == nil && [spi requestCounters:@[ @"counter" ]] == -1);
+		NSArray *list = @[ @"a", @"b" ];
+		NSArray *lists = [spi subdivideCounterList:list];
+		CHECK(lists.count == 1 && lists[0] == list);
+		[spi dispatchAvailableCompletionNotifications];
+		spi.backgroundTrackingPID = 7;
+		[spi setStatOptions:3];
+		[spi setStatLocations:5];
+		spi.numRequestedCounters = 2;
+		spi.numInternalSampleCounters = 4;
+		NSMutableDictionary *info = [NSMutableDictionary dictionary];
+		spi.counterInfo = info;
+		CHECK(spi.backgroundTrackingPID == 7 && spi.StatOptions == 3 && spi.getStatOptions == 3 &&
+		      spi.StatLocations == 5 && spi.getStatLocations == 5 && spi.numRequestedCounters == 2 &&
+		      spi.numInternalSampleCounters == 4 && spi.counterInfo == info);
+		id<MTLCommandBuffer> before = [q.queue commandBuffer];
+		[spi setProfilingEnabled:YES];
+		id<MTLCommandBuffer> after = [q.queue commandBuffer];
+		CHECK(spi.isProfilingEnabled);
+		CHECK(![(id<QueueTestCommandBufferSPI>)before isProfilingEnabled] &&
+		      [(id<QueueTestCommandBufferSPI>)after isProfilingEnabled]);
+	}
+}
+
+// What a descriptor names beyond the command buffer count the queue takes, as Metal's base queue
+// does: its quality of service, its commit queue and switches, and its completion queue, where
+// its buffers' handlers then run.
+void test_queue_takes_its_descriptor()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		MTLCommandQueueDescriptor *descriptor = [MTLCommandQueueDescriptor new];
+		CHECK([descriptor respondsToSelector:@selector(setQosLevel:)] &&
+		      [descriptor respondsToSelector:@selector(setIsOpenGLQueue:)] &&
+		      [descriptor respondsToSelector:@selector(setCompletionQueue:)]);
+		id<QueueTestQueueDescriptorSPI> named = (id<QueueTestQueueDescriptorSPI>)descriptor;
+		dispatch_queue_t commits = dispatch_queue_create("queue-test.commits", DISPATCH_QUEUE_SERIAL);
+		dispatch_queue_t completions =
+		    dispatch_queue_create("queue-test.completions", DISPATCH_QUEUE_SERIAL);
+		static int completionsKey;
+		dispatch_queue_set_specific(completions, &completionsKey, &completionsKey, nullptr);
+		[named setQosLevel:4];
+		[named setCommitQueue:commits];
+		[named setCommitSynchronously:YES];
+		[named setCommitsWithQoS:YES];
+		[named setDisableCrossQueueHazardTracking:YES];
+		[named setIsOpenGLQueue:YES];
+		[named setCompletionQueue:completions];
+		[q.queue rgfxTakeDescriptor:descriptor];
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		CHECK(spi.qosLevel == 4 && spi.commitQueue == commits && spi.commitSynchronously &&
+		      spi.commitsWithQoS && spi.disableCrossQueueHazardTracking && spi.isOpenGLQueue &&
+		      spi.completionQueue == completions);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		std::atomic<bool> onIt{false};
+		std::atomic<bool> *onItp = &onIt;
+		[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+			(void)x;
+			onItp->store(dispatch_get_specific(&completionsKey) == &completionsKey);
+		}];
+		[cb commit];
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		CHECK(onIt.load());
+	}
+}
+
+// finish returns once every buffer committed before it has completed and run its completed
+// handlers, as Metal's waits for its buffers; with none in flight, at once.
+void test_finish_waits_for_committed_buffers()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<QueueTestCommandQueueSPI> spi = (id<QueueTestCommandQueueSPI>)q.queue;
+		[spi finish];
+		std::atomic<int> ran{0};
+		std::atomic<int> *ranp = &ran;
+		id<MTLCommandBuffer> first = [q.queue commandBuffer];
+		id<MTLCommandBuffer> second = [q.queue commandBuffer];
+		for (id<MTLCommandBuffer> cb in @[ first, second ]) {
+			[cb addCompletedHandler:^(id<MTLCommandBuffer> x) {
+				(void)x;
+				std::this_thread::sleep_for(std::chrono::milliseconds(5));
+				ranp->fetch_add(1);
+			}];
+			[cb commit];
+		}
+		const uint64_t firstSeqno = nextSeqno(q);
+		const uint64_t secondSeqno = nextSeqno(q);
+		std::atomic<bool> finished{false};
+		std::atomic<int> ranAtFinish{-1};
+		std::thread waiter([&] {
+			[spi finish];
+			ranAtFinish.store(ran.load());
+			finished.store(true);
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(!finished.load());
+		hostScheduled(q, *driven.kext, firstSeqno, first);
+		hostComplete(q, *driven.kext, firstSeqno, first);
+		[first waitUntilCompleted];
+		std::this_thread::sleep_for(std::chrono::milliseconds(20));
+		CHECK(!finished.load());
+		hostScheduled(q, *driven.kext, secondSeqno, second);
+		hostComplete(q, *driven.kext, secondSeqno, second);
+		waiter.join();
+		CHECK(finished.load() && ranAtFinish.load() == 2);
+	}
+}
+
+#if RgfxMakesResidencySets
+// The arm64 device's queue holds a residency set as many times as it was added, and its command
+// buffer holds the sets it uses, and those its render and compute encoders are given, until it
+// completes, as Metal's do on the M3 Max (oracle_residency's queue, retain, hold, cb and
+// render-use and compute-use cases). A nil set raises the counted set's
+// NSInvalidArgumentException at the queue and the buffer, and the encoders pass over it.
+void test_residency_sets_are_held_until_let_go()
+{
+	Queue q(true);
+	__weak id held = nil;
+	@autoreleasepool {
+		RgfxResidencySet *set = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		held = set;
+		[q.queue addResidencySet:set];
+		[q.queue addResidencySet:set];
+	}
+	CHECK(held != nil);
+	@autoreleasepool {
+		[q.queue removeResidencySet:held];
+	}
+	CHECK(held != nil);
+	@autoreleasepool {
+		[q.queue removeResidencySet:held];
+	}
+	CHECK(held == nil);
+	@autoreleasepool {
+		RgfxResidencySet *a = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *b = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		held = a;
+		id<MTLResidencySet> both[] = {a, b};
+		[q.queue removeResidencySet:a]; // never added: nothing
+		[q.queue addResidencySets:both count:2];
+		[q.queue addResidencySets:both count:0];
+		[q.queue removeResidencySets:both count:0];
+		[q.queue removeResidencySets:both count:2];
+		[q.queue removeResidencySets:both count:2];
+	}
+	CHECK(held == nil);
+	CHECK(raisesInsertingNil(^{
+		[q.queue addResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+	}));
+	@try {
+		[q.queue removeResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+		CHECK(false);
+	} @catch (NSException *e) {
+		CHECK([e.name isEqualToString:NSInvalidArgumentException] &&
+		      [e.reason isEqualToString:@"*** -[NSCountedSet removeObject:]: attempt to remove nil"]);
+	}
+
+	__weak id used = nil, viaRender = nil, viaCompute = nil;
+	id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+	@autoreleasepool {
+		RgfxResidencySet *u = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *r = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		RgfxResidencySet *c = [[RgfxResidencySet alloc] initWithDevice:nil descriptor:nil];
+		used = u;
+		viaRender = r;
+		viaCompute = c;
+		[cb useResidencySet:u];
+		id<MTLResidencySet> twice[] = {u, u};
+		[cb useResidencySets:twice count:2];
+		id<MTLRenderCommandEncoder> renc = [cb renderCommandEncoderWithDescriptor:pass()];
+		id renderSPI = renc;
+		((void (*)(id, SEL, id))objc_msgSend)(renderSPI, @selector(useResidencySet:), nil);
+		((void (*)(id, SEL, id))objc_msgSend)(renderSPI, @selector(useResidencySet:), r);
+		[renc endEncoding];
+		id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+		id<MTLResidencySet> withNil[] = {c, nil};
+		((void (*)(id, SEL, const id *, NSUInteger))objc_msgSend)(
+		    cenc, @selector(useResidencySets:count:), withNil, 2);
+		[cenc endEncoding];
+	}
+	CHECK(used != nil && viaRender != nil && viaCompute != nil);
+	CHECK(raisesInsertingNil(^{
+		[cb useResidencySet:(id<MTLResidencySet> _Nonnull)nil];
+	}));
+	@autoreleasepool {
+		[cb commit];
+	}
+	CHECK(used != nil && viaRender != nil && viaCompute != nil);
+	complete(q, cb);
+	CHECK(used == nil && viaRender == nil && viaCompute == nil);
+	CHECK(!RgfxUnsupportedWasLogged([RgfxCmdBuffer class], @selector(useResidencySet:)) &&
+	      !RgfxUnsupportedWasLogged([RgfxCommandQueue class], @selector(addResidencySet:)));
+}
+#endif
+
+
+#if defined(__arm64__)
+// A shared event of `q`'s, registered with its queue's reader, at `initial`.
+RgfxSharedEvent *queueEvent(Queue &q, uint64_t initial)
+{
+	RgfxSharedEvent *ev = [RgfxSharedEvent sharedEventWithInitialValue:initial
+	                                                             device:nil
+	                                                         serializer:&q.ser];
+	CHECK(ev != nil);
+	[ev rgfxRegisterWithReplyReader:[q.queue sharedReplyReader].get()];
+	return ev;
+}
+
+// The values `q`'s control ring carries for `event` (SHARED_EVENT_SET_VALUE), in order; every
+// message is taken off the ring.
+std::vector<uint64_t> setsOf(Queue &q, RgfxObjId event)
+{
+	std::vector<uint64_t> values;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (q.control.next(&h, &bytes)) {
+		RgfxSharedEventSetValue m = {};
+		if (h.type != RGFX_CMD_SHARED_EVENT_SET_VALUE || bytes.size() < sizeof(m))
+			continue;
+		std::memcpy(&m, bytes.data(), sizeof(m));
+		if (m.obj_id == event)
+			values.push_back(m.value);
+	}
+	return values;
+}
+
+void scheduleSignal(id<MTLCommandBuffer> cb, id<MTLEvent> event, uint64_t value)
+{
+	[(id<QueueTestScheduledSignalSPI>)cb encodeSignalEventScheduled:event value:value];
+}
+
+// An arm64 guest's command buffer answers an Apple GPU's SPI encodeSignalEventScheduled:value:,
+// which MPSGraph sends with no respondsToSelector: check. Its shared event takes the value as
+// the buffer's queue submits it, as Metal's does (measured on the M3 Max, macOS 27.0.1,
+// oracle_cmdbuf schedsig): at the commit's post, before the buffer's work or its scheduling,
+// whatever the buffer encoded before the call; the host is told first, as the CPU's set tells
+// it, then this process's listeners and waits, and the scheduled handler reads the value. The
+// value only rises: an event at 5 stays 5 after a signal of 3, and of two the higher stays, in
+// either order. After the commit the call sets nothing.
+void test_a_scheduled_signal_is_set_as_its_queue_submits_it()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		RgfxSharedEvent *ev = queueEvent(q, 0);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		CHECK([(id)cb respondsToSelector:@selector(encodeSignalEventScheduled:value:)]);
+		[[cb blitCommandEncoder] endEncoding];
+		scheduleSignal(cb, ev, 3);
+		std::atomic<uint64_t> inHandler{0};
+		std::atomic<uint64_t> *inHandlerAt = &inHandler;
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			inHandlerAt->store(ev.signaledValue);
+		}];
+		dispatch_semaphore_t heard = dispatch_semaphore_create(0);
+		MTLSharedEventListener *listener = [[MTLSharedEventListener alloc] init];
+		[ev notifyListener:listener
+		           atValue:3
+		             block:^(id<MTLSharedEvent> e, uint64_t v) {
+			             (void)e;
+			             (void)v;
+			             dispatch_semaphore_signal(heard);
+		             }];
+		CHECK(ev.signaledValue == 0);
+		CHECK(setsOf(q, ev.rgfxObjId).empty());
+		[cb commit];
+		CHECK(ev.signaledValue == 3);
+		CHECK((setsOf(q, ev.rgfxObjId) == std::vector<uint64_t>{3}));
+		CHECK(waitFor(heard, 5) == 0);
+		CHECK(cb.status == MTLCommandBufferStatusCommitted);
+		const uint64_t seqno = nextSeqno(q);
+		hostScheduled(q, *driven.kext, seqno, cb);
+		[cb waitUntilScheduled];
+		CHECK(inHandler == 3);
+		hostComplete(q, *driven.kext, seqno, cb);
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusCompleted);
+		CHECK(ev.signaledValue == 3);
+
+		struct Case {
+			uint64_t initial;
+			std::vector<uint64_t> signals;
+			uint64_t after;
+		};
+		const Case cases[] = {{5, {3}, 5}, {5, {7}, 7}, {5, {6, 8}, 8}, {5, {8, 6}, 8}};
+		for (const Case &c : cases) {
+			RgfxSharedEvent *e = queueEvent(q, c.initial);
+			id<MTLCommandBuffer> b = [q.queue commandBuffer];
+			for (uint64_t v : c.signals)
+				scheduleSignal(b, e, v);
+			[b commit];
+			CHECK(e.signaledValue == c.after);
+			CHECK(setsOf(q, e.rgfxObjId) == c.signals); // the host keeps the higher too
+			const uint64_t s = nextSeqno(q);
+			hostComplete(q, *driven.kext, s, b);
+			[b waitUntilCompleted];
+		}
+
+		RgfxSharedEvent *late = queueEvent(q, 0);
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		[b commit];
+		scheduleSignal(b, late, 1);
+		const uint64_t s = nextSeqno(q);
+		hostComplete(q, *driven.kext, s, b);
+		[b waitUntilCompleted];
+		CHECK(late.signaledValue == 0);
+		CHECK(setsOf(q, late.rgfxObjId).empty());
+		CHECK(b.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// A scheduled signal behind a wait the process does not know met, its buffer's own encoded
+// before it or one of an earlier buffer of its queue, is set at its buffer's scheduling, before
+// the scheduled handlers, as Metal's queue reaches it only once that wait is met (measured on
+// the M3 Max, macOS 27.0.1, oracle_cmdbuf schedsig: 0.04 to 0.15 ms after the CPU set the
+// event waited on, before the scheduled handler). One behind a wait met already, or ahead of a
+// wait, is set at the post; a wait after it on its own event is then met, and the buffer holds
+// up no later signal of its queue (Metal's buffer runs).
+void test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling()
+{
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+
+		RgfxSharedEvent *w = queueEvent(q, 0), *e = queueEvent(q, 0);
+		id<MTLCommandBuffer> cb = [q.queue commandBuffer];
+		[cb encodeWaitForEvent:w value:1];
+		scheduleSignal(cb, e, 1);
+		std::atomic<uint64_t> inHandler{0};
+		std::atomic<uint64_t> *inHandlerAt = &inHandler;
+		[cb addScheduledHandler:^(id<MTLCommandBuffer> c) {
+			(void)c;
+			inHandlerAt->store(e.signaledValue);
+		}];
+		[cb commit];
+		const uint64_t s1 = nextSeqno(q);
+		CHECK(e.signaledValue == 0);
+		CHECK(setsOf(q, e.rgfxObjId).empty());
+		w.signaledValue = 1; // the host's wait goes
+		hostScheduled(q, *driven.kext, s1, cb);
+		[cb waitUntilScheduled];
+		CHECK(inHandler == 1);
+		CHECK(e.signaledValue == 1);
+		CHECK((setsOf(q, e.rgfxObjId) == std::vector<uint64_t>{1}));
+		hostComplete(q, *driven.kext, s1, cb);
+		[cb waitUntilCompleted];
+
+		// Behind an earlier buffer of its queue that waits.
+		RgfxSharedEvent *w2 = queueEvent(q, 0), *e2 = queueEvent(q, 0);
+		id<MTLCommandBuffer> a = [q.queue commandBuffer];
+		[a encodeWaitForEvent:w2 value:1];
+		[a commit];
+		const uint64_t sa = nextSeqno(q);
+		id<MTLCommandBuffer> b = [q.queue commandBuffer];
+		scheduleSignal(b, e2, 1);
+		[b commit];
+		const uint64_t sb = nextSeqno(q);
+		CHECK(e2.signaledValue == 0);
+		CHECK(setsOf(q, e2.rgfxObjId).empty());
+		w2.signaledValue = 1;
+		hostScheduled(q, *driven.kext, sa, a);
+		[a waitUntilScheduled];
+		hostScheduled(q, *driven.kext, sb, b);
+		[b waitUntilScheduled];
+		CHECK(e2.signaledValue == 1);
+		CHECK((setsOf(q, e2.rgfxObjId) == std::vector<uint64_t>{1}));
+		hostComplete(q, *driven.kext, sa, a);
+		hostComplete(q, *driven.kext, sb, b);
+		[b waitUntilCompleted];
+
+		// Behind a wait met already; and ahead of a wait on its own event, which it meets.
+		RgfxSharedEvent *met = queueEvent(q, 1), *e3 = queueEvent(q, 0), *own = queueEvent(q, 0);
+		id<MTLCommandBuffer> c = [q.queue commandBuffer];
+		[c encodeWaitForEvent:met value:1];
+		scheduleSignal(c, e3, 1);
+		scheduleSignal(c, own, 2);
+		[c encodeWaitForEvent:own value:2];
+		[c commit];
+		const uint64_t sc = nextSeqno(q);
+		CHECK(e3.signaledValue == 1);
+		CHECK(own.signaledValue == 2);
+		// So the queue holds nothing: a later buffer's signal is set at its post.
+		RgfxSharedEvent *e4 = queueEvent(q, 0);
+		id<MTLCommandBuffer> d = [q.queue commandBuffer];
+		scheduleSignal(d, e4, 1);
+		[d commit];
+		const uint64_t sd = nextSeqno(q);
+		CHECK(e4.signaledValue == 1);
+		hostComplete(q, *driven.kext, sc, c);
+		hostComplete(q, *driven.kext, sd, d);
+		[d waitUntilCompleted];
+		CHECK(c.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// What the call does with no shared event, as Metal's does (measured on the M3 Max, macOS
+// 27.0.1, oracle_cmdbuf schedsig_plain, schedsig_nil, schedsig_nil_unretained): a plain event
+// ends the process with Metal's words; nil raises Metal's NSInvalidArgumentException on a buffer
+// that retains its references, and fails one that retains none with Metal's error.
+void test_a_scheduled_signal_takes_only_a_shared_event()
+{
+	checkDies("scheduled-signal-plain", "MTLEvent passed to API expecting MTLSharedEvent");
+	@autoreleasepool {
+		Queue q(true);
+		Driven driven({&q});
+		id<MTLCommandBuffer> retained = [q.queue commandBuffer];
+		bool raised = false;
+		@try {
+			scheduleSignal(retained, nil, 1);
+		} @catch (NSException *ex) {
+			raised = [ex.name isEqualToString:NSInvalidArgumentException] &&
+			         [ex.reason isEqualToString:@"*** -[__NSArrayM insertObject:atIndex:]: object "
+			                                    @"cannot be nil"];
+		}
+		CHECK(raised);
+		[retained commit];
+		const uint64_t sr = nextSeqno(q);
+		hostComplete(q, *driven.kext, sr, retained);
+		[retained waitUntilCompleted];
+		CHECK(retained.status == MTLCommandBufferStatusCompleted);
+
+		id<MTLCommandBuffer> unretained = [q.queue commandBufferWithUnretainedReferences];
+		scheduleSignal(unretained, nil, 1);
+		[unretained commit];
+		const uint64_t su = nextSeqno(q);
+		hostComplete(q, *driven.kext, su, unretained);
+		[unretained waitUntilCompleted];
+		CHECK(unretained.status == MTLCommandBufferStatusError);
+		CHECK([unretained.error.domain isEqualToString:MTLCommandBufferErrorDomain]);
+		CHECK(unretained.error.code == MTLCommandBufferErrorInternal);
+		CHECK([unretained.error.localizedDescription
+		    isEqualToString:@"Invalid Input (0000000a:kIOGPUCommandBufferCallbackErrorInvalidInput)"]);
+	}
+}
+#endif
+
+} // namespace
+
 void rgfxQueueTests(const char *self)
 {
 	g_self = self;
 	test_encoder_keeps_its_buffer_until_it_ends();
+	test_encoder_spi_members();
 	test_handlers_after_commit_end_the_process();
 	test_handlers_of_queues_wait_for_each_other();
 	test_handlers_run_on_the_completion_queue();
@@ -1526,9 +2604,23 @@ void rgfxQueueTests(const char *self)
 	test_buffers_run_in_enqueue_order();
 	test_threads_commit_in_enqueue_order();
 	test_submitted_waits_for_the_buffers_before();
+	test_resources_wait_for_their_buffers_in_flight();
 	test_enqueue_and_commit_are_once();
 	test_buffers_let_go_give_their_blocks_back();
 	test_in_place_writes_retire_at_the_take();
 	test_no_copy_write_backs_land_at_the_take();
 	test_a_mid_buffer_signal_wakes_a_cpu_wait_before_the_buffer_ends();
+	test_async_waits_run_after_their_handlers();
+	test_command_buffer_spi_state();
+	test_command_queue_spi_state();
+	test_queue_takes_its_descriptor();
+	test_finish_waits_for_committed_buffers();
+#if RgfxMakesResidencySets
+	test_residency_sets_are_held_until_let_go();
+#endif
+#if defined(__arm64__)
+	test_a_scheduled_signal_is_set_as_its_queue_submits_it();
+	test_a_scheduled_signal_behind_a_wait_is_set_at_its_scheduling();
+	test_a_scheduled_signal_takes_only_a_shared_event();
+#endif
 }

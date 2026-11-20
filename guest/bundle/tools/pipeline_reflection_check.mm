@@ -18,14 +18,25 @@
 //                constants and textures, and a pointer to another argument buffer
 //   c_nested_more  an argument buffer of C arrays of samplers and of pointers to argument
 //                buffers, a struct of members holding one and a C array, and a C array of those
+//   c_deep_ab    a chain of seven argument buffers, each a pointer to the next
 //   c_tables     a visible function table, an intersection function table and acceleration
 //                structures of both kinds
 //   c_ab_tables  the same, as an argument buffer's members
 //   c_more_textures  textures of further shapes, sample types and access
 //   c_imageblock an imageblock
+//   c_imageblock_explicit  an imageblock of an explicit layout
+//   c_imageblock_late  the same as the kernel's second argument
+//   c_imageblock_on, c_imageblock_off  the same under kBlocks, true and false
+//   r_imageblock_data  v_buffers and f_imageblock_data, which reads its tile's imageblock data
+//   r_imageblock_master  v_buffers and f_imageblock_master, whose imageblock data views a master
+//                struct
+//   r_rog_texture  v_buffers and f_rog_texture, which writes a texture in a raster order group
 //   c_atomic_texture  a texture of 64-bit atomics (its library, LIB, is
 //                tools/oracle/oracle_reflection_31.metal's)
 //   r_fetch      v_buffers and f_fetch, which reads its colour attachments (framebuffer fetch)
+//   r_fetch_group  v_buffers and f_fetch_group, which reads colour attachment 0 in raster order
+//                group 0
+//   r_fetch_at   v_buffers and f_fetch_at, which reads colour attachment kFetchAt, 0
 //   r_tables     v_buffers and f_tables, an acceleration structure and a function table in a
 //                fragment function
 //   c_specialised_on, c_specialised_off
@@ -33,6 +44,16 @@
 //                and with both false, kIndex 7, kMode 2 and kOpt true
 //   r_specialised_one, r_specialised_two
 //                v_specialised and f_plain, a vertex descriptor as r_stage_in's, kMode 1 and 2
+//   r_patch      v_patch, a post-tessellation vertex function of a struct of its control points and
+//                its patch's attribute, and f_plain; a vertex descriptor of the control points'
+//                attributes 0, 1 and 2 in buffer 0, stepping per control point, and the patch's
+//                attribute 3 in buffer 1, stepping per patch
+//   r_patch_points  v_patch_points, of its control points alone, and f_plain, r_patch's descriptor
+//   r_patch_buffers v_patch_buffers, of no stage input, and f_plain
+//   r_patch_plain   v_patch_plain, of its control points alone and no position in the patch, and
+//                f_plain, r_patch's descriptor
+//   r_patch_unused  v_patch_unused, of its control points and a position in the patch it does not
+//                read, and f_plain, r_patch's descriptor
 // Prints each difference (with -v, every line both walks agree on), a case ours makes no reflection
 // of with its reason and Metal's getters' answers (with -v its instance variables' too, to measure
 // them), a case Metal makes no pipeline of with its error, and
@@ -60,7 +81,8 @@ std::vector<uint8_t> Bytes; // LIB's bytes
 bool Verbose;
 unsigned Cases, Values, Differ, NotMade, Unmade;
 
-// The nodes of LIB's entry point `name`.
+// The nodes of LIB's entry point `name`: false where a node of it does not read, as the bundle's
+// libraries answer (RgfxLibrary's rgfxAirEntryNamed:).
 bool entryOf(const std::string &name, RgfxAirEntries &module)
 {
 	const uint8_t *p = Bytes.data();
@@ -72,7 +94,7 @@ bool entryOf(const std::string &name, RgfxAirEntries &module)
 	if (!rgfxMetallibBitcode(p, n, name, &bitcode, &size) || !rgfxReadAirEntries(bitcode, size, all))
 		return false;
 	for (RgfxAirEntry &e : all.entries) {
-		if (e.name == name) {
+		if (e.name == name && e.nodesRead) {
 			module.entries = {e};
 			module.constants = all.constants;
 			module.code = all.code;
@@ -96,8 +118,10 @@ bool stageOf(const Fn &f, NSString *prefix, const std::vector<RgfxDescriptorBuff
 		*why = [NSString stringWithFormat:@"%s: its nodes were not read", f.name.c_str()];
 		return false;
 	}
+	// An Apple GPU's answers on one (rgfxAppleGPU's test, which this tool does not link).
+	const bool apple = [D supportsFamily:MTLGPUFamilyApple7];
 	return RgfxStageReflectionOfEntry(module, module.entries[0], f.values.data(), static_cast<uint32_t>(f.values.size()),
-	                                  prefix, buffers, out, why);
+	                                  prefix, buffers, out, why, apple);
 }
 
 RgfxFunctionConstant constant(uint32_t index, MTLDataType type, int32_t value)
@@ -331,6 +355,32 @@ MTLVertexDescriptor *vertexDescriptor(bool spread)
 	return v;
 }
 
+// A post-tessellation vertex function's vertex descriptor: its control points' attributes 0
+// (float4), 1 (float2, at 16) and 2 (float4, at 32) in buffer 0 of stride 48, stepping per control
+// point, and its patch's attribute 3 (float4) in buffer 1 of stride 16, stepping per patch.
+MTLVertexDescriptor *patchDescriptor()
+{
+	MTLVertexDescriptor *v = [MTLVertexDescriptor vertexDescriptor];
+	const struct {
+		NSUInteger attribute;
+		MTLVertexFormat format;
+		NSUInteger offset, buffer;
+	} kAttributes[] = {{0, MTLVertexFormatFloat4, 0, 0},
+	                   {1, MTLVertexFormatFloat2, 16, 0},
+	                   {2, MTLVertexFormatFloat4, 32, 0},
+	                   {3, MTLVertexFormatFloat4, 0, 1}};
+	for (const auto &a : kAttributes) {
+		v.attributes[a.attribute].format = a.format;
+		v.attributes[a.attribute].offset = a.offset;
+		v.attributes[a.attribute].bufferIndex = a.buffer;
+	}
+	v.layouts[0].stride = 48;
+	v.layouts[0].stepFunction = MTLVertexStepFunctionPerPatchControlPoint;
+	v.layouts[1].stride = 16;
+	v.layouts[1].stepFunction = MTLVertexStepFunctionPerPatch;
+	return v;
+}
+
 } // namespace
 
 int main(int argc, char **argv)
@@ -376,7 +426,8 @@ int main(int argc, char **argv)
 		                {"k_builtins", "k_builtins"}, {"c_nested", "k_nested"},
 		                {"c_nested_more", "k_nested_more"}, {"c_tables", "k_tables"},
 		                {"c_ab_tables", "k_ab_tables"}, {"c_more_textures", "k_more_textures"},
-		                {"c_imageblock", "k_imageblock"}};
+		                {"c_imageblock", "k_imageblock"}, {"c_deep_ab", "k_deep_ab"},
+		                {"c_imageblock_explicit", "k_imageblock_explicit"}, {"c_imageblock_late", "k_imageblock_late"}};
 		for (const auto &k : kKernels)
 			if (CASE(k.name))
 				computeCase(k.name, Fn{k.kernel, {}}, nil, false);
@@ -385,6 +436,10 @@ int main(int argc, char **argv)
 		                                                  constant(2, MTLDataTypeInt, 5)};
 		if (CASE("c_constants"))
 			computeCase("c_constants", Fn{"k_constants", values}, nil, false);
+		if (CASE("c_imageblock_on"))
+			computeCase("c_imageblock_on", Fn{"k_imageblock_if", {constant(6, MTLDataTypeBool, 1)}}, nil, false);
+		if (CASE("c_imageblock_off"))
+			computeCase("c_imageblock_off", Fn{"k_imageblock_if", {constant(6, MTLDataTypeBool, 0)}}, nil, false);
 		if (only != nullptr && strcmp(only, "c_atomic_texture") == 0)
 			computeCase("c_atomic_texture", Fn{"k_atomic_texture", {}}, nil, false);
 		const std::vector<RgfxFunctionConstant> on = {constant(0, MTLDataTypeBool, 1), constant(1, MTLDataTypeBool, 0),
@@ -421,6 +476,24 @@ int main(int argc, char **argv)
 		const Fn fetch{"f_fetch", {}}, tables{"f_tables", {}};
 		if (CASE("r_fetch"))
 			renderCase("r_fetch", Fn{"v_buffers", {}}, &fetch, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatRGBA16Float);
+		const Fn fetchGroup{"f_fetch_group", {}}, fetchAt{"f_fetch_at", {constant(5, MTLDataTypeUInt, 0)}};
+		if (CASE("r_fetch_group"))
+			renderCase("r_fetch_group", Fn{"v_buffers", {}}, &fetchGroup, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn imageblockData{"f_imageblock_data", {}};
+		if (CASE("r_imageblock_data"))
+			renderCase("r_imageblock_data", Fn{"v_buffers", {}}, &imageblockData, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn imageblockMaster{"f_imageblock_master", {}};
+		if (CASE("r_imageblock_master"))
+			renderCase("r_imageblock_master", Fn{"v_buffers", {}}, &imageblockMaster, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		const Fn rogTexture{"f_rog_texture", {}};
+		if (CASE("r_rog_texture"))
+			renderCase("r_rog_texture", Fn{"v_buffers", {}}, &rogTexture, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_fetch_at"))
+			renderCase("r_fetch_at", Fn{"v_buffers", {}}, &fetchAt, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_tables"))
 			renderCase("r_tables", Fn{"v_buffers", {}}, &tables, nil, MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_specialised_one"))
@@ -431,6 +504,21 @@ int main(int argc, char **argv)
 			           MTLPixelFormatBGRA8Unorm, MTLPixelFormatInvalid);
 		if (CASE("r_mesh"))
 			meshCase("r_mesh", Fn{"o_payload", {}}, Fn{"m_payload", {}}, Fn{"f_mesh", {}});
+		if (CASE("r_patch"))
+			renderCase("r_patch", Fn{"v_patch", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_points"))
+			renderCase("r_patch_points", Fn{"v_patch_points", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_buffers"))
+			renderCase("r_patch_buffers", Fn{"v_patch_buffers", {}}, &plain, nil, MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_plain"))
+			renderCase("r_patch_plain", Fn{"v_patch_plain", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
+		if (CASE("r_patch_unused"))
+			renderCase("r_patch_unused", Fn{"v_patch_unused", {}}, &plain, patchDescriptor(), MTLPixelFormatBGRA8Unorm,
+			           MTLPixelFormatInvalid);
 		printf("pipeline_reflection_check: %u cases, %u values, %u differ, %u not made, %u Metal made none\n", Cases,
 		       Values, Differ, NotMade, Unmade);
 		return Differ != 0 ? 1 : 0;

@@ -33,6 +33,20 @@ class RgfxSlabs;
 
 NS_ASSUME_NONNULL_BEGIN
 
+/// Bit 18 of MTLResourceOptions (0x40000), whose meaning nothing states. Both x86 Macs make no
+/// buffer of a length or of bytes, nor a texture of a descriptor, whose options hold it: nil in
+/// each storage mode, where they make one with bit 17 or 19 instead (measured: macOS 26.7.1 on the
+/// AMD 5300M and the Intel 630). They make a no-copy buffer and a heap's buffer with it, and
+/// diverge on a Private heap (the AMD's is nil, the Intel's is made).
+static const MTLResourceOptions kRgfxOptionBit18 = (MTLResourceOptions)1 << 18;
+
+/// Whether the device makes no buffer of a length or of bytes, nor a texture, of `options`
+/// (kRgfxOptionBit18).
+static inline BOOL RgfxMakesNoResourceOf(MTLResourceOptions options)
+{
+	return (options & kRgfxOptionBit18) != 0;
+}
+
 @interface RgfxBuffer : RgfxResource <MTLBuffer>
 
 /// Creates a device buffer of `length` bytes with `options`, serialising an
@@ -87,7 +101,7 @@ NS_ASSUME_NONNULL_BEGIN
 /// maxBufferLength; 0 holds none back). Nil too where `slabs` has no room for a Shared or
 /// Managed one, as Metal answers a buffer it cannot place, never memory the GPU does not see;
 /// and for bytes with a mode whose contents the CPU never reaches (Private), which Metal's
-/// validation refuses.
+/// validation refuses; and for options with bit 18, as the x86 Macs (RgfxMakesNoResourceOf).
 + (nullable instancetype)bufferForDeviceWithLength:(NSUInteger)length
                                            options:(MTLResourceOptions)options
                                              bytes:(nullable const void *)bytes
@@ -102,8 +116,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// process's) the host sees in place. Shared or Managed bytes the process may write, where
 /// `region` has pages blocks (RgfxRegion::acquirePages), the host sees in place too: the kext
 /// wires their pages for the buffer's life, the buffer's GPU address keeps the pointer's offset
-/// in its page, and a Managed one is one copy (rgfxOneCopy). Read-only bytes, and those the kext
-/// or the host makes no pages block of, get a range of a
+/// in its page, and a Managed one's CPU copy is a Shared buffer over them, where `slabs` lays
+/// Managed buffers over Shared copies (RgfxSlabs::overCopy). Shared bytes the process maps
+/// read-only the host sees in place where the kext makes a pages block of them
+/// (RGFX_FEATURE_READ_ONLY_PAGES), a buffer of Metal's private bit 24, whose GPU writes the host
+/// drops. Read-only Managed bytes, and those the kext or the host makes no pages block of, get a
+/// range of a
 /// slab of `slabs` as a device buffer of their options does (RgfxSlabs.hpp), the GPU's copy,
 /// synced with them at the command buffers that use the buffer (RgfxMemoryShadow.hpp): the
 /// process's own pages where the device takes them, the region's only where the kernel has none.
@@ -127,12 +145,11 @@ NS_ASSUME_NONNULL_BEGIN
 /// The GPU's copy of app memory the buffer lies over (a no-copy buffer's outside the device
 /// region), null for any other.
 - (std::shared_ptr<RgfxMemoryShadow>)rgfxShadow;
-
-/// Whether the buffer is a Managed one of one copy: a no-copy buffer over the app's own pages in
-/// place, which the host's GPU uses as a Shared buffer's memory, so neither its didModifyRange:
-/// nor a blit's synchronize of it, or of a texture over it, has anything to bring over.
-- (BOOL)rgfxOneCopy;
 #endif
+
+/// Whether the buffer lies over the caller's bytes (bufferWithBytesNoCopy), whose memory past
+/// the length is the caller's own.
+- (BOOL)rgfxOverCallerBytes;
 
 /// Designated initialiser: wraps an already-created host buffer. `objId` and
 /// `gpuAddress` are the guest-picked values the create returned; `length` and

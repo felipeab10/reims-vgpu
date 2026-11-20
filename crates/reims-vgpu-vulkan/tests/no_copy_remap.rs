@@ -1,5 +1,5 @@
-//! Measured: a no-copy buffer keeps the pages its range held when it was made, on Metal
-//! (`MetalPlatform`) and on this crate's runtime alike, which imports them then, as Metal wires
+//! Measured: a no-copy buffer keeps the pages its range held when it was made, on Metal and on
+//! this crate's runtime alike, which imports them then, as Metal wires
 //! them. A `mach_vm_remap` of other pages over the range (`HostVm::remap_shared_overwrite`) after
 //! that is not seen by the GPU, whether the range was ever touched, and whether or not the GPU
 //! used the buffer before the remap: a GPU read answers the old pages' bytes, and a GPU fill
@@ -9,13 +9,12 @@
 //! A buffer made after such a remap, over exactly the bytes of a live one the GPU used, takes the
 //! new pages on Metal, which wires them as it makes each buffer. On this crate's runtime it lies
 //! in the live one's import, over the old pages, unless the runtime was told of the remap: the
-//! platform tells it of what its Mach VM changes (`VulkanPlatform::vm`) and of what the host's
-//! blocks map and unmap (`Platform::host_blocks`), and then the new buffer takes the new pages
-//! too. A no-copy buffer's deallocator may call the platform's Mach VM, which tells the runtime,
+//! platform tells it of what its Mach VM changes (`VulkanPlatform::vm`), and then the new buffer
+//! takes the new pages too. A no-copy buffer's deallocator may call the platform's Mach VM, which tells the runtime,
 //! whichever thread releases the buffer.
 
 #![cfg(target_os = "macos")]
-// Compares with Metal, which is macOS's.
+// Compares with Metal's answers, recorded on macOS.
 // The proof that a command buffer's result is well-formed walks the runtime's types for `Send` and
 // `Sync`, deeper than rustc's default limit of 128, as in the library (`src/lib.rs`).
 #![recursion_limit = "256"]
@@ -30,32 +29,21 @@
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
 
-use reims_vgpu_core::host::{HostBlocks, HostPtr, HostTask, PhysicalMemoryRange};
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::resource::Buffer;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::{HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::vm::MetalVm;
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::device::{GpuDevice, NoCopyDeallocator};
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm;
+use reims_vgpu_vulkan::core::platform::resource::Buffer;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::{HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::OnFault;
+use reims_vgpu_vulkan::os::OsVm;
+use reims_vgpu_vulkan::remap::VulkanVm;
 
 const LEN: u64 = 0x8000;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl<P: Platform> TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// A fresh mapping of `LEN` bytes, every one `byte`.
 fn region(vm: &dyn HostVm, byte: u8) -> HostPtr {
@@ -118,7 +106,7 @@ fn remapped<P: Platform>(
     va: HostPtr,
     before: impl Fn(&P::Buffer),
 ) -> [[u8; 2]; 3] {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     let (released, gone) = mpsc::channel();
     let deallocator: NoCopyDeallocator = Box::new(move || {
         let _ = released.send(());
@@ -150,8 +138,11 @@ fn remapped<P: Platform>(
         Ok(()),
         "the buffer's deallocator ran"
     );
+    // The remap above is the OS's VM's on purpose, which tells the runtime nothing; the unmaps
+    // go through the platform's, which leaves pages an import holds mapped until the runtime
+    // frees the import, after the deallocator ran.
     for mapping in [va, new] {
-        assert!(vm.deallocate(mapping, LEN).is_success());
+        assert!(VulkanVm::new().deallocate(mapping, LEN).is_success());
     }
     seen
 }
@@ -160,7 +151,7 @@ fn remapped<P: Platform>(
 /// over touched pages (`0xa1`), both after the buffer was made and before its first GPU use,
 /// and one after that use (`0xc3`).
 fn every_order<P: Platform>(dev: &P::Device) -> [[[u8; 2]; 3]; 3] {
-    let vm = MetalVm::new();
+    let vm = OsVm::new();
     [
         remapped::<P>(dev, vm.allocate_anywhere(LEN).unwrap(), |_| ()),
         remapped::<P>(dev, region(&vm, 0xa1), |_| ()),
@@ -178,7 +169,8 @@ fn not_seen(old: u8) -> [[u8; 2]; 3] {
 /// The GPU reads the new pages, and fills them, which the range and the new mapping show.
 const SEEN: [[u8; 2]; 3] = [[0xe5; 2], [0x7c; 2], [0x7c; 2]];
 
-/// What every order of [`every_order`] answers on both platforms: the old pages.
+/// What every order of [`every_order`] answers, on Metal and on this crate's platform: the old
+/// pages.
 fn kept() -> [[[u8; 2]; 3]; 3] {
     [not_seen(0), not_seen(0xa1), not_seen(0xc3)]
 }
@@ -187,12 +179,6 @@ fn kept() -> [[[u8; 2]; 3]; 3] {
 fn the_vulkan_runtime_keeps_a_no_copy_buffers_pages_from_its_creation() {
     let dev = VulkanPlatform::system_default_device().unwrap();
     assert_eq!(every_order::<VulkanPlatform>(&dev), kept());
-}
-
-#[test]
-fn metal_keeps_a_no_copy_buffers_pages_from_its_creation() {
-    let dev = MetalPlatform::system_default_device().unwrap();
-    assert_eq!(every_order::<MetalPlatform>(&dev), kept());
 }
 
 /// A no-copy buffer over `va..va + LEN` whose deallocator says so on the answer's receiver.
@@ -242,7 +228,7 @@ fn made_after<P: Platform>(
     let seen = [gpu_read_then_fill::<P>(dev, &b, 0x7c), ends(va), ends(new)];
     drop((b, a));
     released(&[b_gone, a_gone]);
-    assert!(MetalVm::new().deallocate(new, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(new, LEN).is_success());
     seen
 }
 
@@ -254,108 +240,19 @@ fn made_after_a_remap<P: Platform>(dev: &P::Device, vm: &dyn HostVm) -> [[u8; 2]
         vm.remap_shared_overwrite(va, new, LEN).unwrap();
         new
     });
-    assert!(vm.deallocate(va, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     seen
-}
-
-/// Host blocks that do the mapping work as a host does, with Mach VM of their own: `createTask`
-/// reserves the task's range, `mapMemory` remaps each range's pages, whose `physicalAddress` is
-/// here the host address of pages to share, from the task's base plus the offset on,
-/// `unmapMemory` puts fresh zero pages over its range, and `destroyTask` deallocates the task's
-/// range.
-fn host_blocks() -> HostBlocks {
-    let task: Arc<Mutex<(HostPtr, u64)>> = Arc::default();
-    let (t, vm) = (Arc::clone(&task), MetalVm::new());
-    let create = move |size, base: &mut HostPtr| {
-        *base = vm.allocate_anywhere(size).unwrap();
-        *t.lock() = (*base, size);
-        HostTask::from_addr(1)
-    };
-    let (t, vm) = (Arc::clone(&task), MetalVm::new());
-    let destroy = move |_| {
-        let (base, size) = *t.lock();
-        assert!(vm.deallocate(base, size).is_success());
-    };
-    let (t, vm) = (Arc::clone(&task), MetalVm::new());
-    let map = move |_, count: u32, offset: u64, _, ranges: &[PhysicalMemoryRange]| {
-        let mut at = t.lock().0.wrapping_add(offset);
-        for r in &ranges[..usize::try_from(count).unwrap()] {
-            let src = HostPtr::from_addr(usize::try_from(r.physical_address).unwrap());
-            vm.remap_shared_overwrite(at, src, r.physical_length)
-                .unwrap();
-            at = at.wrapping_add(r.physical_length);
-        }
-        true
-    };
-    let (t, vm) = (Arc::clone(&task), MetalVm::new());
-    let unmap = move |_, offset: u64, length| {
-        let at = t.lock().0.wrapping_add(offset);
-        vm.allocate_fixed_overwrite(at, length).is_ok()
-    };
-    HostBlocks {
-        create_task: Some(Arc::new(create)),
-        destroy_task: Some(Arc::new(destroy)),
-        map_memory: Some(Arc::new(map)),
-        unmap_memory: Some(Arc::new(unmap)),
-        ..HostBlocks::default()
-    }
-}
-
-/// [`made_after`] the host's blocks unmapped the task's first `LEN` bytes and mapped other pages
-/// there, through `blocks` (the host's, or what the platform answered for them).
-fn made_after_the_host_remaps<P: Platform>(dev: &P::Device, blocks: &HostBlocks) -> [[u8; 2]; 3] {
-    let vm = MetalVm::new();
-    let (create, destroy) = (blocks.create_task.as_ref(), blocks.destroy_task.as_ref());
-    let (map, unmap) = (blocks.map_memory.as_ref(), blocks.unmap_memory.as_ref());
-    let pages = |at: HostPtr| PhysicalMemoryRange {
-        physical_address: at.addr().try_into().unwrap(),
-        physical_length: LEN,
-    };
-    let mut base = HostPtr::NULL;
-    let task = create.unwrap()(4 * LEN, &mut base);
-    let old = region(&vm, 0xa1);
-    assert!(map.unwrap()(task, 1, 0, false, &[pages(old)]));
-    let seen = made_after::<P>(dev, base, || {
-        assert!(unmap.unwrap()(task, 0, LEN));
-        let new = region(&vm, 0xe5);
-        assert!(map.unwrap()(task, 1, 0, false, &[pages(new)]));
-        new
-    });
-    destroy.unwrap()(task);
-    assert!(vm.deallocate(old, LEN).is_success());
-    seen
-}
-
-#[test]
-fn metal_takes_the_pages_there_at_each_buffer_it_makes() {
-    let dev = MetalPlatform::system_default_device().unwrap();
-    let p = MetalPlatform::new(Box::new(NoLauncher));
-    assert_eq!(made_after_a_remap::<MetalPlatform>(&dev, p.vm()), SEEN);
-    let blocks = p.host_blocks(host_blocks());
-    assert_eq!(
-        made_after_the_host_remaps::<MetalPlatform>(&dev, &blocks),
-        SEEN
-    );
 }
 
 #[test]
 fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
     let dev = VulkanPlatform::system_default_device().unwrap();
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     assert_eq!(made_after_a_remap::<VulkanPlatform>(&dev, p.vm()), SEEN);
-    let blocks = p.host_blocks(host_blocks());
+    // Untold, as through Mach VM of the test's own, the buffer lies in the live one's import: the
+    // GPU reads what A wrote, and fills the old pages.
     assert_eq!(
-        made_after_the_host_remaps::<VulkanPlatform>(&dev, &blocks),
-        SEEN
-    );
-    // Untold, as through Mach VM of the test's own and the host's blocks themselves, the buffer
-    // lies in the live one's import: the GPU reads what A wrote, and fills the old pages.
-    assert_eq!(
-        made_after_a_remap::<VulkanPlatform>(&dev, &MetalVm::new()),
-        not_seen(0xc3)
-    );
-    assert_eq!(
-        made_after_the_host_remaps::<VulkanPlatform>(&dev, &host_blocks()),
+        made_after_a_remap::<VulkanPlatform>(&dev, &OsVm::new()),
         not_seen(0xc3)
     );
 }
@@ -369,7 +266,7 @@ fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
 #[test]
 fn a_deallocator_may_deallocate_through_the_platforms_vm() {
     let dev = VulkanPlatform::system_default_device().unwrap();
-    let p = Arc::new(VulkanPlatform::new(Box::new(NoLauncher)));
+    let p = Arc::new(VulkanPlatform::new());
     let queue = dev.new_command_queue().unwrap();
     let other = region(p.vm(), 0x11);
     let (live, live_gone) = no_copy::<VulkanPlatform>(&dev, other);

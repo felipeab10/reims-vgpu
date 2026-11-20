@@ -7,32 +7,33 @@
 //! - **At the creation**, synchronously on the calling thread: each stage's translation into
 //!   SPIR-V, unless the runtime's memo, the creation's binary archives or its shader cache on disk
 //!   holds it, then the variant's shader modules and layouts. The cache on disk is this
-//!   platform's `~/.cache/reims-vgpu-vulkan` ([`crate::platform`]), under a directory of each
+//!   platform's `reims-vgpu-vulkan` in the user's cache directory (`~/.cache` on Linux and macOS,
+//!   [`crate::os::user_cache_directory`]), under a directory of each
 //!   runtime build: a new build of the runtime starts from an empty one. [`creation`] times each
-//!   creator: render, compute and tile states, from a descriptor (a guest's deserialized one too,
-//!   whose decoding it times as well) or a function, the display's present pipelines, the
-//!   predication step's pipeline, libraries and function lookups.
+//!   creator: render and compute states, from a descriptor or a function, the display's present
+//!   pipelines, the predication step's pipeline, libraries and function lookups.
 //! - **At a state's first use**: a render state's `VkPipeline` of each graphics key (the pass's
 //!   formats and samples, the draw's topology, the encoder state the pipeline takes statically)
-//!   is made by the first draw that needs it, a compute or tile state's of each region
-//!   specialization by the first dispatch, inside that command's runtime call on the encoding
-//!   thread, where MoltenVK makes the Metal pipeline under it. [`encoder_call`] writes an encoder
-//!   command that takes [`SLOW_CALL`] or more, naming the pipeline state set last.
+//!   is made by the first draw that needs it, a compute state's of each region specialization by
+//!   the first dispatch, inside that command's runtime call on the encoding thread, where MoltenVK
+//!   makes the Metal pipeline under it. [`encoder_call`] writes an encoder command that takes
+//!   [`SLOW_CALL`] or more, naming the pipeline state set last.
 //! - **At the commit**: the commands of the indirect command buffers a command buffer executes
 //!   are recorded then, on the committing thread, making the `VkPipeline`s they need; [`commit`]
 //!   writes a commit that takes [`SLOW_CALL`] or more. Those whose records the GPU may write are
 //!   recorded later, by a host step on the runtime's scheduler once the work before them
 //!   completed, which delays the command buffer's completion: [`commit`] also writes a command
 //!   buffer that completes [`LATE_COMPLETION`] or more after its commit, with the times the
-//!   runtime kept of it. Its GPU times are the host's ([`crate::platform`]'s device options): it
-//!   "began" when its submission ended, or when its queue's command buffer before it "ended",
-//!   where later, and "ended" when the runtime saw it complete.
+//!   runtime kept of it. Its GPU times are its GPU's timestamps on the host's clock
+//!   ([`crate::platform`]'s device options), except on MoltenVK, where the runtime answers them
+//!   from the host's: it "began" when its submission ended, or when its queue's command buffer
+//!   before it "ended", where later, and "ended" when the runtime saw it complete.
 //! - **Every completion**: [`commit`] adds each command buffer's times to a summary of its queue's
 //!   (queues of one label are one), and the first completion [`SUMMARY_SPAN`] or more after the
 //!   summary's first writes a line of each queue, then starts the next: how many completed, and
 //!   the median, 95th percentile and most of each leg from the commit to the handler, in the
 //!   times above. A queue's command buffers do not overlap in them, so its GPU legs' sum is how
-//!   long it held the GPU, its completions' detection included.
+//!   long it held the GPU (on MoltenVK, its completions' detection included).
 //!
 //! **Measured** on the M3 Max (MoltenVK, runtime 60b8cadc9), a render state of the suite's
 //! `tri_vert` and `tri_frag` with one BGRA8 target, then three draws: with an empty shader cache
@@ -44,15 +45,15 @@ use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use crate::core::platform::os::{Clock as _, MonoTime};
 use metal2vulkan::pipeline::{MeshPipelineDescriptor, RenderPipelineDescriptor, StageSource};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::{Clock as _, MonoTime};
 
+use crate::core::platform::types::NsErrorText;
+use crate::core::raise::RaiseResult;
+use crate::core::sync::Mutex;
+use crate::core::trace;
 use crate::os::OsClock;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::trace;
 
 /// An encoder command or a commit that takes this long or longer is written.
 pub const SLOW_CALL: Duration = Duration::from_millis(5);
@@ -177,7 +178,7 @@ pub fn creation<T>(
 /// What a render state leaves to its first use, as a creation line says it.
 pub const RENDER_LATER: &str = " (its VkPipelines are made at the draws that first need them)";
 
-/// What a compute or tile state leaves to its first use, as a creation line says it.
+/// What a compute state leaves to its first use, as a creation line says it.
 pub const DISPATCH_LATER: &str =
     " (its VkPipelines are made at the dispatches that first need them)";
 
@@ -396,8 +397,8 @@ const LEGS: [&str; 6] = [
     "commit to submission",
     "submitting",
     "behind the queue",
-    "GPU until seen complete",
-    "seen complete to the handler",
+    "on the GPU",
+    "GPU end to the handler",
     "commit to the handler",
 ];
 
@@ -523,12 +524,12 @@ mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU64;
 
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::raise::OnFault;
+    use crate::core::sync::Mutex;
     use log::LevelFilter;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::sync::Mutex;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -543,7 +544,7 @@ mod tests {
     fn hook() -> Seen {
         let seen = Seen::default();
         let lines = Arc::clone(&seen);
-        let installed = reims_vgpu_core::logging::set_hook(
+        let installed = crate::core::logging::set_hook(
             LevelFilter::Debug,
             Box::new(move |_, target, message| {
                 if target == module_path!().trim_end_matches("::tests") {
@@ -569,7 +570,7 @@ mod tests {
                     "--test-threads=1",
                 ])
                 .env(CHILD, "1")
-                .env_remove(reims_vgpu_core::logging::ENV_VAR)
+                .env_remove(crate::core::logging::ENV_VAR)
                 .output()
                 .unwrap();
             assert!(out.status.success(), "{out:?}");
@@ -674,9 +675,9 @@ mod tests {
                  runtime's times",
                 "summary of queue \"b\" over 1.00 s: 2 command buffers completed, 0 without the \
                  runtime's times; ms p50/p95/max of commit to submission 1.00/1.00/1.00, \
-                 submitting 0.50/0.50/0.50, behind the queue 0.50/0.50/0.50, GPU until seen \
-                 complete 4.00/4.00/8.00, seen complete to the handler 0.50/0.50/0.50, commit to \
-                 the handler 6.50/6.50/10.50; GPU legs sum to 12.0 ms",
+                 submitting 0.50/0.50/0.50, behind the queue 0.50/0.50/0.50, on the GPU \
+                 4.00/4.00/8.00, GPU end to the handler 0.50/0.50/0.50, commit to the handler \
+                 6.50/6.50/10.50; GPU legs sum to 12.0 ms",
             ]
         );
         assert!(summary.queues.is_empty());
@@ -693,14 +694,14 @@ mod tests {
     /// Measured on the M3 Max (MoltenVK, a dev build, runtime a62e8a365f), at the median: 278 us
     /// from the commit to the handler through the platform and 269 us through the runtime, of
     /// which the commit to the submission 29 us and 20 us (the platform's submission check, on
-    /// the runtime's scheduler thread) and the GPU until seen complete 221 us and 222 us; the
+    /// the runtime's scheduler thread) and on the GPU (from the host there) 221 us and 222 us; the
     /// commit held its thread 13 us and 10 us; one handler thread woken a command buffer, and
     /// every transition to scheduled run where submitted, either way.
     #[test]
     #[ignore = "a measurement, run by hand: prints the latencies"]
     fn commit_to_handler_latency() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         let d = dev();
         let q = d.new_command_queue().unwrap();

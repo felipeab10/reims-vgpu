@@ -5,7 +5,7 @@ use objc2::exception::{self, Exception};
 use objc2::rc::Retained;
 use objc2::runtime::{AnyObject, NSObject};
 use objc2_foundation::{NSException, NSString};
-use reims_vgpu_core::testkit::capture::catch_death;
+use reims_vgpu_vulkan::core::testkit::capture::catch_death;
 
 use super::*;
 
@@ -26,12 +26,10 @@ fn ns_exception() -> Retained<AnyObject> {
 /// Whatever the host throws ends the process at the call
 #[test]
 fn a_host_raise_is_fatal_at_the_call() {
-    let d = catch_death(|| host_call("map_memory", || throw(ns_exception())));
-    assert_eq!(d.unwrap_err(), host_raised("map_memory"));
-    let d = catch_death(|| host_call("unmap_memory", || throw(ns_exception())));
-    assert_eq!(d.unwrap_err(), host_raised("unmap_memory"));
-    let d = catch_death(|| host_call("read_memory", || throw(NSObject::new().into_super())));
-    assert_eq!(d.unwrap_err(), host_raised("read_memory"));
+    let d = catch_death(|| host_call("raise_interrupt", || throw(ns_exception())));
+    assert_eq!(d.unwrap_err(), host_raised("raise_interrupt"));
+    let d = catch_death(|| host_call("cursor_move", || throw(NSObject::new().into_super())));
+    assert_eq!(d.unwrap_err(), host_raised("cursor_move"));
 }
 
 unsafe extern "C-unwind" {
@@ -44,9 +42,9 @@ unsafe extern "C-unwind" {
 fn a_nil_throw_is_fatal() {
     // SAFETY: objc_exception_throw(nil).
     let d = catch_death(|| {
-        host_call("create_task", || unsafe {
+        host_call("cursor_show", || unsafe {
             objc_exception_throw(std::ptr::null_mut())
         })
     });
-    assert_eq!(d.unwrap_err(), host_raised("create_task"));
+    assert_eq!(d.unwrap_err(), host_raised("cursor_show"));
 }

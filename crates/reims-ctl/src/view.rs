@@ -6,10 +6,10 @@
 //! Everything goes through the VM's QMP socket, so it works on any running VM:
 //! - A frame is QMP's `screendump` of the display's console: a PPM, written into a directory of
 //!   the viewer's own under `$XDG_RUNTIME_DIR` (or `/dev/shm`, or the temporary directory),
-//!   removed when it ends, or by the next viewer where it was killed (`FrameDir`). For
-//!   it, apple-gfx draws the guest's newest frame into the console's surface
-//!   (vendor/qemu hw/display/apple-gfx.c, `apple_gfx_fb_update_display`), rendering and reading
-//!   it back only when the guest has presented a frame since the last.
+//!   removed when it ends, or by the next viewer where it was killed (`FrameDir`). For it,
+//!   reims-graphics-pci reads back what its display shows from the library at each of the
+//!   console's updates (vendor/qemu hw/display/reims-graphics-pci.c,
+//!   `rvg_graphics_device_read_display`).
 //! - Input is `input-send-event`: the USB tablet's absolute position and buttons, and the USB
 //!   keyboard's keys (keys.rs).
 //!
@@ -37,7 +37,6 @@ mod term;
 
 pub use term::Protocol;
 
-use crate::host::Profile;
 use crate::qmp::Qmp;
 use crate::runtime;
 use crate::vm::Vm;
@@ -59,7 +58,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 use serde_json::{Value, json};
 use std::collections::VecDeque;
-use std::io::Write;
+use std::io::{IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
@@ -67,8 +66,6 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 pub struct Options {
-    /// The display, from 1.
-    pub display: u32,
     /// The most frames a second.
     pub fps: u32,
     /// How to draw frames; asked of the terminal when `None`.
@@ -78,7 +75,6 @@ pub struct Options {
 impl Default for Options {
     fn default() -> Options {
         Options {
-            display: 1,
             fps: 15,
             protocol: None,
         }
@@ -101,11 +97,10 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
     if runtime::pid(vm).is_none() {
         bail!("{name} is not running: reims-ctl start {name}");
     }
-    // SAFETY: isatty only reads its descriptor's state.
-    if unsafe { libc::isatty(0) == 0 || libc::isatty(1) == 0 } {
+    if !std::io::stdin().is_terminal() || !std::io::stdout().is_terminal() {
         bail!("reims-ctl view draws in a terminal: run it in one");
     }
-    let target = Target::for_vm(vm, opts.display)?;
+    let target = Target::for_vm(vm);
     let dir = FrameDir::new()?;
     let file = dir.0.join("frame.ppm");
     // A screendump before the terminal is taken, so that what stops one shows plainly.
@@ -120,8 +115,11 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
         .unwrap_or_else(|| term::choose(&caps, |k| std::env::var(k).ok()));
     let (cols, rows) = ratatui::crossterm::terminal::size()?;
     let measured = term::cell_size(&caps, cols, rows);
-    let pixel_mouse = caps.sgr_pixels && measured.is_some();
-    tg.enable(caps.kitty_keyboard, pixel_mouse, proto == Protocol::Kitty)?;
+    // On Windows crossterm reads the console's records, which give the mouse in cells and keys
+    // without kitty's protocol, whatever the terminal could send.
+    let pixel_mouse = cfg!(unix) && caps.sgr_pixels && measured.is_some();
+    let keyboard = cfg!(unix) && caps.kitty_keyboard;
+    tg.enable(keyboard, pixel_mouse, proto == Protocol::Kitty)?;
 
     let sh = Arc::new(Shared {
         stop: AtomicBool::new(false),
@@ -172,7 +170,6 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
 
     let mut v = View {
         name,
-        display: opts.display,
         proto,
         caps,
         blocks: None,
@@ -194,40 +191,21 @@ pub fn run(vm: &Vm, opts: &Options) -> Result<Option<String>> {
 /// Where QMP finds the display.
 struct Target {
     socket: PathBuf,
-    /// The display device's id and the display's head. vmapple's apple-gfx-mmio has no id; its
-    /// first display is console 0, QMP's default.
-    device: Option<(&'static str, u32)>,
+    /// The display device's id: qemu.rs gives reims-graphics-pci or vmware-svga the id gfx.
+    device: &'static str,
 }
 
 impl Target {
-    fn for_vm(vm: &Vm, display: u32) -> Result<Target> {
-        let count = vm.config.display_count();
-        if display == 0 || display > count {
-            bail!(
-                "{} has {count} display{}: --display takes 1 to {count}",
-                vm.name(),
-                if count == 1 { "" } else { "s" }
-            );
-        }
-        let device = match vm.config.profile {
-            // qemu.rs gives reims-graphics-pci, apple-gfx-pci or vmware-svga the id gfx.
-            Profile::Q35X86_64 => Some(("gfx", display - 1)),
-            Profile::VmappleArm64 if display == 1 => None,
-            Profile::VmappleArm64 => {
-                bail!("a vmapple VM's displays past the first have no name QMP can take")
-            }
-        };
-        Ok(Target {
+    fn for_vm(vm: &Vm) -> Target {
+        Target {
             socket: vm.qmp_socket(),
-            device,
-        })
+            device: "gfx",
+        }
     }
 
     fn with_device(&self, mut v: Value) -> Value {
-        if let Some((d, head)) = self.device {
-            v["device"] = json!(d);
-            v["head"] = json!(head);
-        }
+        v["device"] = json!(self.device);
+        v["head"] = json!(0);
         v
     }
 
@@ -243,7 +221,6 @@ struct FrameDir(PathBuf);
 
 impl FrameDir {
     fn new() -> Result<FrameDir> {
-        use std::os::unix::fs::DirBuilderExt;
         let base = std::env::var_os("XDG_RUNTIME_DIR")
             .map(PathBuf::from)
             .filter(|p| p.is_dir())
@@ -252,10 +229,7 @@ impl FrameDir {
         sweep_frame_dirs(&base);
         let dir = base.join(format!("{FRAME_DIR_PREFIX}{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::DirBuilder::new()
-            .mode(0o700)
-            .create(&dir)
-            .with_context(|| format!("create {}", dir.display()))?;
+        crate::os::create_private_dir(&dir).with_context(|| format!("create {}", dir.display()))?;
         Ok(FrameDir(dir))
     }
 }
@@ -272,28 +246,25 @@ const FRAME_DIR_PREFIX: &str = "reims-ctl-view-";
 /// Removes the frame directories in `base` that viewers which no longer run left: those of this
 /// user's named for a pid no process has. A running viewer's stays, as does any other entry.
 fn sweep_frame_dirs(base: &Path) {
-    use std::os::unix::fs::MetadataExt;
     let Ok(entries) = std::fs::read_dir(base) else {
         return;
     };
-    // SAFETY: getuid has no preconditions.
-    let uid = unsafe { libc::getuid() };
     for e in entries.flatten() {
         let pid = e.file_name().to_str().and_then(|n| {
             n.strip_prefix(FRAME_DIR_PREFIX)
-                .and_then(|p| p.parse::<libc::pid_t>().ok())
+                .and_then(|p| p.parse::<i32>().ok())
         });
         let Some(pid) = pid.filter(|p| *p > 0) else {
             continue;
         };
         // The entry itself, not what a link names.
-        if !e.metadata().is_ok_and(|m| m.is_dir() && m.uid() == uid) {
+        if !e
+            .metadata()
+            .is_ok_and(|m| m.is_dir() && crate::os::owned_by_me(&m))
+        {
             continue;
         }
-        // SAFETY: signal 0 sends nothing; it asks only whether the process exists.
-        let gone = unsafe { libc::kill(pid, 0) } == -1
-            && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH);
-        if gone {
+        if crate::os::gone(pid) {
             let _ = std::fs::remove_dir_all(e.path());
         }
     }
@@ -379,8 +350,7 @@ impl Drop for TermGuard {
         }
         let _ = out.flush();
         // Reports that came in before the terminal stopped sending them go unread.
-        // SAFETY: tcflush only discards stdin's queued input.
-        unsafe { libc::tcflush(0, libc::TCIFLUSH) };
+        crate::os::flush_input();
         ratatui::restore();
     }
 }
@@ -448,7 +418,6 @@ enum Ui {
 
 struct View {
     name: String,
-    display: u32,
     proto: Protocol,
     caps: term::Caps,
     /// Half blocks on the screen, where they draw the frame.
@@ -623,14 +592,14 @@ fn toolbar(name: &str, latch: Mods) -> (Line<'static>, Vec<(u16, u16, Mods)>) {
 }
 
 fn status(v: &View) -> Line<'static> {
-    let mut s = format!(" display {}", v.display);
+    let mut s;
     if let Some(Shown {
         frame: (fw, fh),
         sent: (sw, sh),
         bytes,
     }) = v.frame
     {
-        s.push_str(&format!(" · {fw}×{fh}"));
+        s = format!(" {fw}×{fh}");
         match v.proto {
             Protocol::Blocks => s.push_str(" · half blocks"),
             p => s.push_str(&format!(" · {} {sw}×{sh}", p.name())),
@@ -640,7 +609,7 @@ fn status(v: &View) -> Line<'static> {
             s.push_str(&format!(" · {} KB a frame", bytes.div_ceil(1024)));
         }
     } else {
-        s.push_str(&format!(" · {}", v.proto.name()));
+        s = format!(" {}", v.proto.name());
     }
     let mut spans = vec![Span::styled(s, BAR)];
     if let Some((n, at)) = &v.note

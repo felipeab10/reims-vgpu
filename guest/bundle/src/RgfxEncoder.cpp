@@ -98,81 +98,25 @@ void RgfxEncoder::giveBackBlock()
 	m_block = {};
 }
 
-bool RgfxEncoder::moveToBlock(size_t size)
-{
-	RgfxMessageBlock block = {};
-	if (m_blocks == nullptr || !m_blocks->take(size, &block))
-		return false;
-	uint8_t *to = const_cast<uint8_t *>(block.ptr);
-	const size_t used = static_cast<size_t>(m_cur - m_store);
-	std::memcpy(to, m_store, used);
-	if (m_inBlock)
-		giveBackBlock(); // never posted: no host reads it
-	else
-		std::free(m_store);
-	m_ops = to + (m_ops - m_store);
-	m_cur = to + used;
-	m_store = to;
-	m_end = to + block.size;
-	m_block = block;
-	m_inBlock = true;
-	return true;
-}
-
-void RgfxEncoder::moveToHeap(size_t size)
+void RgfxEncoder::grow(size_t n)
 {
 	const size_t used = static_cast<size_t>(m_cur - m_store);
-	uint8_t *to;
-	if (m_inBlock) {
-		to = static_cast<uint8_t *>(std::malloc(size));
-		if (to != nullptr)
-			std::memcpy(to, m_store, used);
-	} else {
-		to = static_cast<uint8_t *>(std::realloc(m_store, size));
+	size_t size = std::max(used + n, 2 * static_cast<size_t>(m_end - m_store));
+	// A message that outgrows its ring grows to its queue's guess at once (setMessageBlocks), so
+	// a large one is not copied again at each doubling.
+	if (m_ring != nullptr) {
+		const uint64_t message = RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix +
+		                         static_cast<uint64_t>(m_cur - m_ops) + n;
+		if (message > UINT32_MAX || !m_ring->fits(static_cast<uint32_t>(message)))
+			size = std::max<size_t>(size, kHeadroom + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_sizeHint);
 	}
+	uint8_t *to = static_cast<uint8_t *>(std::realloc(m_store, size));
 	if (to == nullptr)
 		std::abort(); // as std::vector's growth ends the process where memory runs out
-	if (m_inBlock) {
-		giveBackBlock();
-		m_inBlock = false;
-	}
 	m_ops = to + (m_ops - m_store);
 	m_cur = to + used;
 	m_store = to;
 	m_end = to + size;
-}
-
-void RgfxEncoder::grow(size_t n)
-{
-	const size_t used = static_cast<size_t>(m_cur - m_store);
-	const size_t need = used + n;
-	const size_t doubled = std::max(need, 2 * static_cast<size_t>(m_end - m_store));
-	// A message too large for its ring goes in a block: once it outgrows the ring it moves
-	// there, to a block as large as its queue's guess, and grows from block to block.
-	if (m_ring != nullptr && m_blocks != nullptr) {
-		const uint64_t message = RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix +
-		                         static_cast<uint64_t>(m_cur - m_ops) + n;
-		if (m_inBlock || message > UINT32_MAX || !m_ring->fits(static_cast<uint32_t>(message))) {
-			const size_t first = m_inBlock ? doubled
-			                               : std::max<size_t>(doubled, kHeadroom +
-			                                                               RGFX_COMMAND_BUFFER_OPS_OFFSET +
-			                                                               m_blockHint);
-			if (moveToBlock(first))
-				return;
-		}
-	}
-	moveToHeap(doubled);
-}
-
-void RgfxEncoder::appendArrayOp(uint16_t tag, const void *head, size_t head_n, const void *elems,
-                                uint32_t count, size_t stride)
-{
-	const size_t tail = static_cast<size_t>(count) * stride;
-	uint8_t *at = reserve(RGFX_OP_BODY_OFFSET + head_n + tail);
-	putHeader(at, tag, RGFX_OP_BODY_OFFSET + head_n + tail);
-	std::memcpy(at + RGFX_OP_BODY_OFFSET, head, head_n);
-	if (tail != 0)
-		std::memcpy(at + RGFX_OP_BODY_OFFSET + head_n, elems, tail);
 }
 
 void RgfxEncoder::prependSurfaceUses(const RgfxOpSurfaceUse *uses, size_t count)
@@ -207,6 +151,19 @@ void RgfxEncoder::prependCommitOrder(const RgfxSurfaceOrderWait *waits, size_t c
 	std::memcpy(at + RGFX_OP_BODY_OFFSET, waits, count * sizeof(RgfxSurfaceOrderWait));
 }
 
+bool RgfxEncoder::prependGuestTimes()
+{
+	if (!m_timesPending)
+		return false;
+	m_timesPending = false;
+	uint8_t *at = prependRoom(kGuestTimesBytes);
+	putHeader(at, RGFX_OP_GUEST_TIMES, kGuestTimesBytes);
+	RgfxOpGuestTimes times = m_times;
+	times.posted_ns = 0; // stamped as it goes on the ring
+	std::memcpy(at + RGFX_OP_BODY_OFFSET, &times, sizeof(times));
+	return true;
+}
+
 uint8_t *RgfxEncoder::prependRoom(size_t bytes)
 {
 	// Before the header's room: the ops move up where the room before them is short.
@@ -232,46 +189,72 @@ bool RgfxEncoder::fitsRing() const
 
 bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &whileWaiting,
                          const std::function<void(uint64_t)> &beforePublish,
-                         RgfxMessageBlock *held)
+                         RgfxMessageBlock *held, RgfxPublishVia *via)
 {
-	const uint64_t size = messageSize();
-	if (m_ring == nullptr || size > UINT32_MAX)
+	if (m_ring == nullptr || messageSize() > UINT32_MAX)
 		return false;
+	// The guest's times go first, the last op put there: the posted time is stamped as the
+	// message goes on the ring, the last write before its publish.
+	const bool timed = prependGuestTimes();
+	const uint64_t size = messageSize();
 	uint8_t *message = m_ops - m_prefix - RGFX_COMMAND_BUFFER_OPS_OFFSET;
 	m_head.op_bytes = opBytes();
-	if (!m_inBlock && m_ring->fits(static_cast<uint32_t>(size))) {
+	if (m_ring->fits(static_cast<uint32_t>(size))) {
 		std::memcpy(message, &m_head, sizeof(m_head));
+		// A buffer whose stream ends in its ask is one the host answers at the doorbell, behind
+		// a walk too (RgfxRingWriter::tryPost).
 		return m_ring->post(RGFX_CMD_COMMAND_BUFFER, message, static_cast<uint32_t>(size),
-		                    out_seqno, whileWaiting, beforePublish);
+		                    out_seqno, whileWaiting, beforePublish, endsInAsk(),
+		                    timed ? RGFX_GUEST_TIMES_POSTED_OFFSET : 0, via);
 	}
-	// Out of line: the block the message was built in, else one it is copied to now.
+	// Out of line: the whole message copied once into a block of the pool, from its start. The
+	// host reads the block once the reference's `producer` is published, which the ring writer
+	// orders after these stores, write-combined ones among them (RgfxRingWriter's storeFence).
 	m_head.header.type = RGFX_CMD_COMMAND_BUFFER;
 	m_head.header.size = static_cast<uint32_t>(size);
 	m_head.header.seqno = 0;
 	std::memcpy(message, &m_head, sizeof(m_head));
-	if (!m_inBlock) {
-		const size_t at = static_cast<size_t>(message - m_store);
-		if (!moveToBlock(static_cast<size_t>(m_cur - m_store)))
-			return false;
-		message = m_store + at;
-	}
-	// Write-back memory the host reads once the reference's `producer` is published (a
-	// release store), so the message's writes are ordered before it.
+	RgfxMessageBlock block = {};
+	if (m_blocks == nullptr || !m_blocks->take(size, &block))
+		return false;
+	uint8_t *to = const_cast<uint8_t *>(block.ptr);
+	std::memcpy(to, message, static_cast<size_t>(size));
+	std::free(m_store);
+	m_store = to;
+	m_ops = to + RGFX_COMMAND_BUFFER_OPS_OFFSET + m_prefix;
+	m_cur = to + size;
+	m_end = to + block.size;
+	m_block = block;
+	m_inBlock = true;
 	RgfxCommandBufferInRegion ref = {};
-	ref.region_offset = m_block.offset + static_cast<uint64_t>(message - m_store);
+	ref.region_offset = block.offset;
 	ref.byte_length = size;
 	if (held != nullptr) {
 		// The holder has it before the host can see the message, as the completion may come
 		// before the post returns; it gives it back once the buffer is done, or goes. The
-		// builder writes it no more.
+		// builder writes it no more, but for its posted time below.
 		*held = m_block;
 		m_block = {};
 		m_inBlock = false;
 		m_store = m_ops = m_cur = m_end = nullptr;
 		m_prefix = 0;
 	}
+	if (!timed)
+		return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
+		                    whileWaiting, beforePublish, false, 0, via);
+	// Its posted time goes into the block as its reference goes on the ring, under the ring's
+	// lock, after the caller's beforePublish and before the publish, which the ring writer's
+	// storeFence orders it before: the wait for the ring is the post's, as a message on the ring
+	// is stamped.
+	uint8_t *posted = to + RGFX_GUEST_TIMES_POSTED_OFFSET;
+	const std::function<void(uint64_t)> stamped = [&beforePublish, posted](uint64_t seqno) {
+		if (beforePublish)
+			beforePublish(seqno);
+		const uint64_t now = rgfxGuestClockNs();
+		std::memcpy(posted, &now, sizeof(now));
+	};
 	return m_ring->post(RGFX_CMD_COMMAND_BUFFER_IN_REGION, &ref, sizeof(ref), out_seqno,
-	                    whileWaiting, beforePublish);
+	                    whileWaiting, stamped, false, 0, via);
 }
 
 // --- framing ----------------------------------------------------------------
@@ -279,11 +262,13 @@ bool RgfxEncoder::finish(uint64_t *out_seqno, const std::function<void()> &while
 void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
                                   const RgfxRenderPassColorAttachment *colors, uint32_t color_count,
                                   const RgfxRenderPassSamplePositions *positions,
-                                  const RgfxRenderPassVisibility *visibility)
+                                  const RgfxRenderPassVisibility *visibility,
+                                  const RgfxRenderPassRateMap *rate_map)
 {
 	desc.color_count = color_count;
-	desc.flags &= ~(RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT);
-	if (positions == nullptr && visibility == nullptr) {
+	desc.flags &= ~(RGFX_PASS_FLAG_SAMPLE_POSITIONS | RGFX_PASS_FLAG_VISIBILITY_RESULT |
+	                RGFX_PASS_FLAG_RATE_MAP);
+	if (positions == nullptr && visibility == nullptr && rate_map == nullptr) {
 		appendArrayOp(RGFX_OP_ENCODER_BEGIN_RENDER, &desc, sizeof(desc), colors, color_count,
 		              sizeof(RgfxRenderPassColorAttachment));
 		return;
@@ -292,11 +277,14 @@ void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
 		desc.flags |= RGFX_PASS_FLAG_SAMPLE_POSITIONS;
 	if (visibility != nullptr)
 		desc.flags |= RGFX_PASS_FLAG_VISIBILITY_RESULT;
+	if (rate_map != nullptr)
+		desc.flags |= RGFX_PASS_FLAG_RATE_MAP;
 	const size_t colorBytes = static_cast<size_t>(color_count) * sizeof(RgfxRenderPassColorAttachment);
 	const size_t positionBytes = positions != nullptr ? sizeof(*positions) : 0;
 	const size_t visibilityBytes = visibility != nullptr ? sizeof(*visibility) : 0;
-	const size_t len =
-	    RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + positionBytes + visibilityBytes;
+	const size_t rateMapBytes = rate_map != nullptr ? sizeof(*rate_map) : 0;
+	const size_t len = RGFX_OP_BODY_OFFSET + sizeof(desc) + colorBytes + positionBytes +
+	                   visibilityBytes + rateMapBytes;
 	uint8_t *at = reserve(len);
 	putHeader(at, RGFX_OP_ENCODER_BEGIN_RENDER, len);
 	at += RGFX_OP_BODY_OFFSET;
@@ -310,6 +298,9 @@ void RgfxEncoder::beginRenderPass(RgfxRenderPassDesc desc,
 	at += positionBytes;
 	if (visibilityBytes)
 		std::memcpy(at, visibility, visibilityBytes);
+	at += visibilityBytes;
+	if (rateMapBytes)
+		std::memcpy(at, rate_map, rateMapBytes);
 }
 
 void RgfxEncoder::beginComputePass()
@@ -342,7 +333,6 @@ void RgfxEncoder::videoDecodeH264(const RgfxVideoOpDecodeH264 &body, const uint8
 {
 	RgfxVideoOpDecodeH264 b = body;
 	b.parameter_sets_size = size;
-	b.reserved_2c = 0;
 	appendVideoDecode(RGFX_OP_VIDEO_DECODE_H264, &b, sizeof(b), parameterSets, size);
 }
 
@@ -351,7 +341,6 @@ void RgfxEncoder::videoDecodeH265(const RgfxVideoOpDecodeH265 &body, const uint8
 {
 	RgfxVideoOpDecodeH265 b = body;
 	b.parameter_sets_size = size;
-	b.reserved_2c = 0;
 	appendVideoDecode(RGFX_OP_VIDEO_DECODE_H265, &b, sizeof(b), parameterSets, size);
 }
 
@@ -754,6 +743,7 @@ void RgfxEncoder::renderSetDepthClipModeSpi(uint64_t mode)
 
 void RgfxEncoder::renderSetProvokingVertexMode(uint64_t mode)
 {
+	m_renderStateSet |= kRgfxRenderStateProvokingVertex;
 	RgfxOpSetProvokingVertexMode b = {};
 	b.mode = mode;
 	appendOp(RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, &b, sizeof(b));
@@ -923,6 +913,7 @@ void RgfxEncoder::renderSetViewportTransformEnabled(bool enabled)
 
 void RgfxEncoder::renderSetPrimitiveRestartEnabled(uint64_t index, bool enabled)
 {
+	m_renderStateSet |= kRgfxRenderStatePrimitiveRestart;
 	RgfxOpSetPrimitiveRestartEnabled b = {};
 	b.index = index;
 	b.enabled = enabled ? 1u : 0u;
@@ -1428,6 +1419,24 @@ void RgfxEncoder::computeSetSamplerStates(uint64_t location,
 	h.length = count;
 	appendArrayOp(RGFX_OP_COMPUTE_SET_SAMPLER_STATES, &h, sizeof(h), samplers, count,
 	              sizeof(RgfxComputeSamplerBinding));
+}
+
+void RgfxEncoder::computeSetVisibleFunctionTable(RgfxObjId table, uint64_t index)
+{
+	RgfxComputeOpSetVisibleFunctionTable b = {};
+	b.table_obj_id = table;
+	b.index = index;
+	appendOp(RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE, &b, sizeof(b));
+}
+
+void RgfxEncoder::computeSetVisibleFunctionTables(
+    uint64_t location, const RgfxComputeVisibleFunctionTableBinding *tables, uint32_t count)
+{
+	RgfxComputeOpSetVisibleFunctionTables h = {};
+	h.location = location;
+	h.length = count;
+	appendArrayOp(RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES, &h, sizeof(h), tables, count,
+	              sizeof(RgfxComputeVisibleFunctionTableBinding));
 }
 
 void RgfxEncoder::computeSetSamplerStatesLodClamps(
@@ -2060,6 +2069,10 @@ void RgfxEncoder::appendSegment(RgfxEncoder &segment, uint32_t reset,
 		renderSetVisibilityResultMode(0, 0); // MTLVisibilityResultModeDisabled
 	if (reset & kRgfxRenderStateTessellationScale)
 		renderSetTessellationFactorScale(1.0f);
+	if (reset & kRgfxRenderStatePrimitiveRestart)
+		renderSetPrimitiveRestartEnabled(kRgfxRestartAtAllOnes, false);
+	if (reset & kRgfxRenderStateProvokingVertex)
+		renderSetProvokingVertexMode(0);
 	const size_t n = static_cast<size_t>(segment.m_cur - segment.m_ops);
 	if (n != 0)
 		std::memcpy(reserve(n), segment.m_ops, n);
