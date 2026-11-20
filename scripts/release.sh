@@ -245,17 +245,33 @@ BUILD_PLATFORM="linux-x86_64"
 # `$CACHE/qemu-build-<plataforma>/` antes de instalar; o layout antigo (in-tree,
 # em `vendor/qemu/build`) fica como último recurso para checkouts v1.6.
 if [[ -z "${QEMU_BIN_OVERRIDE:-}" ]]; then
-    QEMU_BIN=""
-    for candidato in \
-        "build/qemu/qemu-system-x86_64" \
-        "vendor/qemu/build/bin/qemu-system-x86_64" \
+    # All the places a binary may be, best first: the checkout's own builds,
+    # then the install-ctl cache (which may hold an older generation too).
+    CANDIDATES=(
+        "build/qemu/qemu-system-x86_64"
+        "vendor/qemu/build/bin/qemu-system-x86_64"
         "vendor/qemu/build/qemu-system-x86_64"
-    do
-        [[ -f "${candidato}" ]] && { QEMU_BIN="${candidato}"; break; }
+    )
+    while IFS= read -r found; do
+        [[ -n "${found}" ]] && CANDIDATES+=("${found}")
+    done < <(find "${CACHE_DIR}" -maxdepth 3 -name qemu-system-x86_64 -type f 2>/dev/null || true)
+    # Prefer a binary of this generation; a stale apple-gfx build in the cache
+    # must not win over a graphics one beside it. If none is graphics, keep the
+    # first that exists so the check below can say which generation it is.
+    QEMU_BIN=""
+    for candidato in "${CANDIDATES[@]}"; do
+        if [[ -f "${candidato}" ]] && grep -aq 'reims-graphics-pci' "${candidato}"; then
+            QEMU_BIN="${candidato}"
+            break
+        fi
     done
     if [[ -z "${QEMU_BIN}" ]]; then
-        FOUND_QEMU="$(find "${CACHE_DIR}" -maxdepth 3 -name qemu-system-x86_64 -type f 2>/dev/null | head -n1 || true)"
-        [[ -n "${FOUND_QEMU}" ]] && QEMU_BIN="${FOUND_QEMU}"
+        for candidato in "${CANDIDATES[@]}"; do
+            if [[ -f "${candidato}" ]]; then
+                QEMU_BIN="${candidato}"
+                break
+            fi
+        done
     fi
 else
     QEMU_BIN="${QEMU_BIN_OVERRIDE}"
