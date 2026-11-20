@@ -1,14 +1,22 @@
 [package]
 name = "reims-vgpu-vulkan"
-description = "A proof of concept: the Platform implementation over metal2vulkan-runtime, on Vulkan"
+description = "The library's platform: core, what the graphics device and its platform share, and the Platform implementation over metal2vulkan-runtime, on Vulkan"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 publish.workspace = true
 license.workspace = true
 
+[features]
+# core::testkit and testkit::capture outside this crate's own unit tests (architecture 13.2).
+testkit = ["dep:lzma-rs"]
+
 [dependencies]
-reims-vgpu-core.workspace = true
+# core (`core`): its locks (`core::sync`), and the guest's physical ranges as bytes (`core::host`).
+parking_lot.workspace = true
+zerocopy.workspace = true
+# core's testkit::metal_answers: the recorded answers too long for text, in xz files.
+lzma-rs = { workspace = true, optional = true }
 metal2vulkan-runtime.workspace = true
 metal2vulkan.workspace = true
 # The debug lines that time the runtime's compiles (gpu/timing.rs), through core's logger.
@@ -17,26 +25,49 @@ log.workspace = true
 # (`os/wsi.rs`), through ash, on either OS.
 ash.workspace = true
 
-# On macOS the OS services are the metal crate's (threads, clock, Mach VM, the autorelease pool and
-# IOSurface, `os/macos.rs`), with Metal's system default device, whose registryID the runtime's
-# default device answers (os/macos.rs's default_registry_id). The tests that compare answers with
-# the Metal platform's use it too.
+# On macOS the OS services are this crate's own (`os/macos.rs`): threads, clocks, Mach VM, the
+# autorelease pool, IOSurface through Foundation, and the message layer of those sends; with
+# Metal's system default device, whose registryID the runtime's default device answers
+# (os/macos.rs's default_registry_id). objc2's `exception` is on (the workspace's).
 [target.'cfg(target_os = "macos")'.dependencies]
-reims-vgpu-metal.workspace = true
+objc2.workspace = true
+objc2-foundation.workspace = true
+objc2-metal.workspace = true
+mach2.workspace = true
+libc.workspace = true
 
 # On Linux the OS services are this crate's own (`os/linux.rs`): threads, clocks, the views of
 # guest pages over the memory map's files, and IOSurface's stand-in.
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
-# The driver manifests the host's GPUs are read through (`host_gpus.rs`), as the loader reads them.
-serde_json.workspace = true
+
+# On Windows the OS services are this crate's own (`os/windows.rs`): threads, clocks, and the
+# views of guest pages over pagefile-backed sections, with the exception handler that holds a
+# thread across a view's remap, and the user's local application data folder (the shell's).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Com",
+    "Win32_System_Diagnostics_Debug",
+    "Win32_System_Kernel",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+    "Win32_System_WindowsProgramming",
+    "Win32_UI_Shell",
+] }
 
 # The hashes of the metallibs' sources, which a metallib built elsewhere is checked by (build.rs).
 [build-dependencies]
 sha2.workspace = true
 
 [dev-dependencies]
-reims-vgpu-core = { workspace = true, features = ["testkit"] }
+# core's testkit for the integration tests (`tests/`), which link the library as other
+# crates do.
+reims-vgpu-vulkan = { path = ".", features = ["testkit"] }
+# core's testkit in the unit tests, compiled under cfg(test).
+lzma-rs.workspace = true
 
 [lints]
 workspace = true

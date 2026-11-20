@@ -1,7 +1,14 @@
-// RgfxPagesBlock: the arithmetic of a pages block (kRgfxAccelMethodPagesBlock, 0x10e): a block of
+// RgfxPagesBlock: the arithmetic of a pages block (kRgfxAccelMethodPagesBlock, 4): a block of
 // a process's own that holds nothing but the guest RAM runs of pages of that process's, wired by
 // the kext for as long as the block lives, which the device maps in place for the process's
-// buffers over them (RGFX_FEATURE_PAGES_BUFFERS, BUFFER_OVER_PAGES).
+// buffers over them (RGFX_FEATURE_PAGES_BUFFERS, BUFFER_OVER_PAGES). A chunked pages block
+// (kRgfxAccelMethodPagesChunked, 12) is one over the kext's own chunks of kRgfxPagesChunk bytes
+// instead, mapped into the process, its runs found the same way.
+//
+// Memory the process maps read-only takes a block where the guest took RGFX_FEATURE_READ_ONLY_PAGES
+// alone: its pages are wired for reading, and the block's SURFACE_PAGES is marked
+// RGFX_SURFACE_PAGES_READ_ONLY, for the host to keep every object over it from writing them
+// (rgfxPagesWiring).
 //
 // The range a call names is rounded out to whole pages, as the wiring takes them; the device's
 // view starts at the first page, so a buffer over the call's first byte lies at its offset in that
@@ -31,6 +38,35 @@ struct RgfxPagesRange {
 	uint64_t length;
 	uint64_t offset;
 };
+
+// How a pages block's pages are wired (kRgfxAccelMethodPagesBlock): not at all, for reading
+// alone, or for reading and writing.
+enum class RgfxPagesAccess { kRefused, kRead, kReadWrite };
+
+// How a pages block of memory the process maps writable or not is made: its wiring, and the
+// RGFX_SURFACE_PAGES_* its SURFACE_PAGES carries.
+struct RgfxPagesWiring {
+	RgfxPagesAccess access;
+	uint32_t flags;
+};
+
+// The wiring of a pages block over memory the process maps `writable` or not, given the feature
+// word: writable memory for reading and writing, which resolves copy-on-write first, so a
+// private mapping's pages are its own before the device maps them, a block of the process's
+// (RGFX_SURFACE_PAGES_PRIVATE); read-only memory, where the word holds
+// RGFX_FEATURE_READ_ONLY_PAGES, for reading alone, which asks of the VM system no access the
+// process lacks, its block marked RGFX_SURFACE_PAGES_READ_ONLY too, for the host to keep every
+// object over it from writing its pages (the process can post any message on its rings, so the
+// mark, not the bundle's buffers' options, is what holds the line); and without the bit none,
+// as a host that does not know the mark would not hold it.
+inline RgfxPagesWiring rgfxPagesWiring(bool writable, uint64_t word)
+{
+	if (writable)
+		return {RgfxPagesAccess::kReadWrite, RGFX_SURFACE_PAGES_PRIVATE};
+	if (word & RGFX_FEATURE_READ_ONLY_PAGES)
+		return {RgfxPagesAccess::kRead, RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY};
+	return {RgfxPagesAccess::kRefused, 0};
+}
 
 // The whole pages of `page` (a power of two) that hold the `length` bytes at `address`: false
 // where the range is empty, wraps, or covers more than kRgfxPagesBlockMaxBytes.
@@ -90,6 +126,32 @@ inline uint64_t rgfxPagesBlockSize(uint32_t count, uint64_t page)
 {
 	const uint64_t bytes = static_cast<uint64_t>(count) * sizeof(RgfxPageRun);
 	return (bytes + page - 1) & ~(page - 1);
+}
+
+// An arm64 guest's page, 16 KiB, which its kernel gives memory in and wires whole. Where the kext
+// took RGFX_FEATURE_PAGES_16K (RgfxFeatures.hpp), every run of guest RAM it names to the device,
+// and the length of each SURFACE_PAGES, is whole such pages, as a host whose page is 16 KiB maps
+// guest RAM in no less (design.md, "Negotiated features").
+constexpr uint64_t kRgfxPage16K = 0x4000;
+
+// `length` bytes from a page's first byte, taken to the end of their last page of `page` (a power
+// of two).
+inline uint64_t rgfxToPageEnd(uint64_t length, uint64_t page)
+{
+	return (length + page - 1) & ~(page - 1);
+}
+
+// The `count` runs of a span of guest RAM, as the device is told of them in whole pages of `page`
+// (a power of two): the last run taken to the end of its page. A span whose first byte is a
+// page's then covers rgfxToPageEnd(its length) bytes. The bytes past the span's own in its last
+// page are the same allocation's, which the kernel gives and wires in whole pages, so they are no
+// other allocation's to read or write.
+inline void rgfxRunsToPageEnd(RgfxPageRun *runs, uint32_t count, uint64_t page)
+{
+	if (count == 0)
+		return;
+	RgfxPageRun &last = runs[count - 1];
+	last.length = rgfxToPageEnd(last.address + last.length, page) - last.address;
 }
 
 #endif // RGFX_PAGES_BLOCK_HPP_

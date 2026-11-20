@@ -26,6 +26,7 @@
 #include "RgfxAccelerator.hpp"
 #include "RgfxAskGate.hpp"
 #include "RgfxQueueLimits.hpp"
+#include "RgfxQueuePublish.hpp"
 
 class IOBufferMemoryDescriptor;
 
@@ -57,8 +58,11 @@ public:
 	// bytes back over the span, read-only, before the span can be anyone else's. Any thread; the
 	// window's lock alone, which a caller may take under the accelerator's context or surface
 	// lock. mapSpan fails, the op it serves with it, where the window is closed or the span is not
-	// one; an unmapSpan that cannot map the window back closes the window.
-	IOReturn mapSpan(UInt64 offset, UInt64 length);
+	// one; an unmapSpan that cannot map the window back closes the window. The span is mapped
+	// write-back, or write-combined where `writeCombined` (the bytes the process only writes,
+	// allocBlock's), from the region's descriptor for those spans
+	// (RgfxAccelerator::copyWriteCombinedRegion), and write-back where that is missing.
+	IOReturn mapSpan(UInt64 offset, UInt64 length, bool writeCombined = false);
 	void unmapSpan(UInt64 offset, UInt64 length);
 
 	// Whether the client's task is WindowServer (initWithTask): its blocks may take the reserve
@@ -109,6 +113,7 @@ private:
 	// The IOGPU base's device calls on its type-5 client: its configuration and device info.
 	IOReturn deviceMethod(uint32_t selector, IOExternalMethodArguments *arguments);
 	IOReturn submitMethod(IOExternalMethodArguments *arguments);
+	IOReturn submitBatchMethod(IOExternalMethodArguments *arguments);
 	IOReturn takeAnswersMethod(IOExternalMethodArguments *arguments);
 	IOReturn waitCompletionsMethod(IOExternalMethodArguments *arguments);
 	void releaseContext();
@@ -131,6 +136,12 @@ private:
 	// at the release, before the context's blocks go.
 	IOReturn openWindow();
 	void closeWindow();
+	// Binds a doorbell page of BAR 4 to the context and maps it into the task at the context's
+	// open, where the bundle asks for it (kRgfxAccelMethodOpenContext's seventh output);
+	// closeDoorbellPage unmaps it at the release, with the window, and then has it unbound and
+	// given back (RgfxDoorbellPages.hpp).
+	void openDoorbellPage();
+	void closeDoorbellPage();
 	IOReturn deviceInfoMethod(IOExternalMethodArguments *arguments);
 	// The surfaces a command buffer writes (kRgfxAccelMethodSurfaceWrites), and whether a queue is
 	// one of the client's open ones.
@@ -142,6 +153,19 @@ private:
 	// queue's OBJECT_DESTROY posted through submit both go through it, so the kext never keeps
 	// watching a queue the host has torn down.
 	bool destroyQueueIfTracked(UInt64 objId);
+	// Whether `objId` is one of the client's queues, listed or in the making, read under
+	// listLock: destroyQueueIfTracked's first look.
+	bool queueListed(UInt64 objId);
+	// The submission ring headers the kext publishes the client's queues' buffers on
+	// (RgfxQueuePublish.hpp): keepQueueHeader maps queue `objId`'s, whose ring lies at region
+	// offset `ring` in the client's block at `block`, at its create; publishQueue publishes
+	// `producer` on it with `flags` (SubmitBatch's), false where none is kept for the queue;
+	// dropQueueHeaders lets go of the queue `key`'s, those in the block at `key`, or every one,
+	// before what they lie in goes.
+	enum QueueHeaderDrop { kDropQueue, kDropBlock, kDropAll };
+	void keepQueueHeader(UInt64 objId, UInt64 block, UInt64 ring);
+	bool publishQueue(UInt64 objId, UInt64 producer, UInt64 flags);
+	void dropQueueHeaders(QueueHeaderDrop which, UInt64 key);
 
 	// As many as the device watches for one process (RgfxQueueLimits.hpp).
 	static const UInt32 kMaxQueues = kRgfxMaxQueuesPerClient;
@@ -169,6 +193,15 @@ private:
 	UInt64 queues[kMaxQueues];
 	// The queue a QUEUE_CREATE is making, its device's answer not yet in; 0 for none.
 	UInt64 creatingQueue;
+	// The queues' submission ring headers the kext publishes on, under listLock: the first 64
+	// queues' kept at once; a queue made past them has its buffers published by the bundle.
+	static const UInt32 kQueueHeaders = 64;
+	RgfxQueueHeaders<IOMemoryMap, kQueueHeaders> queueHeaders;
+	// Under listLock: the context's doorbell page (kRgfxNoDoorbellPage for none), its mapping in
+	// the task and its address there (0 for none), which the kext's own publish rings at too.
+	UInt32 doorbellPage;
+	IOMemoryMap *doorbellMap;
+	UInt64 doorbellAddress;
 	IOLock *queueLock;
 	IOLock *listLock;
 

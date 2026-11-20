@@ -1,11 +1,15 @@
 /*
- * RgfxRenderPipelineState: see RgfxRenderPipelineState.h. Our own ObjC++; no Apple
- * private SPI.
+ * RgfxRenderPipelineState: see RgfxRenderPipelineState.h. Our own ObjC++. Of Apple's private
+ * SPI it reads only the descriptor's private render state, by key, where the host takes it.
  */
 
 #import "RgfxRenderPipelineState.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxUnsupported.h"
 
+#import <objc/message.h>
+
+#include <cstring>
 #include <vector>
 
 #import "RgfxFunction.h"
@@ -56,12 +60,20 @@ bool fillFunctionRef(RgfxFunctionRef &fr, id<MTLFunction> fn)
 	return true;
 }
 
+/// The arguments of a stage with no function, which binds nothing: one for every pipeline.
+const std::shared_ptr<const RgfxAirFunction> &noStageArguments()
+{
+	static const std::shared_ptr<const RgfxAirFunction> none =
+	    std::make_shared<const RgfxAirFunction>();
+	return none;
+}
+
 /// The arguments of a stage's function `fn`, an RgfxFunction or nil: none for no function, which
 /// binds nothing; null where they are unknown.
 std::shared_ptr<const RgfxAirFunction> stageArguments(id<MTLFunction> fn)
 {
 	if (fn == nil)
-		return std::make_shared<const RgfxAirFunction>();
+		return noStageArguments();
 	return [(RgfxFunction *)fn rgfxAirFunction];
 }
 
@@ -186,7 +198,68 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	out[2] = wire32(size.depth);
 }
 
+// The descriptor's value of its private property `key` (Apple SPI), read by key-value coding
+// where the descriptor answers its getter (`key` or `is<Key>`); nil where it answers neither.
+NSNumber *privateValue(MTLRenderPipelineDescriptor *d, NSString *key)
+{
+	NSString *is = [NSString stringWithFormat:@"is%@%@", [key substringToIndex:1].uppercaseString,
+	                                          [key substringFromIndex:1]];
+	if (![d respondsToSelector:NSSelectorFromString(key)] &&
+	    ![d respondsToSelector:NSSelectorFromString(is)])
+		return nil;
+	id v = [d valueForKey:key];
+	return [v isKindOfClass:[NSNumber class]] ? v : nil;
+}
+
+// A pipeline stage's linked functions, where the descriptor has the getter. MTLLinkedFunctions
+// reached the render and mesh descriptors after macOS 11 (vertexLinkedFunctions and its siblings),
+// and sending one of those getters to a descriptor that lacks it raises an unrecognized-selector
+// exception that ends the process; CoreDisplay creates a render pipeline for its display on macOS
+// 11 (CreateMetalDevice), which read it there. Answer nil where the getter is absent, so the
+// create goes on with no linked functions, as that descriptor carries none.
+MTLLinkedFunctions *stageLinkedFunctions(id descriptor, SEL getter)
+{
+	if (![descriptor respondsToSelector:getter])
+		return nil;
+	return [descriptor valueForKey:NSStringFromSelector(getter)];
+}
+
+// The private state of `d` that Apple's OpenGL renderer sets (RgfxRenderPipelinePrivateState),
+// each property Metal's default where the descriptor does not answer it: a sample mask of all
+// ones, a coverage of 1, logic operation 0 and the flags off.
+RgfxRenderPipelinePrivateState privateStateOf(MTLRenderPipelineDescriptor *d)
+{
+	RgfxRenderPipelinePrivateState s = {};
+	NSNumber *v = privateValue(d, @"sampleMask");
+	s.sample_mask = v != nil ? v.unsignedLongLongValue : UINT64_MAX;
+	const float coverage = (v = privateValue(d, @"sampleCoverage")) != nil ? v.floatValue : 1.0f;
+	std::memcpy(&s.sample_coverage, &coverage, sizeof(coverage));
+	s.logic_operation = (v = privateValue(d, @"logicOperation")) != nil ? wire32(v.unsignedLongValue) : 0;
+	const struct {
+		NSString *key;
+		uint32_t flag;
+	} flags[] = {
+	    {@"openGLModeEnabled", RGFX_PRIVATE_RENDER_OPENGL_MODE},
+	    {@"sampleCoverageInvert", RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT},
+	    {@"logicOperationEnabled", RGFX_PRIVATE_RENDER_LOGIC_OPERATION},
+	    {@"depthStencilWriteDisabled", RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED},
+	};
+	for (const auto &f : flags)
+		if (privateValue(d, f.key).boolValue)
+			s.flags |= f.flag;
+	return s;
+}
+
 } // namespace
+
+// The device's makers of function tables of no stage (MTLDeviceSPI), which Metal's base render
+// pipeline asks for each stage's (RgfxMetalDevice.mm, RgfxMetalDevice+Unsupported.mm).
+@protocol RgfxDeviceFunctionTables
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor;
+- (id<MTLIntersectionFunctionTable>)newIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor;
+@end
 
 @implementation RgfxRenderPipelineState {
 	uint64_t _seqno;
@@ -216,6 +289,7 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	RgfxPipelineKey _key;
 	BOOL _deferred;
 	RgfxPipelineAnswer _answer;
+	NSInteger _textureWriteRoundingMode; // the descriptor's (MTLRenderPipelineDescriptorSPI)
 }
 
 // The host drops the pipeline as the app lets it go, after any command buffer that names it (each
@@ -268,7 +342,9 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -277,15 +353,18 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	// Each stage's linked functions; one another device's library made names no library the
 	// host holds, so the create is refused rather than sent.
 	RgfxLinkedFunctionList vertexLinked, fragmentLinked;
-	id<MTLFunction> foreignLinked =
-	    RgfxCollectLinkedFunctions(descriptor.vertexLinkedFunctions, vertexLinked);
+	id<MTLFunction> foreignLinked = RgfxCollectLinkedFunctions(
+	    stageLinkedFunctions(descriptor, @selector(vertexLinkedFunctions)), vertexLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(fragmentLinkedFunctions)), fragmentLinked);
 	if (foreignLinked != nil) {
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -321,6 +400,11 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	p.input_primitive_topology = static_cast<uint32_t>(descriptor.inputPrimitiveTopology);
 	p.max_vertex_amplification_count =
 	    static_cast<uint32_t>(descriptor.maxVertexAmplificationCount);
+	RgfxRenderPipelinePrivateState privateState = {};
+	if (serializer->carriesPrivateRenderState()) {
+		privateState = privateStateOf(descriptor);
+		p.private_state = &privateState;
+	}
 
 	// Vertex descriptor (optional): scan for the in-use layouts and attributes.
 	std::vector<RgfxVertexBufferLayout> layouts;
@@ -375,6 +459,7 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	                                                                     serializer:serializer];
 	if (state != nil) {
 		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		[state rgfxTakeRoundingOf:descriptor];
 		state->_vertexAir = stageArguments(descriptor.vertexFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
 		if (post.deferred) {
@@ -409,7 +494,12 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 		[failed appendString:@"meshFunction must not be nil.\n"];
 	if (descriptor.fragmentFunction == nil && descriptor.isRasterizationEnabled)
 		[failed appendString:@"fragmentFunction must not be nil.\n"];
-	if (descriptor.supportIndirectCommandBuffers)
+	// supportIndirectCommandBuffers reached the mesh descriptor in macOS 14; before it a mesh
+	// pipeline cannot ask for indirect command buffers, so there is nothing to refuse.
+	BOOL meshSupportsIcb =
+	    [descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)] &&
+	    descriptor.supportIndirectCommandBuffers;
+	if (meshSupportsIcb)
 		[failed appendString:@"Use of mesh shader pipelines in indirect command buffers is not "
 		                     @"supported by this device.\n"];
 	if (failed.length != 0)
@@ -454,7 +544,9 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: function %@ (%@) is not from a library of this device",
 		                     foreign.name, NSStringFromClass([(id)foreign class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -468,17 +560,21 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	}
 
 	RgfxLinkedFunctionList objectLinked, meshLinked, fragmentLinked;
-	id<MTLFunction> foreignLinked =
-	    RgfxCollectLinkedFunctions(descriptor.objectLinkedFunctions, objectLinked);
+	id<MTLFunction> foreignLinked = RgfxCollectLinkedFunctions(
+	    stageLinkedFunctions(descriptor, @selector(objectLinkedFunctions)), objectLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.meshLinkedFunctions, meshLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(meshLinkedFunctions)), meshLinked);
 	if (foreignLinked == nil)
-		foreignLinked = RgfxCollectLinkedFunctions(descriptor.fragmentLinkedFunctions, fragmentLinked);
+		foreignLinked = RgfxCollectLinkedFunctions(
+		    stageLinkedFunctions(descriptor, @selector(fragmentLinkedFunctions)), fragmentLinked);
 	if (foreignLinked != nil) {
 		NSString *msg = [NSString
 		    stringWithFormat:@"render pipeline: linked function %@ (%@) is not from a library of this device",
 		                     foreignLinked.name, NSStringFromClass([(id)foreignLinked class])];
-		NSLog(@"RGFX: %@", msg);
+		static char site;
+		if (rgfxLogFirst(&site))
+			NSLog(@"RGFX: %@", msg);
 		if (error)
 			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, msg);
 		return nil;
@@ -508,7 +604,9 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 		flags |= RGFX_RENDER_PIPELINE_ALPHA_TO_ONE;
 	if (descriptor.isRasterizationEnabled)
 		flags |= RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED;
-	if (descriptor.supportIndirectCommandBuffers)
+	// The mesh descriptor gained supportIndirectCommandBuffers in macOS 14; off before it.
+	if ([descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)] &&
+	    descriptor.supportIndirectCommandBuffers)
 		flags |= RGFX_RENDER_PIPELINE_SUPPORT_ICB;
 	if (descriptor.objectThreadgroupSizeIsMultipleOfThreadExecutionWidth)
 		flags |= RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH;
@@ -521,8 +619,13 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	p.max_total_threadgroups_per_mesh_grid = wire32(descriptor.maxTotalThreadgroupsPerMeshGrid);
 	p.payload_memory_length = wire32(descriptor.payloadMemoryLength);
 	p.max_vertex_amplification_count = wire32(descriptor.maxVertexAmplificationCount);
-	fillSize(p.required_threads_per_object_threadgroup, descriptor.requiredThreadsPerObjectThreadgroup);
-	fillSize(p.required_threads_per_mesh_threadgroup, descriptor.requiredThreadsPerMeshThreadgroup);
+	// requiredThreads* reached the mesh descriptor in macOS 26; before it they are unset (0,0,0).
+	if ([descriptor respondsToSelector:@selector(requiredThreadsPerObjectThreadgroup)]) {
+		fillSize(p.required_threads_per_object_threadgroup,
+		         descriptor.requiredThreadsPerObjectThreadgroup);
+		fillSize(p.required_threads_per_mesh_threadgroup,
+		         descriptor.requiredThreadsPerMeshThreadgroup);
+	}
 
 	RgfxCreated created = serializer->createMeshRenderPipeline(p);
 	if (!created.posted) {
@@ -539,16 +642,33 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 	                                                                         device:device
 	                                                                     serializer:serializer];
 	if (state != nil) {
-		state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
+		if ([descriptor respondsToSelector:@selector(supportIndirectCommandBuffers)])
+			state->_supportIndirectCommandBuffers = descriptor.supportIndirectCommandBuffers;
 		state->_mesh = YES;
+		[state rgfxTakeRoundingOf:descriptor];
 		state->_objectAir = stageArguments(descriptor.objectFunction);
 		state->_meshAir = stageArguments(descriptor.meshFunction);
 		state->_fragmentAir = stageArguments(descriptor.fragmentFunction);
 		state->_vertexAir = stageArguments(nil);
-		state->_requiredObject = descriptor.requiredThreadsPerObjectThreadgroup;
-		state->_requiredMesh = descriptor.requiredThreadsPerMeshThreadgroup;
+		if ([descriptor respondsToSelector:@selector(requiredThreadsPerObjectThreadgroup)]) {
+			state->_requiredObject = descriptor.requiredThreadsPerObjectThreadgroup;
+			state->_requiredMesh = descriptor.requiredThreadsPerMeshThreadgroup;
+		}
 	}
 	return state;
+}
+
+// How the pipeline's texture writes round floats, which Metal's render and mesh descriptors keep
+// (0, their default, where the guest's Metal has no such member) and its pipeline answers. The
+// host rounds as its default.
+- (void)rgfxTakeRoundingOf:(id)descriptor
+{
+	SEL rounding = sel_registerName("textureWriteRoundingMode");
+	if ([descriptor respondsToSelector:rounding])
+		_textureWriteRoundingMode = ((NSInteger (*)(id, SEL))objc_msgSend)(descriptor, rounding);
+	if (_textureWriteRoundingMode != 0)
+		RgfxLogUnsupported([self class], rounding,
+		                   "a texture write rounding mode other than the default (none on the wire)");
 }
 
 - (void)rgfxTakeKnown:(const RgfxPipelineReflection &)known
@@ -578,12 +698,22 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 
 - (std::shared_ptr<const RgfxAirFunction>)rgfxObjectAirFunction
 {
-	return _mesh ? _objectAir : stageArguments(nil);
+	return _mesh ? _objectAir : noStageArguments();
 }
 
 - (std::shared_ptr<const RgfxAirFunction>)rgfxMeshAirFunction
 {
-	return _mesh ? _meshAir : stageArguments(nil);
+	return _mesh ? _meshAir : noStageArguments();
+}
+
+- (RgfxStageArguments)rgfxStageArguments
+{
+	RgfxStageArguments a;
+	a.vertex = _vertexAir.get();
+	a.fragment = _fragmentAir.get();
+	a.object = _mesh ? _objectAir.get() : noStageArguments().get();
+	a.mesh = _mesh ? _meshAir.get() : noStageArguments().get();
+	return a;
 }
 
 - (instancetype)initWithObjId:(uint64_t)objId
@@ -641,7 +771,8 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 - (void)rgfxTakeAnswer:(const RgfxPipelineReflection *)r
 {
 	_answer.take(*r);
-	if (r->status != RGFX_PIPELINE_OK)
+	static char site;
+	if (r->status != RGFX_PIPELINE_OK && rgfxLogFirst(&site, r->status))
 		NSLog(@"RGFX: the device refused render pipeline %llu, made as an equal one it accepted",
 		      static_cast<unsigned long long>(self.rgfxObjId));
 }
@@ -807,6 +938,439 @@ void fillSize(uint32_t (&out)[3], MTLSize size)
 - (MTLSize)requiredThreadsPerMeshThreadgroup
 {
 	return _mesh ? _requiredMesh : MTLSizeMake(0, 0, 0);
+}
+
+// --- MTLRenderPipelineStateSPI -------------------------------------------------------------
+// The members of Metal's render-pipeline SPI that the AMD 5300M's and the Intel 630's pipelines
+// both answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m),
+// each as Metal's base pipeline, _MTLRenderPipelineState, answers it (read from code, macOS
+// 27.0.1), and as a fresh pipeline of both x86 Macs answers those that take no argument (measured:
+// macOS 26.7.1, tools/oracle/oracle_spi_members.m answers).
+
+// The debug info of the pipeline's vertex and fragment shaders: the device keeps none, so they
+// answer nil.
+- (nullable id)newVertexShaderDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+- (nullable id)newFragmentShaderDebugInfo
+{
+	RGFX_UNSUPPORTED("a shader's debug info");
+	return nil;
+}
+
+// Metal's base pipeline answers gpuResourceID with gpuHandle, and gpuHandle with resourceIndex: so
+// these answer gpuResourceID's value, the one the host numbered the pipeline by.
+- (uint64_t)resourceIndex
+{
+	return [self gpuResourceID]._impl;
+}
+
+- (uint64_t)gpuHandle
+{
+	return [self resourceIndex];
+}
+
+// The low 32 bits of uniqueIdentifier, as the base and the AMD 5300M's pipeline answer (the
+// Intel 630's answers 0).
+- (uint32_t)getVertexShaderTelemetryID
+{
+	return static_cast<uint32_t>([self uniqueIdentifier]);
+}
+
+- (uint32_t)getFragmentShaderTelemetryID
+{
+	return static_cast<uint32_t>([self uniqueIdentifier]);
+}
+
+// No debug instrumentation or global constants for any stage, no binaries and no explicit
+// visibility group: the device instruments no shader.
+
+- (id)vertexDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)vertexGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)vertexGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)fragmentDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)fragmentGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)fragmentGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)tileDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)tileGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)tileGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)meshDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)meshGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)meshGlobalConstantsSize
+{
+	return 0;
+}
+
+- (id)objectDebugInstrumentationData
+{
+	return nil;
+}
+
+- (uint64_t)objectGlobalConstantsBase
+{
+	return 0;
+}
+
+- (uint64_t)objectGlobalConstantsSize
+{
+	return 0;
+}
+
+- (NSDictionary *)pipelineBinaries
+{
+	return @{};
+}
+
+- (uint32_t)explicitVisibilityGroupID
+{
+	return 0;
+}
+
+// MTLShaderValidationDisabled, as shaderValidation answers.
+- (NSInteger)shaderValidationState
+{
+	return MTLShaderValidationDisabled;
+}
+
+// The descriptor's rounding of floats on texture writes, as the base keeps it.
+- (NSInteger)textureWriteRoundingMode
+{
+	return _textureWriteRoundingMode;
+}
+
+// The base raises an unrecognized selector for these (it sends itself doesNotRecognizeSelector:),
+// and so does this.
+- (id)functionReflectionWithFunctionDescriptor:(id)descriptor stage:(NSUInteger)stage
+{
+	(void)descriptor;
+	(void)stage;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+- (id)reflectionForFunctionDescriptor:(id)descriptor
+{
+	(void)descriptor;
+	[self doesNotRecognizeSelector:_cmd];
+	return nil;
+}
+
+// A stage's function handle: function pointers, as functionHandleWithFunction:stage:.
+
+- (id)vertexFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)fragmentFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)tileFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)meshFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+- (id)objectFunctionHandleWithFunction:(id<MTLFunction>)function
+{
+	(void)function;
+	RGFX_UNSUPPORTED("function pointers");
+	return nil;
+}
+
+// A stage's function tables, which the base asks its device for, as these do
+// (RgfxDeviceFunctionTables).
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromVertexStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newVertexIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromFragmentStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newFragmentIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromTileStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newTileIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromMeshStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newMeshIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLVisibleFunctionTable>)newVisibleFunctionTableFromObjectStageWithDescriptor:
+    (MTLVisibleFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newVisibleFunctionTableWithDescriptor:descriptor];
+}
+
+- (id<MTLIntersectionFunctionTable>)newObjectIntersectionFunctionTableWithDescriptor:
+    (MTLIntersectionFunctionTableDescriptor *)descriptor
+{
+	id<RgfxDeviceFunctionTables> device = (id<RgfxDeviceFunctionTables>)self.device;
+	return [device newIntersectionFunctionTableWithDescriptor:descriptor];
+}
+
+// A tile pipeline with more binary functions: binary functions, as
+// newRenderPipelineStateWithAdditionalBinaryFunctions:error:.
+- (id)newTileRenderPipelineStateWithAdditionalBinaryFunctions:(id)functions
+                                                        error:(__autoreleasing NSError **)error
+{
+	(void)functions;
+	RGFX_UNSUPPORTED_ERROR(error, "binary functions");
+	return nil;
+}
+
+// Metal's emulation of mesh shaders on a GPU without them, which its own device sets up for the
+// pipelines it makes so: the device carries mesh draws to the host, which draws them, so no
+// pipeline of it emulates, and each answers as one that does not, 0, nil and NO (the base
+// answers from emulation properties that only its setters make). The flag
+// setUsesMeshShaderEmulation: sets is one the base's usesMeshShaderEmulation does not read.
+- (BOOL)usesMeshShaderEmulation
+{
+	return NO;
+}
+
+- (void)setUsesMeshShaderEmulation:(BOOL)uses
+{
+	(void)uses;
+}
+
+- (id)emulationMeshShaderPSO
+{
+	return nil;
+}
+
+- (id)emulationObjectShaderPSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum1PSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum2PSO
+{
+	return nil;
+}
+
+- (id)emulationMeshPrefixSum3PSO
+{
+	return nil;
+}
+
+- (id)emulationNoObjectPrefixSumPSO
+{
+	return nil;
+}
+
+- (id)emulationObjectPrefixSumPSO
+{
+	return nil;
+}
+
+- (NSUInteger)emulationMeshSize
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshMaxVertexCount
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshMaxPrimitiveCount
+{
+	return 0;
+}
+
+- (NSUInteger)emulationObjectShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationMeshShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationVertexShaderIntermediateBufferSlot
+{
+	return 0;
+}
+
+- (NSUInteger)emulationPrimitiveTopology
+{
+	return 0;
+}
+
+- (NSUInteger)emulationPayloadMemoryLength
+{
+	return 0;
+}
+
+// Setting up an emulation, which the device's pipelines never are.
+
+- (void)setEmulationMeshShaderPSO:(id)pipeline
+{
+	(void)pipeline;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationObjectShaderPSO:(id)pipeline
+{
+	(void)pipeline;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshSize:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshMaxVertexCount:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshMaxPrimitiveCount:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationObjectShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationMeshShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationVertexShaderIntermediateBufferSlot:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationPrimitiveTopology:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
+}
+
+- (void)setEmulationPayloadMemoryLength:(NSUInteger)value
+{
+	(void)value;
+	RGFX_UNSUPPORTED("Metal's mesh shader emulation (the host draws mesh pipelines)");
 }
 
 // --- not on the wire ------------------------------------------------------------------

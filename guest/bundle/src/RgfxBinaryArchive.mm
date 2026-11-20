@@ -784,4 +784,97 @@ static BOOL rgfxAnyHolds(NSArray *archives, const RgfxArchiveEntry &entry)
 	return nil;
 }
 
+// --- MTLBinaryArchiveSPI -----------------------------------------------------------------
+// The members of Metal's binary-archive SPI that the AMD 5300M's and the Intel 630's archives both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m):
+// both are Metal's own archive, _MTLBinaryArchive (measured: their class), whose members these
+// follow where the archive's entries allow (read from code, _MTLBinaryArchive, macOS 27.0.1).
+
+// The description Metal's archive gives: the object's own description, then its label and its
+// count of entries, each on a line of its own, indented by `indent` + 4 spaces (measured: both x86
+// Macs' fresh archive, "label = <none>" and "count = 0").
+- (NSString *)formattedDescription:(NSUInteger)indent
+{
+	NSString *pad = [@"\n" stringByPaddingToLength:indent + 4 withString:@" " startingAtIndex:0];
+	NSString *label = self.label;
+	NSArray *fields = @[ pad, @"label =", label ?: @"<none>", pad, @"count =", @(self.keys.count) ];
+	return [NSString stringWithFormat:@"%@%@", [super description], [fields componentsJoinedByString:@" "]];
+}
+
+// Metal's archive answers the hash keys of its functions, as pointers into its own tables: an
+// empty list for a fresh one (measured: both x86 Macs). The archive's entries are keyed as the
+// host compiles them, with none of Metal's keys, so it answers an empty list, logged.
+- (NSArray *)archiveFunctionIds
+{
+	RGFX_UNSUPPORTED("an archive's function IDs");
+	return [NSMutableArray array];
+}
+
+// Metal's pipeline collection of the archive: none here (null, as a fresh archive of both x86 Macs
+// answers; measured).
+- (void *)pipelineCollection
+{
+	return nullptr;
+}
+
+// Metal walks the archives of its own backing file or pipeline collection; the archive has
+// neither, so these walk nothing.
+- (BOOL)enumerateArchivesFromBackingFile:(id)enumerator
+{
+	(void)enumerator;
+	RGFX_UNSUPPORTED("Metal's archive backing files");
+	return NO;
+}
+
+- (BOOL)enumerateArchivesFromPipelineCollection:(id)enumerator
+{
+	(void)enumerator;
+	RGFX_UNSUPPORTED("Metal's archive backing files");
+	return NO;
+}
+
+// A copy of the archive recompiled for another target. Metal refuses an archive of its own
+// device's pipelines at every URL, nil among them, with "No recompilable artifacts found"
+// (MTLBinaryArchiveDomain 1, measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the Intel UHD
+// 630, and macOS 27.0.1, the M3 Max, alike, tools/oracle/oracle_urls.m); the host compiles for its
+// own GPU alone and keeps nothing to recompile, so every archive answers so.
+- (BOOL)recompileToArchiveWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
+{
+	(void)url;
+	RGFX_UNSUPPORTED("recompiling an archive for another target");
+	if (error)
+		*error = archiveError(MTLBinaryArchiveErrorInvalidFile, @"No recompilable artifacts found");
+	return NO;
+}
+
+// A pipeline's descriptor kept in Metal's pipeline collection, without its functions: none here
+// (the add…FunctionsWithDescriptor: members keep a pipeline's functions).
+- (BOOL)storeComputePipelineDescriptor:(MTLComputePipelineDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("Metal's archive pipeline collections");
+	return NO;
+}
+
+- (BOOL)storeRenderPipelineDescriptor:(MTLRenderPipelineDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("Metal's archive pipeline collections");
+	return NO;
+}
+
+- (BOOL)storeTileRenderPipelineDescriptor:(MTLTileRenderPipelineDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("Metal's archive pipeline collections");
+	return NO;
+}
+
+- (BOOL)storeMeshRenderPipelineDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
+{
+	(void)descriptor;
+	RGFX_UNSUPPORTED("Metal's archive pipeline collections");
+	return NO;
+}
+
 @end

@@ -26,23 +26,45 @@
 #ifndef REIMS_GRAPHICS_HPP_
 #define REIMS_GRAPHICS_HPP_
 
+#include <IOKit/IOCommandGate.h>
 #include <IOKit/IOInterruptEventSource.h>
 #include <IOKit/IOLocks.h>
 #include <IOKit/IOWorkLoop.h>
 #include <IOKit/graphics/IOFramebuffer.h>
 #include <IOKit/pci/IOPCIDevice.h>
+#if defined(__arm64e__)
+#include <graft/IOMobileFramebufferLegacy.h>
+// The Graft SDK stand-in's methods answer graft_iomfb_word, a uint64_t; the arm64e front end
+// (ReimsGraphicsMobile.cpp) names it RgfxIOMFBWord.
+typedef graft_iomfb_word RgfxIOMFBWord;
+#include "RgfxLegacySwapInfo.hpp"
+#include "RgfxLegacySwapLayout.hpp"
+#include "RgfxMobileCursor.hpp"
+#include "RgfxSwapRate.hpp"
+#include <kern/thread_call.h>
+#endif
 
+#include "RgfxBootConsole.hpp"
 #include "RgfxDeferredAnswers.hpp"
 #include "RgfxDisplayModes.hpp"
 #include "RgfxPipeClients.hpp"
 #include "RgfxRingRoom.hpp"
 #include "RgfxScanoutOwner.hpp"
+#include "RgfxSharedPipelines.hpp"
 #include "RgfxVblankClock.hpp"
 #include "reims_graphics_wire.h"
 
 class RgfxAccelerator;
 
+// The display front end each architecture's WindowServer drives: an IOFramebuffer on x86-64, and
+// on arm64, where WindowServer opens no IOFramebuffer, an IOMobileFramebuffer, the subclass of
+// IOMobileFramebufferLegacy that Apple's own paravirtual display is (docs/graphics-kext/design.md,
+// Decided 13). The device, its rings and its pipe clients are one for both.
+#if defined(__x86_64__)
 class ReimsGraphics : public IOFramebuffer {
+#else
+class ReimsGraphics : public IOMobileFramebufferLegacy {
+#endif
 	OSDeclareDefaultStructors(ReimsGraphics);
 
 public:
@@ -51,6 +73,7 @@ public:
 	void stop(IOService *provider) override;
 	void free() override;
 
+#if defined(__x86_64__)
 	// IOFramebuffer: the device and its modes
 	IOReturn enableController() override;
 	IODeviceMemory *getApertureRange(IOPixelAperture aperture) override;
@@ -69,9 +92,13 @@ public:
 	IOReturn setStartupDisplayMode(IODisplayModeID displayMode, IOIndex depth) override;
 	IOReturn getTimingInfoForDisplayMode(IODisplayModeID displayMode,
 	                                     IOTimingInformation *info) override;
+	// IODisplay: a mode's valid, safe and default flags, which IOFramebuffer gives in place of
+	// those getInformationForDisplayMode answers (modeFlags).
+	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
+	                      IOOptionBits *flags) override;
 
-	// IOFramebuffer: the timings the OS programs from the display's EDID, under the
-	// framebuffer's kIOFBTimingRangeKey. The driver takes a timing whose size and rate are a
+	// IOFramebuffer: the timings the OS programs, under the framebuffer's
+	// kIOFBTimingRangeKey. The driver takes a timing whose size and rate are a
 	// mode the device lists, and lists the programmed ones in place of its own.
 	IOReturn validateDetailedTiming(void *description, IOByteCount descripSize) override;
 	IOReturn setDetailedTimings(OSArray *array) override;
@@ -85,8 +112,8 @@ public:
 	IOReturn setAttributeForConnection(IOIndex connectIndex, IOSelect attribute,
 	                                   uintptr_t value) override;
 
-	// IOFramebuffer: the display's EDID, made by the driver from the display's modes
-	// (makeEdid), which IODisplay reads for the display's identity.
+	// IOFramebuffer: the display's EDID, made by the driver from the display's id, host screen's
+	// scale and native mode (makeEdid), which IODisplay reads for the display's identity and size.
 	bool hasDDCConnect(IOIndex connectIndex) override;
 	IOReturn getDDCBlock(IOIndex connectIndex, UInt32 blockNumber, IOSelect blockType,
 	                     IOOptionBits options, UInt8 *data, IOByteCount *length) override;
@@ -129,13 +156,54 @@ public:
 	bool isConsoleDevice() override;
 	IOReturn setCLUTWithEntries(IOColorEntry *colors, UInt32 index, UInt32 numEntries,
 	                            IOOptionBits options) override;
-	IOReturn connectFlags(IOIndex connectIndex, IODisplayModeID displayMode,
-	                      IOOptionBits *flags) override;
 	// And the properties processes read of it.
 	using IOFramebuffer::copyProperty;
 	OSObject *copyProperty(const OSSymbol *aKey) const override;
 	OSObject *copyProperty(const OSString *aKey) const override;
 	OSObject *copyProperty(const char *aKey) const override;
+#endif
+#else
+	// IOMobileFramebufferLegacy (ReimsGraphicsMobile.cpp): the class's own pure methods.
+	RgfxIOMFBWord set_notify_tag_mask_gated(IOMFB_NotificationType type, IOMFBNotifyRequest *request,
+	                                        uint32_t mask) override;
+	RgfxIOMFBWord supported_frame_info(uint32_t index, uint32_t *count, char (*names)[64],
+	                                   uint32_t *dataQueue) override;
+	RgfxIOMFBWord factory_portal(void *field_0, task *owner) override;
+	RgfxIOMFBWord executeFactoryConfigurations_gated() override;
+	RgfxIOMFBWord set_frame_info_notification_state_gated(IOMFBNotifyRequest *request,
+	                                                      bool on) override;
+	RgfxIOMFBWord do_swap_info_notify_gated(IOMFBNotifyRequest *request,
+	                                        const IOMobileFramebufferLegacy::SwapInfoBlob *blob) override;
+	RgfxIOMFBWord notify_swap_done_gated(uint32_t field_0, ::SwapInfoBlob *blob, uint32_t *field_2,
+	                                     uint32_t field_3) override;
+	RgfxIOMFBWord notify_crc_ready_gated(uint32_t field_0) override;
+	bool are_timings_enabled() const override;
+	// And what a subclass implements for its display, none of it forwarded to the class, whose own
+	// is for no display (ReimsGraphicsMobile.cpp): the hardware's start and stop, and a swap's
+	// steps; a layer's surface map also presents it.
+	RgfxIOMFBWord start_hardware() override;
+	RgfxIOMFBWord stop_hardware_gated() override;
+	RgfxIOMFBWord swap_begin_gated() override;
+	RgfxIOMFBWord verify_swap(IOMFBSwapIORequest *request) override;
+	RgfxIOMFBWord swap_layer_map(IOMFBSwapIORequest *request, uint32_t layer) override;
+	RgfxIOMFBWord surface_layer_map(IOMFB::AP::DisplayedData *data, uint32_t layer,
+	                                IOSurface *surface) override;
+	RgfxIOMFBWord surface_layer_unmap(IOMFB::AP::DisplayedData *data, uint32_t layer) override;
+	// And what the class reads of its provider as an AppleARMIODevice, which a PCI device is not
+	// (ReimsGraphicsMobile.cpp): the dot pitch.
+	RgfxIOMFBWord get_dot_pitch(uint32_t *pitch) override;
+	// And the mode WindowServer sets of those the display publishes, by its colour and timing IDs
+	// (ReimsGraphicsMobile.cpp), which the class answers kIOReturnUnsupported.
+	RgfxIOMFBWord set_digital_out_mode(uint32_t colorId, uint32_t timingId) override;
+	// And the colour matrix WindowServer sets with a swap (ReimsGraphicsMobile.cpp,
+	// RgfxMobileColor.hpp), which the class answers kIOReturnUnsupported.
+	RgfxIOMFBWord swap_set_color_matrix(IOMFBColorFixedMatrix *matrix,
+	                                    IOMFBColorMatrixFunction function, uint32_t field_2) override;
+	// And the colour filter scale WindowServer sets after that matrix (ReimsGraphicsMobile.cpp,
+	// RgfxMobileColor.hpp), which the class answers kIOReturnUnsupported: its other parameters
+	// go to the class.
+	RgfxIOMFBWord set_parameter(IOMFBParameterName name, const uint64_t *values,
+	                            uint32_t count) override;
 #endif
 
 	// The display pipe (RgfxDisplayPipeUserClient, on the accelerator) presents through the
@@ -164,6 +232,12 @@ public:
 	void scanoutOwnerMoved(task_t owner);
 	// The accelerator on our PCI device, retained for the caller, or nullptr before it started.
 	RgfxAccelerator *copyAccelerator();
+	// Whether the framebuffer has started: its start has taken the device and brought its rings
+	// up, and is in the class's start or has returned true, and its stop has not begun. The rings
+	// then carry the accelerator's messages. Before, after a start that failed (which resets the
+	// device) and from the stop on (which resets it at its end), the device holds nothing of any
+	// process's context (design.md, "Reset").
+	bool hasStarted() const { return __atomic_load_n(&started, __ATOMIC_ACQUIRE); }
 
 	typedef void (*PipeVblankHook)(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
 	typedef void (*PipePresentHook)(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
@@ -176,6 +250,10 @@ public:
 	// DISPLAY_COLOR parts, in order, each waiting for room as post does: thread context only,
 	// with no lock of the work loop's held. The host stages them for the next PRESENT_SURFACE.
 	bool displayColor() const { return displayColorTaken; }
+	// Whether IOAcceleratorFamily2 exports IOAccelMemoryMap::getAssignedGPUVirtualAddressLength()
+	// const, which ReimsGraphics references weakly and never calls; read once at start. It picks
+	// a display pipe client's completion word count (RgfxPipeNotifications.hpp).
+	bool assignedLengthExported() const { return assignedLength; }
 	IOReturn postDisplayColor(UInt32 transactionId, UInt32 stage, UInt32 count,
 	                          const UInt8 *entries);
 	// A pipe client's transaction posts its colour, then its present, holding the presents lock
@@ -219,6 +297,13 @@ public:
 	void setReleaseAnswer(OSObject *target, ReleaseAnswerHook hook);
 	IOReturn postReleases(const RgfxBlockRelease *releases, UInt32 count,
 	                      UInt64 *const *waiterSeqnos, UInt32 *posted);
+	// `count` messages of `type`, each `size` bytes at `messages` back to back, or, with `type`
+	// 0 (the pad's, never a command's), each of the type and size its own header names, which no
+	// thread waits for: on the control ring in order as postReleases puts its releases (each
+	// one's seqno into *waiterSeqnos[i] where `waiterSeqnos` is not null), *posted those posted.
+	// A process's batch (kRgfxAccelMethodSubmitBatch) and the block releases go so.
+	IOReturn postRun(UInt32 type, const void *messages, UInt32 size, UInt32 count,
+	                 UInt64 *const *waiterSeqnos, UInt32 *posted);
 	// A lifecycle message (a CONTEXT_CLOSE) no thread waits for here, its COMPLETE handed to the
 	// setReleaseAnswer hook: as postLifecycle with `replyType` 0, but it writes the seqno into
 	// *waiterSeqno before the message is published, so the answer, however soon it comes, finds
@@ -234,17 +319,21 @@ public:
 	// `replyCapacity`). Thread context only, never on the work loop.
 	static constexpr UInt32 kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 	static constexpr UInt32 kLifecycleReplyMax = 128;
+	// Where `seedOrder` is not null, the waiter is a seed's (LifecycleWaiter), its first
+	// PIPELINE_REFLECTION the *seedOrder th newest.
 	IOReturn postLifecycle(UInt32 type, const void *message, UInt32 size, UInt32 replyType,
 	                       void *reply, UInt32 replyCapacity, UInt32 *replyLength, UInt64 *seqno,
-	                       UInt32 timeoutMs);
+	                       UInt32 timeoutMs, const UInt32 *seedOrder = nullptr);
 
 	// A pipeline create of context `context` posted without waiting for its answer, which the
 	// device's answer then waits for in a slot of the deferred answers (RgfxDeferredAnswers.hpp)
 	// until takeDeferred takes it: as postLifecycle with `replyType` 0, but for its slot.
 	// kIOReturnNoResources, posting nothing, where no slot is free: the caller posts the create
-	// as postLifecycle does, and waits. Thread context only.
+	// as postLifecycle does, and waits. `key`, where not null, is the pipeline key whose kept
+	// answer answered the create (findSharedPipeline): where the device does not make its
+	// pipeline, that answer is forgotten. Thread context only.
 	IOReturn postDeferred(UInt32 context, UInt32 type, const void *message, UInt32 size,
-	                      UInt64 *seqno);
+	                      UInt64 *seqno, const UInt8 *key = nullptr);
 	// Copies context `context`'s answers to its deferred creates into the `capacity` bytes at
 	// `out`, each whole, in their seqnos' order, while they fit, and frees their slots: the bytes
 	// in `*length`, the answers in `*count`. Where `waitFor` is the seqno of one of its creates
@@ -253,6 +342,17 @@ public:
 	                      UInt32 capacity, UInt32 *length, UInt32 *count);
 	// Frees context `context`'s deferred slots, at its close, and lets its waiters go.
 	void dropDeferred(UInt32 context);
+	// The answer the kext keeps for the pipeline create of `key` (32 bytes), stamped with
+	// `seqno` and `objId` (RgfxSharedPipelines.hpp), into `*out`: false where none is kept.
+	bool findSharedPipeline(const UInt8 *key, UInt64 seqno, UInt64 objId,
+	                        RgfxPipelineReflection *out);
+	// Keeps the device's answer to a pipeline create, the `length` bytes of `reply`, where it
+	// carries a made pipeline's key, for every process's equal creates.
+	void learnSharedPipeline(const UInt8 *reply, UInt32 length);
+	// Seeds the shared pipelines, where the host took PIPELINE_ANSWERS, with the answers the
+	// device kept of keyed creates of its earlier runs (RGFX_CMD_PIPELINE_ANSWERS), newest first,
+	// until the device has no more or the table's size is asked. Thread context only, at start.
+	void seedSharedPipelines();
 	// Frees the deferred slot of the create at `seqno`, posted after its context closed.
 	void forgetDeferred(UInt64 seqno);
 
@@ -273,9 +373,8 @@ private:
 
 	// A mode's timing: the active size with reduced blanking (VESA CVT's second reduced
 	// blanking: a fixed 80-pixel horizontal blank and at least 460 us of vertical blank),
-	// its pixel clock in 10 kHz steps, as an EDID carries it. The EDID and
-	// getTimingInfoForDisplayMode both give it, so IODisplay and WindowServer find the
-	// driver's modes among the display's.
+	// its pixel clock in 10 kHz steps, as an EDID carries it. getTimingInfoForDisplayMode
+	// gives it, and so do the arm64e front end's timing elements (publishMobileModes).
 	struct Timing {
 		UInt64 pixelClock;
 		UInt32 hActive, hBlank, hFront, hSync;
@@ -283,18 +382,20 @@ private:
 	};
 	static void timingFor(const Mode &mode, Timing *timing);
 
-	// The display's EDID: a base block, then DisplayID extension blocks listing every mode,
-	// since a mode's pixel clock can be past the base block's limit. makeEdid fills block
-	// `index` (0 the base) and returns false past the last. Call with stateLock held.
-	static constexpr UInt32 kEdidBlockBytes = 128;
-	static constexpr UInt32 kEdidModesPerBlock = 5;
-	static constexpr UInt32 kEdidMaxExtensions = (kMaxModes + kEdidModesPerBlock - 1) / kEdidModesPerBlock;
-	UInt32 edidExtensionCount() const;
+	// The display's EDID: one base block, with no timings (rgfxDisplayEdid). makeEdid fills
+	// block `index` (0, the base) and returns false past it. Call with stateLock held.
+	static constexpr UInt32 kEdidBlockBytes = kRgfxDisplayEdidBytes;
 	bool makeEdid(UInt32 index, UInt8 *block) const;
 
 	static UInt32 refreshMhzOf(const IODetailedTimingInformationV2 &timing);
-	// The physical size of a mode's display, in millimetres, as the EDID gives it.
+	// The device's preferred mode, the display's native one; `mode` where the device lists
+	// none. Call with stateLock held.
+	Mode nativeMode(const Mode &mode) const;
+	// The physical size of a mode's display, in millimetres: its native mode's at the display's
+	// density (RgfxDisplayIdentity.hpp).
 	void imageSize(const Mode &mode, UInt16 *width, UInt16 *height) const;
+	// The IODisplayModeInformation flags of a mode, the preferred one or not.
+	static UInt32 modeFlags(const Mode &mode, bool preferred, UInt32 scale120ths);
 
 	// One of IOFramebuffer's interrupt registrations.
 	struct Interrupt {
@@ -319,12 +420,16 @@ private:
 	static constexpr UInt32 kControlWaiters = 8;
 
 	// A thread waiting for a lifecycle message's answer: free while replyType is 0; its seqno
-	// is 0 until the message is on the ring.
+	// is 0 until the message is on the ring. A seed's (`seed`, seedSharedPipelines) takes the
+	// PIPELINE_REFLECTIONs of its seqno before its answer into the shared pipelines, the next one
+	// the `order`th newest the device hands.
 	struct LifecycleWaiter {
 		UInt64 seqno;
 		UInt32 replyType;
 		UInt32 length;
 		bool done;
+		bool seed;
+		UInt32 order;
 		UInt8 reply[kLifecycleReplyMax];
 	};
 	static constexpr UInt32 kLifecycleWaiters = 32;
@@ -334,6 +439,8 @@ private:
 	static constexpr UInt32 kDeferredPerContext = 64;
 	typedef RgfxDeferredAnswers<kDeferredAnswers, kDeferredPerContext, kLifecycleReplyMax>
 	    DeferredAnswers;
+	// The answers kept by pipeline key (findSharedPipeline): 256 sets of 8, 2,048 answers.
+	typedef RgfxSharedPipelines<256, 8> SharedPipelines;
 
 	// Registers and the control rings.
 	UInt32 readRegister(UInt32 offset) const;
@@ -348,17 +455,24 @@ private:
 	IOReturn post(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
 	              UInt64 *waiterSeqno = nullptr);
 	// tryPost's halves, submitLock held: writeLocked writes one message where it fits, and
-	// publishLocked publishes what was written.
+	// publishLocked publishes what was written, answering whether ring 0's doorbell is to be
+	// rung, which ringControl does once the lock is let go.
 	bool writeLocked(UInt32 type, const void *message, UInt32 size, UInt64 *seqno,
 	                 UInt64 *waiterSeqno);
-	void publishLocked();
+	bool publishLocked();
+	void ringControl();
 	IOReturn command(UInt32 type, const void *message, UInt32 size);
 	void kickWorkLoop();
 
 	// The work loop: the completion ring and what follows from it.
 	static void serviceAction(OSObject *owner, IOInterruptEventSource *sender, int count);
 	void service();
-	bool drainEvents();
+	void takeCompletions();
+	static IOReturn takeAction(OSObject *owner, void *, void *, void *, void *);
+	void lookForAnswer(const LifecycleWaiter *w);
+	// Takes the completion ring's records up to the producer `end`, and stores the consumer where
+	// it moved.
+	void drainEvents(UInt64 end);
 	void handleEvent(UInt32 type, UInt64 seqno, const volatile UInt8 *payload, UInt32 size);
 	UInt32 parseDisplays(const volatile UInt8 *payload, UInt32 size);
 	void answer(UInt64 seqno, UInt32 status);
@@ -375,6 +489,8 @@ private:
 	static UInt32 strideFor(UInt32 width);
 	UInt64 scanoutLimit() const;
 	IOReturn setScanout(const Mode &mode);
+	// The boot screen in the scanout, black, once the display first shows a surface (handleEvent).
+	void clearBootScreen();
 
 	IOPCIDevice *pci;
 	IOMemoryMap *registerMap;
@@ -383,11 +499,23 @@ private:
 	UInt64 regionSize;
 	IOMemoryMap *ringMap;
 	volatile UInt8 *rings;
+	// Ring 0's submit data from kRgfxControlWcFrom, write-combined (RgfxControlRing.hpp): null
+	// where it is not mapped so.
+	IOMemoryMap *controlDataMap;
+	volatile UInt8 *controlData;
+	// The cursor image's slot, at the region's end: kCursorMax x kCursorMax BGRA8, the largest
+	// image the hardware cursor takes (RGFX_CURSOR_MAX_SIZE). A larger one is IOFramebuffer's to
+	// draw on x86-64; on arm64 the display shows its top left corner.
+	static constexpr UInt32 kCursorMax = RGFX_CURSOR_MAX_SIZE;
+	static constexpr UInt64 kCursorSlot = static_cast<UInt64>(kCursorMax) * kCursorMax * 4;
 	IOMemoryMap *cursorMap;
 	UInt8 *cursorPixels;
 	IOWorkLoop *workLoop;
 	IOInterruptEventSource *msix;
 	IOInterruptEventSource *kick;
+	// The work loop's gate as a waiter takes it, never waiting for it (lookForAnswer); none where
+	// it was not made, and waiters then only sleep.
+	IOCommandGate *lookGate;
 
 	// The submission ring, under submitLock: the bytes produced and the
 	// next seqno.
@@ -400,8 +528,10 @@ private:
 	UInt32 hotX;
 	UInt32 hotY;
 
-	// The completion ring's bytes consumed: the work loop's alone.
+	// The completion ring's bytes consumed, and the count at which its last arm found it empty
+	// (RgfxCompletionArm.hpp): the work loop's alone.
 	UInt64 consumed;
+	UInt64 armedAt;
 
 	// The control ring's room (roomMark, waitForRoom): the work loop's passes, which it moves
 	// at each, and the posts waiting for room, which a pass wakes under stateLock. Atomic.
@@ -410,13 +540,29 @@ private:
 	bool submitRoom;
 	// The host took DISPLAY_COLOR (displayColor), set before `ready`.
 	bool displayColorTaken;
+	// The host took DISPLAY_SCALE: its DISPLAYS answers carry each display's scale
+	// (parseDisplays), set before `ready`.
+	bool displayScaleTaken;
 	// The host took HOST_TIME: each VBLANK reads the host's clock for the refreshes' times
 	// (vblankClock), set before `ready`.
 	bool hostTime;
+	// The host took GUEST_TIMES: each VBLANK's reading of the host's clock goes in ring 0's header
+	// as the clocks' offset, for the host to map the bundle's stamps (vblankClock.offsetAt), set
+	// before `ready`.
+	bool guestTimes;
+	// The host took DISPLAY_POWER: the work loop tells it the display's panel (panelWanted), set
+	// before `ready`.
+	bool displayPowerTaken;
+	// The host took PIPELINE_KEYS and PIPELINE_ANSWERS: the start seeds the shared pipelines
+	// (seedSharedPipelines), set before `ready`.
+	bool pipelineAnswersTaken;
 	// The sleeps for room (waitForRoom), under stateLock, and the SUBMIT_ROOM records the work
 	// loop took (atomic), for the log line waitForRoom writes at most every kRoomLogMs.
 	RgfxRingRoomStats roomStats;
 	UInt64 roomRecords;
+
+	// assignedLengthExported, set at start.
+	bool assignedLength;
 
 	// The display pipe's presents (lockPresents), taken before stateLock where both are.
 	IOLock *presentsLock;
@@ -429,9 +575,15 @@ private:
 	// The deferred creates' answers; its waiters (takeDeferred) sleep on it, and each answer or
 	// drop wakes them all.
 	DeferredAnswers deferredAnswers;
+	// The answers kept by pipeline key, allocated at start (null where it could not be: none is
+	// kept, and every create waits), under stateLock.
+	SharedPipelines *sharedPipelines;
 	bool haveDisplay;
 	UInt32 displayId;
 	bool connected;
+	// The scale of the host screen that shows the display, in 120ths (RgfxDisplayScale): 0 where
+	// the host gives none.
+	UInt32 displayScale;
 	Modes modeSet;
 	RgfxModeConfig modeConfig;
 	UInt32 reportedCount;
@@ -458,17 +610,128 @@ private:
 	OSObject *releaseTarget;
 	ReleaseAnswerHook releaseHook;
 
-	// The work loop's alone: what SET_VBLANK last asked, the refreshes' times, and a display
-	// refresh after DISPLAY_CHANGED, waiting to be sent or answered.
+	// The display's panel (RgfxDisplayPower.hpp): on x86-64, the notification of the display
+	// wrangler's publication and the general interest in it the framebuffer registers, under
+	// stateLock; and the panel the framebuffer wants lit, under interruptLock.
+	IONotifier *wranglerNotifier;
+	IONotifier *wranglerInterest;
+	bool panelWanted;
+	// Sets the panel the framebuffer wants lit, and has the work loop tell the host where it
+	// changed: whether it changed.
+	bool wantPanel(bool lit);
+	void startDisplayPower();
+	void stopDisplayPower();
+	static bool wranglerPublished(void *target, void *refCon, IOService *wrangler,
+	                              IONotifier *notifier);
+	static IOReturn wranglerMessage(void *target, void *refCon, UInt32 type, IOService *wrangler,
+	                                void *argument, vm_size_t size);
+
+	// The work loop's alone: what SET_VBLANK last asked, what SET_DISPLAY_POWER last told, the
+	// refreshes' times, and a display refresh after DISPLAY_CHANGED, waiting to be sent or
+	// answered.
 	bool vblankSent;
+	bool panelTold;
 	RgfxVblankClock vblankClock;
 	bool refreshWanted;
 	UInt64 refreshSeqno;
+
+	// The boot screen the scanout holds until clearBootScreen: the boot framebuffer the OS had at
+	// the start (publishBootConsole); the largest span a mode's scanout has had (setScanout, under
+	// stateLock); the seqno of the latest present of a surface before the clear, which tryPost
+	// writes before the host sees the present; and whether it was cleared (the work loop's).
+	RgfxBootConsole bootConsole;
+	UInt64 largestScanout;
+	UInt64 bootScreenSeqno;
+	bool bootScreenCleared;
+
+#if defined(__arm64e__)
+	// The arm64e front end's (ReimsGraphicsMobile.cpp): set up in start before the class's own
+	// start, which it is the pipe client of, and let go in stop. The present of the latest swap's
+	// surface waits for its answer; the transactions it posts are numbered from 1.
+	bool startMobile();
+	void stopMobile();
+	// The display as IOMobileFramebuffer.framework finds it: its node in the device tree
+	// (attachMobileNode, detachMobileNode) and the properties it reads of the framebuffer
+	// (publishMobileDisplay).
+	void attachMobileNode();
+	void detachMobileNode();
+	void publishMobileDisplay();
+	void publishMobileModes();
+	// Shows the mode of a published colour and timing ID (set_digital_out_mode), and writes its
+	// size where the class reads it; kIOReturnUnsupported for a pair it does not publish.
+	IOReturn setMobileMode(uint32_t colorId, uint32_t timingId, Mode *mode);
+	static void mobileVblank(OSObject *client, UInt64 count, UInt64 time, UInt64 next);
+	static void mobilePresented(OSObject *client, UInt64 seqno, UInt32 status, UInt64 time);
+	// The swaps (ReimsGraphicsMobile.cpp, swap_begin_gated): the next one begun, and the swap
+	// whose surface the display is to show completed once the host answers its present, both in
+	// the class's gate.
+	void beginMobileSwaps();
+	void completeMobileSwap();
+	static void mobileSwapAnswered(OSObject *owner, IOInterruptEventSource *sender, int count);
+	bool mobilePipe;
+	// The display's node under /arm-io in the device tree (retained): the firmware's, or one start
+	// attached (mobileNodeAttached), which stop detaches.
+	IORegistryEntry *mobileNode;
+	bool mobileNodeAttached;
+	// Whether start_hardware joined power management, which stop_hardware_gated leaves.
+	bool mobilePowerJoined;
+	// The latest present's seqno, written before the host can answer it; the refresh its answer
+	// came in (mach_absolute_time's, 0 until it comes) and the display's period then (its ticks),
+	// which the swap's completion takes; and that swap's presentation time as its frame info
+	// carries it (mach_continuous_time's, 0 where it showed nothing), which mobileFrameClock gives
+	// (RgfxLegacySwapInfo.hpp), in the class's gate.
+	UInt64 mobilePresentSeqno;
+	UInt64 mobileShownAt;
+	UInt64 mobileShownPeriod;
+	UInt64 mobilePresentedAt;
+	RgfxFrameInfoClock mobileFrameClock;
+	UInt32 mobileTransaction;
+	// The release's swap queue (RgfxLegacySwapLayout.hpp), null where the class's size is no
+	// release's; the swap whose present waits for its answer, null where none does; and the event
+	// source on the class's work loop (retained, with the work loop) that the answer signals.
+	const RgfxLegacySwapLayout *mobileSwapLayout;
+	void *mobileSwapShowing;
+	IOInterruptEventSource *mobileSwapAnswer;
+	IOWorkLoop *mobileSwapLoop;
+	// What the swaps did over the minute now running, logged once it is over (RgfxSwapRate.hpp),
+	// and a minute in mach_absolute_time's ticks.
+	RgfxSwapRate mobileSwapRate;
+	UInt64 mobileSwapRateWindow;
+	void noteMobileSwapRate(UInt64 now);
+	// The swap-info records notify_swap_done_gated keeps while the class holds them
+	// (RgfxLegacySwapInfo.hpp), in the class's gate.
+	RgfxSwapInfoKept mobileSwapInfoKept;
+	// The cursor a swap's layer 1 gives (RgfxMobileCursor.hpp): shown, moved or hidden in the
+	// class's gate, as the swap begins (beginMobileSwaps). True where layer 1's surface has no
+	// image, which the swap then shows in place of layer 0's.
+	bool showMobileCursor(OSObject *surface, int32_t x, int32_t y);
+	IOReturn setMobileCursorImage(OSObject *surface, const RgfxMobileCursorImage &image);
+	bool postMobileCursorMove(int32_t x, int32_t y, bool visible);
+	RgfxMobileCursor mobileCursor;
+	// A change of the device's modes for the display (parseDisplays), taken to the processes as
+	// the paravirtual display takes its host's (mobileDisplayChanged): set where the last list
+	// taken changed them, read and cleared at a refresh's answer, the device's work loop's alone.
+	bool mobileListChanged;
+	// The thread call that republishes the display and tells the processes, off the device's work
+	// loop, whose answers its mode set waits for: made in startMobile, waited for in stopMobile,
+	// and let go once the work loop can ask for it no more (freeMobileChanges).
+	thread_call_t mobileChangeCall;
+	static void mobileDisplayChanged(thread_call_param_t self, thread_call_param_t);
+	void freeMobileChanges();
+	void republishMobileDisplay();
+	// Whether the display last told the class's hot-plug clients it is plugged in (hotPlug_notify),
+	// as the paravirtual display records it; and the timing the display shows (setMobileMode).
+	bool mobileHotPlugged;
+	uint32_t mobileTimingId;
+#endif
 
 	bool ready;
 	// start's and stop's alone: whether start reset the device to take it. Only a device taken is
 	// reset when the kext lets it go; one refused before stays as the firmware left it.
 	bool taken;
+	// hasStarted's: set as start calls the class's start, cleared where the start fails and as
+	// stop begins.
+	bool started;
 };
 
 #endif // REIMS_GRAPHICS_HPP_

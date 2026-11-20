@@ -9,7 +9,7 @@
 use crate::install::Install;
 use crate::paths;
 use anyhow::{Context, Result, bail};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 /// The branches an update can follow.
@@ -74,7 +74,11 @@ pub fn update(channel: Option<Channel>) -> Result<()> {
     if !script.is_file() {
         bail!("{} is missing: was the checkout moved?", script.display());
     }
-    let status = Command::new("bash")
+    let mut bash = Command::new("bash");
+    for v in GIT_REPOSITORY_ENV {
+        bash.env_remove(v);
+    }
+    let status = bash
         .arg(&script)
         .arg("--update")
         .current_dir(&i.repo)
@@ -147,13 +151,30 @@ fn switch(repo: &Path, c: Channel) -> Result<()> {
     Ok(())
 }
 
+/// The variables through which git takes its repository from the environment, which a git hook
+/// and `git rebase -x` export to what they run. `git -C` does not override them, so each git and
+/// script reims-ctl runs on a checkout drops them, as it names the checkout itself.
+pub(crate) const GIT_REPOSITORY_ENV: [&str; 6] = [
+    "GIT_DIR",
+    "GIT_WORK_TREE",
+    "GIT_INDEX_FILE",
+    "GIT_COMMON_DIR",
+    "GIT_OBJECT_DIRECTORY",
+    "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+];
+
+/// git on `repo` alone, whatever repository the environment names ([`GIT_REPOSITORY_ENV`]).
+pub(crate) fn git_command(repo: &Path) -> Command {
+    let mut c = Command::new("git");
+    c.arg("-C").arg(repo);
+    for v in GIT_REPOSITORY_ENV {
+        c.env_remove(v);
+    }
+    c
+}
+
 fn git(repo: &Path, args: &[&str]) -> Result<()> {
-    let status = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .status()
-        .context("run git")?;
+    let status = git_command(repo).args(args).status().context("run git")?;
     if !status.success() {
         bail!("git {} failed", args.join(" "));
     }
@@ -162,24 +183,84 @@ fn git(repo: &Path, args: &[&str]) -> Result<()> {
 
 /// `git args`' output, trimmed; None where it fails or prints nothing.
 fn git_output(repo: &Path, args: &[&str]) -> Option<String> {
-    let o = Command::new("git")
-        .arg("-C")
-        .arg(repo)
-        .args(args)
-        .output()
-        .ok()?;
+    let o = git_command(repo).args(args).output().ok()?;
     let out = String::from_utf8_lossy(&o.stdout).trim().to_string();
     (o.status.success() && !out.is_empty()).then_some(out)
+}
+
+/// The binary to run after an update, from the path this process was started from
+/// (`std::env::current_exe`). The update installs the new reims-ctl over that path (cargo install
+/// --force writes it anew), so it names the new binary. On Linux the path is read from
+/// /proc/self/exe, which names a file replaced since as "PATH (deleted)": PATH is the new one.
+pub fn restart_path(exe: PathBuf) -> PathBuf {
+    if exe.exists() {
+        return exe;
+    }
+    match exe.to_str().and_then(|p| p.strip_suffix(" (deleted)")) {
+        Some(p) => PathBuf::from(p),
+        None => exe,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// A binary replaced since this process started is run from its path again, which holds the
+    /// new one; a path that is there, or names no replaced file, is run as it is.
+    #[test]
+    fn a_restart_runs_the_binary_the_update_installed_at_the_same_path() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-restart-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let bin = d.join("reims-ctl");
+        std::fs::write(&bin, "new").unwrap();
+        assert_eq!(restart_path(d.join("reims-ctl (deleted)")), bin);
+        assert_eq!(restart_path(bin.clone()), bin);
+        // A file of that name is the one to run.
+        let named = d.join("odd (deleted)");
+        std::fs::write(&named, "").unwrap();
+        assert_eq!(restart_path(named.clone()), named);
+        assert_eq!(restart_path(d.join("gone")), d.join("gone"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// What /proc/self/exe names for a running binary replaced as an update replaces it: the
+    /// path with " (deleted)", which [`restart_path`] maps back to the path, now the new binary.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_names_a_replaced_running_binary_deleted() {
+        let d = std::env::temp_dir().join(format!("reims-ctl-replaced-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        let bin = d.join("sleeper");
+        std::fs::copy("/bin/sleep", &bin).unwrap();
+        let mut child = Command::new(&bin).arg("30").spawn().unwrap();
+        // spawn returns once the child's exec lets go of this process's memory, which the kernel
+        // does a moment before it names the new binary as the child's exe: wait for that name.
+        let exe = format!("/proc/{}/exe", child.id());
+        let start = std::time::Instant::now();
+        while std::fs::read_link(&exe).ok().as_deref() != Some(bin.as_path()) {
+            assert!(
+                start.elapsed() < std::time::Duration::from_secs(10),
+                "the sleeper never ran"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        // cargo install --force: the new binary written beside, then renamed over the old.
+        let new = d.join("sleeper.new");
+        std::fs::copy("/bin/sleep", &new).unwrap();
+        std::fs::rename(&new, &bin).unwrap();
+        let named = std::fs::read_link(format!("/proc/{}/exe", child.id())).unwrap();
+        let _ = child.kill();
+        let _ = child.wait();
+        assert_eq!(named, d.join("sleeper (deleted)"));
+        assert_eq!(restart_path(named), bin);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     fn run(dir: &Path, args: &[&str]) {
-        let ok = Command::new("git")
-            .arg("-C")
-            .arg(dir)
+        let ok = git_command(dir)
             .args(args)
             .env("GIT_CONFIG_GLOBAL", "/dev/null")
             .env("GIT_CONFIG_NOSYSTEM", "1")
@@ -188,6 +269,19 @@ mod tests {
             .status
             .success();
         assert!(ok, "git {}", args.join(" "));
+    }
+
+    #[test]
+    fn git_drops_every_variable_that_names_another_repository() {
+        let c = git_command(Path::new("/checkout"));
+        let dropped: Vec<_> = c
+            .get_envs()
+            .filter(|(_, v)| v.is_none())
+            .map(|(k, _)| k)
+            .collect();
+        for v in GIT_REPOSITORY_ENV {
+            assert!(dropped.contains(&std::ffi::OsStr::new(v)), "{v}");
+        }
     }
 
     #[test]

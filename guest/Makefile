@@ -1,84 +1,93 @@
 # The guest side of the reims-graphics device (QEMU's reims-graphics-pci) for
-# x86-64 macOS 26 guests, and the kext set their OpenCore image injects for it,
-# after Lilu: ReimsGraphicsLoader (loader/), its two shims, ReimsGraphics
-# (kext/), staged for the loader, and RgfxGate (rgfxgate/), which carries the
-# Metal bundle (bundle/). OpenCore links injected kexts against the Boot
-# kernel collection only, and ReimsGraphics uses two System-collection
-# libraries, so it loads through the loader (loader/README.md). Builds on a Mac
-# with Xcode.
+# x86-64 macOS 11 to 26 guests, and the kext set their OpenCore image injects
+# for it, and the arm64e set for the arm64 macOS 14 and later guests Ambrosia
+# boots (prebuilt-arm64e/, which Ambrosia's config bundle places):
+# Graft (graft/, vendored from Graft's repository with its record),
+# ReimsGraphics (kext/), injected dormant for Graft to bind against the
+# System kernel collection's libraries, and RgfxGate (rgfxgate/), a Graft
+# client that carries the Metal bundle (bundle/). Builds on a Mac with Xcode
+# alone: no KDK and nothing fetched.
 #
-#   make set KDK=<a macOS 26 KDK's Extensions directory> [OUT=build/set]
+#   make set [OUT=build/set]
 #       build each part in build/set-work/ and write OUT: the set's bundles
-#       and set.toml, their Kernel > Add entries in order
-#       (tools/prebuilt.py). DEPS (default build/deps) holds the pinned Lilu
-#       headers and MacKernelSDK the Lilu plugins build against, fetched
-#       where it has none (rgfxgate/tools/fetch-lilu.sh). The KDK is only
-#       read: the two libraries' exports and class layouts, and the kernel's
-#       exports.
-#   make prebuilt KDK=...
+#       and set.toml, their Kernel > Add entries in order (tools/prebuilt.py)
+#   make prebuilt
 #       the set built afresh into prebuilt/, which the repository carries
 #       for hosts that cannot build it, and prebuilt/sources.toml, the
 #       record of the sources it was built from; commit prebuilt/ with the
 #       change to those sources
+#   make set-arm64e [OUT64=build/set-arm64e]
+#       the arm64e set: Graft's arm64e build, and ReimsGraphics and RgfxGate
+#       for arm64e, with the Metal bundle for arm64e and arm64 inside RgfxGate
+#   make prebuilt-arm64e
+#       that set built afresh into prebuilt-arm64e/ with its own sources.toml
 #   make prebuilt-check
-#       fail unless prebuilt/ is what sources.toml records and the tree's
-#       sources are the ones it was built from; hashes only, on any host
+#       fail unless prebuilt/ and prebuilt-arm64e/ are each what their
+#       sources.toml records, the tree's sources are the ones they were built
+#       from, graft/ is the copy its source.toml records, and no kext leaves
+#       one of our own symbols undefined that no kext before it defines (which
+#       staging a set checks too); hashes and symbol tables only, on any host
 #   make set-check KEXTINJECT=<OpenCorePkg's TestKextInject binary>
-#               BOOT_KC=<the guest's x86_64 BootKernelExtensions.kc>
-#               LILU=<a RELEASE Lilu.kext> [SET=prebuilt]
-#       link Lilu and SET into BOOT_KC with OpenCore's linker, in user space,
-#       in Kernel > Add order, and check every kext injects, every name
-#       resolves and every site of ReimsGraphics holds its shim's
-#       placeholder (tools/oc-link-set.sh)
-#   make test   the parts' own tests: kext/, loader/, rgfxgate/ and bundle/
+#               BOOT_KC=<the guest's x86_64 BootKernelExtensions.kc> [SET=prebuilt]
+#       link SET into BOOT_KC with OpenCore's linker, in user space, in
+#       Kernel > Add order; check every kext injects and every name
+#       resolves, and that ReimsGraphics stays bindable by Graft
+#       (tools/oc-link-set.sh)
+#   make test   the parts' own tests: kext/, rgfxgate/ and bundle/
 #   make clean  remove build/
 #
 # Everything but prebuilt/ lands in build/ or the parts' own build/, never
-# committed.
+# committed. To take a new Graft, replace graft/ with Graft's
+# tools/vendor.py and rebuild prebuilt/.
 
-KDK    ?=
-DEPS   ?= build/deps
-OUT    ?= build/set
-SET    ?= prebuilt
-WORK    = $(abspath build/set-work)
-BUNDLE  = $(WORK)/bundle/package/reims-graphics.bundle
-
+OUT ?= build/set
+OUT64 ?= build/set-arm64e
+SET ?= prebuilt
+WORK = $(abspath build/set-work)
+WORK64 = $(abspath build/set-work-arm64e)
+BUNDLE = $(WORK)/bundle/package/reims-graphics.bundle
+BUNDLE64 = $(WORK64)/bundle/package/reims-graphics.bundle
 KEXTINJECT ?=
-BOOT_KC    ?=
-LILU       ?=
+BOOT_KC ?=
 
 # The parts' Makefiles get only the variables given them below, not this
-# command line's (OUT and KDK would set theirs).
+# command line's (OUT would set theirs).
 MAKEOVERRIDES =
 
-.PHONY: set prebuilt prebuilt-check set-check test clean
+.PHONY: set prebuilt set-arm64e prebuilt-arm64e prebuilt-check set-check test clean
 set:
-	@test -n "$(KDK)" || { echo "set KDK=<a macOS 26 KDK's Extensions directory>" >&2; exit 2; }
-	@# Fetched first: rgfxgate's objects do not wait for its own fetch under -j.
-	@test -d "$(DEPS)/Lilu.kext" && test -d "$(DEPS)/MacKernelSDK" || bash rgfxgate/tools/fetch-lilu.sh "$(abspath $(DEPS))"
 	$(MAKE) -C kext BUILD=$(WORK)/kext
 	$(MAKE) -C bundle BUILD=$(WORK)/bundle package
-	$(MAKE) -C rgfxgate BUILD=$(WORK)/rgfxgate DEPS=$(abspath $(DEPS)) BUNDLE_DIR=$(BUNDLE)
-	$(MAKE) -C loader BUILD=$(WORK)/loader DEPS=$(abspath $(DEPS)) KDK=$(abspath $(KDK)) \
-		KEXT=$(WORK)/kext/ReimsGraphics.kext
+	$(MAKE) -C rgfxgate BUILD=$(WORK)/rgfxgate BUNDLE_DIR=$(BUNDLE)
+	ditto graft/Graft.kext $(WORK)/Graft.kext
 	python3 -I -B tools/prebuilt.py stage $(OUT) $(WORK)
 
 prebuilt:
-	@test -n "$(KDK)" || { echo "set KDK=<a macOS 26 KDK's Extensions directory>" >&2; exit 2; }
 	rm -rf $(WORK)
-	$(MAKE) set OUT=prebuilt KDK=$(abspath $(KDK)) DEPS=$(abspath $(DEPS))
-	python3 -I -B tools/prebuilt.py record prebuilt $(abspath $(KDK))
+	$(MAKE) set OUT=prebuilt
+	python3 -I -B tools/prebuilt.py record prebuilt
+
+set-arm64e:
+	$(MAKE) -C kext ARCH_NAME=arm64e BUILD=$(WORK64)/kext
+	$(MAKE) -C bundle ARCH=arm64e PACKAGE_ARCHS="arm64e arm64" BUILD=$(WORK64)/bundle package
+	$(MAKE) -C rgfxgate ARCH_NAME=arm64e BUILD=$(WORK64)/rgfxgate BUNDLE_DIR=$(BUNDLE64)
+	ditto graft/Graft-arm64e.kext $(WORK64)/Graft-arm64e.kext
+	python3 -I -B tools/prebuilt.py stage-arm64e $(OUT64) $(WORK64)
+
+prebuilt-arm64e:
+	rm -rf $(WORK64)
+	$(MAKE) set-arm64e OUT64=prebuilt-arm64e
+	python3 -I -B tools/prebuilt.py record prebuilt-arm64e
 
 prebuilt-check:
 	python3 -I -B tools/prebuilt.py check
+	python3 -I -B tools/prebuilt.py check prebuilt-arm64e
 
 set-check:
-	bash tools/oc-link-set.sh "$(KEXTINJECT)" "$(BOOT_KC)" "$(LILU)" $(SET) \
-		$(WORK)/loader/staged/ReimsGraphics.bridge/fixups.json build/set-check
+	bash tools/oc-link-set.sh "$(KEXTINJECT)" "$(BOOT_KC)" $(SET) build/set-check
 
 test:
 	$(MAKE) -C kext test
-	$(MAKE) -C loader test
 	$(MAKE) -C rgfxgate test
 	$(MAKE) -C bundle test
 

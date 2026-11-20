@@ -2,12 +2,16 @@
 
 use std::sync::Arc;
 
-use reims_vgpu_core::display::{POS_DATA, TEX_DATA};
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
-use reims_vgpu_metal::MetalPlatform;
-use reims_vgpu_metal::os::iosurface::MetalSurface;
+use crate::core::platform::values::FullRenderPipelineDesc;
 
 use super::*;
+
+/// The display's full-screen triangle strip's positions (float4 × 4).
+const POS_DATA: [f32; 16] = [
+    -1.0, -1.0, 0.0, 1.0, -1.0, 1.0, 0.0, 1.0, 1.0, -1.0, 0.0, 1.0, 1.0, 1.0, 0.0, 1.0,
+];
+/// Its texture coordinates (float2 × 4).
+const TEX_DATA: [f32; 8] = [0.0, 1.0, 0.0, 0.0, 1.0, 1.0, 1.0, 0.0];
 
 /// `MTLPixelFormatRGBA8Unorm`, `BGRA8Unorm`, `RGBA16Float` and `R32Float`.
 const RGBA8: u64 = 70;
@@ -16,19 +20,6 @@ const R32F: u64 = 55;
 
 /// `MTLResourceStorageModeManaged`: the property buffer's options.
 const MANAGED: u64 = 0x10;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<MetalPlatform> for NoLauncher {
-    fn launch(
-        &self,
-        _platform: &Arc<MetalPlatform>,
-        _host: Arc<dyn HostSide<MetalPlatform>>,
-    ) -> Arc<dyn ServiceLink<MetalPlatform>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// The fragment properties as core writes them: the matrix's four columns of three (each
 /// padded to four), then the slopes at 0 and at 1.
@@ -356,21 +347,13 @@ fn present_as<P: Platform>(
         .collect()
 }
 
-/// Runs `check` on this platform and, as the reference, on Metal when the host has it.
+/// Runs `check` on this platform, whose expected values are Metal's.
 fn on_both(check: impl Fn(&dyn Fn(Option<&Gamma>, Frame) -> Vec<[u8; 4]>)) {
     let p = platform();
     let d = dev();
     check(&|gamma, frame| {
         let f = frame.make(&p, &d);
         present(&p, &d, &f, gamma)
-    });
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    check(&|gamma, frame| {
-        let f = frame.make(&mp, &md);
-        present(&mp, &md, &f, gamma)
     });
 }
 
@@ -564,7 +547,7 @@ fn opaque_frame() -> (Vec<[u8; 4]>, Vec<u8>) {
     (px, texels)
 }
 
-/// Each variant on this platform, and on Metal where the host has it when `on_metal`.
+/// Each variant on this platform, checked against Metal's answer when `on_metal`.
 fn variant_on_both(variant: Variant, on_metal: bool) -> Vec<[u8; 4]> {
     let (_, texels) = opaque_frame();
     let frame = Frame {
@@ -575,10 +558,8 @@ fn variant_on_both(variant: Variant, on_metal: bool) -> Vec<[u8; 4]> {
     };
     let (p, d) = (platform(), dev());
     let vulkan = present_as(&p, &d, &frame.make(&p, &d), None, variant);
-    if on_metal && let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        let metal = present_as(&mp, &md, &frame.make(&mp, &md), None, variant);
-        assert_eq!(vulkan, metal, "{variant:?}");
+    if on_metal {
+        crate::metal_check!(format!("{variant:?}"), vulkan);
     }
     vulkan
 }
@@ -666,20 +647,16 @@ const PRIMITIVES: (&str, &str) = ("vertex_ids:ids_vertex", "vertex_ids:primitive
 #[test]
 fn quads_give_metals_primitive_ids() {
     let (p, d) = (platform(), dev());
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let clear = vec![[0, 0, 0, 0xff]; 256];
     for primitive_type in [7, 8] {
         for count in 4..=10 {
             for (start, instances) in [(0, 1), (2, 2)] {
                 for mode in [0, 1] {
                     let draw = (primitive_type, start, count, instances);
+                    let key = format!("{draw:?} at mode {mode}");
                     let ours = flat_pass(&p, &d, PRIMITIVES, mode, draw);
-                    assert!(ours != clear, "{draw:?} at mode {mode}");
-                    let theirs = flat_pass(&mp, &md, PRIMITIVES, mode, draw);
-                    assert!(ours == theirs, "{draw:?} at mode {mode}");
+                    assert!(ours != clear, "{key}");
+                    assert!(crate::metal_matches_raw!(key, ours), "{key}");
                 }
             }
         }
@@ -696,8 +673,6 @@ fn quads_give_metals_primitive_ids() {
 #[test]
 fn private_types_from_far_vertex_starts_draw_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let wrapped = ("vertex_ids:wrapped_vertex", "vertex_ids:ids_fragment");
     let clear = vec![[0, 0, 0, 0xff]; 256];
     let mut differ = Vec::new();
@@ -725,11 +700,9 @@ fn private_types_from_far_vertex_starts_draw_as_metals() {
                     if ours == clear {
                         differ.push(format!("{draw:?} at mode {mode}: drew nothing"));
                     }
-                    if let Some((mp, md)) = &metal {
-                        let theirs = flat_pass(mp, md, wrapped, mode, draw);
-                        if ours != theirs {
-                            differ.push(format!("{draw:?} at mode {mode}: pixels differ"));
-                        }
+                    let key = format!("{draw:?} at mode {mode}");
+                    if !crate::metal_matches_raw!(key, ours) {
+                        differ.push(format!("{key}: pixels differ"));
                     }
                 }
             }
@@ -759,8 +732,6 @@ const QUADS_RESTARTED_WIDE: &[u32] = &[0, 1, 2, 3, 4, 5, 0xffff_ffff, 6, 7, 8, 9
 #[test]
 fn private_types_draw_over_indices_and_arguments_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
@@ -800,10 +771,8 @@ fn private_types_draw_over_indices_and_arguments_as_metals() {
                 for &mode in modes {
                     let ours = provoked(&p, &d, functions, (mode, restart), draw);
                     blank += usize::from(ours == clear);
-                    if let Some((mp, md)) = &metal {
-                        let theirs = provoked(mp, md, functions, (mode, restart), draw);
-                        assert!(ours == theirs, "{draw:?} of {functions:?} at mode {mode}");
-                    }
+                    let key = format!("{draw:?} of {functions:?} at mode {mode}");
+                    assert!(crate::metal_matches_raw!(key, ours), "{key}");
                 }
             }
         }
@@ -880,43 +849,19 @@ fn set_draw<P: Platform>(
     )
 }
 
-/// A guest's state of the fixtures `vertex` and `fragment` for a BGRA8 target, with the render
-/// descriptor's `entries` past its functions' (key 11 the input primitive topology class, 12 the
-/// tessellation partition mode, 25 indirect command buffer support), decoded from a blob as core
-/// decodes one.
-fn blob_state<P: Platform>(
+/// A guest's state of the fixtures `vertex` and `fragment` for a BGRA8 target, the whole render
+/// value `edit` leaves (the input primitive topology class, indirect command buffer support, the
+/// sample count, the depth format), Metal's defaults elsewhere.
+fn value_state<P: Platform>(
     d: &P::Device,
     (vertex, fragment): (&str, &str),
-    entries: &[&str],
+    edit: impl FnOnce(&mut FullRenderPipelineDesc<'_, P>),
 ) -> P::RenderPipeline {
-    use reims_vgpu_core::rt::Hold;
-
-    use crate::gpu::serialized::tests::hex;
-
-    let functions = [fixture::<P>(d, vertex), fixture::<P>(d, fragment)];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
-    // The colour attachments' array follows the entries, its own entry among them, at a 4-byte
-    // boundary.
-    let n = entries.len() + 3;
-    let end = 1 + 6 * n;
-    let at = end.next_multiple_of(4);
-    let blob = hex(&format!(
-        "{n:02x} 08 04 {at:02x}000000 01 04 01000000 02 04 02000000 {} {} \
-         01000000 08000000 02 00 04 00000000 01 04 50000000",
-        entries.join(" "),
-        "00".repeat(at - end)
-    ));
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    let (vertex, fragment) = (fixture::<P>(d, vertex), fixture::<P>(d, fragment));
+    let mut desc =
+        crate::gpu::device::tests::render_value::<P>((&vertex, &fragment), 1, &[&[(1, 80)]]);
+    edit(&mut desc);
+    d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
 }
 
 /// A draw of [`provoked`]'s: `(type, start, count, instances)` over the vertices; over `indices`
@@ -970,14 +915,15 @@ fn provoked<P: Platform>(
     (mode, restart): (u64, Option<(bool, u64)>),
     draw: Provoked<'_>,
 ) -> Vec<[u8; 4]> {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let executed = matches!(draw, Provoked::Executed { .. });
-    let entries: &[&str] = if executed { &["19 04 01000000"] } else { &[] };
-    let state = blob_state::<P>(d, functions, entries);
+    let state = value_state::<P>(d, functions, |v| {
+        v.support_indirect_command_buffers = executed
+    });
     let (pos, colours) = flat_vertices::<P>(d, 64);
     let (index_buffer, indirect_buffer) = provoked_buffers::<P>(d, draw);
     let icb = match draw {
@@ -1043,6 +989,7 @@ fn provoked<P: Platform>(
             for cmd in cmds {
                 c.encode(cmd).unwrap();
             }
+            drop(c);
             Some(icb)
         }
         _ => None,
@@ -1209,8 +1156,6 @@ const RESTARTED_AT_3: &[u32] = &[0, 1, 2, 3, 4, 3, 5, 6, 7, 8, 9];
 #[test]
 fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
         index_type,
@@ -1254,11 +1199,9 @@ fn flat_inputs_take_metals_provoking_vertex_at_every_draw() {
         assert_ne!(first, clear, "{draw:?}");
         let execution = matches!(draw, Provoked::Executed { .. });
         assert_eq!(first == last, execution, "{draw:?}");
-        if let Some((mp, md)) = &metal {
-            for (mode, ours) in [(0, &first), (1, &last)] {
-                let theirs = provoked(mp, md, FLAT, (mode, restart), draw);
-                assert!(*ours == theirs, "{draw:?} at mode {mode}");
-            }
+        for (mode, ours) in [(0, &first), (1, &last)] {
+            let key = format!("{draw:?} at mode {mode}");
+            assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
     }
     for draw in [
@@ -1291,8 +1234,6 @@ fn colours_of(pixels: &[[u8; 4]]) -> std::collections::BTreeSet<[u8; 4]> {
 #[test]
 fn lines_take_metals_flat_inputs_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let kind = rt::Degradation::ProvokingVertexLines;
     for draw in [
         Provoked::Vertices(1, 0, 8, 1),
@@ -1314,20 +1255,19 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
             last
         };
         assert!(first != last, "{draw:?}");
-        if let Some((mp, md)) = &metal {
-            assert!(first == provoked(mp, md, FLAT, (0, None), draw), "{draw:?}");
-            let theirs = provoked(mp, md, FLAT, (1, None), draw);
-            if native {
-                assert!(last == theirs, "{draw:?}");
-            } else {
-                assert_eq!(colours_of(&last), colours_of(&theirs), "{draw:?}");
-            }
+        let keys = [0, 1].map(|mode| format!("{draw:?} at mode {mode}"));
+        let colours = format!("{draw:?} at mode 1: the colours");
+        assert!(crate::metal_matches_raw!(keys[0], first), "{draw:?}");
+        if native {
+            assert!(crate::metal_matches_raw!(keys[1], last), "{draw:?}");
+        } else {
+            crate::metal_check!(colours, colours_of(&last));
         }
     }
 }
 
 /// `setLineWidth:` reaches the runtime's encoder, which draws Metal's widths: lines and line
-/// strips over the flat vertices at widths 1, 3, 2.5 and 0 draw as the Metal platform draws them,
+/// strips over the flat vertices at widths 1, 3, 2.5 and 0 draw as Metal draws them,
 /// where the runtime draws the width exactly (its band of triangles, or device lines it takes as
 /// exact), at 0 the few pixels Metal lights on the segments (3 of the list's, 5 of the strip's
 /// here, the M3 Max). A device's own lines that differ from Metal's say so (`device-wide-lines`),
@@ -1337,8 +1277,6 @@ fn lines_take_metals_flat_inputs_at_the_last_vertex() {
 #[test]
 fn lines_draw_at_metals_widths() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let kind = rt::Degradation::DeviceWideLines;
     /// The flat state's draw of `primitive_type` over the first 8 flat vertices at `line_width`,
     /// the first white.
@@ -1389,11 +1327,9 @@ fn lines_draw_at_metals_widths() {
             let ours = crate::answer::relaxed(|| lines(&p, &d, w, primitive_type));
             let exact = super::relayed_kind(kind) == before;
             lit_at.push(lit(&ours));
-            if let Some((mp, md)) = &metal
-                && exact
-            {
-                let theirs = lines(mp, md, w, primitive_type);
-                assert!(ours == theirs, "{primitive_type} at {w}");
+            let key = format!("{primitive_type} at {w}");
+            if exact {
+                assert!(crate::metal_matches_raw!(key, ours), "{key}");
             }
         }
         assert!(lit_at[1] > lit_at[0], "{primitive_type}: {lit_at:?}");
@@ -1410,8 +1346,6 @@ fn lines_draw_at_metals_widths() {
 #[test]
 fn barycentric_weights_take_metals_order_at_the_last_vertex() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let smooth = ("barycentric:smooth_vertex", "barycentric:smooth_weights");
     let flat = ("barycentric:flat_vertex", "barycentric:flat_weights");
     let draws = [
@@ -1426,10 +1360,8 @@ fn barycentric_weights_take_metals_order_at_the_last_vertex() {
         for mode in [0, 1] {
             let ours = provoked(&p, &d, smooth, (mode, None), draw);
             assert_ne!(ours, vec![[0, 0, 0, 0xff]; 256], "{draw:?}");
-            if let Some((mp, md)) = &metal {
-                let theirs = provoked(mp, md, smooth, (mode, None), draw);
-                assert!(ours == theirs, "{draw:?} at mode {mode}");
-            }
+            let key = format!("smooth: {draw:?} at mode {mode}");
+            assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
     }
     for draw in [
@@ -1445,90 +1377,10 @@ fn barycentric_weights_take_metals_order_at_the_last_vertex() {
             crate::answer::dies_of(kind, || provoked(&p, &d, flat, (1, None), draw));
             None
         };
-        if let Some((mp, md)) = &metal {
-            assert!(first == provoked(mp, md, flat, (0, None), draw), "{draw:?}");
-            if let Some(last) = last {
-                assert!(last == provoked(mp, md, flat, (1, None), draw), "{draw:?}");
-            }
-        }
-    }
-}
-
-/// The pixels of [`pass_pixels`] after a draw of two triangle patches of `corner_patch_vertex`
-/// and `ids_fragment` (`vertex_ids.metal`), each tessellated at factor 1, at
-/// `setProvokingVertexMode:` of `mode`: each patch's triangle in the colour of the corner its
-/// provoking vertex lies at.
-fn patch_pixels<P: Platform>(p: &P, d: &P::Device, mode: u64) -> Vec<[u8; 4]> {
-    let functions = ("vertex_ids:corner_patch_vertex", "vertex_ids:ids_fragment");
-    let state = blob_state::<P>(d, functions, &["0c 04 01000000"]);
-    let corners = [
-        -0.9, -0.9, 0.9, -0.8, 0.1, 0.9, 0.9, 0.9, -0.9, 0.8, -0.1, -0.9,
-    ];
-    let corners = buffer::<P>(d, 64, 0, &bytes(&corners));
-    let factors = buffer::<P>(d, 64, 0, &[0x00, 0x3c].repeat(8));
-    pass_pixels(
-        p,
-        d,
-        vec![
-            RenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(&state),
-            },
-            RenderCmd::SetVertexBuffer {
-                buffer: Some(&corners),
-                offset: 0,
-                index: 0,
-            },
-            RenderCmd::SetTessellationFactorBuffer {
-                buffer: Some(&factors),
-                offset: 0,
-                instance_stride: 0,
-            },
-            RenderCmd::SetProvokingVertexMode { mode },
-            RenderCmd::DrawPatches {
-                number_of_patch_control_points: 3,
-                patch_start: 0,
-                patch_count: 2,
-                patch_index_buffer: None,
-                patch_index_buffer_offset: 0,
-                instance_count: 1,
-                base_instance: 0,
-            },
-        ],
-    )
-}
-
-/// Triangle patches draw at `setProvokingVertexMode:` 0 what Metal draws, each triangle in its
-/// first vertex's flat colour, where Metal's mode 1 takes another. Where the device lacks the
-/// last vertex, the runtime takes the first at mode 1 too, relayed (`provoking-vertex-unmatched`);
-/// where it has it, it relays nothing of the provoking vertex. At a mode from 2 up they draw as
-/// at mode 0, as Metal's do, relaying nothing. A patch draw dies in strict mode on every device
-/// here ([`super::patch_draw_death`]), so each runs by default
-#[test]
-fn a_patchs_last_vertex_is_relayed_where_the_device_lacks_it() {
-    let (p, d) = (platform(), dev());
-    let kind = rt::Degradation::ProvokingVertexUnmatched;
-    let first = crate::answer::relaxed(|| patch_pixels(&p, &d, 0));
-    assert_ne!(first, vec![[0, 0, 0, 0xff]; 256]);
-    let before = super::relayed_kind(kind);
-    let last = crate::answer::relaxed(|| patch_pixels(&p, &d, 1));
-    let native = super::last_vertex_native();
-    assert_eq!(super::relayed_kind(kind) > before, !native);
-    if !native {
-        assert!(last == first);
-    }
-    for mode in [2, u64::MAX] {
-        let before = super::relayed_kind(kind);
-        let third = crate::answer::relaxed(|| patch_pixels(&p, &d, mode));
-        assert!(third == first, "{mode:#x}");
-        assert_eq!(super::relayed_kind(kind), before, "{mode:#x}");
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        let theirs = patch_pixels(&mp, &md, 0);
-        assert!(first == theirs);
-        assert!(patch_pixels(&mp, &md, 1) != theirs);
-        for mode in [2, u64::MAX] {
-            assert!(patch_pixels(&mp, &md, mode) == theirs, "Metal at {mode:#x}");
+        let keys = [0, 1].map(|mode| format!("flat: {draw:?} at mode {mode}"));
+        assert!(crate::metal_matches_raw!(keys[0], first), "{draw:?}");
+        if let Some(last) = last {
+            assert!(crate::metal_matches_raw!(keys[1], last), "{draw:?}");
         }
     }
 }
@@ -1561,8 +1413,6 @@ fn modes_past_1_draw_metals_third_way() {
         (FLAT, Provoked::Vertices(2, 3, 7, 1)),
         (SIZED, Provoked::Vertices(0, 0, 3, 1)),
     ];
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     for (at, (functions, draw)) in [list].into_iter().chain(others).enumerate() {
         let ours =
             |mode| crate::answer::relaxed(|| provoked(&p, &d, functions, (mode, None), draw));
@@ -1573,18 +1423,10 @@ fn modes_past_1_draw_metals_third_way() {
             let relayed = super::relayed_kind(kind) > before;
             assert_eq!(relayed, at != 0, "{draw:?} at {mode:#x}");
         }
-        let Some((mp, md)) = &metal else {
-            continue;
-        };
-        let theirs = |mode| provoked(mp, md, functions, (mode, None), draw);
-        let third = theirs(2);
-        for mode in modes {
-            assert!(theirs(mode) == third, "{draw:?} at {mode:#x}");
-        }
+        // Metal's third way, which a list's triangles draw as at mode 1.
+        let key = format!("{draw:?}: the third way");
         if at == 0 {
-            assert!(third == last, "{draw:?}");
-        } else {
-            assert!(third != theirs(0) && third != theirs(1), "{draw:?}");
+            assert!(crate::metal_matches_raw!(key, last), "{draw:?}");
         }
     }
 }
@@ -1596,8 +1438,6 @@ fn modes_past_1_draw_metals_third_way() {
 fn re_indexed_draws_keep_metals_vertex_ids() {
     let (p, d) = (platform(), dev());
     let ids = ("vertex_ids:ids_vertex", "vertex_ids:ids_fragment");
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     for (mode, draw) in [
         (0, (5, 3, 5, 1)),
         (0, (6, 2, 6, 2)),
@@ -1614,9 +1454,8 @@ fn re_indexed_draws_keep_metals_vertex_ids() {
             !lit.is_empty() && lit.iter().all(|px| drawn(px)),
             "{draw:?}"
         );
-        if let Some((mp, md)) = &metal {
-            assert_eq!(ours, flat_pass(mp, md, ids, mode, draw), "{mode} {draw:?}");
-        }
+        let key = format!("{mode} {draw:?}");
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -1639,8 +1478,6 @@ fn re_indexed_draws_keep_metals_draw_bases() {
     }
     let (p, d) = (platform(), dev());
     let bases = ("vertex_ids:bases_vertex", "vertex_ids:ids_fragment");
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     for (mode, draw) in [
         (0, (3, 2, 6, 2)),
         (0, (5, 3, 5, 1)),
@@ -1657,51 +1494,37 @@ fn re_indexed_draws_keep_metals_draw_bases() {
             !lit.is_empty() && lit.iter().all(|px| px[1] == start && px[0] == 3),
             "{mode} {draw:?}"
         );
-        if let Some((mp, md)) = &metal {
-            let theirs = flat_draw(mp, md, bases, mode, based(draw));
-            assert_eq!(ours, theirs, "{mode} {draw:?}");
-        }
+        let key = format!("{mode} {draw:?}");
+        crate::metal_check_raw!(key, ours);
     }
 }
 
-/// A guest's state of `vertex` and `ids_fragment` for a BGRA8 target, of the input primitive
-/// topology `class`, made as core makes one of a descriptor, with indirect command buffer support
-/// where `indirect` says.
+/// A state of `vertex` and `ids_fragment` for a BGRA8 target, of the input primitive
+/// topology `class`, with indirect command buffer support where `indirect` says.
 fn classed_state(
     d: &crate::gpu::device::VulkanDevice,
     (vertex, indirect): (&str, bool),
     class: PrimitiveTopologyClass,
 ) -> crate::gpu::resource::VulkanRenderPipeline {
-    use metal2vulkan::metal::PixelFormat;
-    use metal2vulkan::pipeline::{
-        ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
-    };
-    use reims_vgpu_core::sync::Mutex;
+    use crate::core::platform::resource::Library as _;
 
-    let library = d.raw.new_library_with_data(VERTEX_IDS).unwrap();
-    let function = |name| {
-        library
-            .new_function_with_name(name)
-            .unwrap()
-            .function_descriptor()
+    let library = d.new_library(VERTEX_IDS).unwrap().unwrap().unwrap();
+    let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
+    let (vertex, fragment) = (function(vertex), function("ids_fragment"));
+    let mut desc = crate::gpu::device::tests::render_value::<VulkanPlatform>(
+        (&vertex, &fragment),
+        1,
+        &[&[(1, 80)]],
+    );
+    desc.input_primitive_topology = match class {
+        PrimitiveTopologyClass::Unspecified => 0,
+        PrimitiveTopologyClass::Point => 1,
+        PrimitiveTopologyClass::Line => 2,
+        PrimitiveTopologyClass::Triangle => 3,
+        other => panic!("no test makes a state of {other:?}"),
     };
-    let mut desc = RenderPipelineDescriptor::new(StageSource::Function(function(vertex)));
-    desc.fragment = Some(StageSource::Function(function("ids_fragment")));
-    desc.color_attachments[0] = Some(ColorAttachmentDescriptor::new(PixelFormat::BGRA8Unorm));
-    desc.input_primitive_topology = class;
     desc.support_indirect_command_buffers = indirect;
-    let descriptor = Obj::new(crate::gpu::desc::PipelineDescriptorObject {
-        desc: Mutex::new(desc),
-        resource_index: Mutex::new(None),
-        ignored: Vec::new(),
-        nearest_even: false,
-        label: None,
-        raw_format: None,
-    });
-    d.new_render_pipeline_state_from_descriptor(Some(&descriptor), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
 }
 
 /// Points die under a state whose vertex function writes no `[[point_size]]` outside the
@@ -1747,14 +1570,7 @@ fn points_die_where_metal_sizes_none() {
         pass_pixels(&p, &d, points::<VulkanPlatform>(&classed)),
         ours
     );
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        let theirs = fixture_state::<MetalPlatform>(&md, SIZED.0, SIZED.1);
-        assert_eq!(
-            pass_pixels(&mp, &md, points::<MetalPlatform>(&theirs)),
-            ours
-        );
-    }
+    crate::metal_check_raw!("the sized points", ours);
 }
 
 /// An indirect command buffer of two commands whose first draws `count` points from vertex 1
@@ -1764,10 +1580,10 @@ fn points_icb(
     state: Option<&crate::gpu::resource::VulkanRenderPipeline>,
     count: u64,
 ) -> crate::gpu::icb::VulkanIcb {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let icb = d
         .new_indirect_command_buffer(
@@ -1844,7 +1660,7 @@ fn commit_dies(cmds: Vec<RenderCmd<'_, VulkanPlatform>>) -> String {
 /// the buffer's commands
 #[test]
 fn executed_points_die_where_metal_sizes_none() {
-    use reims_vgpu_core::platform::event::EventRef;
+    use crate::core::platform::event::EventRef;
 
     let (p, d) = (platform(), dev());
     let unsizing = classed_state(
@@ -1933,7 +1749,7 @@ fn executed_points_die_where_metal_sizes_none() {
     blit.encode(OnFault::Die, reset).unwrap();
 }
 
-reims_vgpu_core::death_test!(
+crate::death_test!(
     /// An execution of a buffer whose records the GPU may have written (a blit's reset of another
     /// of its commands) is asked at the runtime's host step, once the work before it completed:
     /// its draw of points under a state of its own that writes no `[[point_size]]` outside the
@@ -1965,7 +1781,7 @@ reims_vgpu_core::death_test!(
         pass_pixels(&p, &d, execute_first(&written, None));
     },
     |report| {
-        use reims_vgpu_core::raise::death::{DeathId, DeathKind};
+        use crate::core::raise::death::{DeathId, DeathKind};
         report.assert_died(
             DeathId::Platform {
                 kind: DeathKind::Abort,
@@ -1985,10 +1801,10 @@ reims_vgpu_core::death_test!(
 /// cannot, and one where the buffer made resident for writing is numbered 1
 #[test]
 fn work_that_can_encode_after_an_icb_made_writable_runs() {
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::icb::{
         IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
     };
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     let (p, d) = (platform(), dev());
     d.reserve_resource_indices(5, &[2, (1 << 23) + 1]).unwrap();
@@ -2151,8 +1967,6 @@ fn provoked_runs<P: Platform>(
 #[test]
 fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let at = |start: usize, runs: &[u32]| -> Vec<u32> {
         let mut out = vec![0; RUNS];
         out[start..start + runs.len()].copy_from_slice(runs);
@@ -2170,13 +1984,6 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
         (1, (STRIP, 2, 7, 1), at(2, &[1, 2, 3, 3, 3, 2, 1])),
     ] {
         assert_eq!(vertex_runs(&p, &d, mode, draw), expected, "{mode} {draw:?}");
-        if let Some((mp, md)) = &metal {
-            assert_eq!(
-                vertex_runs(mp, md, mode, draw),
-                expected,
-                "Metal: {mode} {draw:?}"
-            );
-        }
     }
     for (mode, draw) in [
         (0, (6, 0, 1000, 3)),
@@ -2188,9 +1995,8 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
     ] {
         let ours = vertex_runs(&p, &d, mode, draw);
         assert!(ours.iter().any(|&n| n > 1), "{mode} {draw:?}");
-        if let Some((mp, md)) = &metal {
-            assert_eq!(ours, vertex_runs(mp, md, mode, draw), "{mode} {draw:?}");
-        }
+        let key = format!("{mode} {draw:?}");
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -2204,8 +2010,6 @@ fn re_indexed_draws_run_the_vertex_function_as_often_as_metals() {
 #[test]
 fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let indirect = |primitive_type, index_type, indices, arguments| Provoked::IndexedIndirect {
         primitive_type,
         index_type,
@@ -2230,10 +2034,8 @@ fn private_types_run_the_vertex_function_as_often_as_metals_at_every_draw() {
             for mode in [0, 1] {
                 let ours = crate::answer::relaxed(|| provoked_runs(&p, &d, (mode, restart), draw));
                 assert!(ours.iter().any(|&n| n > 1), "{draw:?} at mode {mode}");
-                if let Some((mp, md)) = &metal {
-                    let theirs = provoked_runs(mp, md, (mode, restart), draw);
-                    assert_eq!(ours, theirs, "{draw:?} at mode {mode}");
-                }
+                let key = format!("{draw:?} at mode {mode}");
+                crate::metal_check_raw!(key, ours);
             }
         }
     }
@@ -2245,46 +2047,44 @@ const ROUNDING_SAFE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/rounding_
 /// How [`swept`] draws: the fragment function, `sweep_fragment` (a `float4`),
 /// `sweep_half_fragment` (a `half4`) or `sweep_four_fragment` (a `float4` at colours 0 to 3),
 /// the colour attachment's entries past its index and pixel format (key 2 blending, 3 to 8
-/// its factors and operations, 9 its write mask), the blob's render entries past its
-/// fragment function's (key 5 alpha to coverage), the swept attachment's index (past 0,
-/// colour 0 is an `RGBA8Unorm` attachment of the blob's defaults, cleared), and its load
+/// its factors and operations, 9 its write mask: [`colours_of`]), the swept attachment's
+/// index (past 0, colour 0 is an `RGBA8Unorm` attachment of Metal's defaults, cleared), and its
+/// load
 /// action (`MTLLoadAction`: 2 clears it, 1 loads what the new texture holds).
 #[derive(Clone, Copy, Debug)]
 struct Drawn<'a> {
     fragment: &'a str,
     colour: &'a [(u8, u32)],
-    render: &'a [&'a str],
     index: u32,
     load: u64,
 }
 
-/// `sweep_fragment` into an attachment of the blob's defaults: no blend, every channel.
+/// `sweep_fragment` into an attachment of Metal's defaults: no blend, every channel.
 const PLAIN: Drawn<'static> = Drawn {
     fragment: "sweep_fragment",
     colour: &[],
-    render: &[],
     index: 0,
     load: CLEAR,
 };
 
 /// The bytes of a 256 by 256 texture of `format`, `bytes` a texel, after the sweep `kind`
-/// (`rounding.metal`) is written into it under a state of `textureWriteRoundingMode` `mode`,
-/// decoded from a guest's blob as core decodes one: by the kernel where `kernel`, else drawn
-/// into it as the colour attachment `drawn` says, as it says.
+/// (`rounding.metal`) is written into it: by the kernel where `kernel`, else drawn into it as the
+/// colour attachment `drawn` says, as it says.
 fn swept<P: Platform>(
     p: &P,
     d: &P::Device,
-    (kernel, mode): (bool, u32),
+    kernel: bool,
     (format, bytes): (u64, u64),
     kind: u32,
     drawn: Drawn<'_>,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::NsRange;
 
-    use crate::gpu::serialized::tests::{hex, le, rounded_render_of};
+    use crate::core::platform::values::FullComputePipelineDesc;
+
+    use crate::gpu::device::tests::render_value;
 
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
@@ -2293,23 +2093,13 @@ fn swept<P: Platform>(
         function(drawn.fragment),
         function("sweep_kernel"),
     ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let t = texture(p, d, format, READ | 2 | TARGET, (256, 256), None);
     let kinds = buffer::<P>(d, 4, 0, &kind.to_le_bytes());
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     if kernel {
-        let blob = hex(&format!("02 0a 04 {} 00 04 03000000", le(mode)));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
         let state = d
-            .new_compute_pipeline_state(Some(&desc), 0)
-            .unwrap()
+            .new_compute_pipeline_state_full(&FullComputePipelineDesc::new(&functions[2]))
             .unwrap()
             .unwrap();
         let e = cb.compute_encoder(OnFault::Die).unwrap().unwrap();
@@ -2344,18 +2134,8 @@ fn swept<P: Platform>(
             0 => vec![&colour],
             _ => vec![first, &colour],
         };
-        let mut entries = vec!["02 04 02000000"];
-        entries.extend(drawn.render);
-        let blob = rounded_render_of(&entries, &colours, mode);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        let state = d
-            .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let desc = render_value::<P>((&functions[0], &functions[1]), 1, &colours);
+        let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
         let pass = p.render_pass_descriptor();
         let attachment = ColorAttachmentSet {
             texture: Some(Some(&t)),
@@ -2422,42 +2202,25 @@ fn swept<P: Platform>(
     unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
-/// Texture writes under each `textureWriteRoundingMode` that decodes are Metal's under it,
-/// byte for byte, over sweeps through unorm values, past 1 by float steps and past the
-/// largest half: a kernel's at every mode, and a fragment's into an unblended colour
-/// attachment at every mode, where Metal's mode 2 rounds a half-float one's otherwise than
-/// its default
+/// Texture writes are Metal's, byte for byte, over sweeps through unorm values, past 1 by
+/// float steps and past the largest half: a kernel's, and a fragment's into an unblended
+/// colour attachment
 #[test]
-fn texture_writes_round_as_metals_at_the_modes_they_decode() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
+fn texture_writes_round_as_metals() {
     let (p, d) = (platform(), dev());
     let half = [(25, 2), (65, 4), (115, 8)];
     let rest = [(70, 4), (12, 1), (20, 2), (90, 4), (92, 4)];
     let srgb = (81, 4);
     for kind in [0, 1, 3] {
         for format in half.into_iter().chain(rest) {
-            for mode in 0..=2 {
-                let ours = swept(&p, &d, (true, mode), format, kind, PLAIN);
-                let theirs = swept(&mp, &md, (true, mode), format, kind, PLAIN);
-                assert!(ours == theirs, "kernel {format:?} mode {mode} sweep {kind}");
-            }
+            let key = format!("kernel {format:?} sweep {kind}");
+            let ours = swept(&p, &d, true, format, kind, PLAIN);
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
         for format in half.into_iter().chain(rest).chain([srgb]) {
-            for mode in 0..=2 {
-                let ours = swept(&p, &d, (false, mode), format, kind, PLAIN);
-                let theirs = swept(&mp, &md, (false, mode), format, kind, PLAIN);
-                assert!(ours == theirs, "render {format:?} mode {mode} sweep {kind}");
-            }
-        }
-        for format in half {
-            let rounded = swept(&mp, &md, (false, 2), format, kind, PLAIN);
-            assert!(
-                rounded != swept(&mp, &md, (false, 0), format, kind, PLAIN),
-                "{format:?}"
-            );
+            let key = format!("render {format:?} sweep {kind}");
+            let ours = swept(&p, &d, false, format, kind, PLAIN);
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
     }
 }
@@ -2483,11 +2246,10 @@ fn texture_writes_round_as_metals_at_the_modes_they_decode() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::raise::death::DeathKind;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     fn state<P: Platform>(
         d: &P::Device,
@@ -2497,10 +2259,6 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
         let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
         let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
         let functions = [function("sweep_vertex"), function(fragment)];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
         let colour: &[(u8, u32)] = &[
             (0, 0),
             (1, format),
@@ -2512,14 +2270,8 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
             (7, destination),
             (8, 0),
         ];
-        let blob = rounded_render_of(&["02 04 02000000"], &[colour], 0);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
+        let desc = render_value::<P>((&functions[0], &functions[1]), 1, &[colour]);
+        d.new_render_pipeline_state_full(&desc).unwrap()
     }
     /// A draw of `state` over a Private 64 by 64 attachment of `format` that its pass clears.
     fn drawn<P: Platform>(p: &P, d: &P::Device, state: &P::RenderPipeline, format: u32) {
@@ -2554,7 +2306,6 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
     }
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device();
     // Each death, the selector it dies at, and what its line names.
     let half_source = "(metal2vulkan-degrade-extended-range-blend-source)";
     let float_source = "extended-range-float-blend-source";
@@ -2579,14 +2330,6 @@ fn extended_range_fetches_are_made_where_the_runtime_blends_them() {
             "{fragment:?} {blend:?}: {line}"
         );
         assert!(line.contains(named), "{line}");
-    }
-    if let Some(md) = &metal {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        for (fragment, blend) in dies.map(|(d, ..)| d) {
-            let state = state::<MetalPlatform>(md, fragment, blend);
-            let state = state.unwrap_or_else(|| panic!("{fragment:?}"));
-            drawn(&mp, md, &state, fragment.1);
-        }
     }
 }
 
@@ -2728,36 +2471,6 @@ impl<P: Platform> XrSide<P> {
     }
 }
 
-impl XrSide<MetalPlatform> {
-    /// [`XrSide::masked`] on Metal, the configuration named `what`. Where every texel it
-    /// reads is one texel and that texel is Metal's fresh pattern of `format`
-    /// ([`xr_unwritten`]), it fails, naming "Metal's passes did not run": its command buffer
-    /// completed, its read ran, and none of its passes stored anything, which no draw of
-    /// these functions leaves (each texel a hash of its position), so it is never a
-    /// difference to report or an answer to compare with
-    fn drawn(
-        &self,
-        what: &str,
-        drawn: (&[u8], &str),
-        format: u32,
-        shape: (Option<[u32; 6]>, Option<u32>),
-        across: bool,
-    ) -> Vec<u8> {
-        let theirs = self.masked(drawn, format, shape, across);
-        let first = theirs.get(..16).unwrap_or_default();
-        if theirs.chunks(16).all(|t| t == first) {
-            let fresh = xr_unwritten(&self.p, &self.d, &self.q, drawn.0, format);
-            assert!(
-                theirs != fresh,
-                "{what}: Metal's passes did not run: every texel Metal read is its fresh \
-                 pattern of format {format}, {:?}",
-                xr_lanes(first)
-            );
-        }
-        theirs
-    }
-}
-
 /// The answer of `newRenderPipelineStateWithDescriptor:options:reflection:error:` on `d` for a
 /// state of `sweep_vertex` and `fragment` of `library` into colour 0 of `format`, under `blend`
 /// ([`XR_DUAL_BLENDS`]'s layout) or unblended: `Ok` where it is made, else the `NSError`'s code.
@@ -2767,33 +2480,23 @@ fn blended_state<P: Platform>(
     format: u32,
     blend: Option<[u32; 6]>,
 ) -> Result<(), i64> {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     let library = d.new_library(library).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function(fragment)];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let mut colour = vec![(0, 0), (1, format)];
     if let Some(blend) = blend {
         colour.push((2, 1));
         colour.extend((3..).zip(blend));
     }
-    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    match d.new_render_pipeline_state_from_descriptor(Some(&desc), 0) {
-        Ok(Ok(Some(_))) => Ok(()),
-        Ok(Ok(None)) => panic!("{fragment} {format}: nil with no error"),
-        Ok(Err(e)) => Err(e.code),
-        Err(raise) => panic!("{fragment} {format}: raised {raise:?}"),
+    let desc = render_value::<P>((&functions[0], &functions[1]), 1, &[&colour]);
+    match d.new_render_pipeline_state_full(&desc) {
+        Ok(Some(_)) => Ok(()),
+        Ok(None) => panic!("{fragment} {format}: nil with no error"),
+        Err(e) => Err(e.code),
     }
 }
 
@@ -2812,9 +2515,6 @@ fn blended_state<P: Platform>(
 /// Metal answers it
 #[test]
 fn second_source_blends_without_a_second_output_are_refused_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let d = dev();
     let mut differ = Vec::new();
     let formats = [552, 554, 553, 555, 70, 80, 115];
@@ -2837,30 +2537,22 @@ fn second_source_blends_without_a_second_output_are_refused_as_metals() {
     for (library, fragment, format, blend) in cases {
         let fast = if library == ROUNDING { "fast" } else { "safe" };
         let what = format!("{fragment} ({fast}) format {format} blend {blend:?}");
-        let theirs = blended_state::<MetalPlatform>(&md, (library, fragment), format, blend);
         *crate::answer::LAST_LINE.lock() = None;
         let ours =
             catch_death(|| blended_state::<VulkanPlatform>(&d, (library, fragment), format, blend));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         match ours {
-            Ok(ours) if ours == theirs => {}
-            Ok(ours) => differ.push(format!("{what}: ours {ours:?}, Metal {theirs:?}")),
-            Err(site) => differ.push(format!(
-                "{what}: died at {}: {line}; Metal {theirs:?}",
-                site.file
-            )),
+            Ok(ours) if crate::metal_matches!(what, ours) => {}
+            Ok(ours) => differ.push(format!("{what}: ours {ours:?}, not Metal's")),
+            Err(site) => differ.push(format!("{what}: died at {}: {line}", site.file)),
         }
     }
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
-/// This platform's side and Metal's, where the host has a Metal device: one command queue of
-/// each for a test ([`XrSide`]).
+/// This platform's side: one command queue for a test ([`XrSide`]).
 fn xr_sides() -> XrSides {
-    let ours = XrSide::new(platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| XrSide::new(MetalPlatform::new(Box::new(NoLauncher)), md));
-    (ours, metal)
+    XrSide::new(platform(), dev())
 }
 
 /// The four floats of each texel of `bytes`, as `xr_read` writes them.
@@ -2882,36 +2574,25 @@ fn xr_blended_masked<P: Platform>(
     (blend, mask): (Option<[u32; 6]>, Option<u32>),
     across: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::{Hold, Pool};
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::rt::Pool;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     let _pool = Pool::here();
     let library = d.new_library(library).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function(fragment)];
     let state = |blend: Option<[u32; 6]>| {
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
         let mut colour = vec![(0, 0), (1, format)];
         if let Some(blend) = blend {
             colour.push((2, 1));
             colour.extend((3..).zip(blend));
             colour.extend(mask.map(|mask| (9, mask)));
         }
-        let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap()
+        let desc = render_value::<P>((&functions[0], &functions[1]), 1, &[&colour]);
+        d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
     };
     let states: Vec<_> = std::iter::once(None)
         .chain(blend.map(Some))
@@ -2985,27 +2666,6 @@ fn xr_attachment<P: Platform>(p: &P, format: u32) -> P::TextureDescriptor {
     })
 }
 
-/// What `xr_read` of `library` reads of the attachment of `format` ([`xr_attachment`]) that
-/// nothing wrote, on `p`'s device `d`, its command buffer of `q`: on Metal, its fresh pattern
-/// of the format, the texel every texel of a new texture it keeps losslessly compressed reads, or
-/// the texel of zero bytes where a new texture reads zero (the two-plane `RGB10A8_2P_XR10`).
-fn xr_unwritten<P: Platform>(
-    p: &P,
-    d: &P::Device,
-    q: &P::CommandQueue,
-    library: &[u8],
-    format: u32,
-) -> Vec<u8> {
-    let _pool = reims_vgpu_core::rt::Pool::here();
-    let library = d.new_library(library).unwrap().unwrap().unwrap();
-    let t = d
-        .new_texture(OnFault::Die, &xr_attachment(p, format))
-        .unwrap()
-        .unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    xr_read_back::<P>(d, cb, &library, &t)
-}
-
 /// Ends `cb` with `xr_read` of `library` reading `t` (64 by 64) into a Shared buffer of `d`,
 /// a float4 a texel, commits it, waits for it, and answers the buffer's bytes: no error.
 fn xr_read_back<P: Platform>(
@@ -3014,8 +2674,8 @@ fn xr_read_back<P: Platform>(
     library: &P::Library,
     t: &P::Texture,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::Library as _;
 
     let read = library
         .new_function(OnFault::Die, "xr_read")
@@ -3081,9 +2741,8 @@ fn heard(kind: rt::Degradation) -> bool {
     crate::answer::RELAYED.lock().contains(&kind)
 }
 
-/// This platform's side of an extended-range comparison and Metal's, where the host has a
-/// Metal device ([`xr_sides`]).
-type XrSides = (XrSide<VulkanPlatform>, Option<XrSide<MetalPlatform>>);
+/// This platform's side of an extended-range comparison with Metal's answers ([`xr_sides`]).
+type XrSides = XrSide<VulkanPlatform>;
 
 /// Each of `blends` and the unblended draw of `fragment` of `library` into an attachment of
 /// each of `formats` ([`XrSide::blended`]) across passes, on this platform and Metal's, the
@@ -3102,15 +2761,12 @@ fn xr_across(
 /// [`xr_across`]'s comparison, the blended draw in a pass of its own where `across`, else in
 /// the unblended draw's pass ([`XrSide::blended`]).
 fn xr_compared(
-    (ours, metal): &XrSides,
+    ours: &XrSides,
     (mode, library, fragment): (&str, &[u8], &str),
     (formats, blends): (&[u32], &[[u32; 6]]),
     expect: XrExpect<'_>,
     across: bool,
 ) -> (Vec<String>, Vec<String>) {
-    let Some(metal) = metal else {
-        return (Vec::new(), Vec::new());
-    };
     let (mut differ, mut missed) = (Vec::new(), Vec::new());
     // The texels `list` gives the blend, where it lists it.
     let listed = |list: &[XrGap], format, blend| {
@@ -3123,7 +2779,6 @@ fn xr_compared(
             let within = if across { "" } else { " in one pass" };
             let what = format!("{mode} {fragment} format {format} blend {blend:?}{within}");
             let drawn = (library, fragment);
-            let theirs = metal.drawn(&what, drawn, format, (blend, None), across);
             *crate::answer::LAST_LINE.lock() = None;
             let ours = catch_death(|| ours.blended(drawn, format, blend, across));
             let ours = match ours {
@@ -3134,10 +2789,18 @@ fn xr_compared(
                     continue;
                 }
             };
-            let count = (ours.chunks(16).zip(theirs.chunks(16)))
-                .filter(|(o, t)| o != t)
-                .count();
-            let wrong = xr_wrong(&ours, &theirs).map(|w| format!("{what}: {w}"));
+            let (count, wrong) = if crate::metal_matches_bytes!(what, &ours) {
+                (0, None)
+            } else if let Some(theirs) = crate::metal_full!(what) {
+                let count = (ours.chunks(16).zip(theirs.chunks(16)))
+                    .filter(|(o, t)| o != t)
+                    .count();
+                (count, xr_wrong(&ours, &theirs))
+            } else {
+                let digest = "differs from Metal's, recorded by its digest".to_owned();
+                (usize::MAX, Some(digest))
+            };
+            let wrong = wrong.map(|w| format!("{what}: {w}"));
             let allowed = match (expect, blend) {
                 (_, None) => Some(0),
                 (XrExpect::Exact(pinned), _) => Some(listed(pinned, format, blend).unwrap_or(0)),
@@ -3259,21 +2922,18 @@ fn float4_extended_range_blends_are_metals_here() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn float4_extended_range_blends_die_naming_their_source() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
     let drawn = ("fast math", ROUNDING, "xr_float_fragment");
     let sides = xr_sides();
     let (mut differ, _) = xr_across(&sides, drawn, (&XR_LINEAR[..], &[]), XrExpect::Exact(&[]));
-    let (ours, metal) = &sides;
+    let ours = &sides;
     let named = rt::Degradation::ExtendedRangeFloatBlendSource.code();
     for format in XR_LINEAR {
         for blend in XR_BLENDS {
             let what = format!("format {format} blend {blend:?}");
             let drawn = (ROUNDING, "xr_float_fragment");
-            if let Some(metal) = metal {
-                metal.drawn(&what, drawn, format, (Some(blend), None), true);
-            }
             *crate::answer::LAST_LINE.lock() = None;
             let ours = catch_death(|| ours.blended(drawn, format, Some(blend), true));
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3320,7 +2980,7 @@ const XR_CONSTANT_DIFFERENCES: [[u32; 6]; 2] = [[11, 12, 1, 1, 1, 0], [12, 11, 2
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_blends_drawn_without_fast_math_alone_are_metals() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
     let fragments = [
@@ -3361,13 +3021,10 @@ fn extended_range_blends_drawn_without_fast_math_alone_are_metals() {
             [4, 5, 0, 1, 5, 0],
             "ExtendedRangeBlend(SrgbForm)",
         )));
-    let (ours, metal) = &sides;
+    let ours = &sides;
     for ((library, fragment), format, blend, named) in refused {
         let what = format!("{fragment} format {format} blend {blend:?}");
         let drawn = (library, fragment);
-        if let Some(metal) = metal {
-            metal.drawn(&what, drawn, format, (Some(blend), None), true);
-        }
         *crate::answer::LAST_LINE.lock() = None;
         let ours = catch_death(|| ours.blended(drawn, format, Some(blend), true));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3440,12 +3097,10 @@ const XR_DUAL_BLENDS: [[u32; 6]; 6] = [
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn extended_range_masked_blends_and_two_output_states_are_metals() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
-    let (ours, Some(metal)) = xr_sides() else {
-        return;
-    };
+    let ours = xr_sides();
     let mut differ = Vec::new();
     for format in XR_LINEAR.into_iter().chain(XR_SRGB) {
         for fragment in [
@@ -3460,12 +3115,11 @@ fn extended_range_masked_blends_and_two_output_states_are_metals() {
                 let shape = (Some(blend), Some(mask));
                 let what = format!("{fragment} format {format} blend {blend:?} mask {mask:#x}");
                 let library = (ROUNDING_SAFE, fragment);
-                let theirs = metal.drawn(&what, library, format, shape, true);
                 *crate::answer::LAST_LINE.lock() = None;
                 let ours = catch_death(|| ours.masked(library, format, shape, true));
                 match ours {
-                    Ok(ours) => differ
-                        .extend(xr_wrong(&ours, &theirs).map(|wrong| format!("{what}: {wrong}"))),
+                    Ok(ours) if crate::metal_matches_bytes!(what, &ours) => {}
+                    Ok(_) => differ.push(format!("{what}: the texels differ from Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                         differ.push(format!("{what}: died at {site:?}: {line}"));
@@ -3493,12 +3147,11 @@ fn extended_range_masked_blends_and_two_output_states_are_metals() {
                 let what = format!("{fragment} {fast} format {format} blend {blend:?}");
                 let library = (library, fragment);
                 let shape = (blend, None);
-                let theirs = metal.drawn(&what, library, format, shape, true);
                 *crate::answer::LAST_LINE.lock() = None;
                 let ours = catch_death(|| ours.masked(library, format, shape, true));
                 match ours {
-                    Ok(ours) => differ
-                        .extend(xr_wrong(&ours, &theirs).map(|wrong| format!("{what}: {wrong}"))),
+                    Ok(ours) if crate::metal_matches_bytes!(what, &ours) => {}
+                    Ok(_) => differ.push(format!("{what}: the texels differ from Metal's")),
                     Err(site) => {
                         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                         differ.push(format!("{what}: died at {site:?}: {line}"));
@@ -3539,7 +3192,6 @@ fn extended_range_masked_blends_and_two_output_states_are_metals() {
     ];
     for (library, format, shape, named) in refused {
         let what = format!("{} format {format} {shape:?}", library.1);
-        metal.drawn(&what, library, format, shape, true);
         *crate::answer::LAST_LINE.lock() = None;
         let ours = catch_death(|| ours.masked(library, format, shape, true));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
@@ -3583,8 +3235,8 @@ const HALF4_FAST_GAP: [XrGap; 13] = [
 /// A `half4` output (`xr_half_fragment`, each lane a value a `half` holds, computed from the
 /// pixel), compiled with fast math ([`ROUNDING`]), drawn into an attachment of each linear
 /// extended-range format unblended and blended under each of [`XR_BLENDS`], across passes
-/// ([`xr_across`]) and in the first draw's pass ([`xr_within`]): Metal's side draws each, and
-/// every draw of this platform's, the blended and the unblended alike, dies at its selector
+/// ([`xr_across`]) and in the first draw's pass ([`xr_within`]), which Metal draws: every draw
+/// of this platform's, the blended and the unblended alike, dies at its selector
 /// naming `device-pack-conversion` ([`crate::answer::DIES`]). The runtime holds such an
 /// attachment in its codes, which the fragment function converts by the device's arithmetic
 /// (a read multiplies a code by the `f32` nearest `1 / 510`, a write rounds its value's `f32`
@@ -3609,10 +3261,8 @@ fn half4_extended_range_blends_announce_their_source() {
     let (died, differ): (Vec<_>, Vec<_>) = (across.into_iter().chain(within))
         .partition(|what| what.contains(named) && what.contains(at));
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
-    if sides.1.is_some() {
-        let draws = 2 * XR_LINEAR.len() * (1 + XR_BLENDS.len());
-        assert_eq!(died.len(), draws, "the draws that die: {died:#?}");
-    }
+    let draws = 2 * XR_LINEAR.len() * (1 + XR_BLENDS.len());
+    assert_eq!(died.len(), draws, "the draws that die: {died:#?}");
 }
 
 /// A `half4` output (`xr_half_fragment`) compiled without fast math ([`ROUNDING_SAFE`]), as
@@ -3657,21 +3307,16 @@ fn half4_extended_range_blends_are_metals_without_fast_math() {
 /// platform `P` that clears it to `clear` and draws `xr_half_fragment` of seed 1 into it under
 /// source and destination factor one, added, colour and alpha.
 fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> Vec<u8> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::ClearColor;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::ClearColor;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function("xr_half_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let colour = [
         (0, 0),
         (1, 552),
@@ -3683,16 +3328,8 @@ fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> 
         (7, 1),
         (8, 0),
     ];
-    let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    let state = d
-        .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let desc = render_value::<P>((&functions[0], &functions[1]), 1, &[&colour]);
+    let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
     let read = d
         .new_compute_pipeline_state_for_function(Some(&function("xr_read")))
         .unwrap()
@@ -3779,7 +3416,7 @@ fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> 
 /// math) onto a `BGRA10_XR` attachment its pass cleared: onto a clear colour of codes (every
 /// channel 0 but alpha 0.5, which `BGRA10_XR` holds exactly), and onto a clear colour whose red
 /// lies between two codes (0.0005, between 0 and 1/510), where Metal's tile memory holds the
-/// clear's halves. Metal's side draws each; this platform's draw dies at its selector naming
+/// clear's halves. This platform's draw dies at its selector naming
 /// `extended-range-blend-source` ([`crate::answer::DIES`]), which the runtime announces for a
 /// computed `half4` under fast math blended into an extended-range attachment, whatever the
 /// factors, though a blend of one and one is among those it measured Metal's
@@ -3790,189 +3427,14 @@ fn xr_blended_onto_clear<P: Platform>(p: &P, d: &P::Device, clear: [f64; 4]) -> 
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn a_blend_onto_a_clear_between_codes_is_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let kind = rt::Degradation::ExtendedRangeBlendSource;
     for clear in [[0.0, 0.0, 0.0, 0.5], [0.0005, 0.0, 0.0, 0.5]] {
-        xr_blended_onto_clear(&mp, &md, clear);
         let site = crate::answer::dies_of(kind, || xr_blended_onto_clear(&p, &d, clear));
         assert_eq!(
             site.file, "drawPrimitives:vertexStart:vertexCount:",
             "{clear:?}"
         );
-    }
-}
-
-/// A render blob of `textureWriteRoundingMode` 2 decodes, and its state is decided once made,
-/// as Metal's: a compile's refusal is the `NSError` (a float fragment's colour 0 of
-/// `R32Uint`, beside a half-float colour 1); a half-float attachment of write mask none makes
-/// its state, and so does one the function has no output for (colour 1 of `RGBA16Float`
-/// beside a written colour 0 of `RGBA8Unorm`), one it writes, unblended, of 1 sample, of 2
-/// or of 4, and one it writes blended by one and one, whose draw dies naming the runtime's
-/// notice (`blended-write-rounding`: the device's blend rounds the result by its own rule), and
-/// `RGBA16Float` at colour 0 whose alpha alpha to coverage reads, whose draw dies naming the
-/// runtime's notice (`coverage-reads-rounded-alpha`). Metal makes each. That draw by default
-/// (`answer::relaxed`) stores Metal's alpha past 1 by float steps and past the largest half,
-/// rounded by the function as Metal stores it, but not through unorm values, where the coverage
-/// reads the rounded alpha and Metal's the alpha before rounding
-#[test]
-fn mode_2_render_states_are_decided_once_made() {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
-
-    use crate::gpu::serialized::NEAREST_EVEN;
-    use crate::gpu::serialized::tests::rounded_render_of;
-
-    /// A blob's 4-byte render entries past its fragment ref, and its colour attachments'.
-    type Blob<'a> = (&'a [&'a str], &'a [&'a [(u8, u32)]]);
-
-    fn state<P: Platform>(
-        d: &P::Device,
-        entries: &[&str],
-        colours: &[&[(u8, u32)]],
-    ) -> Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText> {
-        let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
-        let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let functions = [function("sweep_vertex"), function("sweep_fragment")];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
-        let mut all = vec!["02 04 02000000"];
-        all.extend(entries);
-        let blob = rounded_render_of(&all, colours, NEAREST_EVEN);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-    }
-    let d = dev();
-    let metal = MetalPlatform::system_default_device();
-    let refused: [&[(u8, u32)]; 2] = [&[(0, 0), (1, 53)], &[(0, 1), (1, 65)]];
-    let unwritten: [&[(u8, u32)]; 1] = [&[(0, 0), (1, 115), (9, 0)]];
-    let no_output: [&[(u8, u32)]; 2] = [&[(0, 0), (1, 70)], &[(0, 1), (1, 115)]];
-    let written: [&[(u8, u32)]; 1] = [&[(0, 0), (1, 115)]];
-    assert!(state::<VulkanPlatform>(&d, &[], &refused).is_err());
-    let made: [Blob<'_>; 5] = [
-        (&[], &unwritten),
-        (&[], &no_output),
-        (&[], &written),
-        (&["04 04 02000000"], &written),
-        (&["04 04 04000000"], &written),
-    ];
-    let additive: [&[(u8, u32)]; 1] = [&[
-        (0, 0),
-        (1, 115),
-        (2, 1),
-        (3, 1),
-        (4, 1),
-        (5, 0),
-        (6, 1),
-        (7, 1),
-        (8, 0),
-    ]];
-    let made: [Blob<'_>; 7] = [
-        made[0],
-        made[1],
-        made[2],
-        made[3],
-        made[4],
-        (&[], &additive),
-        (&["05 04 01000000"], &written),
-    ];
-    for (entries, colours) in made {
-        assert!(
-            matches!(state::<VulkanPlatform>(&d, entries, colours), Ok(Some(_))),
-            "{entries:?} {colours:?}"
-        );
-    }
-    let blended = Drawn {
-        colour: &additive[0][2..],
-        ..PLAIN
-    };
-    let p = platform();
-    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
-        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, blended)
-    });
-    assert!(line.contains("blended-write-rounding"), "{line}");
-    let covered = Drawn {
-        render: &["05 04 01000000"],
-        ..PLAIN
-    };
-    let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
-        swept(&p, &d, (false, NEAREST_EVEN), (115, 8), 0, covered)
-    });
-    assert!(line.contains("coverage-reads-rounded-alpha"), "{line}");
-    if let Some(md) = &metal {
-        assert!(state::<MetalPlatform>(md, &[], &refused).is_err());
-        for (entries, colours) in made {
-            assert!(
-                matches!(state::<MetalPlatform>(md, entries, colours), Ok(Some(_))),
-                "{entries:?} {colours:?}"
-            );
-        }
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        for (kind, metals) in [(0, false), (1, true), (3, true)] {
-            let ours = crate::answer::relaxed(|| {
-                swept(&p, &d, (false, NEAREST_EVEN), (115, 8), kind, covered)
-            });
-            let theirs = swept(&mp, md, (false, NEAREST_EVEN), (115, 8), kind, covered);
-            assert_eq!(ours == theirs, metals, "the covered alpha's sweep {kind}");
-        }
-    }
-}
-
-/// A render state of `textureWriteRoundingMode` 2 whose half-float colour attachment stores
-/// what the fragment function writes as written rounds as Metal's, byte for byte, over the
-/// sweeps through unorm values, past 1 by float steps and past the largest half: `R16Float`,
-/// `RG16Float` and `RGBA16Float`, unblended and blended by one and zero, of a `float4` and of
-/// a `half4` output, and of a write mask of red and green alone, and of none
-#[test]
-#[cfg_attr(
-    target_os = "macos",
-    ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
-)]
-fn mode_2_half_float_attachments_stored_as_written_round_as_metals() {
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let replace: &[(u8, u32)] = &[(2, 1), (3, 1), (4, 0), (5, 0), (6, 1), (7, 0), (8, 0)];
-    let drawn = [
-        PLAIN,
-        Drawn {
-            colour: replace,
-            ..PLAIN
-        },
-        Drawn {
-            fragment: "sweep_half_fragment",
-            ..PLAIN
-        },
-        Drawn {
-            colour: &[(9, 0xc)],
-            ..PLAIN
-        },
-        Drawn {
-            colour: &[(9, 0)],
-            ..PLAIN
-        },
-    ];
-    for format in [(25, 2), (65, 4), (115, 8)] {
-        for (n, &how) in drawn.iter().enumerate() {
-            for kind in [0, 1, 3] {
-                let ours = swept(&p, &d, (false, NEAREST_EVEN), format, kind, how);
-                let theirs = swept(&mp, &md, (false, NEAREST_EVEN), format, kind, how);
-                assert!(ours == theirs, "{format:?} drawn {n} sweep {kind}");
-            }
-        }
     }
 }
 
@@ -4070,11 +3532,10 @@ impl Channels {
 
 /// A `half` colour output (`rounding.metal`'s `sweep_half_fragment`, a `half4` converted from
 /// `float`, every channel the sweep's value), which the runtime rounds to `half` before the blend
-/// and the format's conversion, drawn under
-/// `textureWriteRoundingMode` 0 over the sweeps from -0.25 to 1.25 (0) and from -2 to 2 (4) onto a
-/// 256 by 256 attachment loaded with texels from 0 to 1 (`LOAD`; zeros for `RG11B10Float` and
-/// `RGB9E5Float`), from a congruential sequence (seed 7919, `x * 1103515245 + 12345`, bits 8 to 23
-/// of each step: a unorm byte its low byte, a `half` the step modulo 0x3c01, a `float` the step
+/// and the format's conversion, drawn over the sweeps from -0.25 to 1.25 (0) and from -2 to 2 (4)
+/// onto a 256 by 256 attachment loaded with texels from 0 to 1 (`LOAD`; zeros for `RG11B10Float`
+/// and `RGB9E5Float`), from a congruential sequence (seed 7919, `x * 1103515245 + 12345`, bits 8 to
+/// 23 of each step: a unorm byte its low byte, a `half` the step modulo 0x3c01, a `float` the step
 /// over 65535), blended as each case says, the blend colour (0.3, 0.6, 0.9, 0.45). Compiled with
 /// fast math ([`ROUNDING`]), the function notes `half-output-fast-math-blend`, relayed in the
 /// accepted class of fast-math rewrites: every draw draws, and one the rule below relayed
@@ -4103,10 +3564,9 @@ impl Channels {
     ignore = "MoltenVK: the runtime records device-nan-encoding, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn half_outputs_store_within_the_bound_or_die_named() {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     /// `MTLLoadActionLoad`.
     const LOAD: u64 = 1;
@@ -4128,10 +3588,6 @@ fn half_outputs_store_within_the_bound_or_die_named() {
         let library = d.new_library(library).unwrap().unwrap().unwrap();
         let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
         let functions = [function("sweep_vertex"), function(fragment)];
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            let at = usize::try_from(r - 1).unwrap();
-            Ok(Some(functions[at].clone_ref()))
-        };
         let t = texture(
             p,
             d,
@@ -4146,16 +3602,8 @@ fn half_outputs_store_within_the_bound_or_die_named() {
             colour.extend([(2, 1), (3, source), (4, destination), (5, operation)]);
             colour.extend([(6, source), (7, destination), (8, operation)]);
         }
-        let blob = rounded_render_of(&["02 04 02000000"], &[&colour], 0);
-        let desc = d
-            .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-            .unwrap()
-            .unwrap();
-        let state = d
-            .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap();
+        let desc = render_value::<P>((&functions[0], &functions[1]), 1, &[&colour]);
+        let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         let pass = p.render_pass_descriptor();
@@ -4219,10 +3667,6 @@ fn half_outputs_store_within_the_bound_or_die_named() {
         unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
     }
 
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let blends_relayed = || {
         (crate::answer::inexact_counts().into_iter())
@@ -4364,9 +3808,9 @@ fn half_outputs_store_within_the_bound_or_die_named() {
         for &(blend, relayed) in blends {
             for kind in [0, 4] {
                 let float4 = (ROUNDING, "sweep_fragment", kind);
+                let key = format!("{format:?} {blend:?} sweep {kind}: a float4 output");
                 let ours = drawn((&p, &d), *format, float4, blend, under);
-                let theirs = drawn((&mp, &md), *format, float4, blend, under);
-                if ours != theirs {
+                if !crate::metal_matches_bytes!(key, &ours) {
                     wrong.push(format!(
                         "{format:?} {blend:?} sweep {kind}: a float4 output"
                     ));
@@ -4392,9 +3836,16 @@ fn half_outputs_store_within_the_bound_or_die_named() {
             let (mut most, mut differ) = (0f64, 0);
             for kind in [0, 4] {
                 let half4 = (ROUNDING, "sweep_half_fragment", kind);
+                let key = format!("{format:?} {blend:?} sweep {kind}: a half4 output");
                 let ours = drawn((&p, &d), *format, half4, blend, under);
-                let theirs = drawn((&mp, &md), *format, half4, blend, under);
-                let (far, count) = channels.apart(&ours, &theirs);
+                // Metal's bytes in full where ours differ from them, else by their digest.
+                let (far, count) = if crate::metal_matches_bytes!(key, &ours) {
+                    (0.0, 0)
+                } else if let Some(theirs) = crate::metal_full!(key) {
+                    channels.apart(&ours, &theirs)
+                } else {
+                    (f64::INFINITY, ours.len())
+                };
                 (most, differ) = (most.max(far), differ + count);
             }
             eprintln!(
@@ -4423,12 +3874,11 @@ fn half_outputs_store_within_the_bound_or_die_named() {
 
 /// A fragment function's `float4` output (`sweep_fragment`) and `half4` one
 /// (`sweep_half_fragment`) drawn unblended into an attachment of each bfloat format
-/// (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`), at `textureWriteRoundingMode` 0 and 2, over
-/// each of `rounding.metal`'s five sweeps (through unorm values, past 1 and past -1 by float
-/// steps, past the largest half, and across -2 to 2), stores Metal's codes, byte for byte:
-/// the runtime writes such an output as Metal's tile holds and stores it (a
-/// `float` rounded to `half` toward zero, saturating at 65504, or to nearest even at mode 2,
-/// then the nearest bfloat code, ties to even). A state
+/// (`R16Bfloat`, `RG16Bfloat`, `RGBA16Bfloat`), over each of `rounding.metal`'s five sweeps
+/// (through unorm values, past 1 and past -1 by float steps, past the largest half, and across
+/// -2 to 2), stores Metal's codes, byte for byte: the runtime writes such an output as Metal's
+/// tile holds and stores it (a `float` rounded to `half` toward zero, saturating at 65504, then
+/// the nearest bfloat code, ties to even). A state
 /// that blends into one, by one and zero, which Metal's validation refuses, dies as it is made,
 /// naming the runtime's refusal (`Unsupported` of `Format`); Metal's is not made here. A draw
 /// in a pass that loads one and stores it, which Metal makes, dies at the draw, naming the
@@ -4439,17 +3889,11 @@ fn half_outputs_store_within_the_bound_or_die_named() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn bfloat_draws_store_metals_codes() {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    const STATE: &str = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    const STATE: &str = "newRenderPipelineStateWithDescriptor:error:";
     const DRAW: &str = "drawPrimitives:vertexStart:vertexCount:";
 
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let half = Drawn {
         fragment: "sweep_half_fragment",
@@ -4458,21 +3902,15 @@ fn bfloat_draws_store_metals_codes() {
     let mut differ = Vec::new();
     for format in [(26, 2), (66, 4), (116, 8)] {
         for (output, how) in [("float4", PLAIN), ("half4", half)] {
-            for mode in [0, NEAREST_EVEN] {
-                for kind in [0, 1, 2, 3, 4] {
-                    let case = format!("{format:?} {output} mode {mode} sweep {kind}");
-                    let theirs = swept(&mp, &md, (false, mode), format, kind, how);
-                    *crate::answer::LAST_LINE.lock() = None;
-                    match catch_death(|| swept(&p, &d, (false, mode), format, kind, how)) {
-                        Ok(ours) if ours == theirs => {}
-                        Ok(ours) => {
-                            let off = ours.iter().zip(&theirs).filter(|(a, b)| a != b);
-                            differ.push(format!("{case}: {} bytes differ", off.count()));
-                        }
-                        Err(site) => {
-                            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-                            differ.push(format!("{case}: died at {site:?}: {line}"));
-                        }
+            for kind in [0, 1, 2, 3, 4] {
+                let case = format!("{format:?} {output} sweep {kind}");
+                *crate::answer::LAST_LINE.lock() = None;
+                match catch_death(|| swept(&p, &d, false, format, kind, how)) {
+                    Ok(ours) if crate::metal_matches_bytes!(case, &ours) => {}
+                    Ok(_) => differ.push(format!("{case}: the bytes differ from Metal's")),
+                    Err(site) => {
+                        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
+                        differ.push(format!("{case}: died at {site:?}: {line}"));
                     }
                 }
             }
@@ -4483,7 +3921,7 @@ fn bfloat_draws_store_metals_codes() {
             ..PLAIN
         };
         *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| swept(&p, &d, (false, 0), format, 0, blended));
+        let site = catch_death(|| swept(&p, &d, false, format, 0, blended));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         match site {
             Err(site)
@@ -4493,9 +3931,8 @@ fn bfloat_draws_store_metals_codes() {
             Ok(_) => differ.push(format!("{format:?} blended: drawn")),
         }
         let loaded = Drawn { load: 1, ..PLAIN };
-        swept(&mp, &md, (false, 0), format, 0, loaded);
         *crate::answer::LAST_LINE.lock() = None;
-        let site = catch_death(|| swept(&p, &d, (false, 0), format, 0, loaded));
+        let site = catch_death(|| swept(&p, &d, false, format, 0, loaded));
         let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
         match site {
             Err(site)
@@ -4508,313 +3945,23 @@ fn bfloat_draws_store_metals_codes() {
     assert!(differ.is_empty(), "{} differ: {differ:#?}", differ.len());
 }
 
-/// A render state of `textureWriteRoundingMode` 2 made of what no other test compares rounds
-/// as Metal's, byte for byte, over the sweeps through unorm values, past 1 by float steps
-/// and past the largest half, and so does one of mode 0 of it: `R16Float` and `RG16Float` at
-/// colour 0 under alpha to coverage; `RGBA16Float` at colour 0 under alpha to coverage of a
-/// write mask without alpha, whose coverage reads the alpha before rounding, as Metal's; and
-/// `R16Float`, `RG16Float` and `RGBA16Float` at colours 1 and 3, beside an `RGBA8Unorm` colour 0
-#[test]
-fn mode_2_half_float_attachments_no_other_test_compares_round_as_metals() {
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let coverage: &[&str] = &["05 04 01000000"];
-    let covered = Drawn {
-        render: coverage,
-        ..PLAIN
-    };
-    let mut cases = vec![
-        ((25, 2), covered),
-        ((65, 4), covered),
-        (
-            (115, 8),
-            Drawn {
-                colour: &[(9, 0xe)],
-                ..covered
-            },
-        ),
-    ];
-    for format in [(25, 2), (65, 4), (115, 8)] {
-        for index in [1, 3] {
-            let four = Drawn {
-                fragment: "sweep_four_fragment",
-                index,
-                ..PLAIN
-            };
-            cases.push((format, four));
-        }
-    }
-    let mut differ = Vec::new();
-    for (format, how) in cases {
-        for mode in [0, NEAREST_EVEN] {
-            for kind in [0, 1, 3] {
-                let ours = swept(&p, &d, (false, mode), format, kind, how);
-                let theirs = swept(&mp, &md, (false, mode), format, kind, how);
-                if ours != theirs {
-                    let off = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                    differ.push(format!(
-                        "{format:?} {how:?} mode {mode} sweep {kind}: {off} bytes"
-                    ));
-                }
-            }
-        }
-    }
-    assert!(differ.is_empty(), "{differ:#?}");
-}
-
-/// The bytes of a 256 by 256 texture of `format`, `bytes` a texel, after `write_fragment`
-/// writes the sweep `kind` (`rounding.metal`) into it, bound at fragment texture 0, or, where
-/// `held`, `write_args_fragment` through the argument buffer at fragment buffer 1 that holds its
-/// ID, made resident for writing, under a [`texture_writing_state`] of
-/// `textureWriteRoundingMode` `mode`, drawn over an `RGBA8Unorm` colour attachment.
-fn fragment_written<P: Platform>(
-    p: &P,
-    d: &P::Device,
-    (mode, held): (u32, bool),
-    (format, bytes): (u64, u64),
-    kind: u32,
-) -> Vec<u8> {
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::resource::Texture as _;
-
-    let fragment = if held {
-        "write_args_fragment"
-    } else {
-        "write_fragment"
-    };
-    let state = texture_writing_state::<P>(d, mode, fragment, false)
-        .unwrap()
-        .unwrap()
-        .unwrap();
-    let t = texture(p, d, format, READ | 2, (256, 256), None);
-    let target = texture(p, d, 70, READ | TARGET, (256, 256), None);
-    let kinds = buffer::<P>(d, 4, 0, &kind.to_le_bytes());
-    let args = buffer::<P>(d, 8, 0, &t.gpu_resource_id().to_le_bytes());
-    let resident = [Some(ResourceRef::Texture(&t))];
-    let bind = match held {
-        true => vec![
-            RenderCmd::SetFragmentBuffer {
-                buffer: Some(&args),
-                offset: 0,
-                index: 1,
-            },
-            RenderCmd::UseResources {
-                resources: &resident,
-                usage: 2,
-            },
-        ],
-        false => vec![RenderCmd::SetFragmentTexture {
-            texture: Some(&t),
-            index: 0,
-        }],
-    };
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let pass = p.render_pass_descriptor();
-    let attachment = ColorAttachmentSet {
-        texture: Some(Some(&target)),
-        load_action: Some(CLEAR),
-        store_action: Some(STORE),
-        ..ColorAttachmentSet::default()
-    };
-    pass.set_color_attachment(OnFault::Die, 0, &attachment)
-        .unwrap();
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    for cmd in [
-        RenderCmd::SetRenderPipelineState {
-            pipeline_state: Some(&state),
-        },
-        RenderCmd::SetFragmentBuffer {
-            buffer: Some(&kinds),
-            offset: 0,
-            index: 0,
-        },
-    ]
-    .into_iter()
-    .chain(bind)
-    .chain([
-        RenderCmd::DrawPrimitives {
-            primitive_type: 3,
-            vertex_start: 0,
-            vertex_count: 3,
-        },
-        RenderCmd::EndEncoding,
-    ]) {
-        e.encode(OnFault::Die, cmd).unwrap();
-    }
-    // The draw's command buffer completes before the copy's is made: in one command buffer,
-    // Metal's copy read some texels the draw writes through the argument buffer before the
-    // writes landed (measured here, other texels each run).
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    assert!(cb.error().is_none(), "{:?}", cb.error());
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let length = 256 * 256 * bytes;
-    let out = buffer::<P>(d, length, 0, &[]);
-    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-    blit.encode(
-        OnFault::Die,
-        BlitCmd::CopyTextureToBuffer {
-            source_texture: &t,
-            source_slice: 0,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: MtlSize::new(256, 256, 1),
-            destination_buffer: &out,
-            destination_offset: 0,
-            destination_bytes_per_row: 256 * bytes,
-            destination_bytes_per_image: length,
-        },
-    )
-    .unwrap();
-    blit.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    assert!(cb.error().is_none(), "{:?}", cb.error());
-    let n = usize::try_from(length).unwrap();
-    // SAFETY: a Shared buffer's bytes, read after the blit completed.
-    unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
-}
-
-/// A render state of `textureWriteRoundingMode` 2 whose fragment function writes a texture
-/// is made, as Metal's is, and its draws write what Metal's do, byte for byte over the sweeps
-/// through unorm values, past 1 by float steps and past the largest half, into a texture of
-/// a format Metal's mode 2 writes as its default does (`RGBA8Unorm`, `BGRA8Unorm`,
-/// `R32Float`, `RGBA32Float`); a draw writing one of a half-float format (`R16Float`,
-/// `RG16Float`, `RGBA16Float`), which Metal's mode 2 rounds to nearest even, or of
-/// `RG11B10Float`, which it rounds otherwise than its default (in the sweep through unorm
-/// values; past 1 and past the largest half as its default), dies at the draw's selector,
-/// naming the runtime's refusal of a write at the mode it has not built, and so does one writing
-/// `RGBX16Float` or `RGB9E5Float`, which nothing measured at the mode. At modes 0 and 1 every
-/// format's writes that Metal's are compared with are Metal's
-#[test]
-fn mode_2_fragment_texture_writes_are_metals_or_die_at_the_draw() {
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let draw = |format: (u64, u64), kind| {
-        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
-            fragment_written(&p, &d, (NEAREST_EVEN, false), format, kind)
-        });
-        assert!(
-            line.contains("TextureWriteRounding"),
-            "{format:?} sweep {kind}: {line}"
-        );
-    };
-    let half = [(25, 2), (65, 4), (115, 8)];
-    let rg11b10 = (92, 4);
-    let rounded = [half[0], half[1], half[2], rg11b10];
-    let rest = [(70, 4), (80, 4), (55, 4), (125, 16)];
-    let unmeasured = [(315, 8), (93, 4)];
-    let mut rg11b10_rounded = Vec::new();
-    for kind in [0, 1, 3] {
-        for format in rest.into_iter().chain(rounded) {
-            for mode in 0..=2 {
-                let theirs = fragment_written(&mp, &md, (mode, false), format, kind);
-                if mode == NEAREST_EVEN && rounded.contains(&format) {
-                    draw(format, kind);
-                    let rounds = theirs != fragment_written(&mp, &md, (0, false), format, kind);
-                    if format == rg11b10 {
-                        rg11b10_rounded.extend(rounds.then_some(kind));
-                    } else {
-                        assert!(
-                            rounds,
-                            "Metal's mode 2 writes {format:?} sweep {kind} as its default"
-                        );
-                    }
-                    continue;
-                }
-                let ours = fragment_written(&p, &d, (mode, false), format, kind);
-                assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
-            }
-        }
-        for format in unmeasured {
-            draw(format, kind);
-        }
-    }
-    assert_eq!(
-        rg11b10_rounded,
-        [0],
-        "the sweeps Metal's mode 2 writes RG11B10Float otherwise"
-    );
-}
-
-/// A render state of `textureWriteRoundingMode` 2 whose fragment function writes a texture
-/// through an argument buffer is made, as Metal's is, of `supportIndirectCommandBuffers` or not,
-/// and so is each at modes 0 and 1. Its draw writes Metal's bytes into an `RGBA8Unorm` or an
-/// `RGBA32Float` texture the buffer holds, which Metal's mode 2 writes as its default does, as a
-/// state of mode 0 does, over the sweeps through unorm values, past 1 by float steps and past
-/// the largest half; it dies at the draw, naming the runtime's refusal, where the buffer holds a
-/// texture of a half-float format or `RG11B10Float`, whose write at the mode the runtime has not
-/// built
-#[test]
-fn mode_2_fragment_writes_through_handles_are_metals_or_die_at_the_draw() {
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    type V = crate::platform::VulkanPlatform;
-    let d = dev();
-    let p = platform();
-    let md = MetalPlatform::system_default_device();
-    for mode in 0..=2 {
-        for icb in [false, true] {
-            let made = texture_writing_state::<V>(&d, mode, "write_args_fragment", icb);
-            assert!(matches!(made, Ok(Ok(Some(_)))), "{mode} {icb}");
-            if let Some(md) = &md {
-                let made =
-                    texture_writing_state::<MetalPlatform>(md, mode, "write_args_fragment", icb);
-                assert!(matches!(made, Ok(Ok(Some(_)))), "Metal: {mode} {icb}");
-            }
-        }
-    }
-    for format in [(115, 8), (25, 2), (92, 4)] {
-        let line = died_at("drawPrimitives:vertexStart:vertexCount:", || {
-            fragment_written(&p, &d, (NEAREST_EVEN, true), format, 0)
-        });
-        assert!(line.contains("TextureWriteRounding"), "{format:?}: {line}");
-    }
-    let Some(md) = md else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    for format in [(70, 4), (125, 16)] {
-        for kind in [0, 1, 3] {
-            for mode in [0, NEAREST_EVEN] {
-                let ours = fragment_written(&p, &d, (mode, true), format, kind);
-                let theirs = fragment_written(&mp, &md, (mode, true), format, kind);
-                assert!(ours == theirs, "{format:?} mode {mode} sweep {kind}");
-            }
-        }
-    }
-}
-
-/// The resolved bytes of a 256 by 256 `format` (`bytes` a texel) colour attachment of
-/// `samples` samples, cleared to 0.3, after `sweep_fragment` draws the sweep `kind` into it
-/// under a state of `textureWriteRoundingMode` `mode` over the viewport from `offset` (of a
-/// pixel, both ways: past 0 the first row and column are partly covered, so their resolve
-/// averages the draw's value and the clear's), resolved by the drawing pass where `apart` is
-/// false, else by a later pass that loads the samples and draws nothing.
+/// The resolved bytes of a 256 by 256 `format` (`bytes` a texel) colour attachment of `samples`
+/// samples, cleared to 0.3, after `sweep_fragment` draws the sweep `kind` into it over the viewport
+/// from `offset` (of a pixel, both ways: past 0 the first row and column are partly covered, so
+/// their resolve averages the draw's value and the clear's), resolved by the drawing pass where
+/// `apart` is false, else by a later pass that loads the samples and draws nothing.
 fn resolved<P: Platform>(
     p: &P,
     d: &P::Device,
-    (mode, samples): (u32, u64),
+    samples: u64,
     (format, bytes): (u64, u64),
     kind: u32,
     (offset, apart): (f64, bool),
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::types::ClearColor;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::types::ClearColor;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     /// `MTLTextureType2DMultisample`, `MTLLoadActionLoad`, `MTLStoreActionMultisampleResolve`
     /// and `MTLStoreActionStoreAndMultisampleResolve`.
@@ -4825,23 +3972,10 @@ fn resolved<P: Platform>(
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function("sweep_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let format32 = u32::try_from(format).unwrap();
     let colour: &[(u8, u32)] = &[(0, 0), (1, format32)];
-    let count = format!("04 04 {samples:02x}000000");
-    let blob = rounded_render_of(&["02 04 02000000", &count], &[colour], mode);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    let state = d
-        .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let desc = render_value::<P>((&functions[0], &functions[1]), samples, &[colour]);
+    let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
     let samples = d
         .new_texture(
             OnFault::Die,
@@ -4948,15 +4082,6 @@ fn resolved<P: Platform>(
     unsafe { std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
-/// A render state of `textureWriteRoundingMode` 2 whose half-float colour attachment of two
-/// samples, or of four, stores what the fragment function writes as written resolves as
-/// Metal's, byte for byte, and so does one of mode 0 of it ([`resolves_as_metals`])
-#[test]
-fn mode_2_multisampled_half_float_attachments_resolve_as_metals() {
-    resolves_as_metals(2);
-    resolves_as_metals(4);
-}
-
 /// The resolved bytes of a 64 by 64 `format` (`bytes` a texel) colour attachment of
 /// `samples` samples after `xr_loaded_fragment` draws two tables of `float4`s, a value a
 /// pixel, into it (`tables`, [`drawn_specials`]'s or [`drawn_extended`]'s): the first over every
@@ -4972,10 +4097,9 @@ fn drawn_resolved<P: Platform>(
     store: u64,
     tables: &[Vec<[f32; 4]>; 2],
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     /// `MTLTextureType2DMultisample`, `MTLLoadActionLoad` and
     /// `MTLStoreActionMultisampleResolve`.
@@ -4985,23 +4109,10 @@ fn drawn_resolved<P: Platform>(
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function("xr_loaded_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let format32 = u32::try_from(format).unwrap();
     let colour: &[(u8, u32)] = &[(0, 0), (1, format32)];
-    let count = format!("04 04 {samples:02x}000000");
-    let blob = rounded_render_of(&["02 04 02000000", &count], &[colour], 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    let state = d
-        .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let desc = render_value::<P>((&functions[0], &functions[1]), samples, &[colour]);
+    let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
     let multisampled = d
         .new_texture(
             OnFault::Die,
@@ -5168,10 +4279,6 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
     const TO_BUFFER: &str = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:\
                              toBuffer:destinationOffset:destinationBytesPerRow:\
                              destinationBytesPerImage:";
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let mut differ = Vec::new();
     for samples in [2, 4] {
@@ -5186,15 +4293,10 @@ fn drawn_nan_and_infinite_samples_resolve_as_metals() {
                     }
                     continue;
                 }
-                let theirs = drawn_resolved(&mp, &md, case, store, &drawn_specials());
+                let key = format!("{format} {samples}x store {store}");
                 let ours = drawn_resolved(&p, &d, case, store, &drawn_specials());
-                let texel = usize::try_from(bytes).unwrap();
-                let pairs = ours.chunks(texel).zip(theirs.chunks(texel));
-                let off = pairs.filter(|(o, m)| o != m).count();
-                if off != 0 {
-                    differ.push(format!(
-                        "{format} {samples}x store {store}: {off} of 4096 texels"
-                    ));
+                if !crate::metal_matches_bytes!(key, &ours) {
+                    differ.push(format!("{key}: the texels differ from Metal's"));
                 }
             }
         }
@@ -5255,10 +4357,6 @@ fn drawn_extended_range_samples_resolve_as_metals() {
     /// `MTLStoreActionMultisampleResolve` and `MTLStoreActionStoreAndMultisampleResolve`.
     const RESOLVE: u64 = 2;
     const STORE_AND_RESOLVE: u64 = 3;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let tables = drawn_extended();
     let mut differ = Vec::new();
@@ -5272,7 +4370,6 @@ fn drawn_extended_range_samples_resolve_as_metals() {
             ] {
                 let case = (format, bytes, samples);
                 let what = format!("{format} {samples}x store {store}");
-                let theirs = drawn_resolved(&mp, &md, case, store, &tables);
                 let ours = || drawn_resolved(&p, &d, case, store, &tables);
                 *crate::answer::LAST_LINE.lock() = None;
                 let strict = catch_death(ours);
@@ -5293,6 +4390,16 @@ fn drawn_extended_range_samples_resolve_as_metals() {
                         differ.push(format!("{what}: died at {site:?}: {line}"));
                         continue;
                     }
+                };
+                // Metal's texels in full where ours differ from them, else by their digest.
+                if crate::metal_matches_bytes!(what, &ours) {
+                    continue;
+                }
+                let Some(theirs) = crate::metal_full!(what) else {
+                    differ.push(format!(
+                        "{what}: differs from Metal's, recorded by its digest"
+                    ));
+                    continue;
                 };
                 let codes = extended_codes(format, &ours).into_iter();
                 let pairs = codes.zip(extended_codes(format, &theirs));
@@ -5316,8 +4423,9 @@ fn drawn_extended_range_samples_resolve_as_metals() {
 
 /// How the resolve texture of [`resolved_into`] is made: a texture of its own of a storage
 /// mode (`MTLResourceOptions`), which Metal may compress losslessly or not
-/// (`allowGPUOptimizedContents`); one over a host IOSurface of a storage mode, presented as a
-/// drawable (`setIsDrawable:` and `setFramebufferOnly:`, render target usage alone) or not; or a
+/// (`allowGPUOptimizedContents`); one over an IOSurface of a storage mode, over the buffer that
+/// stands for it, presented as a drawable (`setIsDrawable:` and `setFramebufferOnly:`, render
+/// target usage alone) or not; or a
 /// Private shareable texture (`newSharedTextureWithDescriptor:`), or one opened from its handle.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Made {
@@ -5557,10 +4665,9 @@ fn sweep_state<P: Platform>(
     colours: &[(u32, u64)],
     depth: Option<u64>,
 ) -> P::RenderPipeline {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::resource::Library as _;
 
-    use crate::gpu::serialized::tests::{le, rounded_render_of};
+    use crate::gpu::device::tests::render_value;
 
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
@@ -5569,33 +4676,19 @@ fn sweep_state<P: Platform>(
         _ => "sweep_four_fragment",
     };
     let functions = [function("sweep_vertex"), function(fragment)];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let elements: Vec<[(u8, u32); 2]> = colours
         .iter()
         .map(|&(index, format)| [(0, index), (1, u32::try_from(format).unwrap())])
         .collect();
     let elements: Vec<&[(u8, u32)]> = elements.iter().map(|e| &e[..]).collect();
-    let mut entries = vec!["02 04 02000000".to_owned(), "04 04 04000000".to_owned()];
+    let mut desc = render_value::<P>((&functions[0], &functions[1]), 4, &elements);
     if let Some(format) = depth {
-        let format = le(u32::try_from(format).unwrap());
-        entries.push(format!("09 04 {format}"));
+        desc.depth_pixel_format = format;
         if depth == Some(DEPTH32F_S8) {
-            entries.push(format!("0a 04 {format}"));
+            desc.stencil_pixel_format = format;
         }
     }
-    let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-    let blob = rounded_render_of(&entries, &elements, 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap()
+    d.new_render_pipeline_state_full(&desc).unwrap().unwrap()
 }
 
 /// `cmd` in a blit encoder of its own on `cb`.
@@ -5626,10 +4719,8 @@ fn copy_out<'a, P: Platform>(
 
 /// A rate map of a `width` by `height` screen, with one layer of one sample of 1 on each axis.
 fn even_rate_map<P: Platform>(p: &P, d: &P::Device, (width, height): (u64, u64)) -> P::RateMap {
-    use reims_vgpu_core::platform::rate_map::{
-        RateMapDescriptor as _, RateMapLayerDescriptor as _,
-    };
-    use reims_vgpu_core::platform::values::RateMapDesc;
+    use crate::core::platform::rate_map::{RateMapDescriptor as _, RateMapLayerDescriptor as _};
+    use crate::core::platform::values::RateMapDesc;
 
     let m = p.rate_map_descriptor(&RateMapDesc {
         screen_size: MtlSize::new(width, height, 1),
@@ -5662,18 +4753,16 @@ fn even_rate_map<P: Platform>(p: &P, d: &P::Device, (width, height): (u64, u64))
 /// own: what Metal autoreleased (each command buffer and encoder, which a dev build cannot elide,
 /// and through them the case's queue, textures and buffers) goes at its end, where the test
 /// thread, which pops no pool, would keep every case's until the test ends.
-fn resolved_into<P: Platform<Surface = MetalSurface>>(
+fn resolved_into<P: Platform>(
     p: &P,
     d: &P::Device,
     states: &States<'_, P>,
     c: Resolve,
 ) -> Resolved {
-    use reims_vgpu_core::platform::os::surface::{Surface as _, SurfaceSpec};
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, PassSet, StencilAttachmentSet};
+    use crate::gpu::resource::tests::{StandIn, facts_of};
 
-    /// `kIOSurfaceLockReadOnly`.
-    const READ_ONLY: u32 = 1;
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     let (into, bytes) = c.into;
     let (width, height) = c.size;
     let length = width * height * bytes;
@@ -5719,34 +4808,16 @@ fn resolved_into<P: Platform<Surface = MetalSurface>>(
     });
     let surface = matches!(c.made, Made::Surface { .. }).then(|| {
         let ostype = if bytes == 8 { *b"RGhA" } else { *b"w30r" };
-        let s = p
-            .surfaces()
-            .create(&SurfaceSpec {
-                pixel_format: u32::from_be_bytes(ostype),
-                alloc_size: length,
-                width,
-                height,
-                bytes_per_element: bytes,
-                bytes_per_row: width * bytes,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            })
-            .unwrap();
-        assert!(s.lock(0).is_success());
-        let base = s.base_address().as_ptr::<u8>();
-        // SAFETY: the surface's first `n` bytes, locked, which no texture uses yet.
-        unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), base, n) };
-        assert!(s.unlock(0).is_success());
+        let facts = facts_of(ostype, (width, height), &[]);
+        let s = StandIn::<P>::shared(d, facts, vec![(0, width * bytes)], length);
+        // SAFETY: the buffer's first `n` bytes, which no texture uses yet.
+        unsafe { std::ptr::copy_nonoverlapping(prefill.as_ptr(), s.base(), n) };
         s
     });
     let shareable = matches!(c.made, Made::Shareable { .. })
         .then(|| d.new_shared_texture(&desc).unwrap().unwrap());
     let target = match (&surface, &shareable) {
-        (Some(s), _) => d
-            .new_texture_on_surface(&desc, Some(s), 0)
-            .unwrap()
-            .unwrap(),
+        (Some(s), _) => s.texture(&desc, 0).unwrap().unwrap(),
         (None, Some(t)) if c.made == (Made::Shareable { opened: true }) => {
             let handle = t.new_shared_texture_handle().unwrap().unwrap();
             d.open_shared_texture(Some(&handle), 0).unwrap().unwrap()
@@ -5961,15 +5032,7 @@ fn resolved_into<P: Platform<Surface = MetalSurface>>(
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
     };
     let resolved = match &surface {
-        Some(s) => {
-            assert!(s.lock(READ_ONLY).is_success());
-            // SAFETY: the surface's first `n` bytes, locked, after the command buffer
-            // completed.
-            let bytes = unsafe { std::slice::from_raw_parts(s.base_address().as_ptr::<u8>(), n) };
-            let bytes = bytes.to_vec();
-            assert!(s.unlock(READ_ONLY).is_success());
-            bytes
-        }
+        Some(s) => s.bytes(length),
         None => read(&out, n),
     };
     let texels = usize::try_from(texels).unwrap();
@@ -5982,7 +5045,7 @@ fn resolved_into<P: Platform<Surface = MetalSurface>>(
 
 /// The death of `f`, which must abort at `sel`, and its line.
 fn died_at<T>(sel: &str, f: impl FnOnce() -> T) -> String {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
     *crate::answer::LAST_LINE.lock() = None;
     let Err(site) = catch_death(f) else {
         panic!("no death at {sel}");
@@ -6097,8 +5160,6 @@ fn resolving_pass<P: Platform>(
 )]
 fn resolves_into_other_formats_are_metals_or_die_named() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let untouched = [(115, 8), (554, 4), (555, 4)];
     let written = [(90, 4), (94, 4), (552, 8), (553, 8)];
     let kept = |bytes: &[u8]| bytes.iter().all(|&b| b == 0xa5);
@@ -6120,21 +5181,13 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
         )
     };
     let ours = States::<VulkanPlatform>::new(&d);
-    let theirs = metal
-        .as_ref()
-        .map(|(_, md)| States::<MetalPlatform>::new(md));
     let mut differ = Vec::new();
-    let compared = std::cell::Cell::new(0);
-    let metals = |c: Resolve| {
-        let ((mp, md), states) = (metal.as_ref()?, theirs.as_ref()?);
-        compared.set(compared.get() + 1);
-        Some(resolved_into(mp, md, states, c))
-    };
+    let raw = |r: &Resolved| (r.resolved.clone(), r.samples.clone(), r.beside.clone());
     let mut both = |c: Resolve, keeps: bool| {
         let resolved = resolved_into(&p, &d, &ours, c);
-        if let Some(m) = metals(c).filter(|m| *m != resolved) {
-            let (o, m) = (shown(&resolved), shown(&m));
-            differ.push(format!("{c:?}: ours {o}; Metal {m}"));
+        let key = format!("{c:?}");
+        if !crate::metal_matches_raw!(key, raw(&resolved)) {
+            differ.push(format!("{c:?}: ours {}, not Metal's", shown(&resolved)));
         }
         if kept(&resolved.resolved) != keeps {
             differ.push(format!("{c:?}: ours {}", shown(&resolved)));
@@ -6351,9 +5404,6 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
         .flat_map(|(from, a)| written.map(|into| (from, a, into)))
     {
         let c = Resolve::of(from, into, SHARED, (load, store));
-        if let Some(m) = metals(c).filter(|m| kept(&m.resolved)) {
-            differ.push(format!("{c:?}: Metal {}", shown(&m)));
-        }
         let line = died_at("renderCommandEncoderWithDescriptor:", || {
             resolved_into(&p, &d, &ours, c)
         });
@@ -6365,7 +5415,6 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
                         its own, both 16 by 16";
         assert!(line.contains(measured), "{c:?}: {line}");
     }
-    assert!(metal.is_none() || compared.get() > 0);
     assert!(differ.is_empty(), "{differ:#?}");
 }
 
@@ -6383,27 +5432,18 @@ fn resolves_into_other_formats_are_metals_or_die_named() {
 )]
 fn samples_resolved_into_the_twin_are_metals() {
     let (p, d) = (platform(), dev());
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (ours, theirs) = (
-        States::<VulkanPlatform>::new(&d),
-        States::<MetalPlatform>::new(&md),
-    );
+    let ours = States::<VulkanPlatform>::new(&d);
     let mut differ = Vec::new();
     for (from, twin) in [(80, 81), (81, 80)] {
         for load in [CLEAR, LOAD] {
             for made in SHAPES {
                 let c = Resolve::of(from, (twin, 4), made, (load, RESOLVE));
-                let (o, m) = (
-                    resolved_into(&p, &d, &ours, c),
-                    resolved_into(&mp, &md, &theirs, c),
-                );
-                if o.samples != m.samples {
+                let key = format!("{c:?}");
+                let o = resolved_into(&p, &d, &ours, c);
+                if !crate::metal_matches_bytes!(key, &o.samples) {
                     let head = |b: &[u8]| b.iter().take(8).copied().collect::<Vec<u8>>();
-                    let (o, m) = (head(&o.samples), head(&m.samples));
-                    differ.push(format!("{c:?}: ours {o:02x?}, Metal's {m:02x?}"));
+                    let o = head(&o.samples);
+                    differ.push(format!("{c:?}: ours {o:02x?}, not Metal's"));
                 }
             }
         }
@@ -6418,21 +5458,17 @@ fn samples_resolved_into_the_twin_are_metals() {
 /// untouched ([`measured_pair`]), a 4-sample `BGRA8Unorm_sRGB` attachment into `RGBA16Float`,
 /// in a shape not measured ([`unmeasured_shape`]), whatever the runtime refuses of it, named
 /// with what lies outside: a resolve texture of another size, level 1 of a texture whose level
-/// 1 is the attachment's size, a 2D array's slice 1, a memoryless texture, a Private texture
-/// over an IOSurface, a texture over a plane of a surface with planes, a view, a texture over a
-/// buffer, and one in a heap; an attachment memoryless, in a heap, or with store action
+/// 1 is the attachment's size, a 2D array's slice 1, a memoryless texture, a view, a texture over
+/// a buffer, and one in a heap; an attachment memoryless, in a heap, or with store action
 /// options; a depth attachment that resolves; another colour attachment that resolves into a
 /// texture of another format the runtime does not resolve into; and a rate map the runtime does
 /// not take as the identity, a mutable one not yet reset and one whose rates vary. So does one
 /// by a store action left `Unknown`, which the runtime refuses as the pass is made
 #[test]
 fn untouched_resolves_in_shapes_not_measured_die_named() {
-    use reims_vgpu_core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
-    use reims_vgpu_core::platform::rate_map::{
-        RateMapDescriptor as _, RateMapLayerDescriptor as _,
-    };
-    use reims_vgpu_core::platform::resource::Heap as _;
-    use reims_vgpu_core::platform::values::{
+    use crate::core::platform::rate_map::{RateMapDescriptor as _, RateMapLayerDescriptor as _};
+    use crate::core::platform::resource::Heap as _;
+    use crate::core::platform::values::{
         DepthAttachmentSet, HeapDesc, OptionSet, PassSet, RateMapDesc,
     };
 
@@ -6460,43 +5496,11 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
         d.new_texture(OnFault::Die, &desc).unwrap().unwrap()
     };
     let flat = desc(2, (16, 16), 1, 1, 0);
-    let surface = |planes: Option<Vec<SurfacePlaneSpec>>| {
-        let size = 16 * 16 * 8;
-        p.surfaces()
-            .create(&SurfaceSpec {
-                planes,
-                pixel_format: u32::from_be_bytes(*b"RGhA"),
-                alloc_size: 2 * size,
-                width: 16,
-                height: 16,
-                bytes_per_element: 8,
-                bytes_per_row: 16 * 8,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            })
-            .unwrap()
-    };
-    let plane = |base: u64| SurfacePlaneSpec {
-        base,
-        offset: base,
-        width: 16,
-        height: 16,
-        size: 16 * 16 * 8,
-        bytes_per_row: 16 * 8,
-        bytes_per_element: 8,
-        element_width: 1,
-        element_height: 1,
-        ..SurfacePlaneSpec::default()
-    };
-    let flat_surface = surface(None);
-    let planar = surface(Some(vec![plane(0), plane(16 * 16 * 8)]));
     let heap = d
         .new_heap(&HeapDesc {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         })
         .unwrap()
@@ -6505,7 +5509,7 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
     let bytes = d.new_buffer_of_length(OnFault::Die, 16 * 16 * 8, 0);
     let bytes = bytes.unwrap().unwrap();
     let own = made(2, (16, 16), 1, 1, 0);
-    let resolves: [(&str, VulkanTexture, (u64, u64)); 10] = [
+    let resolves: [(&str, VulkanTexture, (u64, u64)); 8] = [
         (
             "the resolve texture is 32 by 32, the attachment 16 by 16",
             made(2, (32, 32), 1, 1, 0),
@@ -6524,24 +5528,6 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
         (
             "the resolve texture is a texture of its own of storage mode Memoryless",
             made(2, (16, 16), 1, 1, MEMORYLESS),
-            (0, 0),
-        ),
-        (
-            "the resolve texture is a texture over an IOSurface of storage mode Private",
-            d.new_texture_on_surface(
-                &desc(2, (16, 16), 1, 1, PRIVATE_OPTIONS),
-                Some(&flat_surface),
-                0,
-            )
-            .unwrap()
-            .unwrap(),
-            (0, 0),
-        ),
-        (
-            "the resolve texture is a texture over a plane of an IOSurface with planes",
-            d.new_texture_on_surface(&flat, Some(&planar), 0)
-                .unwrap()
-                .unwrap(),
             (0, 0),
         ),
         (
@@ -6733,7 +5719,7 @@ fn untouched_resolves_in_shapes_not_measured_die_named() {
 /// refuses.)
 #[test]
 fn late_setters_of_a_dropped_resolve_are_the_descriptors() {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
 
     /// `MTLPixelFormatBGRA8Unorm_sRGB`; `MTLStoreActionUnknown`.
     const BGRA8_SRGB: u64 = 81;
@@ -6862,7 +5848,7 @@ fn late_setters_of_a_dropped_resolve_are_the_descriptors() {
 /// late `Store`
 #[test]
 fn late_resolves_beside_a_dropped_one_follow_late_store_actions() {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
 
     /// `MTLPixelFormatBGRA8Unorm_sRGB`; `MTLStoreActionUnknown`.
     const BGRA8_SRGB: u64 = 81;
@@ -7007,88 +5993,49 @@ fn resolves_into_twins_are_the_runtimes() {
     }
 }
 
-/// Measures what [`mode_2_multisampled_half_float_attachments_resolve_as_metals`] checks at
-/// 2 and 4 samples at 8, where Metal's device supports the count (the M3 Max's does not):
-/// this platform's states of that count die as they are made, which the probe sets aside
-/// ([`crate::gpu::serialized::RESOLVE_PROBED`]). A count it passes at is measured. One line,
-/// what Metal's device supports and whether it passed.
+/// A render state whose half-float colour attachment of two samples, or of four, stores what
+/// the fragment function writes as written resolves as Metal's, byte for byte
+/// ([`resolves_as_metals`])
 #[test]
-#[ignore = "a measurement, with the GPU free"]
-fn metal_resolves_mode_2_at_other_sample_counts_here() {
-    use reims_vgpu_core::platform::caps::SAMPLE_COUNTS;
-
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let caps = md.caps();
-    for samples in [8] {
-        let at = SAMPLE_COUNTS.iter().position(|&n| n == samples).unwrap();
-        if caps.sample_counts[at] != Ok(true) {
-            println!("{samples} samples: Metal's device does not support them");
-            continue;
-        }
-        let probed = u32::try_from(samples).unwrap();
-        crate::gpu::serialized::RESOLVE_PROBED.store(probed, std::sync::atomic::Ordering::Relaxed);
-        resolves_as_metals(samples);
-        println!("{samples} samples: resolved as Metal's");
-    }
+fn multisampled_half_float_attachments_resolve_as_metals() {
+    resolves_as_metals(2);
+    resolves_as_metals(4);
 }
 
-/// Checks that a render state of `textureWriteRoundingMode` 2 whose half-float colour
-/// attachment of `samples` samples stores what the fragment function writes as written
-/// resolves as Metal's, byte for byte, and so does one of mode 0 of it, over the sweeps
-/// through unorm values, past 1 by float steps and past the largest half: `R16Float`,
-/// `RG16Float` and `RGBA16Float`, fully covered and a quarter pixel in, resolved by the
-/// drawing pass, and a quarter pixel in by a later pass that loads the samples and draws
-/// nothing ([`resolved`]). Metal's are measured first, and so are its facts the runtime's
-/// rounding relies on: at mode 2, fully covered, each sample rounds as a write of one sample
-/// does (the [`swept`] draw), and the later pass resolves as the drawing one, so the resolve
-/// does not take the state's mode; the mode changes what it resolves.
+/// Checks that a render state whose half-float colour attachment of `samples` samples stores
+/// what the fragment function writes as written resolves as Metal's, byte for byte, over the
+/// sweeps through unorm values, past 1 by float steps and past the largest half: `R16Float`,
+/// `RG16Float` and `RGBA16Float`, fully covered and a quarter pixel in, resolved by the drawing
+/// pass, and a quarter pixel in by a later pass that loads the samples and draws nothing
+/// ([`resolved`]), Metal's measured first.
 fn resolves_as_metals(samples: u64) {
-    use crate::gpu::serialized::NEAREST_EVEN;
-
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let modes = [0, NEAREST_EVEN];
     // Fully covered, a quarter pixel in, and a quarter pixel in resolved apart.
     let hows = [(0.0, false), (0.25, false), (0.25, true)];
     let mut cases = Vec::new();
     for kind in [0, 1, 3] {
         for format in [(25, 2), (65, 4), (115, 8)] {
-            let theirs = modes
-                .map(|mode| hows.map(|how| resolved(&mp, &md, (mode, samples), format, kind, how)));
-            let one = swept(&mp, &md, (false, NEAREST_EVEN), format, kind, PLAIN);
-            let [m0, m2] = &theirs;
-            let case = format!("{samples} samples {format:?} sweep {kind}");
-            assert!(m2[0] == one, "Metal {case}: rounded as one sample");
-            assert!(m2[1] == m2[2], "Metal {case}: resolved apart");
-            assert!(m2[1] != m0[1], "Metal {case}: as at mode 0");
-            cases.push((kind, format, theirs));
+            cases.push((kind, format));
         }
     }
+    let key = |format, kind, how| format!("{samples} samples {format:?} sweep {kind} {how:?}");
+    // Metal's first, before this platform makes anything in the process.
     let (p, d) = (platform(), dev());
-    for (kind, format, theirs) in cases {
-        for (&mode, theirs) in modes.iter().zip(&theirs) {
-            for (&how, theirs) in hows.iter().zip(theirs) {
-                let ours = resolved(&p, &d, (mode, samples), format, kind, how);
-                assert!(
-                    ours == *theirs,
-                    "{samples} samples {format:?} sweep {kind} mode {mode} {how:?}"
-                );
-            }
+    for (kind, format) in cases {
+        for how in hows {
+            let ours = resolved(&p, &d, samples, format, kind, how);
+            let key = key(format, kind, how);
+            assert!(crate::metal_matches_bytes!(key, &ours), "{key}");
         }
     }
 }
 
 /// A guest's state of the fixture `vertex` and `vertex_ids`' `plain_fragment` for a BGRA8
 /// target, of the input primitive topology `class` (2 lines, 3 triangles), which Metal asks of a
-/// vertex function that writes a layer or viewport index, decoded from a blob as core decodes
-/// one.
+/// vertex function that writes a layer or viewport index.
 fn routed_state<P: Platform>(d: &P::Device, vertex: &str, class: u8) -> P::RenderPipeline {
-    let class = format!("0b 04 {class:02x}000000");
-    blob_state::<P>(d, (vertex, "vertex_ids:plain_fragment"), &[&class])
+    value_state::<P>(d, (vertex, "vertex_ids:plain_fragment"), |v| {
+        v.input_primitive_topology = u64::from(class);
+    })
 }
 
 /// The pixels of both slices of a 16 by 16 BGRA8 2D array of 2, cleared to black, after
@@ -7103,8 +6050,8 @@ fn routed_pass<P: Platform>(
     (indices, mode): (&[u32], u64),
     draw: RenderCmd<'_, P>,
 ) -> Vec<[u8; 4]> {
-    use reims_vgpu_core::platform::types::MtlViewport;
-    use reims_vgpu_core::platform::values::PassSet;
+    use crate::core::platform::types::MtlViewport;
+    use crate::core::platform::values::PassSet;
 
     let state = routed_state::<P>(d, vertex, class);
     let (pos, _) = flat_vertices::<P>(d, 16);
@@ -7209,8 +6156,6 @@ fn routed_pass<P: Platform>(
 #[test]
 fn the_last_vertex_routes_layers_and_viewports_as_metals() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     /// The draw of `kind`: 0 a list of 6 vertices, 1 a strip of 6, 2 a list over [`LIST`]'s
     /// first 6 indices, 3 a strip over [`STRIP_OF_SIX`], 4 a strip of 6 from indirect
     /// arguments, 5 a line strip of 6, over `bytes`, the indices or arguments.
@@ -7273,16 +6218,10 @@ fn the_last_vertex_routes_layers_and_viewports_as_metals() {
                     };
                     let lit = ours.iter().filter(|px| **px != [0, 0, 0, 0xff]).count();
                     assert!(lit > 0, "{vertex} {indices:?} {mode} {kind}");
-                    if let Some((mp, md)) = &metal
-                        && (kind < 5 || mode == 0 || native)
-                    {
-                        let theirs_bytes = bytes::<MetalPlatform>(md, kind);
-                        let theirs =
-                            routed_pass(mp, md, (vertex, class), shape, draw(kind, &theirs_bytes));
-                        assert!(
-                            ours == theirs,
-                            "{vertex} {indices:?} at mode {mode}, draw {kind}"
-                        );
+                    let key = format!("{vertex} {indices:?} at mode {mode}, draw {kind}");
+                    let compared = kind < 5 || mode == 0 || native;
+                    if compared {
+                        assert!(crate::metal_matches_raw!(key, ours), "{key}");
                     }
                 }
             }
@@ -7299,8 +6238,6 @@ fn the_last_vertex_routes_layers_and_viewports_as_metals() {
 #[test]
 fn indexed_strips_restart_at_the_set_index_as_metals_do() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let odd = u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7]);
     let even = u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7, 8]);
     let wide = u32s(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
@@ -7328,12 +6265,9 @@ fn indexed_strips_restart_at_the_set_index_as_metals_do() {
                 } else if k == 3 {
                     assert_ne!(ours, unset, "{case}");
                 }
-                if let Some((mp, md)) = &metal {
-                    for indirectly in [false, true] {
-                        let restart = Some((enabled, k));
-                        let theirs = restart_draw(mp, md, drawn, restart, (indirectly, offset));
-                        assert_eq!(ours, theirs, "{case}, Metal's indirect {indirectly}");
-                    }
+                for indirectly in [false, true] {
+                    let key = format!("{case}, Metal's indirect {indirectly}");
+                    crate::metal_check_raw!(key, ours);
                 }
             }
         }
@@ -7346,16 +6280,12 @@ fn indexed_strips_restart_at_the_set_index_as_metals_do() {
 #[test]
 fn a_long_restarted_strip_draws_within_the_index_pool_as_metals() {
     let (p, d) = (platform(), dev());
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     for (index_type, indices) in long_restarted_strips() {
         let drawn = (STRIP, index_type, &indices[..]);
         let restart = Some((true, 3));
         let ours = restart_draw(&p, &d, drawn, restart, (true, 0));
-        let theirs = restart_draw(&mp, &md, drawn, restart, (true, 0));
-        assert_eq!(ours, theirs, "{index_type}");
+        let key = format!("{index_type}");
+        crate::metal_check_raw!(key, ours);
     }
 }
 
@@ -7365,8 +6295,6 @@ fn a_long_restarted_strip_draws_within_the_index_pool_as_metals() {
 #[test]
 fn private_types_draw_after_a_restart_set_as_metals_do() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     /// The pixels of ten vertices of `primitive_type`, after a setter of `k` where one is.
     fn drawn<P: Platform>(
         p: &P,
@@ -7397,10 +6325,8 @@ fn private_types_draw_after_a_restart_set_as_metals_do() {
             if primitive_type < 8 {
                 assert_eq!(ours, unset, "type {primitive_type} at {k}");
             }
-            if let Some((mp, md)) = &metal {
-                let theirs = drawn(mp, md, primitive_type, Some(k));
-                assert_eq!(ours, theirs, "type {primitive_type} at {k}");
-            }
+            let key = format!("type {primitive_type} at {k}");
+            crate::metal_check_raw!(key, ours);
         }
     }
 }
@@ -7424,14 +6350,14 @@ fn executed_strip(
     (index_type, indices): (u64, &[u8]),
     (enabled, index): (bool, u64),
 ) -> Vec<[u8; 4]> {
+    use crate::core::platform::icb::{
+        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
+    };
+    use crate::core::platform::values::IcbDesc;
     use metal2vulkan::metal::PixelFormat;
     use metal2vulkan::pipeline::{
         ColorAttachmentDescriptor, RenderPipelineDescriptor, StageSource,
     };
-    use reims_vgpu_core::platform::icb::{
-        IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-    };
-    use reims_vgpu_core::platform::values::IcbDesc;
 
     let function = |name: &str| {
         let path = crate::gpu::device::tests::fixture_shaders().join(format!("{name}.metallib"));
@@ -7524,8 +6450,6 @@ fn executed_strip(
 #[test]
 fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let k = 3;
     for (index_type, indices) in [
         (U16, u16s(&[0, 1, 2, 3, 0xffff, 4, 5, 6, 7])),
@@ -7540,11 +6464,12 @@ fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
         }
         let restarted = restart_strip(&p, &d, strip, Some((true, k)));
         assert_ne!(restarted, direct, "{index_type}");
-        if let Some((mp, md)) = &metal {
-            assert_eq!(restart_strip(mp, md, strip, None), direct, "{index_type}");
-            let theirs = restart_strip(mp, md, strip, Some((true, k)));
-            assert_eq!(theirs, restarted, "{index_type}");
-        }
+        let keys = [
+            format!("{index_type} direct"),
+            format!("{index_type} restarted"),
+        ];
+        crate::metal_check_raw!(keys[0], direct);
+        crate::metal_check_raw!(keys[1], restarted);
     }
 }
 
@@ -7554,7 +6479,7 @@ fn an_execution_draws_its_strips_after_a_restart_set_as_metals_does() {
 /// (`render_draw_icb`)
 #[test]
 fn empty_executions_run_nothing_under_any_pipeline_state() {
-    use reims_vgpu_core::platform::values::IcbDesc;
+    use crate::core::platform::values::IcbDesc;
 
     fn pixels<P: Platform>(p: &P, d: &P::Device, inherit: bool) -> Vec<[u8; 4]> {
         let state = fixture_state::<P>(d, FLAT.0, FLAT.1);
@@ -7588,21 +6513,12 @@ fn empty_executions_run_nothing_under_any_pipeline_state() {
         )
     }
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     for inherit in [true, false] {
         assert_eq!(
             pixels(&p, &d, inherit),
             vec![[0, 0, 0, 0xff]; 256],
             "{inherit}"
         );
-        if let Some((mp, md)) = &metal {
-            assert_eq!(
-                pixels(mp, md, inherit),
-                vec![[0, 0, 0, 0xff]; 256],
-                "{inherit}"
-            );
-        }
     }
 }
 
@@ -7612,8 +6528,8 @@ fn empty_executions_run_nothing_under_any_pipeline_state() {
 /// core makes one, the buffer's bytes at `0x100`, slice 1's being at `0x80`
 #[test]
 fn a_pass_past_its_attachments_slices_dies_where_metal_writes_past_the_texture() {
-    use reims_vgpu_core::platform::values::PassSet;
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::platform::values::PassSet;
+    use crate::core::raise::death::DeathKind;
 
     /// The pass on `d`, and the ranges of the 16 KiB buffer under the texture that its
     /// commit changed from `0x55`.
@@ -7660,25 +6576,6 @@ fn a_pass_past_its_attachments_slices_dies_where_metal_writes_past_the_texture()
         (site.kind, site.file),
         (DeathKind::Abort, "renderCommandEncoderWithDescriptor:")
     );
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (descriptor, backing, _t) = pass(&mp, &md);
-    let q = md.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let e = cb
-        .render_encoder(OnFault::Die, &descriptor)
-        .unwrap()
-        .unwrap();
-    e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    // SAFETY: the Shared buffer's bytes, read after the pass completed.
-    let bytes = unsafe { std::slice::from_raw_parts(backing.contents().as_ptr::<u8>(), 0x4000) };
-    let changed: Vec<usize> = (0..0x4000).filter(|&i| bytes[i] != 0x55).collect();
-    let expected: Vec<usize> = (0x80..0xc0).chain(0x100..0x140).collect();
-    assert_eq!(changed, expected);
 }
 
 /// The resolve texture's texels after a pass of a 4-sample colour and depth attachment, each
@@ -7734,7 +6631,7 @@ fn unknown_stores_over_resolves<P: Platform>(p: &P, d: &P::Device) -> Vec<u8> {
         },
     )
     .unwrap();
-    pass.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+    pass.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
         texture: Some(Some(&depth)),
         resolve_texture: Some(Some(&depth_resolve)),
         load_action: Some(CLEAR),
@@ -7777,10 +6674,6 @@ fn unknown_stores_over_resolves_resolve_nothing() {
     let before: Vec<u8> = (0..64u8).map(|i| i.wrapping_mul(37) | 1).collect();
     let (p, d) = (platform(), dev());
     assert_eq!(unknown_stores_over_resolves(&p, &d), before);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(unknown_stores_over_resolves(&mp, &md), before);
-    }
 }
 
 /// The bytes of a 16 by 16 resolve texture of `format` (`bytes` a texel), a depth or the stencil
@@ -7795,7 +6688,7 @@ fn unused_resolve<P: Platform>(
     store: u64,
     memoryless: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
     let resolve = d
         .new_texture(
             OnFault::Die,
@@ -7885,8 +6778,6 @@ const STENCIL8: u64 = 253;
 #[test]
 fn unused_depth_and_stencil_resolves_leave_their_textures() {
     let (p, d) = (platform(), dev());
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
     let depth: Vec<u8> = (0..256).flat_map(|_| 0.75f32.to_ne_bytes()).collect();
     let stencil = vec![0x5a; 256];
     for (format, kept) in [((DEPTH32F, 4), &depth), ((STENCIL8, 1), &stencil)] {
@@ -7894,13 +6785,6 @@ fn unused_depth_and_stencil_resolves_leave_their_textures() {
             let case = format!("{format:?} store {store} memoryless {memoryless}");
             let ours = unused_resolve(&p, &d, format, store, memoryless);
             assert_eq!(&ours, kept, "{case}");
-            if let Some((mp, md)) = &metal {
-                assert_eq!(
-                    unused_resolve(mp, md, format, store, memoryless),
-                    ours,
-                    "{case}"
-                );
-            }
         }
     }
 }
@@ -7919,8 +6803,6 @@ fn unused_depth_and_stencil_resolves_leave_their_textures() {
 fn render_pass_values_metal_refuses_die_at_the_encoder() {
     let p = platform();
     let d = dev();
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let md = MetalPlatform::system_default_device();
     // Each case's load action, store action and store action options.
     fn set_of<P: Platform>(
         (load_action, store_action, store_action_options): (Option<u64>, Option<u64>, Option<u64>),
@@ -7948,14 +6830,6 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
             set.store_action.unwrap_or(STORE),
         );
         assert_eq!(read, expected);
-        if let Some(md) = &md {
-            let (_dst, theirs) = pass_of(&mp, md, (4, 4));
-            theirs
-                .set_color_attachment(OnFault::Die, 0, &set_of::<MetalPlatform>(case))
-                .unwrap();
-            let state = theirs.color_attachment_state(0).unwrap();
-            assert_eq!((state.load_action, state.store_action), read, "Metal");
-        }
         let q = d.new_command_queue().unwrap();
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
         *crate::answer::LAST_LINE.lock() = None;
@@ -7964,7 +6838,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
         assert_eq!(
             (site.kind, site.file),
             (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
+                crate::core::raise::death::DeathKind::Abort,
                 "renderCommandEncoderWithDescriptor:"
             ),
             "{line}"
@@ -7988,7 +6862,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
     // action of 9, a depth resolve filter of 9 and a stencil resolve filter of 2 or 9
     // ("resolveFilter is not a valid MTLMultisampleDepthResolveFilter.", and
     // "MTLMultisampleStencilResolveFilter."). A depth resolve filter of 2 makes the encoder.
-    use reims_vgpu_core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
+    use crate::core::platform::values::{DepthAttachmentSet, StencilAttachmentSet};
     let q = d.new_command_queue().unwrap();
     let encoder = |pass: &VulkanRenderPassDescriptor| {
         let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -8026,7 +6900,7 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
         assert_eq!(
             (site.kind, site.file),
             (
-                reims_vgpu_core::raise::death::DeathKind::Abort,
+                crate::core::raise::death::DeathKind::Abort,
                 "renderCommandEncoderWithDescriptor:"
             ),
             "{line}"
@@ -8042,7 +6916,6 @@ fn render_pass_values_metal_refuses_die_at_the_encoder() {
 /// The display's functions cannot write an integer target: no pipeline, as on Metal
 #[test]
 fn an_integer_target_has_no_display_pipeline() {
-    let p = platform();
     let d = dev();
     let cache = DisplayPipelineCache::<VulkanPlatform>::new(d.clone_ref()).unwrap();
     let key = PipelineKey {
@@ -8050,18 +6923,13 @@ fn an_integer_target_has_no_display_pipeline() {
         gamma: false,
     };
     assert!(cache.pipeline_for(key).is_none());
-    drop(p);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let cache = DisplayPipelineCache::<MetalPlatform>::new(md).unwrap();
-        assert!(cache.pipeline_for(key).is_none());
-    }
 }
 
 /// The display's pipeline answers Metal's values for a plain state
 #[test]
 fn a_display_pipeline_answers_metals_values() {
     fn values<P: Platform>(d: &P::Device) -> (bool, u64, u64, bool, u64) {
-        use reims_vgpu_core::platform::resource::RenderPipeline as _;
+        use crate::core::platform::resource::RenderPipeline as _;
         let cache = DisplayPipelineCache::<P>::new(d.clone_ref()).unwrap();
         let state = cache
             .pipeline_for(PipelineKey {
@@ -8078,26 +6946,24 @@ fn a_display_pipeline_answers_metals_values() {
         )
     }
     let vulkan = values::<VulkanPlatform>(&dev());
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(values::<MetalPlatform>(&md), vulkan);
-    }
+    crate::metal_check!("values", vulkan);
 }
 
 /// A pass over a rasterization rate map of no layers made from an immutable descriptor that
 /// only loads or clears its target and stores it stores what Metal's does, in a process that has
 /// released no map of layers and after one was made, drawn with and released, which makes
-/// Metal's draws in such a pass draw (its fresh side first). Over a mutable map reset to no
+/// Metal's draws in such a pass draw. Over a mutable map reset to no
 /// layers both store the same, each pass ending with a draw of no vertices
-/// (`crate::gpu::rate_map::no_draw`, the Metal platform's `gpu::rate_map`). A draw in such a pass,
+/// (`crate::gpu::rate_map::no_draw`). A draw in such a pass,
 /// of a public or a private type, and one of primitive type 9 that fails the command buffer,
 /// dies at its selector, naming the map, and a tile dispatch there dies by its own line
 #[test]
 fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::raise::death::DeathKind;
 
     /// `MTLLoadActionLoad`.
     const LOAD: u64 = 1;
@@ -8147,7 +7013,7 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
     /// it once its command buffer completed: on Metal, a map of no layers made after it draws,
     /// which a pass that only loads or clears and stores must not change.
     fn draw_and_release<P: Platform>(p: &P, d: &P::Device) {
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        let _pool = crate::core::rt::Pool::here();
         let map = d.new_rate_map(&one_layer(p, None)).unwrap().unwrap();
         let (_dst, pass) = pass(p, d, &map, false);
         let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
@@ -8308,30 +7174,22 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
             assert!(line.contains(named), "{line}");
         }
     }
-    let metal = MetalPlatform::system_default_device()
-        .map(|md| (MetalPlatform::new(Box::new(NoLauncher)), md));
-    if let Some((mp, md)) = &metal {
-        let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
-        for ((shape, o), t) in shapes.iter().zip(&ours).zip(&theirs) {
-            assert!(o == t, "reset, load {shape:?}");
-        }
+    for (shape, o) in shapes.iter().zip(&ours) {
+        let key = format!("reset, load {shape:?}");
+        assert!(crate::metal_matches_raw!(key, o), "{key}");
     }
     // After a map of one layer was drawn with and released, each platform's own.
     draw_and_release(&p, &d);
     let ours = shapes.map(|(reset, load)| stored(&p, &d, reset, load));
-    if let Some((mp, md)) = &metal {
-        draw_and_release(mp, md);
-        let theirs = shapes.map(|(reset, load)| stored(mp, md, reset, load));
-        for ((shape, o), t) in shapes.iter().zip(&ours).zip(&theirs) {
-            assert!(o == t, "after a released map, reset, load {shape:?}");
-        }
+    for (shape, o) in shapes.iter().zip(&ours) {
+        let key = format!("after a released map, reset, load {shape:?}");
+        assert!(crate::metal_matches_raw!(key, o), "{key}");
     }
 }
 
 /// A pass of no draw call over a rasterization rate map made of a `Mutable` descriptor, whose
-/// `mutability` answers 1, runs and stores its clear, as the Metal platform's does, each ending
-/// with a draw of no vertices (`crate::gpu::rate_map::no_draw`, the Metal platform's
-/// `gpu::rate_map`), without which the runtime fails its command buffer as a GPU hang, as
+/// `mutability` answers 1, runs and stores its clear, as Metal's does, each ending with a draw of
+/// no vertices (`crate::gpu::rate_map::no_draw`), without which the runtime fails its command buffer as a GPU hang, as
 /// Metal's GPU does: its state set or not, over a map of one layer not yet reset, reset to the
 /// identity, reset to half its rate on each axis, and over one made of no layers, in a pass of
 /// one BGRA8 target and, with no state set (the fixtures' state is of one sample, which neither
@@ -8339,10 +7197,10 @@ fn a_drawless_pass_over_a_map_of_no_layers_is_metals() {
 /// command buffer of its own queue, before any command buffer drew over a mutable map
 #[test]
 fn drawless_passes_over_mutable_maps_store_as_metals() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::platform::values::{PassSet, RateMapDesc};
 
     const SIDE: u64 = 64;
     /// `MTLMutabilityMutable`.
@@ -8505,17 +7363,6 @@ fn drawless_passes_over_mutable_maps_store_as_metals() {
     for (run, answer) in runs.iter().zip(&ours) {
         assert_eq!(answer, &(MUTABLE, 4, None, clear.clone()), "{run:?}");
     }
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    for (&(case, multisample), answer) in runs.iter().zip(&ours) {
-        let theirs = drawless(&mp, &md, case, multisample);
-        assert!(
-            &theirs == answer,
-            "Metal: {case:?}, multisample {multisample}"
-        );
-    }
 }
 
 /// A pass that draws over a mutable rasterization rate map draws as Metal's GPU reads the map
@@ -8531,12 +7378,12 @@ fn drawless_passes_over_mutable_maps_store_as_metals() {
 /// reset to 48
 #[test]
 fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
-    use reims_vgpu_core::raise::death::DeathSite;
+    use crate::core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::raise::death::DeathSite;
 
     const SIDE: u64 = 16;
     const HALF: u64 = SIDE / 2;
@@ -8688,15 +7535,6 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
     for (case, side) in cases {
         assert!(drawn(&p, &d, case) == Ok(shaded(case.1, side)), "{case:?}");
     }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        for (case, side) in cases {
-            assert!(
-                drawn(&mp, &md, case) == Ok(shaded(case.1, side)),
-                "{case:?}"
-            );
-        }
-    }
 }
 
 /// A reset of a mutable rasterization rate map whose rates vary to one of another screen size,
@@ -8704,10 +7542,10 @@ fn a_pass_over_a_mutable_map_draws_by_the_map_as_reset_before_it_runs() {
 /// Metal's GPU draws then ([`crate::gpu::rate_map`])
 #[test]
 fn a_reset_of_a_varying_map_to_another_screen_dies_while_its_pass_may_run() {
-    use reims_vgpu_core::platform::rate_map::{
+    use crate::core::platform::rate_map::{
         RateMap as _, RateMapDescriptor as _, RateMapLayerDescriptor as _,
     };
-    use reims_vgpu_core::platform::values::{PassSet, RateMapDesc};
+    use crate::core::platform::values::{PassSet, RateMapDesc};
 
     /// An immutable descriptor of a `side` by `side` screen of one layer of one sample of 0.5
     /// on each axis.
@@ -8784,274 +7622,21 @@ fn the_tile_size_is_metals() {
     }
     let vulkan = tile(&platform(), &dev());
     assert_eq!(vulkan, (32, 32));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(tile(&mp, &md), vulkan);
-    }
 }
 
-/// The tests' tile functions over a colour attachment's imageblock (`tile_edges.metal`).
-const TILE_EDGES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/tile_edges.metallib"));
-
-/// The side of [`tile_edges_pass`]'s tiles.
-const EDGE_TILE: u64 = 16;
-
-/// The cells of [`tile_edges_pass`]'s tiles, one across and two down: cell `(x, y)` is
-/// element `16 y + x` of `tile_edges.metal`'s buffers.
-const EDGE_CELLS: u64 = EDGE_TILE * 2 * EDGE_TILE;
-
-/// The width and height of [`tile_edges_pass`]'s attachment.
-const EDGE_EXTENT: (u64, u64) = (10, 20);
-
-/// The `RGBA8Unorm` codes of [`tile_edges_pass`]'s attachment's texel `(x, y)` before the
-/// pass: red, green, blue and alpha.
-fn edge_texel(x: u64, y: u64) -> [u8; 4] {
-    let code = |v: u64| u8::try_from(v).unwrap();
-    [code(16 * x + 1), code(8 * y + 2), 200, 255]
-}
-
-/// The `RGBA8Unorm` codes [`tile_edges_pass`]'s writes put in cell `i`.
-fn edge_written(i: u64) -> [u8; 4] {
-    [3 * i, 5 * i + 7, i / 2, 255 - i % 256].map(|v| v.to_le_bytes()[0])
-}
-
-/// The codes `(0.25, 0.5, 0.75, 1)` takes in `RGBA8Unorm`, [`tile_edges_pass`]'s clear colour.
-const EDGE_CLEARED: [u8; 4] = [64, 128, 191, 255];
-
-/// What a pass on `p`'s device `d` over an `RGBA8Unorm` attachment of [`EDGE_EXTENT`] in
-/// tiles of [`EDGE_TILE`] leaves: one tile across and two down, so the cells past the
-/// attachment's right edge, and the second tile's past its bottom edge, are cells of no
-/// pixel. The attachment holds [`edge_texel`]s, and the pass loads it (`load` 1) or clears it
-/// (2) to `(0.25, 0.5, 0.75, 1)`, stores it, and dispatches `tile_edges_read`, then
-/// `tile_edges_write` of [`edge_written`], then `tile_edges_read` again, a thread a cell, each
-/// state the suite's tile blob makes: what the two reads wrote, a cell's four floats after
-/// another, and the attachment's bytes once stored.
-fn tile_edges_pass<P: Platform>(p: &P, d: &P::Device, load: u64) -> [Vec<u8>; 3] {
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::values::PassSet;
-    use reims_vgpu_core::rt::Hold;
-    let (w, h) = EDGE_EXTENT;
-    let library = d.new_library(TILE_EDGES).unwrap().unwrap().unwrap();
-    let state = |name: &str| {
-        let f = library.new_function(OnFault::Die, name).unwrap().unwrap();
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 0x31).then(|| f.clone_ref()));
-        let blob = crate::gpu::serialized::tests::pipeline_blob("tile", 0, 0, 0x31);
-        let desc = d
-            .deserialize_tile_render_pipeline_descriptor(Hold::NONE, &blob, 0x100, &mut resolve)
-            .unwrap()
-            .unwrap();
-        let made = d.new_tile_render_pipeline_state(Some(&desc), 0).unwrap();
-        made.unwrap().unwrap()
-    };
-    let (read, write) = (state("tile_edges_read"), state("tile_edges_write"));
-    let texels: Vec<u8> = (0..h)
-        .flat_map(|y| (0..w).flat_map(move |x| edge_texel(x, y)))
-        .collect();
-    let target = texture(p, d, RGBA8, TARGET | READ, (w, h), Some((&texels, w * 4)));
-    let pass = p.render_pass_descriptor();
-    pass.set_color_attachment(
-        OnFault::Die,
-        0,
-        &ColorAttachmentSet {
-            texture: Some(Some(&target)),
-            load_action: Some(load),
-            store_action: Some(STORE),
-            clear_color: Some(ClearColor {
-                red: 0.25,
-                green: 0.5,
-                blue: 0.75,
-                alpha: 1.0,
-            }),
-            ..ColorAttachmentSet::default()
-        },
-    )
-    .unwrap();
-    pass.set_pass(&PassSet {
-        tile_width: Some(EDGE_TILE),
-        tile_height: Some(EDGE_TILE),
-        ..PassSet::default()
-    });
-    let cell_bytes = EDGE_CELLS * 16;
-    let values: Vec<u8> = (0..EDGE_CELLS)
-        .flat_map(|i| edge_written(i).map(|code| f32::from(code) / 255.0))
-        .flat_map(f32::to_le_bytes)
-        .collect();
-    let written = buffer::<P>(d, cell_bytes, 0, &values);
-    let unwritten = vec![0xab; usize::try_from(cell_bytes).unwrap()];
-    let reads = [0, 1].map(|_| buffer::<P>(d, cell_bytes, 0, &unwritten));
-    let stored = buffer::<P>(d, w * h * 4, 0, &[]);
-    let q = d.new_command_queue().unwrap();
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-    for (state, buffer) in [(&read, &reads[0]), (&write, &written), (&read, &reads[1])] {
-        for cmd in [
-            RenderCmd::SetRenderPipelineState {
-                pipeline_state: Some(state),
-            },
-            RenderCmd::SetTileBuffers {
-                buffers: &[Some(buffer)],
-                offsets: &[0],
-                range: NsRange::new(0, 1),
-            },
-            RenderCmd::DispatchThreadsPerTile {
-                threads_per_tile: MtlSize::new(EDGE_TILE, EDGE_TILE, 1),
-            },
-        ] {
-            e.encode(OnFault::Die, cmd).unwrap();
-        }
-    }
-    e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
-    let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-    for cmd in [
-        BlitCmd::CopyTextureToBuffer {
-            source_texture: &target,
-            source_slice: 0,
-            source_level: 0,
-            source_origin: MtlOrigin::new(0, 0, 0),
-            source_size: MtlSize::new(w, h, 1),
-            destination_buffer: &stored,
-            destination_offset: 0,
-            destination_bytes_per_row: w * 4,
-            destination_bytes_per_image: w * h * 4,
-        },
-        BlitCmd::EndEncoding,
-    ] {
-        blit.encode(OnFault::Die, cmd).unwrap();
-    }
-    cb.commit(OnFault::Die).unwrap();
-    cb.wait_until_completed(OnFault::Die).unwrap();
-    assert!(cb.error().is_none(), "{:?}", cb.error());
-    let bytes = |b: &P::Buffer, n: u64| {
-        let n = usize::try_from(n).unwrap();
-        // SAFETY: a Shared buffer of at least `n` bytes, read after its work completed.
-        unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), n) }.to_vec()
-    };
-    [
-        bytes(&reads[0], cell_bytes),
-        bytes(&reads[1], cell_bytes),
-        bytes(&stored, w * h * 4),
-    ]
-}
-
-/// A tile dispatch's cells past its pass's attachment, in the partial tiles at its right and
-/// bottom edges, hold Metal's values when the pass begins, and a tile function's writes there
-/// are what the pass's next dispatch reads: [`tile_edges_pass`], loaded and cleared, reads
-/// and stores what Metal's does, byte for byte. Metal's own answers here are the runtime's
-/// measured rule, checked too: past a loaded attachment the texel nearest each cell, clamped to
-/// its edge, past a cleared one the clear colour, and after the writes every cell's written
-/// value, the attachment storing those inside it
-#[test]
-fn tile_dispatch_cells_past_the_attachment_are_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let (w, h) = EDGE_EXTENT;
-    let floats = |codes: [u8; 4]| codes.map(|c| (f32::from(c) / 255.0).to_bits());
-    let mut differ = Vec::new();
-    for load in [1, CLEAR] {
-        let theirs = tile_edges_pass(&mp, &md, load);
-        let ours = catch_death(|| tile_edges_pass(&p, &d, load)).unwrap_or_else(|site| {
-            let line = crate::answer::LAST_LINE.lock().clone();
-            panic!(
-                "load {load}: died at {} ({:?}): {line:?}",
-                site.file, site.kind
-            )
-        });
-        let cells = |bytes: &[u8]| -> Vec<[u32; 4]> {
-            (bytes.as_chunks::<16>().0.iter())
-                .map(|c| {
-                    std::array::from_fn(|k| u32::from_le_bytes(c[4 * k..][..4].try_into().unwrap()))
-                })
-                .collect()
-        };
-        let (first, after) = (cells(&theirs[0]), cells(&theirs[1]));
-        for i in 0..EDGE_CELLS {
-            let (x, y) = (i % EDGE_TILE, i / EDGE_TILE);
-            let at = usize::try_from(i).unwrap();
-            if x >= w || y >= h {
-                let want = match load {
-                    CLEAR => EDGE_CLEARED,
-                    _ => edge_texel(x.min(w - 1), y.min(h - 1)),
-                };
-                if first[at] != floats(want) {
-                    differ.push(format!(
-                        "load {load}: Metal's cell ({x}, {y}) began {:08x?}, not {want:?}",
-                        first[at]
-                    ));
-                }
-            }
-            if after[at] != floats(edge_written(i)) {
-                differ.push(format!(
-                    "load {load}: Metal's cell ({x}, {y}) read {:08x?} after the writes",
-                    after[at]
-                ));
-            }
-        }
-        for (k, what) in ["the first read", "the read after the writes"]
-            .into_iter()
-            .enumerate()
-        {
-            let (o, m) = (cells(&ours[k]), cells(&theirs[k]));
-            let wrong: Vec<_> = (0..EDGE_CELLS)
-                .zip(o.iter().zip(&m))
-                .filter(|(_, (a, b))| a != b)
-                .collect();
-            if let Some(&(i, (a, b))) = wrong.first() {
-                differ.push(format!(
-                    "load {load}, {what}: {} cells differ, the first ({}, {}): ours {a:08x?}, \
-                     Metal {b:08x?}",
-                    wrong.len(),
-                    i % EDGE_TILE,
-                    i / EDGE_TILE
-                ));
-            }
-        }
-        let texels = |bytes: &[u8]| bytes.as_chunks::<4>().0.to_vec();
-        let (o, m) = (texels(&ours[2]), texels(&theirs[2]));
-        for (i, (a, b)) in (0..w * h).zip(o.iter().zip(&m)) {
-            let (x, y) = (i % w, i / w);
-            if *b != edge_written(y * EDGE_TILE + x) {
-                differ.push(format!("load {load}: Metal stored {b:?} at ({x}, {y})"));
-            }
-            if a != b {
-                differ.push(format!(
-                    "load {load}: ours stored {a:?} at ({x}, {y}), Metal {b:?}"
-                ));
-            }
-        }
-    }
-    assert!(differ.is_empty(), "{differ:#?}");
-}
-
-/// A guest's render state on `d` of `vertex` and `value_fragment` of `simd_stages.metal`, made
-/// by `newRenderPipelineStateWithDescriptor:options:reflection:error:` of a descriptor decoded
-/// as core decodes one.
+/// A guest's render state on `d` of `vertex` and `value_fragment` of `simd_stages.metal` into
+/// an `RGBA8Unorm` colour 0, made from the whole render value.
 fn simd_state<P: Platform>(
     d: &P::Device,
     vertex: &str,
-) -> RaiseResult<Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText>> {
-    use crate::gpu::serialized::tests::pipeline_blob;
-    use reims_vgpu_core::rt::Hold;
+) -> Result<Option<P::RenderPipeline>, crate::core::platform::types::NsErrorText> {
     let v = fixture::<P>(d, &format!("simd_stages:{vertex}"));
     let f = fixture::<P>(d, "simd_stages:value_fragment");
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(match r {
-            0x21 => Some(v.clone_ref()),
-            0x22 => Some(f.clone_ref()),
-            _ => None,
-        })
-    };
-    let desc = d
-        .deserialize_render_pipeline_descriptor(
-            Hold::NONE,
-            &pipeline_blob("basic", 0x21, 0x22, 0),
-            &mut resolve,
-        )
-        .unwrap()
-        .unwrap();
-    d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
+    d.new_render_pipeline_state_full(&crate::gpu::device::tests::render_value::<P>(
+        (&v, &f),
+        1,
+        &[&[(1, 70)]],
+    ))
 }
 
 /// The pixels `vertex` and `value_fragment` of `simd_stages.metal` draw over [`pass_pixels`]'
@@ -9087,30 +7672,25 @@ fn simd_vertex_pixels<P: Platform>(p: &P, d: &P::Device, vertex: &str) -> Vec<[u
 #[test]
 fn simd_operations_in_a_vertex_function_draw_as_metals() {
     let (p, d) = (platform(), dev());
-    let md = MetalPlatform::system_default_device();
     for (vertex, red) in [
         ("plain_vertex", 6),
         ("sum_vertex", 36),
         ("fill_vertex", 0xfe),
     ] {
         let made = simd_state::<VulkanPlatform>(&d, vertex);
-        assert!(matches!(made, Ok(Ok(Some(_)))), "{vertex}: {made:?}");
+        assert!(matches!(made, Ok(Some(_))), "{vertex}: {made:?}");
         let ours = simd_vertex_pixels(&p, &d, vertex);
         assert!(
             ours.iter().all(|&px| px == [0, 0, red, 255]),
             "{vertex}: {ours:?}"
         );
-        if let Some(md) = &md {
-            let mp = MetalPlatform::new(Box::new(NoLauncher));
-            assert_eq!(ours, simd_vertex_pixels(&mp, md, vertex), "{vertex}");
-        }
     }
 }
 
 /// The words `simd_kernel` of `simd_stages.metal` writes on `d`, two a thread, over 64 threads
 /// in one threadgroup: each thread's `simd_sum` and explicit-width fill.
 fn simd_kernel_words<P: Platform>(d: &P::Device) -> Vec<[u32; 2]> {
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
     let f = fixture::<P>(d, "simd_stages:simd_kernel");
     let state = d
         .new_compute_pipeline_state_for_function(Some(&f))
@@ -9187,16 +7767,10 @@ fn simd_operations_in_kernels_and_fragments_run_as_metals() {
     );
     let pixels = ["sum_fragment", "fill_fragment"].map(|f| simd_fragment_pixels(&p, &d, f));
     assert!(pixels[0].iter().all(|px| px[3] == 255), "{:?}", pixels[0]);
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(words, simd_kernel_words::<MetalPlatform>(&md));
-        for (fragment, ours) in ["sum_fragment", "fill_fragment"].into_iter().zip(&pixels) {
-            assert_eq!(
-                ours,
-                &simd_fragment_pixels(&mp, &md, fragment),
-                "{fragment}"
-            );
-        }
+    let fragments = ["sum_fragment", "fill_fragment"];
+    crate::metal_check_raw!("the kernel's words", words);
+    for (fragment, ours) in fragments.into_iter().zip(&pixels) {
+        crate::metal_check_raw!(fragment, ours);
     }
 }
 
@@ -9233,11 +7807,10 @@ pub(crate) fn memoryless_fetched<P: Platform>(
     d: &P::Device,
     tiles_written: bool,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
 
-    use crate::gpu::serialized::tests::rounded_render_of;
+    use crate::gpu::device::tests::render_value;
 
     /// `MTLLoadActionDontCare` and `MTLStoreActionDontCare`.
     const DONT_CARE: u64 = 0;
@@ -9247,21 +7820,9 @@ pub(crate) fn memoryless_fetched<P: Platform>(
     let library = d.new_library(ROUNDING).unwrap().unwrap().unwrap();
     let function = |name| library.new_function(OnFault::Die, name).unwrap().unwrap();
     let functions = [function("sweep_vertex"), function("fetch_seen_fragment")];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        let at = usize::try_from(r - 1).unwrap();
-        Ok(Some(functions[at].clone_ref()))
-    };
     let colours: [&[(u8, u32)]; 2] = [&[(0, 0), (1, 70)], &[(0, 1), (1, 70)]];
-    let blob = rounded_render_of(&["02 04 02000000"], &colours, 0);
-    let desc = d
-        .deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve)
-        .unwrap()
-        .unwrap();
-    let state = d
-        .new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-        .unwrap()
-        .unwrap()
-        .unwrap();
+    let desc = render_value::<P>((&functions[0], &functions[1]), 1, &colours);
+    let state = d.new_render_pipeline_state_full(&desc).unwrap().unwrap();
     let texture = |usage, options| {
         let desc = p.texture_descriptor(&TextureDesc {
             pixel_format: 70,
@@ -9351,65 +7912,8 @@ pub(crate) fn memoryless_fetched<P: Platform>(
     unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), n) }.to_vec()
 }
 
-/// How the first command buffer of [`after_a_failure`] fails.
-#[derive(Debug, Clone, Copy)]
-enum Failure {
-    /// Its render pass, over a 4 by 4 target, draws primitive type 9: Metal's GPU hangs at it.
-    Hang,
-    /// Its blit encoder is made under these protection options.
-    Protected(u64),
-}
-
-/// A command buffer of `q` that fails as `failure` says, on `p`'s device `d`, under `state`,
-/// keeping its target in `keep`.
-fn failing<P: Platform>(
-    p: &P,
-    d: &P::Device,
-    q: &P::CommandQueue,
-    (failure, state): (Failure, &P::RenderPipeline),
-    keep: &mut Vec<P::Texture>,
-) -> P::CommandBuffer {
-    let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
-    match failure {
-        Failure::Hang => {
-            let (dst, pass) = pass_of(p, d, (4, 4));
-            let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
-            for cmd in [
-                RenderCmd::SetRenderPipelineState {
-                    pipeline_state: Some(state),
-                },
-                RenderCmd::DrawPrimitives {
-                    primitive_type: 9,
-                    vertex_start: 0,
-                    vertex_count: 3,
-                },
-                RenderCmd::EndEncoding,
-            ] {
-                e.encode(OnFault::Die, cmd).unwrap();
-            }
-            keep.push(dst);
-        }
-        Failure::Protected(options) => {
-            cb.set_protection_options(OnFault::Die, options).unwrap();
-            let b = buffer::<P>(d, 16, 0, &[0; 16]);
-            let blit = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
-            for cmd in [
-                BlitCmd::FillBuffer {
-                    buffer: &b,
-                    range: NsRange::new(0, 16),
-                    value: 0x77,
-                },
-                BlitCmd::EndEncoding,
-            ] {
-                blit.encode(OnFault::Die, cmd).unwrap();
-            }
-        }
-    }
-    cb
-}
-
 /// What [`filling`]'s completed handlers saw: each one's fill value, status and error code.
-type Seen = Arc<reims_vgpu_core::sync::Mutex<Vec<(u8, u64, Option<i64>)>>>;
+type Seen = Arc<crate::core::sync::Mutex<Vec<(u8, u64, Option<i64>)>>>;
 
 /// A command buffer of `q` that waits for `wait` where given, fills a new 16-byte buffer of `d`'s
 /// with `value` in a blit, then signals a new event of its own to 1, with a completed handler that
@@ -9420,7 +7924,7 @@ fn filling<P: Platform>(
     (value, wait): (u8, Option<&P::SharedEvent>),
     seen: &Seen,
 ) -> (P::CommandBuffer, P::Buffer, P::SharedEvent) {
-    use reims_vgpu_core::platform::event::EventRef;
+    use crate::core::platform::event::EventRef;
     let b = buffer::<P>(d, 16, 0, &[0; 16]);
     let event = d.new_shared_event().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
@@ -9451,153 +7955,6 @@ fn filling<P: Platform>(
     (cb, b, event)
 }
 
-/// When [`after_a_failure`] commits its later command buffers on the hang's queue.
-#[derive(Debug, Clone, Copy)]
-enum Later {
-    /// At once after the hang's commit.
-    AtOnce,
-    /// Once the hang's `waitUntilScheduled` returned.
-    Scheduled,
-    /// This long after the hang's commit.
-    After(std::time::Duration),
-}
-
-/// What two command buffers committed on the queue of one whose draw of primitive type 9 hangs
-/// Metal's GPU, `later`, show on `p`'s device `d`, and one committed on another queue then: each
-/// one's status and error, the hang's status as it was committed, the first byte of the buffer
-/// its blit fills, whether its event signal fired, and what its completed handler saw, in the
-/// order the handlers ran. One line each.
-fn after_a_failure<P: Platform>(
-    p: &P,
-    d: &P::Device,
-    failure: Failure,
-    later: Later,
-) -> Vec<String> {
-    use reims_vgpu_core::platform::event::SharedEvent as _;
-    use reims_vgpu_core::platform::os::Clock as _;
-    let state = fixture_state::<P>(d, "vert:tri_vert", "frag:tri_frag");
-    let (q1, q2) = (
-        d.new_command_queue().unwrap(),
-        d.new_command_queue().unwrap(),
-    );
-    let seen = Seen::default();
-    let mut keep = Vec::new();
-    let hang = failing(p, d, &q1, (failure, &state), &mut keep);
-    let clock = crate::os::OsClock::new();
-    let since = |start| clock.now_mono().saturating_duration_since(start);
-    let started = clock.now_mono();
-    hang.commit(OnFault::Die).unwrap();
-    match later {
-        Later::AtOnce => {}
-        Later::Scheduled => hang.wait_until_scheduled().unwrap(),
-        Later::After(wait) => std::thread::sleep(wait),
-    }
-    let mut cases = Vec::new();
-    let mut commit = |what, q, value| {
-        let (cb, b, event) = filling::<P>(d, q, (value, None), &seen);
-        let status = hang.status().0;
-        cb.commit(OnFault::Die).unwrap();
-        cases.push((what, cb, b, event, value, since(started), status));
-    };
-    commit("same queue", &q1, 0x11u8);
-    commit("same queue, a second", &q1, 0x12);
-    commit("other queue", &q2, 0x21);
-    hang.wait_until_completed(OnFault::Die).unwrap();
-    let hung = since(started);
-    let mut lines = vec![format!(
-        "{failure:?} {later:?}: status {} error {:?} after {hung:?}",
-        hang.status().0,
-        hang.error().map(|e| e.code)
-    )];
-    for (what, cb, b, event, value, at, status) in &cases {
-        cb.wait_until_completed(OnFault::Die).unwrap();
-        // SAFETY: a Shared buffer's bytes, read after its command buffer completed.
-        let first = unsafe { *b.contents().as_ptr::<u8>() };
-        let signalled = event.wait_until_signaled_value(1, 1);
-        lines.push(format!(
-            "  {what} (committed at {at:?}, the hang's status {status}): status {} error {:?} \
-             filled {first:#x} of {value:#x} signal {signalled}",
-            cb.status().0,
-            cb.error().map(|e| (e.code, e.description)),
-        ));
-    }
-    lines.push(format!("  handlers saw {:x?}", seen.lock()));
-    lines
-}
-
-/// [`after_a_failure`]'s lines without what depends on time: when each command buffer was
-/// committed, the hang's status then, and how long the hang took.
-fn untimed(lines: Vec<String>) -> Vec<String> {
-    lines
-        .into_iter()
-        .map(|line| {
-            let line = match line.split_once(" after ") {
-                Some((head, _)) if !line.starts_with(' ') => head.to_owned(),
-                _ => line,
-            };
-            match (line.find(" (committed at "), line.find("): ")) {
-                (Some(from), Some(to)) => format!("{}{}", &line[..from], &line[to + 1..]),
-                _ => line,
-            }
-        })
-        .collect()
-}
-
-/// Command buffers committed on the queue of one whose draw of primitive type 9 hangs the GPU, at
-/// once after its commit, run nothing and complete without an error, their event signals
-/// firing, and one of another queue runs, here as on Metal ([`after_a_failure`]): each one's
-/// status, error, bytes and signal, and what the completed handlers saw, in their order. Under
-/// macOS 27.0.1 Metal runs one committed once the hang's command buffer reads scheduled, about
-/// 1 ms on, in most runs and nothing of it in others (`metal_runs_after_a_type_9_hang_here`),
-/// so only the commit at once is compared
-#[test]
-#[ignore = "a comparison, with the GPU free: it hangs Metal's GPU"]
-fn later_command_buffers_of_a_hang_run_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    for _ in 0..3 {
-        let theirs = untimed(after_a_failure(&mp, &md, Failure::Hang, Later::AtOnce));
-        let ours = untimed(after_a_failure(&p, &d, Failure::Hang, Later::AtOnce));
-        assert_eq!(ours, theirs);
-    }
-}
-
-/// Measures what Metal's GPU does to command buffers committed on the queue of one whose draw of
-/// primitive type 9 hangs it, and on another, at once, once it is scheduled and after 1 to 8 ms
-/// ([`after_a_failure`]). One line a command buffer.
-#[test]
-#[ignore = "a measurement, with the GPU free: it hangs Metal's GPU"]
-fn metal_runs_after_a_type_9_hang_here() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let ms = std::time::Duration::from_millis;
-    for later in [
-        Later::AtOnce,
-        Later::Scheduled,
-        Later::After(ms(1)),
-        Later::After(ms(2)),
-        Later::After(ms(4)),
-        Later::After(ms(8)),
-        Later::AtOnce,
-    ] {
-        for line in after_a_failure(&mp, &md, Failure::Hang, later) {
-            println!("{line}");
-        }
-    }
-    for options in [2, 0x10] {
-        for later in [Later::AtOnce, Later::Scheduled] {
-            for line in after_a_failure(&mp, &md, Failure::Protected(options), later) {
-                println!("{line}");
-            }
-        }
-    }
-}
-
 /// A draw of primitive type 9 of [`type_9_pass`]'s: directly, `(count, instances)`; over
 /// `(count, instances)` of the 16-bit indices 0, 1 and 2; from indirect arguments of 3 vertices
 /// and an instance; or from indirect arguments of those indices and an instance.
@@ -9621,7 +7978,7 @@ fn type_9_pass<P: Platform>(p: &P, d: &P::Device, draw: Nine) -> String {
 /// first byte of each buffer, whether the signal fired, and the target's first texel, black
 /// where the pass's clear ran, read through a new queue.
 fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: Nine) -> String {
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
     let (dst, pass) = pass_of(p, d, (4, 4));
     let region = MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(4, 4, 1));
     dst.replace_region(region, 0, 0, HostRange::of_slice(&[0x11; 64]), 16, 0)
@@ -9738,9 +8095,8 @@ fn type_9_pass_on<P: Platform>(p: &P, d: &P::Device, q: &P::CommandQueue, draw: 
 /// indirect arguments, over indices or not, fails the command buffer as a victim of the GPU's
 /// recovery (`MTLCommandBufferErrorInternal`, code 1), each as a hang fails it: Metal's answer in
 /// a steady stream of work, which the runtime takes. There Metal's GPU races: in some runs the
-/// blit after the pass runs too ([`after_a_fault_runs`]), as where the GPU was idle for some
-/// seconds before (measured on the M3 Max, macOS 27.0.1, `type_9_draws_fail_as_metals`, which
-/// draws these after the hangs).
+/// blit after the pass runs too, as where the GPU was idle for some seconds before (measured on
+/// the M3 Max, macOS 27.0.1, drawing these after the hangs).
 const METALS_TYPE_9: [(Nine, &str); 11] = [
     (
         Nine::Direct(0, 1),
@@ -9788,21 +8144,11 @@ const METALS_TYPE_9: [(Nine, &str); 11] = [
     ),
 ];
 
-/// [`memoryless_slot_pass`]'s lines on Metal are [`METALS_MEMORYLESS_SLOT`]'s, and this
-/// platform's the same
+/// [`memoryless_slot_pass`]'s lines are Metal's, [`METALS_MEMORYLESS_SLOT`]
 #[test]
 fn memoryless_slots_fail_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     for (fragment, metals) in METALS_MEMORYLESS_SLOT {
-        assert_eq!(
-            memoryless_slot_pass(&mp, &md, fragment),
-            metals,
-            "{fragment}"
-        );
         assert_eq!(memoryless_slot_pass(&p, &d, fragment), metals, "{fragment}");
     }
 }
@@ -9819,44 +8165,6 @@ fn type_9_draws_fail_their_command_buffers_as_metals() {
     }
 }
 
-/// `line`, a line of [`METALS_TYPE_9`]'s of a draw over indices or from indirect arguments, as
-/// Metal's GPU answers it in the runs where it runs the blit after the faulted pass: the same
-/// but for that blit's buffer, filled. `None` for a direct draw's line, which has one answer.
-fn after_a_fault_runs(draw: Nine, line: &str) -> Option<String> {
-    match draw {
-        Nine::Direct(..) => None,
-        _ => Some(line.replace("after 0x0", "after 0x6b")),
-    }
-}
-
-/// [`type_9_pass`]'s lines on Metal are [`METALS_TYPE_9`]'s, or after a fault or a victim the
-/// same with the blit after the pass run ([`after_a_fault_runs`]), the other answer of Metal's
-/// race, and this platform's are [`METALS_TYPE_9`]'s, each of a new queue, three times over. Each
-/// fault's and victim's draw has Metal's answer of [`METALS_TYPE_9`] in some run
-#[test]
-#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
-fn type_9_draws_fail_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    let mut steady = vec![0; METALS_TYPE_9.len()];
-    for _ in 0..3 {
-        for (at, (draw, metals)) in METALS_TYPE_9.into_iter().enumerate() {
-            let theirs = type_9_pass(&mp, &md, draw);
-            let raced = after_a_fault_runs(draw, metals);
-            assert!(
-                theirs == metals || Some(&theirs) == raced.as_ref(),
-                "{draw:?}: {theirs}"
-            );
-            steady[at] += usize::from(theirs == metals);
-            assert_eq!(type_9_pass(&p, &d, draw), metals, "{draw:?}");
-        }
-    }
-    assert!(steady.iter().all(|&n| n > 0), "{steady:?}");
-}
-
 /// What a new queue of `p`'s device `d` shows once `draws`, command buffers of
 /// [`type_9_pass_on`]'s, were committed on it in turn, each once the one before completed: each
 /// one's status and error, then a command buffer's committed on it once the last completed,
@@ -9868,7 +8176,7 @@ fn type_9_draws_fail_as_metals() {
 /// some runs (the runtime's measurement, `command_buffer/revocation.rs`), where
 /// [`type_9_draws_fail_as_metals`] compares it on a GPU that ran just before.
 fn after_type_9s<P: Platform>(p: &P, d: &P::Device, draws: &[Nine]) -> Vec<String> {
-    use reims_vgpu_core::platform::event::SharedEvent as _;
+    use crate::core::platform::event::SharedEvent as _;
     let q = d.new_command_queue().unwrap();
     let mut lines: Vec<String> = (draws.iter())
         .map(|&draw| {
@@ -9944,23 +8252,6 @@ fn type_9_faults_revoke_queues_as_on_metal() {
     }
 }
 
-/// [`after_type_9s`]'s lines on Metal after each of [`REVOKING`]'s end in
-/// [`METALS_REVOKING`]'s, and this platform's are Metal's, each of new queues
-#[test]
-#[ignore = "a comparison, with the GPU free: it hangs and faults Metal's GPU"]
-fn type_9_faults_revoke_queues_as_metals() {
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
-    let (p, d) = (platform(), dev());
-    for (draws, metals) in REVOKING.into_iter().zip(METALS_REVOKING) {
-        let theirs = after_type_9s(&mp, &md, draws);
-        assert_eq!(theirs[draws.len()..], metals, "{draws:?}: {theirs:#?}");
-        assert_eq!(after_type_9s(&p, &d, draws), theirs, "{draws:?}");
-    }
-}
-
 /// A step of a visibility case's pass: `setVisibilityResultMode:offset:` of a mode at an offset,
 /// a draw of `render_depth`'s triangle over the whole target at a depth (0.25 passes the depth
 /// test of a pass with depth, 0.75 fails it), or a scissor rectangle over the target's left
@@ -9993,7 +8284,7 @@ fn visibility_results<P: Platform>(
     init: &[u64],
     passes: &[VisPass<'_>],
 ) -> Vec<u64> {
-    use reims_vgpu_core::platform::values::{DepthStencilDesc, PassSet};
+    use crate::core::platform::values::{DepthStencilDesc, PassSet};
 
     let words: Vec<u8> = init.iter().flat_map(|w| w.to_ne_bytes()).collect();
     let length = u64::try_from(words.len()).unwrap();
@@ -10011,15 +8302,12 @@ fn visibility_results<P: Platform>(
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let (mut kept_buffers, mut kept_textures) = (Vec::new(), Vec::new());
     for pass in passes {
-        let mut entries = Vec::new();
-        let count = format!("04 04 {:02x}000000", pass.samples);
-        if pass.samples > 1 {
-            entries.push(count.as_str());
-        }
-        if pass.depth {
-            entries.push("09 04 fc000000"); // Depth32Float
-        }
-        let state = blob_state::<P>(d, ("render_depth", "render_color"), &entries);
+        let state = value_state::<P>(d, ("render_depth", "render_color"), |v| {
+            v.raster_sample_count = pass.samples;
+            if pass.depth {
+                v.depth_pixel_format = 252; // Depth32Float
+            }
+        });
         let attachment = |format: u64| {
             let desc = p.texture_descriptor(&TextureDesc {
                 texture_type: if pass.samples > 1 { 4 } else { 2 },
@@ -10048,7 +8336,7 @@ fn visibility_results<P: Platform>(
         .unwrap();
         let depth = pass.depth.then(|| attachment(252));
         if let Some(depth) = &depth {
-            rp.set_depth_attachment(&reims_vgpu_core::platform::values::DepthAttachmentSet {
+            rp.set_depth_attachment(&crate::core::platform::values::DepthAttachmentSet {
                 texture: Some(Some(depth)),
                 load_action: Some(CLEAR),
                 store_action: Some(0),
@@ -10157,10 +8445,6 @@ type VisCase<'a> = (&'static str, Vec<VisPass<'a>>, [u64; 4], [u64; 4]);
 #[test]
 fn visibility_results_are_metals() {
     use Vis::{Draw, Mode, Scissor};
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (platform(), dev());
     let (all, quad) = (VIS_SIDE * VIS_SIDE, VIS_SIDE * VIS_SIDE * 4);
     let one = |steps| VisPass {
@@ -10264,17 +8548,13 @@ fn visibility_results_are_metals() {
     ];
     for (name, passes, init, want) in &cases {
         let ours = visibility_results(&p, &d, init, passes);
-        let theirs = visibility_results(&mp, &md, init, passes);
-        assert_eq!(theirs, want, "{name} on Metal");
-        assert_eq!(ours, theirs, "{name}");
+        assert_eq!(ours, want, "{name}");
     }
     let start = [100, 5, 7, 9];
     let accumulated = [VisPass {
         result_type: 1,
         ..one(accumulating)
     }];
-    let reset = [one(accumulating)];
     let ours = visibility_results(&p, &d, &start, &accumulated);
     assert_eq!(ours, [all, 1, 0, 0]);
-    assert_eq!(ours, visibility_results(&mp, &md, &start, &reset));
 }

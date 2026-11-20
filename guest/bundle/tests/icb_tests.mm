@@ -10,6 +10,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <map>
 #include <vector>
 
 #import "RgfxBuffer.h"
@@ -91,6 +92,19 @@ struct Fixture {
 		                                         serializer:&ser
 		                                        slotsRegion:&region];
 	}
+
+	// As makeSlots, the slots in a chunked pages block of `region`'s where it gives one.
+	RgfxIndirectCommandBuffer *makePagesSlots(MTLIndirectCommandBufferDescriptor *d,
+	                                          NSUInteger count, RgfxRegion &region)
+	{
+		return [RgfxIndirectCommandBuffer icbWithDescriptor:d
+		                                    maxCommandCount:count
+		                                            options:0
+		                                             device:nil
+		                                         serializer:&ser
+		                                        slotsRegion:&region
+		                                       slotsInPages:YES];
+	}
 };
 
 // A region whose blocks a stand-in kext places from the floor, its bytes 0xee until a block's
@@ -117,8 +131,29 @@ struct SlotRegion {
 		*offset = at;
 		return true;
 	}
+	// A chunked pages source (RgfxRegion::setChunkedPagesSource), as the kext's PagesChunked: its
+	// memory zero-filled, of the `length` asked, which must be whole 64 KiB chunks, and a block of
+	// 0x4000 bytes in the region; none where `refuseChunks`. The memory goes with the block.
+	std::map<uint64_t, std::vector<uint8_t>> chunks;
+	std::vector<uint64_t> asked;
+	bool refuseChunks = false;
+	void givePages() { region.setChunkedPagesSource(&SlotRegion::chunked, this); }
+	static bool chunked(void *c, uint64_t length, uint8_t **bytes, uint64_t *offset, uint64_t *size)
+	{
+		SlotRegion *r = static_cast<SlotRegion *>(c);
+		r->asked.push_back(length);
+		CHECK(length != 0 && length % 0x10000 == 0);
+		if (r->refuseChunks || !alloc(c, 0x4000, 0x4000, offset))
+			return false;
+		std::vector<uint8_t> &memory = r->chunks[*offset];
+		memory.assign(length, 0);
+		*bytes = memory.data();
+		*size = 0x4000;
+		return true;
+	}
 	static void release(void *c, uint64_t offset)
 	{
+		static_cast<SlotRegion *>(c)->chunks.erase(offset);
 		std::vector<uint64_t> &live = static_cast<SlotRegion *>(c)->live;
 		for (auto it = live.begin(); it != live.end(); ++it) {
 			if (*it == offset) {
@@ -221,6 +256,23 @@ std::vector<RgfxIcbSlotRun> nextSlots(TestRing &ring)
 	return runs;
 }
 
+// The next message on `ring`, which must be an ICB_SLOTS_IN_PAGES: its runs, in order.
+std::vector<RgfxIcbSlotPagesRun> nextPagesSlots(TestRing &ring)
+{
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes));
+	CHECK(h.type == RGFX_CMD_ICB_SLOTS_IN_PAGES && bytes.size() >= sizeof(RgfxIcbSlots));
+	RgfxIcbSlots head;
+	std::memcpy(&head, bytes.data(), sizeof(head));
+	CHECK(bytes.size() == sizeof(head) + head.run_count * sizeof(RgfxIcbSlotPagesRun));
+	std::vector<RgfxIcbSlotPagesRun> runs(head.run_count);
+	std::memcpy(runs.data(), bytes.data() + sizeof(head),
+	            runs.size() * sizeof(RgfxIcbSlotPagesRun));
+	CHECK(runs.empty() || head.obj_id == runs[0].icb_obj_id);
+	return runs;
+}
+
 // --- the create ------------------------------------------------------------------------
 
 // The create carries every field of the descriptor, and for the SPI members this Mac's fresh
@@ -285,6 +337,30 @@ void test_buffer_answers()
 	@autoreleasepool {
 		RgfxIndirectCommandBuffer *icb = fx.make(renderDescriptor(), 16);
 		CHECK(icb != nil && icb.size == 16 && icb.gpuResourceID._impl == 7);
+		// Metal's buffer SPI: the index, the handle and the identifier are gpuResourceID's value; no
+		// GPU address the guest sees.
+		for (NSString *member in @[ @"resourceIndex", @"gpuHandle", @"uniqueIdentifier" ])
+			CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(member)) == 7);
+		CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(@"gpuAddress")) == 0);
+		// No driver header of the buffer in the guest.
+		void *header = &fx;
+		uint64_t headerSize = 1;
+		((void (*)(id, SEL, void **, uint64_t *))objc_msgSend)(
+		    icb, NSSelectorFromString(@"getHeader:headerSize:"), &header, &headerSize);
+		CHECK(header == nullptr && headerSize == 0);
+		((void (*)(id, SEL, void **, uint64_t *))objc_msgSend)(
+		    icb, NSSelectorFromString(@"getHeader:headerSize:"), nullptr, nullptr);
+		// The resource SPI: an allocation of its own, aliasing nothing; complete, written and not
+		// purgeable; its options as asked.
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		CHECK(flag(icb, @"isComplete") && flag(icb, @"isWriteComplete") && !flag(icb, @"isPurgeable"));
+		CHECK(u64(icb, @"unfilteredResourceOptions") == 0);
+		((void (*)(id, SEL))objc_msgSend)(icb, NSSelectorFromString(@"waitUntilComplete"));
 		CHECK(icb.resourceOptions == 0x200 && icb.storageMode == MTLStorageModeShared &&
 		      icb.cpuCacheMode == MTLCPUCacheModeDefaultCache &&
 		      icb.hazardTrackingMode == MTLHazardTrackingModeTracked);
@@ -299,6 +375,9 @@ void test_buffer_answers()
 		                                          MTLResourceStorageModePrivate);
 		CHECK(priv.gpuResourceID._impl == 8 && priv.resourceOptions == 0x220 &&
 		      priv.storageMode == MTLStorageModePrivate && priv.allocatedSize == 65536);
+		CHECK(u64(icb, @"allocationID") != 0 && u64(icb, @"allocationID") != u64(priv, @"allocationID"));
+		CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(icb, NSSelectorFromString(@"doesAliasResource:"), priv));
+		CHECK(u64(priv, @"unfilteredResourceOptions") == MTLResourceStorageModePrivate);
 		CHECK(fx.make(renderDescriptor(), 4, MTLResourceHazardTrackingModeUntracked)
 		          .resourceOptions == 0x100);
 		CHECK(fx.make(renderDescriptor(), 4, MTLResourceCPUCacheModeWriteCombined)
@@ -351,6 +430,63 @@ void test_command_lookups()
 		CHECK([empty indirectRenderCommandAtIndex:0] == nil &&
 		      [empty indirectComputeCommandAtIndex:0] == nil);
 		CHECK(ringEmpty(fx.ring)); // a lookup sends nothing
+
+		// Metal's command SPI: what reads back what a command was given answers a fresh
+		// command's, logged; what Metal's base render command raises for raises; nothing is sent.
+		auto obj = [](id object, NSString *name) {
+			return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		auto at = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL, NSUInteger))objc_msgSend)(object, NSSelectorFromString(name), 0);
+		};
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		for (NSString *member in @[ @"drawArguments", @"drawIndexedArguments", @"drawPatchesArguments",
+		                            @"drawIndexedPatchesArguments", @"getTessellationFactorArguments" ])
+			CHECK(obj(a, member) == nil);
+		CHECK(u64(a, @"getCommandType") == 0 && u64(a, @"getOptimizedStatus") == 0 &&
+		      u64(a, @"getPipelineStateUniqueIdentifier") == 0 && !flag(a, @"hasBarrier"));
+		for (NSString *member in @[ @"getVertexBufferAtIndex:", @"getVertexBufferAddressAtIndex:",
+		                            @"getVertexAttributeStrideAtIndex:", @"getFragmentBufferAtIndex:",
+		                            @"getFragmentBufferAddressAtIndex:" ])
+			CHECK(at(a, member) == 0);
+		CHECK(RgfxUnsupportedWasLogged([RgfxIndirectRenderCommand class], NSSelectorFromString(@"getCommandType")));
+		auto raises = [](void (^body)(void)) {
+			@try {
+				body();
+			} @catch (NSException *e) {
+				return [e.reason containsString:@"unrecognized selector"];
+			}
+			return false;
+		};
+		CHECK(raises(^{
+			(void)u64(a, @"getCullMode");
+		}));
+		CHECK(raises(^{
+			(void)obj(a, @"getViewports");
+		}));
+		CHECK(raises(^{
+			(void)at(a, @"getMeshBufferAddressAtIndex:");
+		}));
+		CHECK(raises(^{
+			((void (*)(id, SEL, MTLScissorRect))objc_msgSend)(a, NSSelectorFromString(@"setScissorRect:"),
+			                                                  MTLScissorRect{0, 0, 1, 1});
+		}));
+		id<MTLIndirectComputeCommand> k = [compute indirectComputeCommandAtIndex:0];
+		for (NSString *member in @[ @"dispatchThreadgroupsArguments", @"dispatchThreadsArguments",
+		                            @"getImageBlockSize" ])
+			CHECK(obj(k, member) == nil);
+		CHECK(u64(k, @"getCommandType") == 0 && u64(k, @"getPipelineStateUniqueIdentifier") == 0 &&
+		      !flag(k, @"hasBarrier"));
+		for (NSString *member in @[ @"getKernelBufferAtIndex:", @"getKernelBufferAddressAtIndex:",
+		                            @"getKernelAttributeStrideAtIndex:", @"getThreadgroupMemoryLengthAtIndex:" ])
+			CHECK(at(k, member) == 0);
+		CHECK(RgfxUnsupportedWasLogged([RgfxIndirectComputeCommand class], NSSelectorFromString(@"getCommandType")));
+		CHECK(ringEmpty(fx.ring));
 	}
 	drainRing(fx.ring);
 }
@@ -973,6 +1109,123 @@ void test_which_buffers_take_slots()
 	CHECK(sr.live.empty());
 }
 
+// Where the device took ICB_SLOTS_IN_PAGES, a buffer's slots lie in a chunked pages block of the
+// kext's, of whole 64 KiB chunks, zeroed by the kext and not written over by the bundle, and no
+// block of the region: each encode is written there as in a region block, and the flush names the
+// written commands as runs of ICB_SLOTS_IN_PAGES, each naming the pages block and the first slot's
+// offset in its pages. A buffer of each kind of slot, together in one message; the buffer's
+// destroy posts its slots first, then the destroy, and its block and memory go back.
+void test_slots_in_pages_hold_the_encodes()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	sr.givePages();
+	RgfxObjId gone = 0;
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makePagesSlots(renderDescriptor(), 200, sr.region);
+		RgfxIndirectCommandBuffer *kernels = fx.makePagesSlots(computeDescriptor(), 4, sr.region);
+		CHECK(icb != nil && kernels != nil && sr.live.empty() && sr.chunks.empty());
+		RgfxBuffer *pso = buffer(0x70), *vb = buffer(0x71);
+		id<MTLIndirectRenderCommand> c = [icb indirectRenderCommandAtIndex:130];
+		CHECK(sr.chunks.size() == 1 && sr.live.size() == 1);
+		CHECK(sr.asked.size() == 1 && sr.asked[0] == 0x10000); // 200 slots of 176 bytes
+		const uint64_t block = sr.live[0];
+		std::vector<uint8_t> &pages = sr.chunks.at(block);
+		[c setRenderPipelineState:(id<MTLRenderPipelineState>)pso];
+		[c setVertexBuffer:vb offset:8 attributeStride:24 atIndex:0];
+		[c drawPrimitives:MTLPrimitiveTypeTriangle
+		      vertexStart:3
+		      vertexCount:5
+		    instanceCount:1
+		     baseInstance:0];
+		id<MTLIndirectComputeCommand> k = [kernels indirectComputeCommandAtIndex:1];
+		CHECK(sr.chunks.size() == 2 && sr.live.size() == 2);
+		const uint64_t kernelBlock = sr.live[1];
+		[k setComputePipelineState:(id<MTLComputePipelineState>)pso];
+		[k setKernelBuffer:vb offset:16 atIndex:1];
+		CHECK(ringEmpty(fx.ring));
+		RgfxIcbRenderSlot s;
+		std::memcpy(&s, pages.data() + 130 * kRenderSlot, sizeof(s));
+		CHECK(s.mask == (RGFX_ICB_SLOT_PIPELINE | RGFX_ICB_SLOT_ACTION | RGFX_ICB_SLOT_BUFFER_0) &&
+		      s.mask_b == 0 && s.pipeline == 0x70 && s.op == RGFX_ICB_OP_DRAW && s.strided == 1);
+		RgfxIcbSlotBuffer v0;
+		std::memcpy(&v0, pages.data() + 130 * kRenderSlot + sizeof(RgfxIcbRenderSlot), sizeof(v0));
+		CHECK(v0.obj_id == 0x71 && v0.offset == 8 && v0.stride == 24);
+		for (uint64_t i = 0; i < 130 * kRenderSlot; i++)
+			CHECK(pages[i] == 0);
+		RgfxIcbComputeSlot cs;
+		std::memcpy(&cs, sr.chunks.at(kernelBlock).data() + kComputeSlot, sizeof(cs));
+		CHECK(cs.mask == (RGFX_ICB_SLOT_PIPELINE | (RGFX_ICB_SLOT_BUFFER_0 << 1)) &&
+		      cs.pipeline == 0x70);
+		// The region's bytes are the stand-in kext's 0xee: no slot was written there.
+		for (uint64_t at = RGFX_ALLOCATIONS_OFFSET; at < sr.mem.size(); at++)
+			CHECK(sr.mem[at] == 0xee);
+
+		const RgfxIcbFlush flush = fx.ser.flushIcbWrites();
+		CHECK(flush.messages == 1);
+		std::vector<RgfxIcbSlotPagesRun> runs = nextPagesSlots(fx.ring);
+		CHECK(runs.size() == 2 && ringEmpty(fx.ring));
+		CHECK(runs[0].icb_obj_id == icb.rgfxObjId && runs[0].block_offset == block &&
+		      runs[0].block_size == 0x4000 && runs[0].first_command == 128 &&
+		      runs[0].command_count == 64 && runs[0].pages_offset == 128 * kRenderSlot &&
+		      runs[0].slot_bytes == kRenderSlot && runs[0].kind == RGFX_ICB_SLOTS_RENDER &&
+		      runs[0].bindings_a == 2 && runs[0].bindings_b == 1);
+		CHECK(runs[1].icb_obj_id == kernels.rgfxObjId && runs[1].block_offset == kernelBlock &&
+		      runs[1].first_command == 0 && runs[1].command_count == 4 &&
+		      runs[1].pages_offset == 0 && runs[1].slot_bytes == kComputeSlot &&
+		      runs[1].kind == RGFX_ICB_SLOTS_COMPUTE && runs[1].bindings_a == 2 &&
+		      runs[1].bindings_b == 31);
+		CHECK(fx.ser.flushIcbWrites().messages == 0 && ringEmpty(fx.ring));
+
+		// One goes: its slots first, then its destroy; its block and memory back.
+		[k setBarrier];
+		gone = kernels.rgfxObjId;
+		kernels = nil;
+	}
+	std::vector<RgfxIcbSlotPagesRun> runs = nextPagesSlots(fx.ring);
+	CHECK(runs.size() == 1 && runs[0].icb_obj_id == gone && runs[0].command_count == 4);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(fx.ring.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
+	drainRing(fx.ring);
+	CHECK(sr.chunks.empty() && sr.live.empty());
+}
+
+// A buffer whose slots go in pages takes a block of the region where the kext gives no chunked
+// pages block, or the region has no chunked pages source; and a buffer made without slots in
+// pages takes a block of the region where the source is there.
+void test_slots_in_pages_fall_back_to_the_region()
+{
+	Fixture fx;
+	SlotRegion sr(1 << 20);
+	@autoreleasepool {
+		RgfxIndirectCommandBuffer *icb = fx.makePagesSlots(renderDescriptor(), 8, sr.region);
+		[[icb indirectRenderCommandAtIndex:0] setBarrier];
+		CHECK(sr.live.size() == 1 && sr.chunks.empty() && sr.asked.empty());
+		fx.ser.flushIcbWrites();
+		CHECK(nextSlots(fx.ring).size() == 1 && ringEmpty(fx.ring));
+
+		sr.givePages();
+		sr.refuseChunks = true;
+		RgfxIndirectCommandBuffer *refused = fx.makePagesSlots(renderDescriptor(), 8, sr.region);
+		[[refused indirectRenderCommandAtIndex:0] setBarrier];
+		CHECK(sr.asked.size() == 1 && sr.chunks.empty());
+		fx.ser.flushIcbWrites();
+		std::vector<RgfxIcbSlotRun> runs = nextSlots(fx.ring);
+		CHECK(runs.size() == 1 && runs[0].region_offset == sr.live.back());
+
+		sr.refuseChunks = false;
+		RgfxIndirectCommandBuffer *region = fx.makeSlots(renderDescriptor(), 8, sr.region);
+		[[region indirectRenderCommandAtIndex:0] setBarrier];
+		CHECK(sr.asked.size() == 1 && sr.chunks.empty());
+		fx.ser.flushIcbWrites();
+		CHECK(nextSlots(fx.ring).size() == 1 && ringEmpty(fx.ring));
+		drainRing(fx.ring);
+	}
+	drainRing(fx.ring);
+	CHECK(sr.live.empty());
+}
+
 } // namespace
 
 void rgfxIcbTests()
@@ -992,4 +1245,6 @@ void rgfxIcbTests()
 	test_a_reset_in_a_slot();
 	test_slots_turn_to_records();
 	test_which_buffers_take_slots();
+	test_slots_in_pages_hold_the_encodes();
+	test_slots_in_pages_fall_back_to_the_region();
 }

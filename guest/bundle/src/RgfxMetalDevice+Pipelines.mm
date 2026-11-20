@@ -4,12 +4,15 @@
  */
 
 #import "RgfxMetalDevice+Pipelines.h"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBinaryArchive.h"
 #import "RgfxBlockCall.h"
 #import "RgfxComputePipelineState.h"
+#import "RgfxDynamicLibrary.h"
 #import "RgfxLibrary.h"
+#import "RgfxLibraryFile.h"
 #import "RgfxMetalError.h"
 #import "RgfxPipelineReflection.h"
 #import "RgfxRenderPipelineState.h"
@@ -17,6 +20,7 @@
 
 #include "RgfxAirArguments.hpp"
 #include "RgfxLibraryKey.hpp"
+#include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -65,19 +69,26 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 
 } // namespace
 
-// Every library-from-bytes entry point funnels through here. A .metallib (or a fat file's AIR
-// slice) is first looked up by its content key, which finds a library the device made for any
-// process with no bytes sent; otherwise the bytes go as one LIBRARY_CREATE (waiting for room
-// while the ring is momentarily full) or stream through region blocks, with the key, and the
-// device's answer is waited for, so a library it refuses is nil and an NSError here, as Metal's.
-// Bytes read from a file whose identity is `file` (null for none) take the key the process found
-// for that identity before, if any (rgfxLibraryKeyOfFile).
+// Every library-from-bytes entry point funnels through here. The bytes Metal's compiler answers for
+// OpenCL C source (and, on macOS 11, for Metal source), which are no .metallib, are taken as the
+// .metallib of their functions (RgfxMetallibOfClLibrary). A .metallib (or a fat file's AIR slice)
+// is first looked up by its content key, which finds a library the device made for any process
+// with no bytes sent, then, where it is small, by the key of its whole bytes; otherwise the bytes
+// go as one LIBRARY_CREATE (waiting for room while the ring is momentarily full) or stream through
+// region blocks, with the key, and the device's answer is waited for, so a library it refuses is
+// nil and an NSError here, as Metal's. Bytes read from a file whose identity is `file` (null for
+// none) take the keys the process found for that identity before, if any (rgfxLibraryKeyOfFile).
 - (nullable id<MTLLibrary>)rgfxLibraryWithBytes:(const void *)bytes
                                          length:(NSUInteger)length
                                            file:(const RgfxFileIdentity *)file
                                           error:(__autoreleasing NSError **)error
 {
 	selectAirSlice(bytes, length);
+	std::vector<uint8_t> clKernels;
+	if (RgfxMetallibOfClLibrary(static_cast<const uint8_t *>(bytes), length, clKernels)) {
+		bytes = clKernels.data();
+		length = clKernels.size();
+	}
 	RgfxSerializer *ser = [self serializer];
 	if (ser == nullptr) {
 		if (error)
@@ -90,12 +101,29 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	                                   : rgfxLibraryKey(p, length, key);
 	if (keyed) {
 		id<MTLLibrary> found = [RgfxLibrary libraryFoundWithKey:key
+		                                                 lookup:key
 		                                                  bytes:bytes
 		                                                 length:length
 		                                                 device:self
 		                                             serializer:ser];
 		if (found != nil)
 			return found;
+		// Not under its content key: a small library is asked for by the key of its whole bytes
+		// too, which the host keeps one under where it cannot vouch for the content key (Core
+		// Image's, made again in every process before; rgfxLibraryWholeKey).
+		uint8_t whole[32];
+		if (length <= kRgfxWholeKeyMost &&
+		    (file != nullptr ? rgfxLibraryWholeKeyOfFile(*file, p, length, whole)
+		                     : rgfxLibraryWholeKey(p, length, whole))) {
+			found = [RgfxLibrary libraryFoundWithKey:key
+			                                  lookup:whole
+			                                   bytes:bytes
+			                                  length:length
+			                                  device:self
+			                              serializer:ser];
+			if (found != nil)
+				return found;
+		}
 	}
 	// A small library travels inline in its create; a larger one streams through region
 	// blocks that its chunks name, so no library is bounded by the ring's or region's size.
@@ -182,7 +210,8 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 {
 	NSError *error = nil;
 	id<MTLLibrary> lib = [super newLibraryWithData:data error:&error];
-	if (lib == nil)
+	static char site;
+	if (lib == nil && rgfxLogFirst(&site, static_cast<uint64_t>(error.code)))
 		NSLog(@"RGFX: Metal's own library over %zu bytes: %@", dispatch_data_get_size(data),
 		      error.localizedDescription);
 	return lib;
@@ -359,23 +388,24 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	return [super newLibraryWithDAG:dag functions:shadows error:error];
 }
 
-// A file's library is keyed by the file's identity where it is the same before and after the
-// read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed again.
+// The library of the file at the URL's path, whatever its scheme, as Metal reads it, with Metal's
+// errors for a file it cannot read (RgfxLibraryFile.h): Espresso names its kernels' libraries by
+// URLs of no scheme. A file's library is keyed by the file's identity where it is the same before
+// and after the read (rgfxLibraryKeyOfFile), so a framework's library loaded again is not hashed
+// again.
+// A nil URL ends the process, as Metal's device does at its assertion (measured: macOS 26.7.1, the
+// AMD Radeon Pro 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike).
 - (id<MTLLibrary>)newLibraryWithURL:(NSURL *)url error:(__autoreleasing NSError **)error
 {
-	const char *path = url.isFileURL ? url.fileSystemRepresentation : nullptr;
+	if (url == nil)
+		RgfxMetalAssertionFailed("-[_MTLDevice newLibraryWithURL:error:]", @"url must not be nil.");
+	NSString *filePath = RgfxLibraryFilePath(url);
+	const char *path = filePath.fileSystemRepresentation;
 	RgfxFileIdentity before = {}, after = {};
 	const bool identified = fileIdentity(path, before);
-	NSError *readError = nil;
-	NSData *data = url ? [NSData dataWithContentsOfURL:url options:NSDataReadingMappedIfSafe
-	                                             error:&readError]
-	                   : nil;
-	if (data == nil) {
-		if (error)
-			*error = readError ?: RgfxMakeError(RgfxMetalErrorInvalidDescriptor,
-			                                    @"newLibraryWithURL: could not read URL");
+	NSData *data = RgfxLibraryFileData(filePath, error);
+	if (data == nil)
 		return nil;
-	}
 	const bool same = identified && fileIdentity(path, after) && after == before &&
 	                  after.size == data.length;
 	id<MTLLibrary> lib = [self rgfxLibraryWithBytes:data.bytes
@@ -391,13 +421,14 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
 	return lib;
 }
 
+// The library of the file at `filepath`, as newLibraryWithURL:error: reads it. A nil path ends the
+// process, as Metal's device does at its assertion (measured: macOS 26.7.1, the AMD Radeon Pro
+// 5300M and the Intel UHD 630, and macOS 27.0.1, the M3 Max, alike: "newLibraryWithFile: failed
+// assertion `filepath must not be nil.'").
 - (id<MTLLibrary>)newLibraryWithFile:(NSString *)filepath error:(__autoreleasing NSError **)error
 {
-	if (filepath == nil) {
-		if (error)
-			*error = RgfxMakeError(RgfxMetalErrorInvalidDescriptor, @"newLibraryWithFile: nil path");
-		return nil;
-	}
+	if (filepath == nil)
+		RgfxMetalAssertionFailed("newLibraryWithFile", @"filepath must not be nil.");
 	return [self newLibraryWithURL:[NSURL fileURLWithPath:filepath] error:error];
 }
 
@@ -554,6 +585,119 @@ bool fileIdentity(const char *path, RgfxFileIdentity &out)
                                            error:(__autoreleasing NSError **)error
 {
 	return [super newLibraryWithMPSGraphPackageURL:url name:name error:error];
+}
+
+// --- dynamic libraries -------------------------------------------------------
+
+// The x86 Macs' refusal of a library that is not of type dynamic (measured: the AMD Radeon Pro
+// 5300M and the Intel UHD Graphics 630, macOS 26.7.1, oracle_fnptr: newDynamicLibrary: of an
+// executable library and newDynamicLibraryWithURL: of its file alike).
+static NSError *rgfxNotDynamicError()
+{
+	return [NSError errorWithDomain:MTLBinaryArchiveDomain
+	                           code:5
+	                       userInfo:@{
+		                       NSLocalizedDescriptionKey :
+		                           @"Expected a library with type MTLLibraryTypeDynamic, found "
+		                           @"invalid type: null"
+	                       }];
+}
+
+// The dynamic library of `library`: nil and the x86 Macs' error for a library that is not one of
+// ours of type dynamic (nil among them, which no measurement covers), or nil and an error naming
+// the host's refusal of it (a library whose code reads a function constant, which Metal refuses
+// too; its words on an x86 Mac are not measured). Where the host makes no dynamic libraries, nil
+// and the unsupported error.
+- (id<MTLDynamicLibrary>)newDynamicLibrary:(id<MTLLibrary>)library error:(NSError **)error
+{
+	RgfxSerializer *ser = [self serializer];
+	if (ser == nullptr || !ser->carriesDynamicLibraries()) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
+		                          MTLDynamicLibraryErrorUnsupported);
+		return nil;
+	}
+	if (![(id)library isKindOfClass:[RgfxLibrary class]] ||
+	    library.type != MTLLibraryTypeDynamic) {
+		if (error)
+			*error = rgfxNotDynamicError();
+		return nil;
+	}
+	uint32_t status = kRgfxNoAnswer;
+	RgfxDynamicLibrary *made = [RgfxDynamicLibrary dynamicLibraryOfLibrary:(RgfxLibrary *)library
+	                                                                device:self
+	                                                            serializer:ser
+	                                                                status:&status];
+	if (made == nil && error) {
+		if (status == kRgfxNoAnswer)
+			*error = RgfxMakeError(RgfxMetalErrorRingFull,
+			                       @"dynamic library: the device ring stayed full");
+		else
+			*error = [NSError
+			    errorWithDomain:MTLDynamicLibraryDomain
+			               code:MTLDynamicLibraryErrorCompilationFailure
+			           userInfo:@{
+				           NSLocalizedDescriptionKey : [NSString
+				               stringWithFormat:@"the device refused the library as a dynamic "
+				                                @"library (status %u)",
+				                                status]
+			           }];
+	}
+	return made;
+}
+
+// The dynamic library in the file at `url`, read in this process as Metal reads it, with the
+// x86 Macs' answers (measured: the AMD Radeon Pro 5300M and the Intel UHD Graphics 630, macOS
+// 26.7.1, oracle_urls and oracle_fnptr): a nil URL is MTLBinaryArchiveDomain 1, "URL for dynamic
+// library is nil"; a file that cannot be read is NSData's error (NSCocoaErrorDomain 260 for a
+// missing file, 256 for a URL of no scheme or of another); bytes that are no .metallib are
+// MTLDynamicLibraryDomain 1, "MTLDynamicLibrary could not be loaded as its AIR slice is missing";
+// a .metallib not of type dynamic is newDynamicLibrary:'s error. Metal's universal file, which a
+// Mac's serializeToURL: writes, is read as no .metallib: its AIR slice is not looked for.
+- (id<MTLDynamicLibrary>)newDynamicLibraryWithURL:(NSURL *)url error:(NSError **)error
+{
+	RgfxSerializer *ser = [self serializer];
+	if (ser == nullptr || !ser->carriesDynamicLibraries()) {
+		RGFX_UNSUPPORTED_ERROR_IN(error, "dynamic libraries", MTLDynamicLibraryDomain,
+		                          MTLDynamicLibraryErrorUnsupported);
+		return nil;
+	}
+	if (url == nil) {
+		if (error)
+			*error = [NSError
+			    errorWithDomain:MTLBinaryArchiveDomain
+			               code:1
+			           userInfo:@{NSLocalizedDescriptionKey : @"URL for dynamic library is nil"}];
+		return nil;
+	}
+	NSData *data = [NSData dataWithContentsOfURL:url options:0 error:error];
+	if (data == nil)
+		return nil;
+	const uint8_t *bytes = static_cast<const uint8_t *>(data.bytes);
+	if (data.length < 0x58 || std::memcmp(bytes, "MTLB", 4) != 0) {
+		if (error)
+			*error = [NSError errorWithDomain:MTLDynamicLibraryDomain
+			                             code:MTLDynamicLibraryErrorInvalidFile
+			                         userInfo:@{
+				                         NSLocalizedDescriptionKey :
+				                             @"MTLDynamicLibrary could not be loaded as its AIR "
+				                             @"slice is missing"
+			                         }];
+		return nil;
+	}
+	if (bytes[0x0a] != 2) {
+		if (error)
+			*error = rgfxNotDynamicError();
+		return nil;
+	}
+	dispatch_data_t source = dispatch_data_create(data.bytes, data.length, nil, ^{
+		(void)data;
+	});
+	id<MTLLibrary> library = [self newLibraryWithData:source error:error];
+	if (library == nil)
+		return nil;
+	if ([(id)library isKindOfClass:[RgfxLibrary class]])
+		[(RgfxLibrary *)library rgfxSetMadeFromURL:url];
+	return [self newDynamicLibrary:library error:error];
 }
 
 // --- render pipelines --------------------------------------------------------

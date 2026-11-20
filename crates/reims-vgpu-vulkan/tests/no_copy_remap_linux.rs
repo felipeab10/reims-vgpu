@@ -11,14 +11,17 @@
 //! - **Their pointer** (`VK_EXT_external_memory_host`): the driver's. NVIDIA's import keeps the
 //!   pages it was made over: the GPU reads and fills the old pages, whether the range was ever
 //!   touched, and whether or not the GPU used the buffer before the remap (an RTX 5080 Laptop GPU,
-//!   NVIDIA 615.71.09, Linux 7.2, 2026-10-22). Where the runtime knows a driver's pointer imports
-//!   follow their address (`DriverFact::PointerImportsFollowTheirAddress`: ANV on i915, RADV,
-//!   lavapipe), the GPU reads the pages mapped there at each submission, which `HostMemory::new`'s
-//!   contract forbids changing under a live buffer, and the runtime's own tests check
-//!   (`tests::pointer_residency` there). And where the device refuses a file's pages by their
-//!   pointer, it imports by their pointer only pages with no file behind them (RADV: amdgpu's
-//!   userptr, of private anonymous pages), and a file's pages mapped under such an import fail
-//!   every later submission of the device: amdgpu gets the import's pages again at each
+//!   NVIDIA 615.71.09, Linux 7.2, 2026-10-22). What a pointer import reads after a remap under it
+//!   is otherwise unspecified (`VK_EXT_external_memory_host` leaves it to the driver). Where the
+//!   device releases a no-copy buffer's idle pointer import and imports the pages again at the
+//!   buffer's next use (`Device::releases_idle_pointer_imports`, which the runtime's check answers
+//!   once per driver, release and kernel, where a held import adds to every submission's cost:
+//!   RADV and ANV on i915), the GPU reads the pages mapped there at that use, which
+//!   `HostMemory::new`'s contract forbids changing under a live buffer, and the runtime's own
+//!   tests check (`tests::pointer_residency` there). And where the device refuses a file's pages
+//!   by their pointer, it imports by their pointer only pages with no file behind them (RADV:
+//!   amdgpu's userptr, of private anonymous pages), and a file's pages mapped under such an import
+//!   fail every later submission of the device: amdgpu gets the import's pages again at each
 //!   submission and refuses them, whatever the submission's commands use, and the runtime answers
 //!   `DeviceLost` (both RADV GPUs above). Neither case is measured ([`unmeasured`], said on
 //!   stderr): the first test maps nothing under such an import, and the second checks nothing
@@ -28,9 +31,8 @@
 //! so these measure the ground `crate::remap`'s docs give for pages the library does not unmap.
 //!
 //! A buffer made after such a remap, over exactly the bytes of a live one the GPU used, takes the
-//! new pages where the runtime was told of the remap: by the platform's VM
-//! (`VulkanPlatform::vm`), or by the host's blocks the platform wraps (`Platform::host_blocks`).
-//! Untold, it lies in the live one's import, over the old pages where that import keeps them.
+//! new pages where the runtime was told of the remap, by the platform's VM
+//! (`VulkanPlatform::vm`). Untold, it lies in the live one's import, over the old pages where that import keeps them.
 //!
 //! On Linux a view can be made only of pages with a file behind them (`os::linux::vm`), so every
 //! range remapped here comes from the platform's `allocate_aliasable`, and the remaps no one is
@@ -48,21 +50,19 @@
     unsafe_code
 )]
 
-use std::sync::{Arc, mpsc};
+use std::sync::mpsc;
 use std::time::Duration;
 
-use reims_vgpu_core::host::{HostBlocks, HostPtr, HostTask, PhysicalMemoryRange};
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder};
-use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-use reims_vgpu_core::platform::device::{GpuDevice, NoCopyDeallocator};
-use reims_vgpu_core::platform::os::vm::HostVm;
-use reims_vgpu_core::platform::resource::Buffer;
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::{HostRange, Platform};
-use reims_vgpu_core::raise::OnFault;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::launcher::{HostSide, ServiceLink, TaskLauncher};
 use reims_vgpu_vulkan::VulkanPlatform;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder};
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+use reims_vgpu_vulkan::core::platform::device::{GpuDevice, NoCopyDeallocator};
+use reims_vgpu_vulkan::core::platform::os::vm::HostVm;
+use reims_vgpu_vulkan::core::platform::resource::Buffer;
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::{HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::OnFault;
 use reims_vgpu_vulkan::os::OsVm;
 use reims_vgpu_vulkan::remap::VulkanVm;
 
@@ -71,15 +71,6 @@ type Device = <P as Platform>::Device;
 type BufferOf = <P as Platform>::Buffer;
 
 const LEN: u64 = 0x8000;
-
-/// A launcher no test launches through.
-struct NoLauncher;
-
-impl TaskLauncher<P> for NoLauncher {
-    fn launch(&self, _: &Arc<P>, _: Arc<dyn HostSide<P>>) -> Arc<dyn ServiceLink<P>> {
-        panic!("no task is launched in these tests")
-    }
-}
 
 /// A fresh range of `LEN` bytes a view can be made of, every one `byte`.
 fn region(byte: u8) -> HostPtr {
@@ -157,22 +148,24 @@ fn files_by_pointer(dev: &Device) -> bool {
     let (buffer, gone, path) = no_copy(dev, va);
     drop(buffer);
     released(&[gone]);
-    assert!(OsVm::new().deallocate(va, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     path == Some(Path::Pointer)
 }
 
 /// Why GPU work after a file's pages were mapped, untold, under an import of `path` is not
 /// measured on `dev` (module docs), or `None` where it is: always for dma-bufs; for a pointer,
-/// where the driver's pointer imports are known to follow their address, or the device refuses a
-/// file's pages by their pointer.
+/// where the device releases idle pointer imports and imports the pages again at the next use, or
+/// the device refuses a file's pages by their pointer. The check answers within milliseconds of
+/// the device's making, waited for here up to 10 s; unanswered, it reads as not releasing.
 fn unmeasured(dev: &Device, path: Path) -> Option<&'static str> {
-    let follows = (dev.raw.properties().driver_facts)
-        .contains(&metal2vulkan_runtime::DriverFact::PointerImportsFollowTheirAddress);
+    let _ = dev.raw.settle_submit_checks(Duration::from_secs(10));
+    let releases = dev.raw.releases_idle_pointer_imports();
     match path {
         Path::DmaBuf => None,
-        Path::Pointer if follows => {
-            Some("the runtime knows the driver's pointer imports follow their address")
-        }
+        Path::Pointer if releases => Some(
+            "the device releases an idle pointer import and imports the pages again at the \
+             buffer's next use",
+        ),
         Path::Pointer if !files_by_pointer(dev) => Some(
             "the device refuses a file's pages by their pointer, and fails its later submissions \
              where a file's pages lie under a pointer import",
@@ -251,8 +244,11 @@ fn remapped(
     };
     drop(buffer);
     released(&[gone]);
+    // The remap above is the OS's VM's on purpose, which tells the runtime nothing; the unmaps
+    // go through the platform's, which leaves pages an import holds mapped until the runtime
+    // frees the import, after the deallocator ran.
     for mapping in [va, new] {
-        assert!(vm.deallocate(mapping, LEN).is_success());
+        assert!(VulkanVm::new().deallocate(mapping, LEN).is_success());
     }
     seen
 }
@@ -299,7 +295,7 @@ fn made_after(dev: &Device, va: HostPtr, remap: impl FnOnce() -> HostPtr) -> ([[
     let seen = [gpu_read_then_fill(dev, &b, 0x7c), ends(va), ends(new)];
     drop((b, a));
     released(&[b_gone, a_gone]);
-    assert!(OsVm::new().deallocate(new, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(new, LEN).is_success());
     (seen, path.unwrap())
 }
 
@@ -311,99 +307,22 @@ fn made_after_a_remap(dev: &Device, vm: &dyn HostVm) -> ([[u8; 2]; 3], Path) {
         vm.remap_shared_overwrite(va, new, LEN).unwrap();
         new
     });
-    assert!(vm.deallocate(va, LEN).is_success());
-    seen
-}
-
-/// Host blocks that do the mapping work as a host does, with the OS's VM of their own:
-/// `createTask` reserves the task's range, `mapMemory` remaps each range's pages, whose
-/// `physicalAddress` is here the host address of pages to share, from the task's base plus the
-/// offset on, `unmapMemory` puts fresh zero pages over its range, and `destroyTask` deallocates
-/// the task's range.
-fn host_blocks() -> HostBlocks {
-    let task: Arc<Mutex<(HostPtr, u64)>> = Arc::default();
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let create = move |size, base: &mut HostPtr| {
-        *base = vm.allocate_anywhere(size).unwrap();
-        *t.lock() = (*base, size);
-        HostTask::from_addr(1)
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let destroy = move |_| {
-        let (base, size) = *t.lock();
-        assert!(vm.deallocate(base, size).is_success());
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let map = move |_, count: u32, offset: u64, _, ranges: &[PhysicalMemoryRange]| {
-        let mut at = t.lock().0.wrapping_add(offset);
-        for r in &ranges[..usize::try_from(count).unwrap()] {
-            let src = HostPtr::from_addr(usize::try_from(r.physical_address).unwrap());
-            vm.remap_shared_overwrite(at, src, r.physical_length)
-                .unwrap();
-            at = at.wrapping_add(r.physical_length);
-        }
-        true
-    };
-    let (t, vm) = (Arc::clone(&task), OsVm::new());
-    let unmap = move |_, offset: u64, length| {
-        let at = t.lock().0.wrapping_add(offset);
-        vm.allocate_fixed_overwrite(at, length).is_ok()
-    };
-    HostBlocks {
-        create_task: Some(Arc::new(create)),
-        destroy_task: Some(Arc::new(destroy)),
-        map_memory: Some(Arc::new(map)),
-        unmap_memory: Some(Arc::new(unmap)),
-        ..HostBlocks::default()
-    }
-}
-
-/// [`made_after`] the host's blocks unmapped the task's first `LEN` bytes and mapped other pages
-/// there, through `blocks` (the host's, or what the platform answered for them).
-fn made_after_the_host_remaps(dev: &Device, blocks: &HostBlocks) -> ([[u8; 2]; 3], Path) {
-    let (create, destroy) = (blocks.create_task.as_ref(), blocks.destroy_task.as_ref());
-    let (map, unmap) = (blocks.map_memory.as_ref(), blocks.unmap_memory.as_ref());
-    let pages = |at: HostPtr| PhysicalMemoryRange {
-        physical_address: at.addr().try_into().unwrap(),
-        physical_length: LEN,
-    };
-    let mut base = HostPtr::NULL;
-    let task = create.unwrap()(4 * LEN, &mut base);
-    let old = region(0xa1);
-    assert!(map.unwrap()(task, 1, 0, false, &[pages(old)]));
-    let seen = made_after(dev, base, || {
-        assert!(unmap.unwrap()(task, 0, LEN));
-        let new = region(0xe5);
-        assert!(map.unwrap()(task, 1, 0, false, &[pages(new)]));
-        new
-    });
-    destroy.unwrap()(task);
-    assert!(OsVm::new().deallocate(old, LEN).is_success());
+    assert!(VulkanVm::new().deallocate(va, LEN).is_success());
     seen
 }
 
 /// A buffer made over the bytes of a live one after a remap there takes the new pages where the
-/// runtime was told of it, by the platform's VM or the host's blocks the platform wraps; untold,
+/// runtime was told of it, by the platform's VM; untold,
 /// it lies in the live one's import, and where that import keeps its pages ([`unmeasured`]) the
 /// GPU reads what that one wrote and fills the old pages
 #[test]
 fn a_buffer_made_after_a_remap_the_runtime_was_told_of_takes_the_new_pages() {
     let dev = VulkanPlatform::system_default_device().unwrap();
-    let p = VulkanPlatform::new(Box::new(NoLauncher));
+    let p = VulkanPlatform::new();
     assert_eq!(made_after_a_remap(&dev, p.vm()).0, SEEN);
-    let blocks = p.host_blocks(host_blocks());
-    assert_eq!(made_after_the_host_remaps(&dev, &blocks).0, SEEN);
-    let untold = [
-        ("the OS's VM", made_after_a_remap(&dev, &OsVm::new())),
-        (
-            "the host's blocks",
-            made_after_the_host_remaps(&dev, &host_blocks()),
-        ),
-    ];
-    for (label, (seen, path)) in untold {
-        match unmeasured(&dev, path) {
-            None => assert_eq!(seen, not_seen(0xc3), "{label}"),
-            Some(why) => eprintln!("{label}: not measured ({path:?}): {why}"),
-        }
+    let (seen, path) = made_after_a_remap(&dev, &OsVm::new());
+    match unmeasured(&dev, path) {
+        None => assert_eq!(seen, not_seen(0xc3), "the OS's VM"),
+        Some(why) => eprintln!("the OS's VM: not measured ({path:?}): {why}"),
     }
 }

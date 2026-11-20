@@ -3,6 +3,7 @@
 #include "RgfxAirArguments.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <cstring>
 #include <map>
@@ -77,7 +78,10 @@ struct RgfxAirCode {
 		uint64_t attributes = 0, section = 0;
 		uint8_t builtin = 0;
 	};
-	enum Builtin : uint8_t { kNoBuiltin, kIsDefined, kNormalize };
+	// kConvertS, kConvertU: Metal's conversion between a float and a signed or an unsigned integer
+	// (air.convert.s.*.f.*, air.convert.f.*.s.*; the same with u); kConvertF: from a float to a
+	// float (air.convert.f.*.f.*).
+	enum Builtin : uint8_t { kNoBuiltin, kIsDefined, kNormalize, kConvertS, kConvertU, kConvertF };
 	// A call's attributes: whether it may write memory, unwind or not return.
 	struct Attributes {
 		bool noWrite = false, noUnwind = false, willReturn = false;
@@ -1352,7 +1356,7 @@ bool binding(const Module &m, const Module::Md &node, size_t from, RgfxAirArgume
 // writes: each member names its argument with `air.indirect_argument` and that argument's node.
 bool membersWriteTextures(const Module &m, const Module::Md &info, unsigned depth)
 {
-	if (depth > 8)
+	if (depth > kRgfxAirNesting)
 		return true;
 	for (size_t i = 0; i + 1 < info.ops.size(); i++) {
 		const std::string *s = mdString(m, info.ops[i]);
@@ -1398,18 +1402,24 @@ bool indirectWritesTextures(const Module &m, const Module::Md &node)
 	return true;
 }
 
+// The function tables and acceleration structures, bound among the buffers: each takes a location
+// of the buffers' table (measured: oracle Q33's probe of them, the 5300M, the 630 and the M3).
+bool bindsAmongBuffers(const std::string &kind)
+{
+	return kind == "air.visible_function_table" || kind == "air.intersection_function_table" ||
+	       kind == "air.instance_acceleration_structure" ||
+	       kind == "air.primitive_acceleration_structure";
+}
+
 // The binding kinds besides buffers, argument buffers, textures and samplers that our Metal
 // compiler gives an `air.location_index`, none of them a texture: a vertex function's and a
 // kernel's stage input attribute and a post-tessellation vertex function's patch input (an
 // attribute of the stage input descriptor, fetched from buffers), and the function tables and
-// acceleration structures, bound among the buffers.
+// acceleration structures (bindsAmongBuffers).
 bool bindsNoTexture(const std::string &kind)
 {
 	return kind == "air.vertex_input" || kind == "air.stage_in" || kind == "air.patch_input" ||
-	       kind == "air.visible_function_table" ||
-	       kind == "air.intersection_function_table" ||
-	       kind == "air.instance_acceleration_structure" ||
-	       kind == "air.primitive_acceleration_structure";
+	       bindsAmongBuffers(kind);
 }
 
 // Whether an argument node names a binding (`air.location_index`).
@@ -1437,24 +1447,34 @@ std::string globalName(const Module &m, uint64_t v)
 	return {};
 }
 
-// One entry point's node: the function, then two nodes, the second its arguments.
+// One entry point's node: the function, then two nodes, the second its arguments. False where its
+// arguments do not read; `out.name` is then the function's name, or empty where the node names no
+// function of the module.
 bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunction &out)
 {
+	out.name.clear();
+	out.stage = stage;
+	out.arguments.clear();
+	out.locationsMayOverlap = false;
+	// Each binding argument's table (0 buffers, 1 threadgroup memory, 2 textures, 3 samplers) and
+	// declared location, for locationsMayOverlap.
+	struct Location {
+		int table;
+		uint64_t from, to;
+	};
+	std::vector<Location> locations;
 	const Module::Md *entry = mdAt(m, id);
 	if (entry == nullptr || entry->kind != Module::Md::kNode || entry->ops.size() < 3)
 		return false;
 	const Module::Md *fn = mdAt(m, entry->ops[0]);
-	const Module::Md *args = mdAt(m, entry->ops[2]);
-	if (fn == nullptr || fn->kind != Module::Md::kValue || args == nullptr ||
-	    args->kind != Module::Md::kNode)
+	if (fn == nullptr || fn->kind != Module::Md::kValue)
 		return false;
 	const uint64_t v = fn->value;
 	if (v >= m.globals.size() || !m.globals[static_cast<size_t>(v)].function)
 		return false;
 	out.name = globalName(m, v);
-	out.stage = stage;
-	out.arguments.clear();
-	if (out.name.empty())
+	const Module::Md *args = mdAt(m, entry->ops[2]);
+	if (out.name.empty() || args == nullptr || args->kind != Module::Md::kNode)
 		return false;
 	for (uint64_t argId : args->ops) {
 		const Module::Md *arg = mdAt(m, argId);
@@ -1474,7 +1494,8 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			continue; // an output or a built-in, of no binding
 		RgfxAirArgument a = {};
 		a.access = RgfxAirAccess::Unknown;
-		if (*kind == "air.buffer")
+		// An OpenCL C kernel's argument passed by value is a buffer of the value at its index.
+		if (*kind == "air.buffer" || *kind == "air.constant")
 			a.kind = RgfxAirKind::Buffer;
 		else if (*kind == "air.indirect_buffer")
 			a.kind = RgfxAirKind::IndirectBuffer;
@@ -1482,15 +1503,42 @@ bool entryPoint(const Module &m, uint64_t id, RgfxAirStage stage, RgfxAirFunctio
 			a.kind = RgfxAirKind::Texture;
 		else if (*kind == "air.sampler")
 			a.kind = RgfxAirKind::Sampler;
-		else if (bindsNoTexture(*kind))
+		else if (bindsNoTexture(*kind)) {
+			// No argument the bindings list, but a function table's or an acceleration
+			// structure's location may overlap another of the buffers' table.
+			RgfxAirArgument t = {};
+			if (bindsAmongBuffers(*kind)) {
+				if (!binding(m, *arg, kindAt + 1, t) || t.anyIndex || t.anyCount) {
+					out.locationsMayOverlap = true;
+				} else {
+					const uint64_t from = t.index, to = static_cast<uint64_t>(t.index) + t.count;
+					for (const Location &l : locations)
+						if (l.table == 0 && l.from < to && from < l.to)
+							out.locationsMayOverlap = true;
+					locations.push_back({0, from, to});
+				}
+			}
 			continue;
+		}
 		else if (hasBinding(m, *arg))
 			return false; // a binding of a kind the reader does not know: it may be a texture
 		else
 			continue; // a built-in or a stage input, of no binding
 		if (!binding(m, *arg, kindAt + 1, a))
 			return false;
-		if (a.kind == RgfxAirKind::Buffer && threadgroupMemory(m, *arg))
+		const bool threadgroup = a.kind == RgfxAirKind::Buffer && threadgroupMemory(m, *arg);
+		const int table = threadgroup                         ? 1
+		                  : a.kind == RgfxAirKind::Texture ? 2
+		                  : a.kind == RgfxAirKind::Sampler ? 3
+		                                                   : 0;
+		if (a.anyIndex || a.anyCount)
+			out.locationsMayOverlap = true;
+		const uint64_t from = a.index, to = static_cast<uint64_t>(a.index) + a.count;
+		for (const Location &l : locations)
+			if (l.table == table && l.from < to && from < l.to)
+				out.locationsMayOverlap = true;
+		locations.push_back({table, from, to});
+		if (threadgroup)
 			continue; // threadgroup memory: no buffer at its index
 		// A texture of no access the reader knows is one it may write.
 		if (a.kind == RgfxAirKind::Texture && a.access == RgfxAirAccess::Unknown)
@@ -1757,11 +1805,12 @@ bool stitchingType(const Module &m, uint64_t id, RgfxAirType &out)
 }
 
 // One `air.visible` node: the function, its outputs, its inputs and, for a stitchable function,
-// its `air.stitching_info`.
+// its `air.stitching_info`. False where it names no function of the module; a node of the function
+// that is not of that form is its signature's, unknown.
 bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
 {
 	const Module::Md *entry = mdNode(m, id);
-	if (entry == nullptr || entry->ops.size() < 3)
+	if (entry == nullptr || entry->ops.empty())
 		return false;
 	const Module::Md *fn = mdAt(m, entry->ops[0]);
 	if (fn == nullptr || fn->kind != Module::Md::kValue || fn->value >= m.globals.size() ||
@@ -1770,6 +1819,10 @@ bool visibleFunction(const Module &m, uint64_t id, RgfxAirVisible &out)
 	out.name = globalName(m, fn->value);
 	if (out.name.empty())
 		return false;
+	if (entry->ops.size() < 3) {
+		out.signature = RgfxAirVisible::Signature::Unknown;
+		return true;
+	}
 	const Module::Md *info = nullptr;
 	for (size_t i = 3; i < entry->ops.size() && info == nullptr; i++) {
 		const Module::Md *n = mdNode(m, entry->ops[i]);
@@ -1897,13 +1950,44 @@ bool outputsOf(const Module &m, uint64_t id, std::vector<RgfxAirOutput> &out)
 	return true;
 }
 
+bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out);
+
 // The node `id` whole (RgfxAirArguments.hpp, "An entry point's nodes, whole"): false where an
-// operand is not of the form its key takes.
+// operand is not of the form its key takes, or it names no kind.
 bool wholeNode(const Module &m, uint64_t id, unsigned depth,
                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
 {
+	return nodeKeys(m, id, depth, layouts, out) && !out.kind.empty();
+}
+
+// A post-tessellation vertex function's control points (`air.patch_control_point_input`, the
+// kind of `node`, whose operands from `at` are its control point function's node and its
+// attributes' nodes) into `out.controlPoints`: false where one is not of that form.
+bool controlPointsOf(const Module &m, const Module::Md &node, size_t at, unsigned depth,
+                     std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
+{
+	const Module::Md *function = at < node.ops.size() ? mdNode(m, node.ops[at]) : nullptr;
+	std::string tag;
+	if (function == nullptr || !mdText(m, *function, 0, tag) || tag != "air.patch_control_point_function")
+		return false;
+	for (size_t i = at + 1; i < node.ops.size(); i++) {
+		RgfxAirNode attribute;
+		if (!nodeKeys(m, node.ops[i], depth + 1, layouts, attribute) || !attribute.kind.empty() ||
+		    attribute.hasPosition || !attribute.hasLocation)
+			return false;
+		out.controlPoints.push_back(std::move(attribute));
+	}
+	return true;
+}
+
+// The keys of the node `id` into `out` (wholeNode), which may name no kind: false where an operand
+// is not of the form its key takes.
+bool nodeKeys(const Module &m, uint64_t id, unsigned depth,
+              std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirNode &out)
+{
 	const Module::Md *node = mdNode(m, id);
-	if (node == nullptr || depth > 8)
+	if (node == nullptr || depth > kRgfxAirNesting)
 		return false;
 	size_t i = 0;
 	int64_t position = 0;
@@ -1965,6 +2049,12 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 			if (i + 1 >= node->ops.size() || !layoutOf(m, node->ops[i + 1], depth + 1, layouts, out.layout))
 				return false;
 			i += 1;
+		} else if (k == "air.imageblock_master" && out.kind == "air.imageblock_data") {
+			// The master struct of the tile's imageblock a fragment function's imageblock data views.
+			if (i + 1 >= node->ops.size() ||
+			    !layoutOf(m, node->ops[i + 1], depth + 1, layouts, out.imageblockMaster))
+				return false;
+			i += 1;
 		} else if (k == "air.arg_type_name" || k == "air.arg_name") {
 			if (!mdText(m, *node, i + 1, k == "air.arg_name" ? out.name : out.typeName))
 				return false;
@@ -1985,12 +2075,36 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 			out.hasMesh = true;
 			i += 1;
 		} else if (k == "air.render_target" && out.kind.empty()) {
-			// A fragment function's input of a colour attachment's value: the attachment's index.
+			// A fragment function's input of a colour attachment's value: the attachment's index, an
+			// integer or a global function constants compute.
 			out.kind = k;
-			if (!mdUnsigned(m, *node, i + 1, out.renderTarget))
+			if (i + 1 < node->ops.size() && mdGlobalVariable(m, node->ops[i + 1])) {
+				out.renderTargetIsGlobal = true;
+				out.renderTargetGlobal = mdAt(m, node->ops[i + 1])->value;
+			} else if (!mdUnsigned(m, *node, i + 1, out.renderTarget)) {
 				return false;
+			}
 			out.hasRenderTarget = true;
 			i += 1;
+		} else if ((k == "explicit" || k == "implicit") && out.kind == "air.imageblock" &&
+		           out.imageblockLayout.empty()) {
+			out.imageblockLayout = k;
+		} else if (k == "air.imageblock_data_size") {
+			// An imageblock's or a fragment function's imageblock data's size.
+			if (!mdUnsigned(m, *node, i + 1, out.imageblockDataSize))
+				return false;
+			out.hasImageblockDataSize = true;
+			i += 1;
+		} else if (k == "air.raster_order_group" && (out.kind == "air.render_target" || out.kind == "air.texture")) {
+			// The colour attachment's input's raster order group, or a texture's.
+			if (!mdUnsigned(m, *node, i + 1, out.rasterOrderGroup))
+				return false;
+			out.hasRasterOrderGroup = true;
+			i += 1;
+		} else if (k == "air.patch_control_point_input" && out.kind.empty()) {
+			// Its control point function's node and its attributes' nodes, every operand left.
+			out.kind = k;
+			return controlPointsOf(m, *node, i + 1, depth, layouts, out);
 		} else if (out.kind.empty()) {
 			out.kind = k;
 		} else {
@@ -1999,10 +2113,17 @@ bool wholeNode(const Module &m, uint64_t id, unsigned depth,
 			continue;
 		}
 	}
-	return !out.kind.empty();
+	return true;
 }
 
-// The layout node `id`: its members, each read once a module (`layouts`).
+bool readLayout(const Module &m, uint64_t id, unsigned depth,
+                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+                std::shared_ptr<const std::vector<RgfxAirMember>> &out);
+
+// The layout node `id`: its members, each read once a module (`layouts`), wherever an entry point
+// reaches it. One that does not read is not kept: it reads as none only from where it was reached
+// (past the depth the reader follows, or inside itself), and another entry point's node nearer it
+// reads it again.
 bool layoutOf(const Module &m, uint64_t id, unsigned depth,
               std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
               std::shared_ptr<const std::vector<RgfxAirMember>> &out)
@@ -2012,9 +2133,24 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 		out = known->second;
 		return out != nullptr;
 	}
-	layouts[id] = nullptr; // a layout that holds itself reads as none
+	layouts[id] = nullptr; // while it is read: a layout that holds itself reads as none
+	std::shared_ptr<const std::vector<RgfxAirMember>> read;
+	if (!readLayout(m, id, depth, layouts, read)) {
+		layouts.erase(id);
+		return false;
+	}
+	layouts[id] = read;
+	out = std::move(read);
+	return true;
+}
+
+// The members of the layout node `id` (layoutOf).
+bool readLayout(const Module &m, uint64_t id, unsigned depth,
+                std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts,
+                std::shared_ptr<const std::vector<RgfxAirMember>> &out)
+{
 	const Module::Md *node = mdNode(m, id);
-	if (node == nullptr || depth > 8)
+	if (node == nullptr || depth > kRgfxAirNesting)
 		return false;
 	auto members = std::make_shared<std::vector<RgfxAirMember>>();
 	for (size_t i = 0; i < node->ops.size();) {
@@ -2061,7 +2197,6 @@ bool layoutOf(const Module &m, uint64_t id, unsigned depth,
 		members->push_back(std::move(member));
 	}
 	out = members;
-	layouts[id] = out;
 	return true;
 }
 
@@ -2100,12 +2235,29 @@ Val integer(uint32_t width, uint64_t bits)
 	return scalar(s);
 }
 
+// `f` rounded to the nearest half (IEEE binary16, ties to even), as LLVM folds a half: 11
+// significant bits, 2^-24 apart below 2^-14, and infinite from 65520 up.
+double roundedToHalf(double f)
+{
+	if (std::isnan(f) || std::isinf(f))
+		return f;
+	const double a = std::fabs(f);
+	if (a >= 65520.0)
+		return std::copysign(INFINITY, f);
+	if (a == 0.0)
+		return f;
+	int e = 0;
+	std::frexp(a, &e); // a = m * 2^e, m in [0.5, 1)
+	const double step = e - 1 < -14 ? std::ldexp(1.0, -24) : std::ldexp(1.0, e - 1 - 10);
+	return std::copysign(std::nearbyint(a / step) * step, f);
+}
+
 Val real(uint32_t width, double f)
 {
 	Code::Scalar s;
 	s.isFloat = true;
 	s.width = width;
-	s.f = width == 32 ? static_cast<double>(static_cast<float>(f)) : f;
+	s.f = width == 32 ? static_cast<double>(static_cast<float>(f)) : width == 16 ? roundedToHalf(f) : f;
 	return scalar(s);
 }
 
@@ -2215,6 +2367,31 @@ Val castOp(uint32_t op, const Code::Scalar &a, const Code::Type *to)
 	}
 }
 
+// A call of Metal's conversion `builtin` (RgfxAirCode::Builtin) of `a` to type `to`: a float to
+// an integer toward zero where that is in the integer's range (as LLVM's fptoui and fptosi, and
+// measured: oracle Q33's k_halfidx and k_sidx, -1.5 to -1), else any value; an integer of 32 bits
+// at most to a float, and a float to a float, to the nearest.
+Val convertOp(uint8_t builtin, const Code::Scalar &a, const Code::Type &to)
+{
+	const uint32_t fw = floatWidth(to.kind);
+	if (builtin == Code::kConvertF)
+		return fw != 0 && a.isFloat ? real(fw, a.f) : over();
+	const bool sign = builtin == Code::kConvertS;
+	if (!a.isFloat) {
+		if (fw == 0 || a.width > 32)
+			return over();
+		return real(fw, sign ? static_cast<double>(signedOf(a)) : static_cast<double>(a.bits));
+	}
+	if (to.kind != Code::Kind::Int || to.width == 0 || to.width > 64 || !std::isfinite(a.f))
+		return over();
+	const double t = std::trunc(a.f);
+	const double lo = sign ? -std::ldexp(1.0, static_cast<int>(to.width) - 1) : 0.0;
+	const double hi = std::ldexp(1.0, static_cast<int>(to.width) - (sign ? 1 : 0));
+	if (t < lo || t >= hi)
+		return over();
+	return integer(to.width, sign ? static_cast<uint64_t>(static_cast<int64_t>(t)) : static_cast<uint64_t>(t));
+}
+
 // LLVM's comparison predicates: FCMP_* 0 to 15, ICMP_* 32 to 41.
 Val cmpOp(uint32_t pred, const Code::Scalar &a, const Code::Scalar &b)
 {
@@ -2248,12 +2425,19 @@ Val cmpOp(uint32_t pred, const Code::Scalar &a, const Code::Scalar &b)
 	return integer(1, r ? 1 : 0);
 }
 
+// How many times the process ran a module's initialisers, and followed an entry point's body
+// (rgfxAirInitialisersRun, rgfxAirBodiesFollowed).
+std::atomic<uint64_t> gInitialisersRun{0}, gBodiesFollowed{0};
+
 // The specialisation's evaluator over a module's code: by the `count` constant values at
 // `values`, or (`blind`) by none known, each constant any value, defined or not.
 class Specialiser {
 public:
-	Specialiser(const Code &code, const RgfxFunctionConstant *values, uint32_t count, bool blind)
-	    : c_(code), values_(values), count_(count), blind_(blind)
+	// `locations`: a half constant's value and Metal's conversions (convertOp) are folded too,
+	// which only the argument locations' check asks for (rgfxAirConstantGlobals).
+	Specialiser(const Code &code, const RgfxFunctionConstant *values, uint32_t count, bool blind,
+	            bool locations = false)
+	    : c_(code), values_(values), count_(count), blind_(blind), locations_(locations)
 	{
 	}
 
@@ -2262,6 +2446,7 @@ public:
 	// or that a store of theirs may reach, holds any value.
 	void initialise()
 	{
+		gInitialisersRun.fetch_add(1, std::memory_order_relaxed);
 		for (const Code::Body &body : c_.bodies) {
 			const Code::Global &g = c_.globals[body.function];
 			if (g.section == 0 || g.section > c_.sections.size() || c_.sections[g.section - 1] != "air.static_init")
@@ -2276,6 +2461,7 @@ public:
 	// Which of `body`'s arguments the specialised code may use: false where it was not followed.
 	bool uses(const Code::Body &body, std::vector<bool> &used)
 	{
+		gBodiesFollowed.fetch_add(1, std::memory_order_relaxed);
 		if (!propagate(body))
 			return false;
 		used.assign(body.args, false);
@@ -2426,6 +2612,13 @@ private:
 				const uint32_t b = static_cast<uint32_t>(raw);
 				std::memcpy(&f, &b, sizeof(f));
 				s.f = f;
+			} else if (locations_) {
+				// IEEE half: a sign, 5 bits of exponent, 10 of fraction.
+				const uint32_t h = static_cast<uint32_t>(raw & 0xFFFF), e = (h >> 10) & 31, m = h & 1023;
+				const double sign = (h & 0x8000) != 0 ? -1.0 : 1.0;
+				s.f = e == 31   ? (m != 0 ? NAN : sign * INFINITY)
+				      : e == 0 ? sign * std::ldexp(static_cast<double>(m), -24)
+				               : sign * std::ldexp(static_cast<double>(m | 1024), static_cast<int>(e) - 25);
 			} else {
 				return over(); // a half constant: not folded
 			}
@@ -2507,10 +2700,19 @@ private:
 		case Code::Op::Load:
 			return in.keeps ? over() : load(body, in.ops[0], in.type);
 		case Code::Op::Call: {
-			if (in.ops[0] >= c_.globals.size() || in.type >= c_.types.size() ||
-			    c_.types[in.type].kind != Code::Kind::Int)
+			if (in.ops[0] >= c_.globals.size() || in.type >= c_.types.size())
 				return over();
 			const uint8_t builtin = c_.globals[in.ops[0]].builtin;
+			if (builtin == Code::kConvertS || builtin == Code::kConvertU || builtin == Code::kConvertF) {
+				if (!locations_ || in.ops.size() != 2)
+					return over();
+				const Val a = operand(1);
+				if (a.kind != Val::Const)
+					return a.kind == Val::Top ? Val{} : over();
+				return convertOp(builtin, a.s, c_.types[in.type]);
+			}
+			if (c_.types[in.type].kind != Code::Kind::Int)
+				return over();
 			const uint32_t width = c_.types[in.type].width;
 			if (builtin == Code::kIsDefined && in.ops.size() == 2) {
 				uint64_t g = 0;
@@ -2733,6 +2935,7 @@ private:
 	const RgfxFunctionConstant *values_;
 	uint32_t count_;
 	bool blind_;
+	bool locations_;
 	std::map<uint64_t, Val> memory_;
 	std::map<uint32_t, Val> results_;
 	std::set<uint32_t> resultSet_;
@@ -2741,9 +2944,44 @@ private:
 	std::vector<bool> reachable_;
 };
 
+// The conversion (RgfxAirCode::Builtin) a function of name `name` is, of Metal's scalar
+// conversions air.convert.TO.TYPE.FROM.TYPE (read: the compiler's modules, air.convert.u.i32.f.f16
+// and air.convert.f.f32.s.i32, a conversion each of a constant's initialiser and a function's
+// body): TO and FROM each f, s or u, TYPE f or i and its bits (f16, i32), the f's with a float's.
+// None (kNoBuiltin) for one of two integers, of vectors or of any other name.
+uint8_t conversionOf(const std::string &name)
+{
+	static const std::string kPrefix = "air.convert.";
+	if (name.compare(0, kPrefix.size(), kPrefix) != 0)
+		return RgfxAirCode::kNoBuiltin;
+	std::vector<std::string> parts;
+	size_t from = kPrefix.size();
+	for (size_t dot; (dot = name.find('.', from)) != std::string::npos; from = dot + 1)
+		parts.push_back(name.substr(from, dot - from));
+	parts.push_back(name.substr(from));
+	auto scalarType = [](const std::string &kind, const std::string &type) {
+		if (kind.size() != 1 || type.size() < 2 || type.size() > 3 ||
+		    type.find_first_not_of("0123456789", 1) != std::string::npos)
+			return false;
+		return kind == "f" ? type[0] == 'f' : (kind == "s" || kind == "u") && type[0] == 'i';
+	};
+	if (parts.size() != 4 || !scalarType(parts[0], parts[1]) || !scalarType(parts[2], parts[3]))
+		return RgfxAirCode::kNoBuiltin;
+	const std::string &to = parts[0], &of = parts[2];
+	if (to == "f" && of == "f")
+		return RgfxAirCode::kConvertF;
+	if (to != "f" && of != "f")
+		return RgfxAirCode::kNoBuiltin;
+	return (to == "f" ? of : to) == "s" ? RgfxAirCode::kConvertS : RgfxAirCode::kConvertU;
+}
+
 // The module's code once read (Module::code), where it is one rgfxAirSpecialise can follow: its
 // function constants' globals and the intrinsics it calls found, and every initialiser's body
-// read. Null where it is not.
+// read. Null where it is not. A function constant whose node does not read is left out of its
+// globals: its own global, `externally_initialized constant ... undef` of section
+// `air.fc_initializer` (read: the compiler's modules as LLVM's text form prints them), holds no
+// scalar the reader folds, so a load of it reads any value, as one of a constant of no value does,
+// and the other constants' values stand.
 std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 {
 	if (m.code == nullptr || m.codeBad || m.code->globals.size() != m.globals.size())
@@ -2757,7 +2995,7 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 		uint32_t index = 0;
 		if (node == nullptr || node->ops.size() < 4 || !mdGlobalVariable(m, node->ops[0]) ||
 		    !mdUnsigned(m, *node, 3, index))
-			return nullptr;
+			continue;
 		c.fcGlobals[mdAt(m, node->ops[0])->value] = index;
 	}
 	std::set<uint32_t> bodies;
@@ -2772,6 +3010,8 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 			g.builtin = RgfxAirCode::kIsDefined;
 		else if (name.compare(0, 41, "air.normalize_function_constant_predicate") == 0)
 			g.builtin = RgfxAirCode::kNormalize;
+		else
+			g.builtin = conversionOf(name);
 		const bool init = g.section >= 1 && g.section <= c.sections.size() && c.sections[g.section - 1] == "air.static_init";
 		if (init && (g.proto || bodies.count(static_cast<uint32_t>(v)) == 0))
 			return nullptr; // an initialiser of no body read: what it stores is unknown
@@ -2779,7 +3019,8 @@ std::shared_ptr<const RgfxAirCode> finishCode(const Module &m)
 	return m.code;
 }
 
-// The visible functions of the module `m` (rgfxReadAirVisible).
+// The visible functions of the module `m` (rgfxReadAirVisible): each one's own answer, one whose
+// node names no function left out.
 bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 {
 	out.clear();
@@ -2790,10 +3031,8 @@ bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 	const bool constantsRead = readConstants(m, constants);
 	for (uint64_t id : it->second) {
 		RgfxAirVisible v;
-		if (!visibleFunction(m, id, v)) {
-			out.clear();
-			return false;
-		}
+		if (!visibleFunction(m, id, v))
+			continue;
 		v.constants = constants;
 		v.constantsRead = constantsRead;
 		if (v.signature != RgfxAirVisible::Signature::Read) {
@@ -2807,7 +3046,26 @@ bool visibleOf(const Module &m, std::vector<RgfxAirVisible> &out)
 	return true;
 }
 
-// The entry points' arguments of the module `m` (rgfxReadAirFunctions).
+// The `[[max_total_threads_per_threadgroup(n)]]` of the entry point node `id`: n, from its node of
+// `air.max_work_group_size` and n among those after its arguments' node; 0 where it has none, or
+// one not of that form (read: the modules Apple's Metal compiler builds from
+// tests/air_arguments.metal's kernels of the attribute, `!{!"air.max_work_group_size", i32 64}` as
+// LLVM's text form prints it).
+uint32_t maxWorkGroupSize(const Module &m, uint64_t id)
+{
+	const Module::Md *entry = mdNode(m, id);
+	for (size_t k = 3; entry != nullptr && k < entry->ops.size(); k++) {
+		const Module::Md *extra = mdNode(m, entry->ops[k]);
+		std::string key;
+		uint32_t n = 0;
+		if (extra != nullptr && mdText(m, *extra, 0, key) && key == "air.max_work_group_size")
+			return extra->ops.size() == 2 && mdUnsigned(m, *extra, 1, n) ? n : 0;
+	}
+	return 0;
+}
+
+// The entry points' arguments of the module `m` (rgfxReadAirFunctions): each entry point's own
+// answer, one whose arguments do not read listed with none, one that names no function left out.
 bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 {
 	out.clear();
@@ -2826,9 +3084,13 @@ bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 		for (uint64_t id : it->second) {
 			RgfxAirFunction f;
 			if (!entryPoint(m, id, s.stage, f)) {
-				out.clear();
-				return false;
+				if (f.name.empty())
+					continue;
+				f.argumentsRead = false;
+				f.arguments.clear();
 			}
+			if (s.stage == RgfxAirStage::Kernel)
+				f.maxTotalThreads = maxWorkGroupSize(m, id);
 			f.constants = constants;
 			f.constantsRead = constantsRead;
 			out.push_back(std::move(f));
@@ -2837,7 +3099,75 @@ bool functionsOf(const Module &m, std::vector<RgfxAirFunction> &out)
 	return true;
 }
 
-// The entry points' nodes whole of the module `m` (rgfxReadAirEntries).
+// A buffer node's address space where its node names none: its parameter's, the address space of
+// the entry point's parameter at the node's position, where that is a pointer. Before macOS 13 the
+// compiler writes no air.address_space on a buffer argument, device, constant or threadgroup alike,
+// and its parameter's pointer is of that space (measured: macOS 11.7.11's and 12.7.6's compiler, a
+// kernel's, a vertex function's and a fragment function's buffers, in a guest); macOS 13's and
+// later write it.
+void addressSpaceFromParameter(const Module &m, uint64_t function, RgfxAirNode &n)
+{
+	if (n.hasAddressSpace || !n.hasPosition || (n.kind != "air.buffer" && n.kind != "air.indirect_buffer") ||
+	    m.code == nullptr || function >= m.code->globals.size())
+		return;
+	const RgfxAirCode &c = *m.code;
+	const uint32_t type = c.globals[static_cast<size_t>(function)].type;
+	if (type >= c.types.size() || c.types[type].kind != RgfxAirCode::Kind::Function ||
+	    n.position >= c.types[type].params.size())
+		return;
+	const uint32_t param = c.types[type].params[n.position];
+	if (param >= c.types.size() || c.types[param].kind != RgfxAirCode::Kind::Pointer)
+		return;
+	n.hasAddressSpace = true;
+	n.addressSpace = c.types[param].width;
+}
+
+// One entry point's node whole (entriesOf), its function's name and value number first, the rest
+// after: false where a node of it is not one the reader follows. `out.name` is then the function's
+// name, or empty where the node names no function of the module.
+bool entryOf(const Module &m, uint64_t id,
+             std::map<uint64_t, std::shared_ptr<const std::vector<RgfxAirMember>>> &layouts, RgfxAirEntry &out)
+{
+	const Module::Md *entry = mdNode(m, id);
+	const Module::Md *fn = entry != nullptr && !entry->ops.empty() ? mdAt(m, entry->ops[0]) : nullptr;
+	if (fn == nullptr || fn->kind != Module::Md::kValue || fn->value >= m.globals.size() ||
+	    !m.globals[static_cast<size_t>(fn->value)].function)
+		return false;
+	out.name = globalName(m, fn->value);
+	out.function = fn->value;
+	const Module::Md *args = entry->ops.size() >= 3 ? mdNode(m, entry->ops[2]) : nullptr;
+	if (out.name.empty() || args == nullptr || !outputsOf(m, entry->ops[1], out.outputs))
+		return false;
+	for (uint64_t a : args->ops) {
+		RgfxAirNode n;
+		if (!wholeNode(m, a, 0, layouts, n))
+			return false;
+		addressSpaceFromParameter(m, fn->value, n);
+		out.arguments.push_back(std::move(n));
+	}
+	for (size_t k = 3; k < entry->ops.size(); k++) {
+		const Module::Md *extra = mdNode(m, entry->ops[k]);
+		std::string key;
+		if (extra != nullptr && mdText(m, *extra, 0, key) && key == "air.patch") {
+			std::string type;
+			if (extra->ops.size() < 2 || !mdText(m, *extra, 1, type) || (type != "triangle" && type != "quad"))
+				return false;
+			out.patch = type == "quad" ? RgfxAirPatch::Quad : RgfxAirPatch::Triangle;
+			continue;
+		}
+		if (extra == nullptr || !mdText(m, *extra, 0, key) || key != "air.work_group_size")
+			continue;
+		if (extra->ops.size() != 4 || !mdUnsigned(m, *extra, 1, out.workGroupSize[0]) ||
+		    !mdUnsigned(m, *extra, 2, out.workGroupSize[1]) || !mdUnsigned(m, *extra, 3, out.workGroupSize[2]))
+			return false;
+		out.hasWorkGroupSize = true;
+	}
+	return true;
+}
+
+// The entry points' nodes whole of the module `m` (rgfxReadAirEntries): each entry point's own
+// answer, one a node of which does not read listed with none, one that names no function left out;
+// each function constant whose node reads.
 bool entriesOf(const Module &m, RgfxAirEntries &out)
 {
 	out = {};
@@ -2853,35 +3183,17 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 		if (it == m.named.end())
 			continue;
 		for (uint64_t id : it->second) {
-			const Module::Md *entry = mdAt(m, id);
-			const Module::Md *fn = entry != nullptr && entry->kind == Module::Md::kNode && entry->ops.size() >= 3
-			                           ? mdAt(m, entry->ops[0])
-			                           : nullptr;
-			const Module::Md *args = fn != nullptr ? mdNode(m, entry->ops[2]) : nullptr;
-			if (fn == nullptr || fn->kind != Module::Md::kValue || args == nullptr ||
-			    fn->value >= m.globals.size() || !m.globals[static_cast<size_t>(fn->value)].function) {
-				out = {};
-				return false;
-			}
 			RgfxAirEntry e;
-			e.name = globalName(m, fn->value);
-			e.function = fn->value;
 			e.stage = s.stage;
-			if (!outputsOf(m, entry->ops[1], e.outputs)) {
-				out = {};
-				return false;
-			}
-			for (uint64_t a : args->ops) {
-				RgfxAirNode n;
-				if (!wholeNode(m, a, 0, layouts, n)) {
-					out = {};
-					return false;
-				}
-				e.arguments.push_back(std::move(n));
-			}
-			if (e.name.empty()) {
-				out = {};
-				return false;
+			if (!entryOf(m, id, layouts, e)) {
+				if (e.name.empty())
+					continue;
+				RgfxAirEntry unread;
+				unread.name = std::move(e.name);
+				unread.function = e.function;
+				unread.stage = s.stage;
+				unread.nodesRead = false;
+				e = std::move(unread);
 			}
 			out.entries.push_back(std::move(e));
 		}
@@ -2892,10 +3204,8 @@ bool entriesOf(const Module &m, RgfxAirEntries &out)
 			const Module::Md *c = mdNode(m, id);
 			std::string name;
 			uint32_t index = 0;
-			if (c == nullptr || !mdText(m, *c, 2, name) || !mdUnsigned(m, *c, 3, index)) {
-				out = {};
-				return false;
-			}
+			if (c == nullptr || !mdText(m, *c, 2, name) || !mdUnsigned(m, *c, 3, index))
+				continue;
 			out.constants.emplace_back(name, index);
 		}
 	}
@@ -2927,6 +3237,37 @@ bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out
 	return readModule(bitcode, size, m) && entriesOf(m, out);
 }
 
+// The integer each global holds once `s` ran the initialisers, where it holds a known one.
+static void constantGlobalsOf(const Specialiser &s, std::map<uint64_t, int64_t> &out)
+{
+	for (const auto &[global, v] : s.memory()) {
+		if (v.kind == Val::Const && !v.s.isFloat)
+			out[global] = v.s.width == 1 ? static_cast<int64_t>(v.s.bits) : signedOf(v.s);
+	}
+}
+
+bool rgfxAirConstantGlobals(const RgfxAirEntries &module, const RgfxFunctionConstant *values, uint32_t count,
+                            std::map<uint64_t, int64_t> &out)
+{
+	out.clear();
+	if (module.code == nullptr)
+		return false;
+	Specialiser s(*module.code, values, count, false, true);
+	s.initialise();
+	constantGlobalsOf(s, out);
+	return true;
+}
+
+uint64_t rgfxAirInitialisersRun()
+{
+	return gInitialisersRun.load(std::memory_order_relaxed);
+}
+
+uint64_t rgfxAirBodiesFollowed()
+{
+	return gBodiesFollowed.load(std::memory_order_relaxed);
+}
+
 bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
                        uint32_t count, RgfxAirSpecialisation &out)
 {
@@ -2936,10 +3277,7 @@ bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, 
 	const RgfxAirCode &code = *module.code;
 	Specialiser s(code, values, count, false);
 	s.initialise();
-	for (const auto &[global, v] : s.memory()) {
-		if (v.kind == Val::Const && !v.s.isFloat)
-			out.globals[global] = v.s.width == 1 ? static_cast<int64_t>(v.s.bits) : signedOf(v.s);
-	}
+	constantGlobalsOf(s, out.globals);
 	// Which arguments the specialised code uses: of those the code uses whatever the constants'
 	// values (an argument the code reads none of, such as an implicit imageblock's, is the AIR's
 	// to answer), the ones it uses under these.
@@ -2961,15 +3299,16 @@ bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, 
 	return true;
 }
 
-void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out)
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out, bool entries)
 {
 	out = {};
+	out.withEntries = entries;
 	// One read with the module's code, which the entry points' specialisation takes. A module
 	// whose code does not read answers no entry points, as rgfxReadAirEntries does, and its
 	// functions and visible functions are read again without its code.
 	Module m;
 	m.wantCode = true;
-	if (readModule(bitcode, size, m)) {
+	if (entries && readModule(bitcode, size, m)) {
 		out.functionsRead = functionsOf(m, out.functions);
 		out.visibleRead = visibleOf(m, out.visible);
 		out.entriesRead = entriesOf(m, out.entries);
@@ -3014,32 +3353,51 @@ size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size)
 	return n;
 }
 
-std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size)
+std::shared_ptr<const RgfxAirModule> RgfxAirModuleCache::moduleOf(const uint8_t *bitcode, size_t size, bool entries)
 {
 	const std::string_view key(reinterpret_cast<const char *>(bitcode), bitcode != nullptr ? size : 0);
+	// The kept read of the kind asked, where there is one; a read with the entry points answers
+	// for one without them that is not read yet, and is that one from then on.
+	auto keptOf = [&](Kept &k) -> std::shared_ptr<const RgfxAirModule> {
+		if (entries)
+			return k.full;
+		if (k.plain == nullptr)
+			k.plain = k.full;
+		return k.plain;
+	};
 	{
 		std::lock_guard<std::mutex> hold(lock_);
 		auto found = byBytes_.find(key);
 		if (found != byBytes_.end()) {
-			order_.splice(order_.begin(), order_, found->second);
-			return found->second->module;
+			if (auto module = keptOf(*found->second)) {
+				order_.splice(order_.begin(), order_, found->second);
+				return module;
+			}
 		}
 	}
 	auto read = std::make_shared<RgfxAirModule>();
-	rgfxReadAirModule(bitcode, size, *read);
+	rgfxReadAirModule(bitcode, size, *read, entries);
 	std::shared_ptr<const RgfxAirModule> module = std::move(read);
-	const size_t cost = rgfxAirModuleCost(*module, key.size());
+	const size_t code = rgfxAirModuleCost(*module, key.size()) - key.size();
 	std::lock_guard<std::mutex> hold(lock_);
 	reads_++;
 	auto found = byBytes_.find(key);
 	if (found != byBytes_.end()) {
-		// Another thread read the same bytes meanwhile: its read is the one kept.
+		Kept &k = *found->second;
 		order_.splice(order_.begin(), order_, found->second);
-		return found->second->module;
+		// Another thread read the same bytes meanwhile: its read is the one kept.
+		if (auto kept = keptOf(k))
+			return kept;
+		(entries ? k.full : k.plain) = module;
+		k.cost += code;
+		keptBytes_ += code;
+	} else {
+		Kept k{std::string(key), nullptr, nullptr, key.size() + code};
+		(entries ? k.full : k.plain) = module;
+		order_.push_front(std::move(k));
+		byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
+		keptBytes_ += order_.front().cost;
 	}
-	order_.push_front(Kept{std::string(key), module, cost});
-	byBytes_.emplace(std::string_view(order_.front().bytes), order_.begin());
-	keptBytes_ += cost;
 	while (keptBytes_ > budget_ && !order_.empty()) {
 		const Kept &last = order_.back();
 		keptBytes_ -= last.cost;

@@ -2,8 +2,11 @@
 # Checks a kext's imports against a macOS 26 KDK, as the kernel's linker
 # resolves them: every name the executable imports must be exported by a
 # library its OSBundleLibraries names, and it may name no private KPI
-# (com.apple.kpi.private and com.apple.kpi.unsupported are open to
-# com.apple.* kexts alone). Prints how many names each library gives.
+# (com.apple.kpi.private is open to com.apple.* kexts alone: the kernel's
+# OSKext::resolveDependencies fails any other kext that names it, and checks
+# no other KPI so; com.apple.kpi.unsupported, whose mach_vm_region and
+# kernel_map the kext imports, is open to every kext). Prints how many names
+# each library gives.
 #
 #   tools/check-imports.sh KDK KEXT
 #
@@ -24,7 +27,11 @@ fi
 plist=$kext/Contents/Info.plist
 exe=$kext/Contents/MacOS/$(plutil -extract CFBundleExecutable raw "$plist")
 tmp=$(mktemp -d /tmp/check-imports.XXXXXX)
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 
 # The KDK's bundles by identifier: a KPI's symbol set, or a family.
 find "$kdk" -name Info.plist -path '*.kext/*' -not -path '*.dSYM/*' | while read -r p; do
@@ -49,7 +56,7 @@ libraries=$(plutil -convert json -o - "$plist" | python3 -I -c \
 status=0
 for lib in $libraries; do
 	case $lib in
-	com.apple.kpi.private | com.apple.kpi.unsupported)
+	com.apple.kpi.private)
 		echo "check-imports: $lib is named: only com.apple.* kexts may link it" >&2
 		status=1
 		continue ;;
@@ -73,4 +80,5 @@ if [ -s "$tmp/left" ]; then
 	c++filt < "$tmp/left" | sed 's/^/  /' >&2
 	exit 1
 fi
+ended=1
 echo "check-imports: all $(wc -l < "$tmp/imports" | tr -d ' ') imports resolve, no private KPI"

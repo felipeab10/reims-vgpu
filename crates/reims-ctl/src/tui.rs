@@ -15,10 +15,8 @@ use crate::form::{self, Field, Form, opts};
 use crate::gpu::GpuInfo;
 use crate::host::{Host, Os, Profile};
 use crate::update::Channel;
-use crate::vm::{
-    DiskController, Graphics, Registry, Vm, format_mib, parse_resolution, parse_size_mib,
-};
-use crate::{install, logs, opencore, paths, reims_util, runtime, update};
+use crate::vm::{DiskController, Graphics, Registry, Vm, format_mib, parse_size_mib};
+use crate::{install, logs, opencore, paths, reims_util, runtime, update, usb};
 use anyhow::{Context, Result, bail};
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
@@ -39,7 +37,19 @@ use std::time::{Duration, Instant};
 
 pub fn run() -> Result<()> {
     let host = Host::current();
+    // The first run after an update brings the VMs an older reims-ctl made up to date: what it
+    // changed shows first.
+    let mut updated = Vec::new();
+    crate::migrate::run(&mut |s| updated.push(s.to_string()));
     let mut app = App::new(host)?;
+    if !updated.is_empty() {
+        app.overlay = Some(Overlay::Text {
+            title: "reims-ctl is updated  (Esc close)".into(),
+            lines: updated,
+            scroll: 0,
+            kind: TextKind::Help,
+        });
+    }
     let mut terminal = ratatui::init();
     app.kitty_keys = ratatui::crossterm::terminal::supports_keyboard_enhancement().unwrap_or(false);
     let kitty_keys = app.kitty_keys;
@@ -69,9 +79,8 @@ fn run_update(channel: Option<Channel>) -> Result<()> {
     println!("Updating reims-ctl and its QEMU…\n");
     update::update(channel)?;
     println!("\nUpdated. Starting the new reims-ctl…");
-    use std::os::unix::process::CommandExt;
-    let exe = std::env::current_exe()?;
-    let err = std::process::Command::new(&exe).exec();
+    let exe = update::restart_path(std::env::current_exe()?);
+    let err = crate::os::exec(std::process::Command::new(&exe));
     Err(err).with_context(|| format!("run {}", exe.display()))
 }
 
@@ -101,6 +110,13 @@ enum Overlay {
         title: String,
         body: String,
         options: Vec<(&'static str, Action)>,
+        choice: usize,
+    },
+    /// The host's USB devices, to give the VM `vm` or take back (usb.rs): `choice` is the
+    /// selected row of [`usb::rows`].
+    Usb {
+        vm: String,
+        devices: Vec<usb::HostDevice>,
         choice: usize,
     },
     /// A VM's menu, hanging from a cell: the one right-clicked, or the VM's name in the list.
@@ -145,6 +161,7 @@ enum VmCommand {
     Stop,
     PowerOff,
     Edit,
+    Usb,
     ShowCommand,
     ToggleLogs,
     ViewLogs,
@@ -155,12 +172,13 @@ enum VmCommand {
 
 impl VmCommand {
     /// Each with its key, in the menu's order.
-    const ALL: [(VmCommand, char); 11] = [
+    const ALL: [(VmCommand, char); 12] = [
         (VmCommand::Start, 's'),
         (VmCommand::View, 'v'),
         (VmCommand::Stop, 'x'),
         (VmCommand::PowerOff, 'K'),
         (VmCommand::Edit, 'e'),
+        (VmCommand::Usb, 'p'),
         (VmCommand::ShowCommand, 'c'),
         (VmCommand::ToggleLogs, 'l'),
         (VmCommand::ViewLogs, 'L'),
@@ -277,7 +295,7 @@ impl App {
         if !app.rows.is_empty() {
             app.table.select(Some(0));
         }
-        if host.os == Os::Linux {
+        if matches!(host.os, Os::Linux | Os::Windows) {
             let tx = app.tx.clone();
             std::thread::spawn(move || {
                 let _ = tx.send(Msg::Gpus(crate::gpu::list()));
@@ -332,6 +350,10 @@ impl App {
     fn refresh_state(&mut self) {
         for r in &mut self.rows {
             r.pid = r.vm.as_ref().ok().and_then(runtime::pid);
+        }
+        // Devices plugged in or out show as they are.
+        if let Some(Overlay::Usb { devices, .. }) = &mut self.overlay {
+            *devices = usb::host_devices();
         }
         self.last_state = Instant::now();
     }
@@ -532,10 +554,7 @@ impl App {
         }
         match self.overlay.take() {
             Some(Overlay::Form(kind, mut f)) => match f.handle_key(k) {
-                form::Event::None => {
-                    display_help(&mut f);
-                    self.overlay = Some(Overlay::Form(kind, f))
-                }
+                form::Event::None => self.overlay = Some(Overlay::Form(kind, f)),
                 form::Event::Cancel => {
                     if let Some((id, _)) = f.busy {
                         self.closed_forms.insert(id, (kind, f));
@@ -598,6 +617,11 @@ impl App {
                 at,
                 all,
             }) => self.menu_key(k, vm, choice, at, all),
+            Some(Overlay::Usb {
+                vm,
+                devices,
+                choice,
+            }) => self.usb_key(k, vm, devices, choice),
             None => self.main_key(k),
         }
         self.open_failed_form();
@@ -723,7 +747,7 @@ impl App {
             return;
         };
         let Some(row) = self.rows.get(i) else { return };
-        let Some(&(first, _)) = vm_menu(row, all).first() else {
+        let Some(&(first, _)) = vm_menu(row, all, self.host).first() else {
             return;
         };
         // The name shows on the VM's row, past the highlight symbol.
@@ -743,7 +767,7 @@ impl App {
         self.rows
             .iter()
             .find(|r| r.name == name)
-            .map(|r| vm_menu(r, all))
+            .map(|r| vm_menu(r, all, self.host))
             .unwrap_or_default()
     }
 
@@ -787,10 +811,8 @@ impl App {
                         .find(|r| &r.name == vm)
                         .map(|r| r.dir.join("launch.sh"));
                     if let Some(p) = r {
-                        use std::os::unix::fs::PermissionsExt;
-                        let res = std::fs::write(&p, script).and_then(|_| {
-                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755))
-                        });
+                        let res =
+                            std::fs::write(&p, script).and_then(|_| crate::os::set_mode(&p, 0o755));
                         match res {
                             Ok(()) => self.say(&format!("wrote {}", paths::tilde(&p)), Level::Ok),
                             Err(e) => self.say(&format!("{}: {e}", p.display()), Level::Error),
@@ -889,6 +911,7 @@ impl App {
             VmCommand::Stop => self.stop(false),
             VmCommand::PowerOff => self.ask_force_stop(),
             VmCommand::Edit => self.open_edit(),
+            VmCommand::Usb => self.open_usb(),
             VmCommand::ShowCommand => self.show_command(),
             VmCommand::ToggleLogs => self.toggle_logs(),
             VmCommand::ViewLogs => self.view_logs(),
@@ -964,11 +987,21 @@ impl App {
         // What runtime::warnings finds shows in the VM's details, not here.
         let host = self.host;
         self.spawn(&vm.config.name.clone(), "starting", move |_| {
-            let pid = runtime::start(&vm, host)?;
-            Ok(format!(
-                "{}: running (pid {pid}); its window is open",
-                vm.name()
-            ))
+            // What the start did to its settings first, and why, follows the start's line.
+            let mut vm = vm;
+            let mut said = Vec::new();
+            let warned = runtime::prepare(&mut vm, &mut |s| said.push(s.to_string()));
+            let started = runtime::start(&vm, host)?;
+            let mut s = format!(
+                "{}: running (pid {}); its window is open",
+                vm.name(),
+                started.pid
+            );
+            for n in said.iter().chain(&warned).chain(&started.note) {
+                s.push_str("; ");
+                s.push_str(n);
+            }
+            Ok(s)
         });
     }
 
@@ -1074,12 +1107,11 @@ impl App {
             title: format!("Make {name} a new OpenCore image?"),
             body: format!(
                 "reims-util makes it a new OpenCore image for its graphics, {}, with what it \
-                 carries now, such as ReimsVgpu.kext, which macOS 26 needs for a display wider \
-                 than 2048 pixels and for GPU-accelerated Chrome on apple-gfx, and on reims-vgpu \
-                 the macOS drivers of its GPU device that this reims-ctl carries. It presents the \
-                 same Mac, a {} with serial {}, and the VM keeps its OVMF variables, which hold \
-                 its boot entries, and its boot selection (e changes it).\n\nThe image it \
-                 replaces is deleted, with anything else changed in it.",
+                 carries now, and on reims-vgpu the macOS drivers of its GPU device that this \
+                 reims-ctl carries. It presents the same Mac, a {} with serial {}, and the VM \
+                 keeps its OVMF variables, which hold its boot entries, and its boot selection \
+                 (e changes it).\n\nThe image it replaces is deleted, with anything else \
+                 changed in it.",
                 vm.config.graphics().id(),
                 id.model,
                 id.serial
@@ -1150,6 +1182,95 @@ impl App {
             options,
             choice: 1,
         });
+    }
+
+    /// Opens the selected VM's USB devices, where its host passes them through.
+    fn open_usb(&mut self) {
+        let Some(vm) = self.selected_vm() else { return };
+        if let Err(why) = usb_available(self.host, &vm) {
+            return self.say(&why, Level::Warn);
+        }
+        self.overlay = Some(Overlay::Usb {
+            vm: vm.config.name.clone(),
+            devices: usb::host_devices(),
+            choice: 0,
+        });
+    }
+
+    /// The rows of the USB devices' view of the VM named `vm`: the host's `devices`, each
+    /// with what of the VM's settings, as the list last read them, gives it.
+    fn usb_rows(&self, vm: &str, devices: &[usb::HostDevice]) -> Vec<usb::Row> {
+        let chosen = self
+            .rows
+            .iter()
+            .find(|r| r.name == vm)
+            .and_then(|r| r.vm.as_ref().ok())
+            .map(|vm| vm.config.usb.clone())
+            .unwrap_or_default();
+        usb::rows(&chosen, devices)
+    }
+
+    fn usb_key(
+        &mut self,
+        k: KeyEvent,
+        vm: String,
+        mut devices: Vec<usb::HostDevice>,
+        choice: usize,
+    ) {
+        let rows = self.usb_rows(&vm, &devices);
+        let last = rows.len().saturating_sub(1);
+        let mut choice = choice.min(last);
+        match k.code {
+            KeyCode::Esc | KeyCode::Char('q') => return,
+            KeyCode::Down | KeyCode::Char('j') | KeyCode::Tab => choice = (choice + 1).min(last),
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::BackTab => {
+                choice = choice.saturating_sub(1)
+            }
+            KeyCode::Home => choice = 0,
+            KeyCode::End => choice = last,
+            KeyCode::Char('r') => {
+                devices = usb::host_devices();
+                self.say("rescanned this host's USB devices", Level::Info);
+            }
+            KeyCode::Char(' ') | KeyCode::Enter => {
+                if let Some(row) = rows.get(choice) {
+                    self.toggle_usb(&vm, &devices, row);
+                }
+            }
+            _ => {}
+        }
+        self.overlay = Some(Overlay::Usb {
+            vm,
+            devices,
+            choice,
+        });
+    }
+
+    /// Gives the VM named `name` the device of `row`, or takes it back: at once while it runs
+    /// (usb::apply).
+    fn toggle_usb(&mut self, name: &str, devices: &[usb::HostDevice], row: &usb::Row) {
+        let Some(vm) = self
+            .rows
+            .iter()
+            .find(|r| r.name == name)
+            .and_then(|r| r.vm.as_ref().ok())
+            .cloned()
+        else {
+            return;
+        };
+        match usb::apply(&vm, |cur| usb::toggle(cur, devices, row)) {
+            Ok((_, said)) => {
+                let failed = said
+                    .iter()
+                    .any(|s| s.contains("failed") || s.contains("can't"));
+                self.say(
+                    &said.join("; "),
+                    if failed { Level::Warn } else { Level::Ok },
+                );
+            }
+            Err(e) => self.say(&format!("{e:#}"), Level::Error),
+        }
+        let _ = self.reload();
     }
 
     fn toggle_logs(&mut self) {
@@ -1307,74 +1428,58 @@ impl App {
         let help = if self.gpus.is_none() {
             "Looking for the host's GPUs…"
         } else {
-            "The GPU the library draws on. Automatic takes the first discrete GPU, then the first integrated one."
+            "The GPU the library draws on. Automatic takes the only GPU, or the one of several that \
+             runs a short workload fastest, timed once for each set of GPUs and drivers."
         };
         Field::choice("gpu", "GPU", options, &selected, help)
     }
 
     fn open_create(&mut self) {
         let Some(profile) = self.host.default_profile() else {
-            self.say(
-                &format!("reims-ctl runs no VMs on {} yet", self.host),
-                Level::Error,
-            );
+            self.say(crate::host::UNSUPPORTED, Level::Error);
             return;
         };
-        let name = match profile {
-            Profile::Q35X86_64 => Field::text(
+        let mut fields = vec![
+            Field::text(
                 "name",
                 "Name",
                 "",
                 "Letters, digits, '-', '_' and '.'. Empty names a VM of downloaded macOS after it.",
             )
             .placeholder("the macOS version's, such as tahoe"),
-            Profile::VmappleArm64 => {
-                Field::text("name", "Name", "", "Letters, digits, '-', '_' and '.'.")
-            }
-        };
-        let mut fields = vec![name];
-        match profile {
-            Profile::Q35X86_64 => {
-                if !matches!(self.macos_versions, Some(Ok(_))) {
-                    self.macos_versions =
-                        Some(reims_util::versions().map_err(|e| format!("{e:#}")));
-                }
-                let (options, version_help) = match &self.macos_versions {
-                    Some(Ok(list)) if !list.is_empty() => (
-                        list.iter()
-                            .map(|v| (v.slug.clone(), v.name.clone()))
-                            .collect(),
-                        "The macOS to download from Apple. x86-64 macOS 26 is the one we've tested.".to_string(),
-                    ),
-                    Some(Ok(_)) => (opts(&[("", "none")]), "reims-util lists no versions.".to_string()),
-                    Some(Err(e)) => (opts(&[("", "unavailable")]), e.clone()),
-                    None => (opts(&[("", "unavailable")]), String::new()),
-                };
-                let first = options.first().map(|o| o.0.clone()).unwrap_or_default();
-                fields.extend([
-                    Field::choice("source", "macOS from", opts(&[("download", "Download it from Apple"), ("installer", "An installer image of my own"), ("disk", "A disk that has macOS already")]), "download", "reims-ctl downloads the installer, makes the VM's OpenCore image and a new disk, and the VM boots into the installer."),
-                    Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
-                    Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
-                    Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
-                    Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
-                    Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
-                    Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
-                    Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself.")
-                        .show_if("source", &["disk"]),
-                    Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF and a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
-                        .placeholder("made for this VM"),
-                ]);
-            }
-            Profile::VmappleArm64 => {
-                fields.extend([
-                    Field::choice("source", "macOS from", opts(&[("ipsw", "Install from an IPSW"), ("import", "Import a Virtualization.framework VM")]), "ipsw", "Install a fresh macOS, or bring a VM made with macosvm or tart."),
-                    Field::path("ipsw", "IPSW", "latest", "An .ipsw restore image (Tab completes), or latest to download the newest this Mac supports (about 15 GB).").show_if("source", &["ipsw"]),
-                    Field::text("disk_size", "Disk size", "64G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["ipsw"]),
-                    Field::path("bundle", "VM directory", "", "macosvm's directory (disk.img, aux.img, vm.json) or tart's (disk.img, nvram.bin, config.json).").show_if("source", &["import"]),
-                    Field::choice("bundle_mode", "Use it by", opts(&[("copy", "Cloning it (instant on the same APFS volume)"), ("in-place", "Using it in place")]), "copy", "A clone leaves the original as it was.").show_if("source", &["import"]),
-                ]);
-            }
+        ];
+        if !matches!(self.macos_versions, Some(Ok(_))) {
+            self.macos_versions = Some(reims_util::versions().map_err(|e| format!("{e:#}")));
         }
+        let (options, version_help) = match &self.macos_versions {
+            Some(Ok(list)) if !list.is_empty() => (
+                list.iter()
+                    .map(|v| (v.slug.clone(), v.name.clone()))
+                    .collect(),
+                "The macOS to download from Apple. x86-64 macOS 26 is the one we've tested."
+                    .to_string(),
+            ),
+            Some(Ok(_)) => (
+                opts(&[("", "none")]),
+                "reims-util lists no versions.".to_string(),
+            ),
+            Some(Err(e)) => (opts(&[("", "unavailable")]), e.clone()),
+            None => (opts(&[("", "unavailable")]), String::new()),
+        };
+        let first = options.first().map(|o| o.0.clone()).unwrap_or_default();
+        fields.extend([
+            Field::choice("source", "macOS from", opts(&[("download", "Download it from Apple"), ("installer", "An installer image of my own"), ("disk", "A disk that has macOS already")]), "download", "reims-ctl downloads the installer, makes the VM's OpenCore image and a new disk, and the VM boots into the installer."),
+            Field::choice("macos", "macOS version", options, &first, &version_help).show_if("source", &["download"]),
+            Field::choice("installer_kind", "Installer", opts(&[("online", "Online, about 1 GB"), ("offline", "Offline, 13 to 20 GB")]), "online", "Online is Apple's recovery image: macOS downloads the newest release as it installs. Offline holds one release whole, and installs with no network (macOS 11 and later). Either is kept for the next VM, and a stopped download picks up where it stopped.").show_if("source", &["download"]),
+            Field::text("release", "Release", "", "Optional: an exact release of that macOS, such as 26.6.2; empty for the newest. reims-util offline-installer list lists them.").placeholder("the newest").show_if("installer_kind", &["offline"]),
+            Field::path("installer", "Installer image", "", "An installer to boot (Tab completes): a raw image, such as a recovery image's BaseSystem.img, or a DMG, converted to a raw image in the VM's directory. Eject it once macOS is installed (e).").show_if("source", &["installer"]),
+            Field::text("disk_size", "Disk size", "128G", "The new disk's size; it takes only what the guest writes.").show_if("source", &["download", "installer"]),
+            Field::path("disk_path", "Disk image", "", "A qcow2 or raw image (Tab completes).").show_if("source", &["disk"]),
+            Field::choice("disk_mode", "Use the disk by", opts(&[("copy", "Copying it (instant where the file system reflinks)"), ("in-place", "Using it in place")]), "copy", "A copy leaves the image as it was; in place, the VM writes the image itself. A copy is instant where the image and the VM's directory are on one file system that makes reflinks, such as btrfs or XFS; else it is a full copy, which says so, with its size, before it starts.")
+                .show_if("source", &["disk"]),
+            Field::path("opencore", "OpenCore image", "", "Empty makes one for this VM, with OVMF, presenting the Mac of the image beside an existing disk (opencore.qcow2, as a VM's directory holds them), unless the disk is copied from a VM reims-ctl has, else a Mac identity of its own. Or an OpenCore image of yours to copy, with OVMF_CODE.fd and OVMF_VARS.fd beside it, such as the one a disk of macOS booted from, which keeps its Mac's identity.")
+                .placeholder("made for this VM"),
+        ]);
         fields.extend([
             Field::path(
                 "dir",
@@ -1402,9 +1507,7 @@ impl App {
                 ),
             ),
         ]);
-        if profile == Profile::Q35X86_64 {
-            fields.push(graphics_field(Graphics::default_for(profile)));
-        }
+        fields.push(graphics_field(Graphics::default()));
         if profile.gpu_choice(self.host) {
             fields.push(
                 self.gpu_field(&crate::vm::Gpu::default())
@@ -1412,21 +1515,21 @@ impl App {
             );
         }
         fields.extend([
-            Field::text(
-                "displays",
-                "Displays",
-                "1",
-                "1 to 8, each in a window of its own.",
-            )
-            .show_if("graphics", APPLE_GFX),
             Field::text("resolution", "Resolution", "1920x1080", RESOLUTION_HELP)
-                .show_if("graphics", APPLE_GFX),
-            Field::toggle("hidpi", "HiDPI", false, HIDPI_HELP).show_if("graphics", APPLE_GFX),
+                .show_if("graphics", LIBRARY),
             Field::toggle(
                 "logs",
                 "Logs",
                 false,
                 "Keep the library's log and the serial console, for bug reports.",
+            ),
+            Field::toggle(
+                "network",
+                "Network",
+                true,
+                "User-mode networking (NAT). Installing from an offline installer, turn it off: \
+                 with a network, its installer can download an update as it installs, a second \
+                 download of the release. Turn it on in the VM's edit form once macOS is set up.",
             ),
             Field::text(
                 "ssh_port",
@@ -1434,10 +1537,10 @@ impl App {
                 "",
                 "Optional: a port on 127.0.0.1 forwarded to the guest's SSH (Remote Login).",
             )
-            .placeholder("optional"),
+            .placeholder("optional")
+            .show_if("network", &["yes"]),
         ]);
-        let mut form = Form::new("New VM", "create", fields);
-        display_help(&mut form);
+        let form = Form::new("New VM", "create", fields);
         self.overlay = Some(Overlay::Form(FormKind::Create, form));
     }
 
@@ -1453,62 +1556,34 @@ impl App {
             ),
             Field::text("memory", "Memory", &format_mib(c.memory_mib), "Such as 8G."),
         ];
-        // The displays' and video acceleration's fields are apple-gfx's, and borderless and the
-        // GPU's the library's devices'; an arm64 VM has no other than apple-gfx.
-        if c.profile == Profile::Q35X86_64 {
-            fields.push(graphics_field(c.graphics()));
-        }
+        // The resolution's, borderless's and the GPU's fields are reims-vgpu's.
+        fields.push(graphics_field(c.graphics()));
         fields.extend([
-            Field::text(
-                "displays",
-                "Displays",
-                &c.display.count.to_string(),
-                "1 to 8, each in a window of its own.",
-            )
-            .show_if("graphics", APPLE_GFX),
             Field::text(
                 "resolution",
                 "Resolution",
                 &c.display.resolution,
                 RESOLUTION_HELP,
             )
-            .show_if("graphics", APPLE_GFX),
-            Field::toggle("hidpi", "HiDPI", c.display.hidpi, HIDPI_HELP)
-                .show_if("graphics", APPLE_GFX),
+            .show_if("graphics", LIBRARY),
             Field::toggle(
                 "borderless",
                 "Borderless",
                 c.display.borderless,
-                "Windows without borders that fill their screens.",
+                "A window without borders that fills its screen.",
             )
             .show_if("graphics", LIBRARY),
-            Field::text(
-                "refresh",
-                "Refresh rate",
-                &c.display.refresh.map(|r| r.to_string()).unwrap_or_default(),
-                "Hz offered to the guest; empty for the host screen's.",
-            )
-            .placeholder("the host screen's")
-            .show_if("graphics", APPLE_GFX),
         ]);
         if c.profile.gpu_choice(self.host) {
             fields.push(self.gpu_field(&c.gpu).show_if("graphics", LIBRARY));
         }
         fields.extend([
             Field::toggle(
-                "video_acceleration",
-                "Video acceleration",
-                c.video_acceleration,
-                "The guest decodes, encodes and scales video on the host's hardware. Off, it \
-                 does all of that in software.",
-            )
-            .show_if("graphics", APPLE_GFX),
-            Field::toggle(
                 "audio",
                 "Audio",
                 c.audio.enabled,
-                "A virtio sound device on the host's sound, with a microphone (on x86-64, also \
-                 the HDA controller OpenCore's boot chime plays on).",
+                "Two virtio sound devices on the host's sound, a speaker and a microphone, and \
+                 the HDA controller OpenCore's boot chime plays on.",
             ),
             Field::toggle(
                 "logs",
@@ -1558,9 +1633,9 @@ impl App {
                 "Disk controller",
                 options.to_vec(),
                 q.disk_controller.id(),
-                "SATA, which macOS's installers see, or NVMe, for macOS once installed: an \
-                 installer may find no disk on NVMe. macOS finds its disk on either; once it is \
-                 installed, eject the installer before a move, or OpenCore may start it instead.",
+                "SATA or NVMe: macOS's installers and macOS find the disk on either. Once macOS \
+                 is installed, eject the installer before a move, or OpenCore may start it \
+                 instead.",
             ));
             fields.push(
                 Field::path(
@@ -1616,8 +1691,7 @@ impl App {
         } else {
             ""
         };
-        let mut form = Form::new(&format!("Edit {}{note}", c.name), "save", fields);
-        display_help(&mut form);
+        let form = Form::new(&format!("Edit {}{note}", c.name), "save", fields);
         self.overlay = Some(Overlay::Form(FormKind::Edit(c.name.clone()), form));
     }
 
@@ -1631,8 +1705,6 @@ impl App {
                     let vm = create::create(spec, host, p)?;
                     let next = if runtime::install_steps(&vm).is_some() {
                         "; its details say how to install macOS"
-                    } else if vm.config.q35.is_some() {
-                        "; set Metal's error mode in its macOS if it isn't (README)"
                     } else {
                         ""
                     };
@@ -1650,12 +1722,20 @@ impl App {
                 let mut vm = Registry::load()?.open(name)?;
                 let installer = installer_change(&vm, f)?;
                 let picker = picker_change(&vm, f)?;
-                if (installer.is_some() || picker.is_some())
+                let graphics = vm.config.graphics();
+                apply_edit(&mut vm, f, self.gpus.as_deref())?;
+                // A change of graphics makes the OpenCore image for them, where the VM is
+                // stopped; while it runs, its next start makes one without reims-vgpu's kexts on
+                // another device, and warns of an image that lacks them on reims-vgpu.
+                let image = picker.is_some()
+                    || (vm.config.graphics() != graphics
+                        && !runtime::running(&vm)
+                        && opencore::made_for_other_graphics(&vm));
+                if (installer.is_some() || image)
                     && let Some(a) = self.activity.get(name)
                 {
                     bail!("{name} is busy: {a}");
                 }
-                apply_edit(&mut vm, f, self.gpus.as_deref())?;
                 vm.save()?;
                 let note = if runtime::running(&vm) {
                     " (at its next start)"
@@ -1667,16 +1747,16 @@ impl App {
                 // After the rest is saved: a DMG takes seconds to convert, and a new OpenCore image
                 // about as long. The image first: the form, submitted again after a failure, finds
                 // it made, where it would convert a DMG again.
-                if installer.is_some() || picker.is_some() {
-                    let first = if picker.is_some() {
+                if installer.is_some() || image {
+                    let first = if image {
                         "making a new OpenCore image"
                     } else {
                         "changing the installer"
                     };
                     self.spawn_for(f, name, first, move |p| {
                         let mut done = Vec::new();
-                        if let Some(on) = picker {
-                            done.push(opencore::renew(&mut vm, Some(on), p)?);
+                        if image {
+                            done.push(opencore::renew(&mut vm, picker, p)?);
                         }
                         if let Some(path) = installer {
                             done.push(set_installer(&mut vm, path, p)?);
@@ -1738,40 +1818,21 @@ impl App {
                 }
                 s.opencore = opt_path("opencore");
             }
-            Some(Profile::VmappleArm64) => {
-                if f.choice("source") == "ipsw" {
-                    let i = f.text("ipsw");
-                    if i.is_empty() {
-                        bail!("give an IPSW, or latest");
-                    }
-                    s.ipsw = Some(if i == "latest" {
-                        i
-                    } else {
-                        paths::absolute(&i).to_string_lossy().into_owned()
-                    });
-                    s.disk = Some(DiskSource::New {
-                        size_mib: parse_size_mib(&f.text("disk_size")).context("disk size")?,
-                    });
-                } else {
-                    s.bundle = Some(opt_path("bundle").context("give the VM's directory")?);
-                    s.bundle_mode = ImportMode::parse(&f.choice("bundle_mode"))?;
-                }
-            }
-            None => bail!("this host runs no VMs"),
+            None => bail!(crate::host::UNSUPPORTED),
         }
         if f.is_shown("graphics") {
             s.graphics = Some(Graphics::parse(&f.choice("graphics"))?);
         }
-        // Hidden on reims-vgpu, whose one display follows its window: the defaults, which it
-        // honors.
-        if f.is_shown("displays") {
-            s.display.count = f.text("displays").parse().context("displays: a number")?;
+        // Hidden on VMware SVGA, which opens at the firmware's resolution: the default.
+        if f.is_shown("resolution") {
             s.display.resolution = f.text("resolution");
-            s.display.hidpi = f.toggle("hidpi");
         }
         s.display.check()?;
         s.logs = f.toggle("logs");
-        s.ssh_port = ssh_port_field(f)?;
+        s.network = f.toggle("network");
+        if s.network {
+            s.ssh_port = ssh_port_field(f)?;
+        }
         Ok(s)
     }
 
@@ -1892,6 +1953,15 @@ impl App {
                 options,
                 choice,
             }) => draw_confirm(f, area, title, body, options, *choice),
+            Some(Overlay::Usb {
+                vm,
+                devices,
+                choice,
+            }) => {
+                let rows = self.usb_rows(vm, devices);
+                let running = self.rows.iter().any(|r| &r.name == vm && r.pid.is_some());
+                draw_usb(f, area, vm, running, &rows, devices, *choice);
+            }
             // A menu whose VM has left the list closes.
             Some(Overlay::Menu {
                 vm,
@@ -1910,7 +1980,7 @@ impl App {
         let profile = self
             .host
             .default_profile()
-            .map(|p| p.describe().to_string())
+            .map(|p| p.describe(self.host).to_string())
             .unwrap_or_else(|| "no VMs on this host".into());
         let qemu = match &self.qemu {
             Some(q) => Span::styled(q.clone(), Style::new().fg(Color::Green)),
@@ -2036,6 +2106,7 @@ impl App {
                     for w in incompatible
                         .into_iter()
                         .chain(runtime::warnings(vm, self.host))
+                        .chain(usb::problems(vm))
                     {
                         lines.push(Line::from(""));
                         lines.push(Line::from(Span::styled(w, Style::new().fg(Color::Yellow))));
@@ -2098,7 +2169,7 @@ fn key_hints() -> Line<'static> {
 /// A VM's menu: what can be done with it as it is now, each with its label. A VM whose
 /// settings do not load can only be deleted. With `all`, every command, whatever the VM's
 /// state: one that cannot be done now says why on the status line.
-fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
+fn vm_menu(row: &VmRow, all: bool, host: Host) -> Vec<(VmCommand, &'static str)> {
     let vm = row.vm.as_ref().ok();
     if vm.is_none() && !all {
         return vec![(VmCommand::Delete, "Delete…")];
@@ -2114,6 +2185,10 @@ fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
                 VmCommand::Stop => ("Stop", running),
                 VmCommand::PowerOff => ("Power off…", running),
                 VmCommand::Edit => ("Edit settings…", true),
+                VmCommand::Usb => (
+                    "USB devices…",
+                    vm.is_some_and(|vm| usb_available(host, vm).is_ok()),
+                ),
                 VmCommand::ShowCommand => ("Show QEMU command", true),
                 VmCommand::ToggleLogs => match vm.map(|vm| vm.config.logs.enabled) {
                     Some(true) => ("Turn logs off", true),
@@ -2130,6 +2205,21 @@ fn vm_menu(row: &VmRow, all: bool) -> Vec<(VmCommand, &'static str)> {
         .collect()
 }
 
+/// Whether the VM can be given the host's USB devices: an x86-64 VM on a Linux host. Else why
+/// not, to say.
+fn usb_available(host: Host, vm: &Vm) -> Result<(), String> {
+    if host.default_profile().is_none() {
+        return Err(crate::host::UNSUPPORTED.into());
+    }
+    if vm.config.q35.is_none() {
+        return Err(format!(
+            "{}: USB passthrough is for x86-64 VMs on Linux hosts",
+            vm.name()
+        ));
+    }
+    Ok(())
+}
+
 fn gpu_id(g: &crate::vm::Gpu) -> String {
     match (&g.driver_file, g.device_id) {
         (None, _) => "auto".into(),
@@ -2139,7 +2229,7 @@ fn gpu_id(g: &crate::vm::Gpu) -> String {
 }
 
 fn gpu_options(list: &[GpuInfo]) -> Vec<(String, String)> {
-    let mut v = vec![("auto".to_string(), "Automatic (discrete first)".to_string())];
+    let mut v = vec![("auto".to_string(), "Automatic (the fastest)".to_string())];
     for g in list {
         v.push((gpu_id(&g.to_config()), g.label()));
     }
@@ -2160,18 +2250,20 @@ fn gpu_from_choice(id: &str, list: &[GpuInfo]) -> crate::vm::Gpu {
     crate::vm::Gpu {
         driver_file: Some(file.into()),
         device_id: dev,
+        select: None,
         name: None,
     }
 }
 
-const RESOLUTION_HELP: &str =
-    "The guest's first mode: WIDTHxHEIGHT, or host for the host screen's own modes and density.";
+const RESOLUTION_HELP: &str = "The size the window opens at, WIDTHxHEIGHT in the desktop's \
+     points, shrunk to fit the screen; the guest takes the window's size in pixels, and follows \
+     it as you resize it. It starts a HiDPI desktop by itself in a window at least 3840 pixels \
+     wide.";
 
-/// The graphics field's values that show a field of apple-gfx's alone, and one of the library's.
-const APPLE_GFX: &[&str] = &["apple-gfx"];
-const LIBRARY: &[&str] = &["reims-vgpu", "apple-gfx"];
+/// The graphics field's values that show a field of the library's.
+const LIBRARY: &[&str] = &["reims-vgpu"];
 
-/// The graphics choice of an x86-64 VM, at `current`.
+/// The graphics choice of a VM, at `current`.
 fn graphics_field(current: Graphics) -> Field {
     let options = Graphics::ALL.map(|g| (g.id().to_string(), g.describe().to_string()));
     Field::choice(
@@ -2181,45 +2273,10 @@ fn graphics_field(current: Graphics) -> Field {
         current.id(),
         "reims-vgpu is its own GPU device, which macOS drives with the drivers reims-ctl puts in \
          the VM's OpenCore image (after a change to it, U makes the image again): one display, \
-         in a window whose size the guest follows. apple-gfx is Apple's paravirtualized GPU, \
-         with up to 8 displays and the host's video hardware. VMware SVGA is QEMU's: one \
+         in a window whose size the guest follows. VMware SVGA is QEMU's: one \
          display at the firmware's resolution, with no GPU acceleration (macOS has no driver \
          for it), in QEMU's own window.",
     )
-}
-
-const HIDPI_HELP: &str = "Run the mode at twice the density, as a Retina screen does: the desktop \
-     looks like half the mode, so a larger mode makes everything smaller (3840x2160 looks like \
-     1920x1080, 3200x1800 like 1600x900, 2560x1440 like 1280x720). Needs a mode at least 1920 \
-     pixels wide.";
-
-/// The resolution's and HiDPI's help, each ending with what the desktop looks like at the
-/// values the form holds now.
-fn display_help(f: &mut Form) {
-    if !f.is_shown("resolution") || !f.is_shown("hidpi") {
-        return;
-    }
-    let resolution = f.text("resolution");
-    let hidpi = f.toggle("hidpi");
-    let looks_like = |hidpi| {
-        crate::vm::Display {
-            resolution: resolution.clone(),
-            hidpi,
-            ..Default::default()
-        }
-        .looks_like()
-    };
-    let now = match (parse_resolution(&resolution), looks_like(true)) {
-        _ if resolution == "host" && hidpi => {
-            "host takes the host screen's own density: turn HiDPI off.".to_string()
-        }
-        (Ok(_), Some((w, h))) if hidpi => format!("Now {resolution} looks like {w}x{h}."),
-        (Ok(_), Some((w, h))) => format!("At HiDPI, {resolution} would look like {w}x{h}."),
-        (Ok((w, _)), None) if hidpi => format!("{w} pixels wide is narrower than 1920."),
-        _ => String::new(),
-    };
-    f.set_help("resolution", &format!("{RESOLUTION_HELP} {now}"));
-    f.set_help("hidpi", &format!("{HIDPI_HELP} {now}"));
 }
 
 /// The VM's installer as the edit form shows it: its full path, or empty.
@@ -2279,18 +2336,11 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
     {
         q.disk_controller = DiskController::parse(&f.choice("disk_controller"))?;
     }
-    // Hidden on reims-vgpu and VMware SVGA, the displays' settings stay as they were for
-    // apple-gfx; borderless is reims-vgpu's too.
-    if f.is_shown("displays") {
-        c.display.count = f.text("displays").parse().context("displays: a number")?;
+    // Hidden on VMware SVGA, the resolution, the window's first size, and borderless stay as
+    // they were.
+    if f.is_shown("resolution") {
         c.display.resolution = f.text("resolution");
-        c.display.hidpi = f.toggle("hidpi");
-        let r = f.text("refresh");
-        c.display.refresh = if r.is_empty() {
-            None
-        } else {
-            Some(r.parse().context("refresh rate: a number")?)
-        };
+        c.display.check()?;
     }
     if f.is_shown("borderless") {
         c.display.borderless = f.toggle("borderless");
@@ -2300,10 +2350,6 @@ fn apply_edit(vm: &mut Vm, f: &Form, gpus: Option<&[GpuInfo]>) -> Result<()> {
         if id != gpu_id(&c.gpu) {
             c.gpu = gpu_from_choice(&id, gpus.unwrap_or(&[]));
         }
-    }
-    // Hidden on reims-vgpu and VMware SVGA, which have no video devices, it stays as it was.
-    if f.is_shown("video_acceleration") {
-        c.video_acceleration = f.toggle("video_acceleration");
     }
     c.audio.enabled = f.toggle("audio");
     c.logs.enabled = f.toggle("logs");
@@ -2340,39 +2386,17 @@ fn ssh_port_field(f: &Form) -> Result<Option<u16>> {
     Ok(crate::vm::ssh_port(p))
 }
 
-/// Runs less on `files`, each at its end, as system(3) runs a command: Ctrl+C and Ctrl+\ reach
-/// the terminal's whole foreground process group, so reims-ctl ignores them until less exits,
-/// and less gets them as it would from a shell.
+/// Runs less on `files`, each at its end, in the terminal ([`crate::os::run_in_terminal`]).
 fn run_less(files: &[PathBuf]) -> std::io::Result<std::process::ExitStatus> {
-    use std::os::unix::process::CommandExt;
     let mut cmd = std::process::Command::new("less");
     cmd.arg("++G").args(files);
-    // SAFETY: only signal, which is async-signal-safe, between fork and exec.
-    unsafe {
-        cmd.pre_exec(|| {
-            libc::signal(libc::SIGINT, libc::SIG_DFL);
-            libc::signal(libc::SIGQUIT, libc::SIG_DFL);
-            Ok(())
-        });
-    }
-    // SAFETY: dispositions set to ignore, then back to what they were.
-    let (int, quit) = unsafe {
-        (
-            libc::signal(libc::SIGINT, libc::SIG_IGN),
-            libc::signal(libc::SIGQUIT, libc::SIG_IGN),
-        )
-    };
-    let status = cmd.status();
-    unsafe {
-        libc::signal(libc::SIGINT, int);
-        libc::signal(libc::SIGQUIT, quit);
-    }
-    status
+    crate::os::run_in_terminal(cmd)
 }
 
 /// Has the terminal report the mouse's buttons and wheel, or stop: X11's reports (mode 1000)
 /// in SGR's form (1006), which holds any column. Not the mouse moving, which nothing here
 /// reads.
+#[cfg(unix)]
 fn report_mouse(on: bool) -> std::io::Result<()> {
     use std::io::Write;
     let mut out = std::io::stdout();
@@ -2382,6 +2406,21 @@ fn report_mouse(on: bool) -> std::io::Result<()> {
         b"\x1b[?1006l\x1b[?1000l"
     })?;
     out.flush()
+}
+
+/// Has the console report the mouse, or stop: on Windows crossterm reads the mouse from the
+/// console's mouse records, which come only while its mouse input is on (crossterm's mouse
+/// capture), the mouse moving among them. A stop where it was never on fails, which is no
+/// matter.
+#[cfg(windows)]
+fn report_mouse(on: bool) -> std::io::Result<()> {
+    use ratatui::crossterm::event::{DisableMouseCapture, EnableMouseCapture};
+    if on {
+        execute!(std::io::stdout(), EnableMouseCapture)
+    } else {
+        let _ = execute!(std::io::stdout(), DisableMouseCapture);
+        Ok(())
+    }
 }
 
 /// Has a terminal that speaks kitty's keyboard protocol report keys its way, or stop: pushes
@@ -2424,15 +2463,15 @@ fn copy_to_clipboard(s: &str) -> Option<&'static str> {
 }
 
 const HELP: &str = "\
-reims-ctl runs macOS VMs on QEMU with reims-vgpu: each VM's displays open in windows of their own.
-An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
+reims-ctl runs x86-64 macOS VMs on QEMU with reims-vgpu: each VM's display opens in a window of
+its own. A VM runs reims-vgpu's own GPU device unless its settings choose another (e, graphics).
 
   ↑ ↓ / j k   choose a VM, or click it
   Enter       open its menu: what can be done with it now, each with its key. A right
               click on a VM opens its menu too. Hold Ctrl as you press Enter or right click
               for a menu of everything, whether it can be done now or not (Ctrl-Enter needs
               a terminal that tells it from Enter, such as kitty, foot or Ghostty on a Mac)
-  n           create a VM. On Linux, choose a macOS version: reims-ctl downloads its
+  n           create a VM. Choose a macOS version: reims-ctl downloads its
               installer from Apple and makes the VM's OpenCore image and disk, and the VM
               boots into the installer; its details then say how to install macOS. The form
               stays open until the VM is made, and shows what failed, to fix and create again;
@@ -2441,18 +2480,18 @@ An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another
   x           stop it: the guest is asked to shut down, and powered off if it has not
               when its shutdown timeout ends (edit e to change it)
   K           kill it: power it off at once
-  e           edit its settings: CPUs, memory, displays, resolution, HiDPI, borderless,
-              GPU, video acceleration (the host's hardware video decode, encode and
-              scaling), audio, network, logs, extra QEMU arguments (they apply at its next
-              start), and on x86-64 its disk controller (SATA, or NVMe once macOS is
-              installed), its installer image, its boot selection (OpenCore's picker, which
-              makes it a new OpenCore image) and graphics: reims-vgpu, its own GPU device,
-              on one display in a window whose size the guest follows, with the macOS
-              drivers reims-ctl puts in its OpenCore image (U after a change); apple-gfx,
-              Apple's paravirtualized GPU, with up to 8 displays and the host's video
-              hardware; or QEMU's VMware SVGA, one display with no GPU acceleration, in
-              QEMU's own window. Displays, resolution, HiDPI, refresh rate and video
-              acceleration are apple-gfx's
+  e           edit its settings: CPUs, memory, resolution, borderless, GPU, audio,
+              network, logs, extra QEMU arguments (they apply at its next start), its disk
+              controller (SATA or NVMe), its installer image, its boot selection
+              (OpenCore's picker, which makes it a new OpenCore image) and
+              graphics: reims-vgpu, its own GPU device, on one display in a window whose
+              size the guest follows, with the macOS drivers reims-ctl puts in its OpenCore
+              image (made again on a change); or QEMU's VMware SVGA, one display with no GPU
+              acceleration, in QEMU's own window. Resolution, borderless and GPU are
+              reims-vgpu's
+  p           give it this host's USB devices: Space gives the selected one to
+              the guest or takes it back, at once while the VM runs; a device you gave it
+              joins the guest when it is plugged in. More in reims-ctl usb --help
   c           show the QEMU command it runs, to write as launch.sh (w) or copy (y):
               run it yourself, without reims-ctl
   v           show a running VM's screen here, in the terminal, and use its keyboard and
@@ -2463,12 +2502,10 @@ An x86-64 VM runs reims-vgpu's own GPU device unless its settings choose another
   b           write a bug report: its logs, settings, command and this host's details,
               zipped into your Downloads folder
   d           delete it
-  U           make it a new OpenCore image (x86-64) with the installed reims-util, presenting
-              the same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
-              device that this reims-ctl carries, which an image made for apple-gfx or by an
-              older reims-ctl lacks; on apple-gfx with ReimsVgpu.kext, which an older image
-              lacks and macOS 26 needs for displays wider than 2048 pixels and GPU-accelerated
-              Chrome
+  U           make it a new OpenCore image with the installed reims-util, presenting the
+              same Mac, for its graphics: on reims-vgpu with the macOS drivers of its GPU
+              device that this reims-ctl carries, which an image an older reims-ctl made
+              lacks
   u           update reims-ctl and QEMU from your reims-vgpu checkout
   r           reload the list
   ?           this help
@@ -2578,6 +2615,112 @@ fn draw_confirm(
         spans.push(Span::raw("  "));
     }
     f.render_widget(Paragraph::new(Line::from(spans)), o);
+}
+
+/// Draws the USB devices' view of the VM `vm`: each of `rows` with a box checked where the VM
+/// has the device, its name, IDs and notes, `choice` highlighted, and what lets QEMU open the
+/// devices this user can't.
+fn draw_usb(
+    f: &mut Frame,
+    area: Rect,
+    vm: &str,
+    running: bool,
+    rows: &[usb::Row],
+    devices: &[usb::HostDevice],
+    choice: usize,
+) {
+    let width = area.width.saturating_sub(4).min(100);
+    let inner_w = width.saturating_sub(4) as usize;
+    let mut lines: Vec<Line> = Vec::new();
+    let when = if running {
+        "at once, while it runs"
+    } else {
+        "from its next start"
+    };
+    lines.push(
+        Line::from(format!(
+            "This host's USB devices. One you give {vm} is the guest's, {when}, until the VM \
+             stops or you take it back; one not plugged in joins the guest when it is."
+        ))
+        .dim(),
+    );
+    lines.push(Line::from(""));
+    let first_row = lines.len();
+    if rows.is_empty() {
+        lines.push(Line::from(
+            "No USB devices are plugged into this host, other than hubs.",
+        ));
+    }
+    let name_w = rows
+        .iter()
+        .map(|r| r.name().chars().count())
+        .max()
+        .unwrap_or(0)
+        .min(inner_w.saturating_sub(24).clamp(12, 44));
+    let mut closed = false;
+    for (i, r) in rows.iter().enumerate() {
+        let mut name: String = r.name().chars().take(name_w).collect();
+        if r.name().chars().count() > name_w {
+            name.pop();
+            name.push('…');
+        }
+        let notes = r.notes(devices);
+        closed |= r.device.as_ref().is_some_and(|d| !d.usable());
+        let text = format!(
+            "{} [{}] {name:<name_w$}  {}{}",
+            if i == choice { "›" } else { " " },
+            if r.chosen.is_some() { "x" } else { " " },
+            r.id(),
+            if notes.is_empty() {
+                String::new()
+            } else {
+                format!("  {}", notes.join(", "))
+            }
+        );
+        lines.push(if i == choice {
+            Line::from(text).style(Style::new().fg(Color::Black).bg(Color::Cyan))
+        } else if r.device.is_none() {
+            Line::from(text).dim()
+        } else {
+            Line::from(text)
+        });
+    }
+    lines.push(Line::from(""));
+    if closed {
+        lines.push(
+            Line::from(format!("QEMU can't open what you can't: {}.", usb::fix()))
+                .style(Style::new().fg(Color::Yellow)),
+        );
+    }
+    lines.push(
+        Line::from(format!(
+            "Space give or take back · r rescan · Esc close · up to {} devices a VM",
+            crate::vm::USB_DEVICES_MAX
+        ))
+        .dim(),
+    );
+    // Rows wrap to the popup's width; the highlighted one stays in sight.
+    let rows_of = |l: &Line| (l.width().max(1)).div_ceil(inner_w.max(1)) as u16;
+    let need: u16 = lines.iter().map(rows_of).sum::<u16>() + 2;
+    let height = need.min(area.height);
+    let popup = area.centered(Constraint::Length(width), Constraint::Length(height));
+    f.render_widget(Clear, popup);
+    let block = Block::bordered()
+        .title(Line::from(format!(" {vm}: USB devices ")).bold())
+        .border_style(Style::new().fg(Color::Cyan));
+    let body = block.inner(popup);
+    let above: u16 = lines[..first_row + choice.min(rows.len().saturating_sub(1))]
+        .iter()
+        .map(rows_of)
+        .sum();
+    let scroll = (above + 1).saturating_sub(body.height);
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false })
+            .scroll((scroll, 0)),
+        popup,
+    );
 }
 
 /// Draws a VM's menu below the cell `at`, or above it where the screen has no room below,
@@ -2742,8 +2885,8 @@ mod tests {
         assert!(key_hints().width() <= 80);
     }
 
-    /// A stopped VM's row, x86-64 or arm64, whose files do not exist.
-    fn vm_row(name: &str, q35: bool) -> VmRow {
+    /// A stopped VM's row, whose files do not exist.
+    fn vm_row(name: &str) -> VmRow {
         let config = format!(
             r#"
             name = "{name}"
@@ -2758,14 +2901,10 @@ mod tests {
             "#
         );
         let dir = std::env::temp_dir().join(format!("reims-ctl-tui-{}-{name}", std::process::id()));
-        let mut vm = Vm {
+        let vm = Vm {
             dir: dir.clone(),
             config: toml::from_str(&config).unwrap(),
         };
-        if !q35 {
-            vm.config.profile = Profile::VmappleArm64;
-            vm.config.q35 = None;
-        }
         VmRow {
             name: name.into(),
             dir,
@@ -2810,53 +2949,142 @@ mod tests {
         }
     }
 
+    const LINUX: Host = Host {
+        os: Os::Linux,
+        arch: Arch::X86_64,
+    };
+
     #[test]
     fn a_vms_menu_holds_what_can_be_done_with_it_now() {
         use VmCommand::*;
-        let commands = |r: &VmRow| vm_menu(r, false).iter().map(|it| it.0).collect::<Vec<_>>();
+        let commands = |r: &VmRow| {
+            vm_menu(r, false, LINUX)
+                .iter()
+                .map(|it| it.0)
+                .collect::<Vec<_>>()
+        };
         let every = [ShowCommand, ToggleLogs, ViewLogs, Report];
-        let stopped = [&[Start, Edit][..], &every, &[UpdateOpencore, Delete]].concat();
-        assert_eq!(commands(&vm_row("t", true)), stopped);
-        let mut running = vm_row("t", true);
+        let stopped = [&[Start, Edit, Usb][..], &every, &[UpdateOpencore, Delete]].concat();
+        assert_eq!(commands(&vm_row("t")), stopped);
+        let mut running = vm_row("t");
         running.pid = Some(1);
-        let running_menu = [&[View, Stop, PowerOff, Edit][..], &every].concat();
+        let running_menu = [&[View, Stop, PowerOff, Edit, Usb][..], &every].concat();
         assert_eq!(commands(&running), running_menu);
-        // Only x86-64 VMs boot OpenCore.
-        let arm64 = [&[Start, Edit][..], &every, &[Delete]].concat();
-        assert_eq!(commands(&vm_row("t", false)), arm64);
+        // A Mac passes no USB device through.
+        let mac = Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        };
+        assert!(
+            !vm_menu(&vm_row("t"), false, mac)
+                .iter()
+                .any(|it| it.0 == Usb)
+        );
         let broken = VmRow {
             vm: Err("parse vm.toml".into()),
-            ..vm_row("t", true)
+            ..vm_row("t")
         };
         assert_eq!(commands(&broken), [Delete]);
 
-        let mut row = vm_row("t", true);
-        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs on")));
+        let mut row = vm_row("t");
+        assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs on")));
         row.vm.as_mut().unwrap().config.logs.enabled = true;
-        assert!(vm_menu(&row, false).contains(&(ToggleLogs, "Turn logs off")));
+        assert!(vm_menu(&row, false, LINUX).contains(&(ToggleLogs, "Turn logs off")));
 
         // The menu of everything holds every command, whatever the VM's state.
         let each = VmCommand::ALL.map(|c| c.0);
-        for row in [&vm_row("t", true), &running, &vm_row("t", false), &broken] {
-            let all = vm_menu(row, true);
+        for row in [&vm_row("t"), &running, &broken] {
+            let all = vm_menu(row, true, LINUX);
             assert_eq!(all.iter().map(|it| it.0).collect::<Vec<_>>(), each);
             // Each item is labelled as in the menu of what can be done now.
-            for it in vm_menu(row, false) {
+            for it in vm_menu(row, false, LINUX) {
                 assert!(all.contains(&it), "{it:?}");
             }
         }
-        assert!(vm_menu(&broken, true).contains(&(ToggleLogs, "Turn logs on or off")));
+        assert!(vm_menu(&broken, true, LINUX).contains(&(ToggleLogs, "Turn logs on or off")));
     }
 
-    /// An x86-64 VM's edit form offers its disk's controller as its settings have it, and saves
-    /// the one picked; an arm64 VM's form has none.
+    /// p opens a VM's USB devices: a device it was given that is not plugged in shows checked,
+    /// after the host's devices, and Space takes it back, in its settings as they are now. A
+    /// Mac host says why it has none.
     #[test]
-    fn the_edit_form_picks_an_x86_64_vms_disk_controller() {
-        let mut nvme = vm_row("n", true);
+    fn the_usb_view_takes_back_a_device_not_plugged_in() {
+        let env = crate::testenv::Env::new("tui-usb");
+        let dir = env.root.join("vms/t");
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut vm = vm_row("t").vm.unwrap();
+        vm.dir = dir.clone();
+        vm.config.usb = vec![crate::vm::UsbDevice {
+            id: "fffe:0001".into(),
+            port: None,
+            name: "Gadget Away".into(),
+        }];
+        vm.save().unwrap();
+        let mut reg = Registry::default();
+        reg.add("t", &dir).unwrap();
+        reg.save().unwrap();
+
+        let mut app = App::with(Host {
+            os: Os::Mac,
+            arch: Arch::Aarch64,
+        });
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('p')]);
+        assert!(app.overlay.is_none());
+        assert_eq!(app.status.as_ref().unwrap().0, crate::host::UNSUPPORTED);
+
+        let mut app = App::with(LINUX);
+        app.reload().unwrap();
+        press(&mut app, [KeyCode::Char('p')]);
+        let Some(Overlay::Usb { devices, .. }) = &app.overlay else {
+            panic!("no USB view");
+        };
+        let devices = devices.clone();
+        let rows = app.usb_rows("t", &devices);
+        let away = rows.len() - 1;
+        assert_eq!(rows[away].name(), "Gadget Away");
+        assert!(rows[away].chosen.is_some() && rows[away].device.is_none());
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
+        terminal.draw(|f| app.draw(f)).unwrap();
+        let buf = terminal.backend().buffer().clone();
+        let at = find(&buf, buf.area, "[x] Gadget Away").expect("the device's row");
+        let row: String = (at.x..buf.area.right())
+            .map(|x| buf[(x, at.y)].symbol().to_string())
+            .collect();
+        assert!(row.contains("fffe:0001  not plugged in"), "{row}");
+
+        // Edited meanwhile, as by reims-ctl set: the change keeps it.
+        let mut now = Vm::load(&dir).unwrap();
+        now.config.cpus = 3;
+        now.save().unwrap();
+        press(&mut app, [KeyCode::End, KeyCode::Char(' ')]);
+        let saved = Vm::load(&dir).unwrap().config;
+        assert!(saved.usb.is_empty(), "{:?}", saved.usb);
+        assert_eq!(saved.cpus, 3);
+        assert!(
+            app.status
+                .as_ref()
+                .unwrap()
+                .0
+                .contains("Gadget Away is no longer chosen"),
+            "{:?}",
+            app.status.as_ref().map(|s| &s.0)
+        );
+        assert!(matches!(app.overlay, Some(Overlay::Usb { .. })));
+        press(&mut app, [KeyCode::Esc]);
+        assert!(app.overlay.is_none());
+    }
+
+    /// A VM's edit form offers its disk's controller as its settings have it, and saves the one
+    /// picked.
+    #[test]
+    fn the_edit_form_picks_a_vms_disk_controller() {
+        let mut nvme = vm_row("n");
         let q = nvme.vm.as_mut().unwrap().config.q35.as_mut().unwrap();
         q.disk_controller = DiskController::Nvme;
-        let mut app = test_app(vec![vm_row("t", true), vm_row("a", false), nvme]);
-        app.table.select(Some(2));
+        let mut app = test_app(vec![vm_row("t"), nvme]);
+        app.table.select(Some(1));
         app.open_edit();
         assert_eq!(form(&app).choice("disk_controller"), "nvme");
         app.overlay = None;
@@ -2870,91 +3098,26 @@ mod tests {
             press(&mut app, [KeyCode::Down]);
         }
         press(&mut app, [KeyCode::Right]);
-        let mut vm = vm_row("t", true).vm.unwrap();
+        let mut vm = vm_row("t").vm.unwrap();
         apply_edit(&mut vm, form(&app), None).unwrap();
         assert_eq!(vm.config.q35.unwrap().disk_controller, DiskController::Nvme);
-
-        app.overlay = None;
-        app.table.select(Some(1));
-        app.open_edit();
-        assert!(!form(&app).is_shown("disk_controller"));
     }
 
-    /// The edit form turns video acceleration off on apple-gfx, on either kind of VM, and has no
-    /// such field on reims-vgpu or VMware SVGA, which have no video devices, whose setting stays
-    /// as it was.
+    /// A VM's edit form shows the resolution and borderless on reims-vgpu, and hides them on
+    /// VMware SVGA, whose settings keep them as they were.
     #[test]
-    fn the_edit_form_turns_video_acceleration_off() {
-        let mut apple = vm_row("t", true);
-        apple.vm.as_mut().unwrap().config.graphics = Some(Graphics::AppleGfx);
-        let mut svga = vm_row("s", true);
-        let c = &mut svga.vm.as_mut().unwrap().config;
-        c.graphics = Some(Graphics::VmwareSvga);
-        c.video_acceleration = false;
-        let mut arm64 = vm_row("a", false);
-        arm64.vm.as_mut().unwrap().config.vmapple = Some(crate::vm::Vmapple {
-            aux: "aux.img".into(),
-            ecid: 1234,
-        });
-        let mut reims = vm_row("r", true);
-        reims.vm.as_mut().unwrap().config.video_acceleration = false;
-        let mut app = test_app(vec![apple, arm64, svga, reims]);
-        for row in [0, 1] {
-            app.overlay = None;
-            app.table.select(Some(row));
-            app.open_edit();
-            assert!(form(&app).toggle("video_acceleration"));
-            for _ in 0..form(&app).fields.len() {
-                if form(&app).focused_key() == "video_acceleration" {
-                    break;
-                }
-                press(&mut app, [KeyCode::Down]);
-            }
-            press(&mut app, [KeyCode::Right]);
-            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
-            apply_edit(&mut vm, form(&app), None).unwrap();
-            assert!(!vm.config.video_acceleration);
-        }
-
-        for row in [2, 3] {
-            app.overlay = None;
-            app.table.select(Some(row));
-            app.open_edit();
-            assert!(!form(&app).is_shown("video_acceleration"));
-            let mut vm = app.rows[row].vm.as_ref().unwrap().clone();
-            vm.config.video_acceleration = true;
-            apply_edit(&mut vm, form(&app), None).unwrap();
-            assert!(
-                vm.config.video_acceleration,
-                "a hidden field changes nothing"
-            );
-        }
-    }
-
-    /// An x86-64 VM whose settings name no graphics is on reims-vgpu, whose edit form shows
-    /// borderless alone of the displays' settings, which stay as they were for apple-gfx;
-    /// choosing apple-gfx shows them, and saves it by name.
-    #[test]
-    fn the_edit_form_shows_reims_vgpu_its_display_settings_alone() {
-        let mut row = vm_row("t", true);
+    fn the_edit_form_shows_reims_vgpu_its_display_settings() {
+        let mut row = vm_row("t");
         let c = &mut row.vm.as_mut().unwrap().config;
-        c.display.count = 3;
-        c.display.hidpi = true;
+        c.graphics = None;
         c.display.resolution = "3840x2160".into();
         let mut app = test_app(vec![row]);
         app.open_edit();
         assert_eq!(form(&app).choice("graphics"), "reims-vgpu");
-        for hidden in ["displays", "resolution", "hidpi", "refresh"] {
-            assert!(!form(&app).is_shown(hidden), "{hidden}");
-        }
-        assert!(form(&app).is_shown("borderless"));
+        assert!(form(&app).is_shown("borderless") && form(&app).is_shown("resolution"));
         let mut vm = app.rows[0].vm.as_ref().unwrap().clone();
         apply_edit(&mut vm, form(&app), None).unwrap();
         assert_eq!(vm.config.graphics, Some(Graphics::ReimsVgpu));
-        assert_eq!(
-            (vm.config.display.count, vm.config.display.hidpi),
-            (3, true)
-        );
         for _ in 0..form(&app).fields.len() {
             if form(&app).focused_key() == "graphics" {
                 break;
@@ -2962,16 +3125,20 @@ mod tests {
             press(&mut app, [KeyCode::Down]);
         }
         press(&mut app, [KeyCode::Right]);
-        assert_eq!(form(&app).choice("graphics"), "apple-gfx");
-        assert!(form(&app).is_shown("displays") && form(&app).is_shown("hidpi"));
+        assert_eq!(form(&app).choice("graphics"), "vmware-svga");
+        assert!(!form(&app).is_shown("borderless") && !form(&app).is_shown("resolution"));
+        vm.config.display.resolution = "1280x720".into();
         apply_edit(&mut vm, form(&app), None).unwrap();
-        assert_eq!(vm.config.graphics, Some(Graphics::AppleGfx));
-        assert_eq!(vm.config.display.count, 3);
+        assert_eq!(vm.config.graphics, Some(Graphics::VmwareSvga));
+        assert_eq!(
+            vm.config.display.resolution, "1280x720",
+            "a hidden field changes nothing"
+        );
     }
 
     #[test]
     fn ctrl_with_enter_or_a_right_click_opens_the_menu_of_everything() {
-        let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+        let mut app = test_app(vec![vm_row("alpha"), vm_row("beta")]);
         app.rows[0].pid = Some(1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
@@ -2994,21 +3161,28 @@ mod tests {
         let said = app.status.as_ref().map(|s| s.0.as_str());
         assert_eq!(said, Some("alpha is running: stop it first"));
 
-        // A Ctrl right click: an arm64 VM's menu holds the OpenCore image's item too. A right
-        // click without Ctrl, on the same VM, opens its menu of what can be done now.
+        // A Ctrl right click: a stopped VM's menu holds a running VM's items too. A right click
+        // without Ctrl, on the same VM, opens its menu of what can be done now.
         let mut ctrl_click = mouse(MouseEventKind::Down(MouseButton::Right), beta);
         ctrl_click.modifiers = KeyModifiers::CONTROL;
         app.mouse(ctrl_click);
         assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: true, .. }) if vm == "beta"));
         let screen = draw(&mut app);
-        assert!(find(&screen, app.menu_area, "Make a new OpenCore image…").is_some());
+        assert!(find(&screen, app.menu_area, "View screen in terminal").is_some());
         app.mouse(mouse(MouseEventKind::Down(MouseButton::Right), beta));
         assert!(matches!(&app.overlay, Some(Overlay::Menu { vm, all: false, .. }) if vm == "beta"));
+        let screen = draw(&mut app);
+        assert_eq!(
+            find(&screen, app.menu_area, "View screen in terminal"),
+            None
+        );
     }
 
     #[test]
     fn a_right_click_or_enter_opens_a_vms_menu_whose_items_do_their_commands() {
-        let mut app = test_app(vec![vm_row("alpha", true), vm_row("beta", false)]);
+        let mut app = test_app(vec![vm_row("alpha"), vm_row("beta")]);
+        // A running VM's menu has no OpenCore image item.
+        app.rows[1].pid = Some(1);
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(120, 30)).unwrap();
         let mut draw = |app: &mut App| {
@@ -3112,13 +3286,14 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let config = r#"
             name = "t"
-            profile = "vmapple-arm64"
+            profile = "q35-x86_64"
             cpus = 2
             memory_mib = 4096
-            disk = "disk.img"
-            [vmapple]
-            aux = "aux.img"
-            ecid = 1
+            disk = "disk.qcow2"
+            [q35]
+            opencore = "opencore.qcow2"
+            firmware_code = "OVMF_CODE.fd"
+            firmware_vars = "OVMF_VARS.fd"
         "#;
         std::fs::write(dir.join(crate::vm::CONFIG_FILE), config).unwrap();
         let mut reg = Registry::default();
@@ -3133,41 +3308,5 @@ mod tests {
         let saved = Vm::load(&dir).unwrap().config;
         assert!(saved.logs.enabled);
         assert_eq!(saved.memory_mib, 8192);
-    }
-
-    #[test]
-    fn display_help_says_what_the_desktop_looks_like() {
-        let now = |resolution: &str, hidpi: bool| {
-            let mut f = Form::new(
-                "t",
-                "save",
-                vec![
-                    Field::text("resolution", "Resolution", resolution, RESOLUTION_HELP),
-                    Field::toggle("hidpi", "HiDPI", hidpi, HIDPI_HELP),
-                ],
-            );
-            display_help(&mut f);
-            assert_eq!(
-                f.help("resolution").strip_prefix(RESOLUTION_HELP),
-                f.help("hidpi").strip_prefix(HIDPI_HELP)
-            );
-            f.help("hidpi")[HIDPI_HELP.len()..].trim().to_string()
-        };
-        assert_eq!(now("3200x1800", true), "Now 3200x1800 looks like 1600x900.");
-        assert_eq!(
-            now("3840x2160", false),
-            "At HiDPI, 3840x2160 would look like 1920x1080."
-        );
-        assert_eq!(
-            now("1280x800", true),
-            "1280 pixels wide is narrower than 1920."
-        );
-        assert_eq!(now("1280x800", false), "");
-        assert_eq!(
-            now("host", true),
-            "host takes the host screen's own density: turn HiDPI off."
-        );
-        assert_eq!(now("host", false), "");
-        assert_eq!(now("19x", true), "");
     }
 }

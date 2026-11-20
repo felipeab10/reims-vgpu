@@ -11,12 +11,26 @@
 //!   nothing (`graphics.rs`'s `carry_out`).
 //! - **Threads.** A lane with work has one thread of its own, made as a job comes and none is
 //!   running. A job that comes while every thread of the lane is busy may get the lane another,
-//!   up to [`LANE_THREADS`] in all, where the device's budget of such threads ([`Budget`]) has one
-//!   to spare; a lane never waits for the budget, so those threads add speed and nothing else, and
-//!   a device of many busy queues holds one thread a busy lane and the budget's at most.
+//!   where the device's budget of such threads ([`Budget`]) has one to spare; a lane never waits
+//!   for the budget, so those threads add speed and nothing else, and a device of many busy queues
+//!   holds one thread a busy lane and the budget's at most.
+//! - **Walking and waiting.** At most [`LANE_THREADS`] of a lane's jobs walk at once. A job that
+//!   waits for what is committed before its command buffer (its turn, its tickets in the commit
+//!   order, the buffers its `COMMIT_ORDER` names, a split of its context) waits in
+//!   [`Lane::waiting`], and is not among those meanwhile: the lane starts its next job on another
+//!   thread, so a long walk starts as its buffer comes, not once the buffers before it commit, up
+//!   to [`LANE_MOST`] threads a lane. Counted while they waited, the four threads of Valley's GL
+//!   queue each held a job 79% of the run, at 92% of its buffers' arrivals all four did and 23
+//!   buffers waited behind them (the median), 65.5% of its jobs ended within 1 ms of the job
+//!   before them, waiting for their turns, and a walk started 177 ms after the host took its
+//!   buffer at the median (Unigine Valley at 1920 x 1080, RX 7900 XTX host; measured). Counted
+//!   only while they walk, the walk started 12.4 ms after it at the median and 47.4 ms at the
+//!   90th percentile, where it had been 448 ms, and Valley ran at 23.9 frames a second where it
+//!   had run at 17.6 (the same host and settings; measured). The waits, and so every commit and
+//!   record, are where they were: only the threads that run ahead changed.
 //! - **Which thread takes a job.** A job goes to the lane's thread that went idle last, so the
 //!   jobs of a lane that needs one thread at a time stay on one thread, and a thread goes once it
-//!   has had no job for [`KEEP`](reims_graphics::keep::KEEP), 10 s: the threads a steady load runs
+//!   has had no job for [`KEEP`](reims_vgpu_graphics::keep::KEEP), 10 s: the threads a steady load runs
 //!   at once stay through its pauses, those only a burst of jobs made go 10 s after the burst, and
 //!   a burst after that grows the lane again as the first did. A thread that goes gives back the
 //!   budget's thread first, so the lane's own is the last to go. Woken in turn instead, the
@@ -25,11 +39,28 @@
 //!   cores alone, and its walks took 13.4 ms of CPU a frame where two threads took 10.4 ms
 //!   (game_6000 at 92.7 against 105.6 fps, on a Core Ultra 9 275HX host with an RTX 5080 Laptop
 //!   GPU; measured).
-//! - **Hints.** Each thread gives the scheduler the FIFO thread's hints as it starts
-//!   ([`Threads::give_fifo_hints`]): a walk's speed is the frame rate, as a FIFO thread's is. On
-//!   Linux that is a utilization floor of the CPU's full capacity, which the kernel's
-//!   capacity-aware scheduling reads on a hybrid processor without SMT (the Vulkan platform's
-//!   `os/linux/hints.rs`). Started with nothing but its creator's settings, one walk thread of
+//! - **Woken as the buffer is begun.** A buffer whose walk goes to the lane (one longer than the
+//!   service thread walks itself) has the lane's thread that went idle last woken as its turn is
+//!   taken, before the rest of its begin ([`Lane::expect`]), and the thread waits for the job,
+//!   spinning for at most [`EXPECT_SPIN`], so its wake is made while the service thread begins
+//!   the buffer rather than after. Woken at the hand-off, the 4092 buffers Geekbench 7.1's
+//!   Super Resolution hands to its lanes waited 10.1 µs at the median, 58.0 ms of the pass, from
+//!   the hand-off to their walk's start, nearly all of it the parked thread's wake, against
+//!   9.6 µs at the median for the begin before it; woken as begun, 4.2 µs and 36.0 ms. The
+//!   wake's call moved into the begin (9.1 ms more of it), and the pass's 6296 buffers went from
+//!   their take to their walk's start in 123.9 ms where they took 136.7, 12.8 ± 3.7 ms sooner
+//!   (8 paired slices); over the benchmark's 11 workloads, 22.0 ± 6.5 ms sooner, for 27.1 ms of
+//!   spins, 4.1 µs at the median (Iris Xe host, m3-max-30439 against m3-max-30453; measured).
+//!   Only a thread woken for a job that is to come spins, and only until it comes, its buffer
+//!   is carried out where it was begun ([`Lane::withdraw`]), the lane closes, or the bound
+//!   passes; the jobs, their order and their turns are as they were.
+//! - **Hints.** Each thread gives the scheduler the walk hints as it starts
+//!   ([`Threads::give_walk_hints`]): a walk's speed is the frame rate. On Linux that is a
+//!   utilization floor of the CPU's full capacity, which the kernel's capacity-aware scheduling
+//!   reads on a hybrid processor without SMT (the Vulkan platform's `os/linux/hints.rs`); on
+//!   macOS the user-initiated QoS class, QEMU's HVF vCPU threads' own, above the default class a
+//!   host build runs at (`os/macos/hints.rs`).
+//!   Started with nothing but its creator's settings, one walk thread of
 //!   game_6000's queue ran on the efficiency cores alone in 5 of 19 runs, the second of car 13's
 //!   base's two among them, whose walks then ran 45% of their instructions on those cores where
 //!   car 11's two threads ran 37% (Core Ultra 9 275HX, the guest's eight vCPU threads busy on
@@ -45,18 +76,54 @@
 //!   threads take its jobs in the order they were begun, so the lane's own thread is always at
 //!   or past its first unfinished job, and the device's first unfinished one always runs: the
 //!   waits end. Threads only shared between queues could all be held by later jobs waiting for
-//!   an earlier one not yet started.
+//!   an earlier one not yet started. A job held back by the walks' limit is later than every job
+//!   started, so it holds none of their waits.
 
-use std::collections::{BTreeSet, VecDeque};
+use std::cell::Cell;
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
-use reims_vgpu_core::platform::os::Threads;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::os::Threads;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex, MutexGuard};
 
-/// The most threads a lane runs its jobs on at once: its own and the budget's.
-pub(crate) const LANE_THREADS: usize = 4;
+/// The most of a lane's jobs that walk at once, on its own thread and the budget's: those that
+/// wait for what is committed before them ([`Lane::waiting`]) are not counted. Eight: at four, a
+/// buffer of Valley's GL queue waited 8.6 ms for a walker at the median and 36 ms at the 90th
+/// percentile, three walked as it came at the median and four at the 90th; at eight it waited
+/// 0.03 and 0.05 ms, three walked at the median and five at the 90th (1920 x 1080, RX 7900 XTX
+/// host, the device's trace on; measured). Valley's rate is the same at both: with the trace off,
+/// on metal2vulkan 30a5a88ef6's runtime, one run each (potluck jobs m3-max-21602 at eight and
+/// m3-max-21604 at four), the device presented 15.5 and 15.6 frames a second over Valley's run,
+/// with 127 and 140 gaps of 100 ms or more between frames, 9% fewer at eight (measured).
+pub(crate) const LANE_THREADS: usize = 8;
+
+/// The most threads a lane has, those whose jobs wait among them; a job past it waits to start,
+/// as one past [`LANE_THREADS`] does. 64, as many command buffers as the host's queue holds not
+/// yet completed, whatever count the guest's queue was made with: `QUEUE_CREATE` carries none
+/// (the bundle keeps the guest's `maxCommandBufferCount` as its queue's slots), every queue is
+/// the platform's plain `newCommandQueue`, and its `commandBuffer` waits while the queue holds 64,
+/// as Metal's default. So every buffer the host's queue may hold can be walked ahead of its turn.
+/// It bounds the lane by itself too: a buffer whose begin failed holds no command buffer, and its
+/// job still waits for its turn to post its failure.
+pub(crate) const LANE_MOST: usize = 64;
+
+/// How long a lane's thread woken for a job about to come ([`Lane::expect`]) spins for it before
+/// it waits for a job as an idle thread does. 50 µs, above the whole begin's 99th percentile
+/// (30.6 µs from the buffer's take to its begin's end, with the median at 9.4; 6296 buffers of
+/// Geekbench 7's Super Resolution, Iris Xe host, m3-max-29919; measured): the thread is woken
+/// once the buffer's turn is taken, partway into that begin, so the job comes within the bound
+/// unless the begin waits, and a job that comes after it wakes the thread as before. Of the 4715
+/// spins of a Geekbench 7.1 Metal pass, 99.3% ended with their job before it (the same host,
+/// m3-max-30453; measured).
+pub(crate) const EXPECT_SPIN: Duration = Duration::from_micros(50);
+
+thread_local! {
+    /// The address of the lane whose job the thread runs and walks; 0 while the job waits
+    /// ([`Lane::waiting`]), and on a thread that runs no lane's job.
+    static WALKING: Cell<usize> = const { Cell::new(0) };
+}
 
 /// The rest of a command buffer's work, for a lane's thread.
 pub(crate) type Job = Box<dyn FnOnce() + Send>;
@@ -66,8 +133,8 @@ pub(crate) type Job = Box<dyn FnOnce() + Send>;
 pub(crate) struct Budget {
     limit: usize,
     taken: AtomicUsize,
-    /// The platform's threads, whose FIFO hints each lane thread gives itself as it starts
-    /// ([`Threads::give_fifo_hints`]); none in the tests that make no platform.
+    /// The platform's threads, whose walk hints each lane thread gives itself as it starts
+    /// ([`Threads::give_walk_hints`]); none in the tests that make no platform.
     hints: Option<Arc<dyn Threads>>,
 }
 
@@ -82,11 +149,14 @@ impl std::fmt::Debug for Budget {
 }
 
 impl Budget {
-    /// A budget of twice the host's cores, as many as can run a walk each with as many waiting,
-    /// whose lanes' threads give themselves `threads`' FIFO hints.
+    /// A budget of twice the host's cores, as many as can run a walk each with as many committing,
+    /// and [`LANE_MOST`] more, for a busy queue's buffers walked ahead that wait for their turns
+    /// ([`Lane::waiting`]), which take no core; its lanes' threads give themselves `threads`'
+    /// walk hints. So a device holds a thread of each lane with work and the budget's at most,
+    /// whatever its processes do.
     pub(crate) fn of_host(threads: Arc<dyn Threads>) -> Arc<Budget> {
         let cores = std::thread::available_parallelism().map_or(4, std::num::NonZero::get);
-        Budget::with_hints(2 * cores, Some(threads))
+        Budget::with_hints(2 * cores + LANE_MOST, Some(threads))
     }
 
     /// A budget of `limit` threads, whose lanes' threads give themselves no hints (for the tests).
@@ -95,7 +165,7 @@ impl Budget {
         Budget::with_hints(limit, None)
     }
 
-    /// A budget of `limit` threads, whose lanes' threads give themselves `hints`' FIFO hints.
+    /// A budget of `limit` threads, whose lanes' threads give themselves `hints`' walk hints.
     fn with_hints(limit: usize, hints: Option<Arc<dyn Threads>>) -> Arc<Budget> {
         Arc::new(Budget {
             limit,
@@ -137,8 +207,10 @@ struct State {
     /// The lane's threads that wait for a job, the one that went idle last at the end: a job wakes
     /// it first (the module doc).
     idle: Vec<Arc<Idler>>,
-    /// The threads woken for a job that have not yet taken the lane's lock again.
+    /// The threads woken or made for a job that have not yet taken the lane's lock again.
     woken: usize,
+    /// The lane's threads that run a job and do not wait in it ([`Lane::waiting`]).
+    walking: usize,
     /// The queue went: its threads go once its jobs are done.
     closed: bool,
     /// How many threads the lane made, and how many went (for the tests).
@@ -151,13 +223,28 @@ struct State {
     passed: u64,
     /// The turns past `passed` that passed before it.
     early: BTreeSet<u64>,
+    /// The waits for a turn ([`Turn::wait`]), by the turn's number: each is woken as its turn
+    /// comes, the lane's other waiters left asleep.
+    turn_waits: HashMap<u64, Arc<Condvar>>,
+    /// The thread woken for a job about to come ([`Lane::expect`]), among the woken, until the job
+    /// comes, the expectation is withdrawn, the lane closes or the thread's spin for it ends.
+    expecting: Option<Arc<Idler>>,
+    /// How many idle threads a job woke as it came, and how many an expectation woke (for the
+    /// tests).
+    #[cfg(test)]
+    wakes: usize,
+    #[cfg(test)]
+    expected: usize,
 }
 
 /// A lane's thread waiting for a job ([`State::idle`]).
 #[derive(Default)]
 struct Idler {
-    /// A job came for it, or the lane closed.
+    /// A job came for it, one is about to come ([`Lane::expect`]), or the lane closed.
     wake: Condvar,
+    /// It was woken for a job about to come, and spins for it while this holds: cleared as the
+    /// job comes, the expectation is withdrawn or the lane closes ([`Lane::met`]).
+    expected: AtomicBool,
 }
 
 /// A command queue's lane (the module doc).
@@ -167,11 +254,12 @@ pub(crate) struct Lane {
     /// The device's budget of extra threads.
     budget: Arc<Budget>,
     /// How long a thread of the lane's stays with no job before it goes:
-    /// [`KEEP`](reims_graphics::keep::KEEP), but in the tests.
-    idle_for: reims_graphics::keep::Keep,
+    /// [`KEEP`](reims_vgpu_graphics::keep::KEEP), but in the tests.
+    idle_for: reims_vgpu_graphics::keep::Keep,
+    /// How long a thread woken for a job about to come spins for it: [`EXPECT_SPIN`], but in the
+    /// tests.
+    spin: reims_vgpu_graphics::keep::Keep,
     state: Mutex<State>,
-    /// A turn passed.
-    turned: Condvar,
 }
 
 impl std::fmt::Debug for Lane {
@@ -183,22 +271,42 @@ impl std::fmt::Debug for Lane {
 impl Lane {
     /// The lane of queue `queue`, with no thread yet, its extra threads from `budget`.
     pub(crate) fn new(queue: u64, budget: Arc<Budget>) -> Arc<Lane> {
-        Lane::with_idle(queue, budget, reims_graphics::keep::KEEP)
+        Lane::with_idle(queue, budget, reims_vgpu_graphics::keep::KEEP)
     }
 
     /// The lane of queue `queue`, whose threads go after `idle_for` with no job.
     fn with_idle(queue: u64, budget: Arc<Budget>, idle_for: Duration) -> Arc<Lane> {
-        Lane::with_keep(queue, budget, reims_graphics::keep::Keep::new(idle_for))
+        Lane::with_keep(
+            queue,
+            budget,
+            reims_vgpu_graphics::keep::Keep::new(idle_for),
+        )
     }
 
     /// The lane of queue `queue`, whose threads go once they have waited `keep` with no job.
-    fn with_keep(queue: u64, budget: Arc<Budget>, keep: reims_graphics::keep::Keep) -> Arc<Lane> {
+    fn with_keep(
+        queue: u64,
+        budget: Arc<Budget>,
+        keep: reims_vgpu_graphics::keep::Keep,
+    ) -> Arc<Lane> {
         Arc::new(Lane {
             queue,
             budget,
             idle_for: keep,
+            spin: reims_vgpu_graphics::keep::Keep::new(EXPECT_SPIN),
             state: Mutex::default(),
-            turned: Condvar::new(),
+        })
+    }
+
+    /// The lane of queue `queue`, whose threads woken for a job about to come spin `spin` for it.
+    #[cfg(test)]
+    fn with_spin(queue: u64, budget: Arc<Budget>, spin: Duration) -> Arc<Lane> {
+        Arc::new(Lane {
+            queue,
+            budget,
+            idle_for: reims_vgpu_graphics::keep::Keep::new(reims_vgpu_graphics::keep::KEEP),
+            spin: reims_vgpu_graphics::keep::Keep::new(spin),
+            state: Mutex::default(),
         })
     }
 
@@ -236,43 +344,111 @@ impl Lane {
         Some((turn, made))
     }
 
-    /// Runs `job` on one of the lane's threads, after the jobs that came before it have started:
-    /// the idle one that went idle last, else the lane's own where it has none, else one of the
-    /// budget's where every thread of the lane is busy and the budget has one to spare, else the
-    /// next of the lane's to be free. On the calling thread where the lane has no thread and none
-    /// can be made.
+    /// Runs `job` on one of the lane's threads, after the jobs that came before it have started
+    /// ([`Self::start`]). On the calling thread where the lane has no thread and none can be
+    /// made.
     pub(crate) fn run(self: &Arc<Self>, job: Job) {
         let mut state = self.state.lock();
         state.jobs.push_back(job);
-        // A woken thread for each job not yet started: one woken before takes the one before.
-        if state.woken >= state.jobs.len() {
+        // A thread woken for it takes it: among the woken, so no other is woken for it.
+        Self::met(&mut state);
+        self.start(state);
+    }
+
+    /// A job is about to come, its command buffer being begun on its queue's service thread
+    /// ([`super::GraphicsDecoder::begin_taken`]): the lane's thread that went idle last is woken
+    /// for it now, so it wakes during the begin and spins for the job (the module doc), where the
+    /// lane has an idle thread, no thread is woken for a job already, no other job is expected,
+    /// and a job may start now. The job comes with [`Self::run`], or [`Self::withdraw`] says it
+    /// will not; else the thread waits as an idle thread again once [`EXPECT_SPIN`] has passed.
+    pub(crate) fn expect(&self) {
+        let mut state = self.state.lock();
+        if state.expecting.is_some()
+            || state.woken > 0
+            || state.walking >= LANE_THREADS
+            || !state.jobs.is_empty()
+        {
             return;
         }
-        if let Some(idler) = state.idle.pop() {
-            state.woken += 1;
-            drop(state);
-            idler.wake.notify_one();
+        let Some(idler) = state.idle.pop() else {
             return;
-        }
-        let own = !state.own;
-        if own {
-            state.own = true;
-        } else if 1 + state.extra < LANE_THREADS && self.budget.take() {
-            state.extra += 1;
-        } else {
-            return;
-        }
+        };
+        state.woken += 1;
+        idler.expected.store(true, Ordering::Release);
+        state.expecting = Some(Arc::clone(&idler));
         #[cfg(test)]
         {
-            state.made += 1;
+            state.expected += 1;
         }
         drop(state);
-        let lane = Arc::clone(self);
-        let spawned = std::thread::Builder::new()
-            .name(format!("reims-vgpu.graphics-lane-{:#x}", self.queue))
-            .spawn(move || lane.serve());
-        if spawned.is_err() {
-            let mut state = self.state.lock();
+        idler.wake.notify_one();
+    }
+
+    /// The job [`Self::expect`] woke a thread for is not to come (its command buffer is carried
+    /// out where it was begun): the thread spins for it no more.
+    pub(crate) fn withdraw(&self) {
+        Self::met(&mut self.state.lock());
+    }
+
+    /// The expectation of a job ends ([`Self::expect`]): its thread, still among the woken, stops
+    /// spinning and takes the lane's lock again.
+    fn met(state: &mut State) {
+        if let Some(idler) = state.expecting.take() {
+            idler.expected.store(false, Ordering::Release);
+        }
+    }
+
+    /// Spins, with the lane's lock let go, while `me`, woken for a job about to come, expects it
+    /// ([`Idler::expected`]), for the lane's `spin` at most.
+    fn spin_for_job(&self, me: &Idler) {
+        let since = self.spin.now();
+        while me.expected.load(Ordering::Acquire) && !self.spin.passed(since) {
+            std::hint::spin_loop();
+        }
+    }
+
+    /// Starts each job not yet started that may start now, that is, while fewer than
+    /// [`LANE_THREADS`] of the lane's threads walk or are woken to: one woken before takes the
+    /// one before. Each goes to the idle thread that went idle last, else to a thread made for it:
+    /// the lane's own where it has none, else one of the budget's where the lane has fewer than
+    /// [`LANE_MOST`] and the budget has one to spare. Else it starts once one of the lane's
+    /// threads is free. Where the lane's own thread cannot be made, the lane's jobs are carried
+    /// out on the calling thread, which runs no job of the lane's then: the lane has no thread.
+    fn start<'a>(self: &'a Arc<Self>, mut state: MutexGuard<'a, State>) {
+        let mut wake = Vec::new();
+        while state.jobs.len() > state.woken && state.walking + state.woken < LANE_THREADS {
+            if let Some(idler) = state.idle.pop() {
+                state.woken += 1;
+                #[cfg(test)]
+                {
+                    state.wakes += 1;
+                }
+                wake.push(idler);
+                continue;
+            }
+            let own = !state.own;
+            if own {
+                state.own = true;
+            } else if 1 + state.extra < LANE_MOST && self.budget.take() {
+                state.extra += 1;
+            } else {
+                break;
+            }
+            state.woken += 1;
+            #[cfg(test)]
+            {
+                state.made += 1;
+            }
+            drop(state);
+            let lane = Arc::clone(self);
+            let spawned = std::thread::Builder::new()
+                .name(format!("reims-vgpu.graphics-lane-{:#x}", self.queue))
+                .spawn(move || lane.serve());
+            state = self.state.lock();
+            if spawned.is_ok() {
+                continue;
+            }
+            state.woken -= 1;
             #[cfg(test)]
             {
                 state.made -= 1;
@@ -280,7 +456,7 @@ impl Lane {
             if !own {
                 state.extra -= 1;
                 self.budget.give_back();
-                return;
+                break;
             }
             state.own = false;
             log::warn!(
@@ -291,30 +467,75 @@ impl Lane {
             );
             let jobs = std::mem::take(&mut state.jobs);
             drop(state);
+            for idler in wake {
+                idler.wake.notify_one();
+            }
             for job in jobs {
                 job();
             }
+            return;
+        }
+        drop(state);
+        for idler in wake {
+            idler.wake.notify_one();
         }
     }
 
-    /// A lane thread: the FIFO thread's hints, then the jobs, in the order they came, until the
-    /// lane closes with none left or none comes for the lane's `idle_for`. It goes as one of the
-    /// budget's where the lane has any, else as the lane's own, so the lane's own thread is the
-    /// last to go.
+    /// Runs `wait`, a wait of the job this thread runs for what is committed before its command
+    /// buffer (its turn, its tickets in the commit order, the buffers its `COMMIT_ORDER` names, a
+    /// split of its context), with the thread not among the lane's walking ones meanwhile: the
+    /// lane starts its next jobs on its other threads ([`Self::start`]), as the wait holds no
+    /// walk. Just `wait()` on a thread that runs no job of the lane's (a queue's service thread
+    /// carrying out a buffer itself), and inside another such wait.
+    pub(crate) fn waiting<R>(self: &Arc<Self>, wait: impl FnOnce() -> R) -> R {
+        let lane = Arc::as_ptr(self).addr();
+        if WALKING.get() != lane {
+            return wait();
+        }
+        WALKING.set(0);
+        let mut state = self.state.lock();
+        state.walking -= 1;
+        self.start(state);
+        // Walking again once the wait ends, whatever the count, so the commit goes on.
+        let _walking = Walks { lane: self };
+        wait()
+    }
+
+    /// A lane thread: the walk hints, then the jobs, in the order they came, each once fewer
+    /// than [`LANE_THREADS`] of the lane's threads walk, until the lane closes with none left or
+    /// none comes for the lane's `idle_for`. It goes as one of the budget's where the lane has
+    /// any, else as the lane's own, so the lane's own thread is the last to go.
     fn serve(&self) {
         if let Some(threads) = &self.budget.hints {
-            threads.give_fifo_hints();
+            threads.give_walk_hints();
         }
         let me = Arc::new(Idler::default());
+        let lane = std::ptr::from_ref(self).addr();
         let mut state = self.state.lock();
+        // Made for a job ([`Self::start`]).
+        state.woken -= 1;
         loop {
-            if let Some(job) = state.jobs.pop_front() {
+            if state.walking < LANE_THREADS
+                && let Some(job) = state.jobs.pop_front()
+            {
+                state.walking += 1;
+                // The closed lane's last job: its idle threads go.
+                if state.closed && state.jobs.is_empty() {
+                    let idle = std::mem::take(&mut state.idle);
+                    state.woken += idle.len();
+                    for idler in idle {
+                        idler.wake.notify_one();
+                    }
+                }
                 drop(state);
+                WALKING.set(lane);
                 job();
+                WALKING.set(0);
                 state = self.state.lock();
+                state.walking -= 1;
                 continue;
             }
-            if state.closed {
+            if state.closed && state.jobs.is_empty() {
                 break;
             }
             // Its wait's start read under the lock it joins the idle under, so a test that sees it
@@ -325,10 +546,20 @@ impl Lane {
             while !kept && state.idle.iter().any(|idler| Arc::ptr_eq(idler, &me)) {
                 kept = self.idle_for.wait(&me.wake, &mut state, since);
             }
-            // Still among the idle where nothing woke it; else a job or the close took it out.
+            // Still among the idle where nothing woke it; else a job, an expected one or the close
+            // took it out. Woken for a job about to come, it spins for it with the lock let go,
+            // among the woken meanwhile, so the job wakes no other thread.
             if let Some(at) = state.idle.iter().rposition(|idler| Arc::ptr_eq(idler, &me)) {
                 state.idle.remove(at);
             } else {
+                if me.expected.load(Ordering::Acquire) {
+                    drop(state);
+                    self.spin_for_job(&me);
+                    state = self.state.lock();
+                    if (state.expecting.as_ref()).is_some_and(|idler| Arc::ptr_eq(idler, &me)) {
+                        Self::met(&mut state);
+                    }
+                }
                 state.woken -= 1;
             }
             // Gone, unless a job waits that no thread was woken for: one that was takes it.
@@ -352,6 +583,7 @@ impl Lane {
     pub(crate) fn close(&self) {
         let mut state = self.state.lock();
         state.closed = true;
+        Self::met(&mut state);
         let idle = std::mem::take(&mut state.idle);
         state.woken += idle.len();
         drop(state);
@@ -373,6 +605,21 @@ impl Lane {
     fn counts(&self) -> (usize, usize, usize) {
         let state = self.state.lock();
         (state.idle.len(), state.made, state.gone)
+    }
+
+    /// How many idle threads of the lane's a job woke as it came, how many an expectation woke
+    /// ([`Self::expect`]), and how many wait for a job (for the tests).
+    #[cfg(test)]
+    pub(crate) fn wakes(&self) -> (usize, usize, usize) {
+        let state = self.state.lock();
+        (state.wakes, state.expected, state.idle.len())
+    }
+
+    /// How many of the lane's threads walk, and how many turns are waited for (for the tests).
+    #[cfg(test)]
+    fn walks_and_turn_waits(&self) -> (usize, usize) {
+        let state = self.state.lock();
+        (state.walking, state.turn_waits.len())
     }
 }
 
@@ -401,29 +648,54 @@ impl Turn {
         self.lane.state.lock().passed == self.number
     }
 
-    /// Waits, with no lock of the caller's held, for every turn before this one to pass.
+    /// Waits, with no lock of the caller's held, for every turn before this one to pass: woken
+    /// once the last of them has.
     pub(crate) fn wait(&self) {
         let mut state = self.lane.state.lock();
-        while state.passed < self.number {
-            self.lane.turned.wait(&mut state);
+        if state.passed >= self.number {
+            return;
         }
+        let turned = Arc::new(Condvar::new());
+        state.turn_waits.insert(self.number, Arc::clone(&turned));
+        while state.passed < self.number {
+            turned.wait(&mut state);
+        }
+        state.turn_waits.remove(&self.number);
     }
 }
 
 impl Drop for Turn {
+    /// The turn passes. Where every turn before it has, so do the turns after it that passed
+    /// before it, and the wait of the turn next after them is woken: every turn before that one
+    /// has passed, so none before it waits.
     fn drop(&mut self) {
         let mut guard = self.lane.state.lock();
         let state = &mut *guard;
-        if state.passed == self.number {
-            state.passed += 1;
-            while state.early.remove(&state.passed) {
-                state.passed += 1;
-            }
-        } else {
+        if state.passed != self.number {
             state.early.insert(self.number);
+            return;
         }
+        state.passed += 1;
+        while state.early.remove(&state.passed) {
+            state.passed += 1;
+        }
+        let next = state.turn_waits.get(&state.passed).cloned();
         drop(guard);
-        self.lane.turned.notify_all();
+        if let Some(next) = next {
+            next.notify_one();
+        }
+    }
+}
+
+/// A job's wait in [`Lane::waiting`]: as it drops, the job walks again.
+struct Walks<'a> {
+    lane: &'a Arc<Lane>,
+}
+
+impl Drop for Walks<'_> {
+    fn drop(&mut self) {
+        self.lane.state.lock().walking += 1;
+        WALKING.set(Arc::as_ptr(self.lane).addr());
     }
 }
 
@@ -498,15 +770,10 @@ mod tests {
         }
     }
 
-    /// Waits about 2 s for `done`; whether it came.
+    /// Waits for `done` as the graphics tests wait ([`crate::graphics::tests::eventually`]: a
+    /// loaded host starves the lane's threads for seconds); whether it came.
     fn until(done: impl Fn() -> bool) -> bool {
-        for _ in 0..2000 {
-            if done() {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(1));
-        }
-        false
+        crate::graphics::tests::eventually(done)
     }
 
     /// A lane runs its jobs at once on up to [`LANE_THREADS`] threads, its own and the budget's,
@@ -568,6 +835,312 @@ mod tests {
         assert!(until(|| lane.threads() == 0));
     }
 
+    /// A spin longer than any test waits: a thread that spins it out fails the test's wait.
+    const LONG_SPIN: Duration = Duration::from_secs(600);
+
+    /// Runs a job on `lane` and waits until it has run and `idle` of the lane's threads wait for a
+    /// job; the thread it ran on.
+    fn ran_on(lane: &Arc<Lane>, idle: usize) -> std::thread::ThreadId {
+        let ran = Arc::new(Mutex::new(None));
+        let on = Arc::clone(&ran);
+        lane.run(Box::new(move || {
+            *on.lock() = Some(std::thread::current().id());
+        }));
+        let done = || ran.lock().is_some() && lane.counts().0 == idle;
+        assert!(until(done), "the job ran with {:?}", lane.counts());
+        ran.lock().unwrap()
+    }
+
+    /// A job expected before it comes ([`Lane::expect`]) starts on the idle thread the expectation
+    /// woke, which spun for it: the job wakes no thread as it comes, and the lane makes no other.
+    #[test]
+    fn an_expected_job_starts_on_the_thread_woken_for_it() {
+        let lane = Lane::with_spin(13, Budget::new(LANE_THREADS), LONG_SPIN);
+        let first = ran_on(&lane, 1);
+        lane.expect();
+        assert_eq!(
+            lane.wakes(),
+            (0, 1, 0),
+            "(woken by a job, by an expectation, idle)"
+        );
+        // The woken thread spins meanwhile, as the buffer's begin ends.
+        std::thread::sleep(Duration::from_millis(10));
+        assert_eq!(ran_on(&lane, 1), first, "the job ran on another thread");
+        assert_eq!(lane.wakes(), (0, 1, 1), "the job woke a thread as it came");
+        assert_eq!(lane.counts(), (1, 1, 0), "(idle, made, gone)");
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// A job expected and slower to come than the spin ([`EXPECT_SPIN`]) finds its thread among
+    /// the idle again, and wakes it as it comes, as a job not expected does.
+    #[test]
+    fn an_expected_job_that_comes_after_the_spin_wakes_its_thread_as_it_comes() {
+        let lane = Lane::with_spin(14, Budget::new(LANE_THREADS), Duration::from_millis(1));
+        let first = ran_on(&lane, 1);
+        lane.expect();
+        // The woken thread may already be idle again here: its 1 ms spin can pass before this
+        // line runs on a loaded host, so only the wakes are certain at this point.
+        let (by_job, by_expectation, _) = lane.wakes();
+        assert_eq!(
+            (by_job, by_expectation),
+            (0, 1),
+            "(woken by a job, by an expectation)"
+        );
+        assert!(
+            until(|| lane.counts().0 == 1),
+            "the thread did not wait for a job again once its spin had passed"
+        );
+        assert_eq!(ran_on(&lane, 1), first);
+        assert_eq!(
+            lane.wakes(),
+            (1, 1, 1),
+            "the job did not wake the thread as it came"
+        );
+        assert_eq!(lane.counts(), (1, 1, 0), "(idle, made, gone)");
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// A withdrawn expectation ([`Lane::withdraw`]), and the lane's close, end the woken thread's
+    /// spin at once: it waits for a job again, or goes, long before the spin's bound.
+    #[test]
+    fn a_withdrawn_expectation_or_the_close_ends_the_spin_at_once() {
+        let lane = Lane::with_spin(15, Budget::new(LANE_THREADS), LONG_SPIN);
+        let first = ran_on(&lane, 1);
+        lane.expect();
+        assert_eq!(lane.wakes(), (0, 1, 0));
+        lane.withdraw();
+        assert!(
+            until(|| lane.counts().0 == 1),
+            "the thread still spun for a withdrawn job"
+        );
+        // A job after it wakes the thread as it comes.
+        assert_eq!(ran_on(&lane, 1), first);
+        assert_eq!(lane.wakes(), (1, 1, 1));
+        lane.expect();
+        assert_eq!(lane.wakes(), (1, 2, 0));
+        lane.close();
+        assert!(
+            until(|| lane.threads() == 0),
+            "the closed lane's thread still spun"
+        );
+    }
+
+    /// An expectation wakes nothing where no thread waits for a job (none made yet, or the lane's
+    /// one thread walking), nor a second thread while a job is expected already; jobs expected
+    /// one at a time still run in the order they came, and the lane makes its threads for them as
+    /// it would.
+    #[test]
+    fn an_expectation_wakes_only_an_idle_thread_and_one_at_a_time() {
+        let lane = Lane::with_spin(16, Budget::new(0), LONG_SPIN);
+        lane.expect();
+        assert_eq!(
+            (lane.threads(), lane.wakes()),
+            (0, (0, 0, 0)),
+            "no thread yet"
+        );
+        let gate = Arc::new(Gate::default());
+        let (job_gate, walking) = (Arc::clone(&gate), Arc::new(AtomicUsize::new(0)));
+        let job_walking = Arc::clone(&walking);
+        lane.run(Box::new(move || {
+            job_walking.fetch_add(1, Ordering::AcqRel);
+            job_gate.pass();
+        }));
+        assert!(until(|| walking.load(Ordering::Acquire) == 1));
+        lane.expect();
+        assert_eq!(
+            lane.wakes(),
+            (0, 0, 0),
+            "woke a thread with its one thread walking"
+        );
+        gate.open();
+        assert!(until(|| lane.counts().0 == 1));
+        let done = Arc::new(Mutex::new(Vec::new()));
+        for n in 0..8 {
+            lane.expect();
+            let done = Arc::clone(&done);
+            lane.run(Box::new(move || done.lock().push(n)));
+        }
+        assert!(until(|| done.lock().len() == 8));
+        assert_eq!(*done.lock(), (0..8).collect::<Vec<_>>());
+        assert_eq!(lane.threads(), 1);
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+
+        // Two idle threads: one expectation at a time wakes one.
+        let lane = Lane::with_spin(17, Budget::new(LANE_THREADS), LONG_SPIN);
+        burst(&lane, 2);
+        assert!(until(|| lane.counts().0 == 2));
+        lane.expect();
+        lane.expect();
+        let (_, expected, idle) = lane.wakes();
+        assert_eq!((expected, idle), (1, 1), "(woken by an expectation, idle)");
+        lane.withdraw();
+        assert!(until(|| lane.counts().0 == 2));
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// A job that waits in [`Lane::waiting`] is not among the lane's walks: with [`LANE_THREADS`]
+    /// jobs waiting, as many more walk at once, each on a thread of its own; one more waits to
+    /// start until a walk ends, though the lane may make more threads; and once every job is done
+    /// none walks.
+    #[test]
+    fn a_lane_starts_its_next_jobs_while_its_jobs_wait() {
+        let budget = Budget::new(LANE_MOST);
+        let lane = Lane::new(8, Arc::clone(&budget));
+        let (waits, walks) = (Arc::new(Gate::default()), Arc::new(Gate::default()));
+        let (waiting, walking) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        let done = Arc::new(AtomicUsize::new(0));
+        for _ in 0..LANE_THREADS {
+            let (job_lane, waits, waiting, done) = (
+                Arc::clone(&lane),
+                Arc::clone(&waits),
+                Arc::clone(&waiting),
+                Arc::clone(&done),
+            );
+            lane.run(Box::new(move || {
+                job_lane.waiting(|| {
+                    waiting.fetch_add(1, Ordering::AcqRel);
+                    waits.pass();
+                });
+                done.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        assert!(until(|| waiting.load(Ordering::Acquire) == LANE_THREADS));
+        for _ in 0..=LANE_THREADS {
+            let (walks, walking, done) =
+                (Arc::clone(&walks), Arc::clone(&walking), Arc::clone(&done));
+            lane.run(Box::new(move || {
+                walking.fetch_add(1, Ordering::AcqRel);
+                walks.pass();
+                done.fetch_add(1, Ordering::AcqRel);
+            }));
+        }
+        assert!(
+            until(|| walking.load(Ordering::Acquire) == LANE_THREADS),
+            "the jobs behind the waiting ones did not walk at once"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            walking.load(Ordering::Acquire),
+            LANE_THREADS,
+            "more than {LANE_THREADS} walked at once"
+        );
+        assert_eq!(lane.threads(), 2 * LANE_THREADS);
+        assert_eq!(lane.walks_and_turn_waits().0, LANE_THREADS);
+        walks.open();
+        assert!(until(|| walking.load(Ordering::Acquire) == LANE_THREADS + 1));
+        waits.open();
+        assert!(until(
+            || done.load(Ordering::Acquire) == 2 * LANE_THREADS + 1
+        ));
+        assert!(until(|| lane.walks_and_turn_waits() == (0, 0)));
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+        assert_eq!(budget.taken(), 0);
+    }
+
+    /// A lane holds [`LANE_MOST`] threads at most, its jobs all waiting: those past it start in
+    /// the order they came, as the waits end.
+    #[test]
+    fn a_lane_of_waiting_jobs_holds_lane_most_threads_at_most() {
+        const JOBS: usize = LANE_MOST + 8;
+        let budget = Budget::new(JOBS);
+        let lane = Lane::new(9, Arc::clone(&budget));
+        let gate = Arc::new(Gate::default());
+        let started = Arc::new(Mutex::new(Vec::new()));
+        for n in 0..JOBS {
+            let (job_lane, gate, started) =
+                (Arc::clone(&lane), Arc::clone(&gate), Arc::clone(&started));
+            lane.run(Box::new(move || {
+                started.lock().push(n);
+                job_lane.waiting(|| gate.pass());
+            }));
+        }
+        assert!(
+            until(|| started.lock().len() == LANE_MOST),
+            "{} of the waiting jobs started",
+            started.lock().len()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+        assert_eq!(
+            started.lock().len(),
+            LANE_MOST,
+            "past the lane's most threads"
+        );
+        assert_eq!(lane.threads(), LANE_MOST);
+        let mut first = started.lock().clone();
+        first.sort_unstable();
+        assert_eq!(
+            first,
+            (0..LANE_MOST).collect::<Vec<_>>(),
+            "not the first to come"
+        );
+        gate.open();
+        assert!(until(|| started.lock().len() == JOBS));
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+        assert_eq!(budget.taken(), 0);
+    }
+
+    /// A wait off the lane's threads, or inside another wait of a job's, is the wait alone: it
+    /// counts nothing, and the lane's walks are as they were.
+    #[test]
+    fn a_wait_off_the_lane_s_threads_or_inside_another_is_the_wait_alone() {
+        let lane = Lane::new(11, Budget::new(LANE_THREADS));
+        assert_eq!(lane.waiting(|| 7), 7);
+        assert_eq!(lane.walks_and_turn_waits(), (0, 0));
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (job_lane, job_seen) = (Arc::clone(&lane), Arc::clone(&seen));
+        lane.run(Box::new(move || {
+            let walks = || job_lane.walks_and_turn_waits().0;
+            job_seen.lock().push(walks());
+            job_lane.waiting(|| {
+                job_seen.lock().push(walks());
+                job_lane.waiting(|| job_seen.lock().push(walks()));
+                job_seen.lock().push(walks());
+            });
+            job_seen.lock().push(walks());
+        }));
+        assert!(until(|| seen.lock().len() == 5));
+        assert_eq!(*seen.lock(), [1, 0, 0, 0, 1]);
+        assert!(until(|| lane.walks_and_turn_waits() == (0, 0)));
+        lane.close();
+        assert!(until(|| lane.threads() == 0));
+    }
+
+    /// Many turns waited for at once each go in their turn, whatever order their waits began in:
+    /// each passing wakes the wait of the turn after it.
+    #[test]
+    fn many_waiting_turns_each_go_in_their_turn() {
+        const TURNS: u64 = 48;
+        let lane = Lane::new(12, Budget::new(0));
+        let turns: Vec<Turn> = (0..TURNS).map(|_| lane.turn(false).unwrap()).collect();
+        let order = Mutex::new(Vec::new());
+        std::thread::scope(|scope| {
+            let mut turns = turns.into_iter();
+            let first = turns.next().unwrap();
+            // The later turns' waits begin last first.
+            for turn in turns.rev() {
+                let order = &order;
+                scope.spawn(move || {
+                    turn.wait();
+                    order.lock().push(turn.number);
+                    drop(turn);
+                });
+            }
+            assert!(
+                until(|| lane.walks_and_turn_waits().1 == TURNS as usize - 1),
+                "the turns' waits did not begin"
+            );
+            drop(first);
+        });
+        assert_eq!(*order.lock(), (1..TURNS).collect::<Vec<_>>());
+        assert_eq!(lane.walks_and_turn_waits(), (0, 0));
+    }
+
     /// 2048 busy queues, the most a process may make, hold one thread each and the budget's, at
     /// most: the threads a device makes are bounded whatever its processes do.
     #[test]
@@ -607,7 +1180,7 @@ mod tests {
         assert_eq!(running.load(Ordering::Acquire), 3 * QUEUES as usize);
     }
 
-    /// What the threads of [`each_thread_gives_itself_the_fifo_hints_before_its_first_job`] did,
+    /// What the threads of [`each_thread_gives_itself_the_walk_hints_before_its_first_job`] did,
     /// in order: a hint, or a job, with the thread it ran on.
     #[derive(Clone, Copy, Debug, PartialEq, Eq)]
     enum Did {
@@ -615,7 +1188,7 @@ mod tests {
         Job(std::thread::ThreadId),
     }
 
-    /// Threads that only note each [`Threads::give_fifo_hints`]: the lane starts its own.
+    /// Threads that only note each [`Threads::give_walk_hints`]: the lane starts its own.
     struct HintLog(Arc<Mutex<Vec<Did>>>);
 
     impl Threads for HintLog {
@@ -627,7 +1200,7 @@ mod tests {
             unreachable!("a lane starts no worker")
         }
 
-        fn give_fifo_hints(&self) {
+        fn give_walk_hints(&self) {
             self.0.lock().push(Did::Hint(std::thread::current().id()));
         }
 
@@ -635,15 +1208,17 @@ mod tests {
             Arc::new(HintLog(Arc::clone(&self.0)))
         }
 
-        fn timer_clock(&self) -> Option<Arc<dyn reims_vgpu_core::platform::os::TimerClock>> {
+        fn timer_clock(
+            &self,
+        ) -> Option<Arc<dyn reims_vgpu_vulkan::core::platform::os::TimerClock>> {
             None
         }
     }
 
-    /// Each of a lane's threads, its own and the budget's, gives itself the FIFO thread's hints
-    /// before it runs its first job; a lane of a budget with no platform gives none.
+    /// Each of a lane's threads, its own and the budget's, gives itself the walk hints before it
+    /// runs its first job; a lane of a budget with no platform gives none.
     #[test]
-    fn each_thread_gives_itself_the_fifo_hints_before_its_first_job() {
+    fn each_thread_gives_itself_the_walk_hints_before_its_first_job() {
         let log = Arc::new(Mutex::new(Vec::new()));
         let threads: Arc<dyn Threads> = Arc::new(HintLog(Arc::clone(&log)));
         let lane = Lane::new(6, Budget::with_hints(LANE_THREADS, Some(threads)));
@@ -798,7 +1373,7 @@ mod tests {
     mod kept {
         use std::collections::HashSet;
 
-        use reims_graphics::keep::{KEEP, Keep, TestClock};
+        use reims_vgpu_graphics::keep::{KEEP, Keep, TestClock};
 
         use super::*;
 
@@ -816,14 +1391,17 @@ mod tests {
                 *on.lock() = Some(std::thread::current().id());
             }));
             let done = || ran.lock().is_some() && lane.counts().0 == idle;
-            for _ in 0..10_000 {
-                if done() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(1));
-            }
-            assert!(done(), "the job ran with {:?}", lane.counts());
+            assert!(until(done), "the job ran with {:?}", lane.counts());
             ran.lock().unwrap()
+        }
+
+        /// `lane`'s counts (waiting, made, gone) once they are `settled`, waited for as [`until`]
+        /// waits, else as they are then. The job's thread sets what [`one_job`] waits for before
+        /// it is among the waiting again, and a thread past [`KEEP`] goes once its own wait ends,
+        /// so a read just after [`one_job`] may meet the threads halfway.
+        fn settled_counts(lane: &Lane, settled: (usize, usize, usize)) -> (usize, usize, usize) {
+            until(|| lane.counts() == settled);
+            lane.counts()
         }
 
         /// Jobs one at a time, each after a pause longer than a lane's thread was once kept
@@ -840,7 +1418,8 @@ mod tests {
                 clock.advance(Duration::from_secs(2));
             }
             assert_eq!(ran_on.len(), 1, "one thread ran the jobs");
-            assert_eq!(lane.counts(), (1, 1, 0), "(waiting, made, gone)");
+            let counts = settled_counts(&lane, (1, 1, 0));
+            assert_eq!(counts, (1, 1, 0), "(waiting, made, gone)");
             clock.advance(KEEP);
             assert!(until(|| lane.threads() == 0), "the idle thread stayed");
             assert_eq!(lane.counts(), (0, 1, 1));
@@ -861,7 +1440,8 @@ mod tests {
             for n in 1..pauses {
                 clock.advance(Duration::from_secs(2));
                 ran_on.insert(one_job(&lane, 3));
-                assert_eq!(lane.counts(), (3, 3, 0), "{} s after the burst", 2 * n);
+                let counts = settled_counts(&lane, (3, 3, 0));
+                assert_eq!(counts, (3, 3, 0), "{} s after the burst", 2 * n);
             }
             assert_eq!(
                 ran_on.len(),
@@ -870,7 +1450,8 @@ mod tests {
             );
             clock.advance(Duration::from_secs(2));
             one_job(&lane, 1);
-            assert_eq!(lane.counts(), (1, 3, 2), "(waiting, made, gone)");
+            let counts = settled_counts(&lane, (1, 3, 2));
+            assert_eq!(counts, (1, 3, 2), "(waiting, made, gone)");
             assert_eq!(budget.taken(), 0, "the lane's own thread is the one left");
             clock.advance(KEEP);
             assert!(until(|| lane.threads() == 0), "the last thread stayed");

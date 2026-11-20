@@ -8,6 +8,7 @@
 #include "ReimsGraphics.hpp"
 #include "RgfxAcceleratorUserClient.hpp"
 #include "RgfxDisplayPipeUserClient.hpp"
+#include "RgfxGLUserClients.hpp"
 #include "RgfxSurfaceUserClient.hpp"
 
 #include <IOKit/IOLib.h>
@@ -16,13 +17,35 @@
 #include <kern/thread_call.h>
 #include <sys/vnode.h>
 
+#include "RgfxAccelTypes.hpp"
 #include "RgfxBundlePaths.hpp"
 #include "RgfxFeatures.hpp"
+#include "RgfxIOSurfaceKPI.hpp"
+#include "RgfxKeptService.hpp"
+#include "RgfxPciClass.hpp"
+#include "RgfxRegionMapping.hpp"
+#include "RgfxSurfaceLimits.hpp"
+#include "RgfxSurfaceRows.hpp"
 #include "RgfxTrace.hpp"
 #include "RgfxVideoCodecs.hpp"
 
 #define super IOAccelerator
 OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
+
+namespace {
+// The started framebuffer copyFramebuffer found, retained, under keptLock (made at the
+// accelerator's start), handed out while it is live (RgfxKeptService.hpp): one accelerator per
+// device, one device per guest, as the contexts' state (RgfxAcceleratorContexts.cpp), and kept out
+// of the class, whose layout stays as the loader's sites were taken from (RgfxAccelerator.hpp).
+IOLock *keptLock = nullptr;
+ReimsGraphics *keptFramebuffer = nullptr;
+
+// A framebuffer is live while it has started and its termination has not begun.
+struct KeptOps {
+	bool live(ReimsGraphics *fb) { return fb->hasStarted() && !fb->isInactive(); }
+	void retain(ReimsGraphics *fb) { fb->retain(); }
+};
+} // namespace
 
 // MARK: - The bundle
 //
@@ -54,6 +77,12 @@ OSDefineMetaClassAndStructors(RgfxAccelerator, IOAccelerator);
 // there were none, so WindowServer composites in software: a bundle that refused to make a
 // device under a registered accelerator would leave WindowServer aborting, as with no bundle.
 //
+// The accelerator registers only once the framebuffer has started too (ReimsGraphics::hasStarted):
+// a process's context reaches the device only through the framebuffer's rings, so with no
+// framebuffer (one whose start failed, as arm64 27.0.1's once did) every context Metal opened
+// would have its messages and its close refused. The check repeats until both hold; with the
+// bundle found and no framebuffer started it says so once.
+//
 // Where RgfxGate installs the bundle, nothing on disk counts while its install pass is under way
 // (rgfxBundleRegisters): an update that keeps the wire version finds the old bundle and its
 // marker before the pass drops the marker and rewrites the files. The pass publishes itself on
@@ -70,6 +99,8 @@ constexpr UInt32 kBundleRegisterWaitMs = 5000;
 // looks.
 constexpr UInt32 kGatePassWaitMs = 5000;
 constexpr UInt32 kGatePassLookMs = 10;
+// How long the start waits for IOSurfaceRoot to align the rows it lays out.
+constexpr uint64_t kSurfaceRootWaitNs = 10ull * 1000 * 1000 * 1000;
 
 enum : UInt32 {
 	// The check repeats.
@@ -94,8 +125,10 @@ struct BundleWatch {
 	// The bundle's executable and its marker for this kext's wire version, NAME the
 	// accelerator's MetalPluginName (the bundle's Makefile names its executable so).
 	RgfxBundlePaths paths;
+	// The check's own: whether it has said the bundle waits for the framebuffer.
+	bool toldFramebuffer;
 };
-BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}};
+BundleWatch bundle = {nullptr, kBundleWatching, nullptr, false, {}, false};
 
 // What the lookups find.
 enum BundleFound : UInt32 {
@@ -189,7 +222,8 @@ void registerAccelerator(RgfxAccelerator *accelerator, const char *when)
 	IOLockUnlock(bundle.lock);
 }
 
-// The repeating check, on a thread call: registers the accelerator once the bundle is there.
+// The repeating check, on a thread call: registers the accelerator once the bundle is there and
+// the framebuffer has started.
 void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 {
 	IOLockLock(bundle.lock);
@@ -197,8 +231,15 @@ void checkBundle(thread_call_param_t accelerator, thread_call_param_t)
 	IOLockUnlock(bundle.lock);
 	// The pass first: once it has ended, the disk holds what it left.
 	const RgfxGatePass gate = gatePass();
-	bool found = rgfxBundleRegisters(gate, gate != kRgfxGateInstalling &&
-	                                           bundleOnDisk() == kBundleOurs);
+	const bool ours = gate != kRgfxGateInstalling && bundleOnDisk() == kBundleOurs;
+	const bool framebuffer = static_cast<RgfxAccelerator *>(accelerator)->framebufferStarted();
+	bool found = rgfxBundleRegisters(gate, ours, framebuffer);
+	if (ours && !framebuffer && !bundle.toldFramebuffer) {
+		bundle.toldFramebuffer = true;
+		IOLog("RgfxAccelerator: the bundle is at %s, and the framebuffer has not started: not "
+		      "registered until it has\n",
+		      bundle.paths.executable);
+	}
 	IOLockLock(bundle.lock);
 	bool watching = bundle.state == kBundleWatching;
 	if (watching && found)
@@ -255,7 +296,9 @@ void RgfxAccelerator::settleBundle()
 			gate = gatePass();
 		}
 		BundleFound found = gate == kRgfxGateInstalling ? kBundleAbsent : bundleOnDisk();
-		if (rgfxBundleRegisters(gate, found == kBundleOurs)) {
+		// The framebuffer that calls this is registered, its start under way or done: its
+		// connection is the server's first.
+		if (rgfxBundleRegisters(gate, found == kBundleOurs, true)) {
 			if (leaveWatching(kBundleRegistering))
 				registerAccelerator(this, " as WindowServer opens the display");
 		} else if (leaveWatching(kBundleSettled)) {
@@ -283,12 +326,13 @@ void RgfxAccelerator::settleBundle()
 
 UInt32 RgfxAccelerator::readRegister(UInt32 offset) const
 {
-	return *reinterpret_cast<const volatile UInt32 *>(registers + offset);
+	return rgfxRegisterRead32(registers + offset);
 }
 
 void RgfxAccelerator::writeRegister(UInt32 offset, UInt32 value)
 {
-	*reinterpret_cast<volatile UInt32 *>(registers + offset) = value;
+	rgfxRegisterWriteBarrier();
+	rgfxRegisterWrite32(registers + offset, value);
 }
 
 uint64_t RgfxAccelerator::featureWord() const
@@ -302,16 +346,67 @@ uint64_t RgfxAccelerator::featureWord() const
 
 // MARK: - IOService
 
+namespace {
+// The size, in bits, of the driver keys' numbers: 64, as the kernel makes a plist's <integer>, so
+// a process reads each as a 64-bit CFNumber (kCFNumberSInt64Type).
+constexpr unsigned kDriverKeyNumberBits = 64;
+
+// The accelerator's driver keys, on its registry entry, where the guest's frameworks read them:
+// Metal the bundle and the class it makes the device of (MetalPluginName, MetalPluginClassName),
+// OpenGL its renderer (IOGLBundleName), AppleGVA its video driver (IODVDBundleName,
+// IOVARendererID, IOGVACodec), the display pipe's capabilities (AcceleratorProperties), and the
+// display count (DisplayPortCount); the same on x86-64 and arm64. The personality holds only what
+// matches the provider and names the driver: Graft records the rest of a personality as the
+// provider's matching. Set at the start of start, before registerService lets any process find
+// the accelerator and before the bundle's check reads MetalPluginName.
+bool setDriverKeys(IOService *service)
+{
+	OSDictionary *pipe = OSDictionary::withCapacity(2);
+	OSDictionary *accel = OSDictionary::withCapacity(2);
+	OSString *category = OSString::withCString("IOAccelerator");
+	OSNumber *ports = OSNumber::withNumber(1ull, kDriverKeyNumberBits);
+	OSNumber *renderer = OSNumber::withNumber(0x1020004ull, kDriverKeyNumberBits);
+	bool set = pipe && accel && category && ports && renderer &&
+	           pipe->setObject("DisplayPipeSupported", kOSBooleanTrue) &&
+	           pipe->setObject("TransactionsSupported", kOSBooleanTrue) &&
+	           accel->setObject("IOAccelDisplayPipeCapabilities", pipe) &&
+	           accel->setObject("IOMatchCategory", category) &&
+	           service->setProperty("AcceleratorProperties", accel) &&
+	           service->setProperty("DisplayPortCount", ports) &&
+	           service->setProperty("IODVDBundleName", "reims-graphics") &&
+	           service->setProperty("IOGLBundleName", "AppleMetalOpenGLRenderer") &&
+	           service->setProperty("IOGVACodec", "RgfxVideo") &&
+	           service->setProperty("IOVARendererID", renderer) &&
+	           service->setProperty("MetalPluginClassName", "RgfxMetalDevice") &&
+	           service->setProperty("MetalPluginName", "reims-graphics");
+	OSSafeReleaseNULL(renderer);
+	OSSafeReleaseNULL(ports);
+	OSSafeReleaseNULL(category);
+	OSSafeReleaseNULL(accel);
+	OSSafeReleaseNULL(pipe);
+	return set;
+}
+} // namespace
+
 bool RgfxAccelerator::start(IOService *provider)
 {
 	ReimsGraphics *fb = nullptr;
+	if (!setDriverKeys(this)) {
+		IOLog("RgfxAccelerator: no memory for its driver keys: not starting\n");
+		return false;
+	}
 	pci = OSDynamicCast(IOPCIDevice, provider);
 	if (!pci)
 		return false;
 	// The framebuffer enables these too; doing so again is harmless. The
 	// accelerator needs BAR 0 for the doorbell and BAR 2 to hand to the bundle.
 	pci->setMemoryEnable(true);
-	pci->setBusLeadEnable(true);
+	// setBusMasterEnable rather than setBusLeadEnable, which macOS 11 does not export: a call
+	// through IOPCIDevice's vtable, the same slot on macOS 11 to 26 (ReimsGraphics::start).
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+	pci->setBusMasterEnable(true);
+#pragma clang diagnostic pop
 
 	registerMap = pci->mapDeviceMemoryWithRegister(kIOPCIConfigBaseAddress0);
 	if (!registerMap) {
@@ -347,9 +442,10 @@ bool RgfxAccelerator::start(IOService *provider)
 		goto fail;
 	}
 
-	// The Metal discovery keys (MetalPluginName / MetalPluginClassName) and the PCI
-	// match that make Metal load the bundle are in src/Info.plist's accelerator
-	// personality, so they are already registry properties on this service. The
+	// The Metal discovery keys (MetalPluginName / MetalPluginClassName) that make Metal
+	// load the bundle are on this service already (setDriverKeys, above); so is
+	// IOGLBundleName, the GL renderer OpenGL loads for it (AppleMetalOpenGLRenderer,
+	// which runs on the bundle's Metal device). The
 	// accelerator does not touch pixels or the control ring (the framebuffer owns
 	// those); it only publishes those keys and vends the region-map + doorbell user
 	// client. registerService lets Metal's IOServiceMatching("IOAccelerator")
@@ -380,12 +476,22 @@ bool RgfxAccelerator::start(IOService *provider)
 			data->release();
 		}
 	}
+	// The GPU's class, as a Mac's GPU states it (RgfxPciClass.hpp): `class-code` on the PCI
+	// device, where software in the guest lists the Mac's GPUs.
+	if (OSData *data = OSData::withBytes(kRgfxMacGpuClassCode, sizeof(kRgfxMacGpuClassCode))) {
+		pci->setProperty("class-code", data);
+		data->release();
+	}
 	nameProviderForVideo();
 	// AppleGVA reads the video codecs off this service once Metal's matching sees it, after
 	// registerService.
 	publishVideoCodecs();
+	// Before any process that lays out a surface: WindowServer starts after the kernel's boot.
+	setSurfaceLimits();
 	// Name this accelerator on the framebuffer, if it has started already (else the display
 	// pipe's first association does).
+	if (!keptLock)
+		keptLock = IOLockAlloc();
 	OSSafeReleaseNULL(fb);
 	fb = copyFramebuffer();
 	// Without the check (no bundle named, no memory for it) the accelerator stays unregistered,
@@ -421,6 +527,13 @@ void RgfxAccelerator::stop(IOService *provider)
 		fb->setReleaseAnswer(nullptr, nullptr);
 		fb->release();
 	}
+	if (keptLock) {
+		IOLockLock(keptLock);
+		ReimsGraphics *kept = keptFramebuffer;
+		keptFramebuffer = nullptr;
+		IOLockUnlock(keptLock);
+		OSSafeReleaseNULL(kept);
+	}
 	super::stop(provider);
 	teardown();
 }
@@ -439,9 +552,11 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
                                         OSDictionary *properties, IOUserClient **handler)
 {
 	// The types served: the display pipe (4), the one the IOGPUMetalDevice base builds its
-	// device over (5), ours, and a shared event's port (RgfxSharedEventUserClient). Any other is refused, logged once per type. IOAccel surfaces
-	// (0) are among them: CoreDisplay opens them at display start for its display surface, and
-	// maps the framebuffer's memory for it when they are refused.
+	// device over (5), ours, a shared event's port (RgfxSharedEventUserClient), and a GL
+	// window's drawable (7) and surface (0x20) (RgfxGLUserClients.hpp). Any other is refused,
+	// logged once per type. IOAccel surfaces (0) are among them: CoreDisplay opens them at
+	// display start for its display surface, and maps the framebuffer's memory for it when
+	// they are refused.
 	RgfxCaller caller;
 	IOLog("RGFX: newUserClient type=%u from %s[%d]\n", type, caller.name, caller.pid);
 	// Unregistered, without its bundle, the accelerator is no GPU ("The bundle"): a task that
@@ -459,6 +574,8 @@ IOReturn RgfxAccelerator::newUserClient(task_t owningTask, void *securityID, UIn
 		return newDisplayPipe(owningTask, securityID, type, properties, handler);
 	if (type == kRgfxSharedEventUserClientType)
 		return newSharedEventPort(owningTask, securityID, type, properties, handler);
+	if (type == kRgfxGLDrawableUserClientType || type == kRgfxGLSurfaceUserClientType)
+		return newGLClient(owningTask, securityID, type, properties, handler);
 	if (type != kRgfxAccelUserClientType && type != kRgfxIOGPUDeviceUserClientType) {
 		static char site;
 		if (rgfxFirstCalls(&site, type, 1))
@@ -511,6 +628,34 @@ IOReturn RgfxAccelerator::newDisplayPipe(task_t owningTask, void *securityID, UI
 	return kIOReturnSuccess;
 }
 
+// A GL window's drawable or surface (RgfxGLUserClients.hpp).
+IOReturn RgfxAccelerator::newGLClient(task_t owningTask, void *securityID, UInt32 type,
+                                      OSDictionary *properties, IOUserClient **handler)
+{
+	IOUserClient *client = nullptr;
+	if (type == kRgfxGLDrawableUserClientType)
+		client = OSTypeAlloc(RgfxGLDrawableUserClient);
+	else
+		client = OSTypeAlloc(RgfxGLSurfaceUserClient);
+	if (!client)
+		return kIOReturnNoMemory;
+	if (!client->initWithTask(owningTask, securityID, type, properties)) {
+		client->release();
+		return kIOReturnNoResources;
+	}
+	if (!client->attach(this)) {
+		client->release();
+		return kIOReturnInternalError;
+	}
+	if (!client->start(this)) {
+		client->detach(this);
+		client->release();
+		return kIOReturnInternalError;
+	}
+	*handler = client;
+	return kIOReturnSuccess;
+}
+
 // An IOAccel surface (RgfxSurfaceUserClient).
 IOReturn RgfxAccelerator::newSurface(task_t owningTask, void *securityID, UInt32 type,
                                      OSDictionary *properties, IOUserClient **handler)
@@ -539,6 +684,19 @@ IOReturn RgfxAccelerator::newSurface(task_t owningTask, void *securityID, UInt32
 
 ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 {
+	// The one kept, while it is live: a lookup walks the PCI device's clients and builds this
+	// accelerator's path under the registry's lock, which every message the kext posts paid for.
+	// One that stopped or was terminated is let go, and the lookup made again (RgfxKeptService.hpp).
+	KeptOps ops;
+	if (keptLock) {
+		ReimsGraphics *dropped = nullptr;
+		IOLockLock(keptLock);
+		ReimsGraphics *kept = rgfxKeptTake(keptFramebuffer, ops, &dropped);
+		IOLockUnlock(keptLock);
+		OSSafeReleaseNULL(dropped);
+		if (kept)
+			return kept;
+	}
 	if (!pci)
 		return nullptr;
 	ReimsGraphics *found = nullptr;
@@ -553,13 +711,34 @@ ReimsGraphics *RgfxAccelerator::copyFramebuffer()
 		}
 		clients->release();
 	}
-	if (found && !found->getProperty("IOAccelTypes")) {
+	// Named by this accelerator's path as it stands (RgfxAccelTypes.hpp): the framebuffer, started
+	// first, named it through the PCI device's name before nameProviderForVideo renamed the device
+	// GFX0, a path that no longer leads anywhere.
+	if (found) {
 		char path[512];
 		int length = sizeof(path);
-		if (getPath(path, &length, gIOServicePlane))
-			found->setProperty("IOAccelTypes", path);
+		if (getPath(path, &length, gIOServicePlane)) {
+			OSString *named = OSDynamicCast(OSString, found->getProperty("IOAccelTypes"));
+			if (rgfxAccelTypesStale(named ? named->getCStringNoCopy() : nullptr, path))
+				found->setProperty("IOAccelTypes", path);
+		}
+	}
+	// Kept once it is live, as named: the rename is this accelerator's own, at its start, before
+	// any lookup (nameProviderForVideo), so the path stays as it stands now.
+	if (found && keptLock) {
+		IOLockLock(keptLock);
+		rgfxKeptOffer(keptFramebuffer, ops, found);
+		IOLockUnlock(keptLock);
 	}
 	return found;
+}
+
+bool RgfxAccelerator::framebufferStarted()
+{
+	ReimsGraphics *fb = copyFramebuffer();
+	const bool started = fb && fb->hasStarted();
+	OSSafeReleaseNULL(fb);
+	return started;
 }
 
 IODeviceMemory *RgfxAccelerator::copyRegion() const
@@ -642,6 +821,47 @@ void RgfxAccelerator::nameProviderForVideo()
 		}
 	}
 	pci->setName("GFX0");
+}
+
+static_assert(kRgfxIOSurfaceNoLimit == kRgfxSurfaceNoLimit, "IOSurfaceRoot's own limit");
+
+void RgfxAccelerator::setSurfaceLimits()
+{
+	const void *info = nullptr;
+	const uint64_t end = kRgfxSurfaceRowsEnd > kRgfxSurfaceLimitsEnd ? kRgfxSurfaceRowsEnd
+	                                                                 : kRgfxSurfaceLimitsEnd;
+	IOMemoryMap *map = mapDeviceInfo(end, &info);
+	if (!map)
+		return;
+	const uint8_t *bytes = static_cast<const uint8_t *>(info);
+	const uint32_t align = rgfxSurfaceRowAlignmentFrom(bytes + kRgfxSurfaceRowsFirst);
+	const RgfxSurfaceLimits limits = rgfxSurfaceLimitsFrom(bytes + kRgfxSurfaceLimitsFirst);
+	map->release();
+	// IOSurfaceRoot starts with IOSurface.kext, which a GPU's accelerator waits for as well.
+	OSDictionary *matching = IOService::serviceMatching("IOSurfaceRoot");
+	IOService *root =
+	    matching ? IOService::waitForMatchingService(matching, kSurfaceRootWaitNs) : nullptr;
+	OSSafeReleaseNULL(matching);
+	if (!root) {
+		IOLog("RgfxAccelerator: no IOSurfaceRoot: surfaces' rows stay at IOSurface's alignment, "
+		      "not the host GPU's %u bytes, and IOSurface's limits stay its own\n",
+		      align);
+		return;
+	}
+	// The plane offsets IOSurface works out take the host's alignment as the rows do, as the
+	// GPU's linear images start there; a mask of 0 ORs nothing in: IOSurface's own alignment
+	// where the host asks no more.
+	const uint32_t mask = align > kRgfxSurfaceRowsLeast ? align - 1 : 0;
+	rgfxIOSurfaceRootUpdateLimits(root, mask, mask, limits.bytesPerRow, limits.width,
+	                              limits.height);
+	root->release();
+	if (align > kRgfxSurfaceRowsLeast)
+		IOLog("RgfxAccelerator: IOSurface aligns the bytes per row and plane offsets it works out "
+		      "to %u, as the host's GPU takes linear images in place\n",
+		      align);
+	IOLog("RgfxAccelerator: IOSurface answers surfaces of at most %u x %u and %u bytes a row, as "
+	      "the device's textures take them\n",
+	      limits.width, limits.height, limits.bytesPerRow);
 }
 
 void RgfxAccelerator::publishVideoCodecs()

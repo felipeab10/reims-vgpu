@@ -8,7 +8,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 out=${1:-/tmp/rgk-oracle/x86}
 arch=${2:-x86_64}
 mkdir -p "$out"
-for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors oracle_source oracle_ycbcr oracle_ca_ycbcr oracle_sampler oracle_icb oracle_order oracle_names oracle_surftex oracle_texdesc oracle_nilbind oracle_reflection oracle_mesh; do
+for p in oracle_iosurface oracle_storage oracle_passes oracle_cmdbuf oracle_caps oracle_errors oracle_source oracle_ycbcr oracle_ca_ycbcr oracle_sampler oracle_icb oracle_order oracle_names oracle_surftex oracle_texdesc oracle_nilbind oracle_reflection oracle_mesh oracle_spi_members oracle_complete oracle_urls oracle_rows oracle_ratemap oracle_fnptr oracle_residency oracle_threads oracle_overlap oracle_profile oracle_waits oracle_archtype oracle_pastlen; do
 	xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall \
 		-framework Metal -framework IOSurface -framework CoreVideo -framework QuartzCore \
 		-framework VideoToolbox -framework CoreGraphics -framework Foundation \
@@ -23,13 +23,46 @@ xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle
 xcrun -sdk macosx metallib "$air" -o "$out/oracle_reflection.metallib"
 xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_nilbind.metal" -o "$air"
 xcrun -sdk macosx metallib "$air" -o "$out/oracle_nilbind.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_ratemap.metal" -o "$air"
+xcrun -sdk macosx metallib "$air" -o "$out/oracle_ratemap.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_fnptr.metal" -o "$air"
+xcrun -sdk macosx metallib "$air" -o "$out/oracle_fnptr.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -c "$here/oracle_overlap.metal" -o "$air"
+xcrun -sdk macosx metallib "$air" -o "$out/oracle_overlap.metallib"
 rm -f "$air"
+# oracle_fnptr's dynamic library, and its kernel linked against it.
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
+	-install_name @executable_path/liboracle_fnptr_dyn.metallib "$here/oracle_fnptr_dyn.metal" \
+	-o "$out/liboracle_fnptr_dyn.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/oracle_fnptr_link.metal" \
+	-L "$out" -loracle_fnptr_dyn -o "$out/oracle_fnptr_link.metallib"
+# The same kernel linked against a library of an install name that names no file.
+gone=$(mktemp -d)
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 -dynamiclib \
+	-install_name @executable_path/liboracle_fnptr_gone.metallib "$here/oracle_fnptr_dyn.metal" \
+	-o "$gone/liboracle_fnptr_gone.metallib"
+xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/oracle_fnptr_link.metal" \
+	-L "$gone" -loracle_fnptr_gone -o "$out/oracle_fnptr_link_missing.metallib"
+rm -r "$gone"
 # oracle_bundle and its libraries; a library this toolchain does not build is left out, and its
 # case says so.
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework Foundation -framework IOSurface "$here/oracle_bundle.m" -o "$out/oracle_bundle"
 xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
 	-framework Foundation -framework IOKit "$here/oracle_events.m" -o "$out/oracle_events"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_readonly.m" -o "$out/oracle_readonly"
+cp "$here/oracle_readonly.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework Foundation "$here/oracle_failways.m" -o "$out/oracle_failways"
+cp "$here/oracle_failways.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework IOSurface -framework Foundation "$here/oracle_twinwrites.m" -o "$out/oracle_twinwrites"
+cp "$here/oracle_twinwrites.sh" "$out/"
+xcrun clang -arch "$arch" -mmacosx-version-min=26.0 -fobjc-arc -Wall -framework Metal \
+	-framework IOSurface -framework CoreVideo -framework Foundation "$here/oracle_surfresolve.m" \
+	-o "$out/oracle_surfresolve"
+cp "$here/oracle_surfresolve.sh" "$out/"
 for m in oracle_bundle oracle_bundle_mesh oracle_bundle_rt oracle_bundle_args; do
 	xcrun -sdk macosx metal -std=metal3.0 -mmacosx-version-min=26.0 "$here/$m.metal" \
 		-o "$out/$m.metallib" || echo "oracle_bundle: $m.metallib not built"

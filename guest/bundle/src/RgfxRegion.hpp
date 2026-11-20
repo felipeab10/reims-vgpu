@@ -26,6 +26,18 @@
  * aligned to a cache line so the ring header's 64-byte lines never share one; resource
  * blocks default to a page so a block can later back a mapping.
  *
+ * WRITE-COMBINED PARTS. The region is no RAM of the guest's, so the kernel maps it uncached
+ * whatever the kext asks for write-back (xnu's pmap sets PCD on every page it does not manage),
+ * and an AMD host applies the guest's memory type: plain stores there cost about 0.3 us per
+ * 4 bytes. Where the kext maps part of a block write-combined (setWriteCombinedSource,
+ * kRgfxKextFeatureWriteCombined), the bytes the process only writes take that part: a submission
+ * ring's data (allocateRingPair, its header alone in the page before it), command buffers' bodies
+ * and a library's staging chunks (allocate's `writeCombinedFrom`). Write-combined stores are
+ * weakly ordered: the ring writer fences them (sfence) before it publishes a message that names
+ * them, and a lock or a fence orders them for another thread, as for any store. The process never
+ * reads them back, nor takes an atomic there: loads there are uncached, and a locked operation on
+ * write-combined memory is not atomic.
+ *
  * Our own code; depends only on the committed wire header. In a unit test the region
  * is a plain buffer; in the bundle it is the context's window.
  */
@@ -34,7 +46,10 @@
 #define RGFX_REGION_HPP_
 
 #include <cstdint>
+#include <map>
 #include <mutex>
+#include <tuple>
+#include <vector>
 
 #include "reims_graphics_wire.h"
 
@@ -61,6 +76,10 @@ public:
 		uint32_t submit_data_size;
 		uint32_t complete_data_size;
 		bool ok;
+		/// The blocks the rings lie in, which release() takes: a ring's own offset, but for a
+		/// submission ring whose data is write-combined, which starts its block's second page.
+		uint64_t submit_block;
+		uint64_t complete_block;
 	};
 
 	/// The allocator over the region whose CPU base is `base`, `size` bytes long.
@@ -88,8 +107,14 @@ public:
 	/// `ok` is false when `align` is not a power of two or the region has no room.
 	Block allocate(uint64_t size, uint64_t align = kDefaultBlockAlign);
 
-	/// Hands back the block at region offset `offset` (one allocate() returned) to the block
-	/// source; nothing without one.
+	/// As allocate, with the block's bytes from `writeCombinedFrom` (a multiple of
+	/// kDefaultBlockAlign) mapped write-combined where a write-combined source is set
+	/// (WRITE-COMBINED PARTS); the whole block write-back otherwise.
+	Block allocate(uint64_t size, uint64_t align, uint64_t writeCombinedFrom);
+
+	/// Hands back the block at region offset `offset` (one allocate() or acquirePages() returned)
+	/// to the block source; nothing without one. A pages block given more than once
+	/// (acquirePages' `join`) goes back at the release for the last time it was given.
 	void release(uint64_t offset);
 
 	/// Where blocks come from: `alloc` places `size` bytes aligned to `align` and writes the
@@ -99,9 +124,20 @@ public:
 	typedef void (*ReleaseFn)(void *context, uint64_t offset);
 	void setBlockSource(AllocFn alloc, ReleaseFn release, void *context);
 
+	/// Where blocks part of which is write-combined come from (WRITE-COMBINED PARTS): as the
+	/// block source's `alloc`, with the bytes from `writeCombinedFrom` mapped write-combined.
+	/// Called with the block source's context; its blocks go back through its `release`.
+	typedef bool (*WriteCombinedAllocFn)(void *context, uint64_t size, uint64_t align,
+	                                     uint64_t writeCombinedFrom, uint64_t *offset);
+	void setWriteCombinedSource(WriteCombinedAllocFn alloc);
+
+	/// Whether a write-combined source is set.
+	bool writeCombines() const { return m_writeCombinedAlloc != nullptr; }
+
 	/// What the process keeps for reuse and can give back where the kext has no room: `reclaim`
 	/// lets go of such blocks (the buffers' empty and cached slabs, RgfxSlabs.hpp, and the
-	/// IOSurface views the keep holds, RgfxIOSurface.h) and answers whether it let any go, and
+	/// IOSurface views the keep holds, RgfxIOSurface.h), waits for the slabs another thread is
+	/// giving back at that moment (RgfxSlabs::reclaim), and answers whether any went, and
 	/// allocate() then asks the block source once more, so a block is refused only where the
 	/// process holds nothing it could give back; so does acquireSurfacePages where the kext had
 	/// no room (kPagesNoRoom). The surface sources' other refusals are not asked again: theirs
@@ -153,13 +189,16 @@ public:
 	/// `surfaceId` whose whole allocation, `length` bytes, this process maps at `base`, the
 	/// device's GPU using those pages in place. Where `cacheable`, the block may be made cached,
 	/// its GPU copy kept in a device cache on the host; `*cached` says whether the block is,
-	/// whoever made it. Its blocks go back through the surface source's release
-	/// (releaseSurface). `alignment` is what the host's textures over the pages ask of each
-	/// plane's offset and rows (0: none known). Called with `context`, from any thread.
+	/// whoever made it. `layout`, where not null, is the surface's planes as its memory holds
+	/// them, by which a host whose GPU shares the CPU's memory decides whether the block needs a
+	/// device cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED). Its blocks go back through the surface
+	/// source's release (releaseSurface). `alignment` is what the host's textures over the pages
+	/// ask of each plane's offset and rows (0: none known). Called with `context`, from any
+	/// thread.
 	typedef PagesAnswer (*SurfacePagesFn)(void *context, const void *base, uint64_t length,
 	                                      uint64_t size, uint32_t surfaceId, bool cacheable,
-	                                      uint64_t *offset, uint64_t *serial, bool *fresh,
-	                                      bool *cached);
+	                                      const RgfxSurfacePagesLayout *layout, uint64_t *offset,
+	                                      uint64_t *serial, bool *fresh, bool *cached);
 	void setSurfacePagesSource(SurfacePagesFn acquire, uint64_t alignment, void *context);
 
 	/// Where the kext learns of command buffers' writes of surfaces' shared blocks, so a CPU lock
@@ -183,16 +222,30 @@ public:
 	/// Queue `queue`'s buffers up to `seqno` have their results in the surfaces' pages.
 	void retireSurfaceWrites(uint64_t queue, uint64_t seqno);
 
+	/// Where a surface's two seeds come from (the kext's, kRgfxAccelMethodSurfaceSeeds): `seeds`
+	/// answers the lock seed (IOSurfaceGetSeed's) and the unlock seed of the surface of IOSurfaceID
+	/// `surfaceId` the process holds, false where it has none. IOSurface moves the lock seed at a
+	/// read-write lock and the unlock seed at its unlock, and both at a GPU write, so the two differ
+	/// while a CPU holds the surface locked for writing. Called with `context`, from any thread.
+	typedef bool (*SurfaceSeedsFn)(void *context, uint32_t surfaceId, uint32_t *lockSeed,
+	                               uint32_t *unlockSeed);
+	void setSurfaceSeedsSource(SurfaceSeedsFn seeds, void *context);
+
+	/// The surface `surfaceId`'s lock and unlock seeds (SurfaceSeedsFn); false without a seeds
+	/// source, or where it has none.
+	bool surfaceSeeds(uint32_t surfaceId, uint32_t *lockSeed, uint32_t *unlockSeed);
+
 	/// Whether a surface pages source is set, and the alignment it gave.
 	bool hasSurfacePages() const { return m_pagesAcquire != nullptr; }
 	uint64_t surfacePagesAlignment() const { return m_pagesAlignment; }
 
 	/// The shared block in place of `size` bytes for the surface `surfaceId` of `length` bytes
-	/// at `base`, the one every process that holds the surface gets, asked cached where
-	/// `cacheable` (SurfacePagesFn); `*answer` says how the ask ended, and `block.ok` is true
-	/// only where it is kPagesGiven.
+	/// at `base`, laid out as `layout` says, the one every process that holds the surface gets,
+	/// asked cached where `cacheable` (SurfacePagesFn); `*answer` says how the ask ended, and
+	/// `block.ok` is true only where it is kPagesGiven.
 	SurfaceBlock acquireSurfacePages(const void *base, uint64_t length, uint64_t size,
-	                                 uint32_t surfaceId, bool cacheable, PagesAnswer *answer);
+	                                 uint32_t surfaceId, bool cacheable,
+	                                 const RgfxSurfacePagesLayout *layout, PagesAnswer *answer);
 
 	/// Where pages blocks come from (the kext's PagesBlock, RGFX_FEATURE_PAGES_BUFFERS): `acquire`
 	/// answers the block of the runs of the pages that hold the `length` bytes at `address` in the
@@ -207,10 +260,70 @@ public:
 	/// Whether a pages block source is set.
 	bool hasPagesBlocks() const { return m_pagesBlock != nullptr; }
 
+	/// Where chunked pages blocks come from (the kext's PagesChunked,
+	/// kRgfxKextFeaturePagesChunked): `make` answers `length` bytes of the kext's own memory,
+	/// zero-filled, in runs of guest RAM of 64 KiB at least, mapped read and write in the process
+	/// at `*bytes`, and the pages block of those runs, its region offset and size, or false where
+	/// it gives none. The memory is the block's: the block's release (release()) takes it out of
+	/// the process too, and the process never unmaps it. Called with `context`, from any thread.
+	typedef bool (*ChunkedPagesFn)(void *context, uint64_t length, uint8_t **bytes,
+	                               uint64_t *offset, uint64_t *size);
+	void setChunkedPagesSource(ChunkedPagesFn make, void *context);
+
+	/// Whether a chunked pages block source is set.
+	bool hasChunkedPages() const { return m_chunkedPages != nullptr; }
+
+	/// A chunked pages block of `length` bytes (ChunkedPagesFn): `ok` false without a chunked
+	/// pages source, or where it gives none; its `ptr` the memory in the process, given back with
+	/// the block at its release(). Never joined: each is its own.
+	Block acquireChunkedPages(uint64_t length);
+
+#if defined(__arm64__)
+	/// The page the kext rounds a pages block's range out to, which the device's view of the block
+	/// starts at: 16 KiB where the kext took RGFX_FEATURE_PAGES_16K (its RgfxPagesBlock.hpp),
+	/// else 4 KiB. Set with the pages block source, before any block is asked.
+	void setPagesPage(uint64_t page) { m_pagesPage = page; }
+	uint64_t pagesPage() const { return m_pagesPage; }
+#endif
+
 	/// The pages block of the `length` bytes at `address` (PagesBlockFn): `ok` false without a
 	/// pages block source, or where it gives none. Its `ptr` is null: the process never maps a
 	/// pages block, which holds the device's runs alone.
-	Block acquirePages(const void *address, uint64_t length, bool writable);
+	///
+	/// With a `join` other than kPagesOwn, a block given for the same bytes, writability and
+	/// `join` that is still joinable is given again rather than a new one, so the device makes one
+	/// view of the pages, and one copy of them where it copies them: two no-copy buffers over the
+	/// same memory lie in one host memory, as on a Mac they lie in the same pages. A block stays
+	/// joinable until leavePages() was called for each time it was given: the caller calls it as
+	/// the object over the block goes for the app. It goes back through the block source at the
+	/// release() for the last time it was given.
+	///
+	/// The same bytes are the same memory only where the process still maps it there: an object
+	/// can outlive the app's hold of the memory under it (a texture over the buffer, a command
+	/// buffer that holds it), and the app may unmap the memory and map other memory at the same
+	/// address meanwhile, as WindowServer maps one layer's image where another's was. So a block
+	/// is joined only where the memory at the bytes is what it was when the block was given: the
+	/// same VM object at the same offset in each VM region the bytes span
+	/// (rgfxPagesIdentity, read once the block's pages are wired, which may give a
+	/// copy-on-write mapping an object of its own). A block whose bytes hold other memory now is
+	/// joinable no longer, and the bytes take a block of their own; so do bytes whose memory
+	/// cannot be told (no object yet, a hole). Joined over other memory, a buffer's GPU reads
+	/// and writes would reach the old memory's pages, wired under the old block, while the app
+	/// writes the new: in a macOS 26.7.2 guest, System Settings' labels drew the strings of
+	/// labels on the pane before.
+	Block acquirePages(const void *address, uint64_t length, bool writable,
+	                   uint32_t join = kPagesOwn);
+
+	/// How many times acquirePages found a joinable block for the bytes asked whose memory is
+	/// other memory now, which it then joined no longer (a diagnostic).
+	uint64_t pagesRejoinsRefused() const;
+
+	/// acquirePages' `join` for a block of its own, given to no one else.
+	static const uint32_t kPagesOwn = 0;
+
+	/// The pages block at `offset` is no longer joinable for one of the times acquirePages gave
+	/// it (its object went for the app); nothing for a block given with kPagesOwn.
+	void leavePages(uint64_t offset);
 
 	/// A submission + completion ring pair (see RingPair). Each data size must be a
 	/// power of two; `complete_data_size` may be 0 (no completion ring placed).
@@ -244,6 +357,7 @@ private:
 	uint64_t m_floor;   // RGFX_ALLOCATIONS_OFFSET
 	uint64_t m_cursor;  // the next free offset, at or above the floor
 	AllocFn m_alloc = nullptr;     // the block source, where set (the kext)
+	WriteCombinedAllocFn m_writeCombinedAlloc = nullptr; // the write-combined source (the kext)
 	ReleaseFn m_release = nullptr;
 	void *m_sourceContext = nullptr;
 	ReclaimFn m_reclaim = nullptr; // the process's blocks kept for reuse, where set (the slabs)
@@ -256,11 +370,50 @@ private:
 	void *m_pagesContext = nullptr;
 	PagesBlockFn m_pagesBlock = nullptr; // the pages block source, where set (the kext)
 	void *m_pagesBlockContext = nullptr;
+	ChunkedPagesFn m_chunkedPages = nullptr; // the chunked pages source, where set (the kext)
+	void *m_chunkedPagesContext = nullptr;
+#if defined(__arm64__)
+	uint64_t m_pagesPage = 0x1000; // pagesPage()
+#endif
+	// The pages blocks given with a join (acquirePages): the joinable ones by their bytes,
+	// writability and join, and each such block's counts by its offset, under m_pagesLock.
+	struct PagesRange {
+		uintptr_t address;
+		uint64_t length;
+		bool writable;
+		uint32_t join;
+		bool operator<(const PagesRange &o) const
+		{
+			return std::tie(address, length, writable, join) <
+			       std::tie(o.address, o.length, o.writable, o.join);
+		}
+	};
+	struct JoinedPages {
+		PagesRange range;
+		uint64_t size;
+		uint32_t joinable; // the times given whose leavePages has not come
+		uint32_t held;     // the times given whose release has not come
+		// The memory the bytes were when the block was given (rgfxPagesIdentity).
+		std::vector<uint64_t> identity;
+	};
+	std::map<PagesRange, uint64_t> m_joinablePages;
+	std::map<uint64_t, JoinedPages> m_joinedPages;
+	uint64_t m_rejoinsRefused = 0; // pagesRejoinsRefused(), under m_pagesLock
+	mutable std::mutex m_pagesLock;
 	SurfaceWritesFn m_writesNote = nullptr; // the surface write source, where set (the kext)
 	SurfaceRetireFn m_writesRetire = nullptr;
 	void *m_writesContext = nullptr;
+	SurfaceSeedsFn m_seeds = nullptr; // the surface seeds source, where set (the kext)
+	void *m_seedsContext = nullptr;
 
 	std::mutex m_lock;
 };
+
+/// The memory the `length` bytes at `address` lie in, in this process, now: for each VM region
+/// they span, in order, its VM object (mach_vm_region_recurse's `object_id_full`, which no other
+/// live object of the kernel's has), the offset in that object of the first of the bytes the
+/// region holds, and how many of them it holds. False where a byte is not mapped, a region has
+/// no object yet, or the kernel answers no `object_id_full`.
+bool rgfxPagesIdentity(const void *address, uint64_t length, std::vector<uint64_t> *identity);
 
 #endif // RGFX_REGION_HPP_

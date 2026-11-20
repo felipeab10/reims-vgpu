@@ -9,12 +9,10 @@
 //! do; runs whose file offsets follow on are one VMA to the kernel.
 //!
 //! - **`allocate_anywhere`** is private anonymous memory (`MAP_NORESERVE`), zero-filled and in no
-//!   file, so no view can be made of it: it serves core's reservations, the detach buffer's
-//!   temporary and the address space views are mapped over. A range a view must be made of comes
-//!   from [`allocate_aliasable`], a shared mapping of a file of its own: the detach heap's
-//!   temporary, which Metal's heap is made over, is one (core's `HostVm::allocate_aliasable`),
-//!   and so is an alias whose zeros past the guest's pages the runtime imports with them
-//!   (`crate::gpu::backing::gather`), as a dma-buf takes file pages alone.
+//!   file, so no view can be made of it: it serves reservations and the address space views are
+//!   mapped over. A range a view must be made of comes from [`allocate_aliasable`], a shared
+//!   mapping of a file of its own (core's `HostVm::allocate_aliasable`), as a dma-buf takes file
+//!   pages alone: the tests' stand-in for guest memory is one.
 //! - **`remap_shared_overwrite`** fails with `KERN_INVALID_ADDRESS` where a byte of the source
 //!   has no file behind it, as Mach fails for an unmapped source, before it maps anything. A
 //!   piece the kernel refuses fails the call with nothing changed, as Mach's remap is all or
@@ -35,11 +33,27 @@
 //!
 //! **Mappings.** A run of a view mapped from its file is a VMA, so such a view of scattered pages
 //! costs one per run. The views share a budget short of `vm.max_map_count` ([`super::budget`]): a
-//! remap, a range a view can be made of or a stand-in's memory that would pass it is refused
-//! before anything is mapped, so the rest of the process keeps its mappings: a remap or a range
-//! answers `KERN_NO_SPACE` and a stand-in no memory, as Mach's and IOSurface's calls answer when
-//! memory runs out, which core answers as it does on the Metal platform then
-//! (`crate::answer::out_of_host_memory`, counted; in strict mode a death).
+//! remap, a range a view can be made of or memory of the library's own that would pass it is
+//! refused before anything is mapped, so the rest of the process keeps its mappings: a remap or a
+//! range answers `KERN_NO_SPACE` and the library's own memory none, as Mach's calls answer when
+//! memory runs out, which core answers as Metal does then (`crate::answer::out_of_host_memory`,
+//! counted; in strict mode a death).
+//!
+//! A view of many runs is resolved in one pass of the backing table and recorded over its fresh
+//! reservation with no run to cut (`files::view_pieces`, `files::record_pieces`), so the kernel's
+//! maps are most of what it costs. **Measured** 2026-11-08 on homelab-um870-1 (Ryzen 7 8745H, Linux
+//! 7.3.1, release build): a view of 7,261 one-page runs of a registered memfd, three in four the
+//! page below the one before (an IOSurface's, as an x86-64 macOS guest hands its pages out), took
+//! 1.86 µs a run beside 66,000 one-page views, and 2.06 µs beside 200,000, against 2.06 and 2.29 µs
+//! with each run resolved and recorded on its own. On homelab-ms01-1 (Core i9-13900H, Linux 7.3.1),
+//! beside 66,000, it took 1.21 µs a run on a performance core and 2.11 µs on an efficiency core,
+//! against 1.50 and 2.58 µs a run at a time: that processor gives the kernel no capacity to place a
+//! thread by (`hints`), so a view is mapped on either. A C loop of the same maps took 2.0 to 2.2 µs
+//! a run on homelab-um790-xtx-1 (Ryzen 7 7840HS, Linux 7.3.1) beside 66,000 one-page mappings of
+//! the file, and 1.09 to 1.26 µs on homelab-ms01-1, each `MAP_FIXED` cutting the reservation it
+//! lands in (`vms_gather_munmap_vmas` and `__split_vma` in its profile); `MAP_FIXED_NOREPLACE` into
+//! a hole took 1.6 to 1.7 µs and 0.90 to 1.01 µs, but a hole is no reservation: another thread's
+//! `mmap` may land in it while the runs go in.
 //!
 //! **Views through dma-bufs.** An x86-64 macOS guest hands out its pages in 4 KiB pieces, each
 //! 16 KiB clump of them backwards (its free queue refills each CPU's list last in, first out), and
@@ -50,7 +64,7 @@
 //! million VMAs, about 4 GiB of the guest's pages, each page in about one view, within 190 s of a
 //! drag, a resize and Safari's scroll, and passed the budget of a `vm.max_map_count` of 1,048,576.
 //! So a view of more than one run of file pages made at once (`remap_runs_shared_overwrite`, which
-//! core's memory map, the surface stand-in and the platform's aliases make their views with) is
+//! core's memory map makes its views with) is
 //! mapped as dma-bufs of those pages instead, made by udmabuf (`UDMABUF_CREATE_LIST`, in any order)
 //! within its limits, one after another, each one VMA ([`super::dma_buf::of_view`]): at udmabuf's
 //! stock `list_limit` of 1,024 a view of scattered pages takes a VMA per 4 MiB. Such a mapping
@@ -70,7 +84,8 @@
 //! pins none. So where a device of the process refuses such a view (`super::import`'s
 //! `learn_view_imports`, as the device is made), views are mapped from their files from then on,
 //! a mapping a run, and an import of a view made through dma-bufs before maps what of its pages
-//! lies in them from their files for as long as the view lives ([`unfold`]). Where those
+//! lies in them from their files ([`unfold`]), until the import is made where the device keeps
+//! what it pinned (below, "Folding back"), else for as long as the view lives. Where those
 //! mappings would come within the headroom of the views' budget (`super::budget`'s `claim`), a
 //! view is mapped through dma-bufs there too, and no view ends the process. A no-copy buffer's or
 //! heap's import of pages left in dma-bufs for want of mappings, which the runtime asks the
@@ -78,14 +93,53 @@
 //! holds folded back first where that may free some ([`fold_short_due`]); past it the gate
 //! refuses them, and the runtime makes the buffer or heap over a copy of them, which takes no
 //! mapping (`super::import`'s `import_gate`); a rebind's alike, which the runtime then makes over
-//! a copy too. A device lend's maps them short of the headroom alone: past it the device declines
-//! the frame, which the CPU copies into the guest's buffer instead (`super::import`'s
-//! `pages_from_files`).
+//! a copy too. Pages one dma-buf holds are let through instead where the device takes such a
+//! dma-buf in place of the pointer it refuses (NVIDIA's driver, as an allocation dedicated to the
+//! buffer, and ANV's: `super::import`'s `ONE_DMA_BUF`): the runtime imports them through it, with
+//! no mapping of their own.
+//!
+//! **One dma-buf a view.** On such a device whose textures over the pages one dma-buf holds lie in
+//! place too (`super::import`'s `ONE_DMA_BUF_VIEWS`: ANV's at metal2vulkan fb33065288, not NVIDIA's
+//! driver's, whose textures over such pages are shadows), a view one dma-buf holds, more than one
+//! run of one protection within udmabuf's limits (at its defaults 1,024 runs and 64 MiB), is mapped
+//! through that one dma-buf from the first, budget or not ([`one_buf_view`]), and the dma-buf is
+//! kept while a run of the view lies in it (`files::Kept`): a no-copy buffer's import leaves the
+//! pages where they lie (`super::import`'s `import_view`), and the runtime's import of the whole
+//! view is given a duplicate of the kept dma-buf's descriptor, so no dma-buf is made again
+//! (`super::import`'s `host_memory`). A heap's import maps them from their files, as before
+//! (`super::import`'s `import_heap_view`); so does a device outside the runtime that pins a
+//! pointer's pages, CUDA's registration for the host's video decoders (`super::device_lend`'s
+//! `map_for_pointer`). A view of more runs than one dma-buf takes is mapped as above. The device
+//! learns whether its textures lie in place once, as it is made (`super::import`'s
+//! `learn_view_imports`), from the runtime's in-place check: where the check has not answered by
+//! then, as in the first process after a driver update or a change of the check's version, before
+//! the runtime keeps its verdicts, the views of that whole process are mapped as above, and the
+//! route is taken from the next process on. **Measured** 2026-11-15 on homelab-ms01-1's Iris Xe at
+//! metal2vulkan fb33065288: the first boot of a guest there after the pin move ran without it, its
+//! device's check answering after the probe (job m3-max-33721), and the next process there recalled
+//! the kept verdicts as its device was made (job m3-max-33777, at metal2vulkan c2206c14b0, whose
+//! check is of the same version). **Measured** 2026-11-14 on homelab-ms01-1's Iris Xe (ANV, Linux
+//! 7.3.1, Mesa 26.2.6, release build, job m3-max-31409, three rounds each), a view of 1,024 pages
+//! backwards, written first: mapped from its files in 1,086-1,121 µs, imported by its pointer in
+//! 46-52 µs and unmapped in 696-705 µs, 1,024 mappings; through one dma-buf in 551-574 µs, imported
+//! through the kept dma-buf in 116-120 µs and unmapped in 118-200 µs, one mapping, no dma-buf made
+//! for the import (a second one of the same pages took 305 µs, job m3-max-31264); of 256 pages,
+//! 289-314, 25-27 and 186-206 µs against 149-150, 59-63 and 54-64 µs. The GPU read and wrote the
+//! pages through either, and a linear texture over the buffer was not shadowed. Of the 3,152 views
+//! an x86-64 macOS 26.7.2 guest's walk through its apps and Geekbench made on the same host, 2,082
+//! were of 2 to 1,024 runs within 64 MiB, 140,322 runs in all, and 260 of more, 1,727,177 runs (job
+//! m3-max-31194).
 //!
 //! **Folding back.** At the views' budget, before anything is refused, the views' runs mapped
 //! from their files that no import a device may pin holds (`super::import`'s `Pinned`) are mapped
 //! through dma-bufs of their pages instead, a mapping per 4 MiB ([`fold_idle`]), where udmabuf is
-//! the process's. The same pages are mapped over them, so nothing reading or writing them sees a
+//! the process's. An import holds its pages so only while it is being made where the device that
+//! makes it keeps what it pinned at the import (`super::import`'s `ImportMade`, learned of each
+//! GPU by a probe, `super::import`'s `probe_fold`): NVIDIA's driver pins the pages as it imports
+//! them and keeps those pages, whatever is mapped over their range later, so a made import's view
+//! of scattered pages, a mapping a run, is folded as an idle one is, and the mappings it held go
+//! to the next import; another import of the same view maps it from its files again until that
+//! one is made too. The same pages are mapped over them, so nothing reading or writing them sees a
 //! change; every change the library makes to its views' mappings (a view, an unfold, a protect,
 //! an overwrite, an unmap) holds the views' lock to read ([`views`]), and a fold holds it to
 //! write, so none of them runs while a fold maps, and a fold never maps over a range another
@@ -110,12 +164,14 @@
 use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
 use std::sync::Arc;
 
-use reims_vgpu_core::num::{ToU64, ToUsize};
-use reims_vgpu_core::platform::os::vm::{HostAddr, HostVm, KernReturn, VmProt};
-use reims_vgpu_core::sync::{ReadGuard, WriterPrefRwLock};
+use crate::core::num::{ToU64, ToUsize};
+use crate::core::platform::os::vm::{
+    GroupHold, GroupLimits, HostAddr, HostVm, KernReturn, ViewGroups, VmProt,
+};
+use crate::core::sync::{ReadGuard, WriterPrefRwLock};
 
 use super::budget;
-use super::files::{self, Backing, Through};
+use crate::os::files::{self, Backing, Through};
 
 /// `KERN_INVALID_ADDRESS`.
 const INVALID_ADDRESS: KernReturn = KernReturn(1);
@@ -193,13 +249,32 @@ fn fold_within(within: std::ops::Range<u64>) -> u64 {
     AT_LIMIT.with(|a| a.set(outer));
     let freed = before.saturating_sub(files::mappings());
     if freed > 0 {
+        // A fallback a guest's load reaches: at info once per process (`kind`), later at debug.
         log::info!(
-            target: "reims_vgpu_vulkan::os",
+            target: "reims_vgpu_vulkan::os", kind = "fold";
             "at the views' budget (vm.max_map_count): {freed} of the views' {before} mappings \
              freed by mapping the pages no import holds through dma-bufs"
         );
     }
     freed
+}
+
+/// Maps the runs of `range` mapped from their files through dma-bufs of their pages, whatever
+/// import holds them, as [`fold_idle`] maps those no import holds: `super::import`'s probe of
+/// whether a device keeps the pages of its import of a pointer once its view is so folded
+/// (`super::import`'s `probe_fold`). Whether the range then lies in views through dma-bufs;
+/// `false` where udmabuf is not the process's, or the thread holds the views' lock.
+pub(super) fn fold_held(range: std::ops::Range<u64>) -> bool {
+    if IN_VIEWS.with(std::cell::Cell::get) > 0 || !super::dma_buf::opens() {
+        return false;
+    }
+    {
+        let _all = VIEWS.write();
+        let outer = AT_LIMIT.with(|a| a.replace(Some(false)));
+        fold(range.clone());
+        AT_LIMIT.with(|a| a.set(outer));
+    }
+    !files::through_pieces(range.start, range.end).is_empty()
 }
 
 /// The views' mappings and the imports freed (`super::import`'s `unpinned`) as the last fold for
@@ -233,17 +308,6 @@ fn fold_short() {
     fold_idle();
     SHORT_FOLDED[0].store(files::mappings(), Relaxed);
     SHORT_FOLDED[1].store(unpinned, Relaxed);
-}
-
-/// Claims `adding` mappings short of the headroom of the views' budget for a gated import's twin
-/// (`super::import`'s `twin`), the views no import holds folded first where the budget refuses and
-/// a fold may free something ([`fold_short_due`]).
-pub(super) fn claim_short(adding: u64) -> Option<budget::Claim> {
-    let reach = budget::Reach::ShortOfHeadroom;
-    budget::claim(adding, reach).or_else(|| {
-        fold_short_due().then(fold_short)?;
-        budget::claim(adding, reach)
-    })
 }
 
 thread_local! {
@@ -329,7 +393,7 @@ fn fold(range: std::ops::Range<u64>) {
         return;
     }
     // A refused map leaves what was mapped before it, and is logged where it is.
-    let _ = through(range.start, pieces, bufs, false);
+    let _ = through(range.start, pieces, bufs, false, false);
 }
 
 /// The host's page size.
@@ -389,7 +453,7 @@ fn no_space(what: &str) -> KernReturn {
     let at_limit = at_the_limit(&mappings, &limit);
     if at_limit && AT_LIMIT.with(|a| a.replace(a.get().map(|_| true)).is_some()) {
         log::warn!(
-            target: "reims_vgpu_vulkan::os",
+            target: "reims_vgpu_vulkan::os", kind:% = what;
             "{what}: the kernel refused the map at the process's limit of mappings, {mappings} of \
              vm.max_map_count {limit} held, {} of them the library's views of memory: folding the \
              views no import holds, to try again",
@@ -410,7 +474,7 @@ fn no_space(what: &str) -> KernReturn {
         return NO_SPACE;
     }
     log::error!(
-        target: "reims_vgpu_vulkan::os",
+        target: "reims_vgpu_vulkan::os", kind:% = what;
         "{what}: the kernel refused the map (ENOMEM): the process has {mappings} mappings, \
          vm.max_map_count is {limit}"
     );
@@ -475,7 +539,7 @@ pub(super) fn file(
     at: Option<u64>,
     length: u64,
     backing: &Backing,
-    prot: i32,
+    prot: VmProt,
 ) -> Result<u64, KernReturn> {
     let fixed = if at.is_some() { libc::MAP_FIXED } else { 0 };
     let offset = libc::off_t::try_from(backing.offset).map_err(|_| INVALID_ARGUMENT)?;
@@ -485,9 +549,9 @@ pub(super) fn file(
         libc::mmap(
             ptr(at.unwrap_or(0)),
             length.to_usize(),
-            prot,
+            prot_bits(prot),
             libc::MAP_SHARED | fixed,
-            backing.fd.as_raw_fd(),
+            backing.file.as_raw_fd(),
             offset,
         )
     };
@@ -499,8 +563,7 @@ pub(super) fn file(
 
 /// A fresh range of `len` bytes, rounded up to whole pages, of zeros, that a view can be made of:
 /// a shared mapping of a file of its own, recorded in the backing table. Freed by `deallocate`,
-/// as any other range. The block of zeros a detached object reads, and the tests' stand-in for
-/// guest memory, are such ranges.
+/// as any other range. The tests' stand-in for guest memory is such a range.
 pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
     let Some((_, length)) = pages(HostAddr::NULL, len) else {
         return Err(NO_SPACE);
@@ -513,8 +576,11 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
             return Err(NO_SPACE);
         }
         let fd = memfd(length).map_err(|_| NO_SPACE)?;
-        let backing = Backing { fd, offset: 0 };
-        let prot = libc::PROT_READ | libc::PROT_WRITE;
+        let backing = Backing {
+            file: fd,
+            offset: 0,
+        };
+        let prot = VmProt::READ | VmProt::WRITE;
         let at = file(None, length, &backing, prot)?;
         files::record(at, length, backing, prot);
         Ok(HostAddr::from_addr(at.to_usize()))
@@ -523,7 +589,8 @@ pub(crate) fn allocate_aliasable(len: u64) -> Result<HostAddr, KernReturn> {
 
 /// Memory of the library's own that a view can be made of and that only its holder frees: a
 /// shared mapping of a new file, read and write, registered in the backing table
-/// ([`files::Registration`]), so that `deallocate` refuses it. An IOSurface stand-in's memory.
+/// ([`files::Registration`]), so that `deallocate` refuses it: a graphics device's region
+/// ([`RegionMemory`]).
 #[derive(Debug)]
 pub(crate) struct OwnMemory {
     first: u64,
@@ -533,22 +600,22 @@ pub(crate) struct OwnMemory {
 
 impl OwnMemory {
     /// `len` bytes, rounded up to whole pages, of zeros; `None` for none, or where the host
-    /// gives no file, no address space or no mapping within the views' budget, as an IOSurface's
-    /// creation answers nil when memory runs out.
+    /// gives no file, no address space or no mapping within the views' budget, as when memory runs
+    /// out.
     pub(crate) fn new(len: u64) -> Option<OwnMemory> {
         let (_, length) = pages(HostAddr::NULL, len)?;
         if length == 0 {
             return None;
         }
         let (first, backing) = reclaiming(|| {
-            if !budget::admit(1, "an IOSurface stand-in's memory") {
+            if !budget::admit(1, "memory of the library's own") {
                 return None;
             }
             let backing = Backing {
-                fd: memfd(length).ok()?,
+                file: memfd(length).ok()?,
                 offset: 0,
             };
-            let first = file(None, length, &backing, libc::PROT_READ | libc::PROT_WRITE).ok()?;
+            let first = file(None, length, &backing, VmProt::READ | VmProt::WRITE).ok()?;
             Some((first, backing))
         })?;
         budget::own_hold(1, true);
@@ -566,12 +633,44 @@ impl OwnMemory {
 }
 
 impl Drop for OwnMemory {
-    /// Drops the registration, then the mapping.
+    /// Drops the registration, then the mapping, through the platform's VM: pages a device's
+    /// import still holds stay mapped until the runtime has freed it, as Vulkan requires of
+    /// imported host memory (`VK_EXT_external_memory_host`), and go as the import's hold does
+    /// ([`crate::remap::UnmapHold`]). A region's last reference may go in a no-copy buffer's
+    /// deallocator (the scanout's, `reims-vgpu`'s `graphics::sink`), which the runtime runs at the
+    /// buffer's release, before it frees the buffer's import of the region's pages.
     fn drop(&mut self) {
         drop(self.registration.take());
-        // SAFETY: the mapping this made, which nothing uses once its holder lets go of it.
-        let _ = unsafe { libc::munmap(ptr(self.first), self.length.to_usize()) };
+        let at = HostAddr::from_addr(self.first.to_usize());
+        let _ = crate::remap::VulkanVm::new().deallocate(at, self.length);
         budget::own_hold(1, false);
+    }
+}
+
+/// A graphics device's region (BAR 2) in memory of the library's own ([`OwnMemory`]): a shared
+/// mapping of a memfd, so a device that refuses the region's pointer imports dma-bufs of its pages
+/// instead (`super::import`'s dma-buf source), as RADV refuses every page with a file behind it.
+///
+/// RADV imports host memory by pointer as an amdgpu userptr, and amdgpu walks every page of every
+/// userptr import a device holds in each of its submissions, where a dma-buf import costs a
+/// submission the same at any size (**measured** 2026-11-07, Radeon 780M, RADV of Mesa 26.2.6,
+/// Linux 7.3.1, raw Vulkan, the median of 300 empty submissions: 6.9 us with none held; 256 MiB of
+/// pointer imports in 4 pieces 90.7 us, in 128 pieces 171 us; 256 MiB of dma-buf imports in 4
+/// pieces 12.2 us, in 128 pieces 66.8 us). The region's blocks are the guest's Shared buffers,
+/// upload chunks and heaps, each imported as its buffer or heap is made.
+#[derive(Debug)]
+pub struct RegionMemory(OwnMemory);
+
+impl RegionMemory {
+    /// `len` bytes of zeros, rounded up to whole pages; `None` where the host gives no file, no
+    /// address space or no mapping within the views' budget.
+    pub fn new(len: u64) -> Option<RegionMemory> {
+        OwnMemory::new(len).map(RegionMemory)
+    }
+
+    /// Its first byte.
+    pub fn base(&self) -> *mut u8 {
+        ptr(self.0.first()).cast()
     }
 }
 
@@ -637,7 +736,7 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
     crate::answer::out_of_host_memory(call, || {
         format!(
             "the kernel gave no file of {length:#x} bytes for the library's memory ({error}); \
-             the open-file limit is {limit}; IOSurface's and Mach's calls need no file on macOS"
+             the open-file limit is {limit}; Mach's calls need no file on macOS"
         )
     });
     error
@@ -649,8 +748,8 @@ fn no_file(call: &'static str, length: u64, error: std::io::Error) -> std::io::E
 /// piece is mapped), and fresh zeros with no access over bytes of no file.
 ///
 /// Bytes of no file in a remap's target are a reservation: a mapping task's, which has no access,
-/// or a fresh range its caller frees after the failure (core's range mappings, an alias, a
-/// surface's view), so the protection of those zeros never shows. No import of the runtime's
+/// or a fresh range its caller frees after the failure (core's range mappings, a surface's
+/// view), so the protection of those zeros never shows. No import of the runtime's
 /// lies over them, as the runtime imports no page without read access and nothing imports a
 /// fresh range before its remaps succeed, so putting zeros there is reported to no one
 /// ([`crate::remap`]); the table's files are mapped back as they were, the same pages. A
@@ -702,7 +801,7 @@ fn put_back(at: u64, length: u64) {
 /// where the view cuts a run of its target in two.
 pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
     let follows = |a: &files::Piece, b: &files::Piece| {
-        Arc::ptr_eq(&a.backing.fd, &b.backing.fd)
+        Arc::ptr_eq(&a.backing.file, &b.backing.file)
             && a.backing.offset + a.length == b.backing.offset
             && a.prot == b.prot
     };
@@ -712,19 +811,28 @@ pub(super) fn mappings_added(pieces: &[files::Piece]) -> u64 {
 
 /// Maps `pieces`, which follow on from `target`, each from its file, or, where they are more than
 /// one, through dma-bufs of their pages where the host makes them: where no device of the process
-/// needs imported pages mapped from their files, and where one does, once the pieces from their
-/// files would come within the headroom of the views' budget ([`budget::claim`]; module docs,
-/// "Views through dma-bufs" and "Imports of views"). Records them: all or nothing, the pieces
-/// mapped before a refusal put back.
+/// needs imported pages mapped from their files; where one does and takes the pages one dma-buf
+/// holds through it, through one kept for the view's imports where one holds them all
+/// ([`one_buf_view`]); and otherwise there once the pieces from their files would come within the
+/// headroom of the views' budget ([`budget::claim`]; module docs, "Views through dma-bufs" and
+/// "Imports of views"). Records them: all or nothing, the pieces mapped before a refusal put back.
 fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
+    trace_view(target, &pieces);
     let adding = mappings_added(&pieces);
+    let need_files = super::import::imports_need_files();
+    if need_files && one_buf_view(&pieces, adding) {
+        match super::dma_buf::of_view(&pieces) {
+            Ok(bufs) if bufs.len() == 1 => return map_through(target, pieces, bufs, true),
+            // More than one, which the limits it was weighed against never make: as below.
+            Ok(_) => {}
+            Err(refusal) => no_dma_bufs(&refusal),
+        }
+    }
     // Held until the pieces are recorded, which counts them.
-    let claim = super::import::imports_need_files()
-        .then(|| budget::claim(adding, budget::Reach::ShortOfHeadroom))
-        .flatten();
+    let claim = need_files.then(|| budget::claim(adding)).flatten();
     if pieces.len() > 1 && claim.is_none() {
         match super::dma_buf::of_view(&pieces) {
-            Ok(bufs) => return map_through(target, pieces, bufs),
+            Ok(bufs) => return map_through(target, pieces, bufs, false),
             Err(refusal) => no_dma_bufs(&refusal),
         }
     }
@@ -751,6 +859,50 @@ fn map_view(target: u64, pieces: Vec<files::Piece>) -> Result<(), KernReturn> {
     Ok(())
 }
 
+/// The block the trace's `view` record measures a view's runs against: 64 KiB.
+const TRACE_BLOCK: u64 = 64 << 10;
+
+/// The trace's record of a view of `pieces` from `target`, with `REIMS_VGPU_TRACE` set
+/// ([`crate::core::trace`]): `view`, its first byte, its runs (pieces whose bytes follow on in
+/// the view and in the same file taken as one), its bytes, the bytes in runs of
+/// [`TRACE_BLOCK`] or more, and the bytes in whole blocks of [`TRACE_BLOCK`] whose offsets from
+/// the view's first byte and in their file are both multiples of it. A diagnostic: nothing with
+/// the trace off.
+fn trace_view(target: u64, pieces: &[files::Piece]) {
+    if !crate::core::trace::on() {
+        return;
+    }
+    let (mut runs, mut bytes, mut long, mut blocks) = (0u64, 0u64, 0u64, 0u64);
+    let mut rest = pieces;
+    while let Some((first, after)) = rest.split_first() {
+        let mut length = first.length;
+        let follows = after
+            .iter()
+            .take_while(|p| {
+                let on = Arc::ptr_eq(&p.backing.file, &first.backing.file)
+                    && p.at == first.at + length
+                    && p.backing.offset == first.backing.offset + length;
+                if on {
+                    length += p.length;
+                }
+                on
+            })
+            .count();
+        runs += 1;
+        bytes += length;
+        if length >= TRACE_BLOCK {
+            long += length;
+        }
+        if first.at % TRACE_BLOCK == first.backing.offset % TRACE_BLOCK {
+            let start = first.at.next_multiple_of(TRACE_BLOCK);
+            let end = (first.at + length) / TRACE_BLOCK * TRACE_BLOCK;
+            blocks += end.saturating_sub(start);
+        }
+        rest = &after[follows..];
+    }
+    crate::core::trace::event("view", &[target, runs, bytes, long, blocks]);
+}
+
 /// Logs, once per kind, why a view of several runs is mapped from their files, a mapping a run,
 /// rather than through dma-bufs of their pages.
 fn no_dma_bufs(refusal: &super::dma_buf::Refusal) {
@@ -774,31 +926,69 @@ fn no_dma_bufs(refusal: &super::dma_buf::Refusal) {
     }
 }
 
+/// Whether a view of `pieces`, `adding` mappings from their files ([`mappings_added`]), is mapped
+/// through one dma-buf kept for its imports, on a device that needs imported pages mapped from
+/// their files (module docs, "Imports of views"): the device takes the pages one dma-buf holds
+/// through it and textures over them lie in place (`super::import`'s `ONE_DMA_BUF_VIEWS`), and
+/// they are more than one run of one protection that one dma-buf takes, within udmabuf's limits
+/// as the host has them now.
+fn one_buf_view(pieces: &[files::Piece], adding: u64) -> bool {
+    let runs = adding.saturating_sub(1);
+    let prot = pieces.first().map(|p| p.prot);
+    let bytes = pieces.iter().map(|p| p.length).sum();
+    runs > 1
+        && super::import::one_dma_buf_views()
+        && !FROM_FILES.with(std::cell::Cell::get)
+        && pieces.iter().all(|p| Some(p.prot) == prot)
+        && super::dma_buf::fits_pieces(runs, bytes).is_ok()
+}
+
+thread_local! {
+    /// Whether the views the thread makes are mapped from their files whatever one dma-buf
+    /// holds ([`from_files`]).
+    static FROM_FILES: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// `f`, with the views the thread makes in it mapped as they are where no device takes the pages
+/// one dma-buf holds through it ([`one_buf_view`]): from their files short of the headroom of the
+/// views' budget. For `super::import`'s probe of what a device does with a view mapped from its
+/// files once it is folded (`probe_fold`).
+pub(super) fn from_files<R>(f: impl FnOnce() -> R) -> R {
+    let outer = FROM_FILES.with(|from| from.replace(true));
+    let made = f();
+    FROM_FILES.with(|from| from.set(outer));
+    made
+}
+
 /// Maps `bufs`, dma-bufs of the pages `pieces` show from `target` ([`super::dma_buf::of_view`]),
 /// one after another, each a mapping of its own, and records the pieces as mapped through them:
 /// all or nothing, those mapped before a refusal put back. The descriptors go once mapped, the
-/// mappings holding the dma-bufs, weighed against the budget first.
+/// mappings holding the dma-bufs, weighed against the budget first; where `keep`, the one
+/// dma-buf a whole view is mapped through is kept for the view's imports while a run lies in it
+/// (`files::Kept`).
 fn map_through(
     target: u64,
     pieces: Vec<files::Piece>,
     bufs: Vec<super::dma_buf::ViewBuf>,
+    keep: bool,
 ) -> Result<(), KernReturn> {
     if !budget::admit(bufs.len().to_u64() + 2, "a view of guest pages") {
         return Err(NO_SPACE);
     }
     let _views = views();
-    through(target, pieces, bufs, true)
+    through(target, pieces, bufs, true, keep)
 }
 
 /// [`map_through`]'s maps and record, weighed and with the views' lock held by the caller: all
 /// or nothing where `whole`; otherwise, a fold's, what the dma-bufs mapped before a refused one
 /// show stays so, recorded, as it shows the same pages as before, and mapping their files back
-/// could be refused too.
+/// could be refused too. Where `keep` and `bufs` is one dma-buf, it is kept ([`map_through`]).
 fn through(
     target: u64,
     mut pieces: Vec<files::Piece>,
     mut bufs: Vec<super::dma_buf::ViewBuf>,
     whole: bool,
+    keep: bool,
 ) -> Result<(), KernReturn> {
     let failed = bufs.iter().position(|buf| {
         // SAFETY: a shared mapping of a dma-buf of the pages the view shows, over the caller's
@@ -807,7 +997,7 @@ fn through(
             libc::mmap(
                 ptr(target + buf.at),
                 buf.length.to_usize(),
-                buf.prot,
+                prot_bits(buf.prot),
                 libc::MAP_SHARED | libc::MAP_FIXED,
                 buf.fd.as_raw_fd(),
                 0,
@@ -833,21 +1023,30 @@ fn through(
         bufs.truncate(done);
         refusal = Some(kr);
     }
-    // Each piece where it lies in the dma-bufs, cut where one ends.
+    // Each piece where it lies in the dma-bufs, cut where one ends; the descriptors go here, but
+    // a kept one's.
+    let keep = keep && bufs.len() == 1;
     let mut through = Vec::with_capacity(pieces.len());
-    let mut bufs = bufs
-        .iter()
-        .map(|b| (b.at, b.at + b.length, Through::new_buf()));
+    let mut bufs = bufs.into_iter().map(|b| {
+        let kept = keep.then(|| {
+            Arc::new(files::Kept {
+                fd: b.fd,
+                length: b.length,
+            })
+        });
+        (b.at, b.at + b.length, Through::new_buf(), kept)
+    });
     let mut buf = bufs.next();
     for piece in pieces {
         let mut piece = piece;
-        while let Some((first, end, id)) = buf {
+        while let Some((first, end, id, kept)) = &buf {
+            let (first, end, id) = (*first, *end, *id);
             let take = piece.length.min(end - piece.at);
             let rest = files::Piece {
                 at: piece.at + take,
                 length: piece.length - take,
                 backing: Backing {
-                    fd: Arc::clone(&piece.backing.fd),
+                    file: Arc::clone(&piece.backing.file),
                     offset: piece.backing.offset + take,
                 },
                 prot: piece.prot,
@@ -858,7 +1057,11 @@ fn through(
                     length: take,
                     ..piece
                 },
-                Through { buf: id, offset },
+                Through {
+                    buf: id,
+                    offset,
+                    kept: kept.clone(),
+                },
             ));
             if piece.at + take == end {
                 buf = bufs.next();
@@ -877,7 +1080,7 @@ fn through(
 /// those bytes by their pointer (module docs, "Imports of views"); refused maps are logged, and
 /// leave those bytes as they were. Where the mappings would come within the headroom of the
 /// views' budget ([`budget::claim`]), nothing is mapped, and the answer is how many they are: the
-/// views' gate then refuses the import, or a lend's device declines it. One at a time, so two
+/// views' gate then refuses the import. One at a time, so two
 /// imports of the same pages map them once.
 pub(crate) fn unfold(first: u64, end: u64) -> Result<(), u64> {
     reclaiming(|| unfold_once(first, end))
@@ -885,7 +1088,7 @@ pub(crate) fn unfold(first: u64, end: u64) -> Result<(), u64> {
 
 /// [`unfold`], once: what a refused map leaves through dma-bufs a second try maps.
 fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
-    static UNFOLDING: reims_vgpu_core::sync::Mutex<()> = reims_vgpu_core::sync::Mutex::new(());
+    static UNFOLDING: crate::core::sync::Mutex<()> = crate::core::sync::Mutex::new(());
     let _one = UNFOLDING.lock();
     let mut held = views();
     let mut pieces = files::through_pieces(first, end);
@@ -896,8 +1099,7 @@ fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
     // Held until the pieces are recorded, which counts them. An import folds the views no import
     // holds first, its own pages among those held (module docs), where a fold may free something
     // since the last ([`fold_short`]).
-    let reach = budget::Reach::ShortOfHeadroom;
-    let mut claim = budget::claim(adding, reach);
+    let mut claim = budget::claim(adding);
     if claim.is_none() && fold_short_due() {
         drop(held);
         fold_short();
@@ -907,7 +1109,7 @@ fn unfold_once(first: u64, end: u64) -> Result<(), u64> {
             return Ok(());
         }
         adding = mappings_added(&pieces);
-        claim = budget::claim(adding, reach);
+        claim = budget::claim(adding);
     }
     let Some(_claim) = claim else {
         return Err(adding);
@@ -1099,38 +1301,23 @@ impl HostVm for LinuxVm {
         }
         reclaiming(|| {
             let target = dst.addr().to_u64();
-            let mut all: Vec<files::Piece> = Vec::new();
-            let mut offset = 0u64;
-            for (i, &(src, len)) in runs.iter().enumerate() {
-                let source = src.addr().to_u64();
-                let Some(pieces) = files::pieces(source, len) else {
+            let sources: Vec<(u64, u64)> = (runs.iter())
+                .map(|&(src, len)| (src.addr().to_u64(), len))
+                .collect();
+            match files::view_pieces(&sources) {
+                Ok(all) => map_view(target, all).map_err(|kr| (0, kr)),
+                Err((i, before)) => {
+                    let (source, len) = sources[i];
                     log::debug!(
                         target: "reims_vgpu_vulkan::os",
                         "remap of {len:#x} bytes at {source:#x}: no file behind them"
                     );
-                    if !all.is_empty() {
-                        map_view(target, all).map_err(|kr| (0, kr))?;
+                    if !before.is_empty() {
+                        map_view(target, before).map_err(|kr| (0, kr))?;
                     }
-                    return Err((i, INVALID_ADDRESS));
-                };
-                for piece in pieces {
-                    match all.last_mut() {
-                        Some(last)
-                            if Arc::ptr_eq(&last.backing.fd, &piece.backing.fd)
-                                && last.backing.offset + last.length == piece.backing.offset
-                                && last.prot == piece.prot =>
-                        {
-                            last.length += piece.length;
-                        }
-                        _ => all.push(files::Piece {
-                            at: offset + piece.at,
-                            ..piece
-                        }),
-                    }
+                    Err((i, INVALID_ADDRESS))
                 }
-                offset += len;
             }
-            map_view(target, all).map_err(|kr| (0, kr))
         })
     }
 
@@ -1141,10 +1328,12 @@ impl HostVm for LinuxVm {
         }
         let (first, length) = pages(addr, len).ok_or(INVALID_ARGUMENT)?;
         let bits = prot_bits(prot);
+        // The table holds the protection as the kernel has it: the same bits.
+        let held = VmProt(bits);
         let _views = views();
         // Core protects each mapping it made once its views are in, read and write as the views
         // already are unless it is read-only: no call where the views have the protection.
-        if files::protected(first, length, bits) {
+        if files::protected(first, length, held) {
             return Ok(());
         }
         // SAFETY: lowering or raising a range's protection is the caller's decision; a later
@@ -1152,7 +1341,7 @@ impl HostVm for LinuxVm {
         if unsafe { libc::mprotect(ptr(first), length.to_usize(), bits) } != 0 {
             return Err(refused("protect_max", true));
         }
-        files::protect(first, length, bits);
+        files::protect(first, length, held);
         Ok(())
     }
 
@@ -1189,11 +1378,67 @@ impl HostVm for LinuxVm {
         }
         KernReturn::SUCCESS
     }
+
+    /// The budget's headroom ([`budget::HEADROOM`]): what the budget keeps short of itself for
+    /// what has no way but mappings of its own. A view kept only to be taken again has another,
+    /// being made again, so the views no object holds take no more of the room below the budget
+    /// than that.
+    fn idle_view_mappings(&self) -> Option<u64> {
+        Some(budget::HEADROOM)
+    }
+
+    /// The views' budget's room ([`budget::room`]): short of its headroom where a device of the
+    /// process pins imported pages, as a view past it is mapped through dma-bufs there.
+    fn view_room(&self) -> Option<u64> {
+        Some(budget::room())
+    }
+
+    /// The mappings the backing table's runs in the view take ([`files::mappings_between`]), as
+    /// the budget counts them: a mapping a run mapped from its file, one a dma-buf ("Views
+    /// through dma-bufs").
+    fn view_mappings(&self, at: HostAddr, len: u64) -> Option<u64> {
+        let first = at.addr().to_u64();
+        Some(files::mappings_between(first, first.saturating_add(len)))
+    }
+
+    /// udmabuf's limits as the host has them, a group's bytes at most 64 MiB
+    /// ([`super::dma_buf::group_limits`]), where the process's devices import views through their
+    /// dma-buf sources ([`super::import::groups_views`]).
+    fn view_groups(&self) -> Option<GroupLimits> {
+        super::import::groups_views().then(|| {
+            let limits = super::dma_buf::group_limits();
+            GroupLimits {
+                runs: limits.pieces,
+                bytes: limits.bytes,
+            }
+        })
+    }
+
+    /// Group dma-bufs of the views' pages ([`super::dma_buf::group_views`]), where
+    /// [`Self::view_groups`] answers limits; none otherwise.
+    fn group_views(&self, views: &[(HostAddr, u64)]) -> ViewGroups {
+        if !super::import::groups_views() {
+            return ViewGroups {
+                making: None,
+                members: views.iter().map(|_| None).collect(),
+            };
+        }
+        let views: Vec<(u64, u64)> = (views.iter())
+            .map(|&(at, length)| (at.addr().to_u64(), length))
+            .collect();
+        let (files, members) = super::dma_buf::group_views(&views);
+        ViewGroups {
+            making: (!files.is_empty()).then(|| -> GroupHold { Box::new(files) }),
+            members: (members.into_iter())
+                .map(|m| m.map(|m| -> GroupHold { Box::new(m) }))
+                .collect(),
+        }
+    }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
-    use reims_vgpu_core::raise::death::DeathKind;
+    use crate::core::raise::death::DeathKind;
 
     use super::*;
 
@@ -1245,6 +1490,26 @@ pub(crate) mod tests {
             }
         }
         false
+    }
+
+    /// Memory of the library's own whose pages a device's import holds stays mapped past its
+    /// drop, until the import's hold goes, as a region's whose last reference goes in a no-copy
+    /// buffer's deallocator, before the runtime frees the buffer's import
+    #[test]
+    fn own_memory_an_import_holds_is_unmapped_once_its_hold_goes() {
+        let memory = OwnMemory::new(2 * page()).unwrap();
+        let at = HostAddr::from_addr(memory.first().to_usize());
+        let held = at.wrapping_add(page());
+        let hold = crate::remap::UnmapHold::new(
+            std::ptr::NonNull::new(held.as_ptr::<u8>()).unwrap(),
+            page(),
+        );
+        write(held, 0, 0x5a);
+        drop(memory);
+        assert!(crate::remap::unmap_waits(at, 2 * page()), "the unmap waits");
+        assert_eq!(read(held, 0), 0x5a, "the held page stays mapped");
+        drop(hold);
+        assert!(!crate::remap::unmap_waits(at, 2 * page()), "unmapped");
     }
 
     /// Whether the page at `at` is mapped at all (`mincore` refuses an unmapped one).
@@ -1308,6 +1573,41 @@ pub(crate) mod tests {
         assert_eq!(both(), (4, 4), "its third page unmapped");
         assert!(v.deallocate(at, 8 * p).is_success());
         assert!(v.deallocate(src, 8 * p).is_success());
+    }
+
+    /// What `view_mappings` answers for a view is the kernel's count in its range, which its
+    /// teardown gives back: a mapping a page for pages remapped one at a time backwards, and,
+    /// for the same pages remapped at once, one where views are mapped through dma-bufs
+    #[test]
+    fn a_views_mappings_are_the_kernels_in_its_range() {
+        let v = vm();
+        let p = page();
+        let n = 16u64;
+        let src = allocate_aliasable(n * p).unwrap();
+        let one = v.allocate_anywhere(n * p).unwrap();
+        let at_once = v.allocate_anywhere(n * p).unwrap();
+        // Backwards, a page a run.
+        let runs: Vec<_> = (0..n)
+            .map(|i| (src.wrapping_add((n - 1 - i) * p), p))
+            .collect();
+        for (i, &(from, len)) in runs.iter().enumerate() {
+            v.remap_shared_overwrite(one.wrapping_add(i.to_u64() * p), from, len)
+                .unwrap();
+        }
+        v.remap_runs_shared_overwrite(at_once, &runs).unwrap();
+        let kernel = |at: HostAddr| {
+            let first = at.addr().to_u64();
+            kernel_mappings(first, first + n * p)
+        };
+        assert_eq!(v.view_mappings(one, n * p), Some(n));
+        assert_eq!(v.view_mappings(one, n * p), Some(kernel(one)));
+        let through = super::super::import::views_through_dma_bufs();
+        let want = if through { 1 } else { n };
+        assert_eq!(v.view_mappings(at_once, n * p), Some(want));
+        assert_eq!(v.view_mappings(at_once, n * p), Some(kernel(at_once)));
+        for at in [one, at_once, src] {
+            assert!(v.deallocate(at, n * p).is_success());
+        }
     }
 
     /// Whether this process opens `/dev/udmabuf`, which views through dma-bufs need.
@@ -1432,11 +1732,11 @@ pub(crate) mod tests {
     /// a call that can try again, it ends the process in strict mode
     #[test]
     fn a_map_refused_at_the_limit_folds_the_views_and_tries_again() {
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::testkit::capture::catch_death;
         if !udmabuf_opens() {
             return;
         }
-        let dies = |site: Result<KernReturn, reims_vgpu_core::raise::death::DeathSite>| {
+        let dies = |site: Result<KernReturn, crate::core::raise::death::DeathSite>| {
             site.is_err_and(|site| (site.kind, site.file) == (DeathKind::Abort, "mmap"))
         };
         let at_limit = |on: bool| TEST_AT_LIMIT.with(|t| t.set(on));
@@ -1489,11 +1789,11 @@ pub(crate) mod tests {
     }
 
     /// Where the kernel gives no file, a range a view can be made of answers `KERN_NO_SPACE` and
-    /// a stand-in's memory none, as Mach's and IOSurface's calls do when memory runs out,
-    /// counted; in strict mode the process ends at the call that made no file
+    /// the library's own memory none, as Mach's calls do when memory runs out, counted; in strict
+    /// mode the process ends at the call that made no file
     #[test]
     fn no_file_answers_as_memory_runs_out() {
-        use reims_vgpu_core::testkit::capture::catch_death;
+        use crate::core::testkit::capture::catch_death;
         let p = page();
         TEST_NO_FILE.with(|t| t.set(true));
         let site = catch_death(|| allocate_aliasable(p));
@@ -1502,14 +1802,31 @@ pub(crate) mod tests {
             Err((DeathKind::Abort, "memfd_create"))
         );
         let before = crate::answer::out_of_host_memory_count();
-        let (range, stand_in) =
-            crate::answer::relaxed(|| (allocate_aliasable(p), OwnMemory::new(p)));
+        let (range, own) = crate::answer::relaxed(|| (allocate_aliasable(p), OwnMemory::new(p)));
         TEST_NO_FILE.with(|t| t.set(false));
         assert_eq!(range, Err(NO_SPACE));
-        assert!(stand_in.is_none());
+        assert!(own.is_none());
         assert_eq!(crate::answer::out_of_host_memory_count(), before + 2);
         let at = allocate_aliasable(p).unwrap();
         assert!(vm().deallocate(at, p).is_success());
+    }
+
+    /// A graphics region's memory is zeros of one file of its own, mapped read and write, so a
+    /// device that refuses its pointer imports a dma-buf of its pages (`super::import`); none is
+    /// made of 0 bytes
+    #[test]
+    fn a_region_s_memory_is_one_file_s_pages() {
+        let len = 4 * page();
+        let memory = RegionMemory::new(len).unwrap();
+        let at = HostAddr::from_addr(memory.base().addr());
+        assert_eq!(at.addr().to_u64() % page(), 0);
+        assert_eq!((read(at, 0), read(at, len - 1)), (0, 0));
+        write(at, 5, 0x5a);
+        assert_eq!(read(at, 5), 0x5a);
+        let first = at.addr().to_u64();
+        assert_eq!(files::pieces(first, len).map(|p| p.len()), Some(1));
+        assert_eq!(files::writable(first, len), Some(true));
+        assert!(RegionMemory::new(0).is_none());
     }
 
     /// The host page is 4 KiB on x86-64 Linux, its shift 12
@@ -1656,10 +1973,10 @@ pub(crate) mod tests {
             None,
             page(),
             &Backing {
-                fd: Arc::clone(&fd),
+                file: Arc::clone(&fd),
                 offset: 0,
             },
-            libc::PROT_READ | libc::PROT_WRITE,
+            VmProt::READ | VmProt::WRITE,
         )
         .unwrap();
         // SAFETY: the page just mapped writable, unmapped right after.
@@ -1685,22 +2002,22 @@ pub(crate) mod tests {
     fn a_remap_that_fails_part_way_changes_nothing() {
         let v = vm();
         let p = page();
-        let rw = libc::PROT_READ | libc::PROT_WRITE;
+        let rw = VmProt::READ | VmProt::WRITE;
         // The source: a run of a file of 0x11s, then a registration of a file of 0x22s whose
         // descriptor is read-only, which the kernel refuses to map shared and writable.
         let src = v.allocate_anywhere(2 * p).unwrap();
         let first = src.addr().to_u64();
         let ones = Backing {
-            fd: page_file(0x11, false),
+            file: page_file(0x11, false),
             offset: 0,
         };
         file(Some(first), p, &ones, rw).unwrap();
         files::record(first, p, ones, rw);
         let twos = Backing {
-            fd: page_file(0x22, true),
+            file: page_file(0x22, true),
             offset: 0,
         };
-        file(Some(first + p), p, &twos, libc::PROT_READ).unwrap();
+        file(Some(first + p), p, &twos, VmProt::READ).unwrap();
         let held = files::Registration::new(first + p, p, twos);
         assert_eq!(files::pieces(first, 2 * p).map(|ps| ps.len()), Some(2));
 
@@ -1778,13 +2095,20 @@ pub(crate) mod tests {
             None,
             page(),
             &Backing {
-                fd: Arc::clone(&fd),
+                file: Arc::clone(&fd),
                 offset: 0,
             },
-            3,
+            VmProt::READ | VmProt::WRITE,
         )
         .unwrap();
-        let held = files::Registration::new(at, page(), Backing { fd, offset: 0 });
+        let held = files::Registration::new(
+            at,
+            page(),
+            Backing {
+                file: fd,
+                offset: 0,
+            },
+        );
         let ram = HostAddr::from_addr(at.to_usize());
         assert_eq!(v.deallocate(ram, page()), INVALID_ARGUMENT);
         assert!(mapped(ram));
@@ -1836,37 +2160,5 @@ pub(crate) mod tests {
         assert!(!at_the_limit("65527", "65530"));
         assert!(!at_the_limit("?", "65530"));
         assert!(!at_the_limit("65530", "?"));
-    }
-
-    /// An alias of a guest page with zeros past it, as a heap of less than the runtime's 16 KiB
-    /// is made over, has a file behind every byte, writable or read-only, so a dma-buf can be
-    /// made of all of it, as the runtime asks where the device refuses file pages as host memory
-    /// (`crate::gpu::backing::gather`, `super::dma_buf`)
-    #[test]
-    fn an_alias_with_zeros_past_its_pages_has_a_file_behind_every_byte() {
-        use crate::gpu::backing::{REPLACE, gather};
-        use reims_vgpu_core::platform::types::ResourceAddressRange;
-        let p = page();
-        for read_only in [false, true] {
-            let guest = allocate_aliasable(p).unwrap();
-            write(guest, 0, 0x5a);
-            let ranges = [ResourceAddressRange {
-                address: guest.addr().to_u64(),
-                length: p,
-            }];
-            let alias = gather(REPLACE, &ranges, 4 * p, read_only).unwrap();
-            let first = alias.first().as_ptr().addr().to_u64();
-            assert!(
-                files::pieces(first, 4 * p).is_some(),
-                "read-only {read_only}"
-            );
-            let at = HostAddr::from_addr(alias.first().as_ptr().addr());
-            assert_eq!(
-                (read(at, 0), read(at, p), read(at, 4 * p - 1)),
-                (0x5a, 0, 0)
-            );
-            drop(alias);
-            assert!(vm().deallocate(guest, p).is_success());
-        }
     }
 }

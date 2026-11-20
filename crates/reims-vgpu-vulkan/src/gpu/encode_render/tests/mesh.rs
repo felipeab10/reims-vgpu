@@ -3,12 +3,12 @@
 //! a state answers, what its creation refuses, and what its draws draw, against what the graphics
 //! lane's mesh oracle measured of Metal on the M3 Max
 //! (`guest/bundle/tools/oracle/oracle_mesh.m`, `draw` and `make`, macOS 27.0.1), whose functions
-//! `mesh.metal` holds, and on macOS against the Metal platform drawing the same. MoltenVK has no
-//! `VK_EXT_mesh_shader`, so on a Mac the runtime draws them emulated (the module docs).
+//! `mesh.metal` holds. MoltenVK has no `VK_EXT_mesh_shader`, so on a Mac the runtime draws them
+//! emulated (the module docs).
 
-use reims_vgpu_core::platform::resource::Library as _;
-use reims_vgpu_core::platform::types::NsErrorText;
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::resource::Library as _;
+use crate::core::platform::types::NsErrorText;
+use crate::core::platform::values::{
     ColorAttachmentDesc, FullMeshRenderPipelineDesc, LinkedFunctionsDesc, SamplerDesc,
 };
 
@@ -336,16 +336,10 @@ fn drawn<P: Platform>(p: &P, d: &P::Device, draw: Draw) -> ([u32; 8], [u32; 4]) 
 /// too, draw what Metal draws on the M3 Max, directly, from indirect arguments and by
 /// `drawMeshThreads:`, from buffers, an offset set after the bind, a texture and a sampler,
 /// object threadgroup memory and the payload; a grid of no threadgroup draws nothing; and a mesh
-/// function's writes into a buffer bound to its stage land. On macOS the Metal platform draws
-/// each the same
+/// function's writes into a buffer bound to its stage land
 #[test]
 fn mesh_draws_draw_what_metal_draws() {
     let (p, d) = (platform(), dev());
-    #[cfg(target_os = "macos")]
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|md| {
-        let launcher = crate::gpu::device::tests::metal_tests::NoLauncher;
-        (reims_vgpu_metal::MetalPlatform::new(Box::new(launcher)), md)
-    });
     let draws = [
         Draw::Threadgroups,
         Draw::Indirect,
@@ -366,15 +360,6 @@ fn mesh_draws_draw_what_metal_draws() {
         if ours != (metals(draw), written) {
             differ.push(format!("{draw:?}: drew {ours:08x?}"));
         }
-        #[cfg(target_os = "macos")]
-        if let Some((mp, md)) = &metal {
-            let theirs = drawn(mp, md, draw);
-            if ours != theirs {
-                differ.push(format!(
-                    "{draw:?}: {ours:08x?}, the Metal platform {theirs:08x?}"
-                ));
-            }
-        }
     }
     assert!(differ.is_empty(), "{differ:#?}");
 }
@@ -389,8 +374,7 @@ fn limit(object: bool) -> u64 {
 /// the device's own where none is set: 0 and an object width of 0 without an object function,
 /// the simdgroups' 32 as its execution widths, Metal's grid of 2^20 threadgroups or the
 /// descriptor's. Its required sizes change no answer, and a state of a payload of 16 KiB is made,
-/// but of one byte more is refused with the M3 Max's code and words. On macOS the Metal platform
-/// answers alike where Metal's three measured GPUs do, and refuses the payload too
+/// but of one byte more is refused with the M3 Max's code and words
 #[test]
 fn mesh_states_answer_their_maxima_and_refuse_big_payloads() {
     let d = dev();
@@ -443,37 +427,10 @@ fn mesh_states_answer_their_maxima_and_refuse_big_payloads() {
     let words =
         "Object shader payload size (16385) exceeds the maximum payload size allowed (16384)";
     assert_eq!((refused.code, refused.description.as_str()), (3, words));
-    #[cfg(target_os = "macos")]
-    if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        use reims_vgpu_metal::MetalPlatform as M;
-        let fs = functions::<M>(&md, &["m_plain", "m_payload", "o_fn", "f_col"]);
-        let [plain_fn, payload_fn, object_fn, fragment] = [&fs[0], &fs[1], &fs[2], &fs[3]];
-        let plain_state = state(&md, &descriptor::<M>(None, plain_fn, Some(fragment)));
-        let [_, mesh, _, mesh_width, grid] = answers::<M>(&plain_state);
-        assert_eq!([mesh, mesh_width, grid], [mesh_limit, 32, 1 << 20]);
-        let object = descriptor::<M>(Some(object_fn), payload_fn, Some(fragment));
-        assert_eq!(answers::<M>(&state(&md, &object)), of_object);
-        let maxima = FullMeshRenderPipelineDesc {
-            max_total_threads_per_object_threadgroup: 64,
-            max_total_threads_per_mesh_threadgroup: 32,
-            max_total_threadgroups_per_mesh_grid: 8,
-            payload_memory_length: 256,
-            ..descriptor::<M>(Some(object_fn), payload_fn, Some(fragment))
-        };
-        assert_eq!(answers::<M>(&state(&md, &maxima)), [64, 32, 32, 32, 8]);
-        let big = FullMeshRenderPipelineDesc {
-            payload_memory_length: 16385,
-            ..descriptor::<M>(Some(object_fn), payload_fn, Some(fragment))
-        };
-        // Metal's description is its `NSError`'s whole, its domain and code among the words.
-        let theirs = md.new_mesh_render_pipeline_state_full(&big).unwrap_err();
-        assert_eq!(theirs.code, 3);
-        assert!(theirs.description.contains(words), "{theirs:?}");
-    }
 }
 
 /// A mesh render pipeline whose mesh, object or fragment function is of another stage's type is
-/// refused in the compiler's domain, as the Metal platform refuses it before Metal sees it: code
+/// refused in the compiler's domain, before the runtime sees it: code
 /// 2 for a vertex function as the mesh function, 1 for an object function as the mesh function,
 /// a mesh function as the object function, a fragment function as the object function, and a
 /// mesh function as the fragment function. The mesh function is asked first
@@ -614,31 +571,4 @@ fn mesh_draws_outside_their_states_threadgroups_die() {
             }
         }
     }
-}
-
-/// A mesh render pipeline state's reflection asks the object, mesh and fragment stages' slot
-/// writes, in that order: the mesh function may store through its `device` buffer 2 and not
-/// through its `constant` buffer 0, and the object function not through its `constant` buffer 0
-#[test]
-fn mesh_states_reflect_their_stages_slot_writes() {
-    let d = dev();
-    let fs = functions::<VulkanPlatform>(&d, &["m_writes", "o_fn", "f_col", "m_payload"]);
-    let writes = state(
-        &d,
-        &descriptor::<VulkanPlatform>(None, &fs[0], Some(&fs[2])),
-    );
-    let reflection = &writes.reflection;
-    assert_eq!(reflection.stages(), &[OBJECT, MESH, FRAGMENT]);
-    let slots = reflection.slots().unwrap();
-    use metal2vulkan::reflection::SlotWritability as S;
-    assert_eq!(slots[MESH].buffer(2), S::Maybe);
-    assert_eq!(slots[MESH].buffer(0), S::Never);
-    let object = state(
-        &d,
-        &descriptor::<VulkanPlatform>(Some(&fs[1]), &fs[3], Some(&fs[2])),
-    );
-    assert_eq!(
-        object.reflection.slots().unwrap()[OBJECT].buffer(0),
-        S::Never
-    );
 }

@@ -1,9 +1,11 @@
 //! What an `ICB_SLOTS` costs the thread that carries it out, a command at a time: 16384 render
 //! commands, each a full slot (its pipeline state, two vertex buffers, a fragment buffer and a
 //! draw), through the decoder as ring 0 hands it the message, against the same setters sent
-//! through the platform's core traits and, on the Vulkan platform, through the runtime alone: a
-//! measurement, run by hand in a release build, holding the host's GPU
-//! (`scripts/internal/gpu-locks.sh -- cargo nextest run -p reims-vgpu --release
+//! through the platform's core traits, one call a command as the decoder sends them
+//! (`encode_render_command`), and, on the Vulkan platform, through the runtime alone, one call a
+//! command (`set_render_command`): a
+//! measurement, run by hand in a release build, in a potluck job holding the host's GPU
+//! (`--gpu`: `cargo nextest run -p reims-vgpu --release
 //! --no-default-features --features reims-vgpu/vulkan --run-ignored only -E
 //! 'test(icb_slots_cost)' --no-capture`).
 //!
@@ -21,29 +23,27 @@
 
 use std::sync::Arc;
 
-use reims_graphics::icb::{
+use reims_vgpu_graphics::icb::{
     RGFX_ICB_OP_DRAW, RGFX_ICB_SLOT_ACTION, RGFX_ICB_SLOT_BUFFER_0, RGFX_ICB_SLOT_PIPELINE,
     RgfxIcbDraw, RgfxIcbRenderSlot, RgfxIcbSlotBuffer,
 };
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN,
     RGFX_ICB_SLOTS_RENDER, RgfxIcbCreate, RgfxIcbSlotRun, RgfxIcbSlots, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::icb::{
-    IcbRenderCmd, IndirectCommandBuffer as _, IndirectRenderCommand as _,
-};
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::types::NsRange;
-use reims_vgpu_core::platform::values::{
+use reims_vgpu_vulkan::core::platform::blit::ResourceRef;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::descriptor::RenderPassDescriptor as _;
+use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+use reims_vgpu_vulkan::core::platform::icb::{IcbRenderCmd, IndirectCommandBuffer as _};
+use reims_vgpu_vulkan::core::platform::render::{RenderCmd, RenderEncoder as _};
+use reims_vgpu_vulkan::core::platform::types::NsRange;
+use reims_vgpu_vulkan::core::platform::values::{
     ColorAttachmentDesc, ColorAttachmentSet, FullRenderPipelineDesc, LinkedFunctionsDesc,
     TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use reims_vgpu_vulkan::core::raise::OnFault;
 use zerocopy::IntoBytes;
 
 use super::draw_cost::{Counts, FIGURES, counts, fixture, spread};
@@ -163,7 +163,7 @@ impl<P: ApiPlatform> Bench<P> {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let size = SLOTS_AT + (COMMANDS * STRIDE).next_multiple_of(0x1_0000) + RGFX_CURSOR_SPAN;
-        let region = Arc::new(Region::new(size as usize).unwrap());
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
         let mut decoder = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
         let create = RgfxIcbCreate {
             header: RgfxMsgHeader {
@@ -205,6 +205,7 @@ impl<P: ApiPlatform> Bench<P> {
                 support_indirect_command_buffers: true,
                 vertex_linked: LinkedFunctionsDesc::default(),
                 fragment_linked: LinkedFunctionsDesc::default(),
+                private_state: None,
             })
             .unwrap()
             .unwrap();
@@ -309,7 +310,8 @@ impl<P: ApiPlatform> Bench<P> {
         spent
     }
 
-    /// One repetition through the platform's core traits, on the decoder's objects.
+    /// One repetition through the platform's core traits, on the decoder's objects: one call a
+    /// command.
     fn through_platform(&self) -> Counts {
         let icb = self.icb();
         let (a, b, pipeline) = (
@@ -319,7 +321,6 @@ impl<P: ApiPlatform> Bench<P> {
         );
         let start = counts();
         for i in 0..COMMANDS {
-            let c = icb.render_command(i).unwrap().unwrap();
             let cmds = [
                 IcbRenderCmd::SetRenderPipelineState {
                     pipeline_state: Some(pipeline),
@@ -347,29 +348,47 @@ impl<P: ApiPlatform> Bench<P> {
                     base_instance: 0,
                 },
             ];
-            for cmd in cmds {
-                c.encode(cmd).unwrap();
-            }
+            assert!(icb.encode_render_command(i, cmds.into_iter()).unwrap());
         }
         counts() - start
     }
 }
 
-/// The runtime alone, on the Vulkan platform's objects of `bench`.
-#[cfg(feature = "vulkan")]
+/// The runtime alone, on the Vulkan platform's objects of `bench`: one call a command.
 fn through_runtime(bench: &Bench<reims_vgpu_vulkan::VulkanPlatform>) -> Counts {
+    use metal2vulkan_runtime::IndirectRenderSet as S;
     let triangle = metal2vulkan_runtime::DrawPrimitiveType::from_raw(TRIANGLE).unwrap();
     let icb = &bench.icb().raw;
     let (a, b) = (&bench.buffer(BUFFER_A).raw, &bench.buffer(BUFFER_B).raw);
     let pipeline = &bench.pipeline().raw;
     let start = counts();
     for i in 0..COMMANDS {
-        let c = icb.indirect_render_command_at(i).unwrap();
-        c.set_render_pipeline_state(pipeline).unwrap();
-        c.set_vertex_buffer(Some(a), (i % 16) * 16, 0).unwrap();
-        c.set_vertex_buffer(Some(b), 0, 1).unwrap();
-        c.set_fragment_buffer(Some(a), 256, 0).unwrap();
-        c.draw_primitives(triangle, 0, 3, 1, 0).unwrap();
+        let sets = [
+            S::SetRenderPipelineState(pipeline),
+            S::SetVertexBuffer {
+                buffer: Some(a),
+                offset: (i % 16) * 16,
+                index: 0,
+            },
+            S::SetVertexBuffer {
+                buffer: Some(b),
+                offset: 0,
+                index: 1,
+            },
+            S::SetFragmentBuffer {
+                buffer: Some(a),
+                offset: 256,
+                index: 0,
+            },
+            S::DrawPrimitives {
+                primitive_type: triangle,
+                vertex_start: 0,
+                vertex_count: 3,
+                instance_count: 1,
+                base_instance: 0,
+            },
+        ];
+        icb.set_render_command(i, sets).unwrap();
     }
     counts() - start
 }
@@ -389,7 +408,7 @@ fn measure<P: ApiPlatform>(
     let only = only.as_deref();
     let message = message();
     let executed = std::env::var("ICB_SLOTS_COST_EXECUTED").is_ok_and(|v| v == "1");
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
     #[cfg(target_os = "macos")]
     // SAFETY: sets this thread's own class, which takes no pointer.
     unsafe {
@@ -491,7 +510,6 @@ fn measure<P: ApiPlatform>(
 }
 
 /// On the Vulkan platform: the decoder, the platform and the runtime alone.
-#[cfg(feature = "vulkan")]
 #[test]
 #[ignore = "a measurement, run by hand in a release build holding the GPU: prints a command's cost"]
 fn on_vulkan_icb_slots_cost() {
@@ -499,17 +517,5 @@ fn on_vulkan_icb_slots_cost() {
         "vulkan",
         Bench::<reims_vgpu_vulkan::VulkanPlatform>::new(),
         Some(through_runtime),
-    );
-}
-
-/// On the Metal platform: the decoder and the platform.
-#[cfg(target_os = "macos")]
-#[test]
-#[ignore = "a measurement, run by hand in a release build holding the GPU: prints a command's cost"]
-fn on_metal_icb_slots_cost() {
-    measure(
-        "metal",
-        Bench::<reims_vgpu_metal::MetalPlatform>::new(),
-        None,
     );
 }

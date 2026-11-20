@@ -6,6 +6,7 @@
  */
 
 #import "RgfxLibrary.h"
+#include "RgfxLogOnce.hpp"
 #import "RgfxArgumentEncoder.h"
 #import "RgfxBlockCall.h"
 #import "RgfxUnsupported.h"
@@ -17,8 +18,10 @@
 #import "RgfxInterop.h"
 #import "RgfxMetalError.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxPipelineReflection.h"
 
 #include <algorithm>
+#include <atomic>
 #include <array>
 #include <cstring>
 #include <map>
@@ -33,6 +36,7 @@
 #include "RgfxAirArguments.hpp"
 #include "RgfxFunctionConstants.hpp"
 #include "RgfxLibraryStream.hpp"
+#include "RgfxMetallibWriter.hpp"
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
 
@@ -75,6 +79,66 @@ uint64_t rd64(const uint8_t *p)
 	std::memcpy(&v, p, sizeof(v));
 	return v;
 }
+
+// Reads the tags of a tag list from `q` up to ENDT or `end`, each to `tag`; false where one runs
+// past `end`.
+template <typename Tag>
+static bool readTags(const uint8_t *p, uint64_t q, uint64_t end, Tag tag)
+{
+	while (end - q >= 4 && std::memcmp(p + q, "ENDT", 4) != 0) {
+		if (end - q < 6)
+			return false;
+		const uint16_t size = rd16(p + q + 4);
+		if (size > end - q - 6)
+			return false;
+		tag(p + q, p + q + 6, size);
+		q += 6 + static_cast<uint64_t>(size);
+	}
+	return true;
+}
+
+} // namespace
+
+bool rgfxReadMetallibLinkage(const uint8_t *p, size_t n, RgfxMetallibLinkage &out)
+{
+	out = {};
+	if (p == nullptr || n < 0x28 || std::memcmp(p, "MTLB", 4) != 0)
+		return false;
+	const uint64_t list = rd64(p + 0x18), listSize = rd64(p + 0x20);
+	if (list > n || n - list < 4 || listSize > n - list - 4)
+		return false;
+	uint64_t region = 0, regionSize = 0;
+	bool haveRegion = false;
+	if (!readTags(p, list + 4 + listSize, n, [&](const uint8_t *name, const uint8_t *data,
+	                                               uint16_t size) {
+		    if (std::memcmp(name, "HDYN", 4) == 0 && size == 16) {
+			    region = rd64(data);
+			    regionSize = rd64(data + 8);
+			    haveRegion = true;
+		    }
+	    }))
+		return false;
+	if (!haveRegion)
+		return true;
+	if (region > n || regionSize > n - region)
+		return false;
+	auto text = [](const uint8_t *data, uint16_t size) {
+		const char *c = reinterpret_cast<const char *>(data);
+		return std::string(c, strnlen(c, size));
+	};
+	const bool read = readTags(p, region, region + regionSize,
+	                           [&](const uint8_t *name, const uint8_t *data, uint16_t size) {
+		                           if (std::memcmp(name, "NAME", 4) == 0)
+			                           out.installName = text(data, size);
+		                           else if (std::memcmp(name, "DYNL", 4) == 0)
+			                           out.dependencies.push_back(text(data, size));
+	                           });
+	if (!read)
+		out = {};
+	return read;
+}
+
+namespace {
 
 // A .metallib's TYPE tag byte, as MTLFunctionType. measured: macOS 27 Metal, on
 // CoreDisplay's default.metallib (0 vertex, 1 fragment, 2 kernel), and on a Core Image
@@ -340,9 +404,32 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	return table;
 }
 
+// What Metal's library keeps past its protocol for its tools and its compiler (MTLLibrarySPI): an
+// override of the target triple, a copy of the one set (nil until set), and whether shader
+// validation is on (NO until set), each answered as set (measured: M3 Max, macOS 27, a library
+// made from bytes, from a URL and of a function array).
+struct LibraryToolState {
+	std::mutex lock; // guards overrideTriple
+	NSString *overrideTriple = nil;
+	std::atomic<bool> shaderValidation{false};
+
+	NSString *triple()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		return overrideTriple;
+	}
+	void setTriple(NSString *triple)
+	{
+		NSString *copy = [triple copy];
+		std::lock_guard<std::mutex> hold(lock);
+		overrideTriple = copy;
+	}
+};
+
 } // namespace
 
 @implementation RgfxLibrary {
+	LibraryToolState _tools; // MTLLibrarySPI's triple and validation switch
 	// The .metallib's function list, shared by every library of its content key (functionTableOf).
 	std::shared_ptr<const FunctionTable> _table;
 	std::mutex _shadowLock;                   // guards the three below
@@ -352,11 +439,17 @@ std::shared_ptr<const FunctionTable> functionTableOf(const uint8_t *bytes, size_
 	BOOL _shadowTried;
 	BOOL _madeFromURL; // newLibraryWithURL:'s, which Metal does not serialize
 	NSString *_fileName; // the last part of newLibraryWithURL:'s URL, nil for any other
+	NSURL *_url;         // newLibraryWithURL:'s URL, nil for any other
+	// Its install name and those of the libraries it was linked against, read once from _source.
+	std::once_flag _linkageRead;
+	RgfxMetallibLinkage _linkage;
 	BOOL _dynamic;       // a dynamic library's bytes (rgfxMetallibIsDynamic)
-	std::mutex _airLock; // guards the four below
+	std::mutex _airLock; // guards the five below
 	// The module `_source` holds for each function a read below asked for, by name, as the process
-	// read it (rgfxAirModules), with why there is none (null where there is one).
+	// read it (rgfxAirModules), with why there is none (null where there is one): read without its
+	// entry points, and with them.
 	std::map<std::string, std::pair<std::shared_ptr<const RgfxAirModule>, const char *>> _modules;
+	std::map<std::string, std::pair<std::shared_ptr<const RgfxAirModule>, const char *>> _entryModules;
 	// Each entry point's arguments read from its bitcode in `_source`, by name, once each: null
 	// where they did not read.
 	std::map<std::string, std::shared_ptr<const RgfxAirFunction>> _air;
@@ -401,6 +494,9 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
                           serializer:(RgfxSerializer *)serializer
 {
 	RgfxLibrary *lib = [[RgfxLibrary alloc] initWithObjId:objId device:device serializer:serializer];
+	// Its pipelines' keys name it by its content key (RgfxSerializer::setLibraryKey).
+	if (lib != nil && key != nullptr && serializer != nullptr)
+		serializer->setLibraryKey(objId, key);
 	if (lib != nil) {
 		lib->_table = functionTableOf(static_cast<const uint8_t *>(bytes), length, key);
 		lib->_dynamic = rgfxMetallibIsDynamic(static_cast<const uint8_t *>(bytes), length);
@@ -440,6 +536,7 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 }
 
 + (instancetype)libraryFoundWithKey:(const uint8_t *)key
+                             lookup:(const uint8_t *)lookup
                               bytes:(const void *)bytes
                              length:(NSUInteger)length
                              device:(id<MTLDevice>)device
@@ -447,7 +544,7 @@ static bool rgfxMetallibIsDynamic(const uint8_t *bytes, size_t length)
 {
 	if (serializer == nullptr)
 		return nil;
-	RgfxCreated found = serializer->lookupLibrary(key, length);
+	RgfxCreated found = serializer->lookupLibrary(lookup, length);
 	if (!found.posted || found.status != RGFX_STATUS_OK)
 		return nil;
 	return [self rgfxLibraryWithObjId:found.obj_id
@@ -572,15 +669,18 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 }
 
 // The module the library holds for the function `name`, in the bytes it was made from, as the
-// process read it (rgfxAirModules: one read for every library over equal bytes), once for the
-// library: null where the library kept no bytes (one Metal's link or stitching made), with `*why`
-// null, or where it holds no bitcode for the function, with `*why` saying so. Called holding
-// _airLock.
-- (std::shared_ptr<const RgfxAirModule>)rgfxModuleOf:(const std::string &)name why:(const char **)why
+// process read it (rgfxAirModules: one read of each kind for every library over equal bytes), its
+// entry points among the reads where `entries` asks for them, once for the library for each kind:
+// null where the library kept no bytes (one Metal's link or stitching made), with `*why` null, or
+// where it holds no bitcode for the function, with `*why` saying so. Called holding _airLock.
+- (std::shared_ptr<const RgfxAirModule>)rgfxModuleOf:(const std::string &)name
+                                                entries:(bool)entries
+                                                    why:(const char **)why
 {
 	*why = nullptr;
-	auto known = _modules.find(name);
-	if (known != _modules.end()) {
+	auto &kept = entries ? _entryModules : _modules;
+	auto known = kept.find(name);
+	if (known != kept.end()) {
 		*why = known->second.second;
 		return known->second.first;
 	}
@@ -594,23 +694,32 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	const void *mapped = nullptr;
 	size_t size = 0;
 	dispatch_data_t map = dispatch_data_create_map(source, &mapped, &size);
-	// The library was made from a universal .metallib's AIR slice; the bytes kept are whole.
+	// The library was made from a universal .metallib's AIR slice; the bytes kept are whole. It
+	// was made from the .metallib of their kernels where they are the bytes Metal's compiler
+	// answers for OpenCL C source (RgfxMetallibOfClLibrary), which the process keeps as they are
+	// for the shadow.
 	const uint8_t *bytes = static_cast<const uint8_t *>(mapped);
 	rgfxMetallibAirSlice(bytes, size);
+	std::vector<uint8_t> clKernels;
+	if (map != nil && RgfxMetallibOfClLibrary(bytes, size, clKernels)) {
+		bytes = clKernels.data();
+		size = clKernels.size();
+	}
 	const uint8_t *bitcode = nullptr;
 	size_t bitcodeSize = 0;
 	std::shared_ptr<const RgfxAirModule> module;
 	if (map == nil || !_table->bitcode->find(bytes, size, name, &bitcode, &bitcodeSize))
 		*why = "the library holds no bitcode for it";
 	else
-		module = rgfxAirModules().moduleOf(bitcode, bitcodeSize);
-	_modules.emplace(name, std::make_pair(module, *why));
+		module = rgfxAirModules().moduleOf(bitcode, bitcodeSize, entries);
+	kept.emplace(name, std::make_pair(module, *why));
 	return module;
 }
 
 // The arguments of the entry point `name`, read from its bitcode in the bytes the library was
-// made from (rgfxModuleOf:why:), once: null where the library kept no bytes (one Metal's link or
-// stitching made), or they do not read, so which textures the function writes is unknown.
+// made from (rgfxModuleOf:entries:why:), once: null where the library kept no bytes (one Metal's link or
+// stitching made), or its module or its own arguments do not read, so which textures the function
+// writes is unknown.
 - (std::shared_ptr<const RgfxAirFunction>)rgfxAirFunctionNamed:(const std::string &)name
 {
 	std::lock_guard<std::mutex> hold(_airLock);
@@ -618,19 +727,24 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	if (known != _air.end())
 		return known->second;
 	const char *why = nullptr;
-	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name entries:false why:&why];
 	std::shared_ptr<const RgfxAirFunction> air;
 	if (module != nullptr && !module->functionsRead) {
 		why = "its module did not read";
 	} else if (module != nullptr) {
+		const RgfxAirFunction *named = nullptr;
 		for (const RgfxAirFunction &f : module->functions) {
 			if (f.name == name) {
-				air = std::shared_ptr<const RgfxAirFunction>(module, &f);
+				named = &f;
 				break;
 			}
 		}
-		if (air == nullptr)
+		if (named == nullptr)
 			why = "its module declares no such entry point";
+		else if (!named->argumentsRead)
+			why = "an argument of it is not one the reader follows";
+		else
+			air = std::shared_ptr<const RgfxAirFunction>(module, named);
 	}
 	if (air == nullptr && why != nullptr && rgfxAirUnreadFirstLog(name))
 		NSLog(@"RGFX: %s: no arguments read (%s): the textures it binds are taken as written "
@@ -647,25 +761,32 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	if (known != _entries.end())
 		return known->second;
 	const char *why = nullptr;
-	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name entries:true why:&why];
 	std::shared_ptr<const RgfxAirEntries> entries;
 	if (module != nullptr && !module->entriesRead) {
 		why = "its module did not read";
 	} else if (module != nullptr) {
+		const RgfxAirEntry *named = nullptr;
 		for (const RgfxAirEntry &e : module->entries.entries) {
 			if (e.name == name) {
-				auto one = std::make_shared<RgfxAirEntries>();
-				one->entries.push_back(e);
-				one->constants = module->entries.constants;
-				one->code = module->entries.code;
-				entries = std::move(one);
+				named = &e;
 				break;
 			}
 		}
-		if (entries == nullptr)
+		if (named == nullptr) {
 			why = "its module declares no such entry point";
+		} else if (!named->nodesRead) {
+			why = "a node of it is not one the reader follows";
+		} else {
+			auto one = std::make_shared<RgfxAirEntries>();
+			one->entries.push_back(*named);
+			one->constants = module->entries.constants;
+			one->code = module->entries.code;
+			entries = std::move(one);
+		}
 	}
-	if (entries == nullptr && why != nullptr)
+	static char site;
+	if (entries == nullptr && why != nullptr && rgfxLogFirst(&site, rgfxLogKindOf(why)))
 		NSLog(@"RGFX: %s: its nodes were not read (%s): pipelines of it answer no reflection",
 		      name.c_str(), why);
 	_entries.emplace(name, entries);
@@ -681,7 +802,7 @@ bool rgfxAirUnreadFirstLog(const std::string &name)
 	if (known != _visible.end())
 		return known->second;
 	const char *why = nullptr;
-	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name why:&why];
+	std::shared_ptr<const RgfxAirModule> module = [self rgfxModuleOf:name entries:false why:&why];
 	std::shared_ptr<const RgfxAirVisible> visible;
 	if (module != nullptr && !module->visibleRead) {
 		why = "its module did not read";
@@ -730,28 +851,61 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	return declared;
 }
 
+// The index of each constant the module of the function `name` names in its
+// `air.function_constants`, by name, each node that reads (RgfxAirEntries::constants): none where
+// the library holds no bitcode for it or its module did not read.
+- (std::map<std::string, uint32_t>)rgfxAirConstantIndicesOf:(const std::string &)name
+{
+	std::shared_ptr<const RgfxAirModule> module;
+	{
+		std::lock_guard<std::mutex> hold(_airLock);
+		const char *why = nullptr;
+		module = [self rgfxModuleOf:name entries:true why:&why];
+	}
+	std::map<std::string, uint32_t> out;
+	if (module != nullptr && module->entriesRead)
+		for (const auto &[constantName, index] : module->entries.constants)
+			out.emplace(constantName, index);
+	return out;
+}
+
 // The constants of `entry`, a function of a table that read whose metadata gives none (no CNST
 // tag, or one that did not read), as its AIR module declares them (RgfxAirConstant), in index
-// order: false where the module declares none or they did not read, or the function is of no
-// stage the AIR reader follows. Apple's compiler writes a CNST tag for every function its module
-// declares constants for (RgfxAirArguments.hpp), so this answers for metadata of another writer.
+// order: true where they are known, `out` then empty where the module declares none; false where
+// they are not (the library holds no bitcode for the function, its module or its constants did
+// not read, or it is of no stage the AIR reader follows), whatever else of the function read.
+// Apple's compiler writes a CNST tag for every function its module declares constants for
+// (RgfxAirArguments.hpp), so this answers for metadata of another writer.
 - (bool)rgfxAirConstantsOf:(const MetallibFunction &)entry into:(std::vector<RgfxConstantDecl> &)out
 {
 	out.clear();
-	std::shared_ptr<const RgfxAirFunction> fn;
-	std::shared_ptr<const RgfxAirVisible> visible;
+	const bool stage = entry.type == MTLFunctionTypeVertex || entry.type == MTLFunctionTypeFragment ||
+	                   entry.type == MTLFunctionTypeKernel;
+	if (!stage && entry.type != MTLFunctionTypeVisible)
+		return false;
 	const std::vector<RgfxAirConstant> *air = nullptr;
-	if (entry.type == MTLFunctionTypeVertex || entry.type == MTLFunctionTypeFragment ||
-	    entry.type == MTLFunctionTypeKernel) {
-		fn = [self rgfxAirFunctionNamed:entry.name];
-		if (fn != nullptr && fn->constantsRead)
-			air = &fn->constants;
-	} else if (entry.type == MTLFunctionTypeVisible) {
-		visible = [self rgfxAirVisibleNamed:entry.name];
-		if (visible != nullptr && visible->constantsRead)
-			air = &visible->constants;
+	std::shared_ptr<const RgfxAirModule> module;
+	{
+		std::lock_guard<std::mutex> hold(_airLock);
+		const char *why = nullptr;
+		module = [self rgfxModuleOf:entry.name entries:false why:&why];
 	}
-	if (air == nullptr || air->empty())
+	if (module != nullptr && stage && module->functionsRead) {
+		for (const RgfxAirFunction &f : module->functions) {
+			if (f.name == entry.name) {
+				air = f.constantsRead ? &f.constants : nullptr;
+				break;
+			}
+		}
+	} else if (module != nullptr && !stage && module->visibleRead) {
+		for (const RgfxAirVisible &v : module->visible) {
+			if (v.name == entry.name) {
+				air = v.constantsRead ? &v.constants : nullptr;
+				break;
+			}
+		}
+	}
+	if (air == nullptr)
 		return false;
 	for (const RgfxAirConstant &c : *air)
 		out.push_back(RgfxConstantDecl{c.name, c.type, c.index, c.required});
@@ -768,7 +922,8 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	std::vector<RgfxConstantDecl> declaredByAir;
 	if (entry != nullptr && entry->haveConstants && !entry->constants.empty()) {
 		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(entry->constants)];
-	} else if (entry != nullptr && [self rgfxAirConstantsOf:*entry into:declaredByAir]) {
+	} else if (entry != nullptr && [self rgfxAirConstantsOf:*entry into:declaredByAir] &&
+	           !declaredByAir.empty()) {
 		// Metadata that names no constants: its module's.
 		[fn rgfxSetUnspecialisedConstants:rgfxDeclaredConstants(declaredByAir)];
 	} else if (fn != nil && !_table->readable) {
@@ -797,14 +952,14 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	readConstantValues(constantValues, byIndex, byName);
 	std::vector<RgfxFunctionConstant> constants;
 	// The function's constants: its table entry's; where its entry names none, those its module
-	// declares (rgfxAirConstantsOf:into:); where the table did not read, those its shadow's
-	// function declares (Metal's own over the same bytes), in index order.
+	// declares (rgfxAirConstantsOf:into:, none where it declares none), and unknown where they did
+	// not read; where the table did not read, those its shadow's function declares (Metal's own
+	// over the same bytes), in index order.
 	const std::vector<RgfxConstantDecl> *decls =
 	    entry != nullptr && entry->haveConstants ? &entry->constants : nullptr;
 	std::vector<RgfxConstantDecl> declaredByAir;
-	if (entry != nullptr && (decls == nullptr || decls->empty()) &&
-	    [self rgfxAirConstantsOf:*entry into:declaredByAir])
-		decls = &declaredByAir;
+	if (entry != nullptr && (decls == nullptr || decls->empty()))
+		decls = [self rgfxAirConstantsOf:*entry into:declaredByAir] ? &declaredByAir : nullptr;
 	std::vector<RgfxConstantDecl> declaredByShadow;
 	if (!_table->readable) {
 		BOOL haveShadow = NO;
@@ -843,24 +998,67 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 			return nil;
 		}
 	} else {
-		// Nothing to resolve against (a table that did not read and no shadow, or an entry
-		// whose metadata did not read): the values set by index, as set; the host checks them
-		// against the function. Values set by name need the constants' names, and are not
-		// carried, which is logged.
-		if (!byName.empty())
-			RGFX_UNSUPPORTED("function constants set by name, in a library whose table did not read");
-		for (const auto &[index, v] : byIndex) {
-			if (v.bytes.empty())
+		// Nothing to resolve against (a table that did not read and no shadow, or an entry whose
+		// metadata names none and whose module's constants did not read): every value set, by
+		// index as set, the host checking them against the function; a value set by name at the
+		// index its module's `air.function_constants` gives the name (rgfxAirConstantIndicesOf:),
+		// where a value set by index is not there, as Metal takes the index's first. One whose
+		// name no node of the module names is not carried, which is logged.
+		std::map<uint32_t, const RgfxConstantValue *> carried;
+		for (const auto &[index, v] : byIndex)
+			carried.emplace(index, &v);
+		if (!byName.empty()) {
+			const std::map<std::string, uint32_t> indices = [self rgfxAirConstantIndicesOf:name.UTF8String];
+			for (const auto &[constantName, v] : byName) {
+				auto at = indices.find(constantName);
+				if (at == indices.end())
+					RGFX_UNSUPPORTED("function constants set by name, of a name the function's module does not "
+					                 "name where its constants did not read");
+				else
+					carried.emplace(at->second, &v);
+			}
+		}
+		for (const auto &[index, v] : carried) {
+			if (v->bytes.empty())
 				continue;
 			RgfxFunctionConstant k = {};
 			k.index = index;
-			k.data_type = v.type;
-			std::memcpy(k.value, v.bytes.data(),
-			            v.bytes.size() < sizeof(k.value) ? v.bytes.size() : sizeof(k.value));
+			k.data_type = v->type;
+			std::memcpy(k.value, v->bytes.data(),
+			            v->bytes.size() < sizeof(k.value) ? v->bytes.size() : sizeof(k.value));
 			constants.push_back(k);
 		}
 	}
-	return [self rgfxFunctionNamed:name constants:constants];
+	// Values that put two of its present arguments at overlapping locations of one argument table:
+	// Metal refuses the function here (RgfxOverlappingArgumentError), and so does the bundle, where
+	// its module's nodes and code tell; where they do not, the host's compile refuses its pipeline.
+	// Looked at only where its arguments may overlap at all (RgfxAirFunction's
+	// locationsMayOverlap, or arguments that did not read).
+	if (entry != nullptr && !constants.empty() &&
+	    (entry->type == MTLFunctionTypeKernel || entry->type == MTLFunctionTypeVertex ||
+	     entry->type == MTLFunctionTypeFragment)) {
+		std::shared_ptr<const RgfxAirFunction> air = [self rgfxAirFunctionNamed:entry->name];
+		std::shared_ptr<const RgfxAirEntries> module =
+		    air == nullptr || air->locationsMayOverlap ? [self rgfxAirEntryNamed:entry->name] : nullptr;
+		NSError *overlap = module != nullptr && !module->entries.empty()
+		                       ? RgfxOverlappingArgumentError(*module, module->entries.front(), constants.data(),
+		                                                      static_cast<uint32_t>(constants.size()))
+		                       : nil;
+		if (overlap != nil) {
+			static char site;
+			if (rgfxLogFirst(&site))
+				NSLog(@"RGFX: function %@ refused, as Metal refuses it: %@ (logged once a process)", name,
+				      overlap.localizedDescription);
+			if (error)
+				*error = overlap;
+			return nil;
+		}
+	}
+	id<MTLFunction> fn = [self rgfxFunctionNamed:name constants:constants];
+	// Its shadow is made with the same values, should a stitch or a link need it.
+	if ([(id)fn isKindOfClass:[RgfxFunction class]])
+		[(RgfxFunction *)fn rgfxSetShadowConstantValues:constantValues];
+	return fn;
 }
 
 - (void)newFunctionWithName:(NSString *)name
@@ -887,9 +1085,13 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	id<MTLFunction> fn = [self newFunctionWithName:descriptor.name
 	                                constantValues:descriptor.constantValues
 	                                         error:error];
+	// binaryArchives reached MTLFunctionDescriptor in macOS 12; before it there are none to miss.
+	NSArray<id<MTLBinaryArchive>> *archives = nil;
+	if ([descriptor respondsToSelector:@selector(binaryArchives)])
+		archives = descriptor.binaryArchives;
 	NSError *miss = [RgfxBinaryArchive rgfxMissOfFunction:(RgfxFunction *)fn
 	                                              options:descriptor.options
-	                                             archives:descriptor.binaryArchives];
+	                                             archives:archives];
 	if (miss != nil) {
 		if (error)
 			*error = miss;
@@ -990,6 +1192,43 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	std::lock_guard<std::mutex> hold(_shadowLock);
 	_madeFromURL = YES;
 	_fileName = [url.lastPathComponent copy];
+	_url = [url copy];
+}
+
+- (NSURL *)rgfxURL
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _url;
+}
+
+- (dispatch_data_t)rgfxSource
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	return _source;
+}
+
+// The library's linkage (rgfxReadMetallibLinkage of its bytes), read once: empty where it kept no
+// bytes or they hold none.
+- (const RgfxMetallibLinkage &)rgfxLinkage
+{
+	std::call_once(_linkageRead, [&] {
+		dispatch_data_t source = [self rgfxSource];
+		if (source == nil)
+			return;
+		const void *bytes = nullptr;
+		size_t size = 0;
+		dispatch_data_t map = dispatch_data_create_map(source, &bytes, &size);
+		RgfxMetallibLinkage linkage;
+		if (rgfxReadMetallibLinkage(static_cast<const uint8_t *>(bytes), size, linkage))
+			_linkage = std::move(linkage);
+		(void)map;
+	});
+	return _linkage;
+}
+
+- (std::vector<std::string>)rgfxDependencies
+{
+	return [self rgfxLinkage].dependencies;
 }
 
 // Metal answers nil for a library made from bytes, of data or of a URL (measured: macOS 27), as
@@ -1037,9 +1276,10 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 // The library's type and install name as Metal answers them on the AMD 5300M and the Intel 630
 // under macOS 26.7.1 (oracle_bundle libtype and functypes): a dynamic library's bytes answer
 // Dynamic and the install name they hold (@executable_path/liboracle_bundle_dyn.metallib), made
-// from a URL or from data, which the shadow, Metal's own library over them, answers; any other
-// answers Executable, and as its install name the last part of the URL it was made from
-// (oracle_bundle.metallib), or default.metallib for one made from data or source.
+// from a URL or from data, read from their HDYN's NAME (rgfxReadMetallibLinkage), else answered by
+// the shadow, Metal's own library over them; any other answers Executable, and as its install
+// name the last part of the URL it was made from (oracle_bundle.metallib), or default.metallib for
+// one made from data or source.
 - (MTLLibraryType)type
 {
 	return _dynamic ? MTLLibraryTypeDynamic : MTLLibraryTypeExecutable;
@@ -1048,6 +1288,9 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 - (NSString *)installName
 {
 	if (_dynamic) {
+		const std::string &installName = [self rgfxLinkage].installName;
+		if (!installName.empty())
+			return [NSString stringWithUTF8String:installName.c_str()];
 		id<MTLLibrary> shadow = [self rgfxShadow];
 		return [shadow respondsToSelector:_cmd] ? shadow.installName : nil;
 	}
@@ -1104,6 +1347,46 @@ rgfxDeclaredConstants(const std::vector<RgfxConstantDecl> &decls)
 	}
 	RGFX_UNSUPPORTED("function reflection (the host sends no argument bindings)");
 	return nil;
+}
+
+// --- MTLLibrarySPI: what Metal's library keeps for its tools ---------------------------------
+// As Metal's own library answers each (measured: M3 Max, macOS 27, libraries made from bytes,
+// from a URL and of a function array; the AMD 5300M and the Intel 630, macOS 26.7.1, one made from
+// source): the triple and the validation switch as set, nil and NO until set. The host compiles a
+// library's functions for its own GPU, whatever the triple, and the device validates no shader.
+
+// Metal answers nil for a library made from bytes or from a URL (measured: macOS 27), as every
+// library of the device is, and a UUID for one it compiled from source (measured: macOS 26.7.1):
+// the shadow of one Metal compiled, linked or stitched, Metal's own library, answers it, as for
+// bitcodeData.
+- (id)libraryIdentifier
+{
+	id<MTLLibrary> shadow = nil;
+	{
+		std::lock_guard<std::mutex> hold(_shadowLock);
+		shadow = _shadow;
+	}
+	return [shadow respondsToSelector:_cmd] ? ((id (*)(id, SEL))objc_msgSend)(shadow, _cmd) : nil;
+}
+
+- (NSString *)overrideTriple
+{
+	return _tools.triple();
+}
+
+- (void)setOverrideTriple:(NSString *)overrideTriple
+{
+	_tools.setTriple(overrideTriple);
+}
+
+- (BOOL)shaderValidationEnabled
+{
+	return _tools.shaderValidation.load();
+}
+
+- (void)setShaderValidationEnabled:(BOOL)enabled
+{
+	_tools.shaderValidation.store(enabled);
 }
 
 @end
@@ -1223,6 +1506,7 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 
 @implementation RgfxFunctionArrayLibrary {
 	NSArray<id<MTLFunction>> *_functions; // in the order given
+	LibraryToolState _tools;              // MTLLibrarySPI's triple and validation switch
 }
 
 + (instancetype)libraryOfFunctions:(NSArray<id<MTLFunction>> *)functions
@@ -1361,7 +1645,22 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 	return nil;
 }
 
+// nil, as Metal's library of a function array answers (measured: M3 Max, macOS 27).
 - (NSArray<NSString *> *)externFunctionNames
+{
+	return nil;
+}
+
+// The function given of that name, as Metal's library of a function array answers, and nil for a
+// name none has (measured: M3 Max, macOS 27).
+- (id<MTLFunction>)newExternFunctionWithName:(NSString *)name
+{
+	return [self rgfxGiven:name];
+}
+
+// No bitcode of its own, as Metal's library of a function array answers (measured: M3 Max, macOS
+// 27): its functions keep theirs.
+- (id)bitcodeData
 {
 	return nil;
 }
@@ -1375,6 +1674,37 @@ id<MTLLibrary> RgfxStitchOverShadows(MTLStitchedLibraryDescriptor *descriptor, i
 		               code:MTLLibraryErrorUnsupported
 		           userInfo:@{NSLocalizedDescriptionKey : @"MTLLibrary is not formatted as a MetalLib file."}];
 	return NO;
+}
+
+// --- MTLLibrarySPI: what Metal's library keeps for its tools ---------------------------------
+// As Metal's own library of a function array answers each (measured: M3 Max, macOS 27): no
+// identifier, and the triple and the validation switch as set, nil and NO until set. The host
+// compiles a library's functions for its own GPU, whatever the triple, and the device validates
+// no shader.
+
+- (id)libraryIdentifier
+{
+	return nil;
+}
+
+- (NSString *)overrideTriple
+{
+	return _tools.triple();
+}
+
+- (void)setOverrideTriple:(NSString *)overrideTriple
+{
+	_tools.setTriple(overrideTriple);
+}
+
+- (BOOL)shaderValidationEnabled
+{
+	return _tools.shaderValidation.load();
+}
+
+- (void)setShaderValidationEnabled:(BOOL)enabled
+{
+	_tools.shaderValidation.store(enabled);
 }
 
 @end

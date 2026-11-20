@@ -12,6 +12,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <dlfcn.h>
 #include <memory>
 #include <mutex>
 
@@ -126,15 +127,41 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
                                  serializer:(RgfxSerializer *)serializer
 {
 	// The x86 Macs' heap descriptor validation ends the process at a Shared heap (oracle_bundle
-	// heapbuffers, AMD 5300M and Intel 630, macOS 26.7.1; the M3 Max makes one), sending nothing.
-	if (descriptor != nil && descriptor.storageMode == MTLStorageModeShared)
+	// heapbuffers, AMD 5300M and Intel 630, macOS 26.7.1), sending nothing; an Apple GPU makes
+	// one (oracle_bundle Apple heap.shared, 11-13).
+	const bool apple = rgfxAppleGPU(device);
+	if (descriptor != nil && descriptor.storageMode == MTLStorageModeShared && !apple)
 		RgfxMetalAssertionFailed("-[MTLHeapDescriptorInternal validateWithDevice:]",
 		                         @"Heap Descriptor Validation\nShared storage mode disallowed\n");
 	if (descriptor == nil || descriptor.size == 0 ||
 	    (maxLength != 0 && descriptor.size > maxLength))
 		return nil;
-	(void)region; // no heap the device makes lies in the region: a Shared one ends the process
-	return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (descriptor.storageMode != MTLStorageModeShared)
+		return [RgfxHeap heapWithDescriptor:descriptor device:device serializer:serializer];
+	if (region == nullptr || serializer == nullptr)
+		return nil;
+	// A Shared one's memory is a block of the region, on the host too, whole pages of Metal's
+	// 16 KiB, so the CPU and the host's GPU reach its resources in place.
+	const uint64_t size = static_cast<uint64_t>(descriptor.size);
+	RgfxRegion::Block block =
+	    region->allocate((size + kHeapPage - 1) & ~(kHeapPage - 1), kHeapPage);
+	if (!block.ok)
+		return nil;
+	uint8_t *bytes = const_cast<uint8_t *>(block.ptr);
+	std::memset(bytes, 0, block.size);
+	// The block goes back to the region once the host has dropped the heap.
+	const uint64_t offset = block.offset;
+	RgfxHeap *heap = [RgfxHeap heapOverHostMemoryWithDescriptor:descriptor
+	                                              regionOffset:offset
+	                                                  contents:bytes
+	                                               deallocator:^{
+		                                               region->release(offset);
+	                                               }
+	                                                    device:device
+	                                                serializer:serializer];
+	if (heap == nil)
+		region->release(offset); // no heap lies over the block
+	return heap;
 }
 
 + (instancetype)heapOverHostMemoryWithDescriptor:(MTLHeapDescriptor *)descriptor
@@ -354,7 +381,9 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	}
 	// As Metal's validation, sending nothing.
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
-	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode);
+	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode, self.device);
+	if (rgfxDeviceMakesNoTextureOf(descriptor, self.device))
+		return nil;
 	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
 	                                                     heap:[self rgfxObjId]
 	                                               heapOffset:offset
@@ -440,7 +469,9 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 	}
 	// As Metal's validation, before the host is asked the texture's size.
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self.device);
-	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode);
+	rgfxEndAtHeapStorageMismatch(descriptor, self.storageMode, self.device);
+	if (rgfxDeviceMakesNoTextureOf(descriptor, self.device))
+		return nil;
 	const MTLSizeAndAlign sa = rgfxHeapTextureSizeAndAlign(ser, descriptor, [self class], _cmd);
 	uint64_t offset = 0;
 	if (![self rgfxTakeRange:sa.size align:sa.align offset:&offset]) {
@@ -466,6 +497,64 @@ MTLSizeAndAlign rgfxHeapTextureSizeAndAlign(RgfxSerializer *serializer,
 - (NSUInteger)allocatedSize
 {
 	return static_cast<NSUInteger>(_size);
+}
+
+// --- MTLHeapSPI ----------------------------------------------------------------------
+
+// The heap's memory pool: 0, as Metal's base heap answers, which neither x86 Mac's heap overrides
+// (read from code; measured on the AMD 5300M and the Intel 630, %spi-answers).
+- (uint64_t)memoryPoolId
+{
+	return 0;
+}
+
+// Metal's base heap raises an unrecognized selector here, sending itself
+// doesNotRecognizeSelector:, and neither x86 Mac's heap overrides it (read from code).
+- (BOOL)detachBacking
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return NO;
+}
+
+- (BOOL)replaceBackingWithRanges:(id)ranges readOnly:(BOOL)readOnly
+{
+	[self doesNotRecognizeSelector:_cmd];
+	return NO;
+}
+
+// The description Metal's base heap gives, which neither x86 Mac's heap overrides (read from
+// code): the object's own description, then each field on a line of its own, indented by
+// `indent` + 4 spaces. The hazard tracking mode and the options are worded by Metal's own
+// MTLHazardTrackingModeString and MTLResourceOptionsString, where the guest's Metal has them, and
+// given as numbers where it does not.
+- (NSString *)formattedDescription:(NSUInteger)indent
+{
+	using Words = NSString *(*)(NSUInteger);
+	static const Words hazardWords =
+	    reinterpret_cast<Words>(dlsym(RTLD_DEFAULT, "MTLHazardTrackingModeString"));
+	static const Words optionWords =
+	    reinterpret_cast<Words>(dlsym(RTLD_DEFAULT, "MTLResourceOptionsString"));
+	NSString *pad = [@"\n" stringByPaddingToLength:indent + 4 withString:@" " startingAtIndex:0];
+	NSString *type = _type == MTLHeapTypeAutomatic   ? @"MTLHeapTypeAutomatic"
+	                 : _type == MTLHeapTypePlacement ? @"MTLHeapTypePlacement"
+	                                                 : @"Invalid";
+	const MTLCPUCacheMode cache = self.cpuCacheMode;
+	NSString *cacheWords = cache == MTLCPUCacheModeDefaultCache    ? @"MTLCPUCacheModeDefaultCache"
+	                       : cache == MTLCPUCacheModeWriteCombined ? @"MTLCPUCacheModeWriteCombined"
+	                                                               : @"Invalid";
+	// Metal's base heap words only a Private heap's mode.
+	NSString *storage = self.storageMode == MTLStorageModePrivate ? @"MTLStorageModePrivate" : @"Invalid";
+	const MTLHazardTrackingMode hazard = self.hazardTrackingMode;
+	const MTLResourceOptions options = self.resourceOptions;
+	NSString *hazardText = hazardWords != nullptr ? hazardWords(hazard) : @(hazard).stringValue;
+	NSString *optionText = optionWords != nullptr ? optionWords(options) : @(options).stringValue;
+	NSArray *fields = @[
+		pad, @"label =", self.label ?: @"<none>", pad, @"type =", type, pad, @"size =", @(self.size), pad,
+		@"usedSize =", @(self.usedSize), pad, @"cpuCacheMode =", cacheWords, pad, @"storageMode =",
+		storage, pad, @"hazardTrackingMode =", hazardText ?: @"", pad, @"resourceOptions =",
+		optionText ?: @""
+	];
+	return [NSString stringWithFormat:@"%@%@", [super description], [fields componentsJoinedByString:@" "]];
 }
 
 // --- unsupported: the device makes no acceleration structure ------------------------

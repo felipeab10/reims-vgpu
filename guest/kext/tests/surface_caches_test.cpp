@@ -23,7 +23,10 @@
 // in place of a surface whose pages are still to take a released block's write-back waits for it
 // until the release is late, and so does a CPU lock of the surface. A release is flagged unheld
 // only where nothing but the kext holds the surface, and a lock or a new block of it met before
-// the answer marks the header's clients for the host.
+// the answer marks the header's clients for the host. The wire of the pages a deferral carried is
+// held while the host may read them, is the caller's once the block's pages are named or the
+// deferral refused, and goes with the entry wherever it goes. A block's SURFACE_PAGES carries its
+// surface's layout where it asks, and where it is cached on a device that asks nothing.
 #include "RgfxSurfaceCaches.hpp"
 
 #include <cstdio>
@@ -288,6 +291,203 @@ void deferral()
 	check(r->deferral == kRgfxCacheNotDeferred, "nor one whose deferral the host refused");
 	rgfxCacheSettled(t, kNotCached, true);
 	check(r->deferral == kRgfxCacheNotDeferred, "an answer after it changes nothing");
+}
+
+// A surface is fresh only where its bytes can be in no page: its read under the read-only
+// lock, its seed 0, its pages counted, and none resident, compressed or paged out. A page a
+// writer that takes no lock dirtied, then compressed or paged out, is not resident but holds
+// its bytes: the surface is not fresh, so its block is never deferred over zeros.
+void heldBytes()
+{
+	const RgfxSurfacePageCounts untouched = {true, 0, 0};
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, untouched, 0),
+	      "no page resident, compressed or paged out, seed 0, under the lock: fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 0, 1}, 0),
+	      "a page compressed or paged out holds bytes: not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 1, 0}, 0),
+	      "a page resident: not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {false, 0, 0}, 0),
+	      "pages the kernel could not count so (an older kernel, or memory not the kernel's "
+	      "buffer): not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 1, untouched, 0),
+	      "a lock for writing taken (seed 1): not fresh");
+	check(!rgfxSurfaceHoldsOnlyResident(false, 0, untouched, 0), "read without the lock: no");
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, {true, 3, 0}, 3),
+	      "three pages expected resident, three resident, none elsewhere: only those");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 3, 1}, 3),
+	      "and one compressed besides: not only those");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, {true, 2, 0}, 3), "two of three: no");
+}
+
+// A surface's counts come from the regions of its mapping in the kernel's map, and count only
+// where those regions are the mapping exactly: a region past it would count pages not the
+// surface's, and a gap pages not counted, so either refuses the count (and with it a deferral),
+// never grants one.
+void regionCounts()
+{
+	constexpr uint64_t start = 0x10000000, page = 0x1000, length = 16 * page;
+	const RgfxPageRegion whole[] = {{start, length, 0, 0, false, false}};
+	RgfxSurfacePageCounts c = rgfxRegionPageCounts(whole, 1, start, length);
+	check(c.counted && c.resident == 0 && c.swapped == 0,
+	      "one region that is the mapping, nothing in it: counted, none resident or swapped");
+	check(rgfxSurfaceHoldsOnlyResident(true, 0, c, 0), "and that surface reads fresh");
+	const RgfxPageRegion split[] = {{start, 4 * page, 2, 1, false, false},
+	                                {start + 4 * page, 12 * page, 3, 4, false, false}};
+	c = rgfxRegionPageCounts(split, 2, start, length);
+	check(c.counted && c.resident == 5 && c.swapped == 5,
+	      "two regions that tile the mapping: their counts summed");
+	check(!rgfxSurfaceHoldsOnlyResident(true, 0, c, 0), "with pages swapped: not fresh");
+	const RgfxPageRegion before[] = {{start - page, length + page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(before, 1, start, length).counted,
+	      "a region starting before the mapping: refused");
+	const RgfxPageRegion past[] = {{start, length + page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(past, 1, start, length).counted,
+	      "a region ending past the mapping: refused, though its counts are all zero");
+	const RgfxPageRegion pastLast[] = {{start, 4 * page, 0, 0, false, false},
+	                                   {start + 4 * page, 13 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(pastLast, 2, start, length).counted,
+	      "the last of two regions ending past the mapping: refused");
+	const RgfxPageRegion gap[] = {{start, 4 * page, 0, 0, false, false},
+	                              {start + 5 * page, 11 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(gap, 2, start, length).counted,
+	      "a gap between two regions: refused");
+	const RgfxPageRegion part[] = {{start, 4 * page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(part, 1, start, length).counted,
+	      "regions covering part of the mapping: refused");
+	const RgfxPageRegion pager[] = {{start, length, 0, 0, true, false}};
+	check(!rgfxRegionPageCounts(pager, 1, start, length).counted,
+	      "a pager's memory (a file's), whose pages not resident hold its bytes: refused");
+	const RgfxPageRegion empty[] = {{start, length, 0, 0, false, true}};
+	check(!rgfxRegionPageCounts(empty, 1, start, length).counted,
+	      "a region with nothing the walk can count (SM_EMPTY): refused");
+	check(!rgfxRegionPageCounts(whole, 0, start, length).counted, "no region: refused");
+	check(!rgfxRegionPageCounts(whole, 1, start, 0).counted, "an empty mapping: refused");
+	const RgfxPageRegion zero[] = {{start, 0, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(zero, 1, start, length).counted, "a region of no size: refused");
+	const RgfxPageRegion top[] = {{~0ull - page + 1, page, 0, 0, false, false}};
+	check(!rgfxRegionPageCounts(top, 1, ~0ull - page + 1, 2 * page).counted,
+	      "a mapping that would wrap the address space: refused");
+}
+
+// On a host that answers which surfaces need a cache, a deferral refused, or a surface read not
+// fresh, has the block ask with its pages; answered in place, its entry goes.
+void ungated()
+{
+	RgfxCachedSurface entries[3] = {};
+	RgfxCacheTable t = {entries, 0, 3};
+	void *map = nullptr, *wire = nullptr;
+	int mapping = 0, memory = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->map = &mapping;
+	c->wire = &memory;
+	c->deferral = kRgfxCacheGating;
+	check(rgfxCacheUngated(t, kSurface, &map, &wire) && map == &mapping && wire == &memory,
+	      "a gating entry goes, its mapping and memory the caller's to let go");
+	check(rgfxCacheFind(t, kSurface) == nullptr && t.count == 0, "nothing is left of it");
+
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheGating;
+	check(rgfxCacheGated(t, kSurface), "fresh, it asks to be deferred");
+	check(rgfxCacheUngated(t, kSurface, &map, &wire) && t.count == 0,
+	      "a deferring one goes too, its deferral refused and its pages in place");
+
+	// One the host deferred, or one named cached, stays.
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheGating;
+	rgfxCacheSettled(t, kSurface, true);
+	check(!rgfxCacheUngated(t, kSurface, &map, &wire) && map == nullptr && wire == nullptr &&
+	          rgfxCacheFind(t, kSurface) == c,
+	      "a deferred entry stays");
+	RgfxCachedSurface *d = rgfxCacheAdd(t, kOther, kOtherBlock, kOtherId);
+	d->deferral = kRgfxCacheGating;
+	rgfxCacheSettled(t, kOther, false);
+	check(!rgfxCacheUngated(t, kOther, &map, &wire) && rgfxCacheFind(t, kOther) == d,
+	      "so does one whose pages were named cached");
+	check(!rgfxCacheUngated(t, kNotCached, &map, &wire), "and a surface not cached has none");
+}
+
+// The wire of the pages a deferral carried (RgfxDeferCarry.hpp): held while the host may read
+// them, the caller's once the block's pages are named or the host refused the deferral, and
+// handed out with the entry wherever it goes.
+void carriedWires()
+{
+	RgfxCachedSurface entries[2] = {};
+	RgfxCacheTable t = {entries, 0, 2};
+	int carriedWire = 0, surfaceObject = 0;
+	void *map = nullptr, *wire = nullptr, *held = nullptr, *carried = nullptr;
+	uint64_t offset = 0, mark = 0;
+	RgfxCachedSurface *c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	check(c->carried == nullptr, "a new entry carries nothing");
+	c->deferral = kRgfxCacheGating;
+	c->carried = &carriedWire;
+	check(rgfxCacheGated(t, kSurface), "fresh but for the carried pages, it asks to be deferred");
+	check(rgfxCacheTakeCarried(t, kSurface) == nullptr && c->carried == &carriedWire,
+	      "its pages not named, the carried wire stays");
+	check(rgfxCacheRefusedCarried(t, kSurface) == &carriedWire && c->carried == nullptr,
+	      "the host refused the deferral, making nothing: the carried wire is the caller's");
+	check(rgfxCacheRefusedCarried(t, kSurface) == nullptr, "and only once");
+
+	// Deferred, the host may read the carried pages until the block's pages are named.
+	c->carried = &carriedWire;
+	rgfxCacheSettled(t, kSurface, true);
+	check(c->deferral == kRgfxCacheDeferred && rgfxCacheRefusedCarried(t, kSurface) == nullptr &&
+	          c->carried == &carriedWire,
+	      "a deferral answered keeps the carried wire");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          rgfxCacheTakeCarried(t, kSurface) == nullptr,
+	      "a lock names the block's pages: while it is in flight, the carried wire stays");
+	check(rgfxCacheAttached(t, kSurface, kRgfxPagesNotNamed, &map, &wire, &held) == 0 &&
+	          rgfxCacheTakeCarried(t, kSurface) == nullptr && c->carried == &carriedWire,
+	      "a naming not taken leaves it");
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          rgfxCacheAttached(t, kSurface, kRgfxPagesNamed, &map, &wire, &held) == 0,
+	      "the next lock names them");
+	check(rgfxCacheTakeCarried(t, kSurface) == &carriedWire && c->carried == nullptr,
+	      "named, the host reads the pages themselves: the carried wire is the caller's");
+	check(rgfxCacheTakeCarried(t, kSurface) == nullptr, "and only once");
+
+	// Wherever the entry goes, its carried wire goes with it.
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheLetGo(t, kSurface, false, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == &carriedWire && t.count == 0,
+	      "a deferred block let go hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferring;
+	c->carried = &carriedWire;
+	check(rgfxCacheUngated(t, kSurface, &map, &wire, &carried) && carried == &carriedWire,
+	      "so does a deferral ungated");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(!rgfxCacheLetGo(t, kSurface, true, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == nullptr,
+	      "a block released keeps it until its release is answered");
+	check(rgfxCacheReleased(t, kBlock, &map, &wire, &held, &carried) == kSurface &&
+	          carried == &carriedWire,
+	      "then hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheNext(t, kSurface, &offset, &mark, true) == kRgfxCacheAttach &&
+	          !rgfxCacheLetGo(t, kSurface, false, &surfaceObject, &map, &wire, true, &carried) &&
+	          carried == nullptr,
+	      "a block let go while its pages are named keeps it for the naming");
+	check(rgfxCacheAttached(t, kSurface, kRgfxPagesNotNamed, &map, &wire, &held, nullptr,
+	                        &carried) == kSurface &&
+	          carried == &carriedWire,
+	      "whose answer hands it out");
+	c = rgfxCacheAdd(t, kSurface, kBlock, kId);
+	c->deferral = kRgfxCacheDeferred;
+	c->carried = &carriedWire;
+	check(rgfxCacheBlockLetGo(t, kSurface, kOtherBlock, false, &surfaceObject, &map, &wire, true,
+	                          &carried) &&
+	          carried == nullptr && t.count == 1,
+	      "another block of the surface going leaves it");
+	check(rgfxCacheBlockLetGo(t, kSurface, kBlock, false, &surfaceObject, &map, &wire, true,
+	                          &carried) &&
+	          carried == &carriedWire && t.count == 0,
+	      "its own block going hands it out");
 }
 
 // Op 5 keeps a dormant deferred block while clients are left, and its release names its pages
@@ -733,6 +933,23 @@ void writeBack()
 
 // A block whose ask names its pages after all (deferSurfaceBlock): each wiring taken is let go
 // once, by its cache or by the asker's hold, cached or not, whatever the naming's outcome.
+// A SURFACE_PAGES carries the layout the bundle gave where it asks whether the block needs a
+// device cache, and where it names a cached block on a device that asks nothing; a cached block
+// on a device that answers asks, an uncached block on one that asks nothing, and any block with
+// no layout given carry none.
+void layoutCarried()
+{
+	check(rgfxPagesCarryLayout(true, true, false, true), "an ask carries the layout");
+	check(rgfxPagesCarryLayout(true, false, true, false),
+	      "a cached block on a device that asks nothing carries it");
+	check(!rgfxPagesCarryLayout(true, false, true, true),
+	      "a cached block on a device that answers asks carries none");
+	check(!rgfxPagesCarryLayout(true, false, false, false), "an uncached block carries none");
+	check(!rgfxPagesCarryLayout(false, true, false, true) &&
+	          !rgfxPagesCarryLayout(false, false, true, false),
+	      "no layout given: none carried");
+}
+
 void askNaming()
 {
 	const RgfxPagesNaming namings[] = {kRgfxPagesNamed, kRgfxPagesNotNamed,
@@ -851,6 +1068,7 @@ void unheldReleases()
 
 int main()
 {
+	layoutCarried();
 	askNaming();
 	unheldReleases();
 	RgfxCachedSurface entries[2] = {};
@@ -952,6 +1170,10 @@ int main()
 	clients();
 	room();
 	deferral();
+	heldBytes();
+	regionCounts();
+	carriedWires();
+	ungated();
 	deferredRelease();
 	forgottenAttach();
 	keptAttachWire();

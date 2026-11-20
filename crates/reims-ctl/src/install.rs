@@ -5,7 +5,7 @@
 //! the link, so a running VM's binary is never written.
 //!
 //! `REIMS_CTL_QEMU` names a QEMU binary to use instead (a build tree's, such as `make qemu`'s
-//! `build/qemu/qemu-system-aarch64`); `qemu-img` is taken from beside it.
+//! `build/qemu/qemu-system-x86_64`); `qemu-img` is taken from beside it.
 
 use crate::host::Profile;
 use crate::paths;
@@ -73,7 +73,11 @@ pub fn qemu_binary_or_default(profile: Profile) -> PathBuf {
 /// `qemu-img`, beside the QEMU binary.
 pub fn qemu_img(profile: Profile) -> Result<PathBuf> {
     let bin = qemu_binary(profile)?;
-    let img = bin.with_file_name("qemu-img");
+    let img = bin.with_file_name(if cfg!(windows) {
+        "qemu-img.exe"
+    } else {
+        "qemu-img"
+    });
     if !img.exists() {
         bail!(
             "{} is missing: reinstall with scripts/install-ctl.sh",
@@ -120,26 +124,41 @@ fn backends(qemu: &Path, option: &'static str) -> Vec<String> {
     list
 }
 
-/// The audio backend to use where the VM names none: the host's native one, among those built.
+/// What `qemu -device NAME,help` answered, by binary and device.
+type Probes = HashMap<(PathBuf, &'static str), Option<bool>>;
+
+/// Whether `qemu` was built with the device `name` (`-device NAME,help` lists its properties,
+/// and fails for a device it does not have), cached per binary; None where it does not run.
+pub fn has_device(qemu: &Path, name: &'static str) -> Option<bool> {
+    static CACHE: OnceLock<Mutex<Probes>> = OnceLock::new();
+    let cache = CACHE.get_or_init(Default::default);
+    let key = (qemu.to_path_buf(), name);
+    if let Some(v) = cache.lock().unwrap().get(&key) {
+        return *v;
+    }
+    let has = std::process::Command::new(qemu)
+        .args(["-device", &format!("{name},help")])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .ok()
+        .map(|s| s.success());
+    cache.lock().unwrap().insert(key, has);
+    has
+}
+
+/// The audio backend to use where the VM names none: the host's native one, among those built
+/// (DirectSound's on Windows).
 pub fn default_audio_backend(available: &[String]) -> String {
-    let wanted: &[&str] = if cfg!(target_os = "macos") {
-        &["coreaudio"]
-    } else {
-        &["pipewire", "pa", "alsa", "sdl"]
-    };
-    for w in wanted {
+    for w in ["pipewire", "pa", "alsa", "dsound", "sdl"] {
         if available.iter().any(|a| a == w) {
-            return (*w).into();
+            return w.into();
         }
     }
     if available.is_empty() {
         // QEMU could not be asked (not installed yet): its usual choice.
-        return if cfg!(target_os = "macos") {
-            "coreaudio"
-        } else {
-            "pipewire"
-        }
-        .into();
+        return if cfg!(windows) { "dsound" } else { "pipewire" }.into();
     }
     "none".into()
 }
@@ -177,7 +196,9 @@ mod tests {
 
     /// The installer's prune keeps a build older than the newest three while a QEMU runs from
     /// it, started as reims-ctl starts it, through `qemu/current`, which a newer build then
-    /// took; and removes the old builds nothing runs.
+    /// took; and removes the old builds nothing runs. The installer runs on Linux alone, whose
+    /// /proc names each process's executable.
+    #[cfg(target_os = "linux")]
     #[test]
     fn the_installers_prune_keeps_a_build_a_running_qemu_executes() {
         // The crate's directory, which cargo and nextest give a test process: read at run time, so
@@ -216,12 +237,25 @@ mod tests {
             std::os::unix::fs::symlink(b, qemu.join("current")).unwrap();
         };
         link(builds[0]);
-        let mut running = std::process::Command::new(qemu.join("current").join(bin))
-            .args(["--exact", "install::tests::idle_as_a_qemu"])
-            .env("REIMS_CTL_TEST_IDLE", "1")
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
+        let spawn = || {
+            std::process::Command::new(qemu.join("current").join(bin))
+                .args(["--exact", "install::tests::idle_as_a_qemu"])
+                .env("REIMS_CTL_TEST_IDLE", "1")
+                .stdout(std::process::Stdio::null())
+                .spawn()
+        };
+        // The copy is busy for as long as a process another test forked before its copy closed
+        // holds it open, until that process execs: Linux refuses to exec it then (ETXTBSY).
+        let mut tries = 0;
+        let mut running = loop {
+            match spawn() {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && tries < 200 => {
+                    tries += 1;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                r => break r.unwrap(),
+            }
+        };
         link(builds[4]);
         let pruned = std::process::Command::new("bash")
             .arg("-c")
@@ -237,21 +271,127 @@ mod tests {
         assert_eq!(left, [&builds[0], &builds[2], &builds[3], &builds[4]]);
     }
 
+    /// The installer's --skip-qemu keeps the installed QEMU: with none installed it ends at
+    /// once, before it builds or installs anything, saying what to do. On a host other than
+    /// Linux on x86-64 it ends before that, saying where reims-ctl runs VMs.
+    #[test]
+    fn the_installer_skips_qemu_only_where_one_is_installed() {
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let script = Path::new(&dir).join("../../scripts/install-ctl.sh");
+        let root = std::env::temp_dir().join(format!("reims-ctl-skip-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let out = std::process::Command::new("bash")
+            .arg(&script)
+            .arg("--skip-qemu")
+            .env("XDG_DATA_HOME", root.join("data"))
+            .env("XDG_CACHE_HOME", root.join("cache"))
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.code(), Some(1), "{err}");
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert!(
+                err.contains("--skip-qemu keeps the installed QEMU, and none is installed")
+                    && err.contains("run this without --skip-qemu, which builds it"),
+                "{err}"
+            );
+        } else {
+            assert!(err.contains(crate::host::UNSUPPORTED), "{err}");
+        }
+    }
+
+    /// What the installer says of the QEMU build --skip-qemu keeps: nothing where it was built
+    /// from what this checkout builds it from, which a change to reims-ctl alone leaves as it
+    /// was; else that QEMU or the library changed since its commit, or that the checkout lacks
+    /// that commit.
+    #[test]
+    fn the_installer_says_when_the_qemu_it_keeps_is_not_this_checkouts() {
+        let dir = std::env::var_os("CARGO_MANIFEST_DIR")
+            .expect("CARGO_MANIFEST_DIR: run the tests with cargo");
+        let text =
+            std::fs::read_to_string(Path::new(&dir).join("../../scripts/install-ctl.sh")).unwrap();
+        let function = script_function(&text, "kept_qemu");
+        let repo = std::env::temp_dir().join(format!("reims-ctl-kept-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&repo);
+        let git = |args: &[&str]| {
+            let out = crate::update::git_command(&repo)
+                .args([
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "-c",
+                    "commit.gpgsign=false",
+                ])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{args:?}: {out:?}");
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        };
+        let commit = |file: &str| {
+            let path = repo.join(file);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            let text = std::fs::read_to_string(&path).unwrap_or_default();
+            std::fs::write(&path, text + "x\n").unwrap();
+            git(&["add", file]);
+            git(&["commit", "-q", "-m", file]);
+            git(&["rev-parse", "--short", "HEAD"])
+        };
+        std::fs::create_dir_all(&repo).unwrap();
+        git(&["init", "-q"]);
+        commit("vendor/qemu/configure");
+        let built = commit("crates/reims-vgpu/src/lib.rs");
+        commit("crates/reims-ctl/src/main.rs");
+        commit("docs/qemu.md");
+        let kept = |build: &str| {
+            let mut bash = std::process::Command::new("bash");
+            for v in crate::update::GIT_REPOSITORY_ENV {
+                bash.env_remove(v);
+            }
+            let out = bash
+                .arg("-c")
+                .arg(format!("set -euo pipefail\n{function}kept_qemu \"$1\""))
+                .arg("kept")
+                .arg(format!("/data/reims-ctl/qemu/{build}"))
+                .env("ROOT", &repo)
+                .output()
+                .unwrap();
+            assert!(out.status.success(), "{out:?}");
+            String::from_utf8(out.stdout).unwrap()
+        };
+        let this = kept(&format!("20261107-120000-{built}"));
+        let unknown = kept("20261107-120000-0000000");
+        commit("crates/reims-vgpu/src/lib.rs");
+        let changed = kept(&format!("20261107-120000-{built}"));
+        let _ = std::fs::remove_dir_all(&repo);
+        assert_eq!(this, "");
+        assert_eq!(
+            unknown,
+            "the installed QEMU was built at 0000000, which this checkout does not have: run this \
+             without --skip-qemu to build this checkout's\n"
+        );
+        assert_eq!(
+            changed,
+            format!(
+                "the installed QEMU was built at {built}, and QEMU or the library it links changed \
+                 since: run this without --skip-qemu to build this checkout's\n"
+            )
+        );
+    }
+
     #[test]
     fn audio_backend_prefers_the_native_one() {
         let v = |s: &[&str]| s.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-        if cfg!(target_os = "macos") {
-            assert_eq!(
-                default_audio_backend(&v(&["none", "coreaudio"])),
-                "coreaudio"
-            );
-        } else {
-            assert_eq!(
-                default_audio_backend(&v(&["none", "alsa", "pa", "pipewire"])),
-                "pipewire"
-            );
-            assert_eq!(default_audio_backend(&v(&["none", "alsa"])), "alsa");
-        }
+        assert_eq!(
+            default_audio_backend(&v(&["none", "alsa", "pa", "pipewire"])),
+            "pipewire"
+        );
+        assert_eq!(default_audio_backend(&v(&["none", "alsa"])), "alsa");
         assert_eq!(default_audio_backend(&v(&["none", "dbus"])), "none");
     }
 }

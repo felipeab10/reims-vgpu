@@ -106,28 +106,29 @@
 //!   a command of the other kind, and a Private buffer's command each answer a command object).
 
 use std::collections::BTreeSet;
+use std::marker::PhantomData;
 use std::ops::Range;
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 
-use metal2vulkan::metal::{IndexType, IndirectCommandType};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::Truncate;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::icb::{
+use crate::core::num::Truncate;
+use crate::core::platform::Handle;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::icb::{
     DispatchThreadgroupsArgs, DispatchThreadsArgs, DrawArgs, DrawIndexedArgs,
     DrawIndexedPatchesArgs, DrawPatchesArgs, IcbComputeCmd, IcbRenderCmd, ImageBlockArgs,
     IndirectCommandBuffer, IndirectComputeCommand, IndirectRenderCommand, TessellationFactorArgs,
 };
-use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
-use reims_vgpu_core::platform::values::IcbDesc;
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
+use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+use crate::core::platform::values::IcbDesc;
+use crate::core::raise::RaiseResult;
+use crate::core::sync::{Mutex, MutexGuard};
+use metal2vulkan::metal::{IndexType, IndirectCommandType};
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{
     Inexact, Policy, created_or_decided, decide, get, hang, inexact, metal_aborts, plain, plain_at,
-    refused, send, unrepresentable, unstopped_at,
+    refused, send, unrepresentable,
 };
 use crate::gpu::command::{Progress, Stage};
 use crate::gpu::device::VulkanDevice;
@@ -153,8 +154,7 @@ const LENGTHS_A_COMMAND: u64 = 38;
 
 /// The lock of Metal's pool of indirect command buffer IDs, of the process (one device's, as the
 /// host has one), which a reservation Metal spins at holds for good ([`reserve`]) and every
-/// creation takes ([`new_indirect_command_buffer`]). Isolated tasks share it, as every task's
-/// device is the one object of the process's device ([`crate::gpu::device::adopt`]).
+/// creation takes ([`new_indirect_command_buffer`]).
 ///
 /// Measured on this host: plain allocation hands out IDs from Metal's pool, which the runtime
 /// follows (the tests compare it with Metal: its first 32 IDs, the smallest free range first, a
@@ -188,7 +188,7 @@ const LENGTHS_A_COMMAND: u64 = 38;
 /// wait, and texture reservations go on. No buffer lives while it spins: one made first makes
 /// Metal ignore the reservation. At the runtime's refusal the thread parks for good holding this
 /// lock ([`answered`], [`crate::answer::hang`]), as a hang stays a hang, so every later creation
-/// and reservation of type 5, on any thread, an isolated task's among them, waits on it for good,
+/// and reservation of type 5, on any thread, waits on it for good,
 /// before any death of its own ([`new_indirect_command_buffer`]).
 ///
 /// A buffer released is not free while a command buffer that uses it may run (measured, a
@@ -203,16 +203,10 @@ static RESERVING: Mutex<()> = Mutex::new(());
 /// drops it as Metal does ([`RESERVING`]); the thread parks for good where Metal spins, which the
 /// runtime's refusal tells ([`answered`]). Another refusal of its would die at the selector.
 pub(crate) fn reserve(device: &VulkanDevice, sel: &'static str, ids: &[u64]) -> RaiseResult<()> {
-    // The pool's lock stays held until the runtime answered, as a call Metal spins at holds it;
-    // no stop of an ended task comes between the two, so a call that took the lock reaches the
-    // runtime.
+    // The pool's lock stays held until the runtime answered, as a call Metal spins at holds it.
     let held = plain(|| RESERVING.lock());
-    #[cfg(test)]
-    if let Some(amid) = AMID_RESERVATION.take() {
-        amid();
-    }
     let ids: Vec<rt::ResourceId> = ids.iter().map(|&id| rt::ResourceId(id)).collect();
-    let answer = unstopped_at(sel, || {
+    let answer = plain_at(sel, || {
         device
             .raw
             .reserve_resource_ids(rt::ResourceIdKind::IndirectCommandBuffer, &ids)
@@ -249,13 +243,6 @@ fn spins(e: &rt::Error) -> bool {
             ..
         })
     )
-}
-
-#[cfg(test)]
-thread_local! {
-    /// What a test runs in [`reserve`] on this thread once it holds [`RESERVING`], before the
-    /// runtime takes the reservation.
-    static AMID_RESERVATION: std::cell::Cell<Option<fn()>> = const { std::cell::Cell::new(None) };
 }
 
 // ---- The buffer.
@@ -401,13 +388,122 @@ impl Sides {
 /// pipeline and dispatch words, in a buffer that does not inherit its pipeline state. A word that
 /// differs, or may, is relayed at its getter, a death in strict mode
 /// ([`Inexact::IcbLengthPastTheLastCommand`]), until core sets it again.
+///
+/// The places that may differ are kept as bits of their command ([`Tail::spot`]): a setter of a
+/// command's pipeline or dispatch, which a CPU encode of a compute command sends for each of its
+/// commands, sets bits of its command's word, where a set of places took an insertion a place.
 #[derive(Debug, Default)]
 struct Tail {
-    /// The places in the buffer's array of lengths whose answer may not be Metal's.
-    unknown: BTreeSet<u64>,
+    /// The buffer's size, which places its commands' words.
+    n: u64,
+    /// Of each command from the first, the bits of its words whose answer may not be Metal's:
+    /// bit `k` for word `k` of its pipeline's 2 (0 and 1), then of its dispatch's 6 and its
+    /// imageblock's 2 (2 to 9); as long as the last command marked.
+    words: Vec<u16>,
+    /// Whether the word a copy writes ([`Tail::copied`]) may not answer Metal's.
+    copied: bool,
+    /// The other places that may not: past the copy's word, which a copy whose commands land past
+    /// the buffer's end reaches.
+    others: BTreeSet<u64>,
+}
+
+/// Where a place of a buffer's array of lengths lies in its [`Tail`].
+enum Spot {
+    /// Bit `1 << k` of command `i`'s words, `(i, k)`.
+    Word(usize, u32),
+    /// The copy's word.
+    Copied,
+    /// Another place ([`Tail::others`]).
+    Other,
 }
 
 impl Tail {
+    /// The tail of a buffer of `n` commands, where every place answers Metal's.
+    fn of(n: u64) -> Tail {
+        Tail {
+            n,
+            ..Tail::default()
+        }
+    }
+
+    /// Where `place` lies ([`Spot`]).
+    fn spot(&self, place: u64) -> Spot {
+        let n = self.n;
+        let Some(at) = place.checked_sub(n * LENGTHS_A_COMMAND) else {
+            return Spot::Other;
+        };
+        let bit = |i: u64, k: u64| Spot::Word(usize::try_from(i).unwrap_or(usize::MAX), k as u32);
+        match at {
+            _ if at < 2 * n => bit(at / 2, at % 2),
+            _ if at < 10 * n => bit((at - 2 * n) / 8, 2 + (at - 2 * n) % 8),
+            _ if at == 10 * n => Spot::Copied,
+            _ => Spot::Other,
+        }
+    }
+
+    /// Whether `place` may not answer Metal's.
+    fn contains(&self, place: u64) -> bool {
+        match self.spot(place) {
+            Spot::Word(i, k) => self.words.get(i).is_some_and(|w| w & (1 << k) != 0),
+            Spot::Copied => self.copied,
+            Spot::Other => self.others.contains(&place),
+        }
+    }
+
+    /// `place` answers Metal's.
+    fn remove(&mut self, place: u64) {
+        match self.spot(place) {
+            Spot::Word(i, k) => {
+                if let Some(w) = self.words.get_mut(i) {
+                    *w &= !(1 << k);
+                }
+            }
+            Spot::Copied => self.copied = false,
+            Spot::Other => {
+                self.others.remove(&place);
+            }
+        }
+    }
+
+    /// `place` may not answer Metal's.
+    fn insert(&mut self, place: u64) {
+        match self.spot(place) {
+            Spot::Word(i, k) => {
+                if i >= self.words.len() {
+                    self.words.resize(i + 1, 0);
+                }
+                self.words[i] |= 1 << k;
+            }
+            Spot::Copied => self.copied = true,
+            Spot::Other => {
+                self.others.insert(place);
+            }
+        }
+    }
+
+    /// Of command `i`'s bits ([`Tail::words`](Tail#structfield.words)), its pipeline's words',
+    /// its dispatch's and its imageblock's: where [`Tail::pipeline`], [`Tail::dispatch`] and
+    /// [`Tail::imageblock`] place them for a command of the buffer.
+    const PIPELINE: u16 = 0b11;
+    const DISPATCH: u16 = 0b11_1111 << 2;
+    const IMAGEBLOCK: u16 = 0b11 << 8;
+
+    /// The words `bits` names ([`Tail::PIPELINE`], [`Tail::DISPATCH`], [`Tail::IMAGEBLOCK`]) of
+    /// command `i`, one of the buffer's, may not answer Metal's: as [`Tail::mark`] of their
+    /// places, the command's bits set at once.
+    fn mark_words(&mut self, i: u32, bits: u16) {
+        debug_assert!(
+            u64::from(i) < self.n,
+            "command {i} of a buffer of {}",
+            self.n
+        );
+        let i = i as usize;
+        if i >= self.words.len() {
+            self.words.resize(i + 1, 0);
+        }
+        self.words[i] |= bits;
+    }
+
     /// Of a buffer of `n` commands, the places of command `i`'s pipeline words.
     fn pipeline(n: u64, i: u64) -> Range<u64> {
         let at = n * LENGTHS_A_COMMAND + 2 * i;
@@ -449,22 +545,39 @@ impl Tail {
     /// The places of `range` that may not answer Metal's, as offsets from its start.
     fn within(&self, range: Range<u64>) -> Vec<u64> {
         let start = range.start;
-        self.unknown
-            .range(range)
+        range
+            .filter(|&place| self.contains(place))
             .map(|place| place - start)
             .collect()
     }
 
     /// The places of `range` may not answer Metal's.
     fn mark(&mut self, range: impl IntoIterator<Item = u64>) {
-        self.unknown.extend(range);
+        for place in range {
+            self.insert(place);
+        }
     }
 
-    /// The places of `range` answer Metal's.
+    /// The places of `range` answer Metal's: only those of the commands marked so far are
+    /// visited, so a clear of a buffer's every command whose words no setter marked costs nothing
+    /// a command.
     fn clear(&mut self, range: Range<u64>) {
-        let gone: Vec<u64> = self.unknown.range(range).copied().collect();
-        for place in gone {
-            self.unknown.remove(&place);
+        let (base, n) = (self.n * LENGTHS_A_COMMAND, self.n);
+        let marked = self.words.len() as u64;
+        let segments = [
+            base..base + 2 * marked.min(n),
+            base + 2 * n..base + 2 * n + 8 * marked.min(n),
+        ];
+        for segment in segments {
+            for place in range.start.max(segment.start)..range.end.min(segment.end) {
+                self.remove(place);
+            }
+        }
+        if range.contains(&Self::copied(n)) {
+            self.copied = false;
+        }
+        if !self.others.is_empty() {
+            self.others.retain(|place| !range.contains(place));
         }
     }
 }
@@ -713,17 +826,18 @@ impl IcbObject {
         });
     }
 
-    /// A setter of command `index` wrote the words `words` gives of a buffer of its size, as
-    /// Metal's does and the runtime's does not ([`Tail`]).
-    fn words_set(&self, index: u32, words: fn(u64, u64) -> Range<u64>) {
-        let n = plain(|| self.raw.size());
-        plain(|| (self.sides.lock().tail).mark(words(n, u64::from(index))));
+    /// A setter of command `index` wrote the words `bits` names ([`Tail::mark_words`]), as
+    /// Metal's does and the runtime's does not ([`Tail`]): a compute command's pipeline and
+    /// dispatch setters, which a CPU encode sends for each of its commands, set their bits under
+    /// one hold of the sides, with no call into the runtime.
+    fn words_set(&self, index: u32, bits: u16) {
+        self.sides.lock().tail.mark_words(index, bits);
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them,
     /// past the last command's ([`Tail`]): it answers as set again.
     fn tail_set(&self, flat: u64) {
-        plain(|| self.sides.lock().tail.unknown.remove(&flat));
+        plain(|| self.sides.lock().tail.remove(flat));
     }
 
     /// Core set the threadgroup memory length `flat` places into the buffer's array of them, of a
@@ -731,6 +845,18 @@ impl IcbObject {
     /// ([`Sides::copied_lengths`]).
     fn record_set(&self, flat: u64) {
         plain(|| self.sides.lock().copied_lengths.remove(&flat));
+    }
+
+    /// Core set command `command`'s threadgroup memory length at `index`, the low 32 bits of the
+    /// index it sent, which Metal keeps in the buffer's array of them ([`LENGTHS_A_COMMAND`]):
+    /// of a command's record ([`record_set`](Self::record_set)) or past the last command's
+    /// ([`tail_set`](Self::tail_set)).
+    fn length_set(&self, command: u32, index: u32) {
+        let flat = u64::from(command) * LENGTHS_A_COMMAND + u64::from(index);
+        match flat / LENGTHS_A_COMMAND < plain(|| self.raw.size()) {
+            true => self.record_set(flat),
+            false => self.tail_set(flat),
+        }
     }
 
     /// `sel` reads the threadgroup memory length `flat` places into the buffer's array of them,
@@ -757,7 +883,7 @@ impl IcbObject {
         let unknown = plain(|| {
             let sides = self.sides.lock();
             let written = sides.kernel_written && Tail::words(n).contains(&flat);
-            written || sides.tail.unknown.contains(&flat)
+            written || sides.tail.contains(flat)
         });
         if unknown {
             inexact(sel, Inexact::IcbLengthPastTheLastCommand, || {
@@ -1049,6 +1175,10 @@ pub(crate) fn new_indirect_command_buffer(
         Err(e) => return created_or_decided(sel, Policy::Dies, e),
     };
     drop(held);
+    let sides = Sides {
+        tail: Tail::of(plain(|| raw.size())),
+        ..Sides::default()
+    };
     Ok(Some(Obj::new(IcbObject {
         raw,
         strides: d.support_dynamic_attribute_stride,
@@ -1056,7 +1186,7 @@ pub(crate) fn new_indirect_command_buffer(
             pipeline: d.inherit_pipeline_state,
             buffers: d.inherit_buffers,
         },
-        sides: Arc::default(),
+        sides: Arc::new(Mutex::new(sides)),
         overrun_shape,
         readers: Arc::default(),
     })))
@@ -1073,32 +1203,114 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
     fn compute_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<VulkanIndirectComputeCommand>> {
+    ) -> RaiseResult<Option<VulkanIndirectComputeCommand<'_>>> {
         let sel = "indirectComputeCommandAtIndex:";
         let raw = send(sel, Policy::Dies, || {
             self.raw.indirect_compute_command_at(command_index)
         })?;
-        Ok(Some(Obj::new(CommandObject {
-            icb: self.clone_ref(),
+        Ok(Some(CommandObject {
+            icb: self,
             index: command_index.low_u32(),
             raw,
-        })))
+        }))
     }
 
     /// As [`compute_command`](Self::compute_command), for a render command.
     fn render_command(
         &self,
         command_index: u64,
-    ) -> RaiseResult<Option<VulkanIndirectRenderCommand>> {
+    ) -> RaiseResult<Option<VulkanIndirectRenderCommand<'_>>> {
         let sel = "indirectRenderCommandAtIndex:";
         let raw = send(sel, Policy::Dies, || {
             self.raw.indirect_render_command_at(command_index)
         })?;
-        Ok(Some(Obj::new(CommandObject {
-            icb: self.clone_ref(),
+        Ok(Some(CommandObject {
+            icb: self,
             index: command_index.low_u32(),
             raw,
-        })))
+        }))
+    }
+
+    /// The runtime's `set_render_command`: the command's sets in one call, with no command
+    /// object, as [`render_command`](Self::render_command) and [`encode`] of each would make
+    /// them ([`Sets`]). The runtime's refusal of the take (a command past the size) dies at
+    /// `indirectRenderCommandAtIndex:`, and that of a set at the set's selector, naming the
+    /// runtime's error, as those calls die: the sets before it made, those after it not taken. A
+    /// command whose [`encode`] dies before the runtime is called (a nil object, a primitive
+    /// type 9) ends the call, and is sent alone, after it, through [`encode`], which dies there;
+    /// the sets after it go on in another call.
+    ///
+    /// [`encode`]: IndirectRenderCommand::encode
+    #[inline(always)]
+    fn encode_render_command<'c>(
+        &self,
+        command_index: u64,
+        mut cmds: impl Iterator<Item = IcbRenderCmd<'c, VulkanPlatform>>,
+    ) -> RaiseResult<bool> {
+        const TAKE: &str = "indirectRenderCommandAtIndex:";
+        let index = command_index.low_u32();
+        loop {
+            let mut sets = Sets {
+                icb: self,
+                index,
+                cmds: &mut cmds,
+                sel: TAKE,
+                after: After::Nothing,
+                alone: None,
+                kind: PhantomData::<RenderSets>,
+            };
+            let done = plain_at(TAKE, || {
+                self.raw.set_render_command(command_index, &mut sets)
+            });
+            if let Err((_, e)) = done {
+                return decide(sets.sel, Policy::Dies, e);
+            }
+            sets.note();
+            let Some(cmd) = sets.alone else {
+                return Ok(true);
+            };
+            if let Some(c) = self.render_command(command_index)? {
+                c.encode(cmd)?;
+            }
+        }
+    }
+
+    /// The runtime's `set_compute_command`, as
+    /// [`encode_render_command`](Self::encode_render_command) sends a render command's: its
+    /// take's refusal (a command past the size, or a compute command of a buffer of render
+    /// commands) dies at `indirectComputeCommandAtIndex:`.
+    #[inline(always)]
+    fn encode_compute_command<'c>(
+        &self,
+        command_index: u64,
+        mut cmds: impl Iterator<Item = IcbComputeCmd<'c, VulkanPlatform>>,
+    ) -> RaiseResult<bool> {
+        const TAKE: &str = "indirectComputeCommandAtIndex:";
+        let index = command_index.low_u32();
+        loop {
+            let mut sets = Sets {
+                icb: self,
+                index,
+                cmds: &mut cmds,
+                sel: TAKE,
+                after: After::Nothing,
+                alone: None,
+                kind: PhantomData::<ComputeSets>,
+            };
+            let done = plain_at(TAKE, || {
+                self.raw.set_compute_command(command_index, &mut sets)
+            });
+            if let Err((_, e)) = done {
+                return decide(sets.sel, Policy::Dies, e);
+            }
+            sets.note();
+            let Some(cmd) = sets.alone else {
+                return Ok(true);
+            };
+            if let Some(c) = self.compute_command(command_index)? {
+                c.encode(cmd)?;
+            }
+        }
     }
 
     /// The runtime's `reset_with_range`, one call for the range, which refuses a range past the
@@ -1144,11 +1356,13 @@ impl IndirectCommandBuffer<VulkanPlatform> for VulkanIcb {
 
 // ---- The commands.
 
-/// One command of an indirect command buffer: the runtime's setters, and the buffer.
+/// One command of an indirect command buffer: the runtime's setters, and the buffer, lent for
+/// the command's life. No object is made for it, nor a reference to the buffer taken: core takes
+/// one for each slot or run of records it carries out, 16384 a take of a large buffer.
 #[derive(Debug)]
-pub struct CommandObject<C> {
+pub struct CommandObject<'a, C> {
     /// The buffer it is a command of.
-    icb: VulkanIcb,
+    icb: &'a IcbObject,
     /// Its index there.
     index: u32,
     /// The runtime's setters.
@@ -1156,10 +1370,10 @@ pub struct CommandObject<C> {
 }
 
 /// `id<MTLIndirectRenderCommand>`.
-pub type VulkanIndirectRenderCommand = Obj<CommandObject<rt::IndirectRenderCommand>>;
+pub type VulkanIndirectRenderCommand<'a> = CommandObject<'a, rt::IndirectRenderCommand>;
 
 /// `id<MTLIndirectComputeCommand>`.
-pub type VulkanIndirectComputeCommand = Obj<CommandObject<rt::IndirectComputeCommand>>;
+pub type VulkanIndirectComputeCommand<'a> = CommandObject<'a, rt::IndirectComputeCommand>;
 
 /// A runtime setter's answer, for `sel`: every refusal dies (the module docs).
 fn set(sel: &'static str, call: impl FnOnce() -> Result<(), rt::Error>) -> RaiseResult<()> {
@@ -1193,7 +1407,7 @@ fn address_or_nil(address: Option<rt::GpuAddress>) -> u64 {
     address.map_or(NIL_BUFFER_ADDRESS, |a| a.0)
 }
 
-impl CommandObject<rt::IndirectRenderCommand> {
+impl CommandObject<'_, rt::IndirectRenderCommand> {
     /// The command's record, read back, for `sel`.
     fn record(&self, sel: &'static str) -> rt::EncodedRenderCommand {
         self.icb.intact(sel, self.index);
@@ -1216,7 +1430,7 @@ impl CommandObject<rt::IndirectRenderCommand> {
     }
 }
 
-impl CommandObject<rt::IndirectComputeCommand> {
+impl CommandObject<'_, rt::IndirectComputeCommand> {
     /// The place of the command's threadgroup memory length at `index`'s low 32 bits in the
     /// buffer's array of them ([`LENGTHS_A_COMMAND`]).
     fn flat(&self, index: u64) -> u64 {
@@ -1247,6 +1461,417 @@ impl CommandObject<rt::IndirectComputeCommand> {
     }
 }
 
+/// What the platform notes of a command once the runtime made a set of it, as [`encode`] notes
+/// it after the set's call ([`Sets::note`]).
+///
+/// [`encode`]: IndirectRenderCommand::encode
+#[derive(Clone, Copy)]
+enum After {
+    Nothing,
+    /// A reset: [`IcbObject::rewritten`].
+    Rewritten,
+    /// A compute command's words `bits` set: [`IcbObject::words_set`].
+    Words(u16),
+    /// A compute command's threadgroup memory length at the index: [`IcbObject::length_set`].
+    Length(u32),
+}
+
+/// A command's sets, as the runtime's `set_render_command` or `set_compute_command` takes them:
+/// each of `cmds` made into the runtime's set by its kind `K` ([`MakeSet`]), in turn, ending at
+/// the first `K` does not make, which is kept (`alone`) for [`encode`] to send alone. The runtime takes a set once
+/// it made the one before ([`rt::IndirectCommandBuffer::set_render_command`]), so each set's
+/// [`After`] is noted as the next is taken, and the last's once the call returns: what the
+/// runtime made alone is noted. `sel` is the selector of the last set handed out, which a
+/// refusal is the set's of; while none is, the take's.
+///
+/// [`encode`]: IndirectRenderCommand::encode
+struct Sets<'i, I, K: MakeSet> {
+    icb: &'i IcbObject,
+    index: u32,
+    cmds: I,
+    sel: &'static str,
+    /// What the last set handed out notes once made.
+    after: After,
+    alone: Option<K::Cmd>,
+    kind: PhantomData<K>,
+}
+
+impl<I, K: MakeSet> Sets<'_, I, K> {
+    /// Note what the last set handed out set, which the runtime made.
+    #[inline(always)]
+    fn note(&mut self) {
+        let icb = self.icb;
+        match std::mem::replace(&mut self.after, After::Nothing) {
+            After::Nothing => {}
+            After::Rewritten => icb.rewritten(self.index),
+            After::Words(bits) => icb.words_set(self.index, bits),
+            After::Length(index) => icb.length_set(self.index, index),
+        }
+    }
+}
+
+impl<I: Iterator<Item = K::Cmd>, K: MakeSet> Iterator for Sets<'_, I, K> {
+    type Item = K::Set;
+
+    #[inline(always)]
+    fn next(&mut self) -> Option<K::Set> {
+        self.note();
+        if self.alone.is_some() {
+            return None;
+        }
+        match K::make(self.cmds.next()?) {
+            Ok((set, sel, after)) => {
+                self.sel = sel;
+                self.after = after;
+                Some(set)
+            }
+            Err(cmd) => {
+                self.alone = Some(cmd);
+                None
+            }
+        }
+    }
+}
+
+/// How [`Sets`] makes a command kind's sets: [`render_set`] or [`compute_set`], called by name,
+/// so that it inlines into the runtime's loop over the sets. Passed as a function, its `FnMut`
+/// shim was a call of its own, whose set came back through the caller's frame: stored field by
+/// field, then copied out in loads wider than those stores, each waiting for them to land.
+trait MakeSet {
+    type Cmd;
+    type Set;
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd>;
+}
+
+/// [`MakeSet`] of a render command: [`render_set`].
+struct RenderSets<'c>(PhantomData<&'c ()>);
+
+impl<'c> MakeSet for RenderSets<'c> {
+    type Cmd = IcbRenderCmd<'c, VulkanPlatform>;
+    type Set = rt::IndirectRenderSet<'c>;
+
+    #[inline(always)]
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd> {
+        render_set(cmd)
+    }
+}
+
+/// [`MakeSet`] of a compute command: [`compute_set`].
+struct ComputeSets<'c>(PhantomData<&'c ()>);
+
+impl<'c> MakeSet for ComputeSets<'c> {
+    type Cmd = IcbComputeCmd<'c, VulkanPlatform>;
+    type Set = rt::IndirectComputeSet<'c>;
+
+    #[inline(always)]
+    fn make(cmd: Self::Cmd) -> Result<(Self::Set, &'static str, After), Self::Cmd> {
+        compute_set(cmd)
+    }
+}
+
+/// A binding index core passes as `NSUInteger`, where [`slot`] would not die of it.
+#[inline(always)]
+fn try_slot(index: u64) -> Option<u32> {
+    u32::try_from(index).ok()
+}
+
+/// A draw's raw primitive type, where [`primitive`] would not die of it.
+#[inline(always)]
+fn try_primitive(raw: u64) -> Option<rt::DrawPrimitiveType> {
+    match raw {
+        5..=8 => rt::DrawPrimitiveType::from_raw(raw).ok(),
+        9 => None,
+        _ => Some(rt::DrawPrimitiveType::Public(
+            u32::try_from(raw).ok()?.try_into().ok()?,
+        )),
+    }
+}
+
+/// `cmd` as the runtime's set, its selector and what it notes once made, where [`encode`] would
+/// call the runtime's setter for it; else `cmd`, which [`encode`] dies at before any call.
+///
+/// [`encode`]: IndirectRenderCommand::encode
+#[inline(always)]
+fn render_set(
+    cmd: IcbRenderCmd<'_, VulkanPlatform>,
+) -> Result<(rt::IndirectRenderSet<'_>, &'static str, After), IcbRenderCmd<'_, VulkanPlatform>> {
+    use rt::IndirectRenderSet as S;
+    let sel = cmd.selector();
+    let mut after = After::Nothing;
+    let set = match cmd {
+        IcbRenderCmd::ClearBarrier => S::ClearBarrier,
+        IcbRenderCmd::SetBarrier => S::SetBarrier,
+        IcbRenderCmd::DrawIndexedPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer,
+            patch_index_buffer_offset,
+            control_point_index_buffer,
+            control_point_index_buffer_offset,
+            instance_count,
+            base_instance,
+            buffer: Some(factors),
+            offset,
+            instance_stride,
+        } => {
+            let patch_index_buffer = patch_index_buffer.map(|b| &b.raw);
+            match control_point_index_buffer {
+                Some(control_points) => S::DrawIndexedPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    control_point_index_buffer: Some(&control_points.raw),
+                    control_point_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                    tessellation_factor_buffer: &factors.raw,
+                    tessellation_factor_buffer_offset: offset,
+                    tessellation_factor_buffer_instance_stride: instance_stride,
+                },
+                None => S::DrawPatches {
+                    number_of_patch_control_points,
+                    patch_start,
+                    patch_count,
+                    patch_index_buffer,
+                    patch_index_buffer_offset,
+                    instance_count,
+                    base_instance,
+                    tessellation_factor_buffer: &factors.raw,
+                    tessellation_factor_buffer_offset: offset,
+                    tessellation_factor_buffer_instance_stride: instance_stride,
+                },
+            }
+        }
+        IcbRenderCmd::DrawIndexedPrimitives {
+            primitive_type,
+            index_count,
+            index_type,
+            index_buffer: Some(indices),
+            index_buffer_offset,
+            instance_count,
+            base_vertex,
+            base_instance,
+        } => {
+            let typed: Option<IndexType> = u32::try_from(index_type)
+                .ok()
+                .and_then(|t| t.try_into().ok());
+            let (Some(primitive_type), Some(index_type)) = (try_primitive(primitive_type), typed)
+            else {
+                return Err(cmd);
+            };
+            S::DrawIndexedPrimitives {
+                primitive_type,
+                index_count,
+                index_type,
+                index_buffer: &indices.raw,
+                index_buffer_offset,
+                instance_count,
+                base_vertex,
+                base_instance,
+            }
+        }
+        IcbRenderCmd::DrawPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer,
+            patch_index_buffer_offset,
+            instance_count,
+            base_instance,
+            buffer: Some(factors),
+            offset,
+            instance_stride,
+        } => S::DrawPatches {
+            number_of_patch_control_points,
+            patch_start,
+            patch_count,
+            patch_index_buffer: patch_index_buffer.map(|b| &b.raw),
+            patch_index_buffer_offset,
+            instance_count,
+            base_instance,
+            tessellation_factor_buffer: &factors.raw,
+            tessellation_factor_buffer_offset: offset,
+            tessellation_factor_buffer_instance_stride: instance_stride,
+        },
+        IcbRenderCmd::DrawPrimitives {
+            primitive_type,
+            vertex_start,
+            vertex_count,
+            instance_count,
+            base_instance,
+        } => {
+            let Some(primitive_type) = try_primitive(primitive_type) else {
+                return Err(cmd);
+            };
+            S::DrawPrimitives {
+                primitive_type,
+                vertex_start,
+                vertex_count,
+                instance_count,
+                base_instance,
+            }
+        }
+        IcbRenderCmd::Reset => {
+            after = After::Rewritten;
+            S::Reset
+        }
+        IcbRenderCmd::SetFragmentBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetFragmentBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbRenderCmd::SetRenderPipelineState {
+            pipeline_state: Some(state),
+        } => S::SetRenderPipelineState(&state.raw),
+        IcbRenderCmd::SetVertexBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetVertexBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbRenderCmd::SetVertexBufferAttributeStride {
+            buffer,
+            offset,
+            stride,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetVertexBufferWithStride {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                stride,
+                index,
+            }
+        }
+        IcbRenderCmd::DrawIndexedPatches { buffer: None, .. }
+        | IcbRenderCmd::DrawIndexedPrimitives {
+            index_buffer: None, ..
+        }
+        | IcbRenderCmd::DrawPatches { buffer: None, .. }
+        | IcbRenderCmd::SetRenderPipelineState {
+            pipeline_state: None,
+        } => return Err(cmd),
+    };
+    Ok((set, sel, after))
+}
+
+/// `cmd` as the runtime's set, as [`render_set`] makes a render command's.
+#[inline(always)]
+fn compute_set(
+    cmd: IcbComputeCmd<'_, VulkanPlatform>,
+) -> Result<(rt::IndirectComputeSet<'_>, &'static str, After), IcbComputeCmd<'_, VulkanPlatform>> {
+    use rt::IndirectComputeSet as S;
+    let sel = cmd.selector();
+    let mut after = After::Nothing;
+    let set = match cmd {
+        IcbComputeCmd::ClearBarrier => S::ClearBarrier,
+        IcbComputeCmd::ConcurrentDispatchThreadgroups {
+            threadgroups_per_grid,
+            threads_per_threadgroup,
+        } => {
+            after = After::Words(Tail::DISPATCH);
+            S::ConcurrentDispatchThreadgroups {
+                threadgroups: crate::gpu::size(threadgroups_per_grid),
+                threads_per_threadgroup: crate::gpu::size(threads_per_threadgroup),
+            }
+        }
+        IcbComputeCmd::ConcurrentDispatchThreads {
+            threads_per_grid,
+            threads_per_threadgroup,
+        } => {
+            after = After::Words(Tail::DISPATCH);
+            S::ConcurrentDispatchThreads {
+                threads: crate::gpu::size(threads_per_grid),
+                threads_per_threadgroup: crate::gpu::size(threads_per_threadgroup),
+            }
+        }
+        IcbComputeCmd::Reset => {
+            after = After::Rewritten;
+            S::Reset
+        }
+        IcbComputeCmd::SetBarrier => S::SetBarrier,
+        IcbComputeCmd::SetComputePipelineState {
+            pipeline_state: Some(state),
+        } => {
+            after = After::Words(Tail::PIPELINE);
+            S::SetComputePipelineState(&state.raw)
+        }
+        IcbComputeCmd::SetComputePipelineState {
+            pipeline_state: None,
+        } => return Err(cmd),
+        IcbComputeCmd::SetImageblockWidth { width, height } => {
+            after = After::Words(Tail::IMAGEBLOCK);
+            S::SetImageblockSize { width, height }
+        }
+        IcbComputeCmd::SetKernelBuffer {
+            buffer,
+            offset,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetKernelBuffer {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                index,
+            }
+        }
+        IcbComputeCmd::SetKernelBufferAttributeStride {
+            buffer,
+            offset,
+            stride,
+            index,
+        } => {
+            let Some(index) = try_slot(index) else {
+                return Err(cmd);
+            };
+            S::SetKernelBufferWithStride {
+                buffer: buffer.map(|b| &b.raw),
+                offset,
+                stride,
+                index,
+            }
+        }
+        IcbComputeCmd::SetStageInRegion { region } => {
+            S::SetStageInRegion(crate::gpu::region(region))
+        }
+        IcbComputeCmd::SetThreadgroupMemoryLength { length, index } => {
+            let Ok(length) = u32::try_from(length) else {
+                return Err(cmd);
+            };
+            after = After::Length(index.low_u32());
+            S::SetThreadgroupMemoryLength {
+                length,
+                index: index.low_u32(),
+            }
+        }
+    };
+    Ok((set, sel, after))
+}
+
 /// A draw's raw primitive type, sent with `sel`: a public `MTLPrimitiveType`, or one of Metal's
 /// private types 5 to 8, which the runtime's executions draw as an encoder's draw of the type
 /// draws ([`rt::DrawPrimitiveType`]; the module docs). Type 9 dies ([`TYPE_9`]), and so does a
@@ -1269,10 +1894,15 @@ const TYPE_9: &str = "a draw of primitive type 9 in an indirect command, which M
      a range given at the execution's call, as the records stand then, and runs nothing of one \
      written after the call or among a range a buffer holds";
 
-impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
+impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, index buffer or tessellation factor
     /// buffer, which the runtime's setters take none of, dies. A nil buffer the runtime holds at
     /// its offset (the module docs).
+    ///
+    /// Inlined always, so that a caller's command, which it makes of one kind, is matched where
+    /// it is made: handed over in a call, it went through memory, and the loads that read it back
+    /// waited for the stores that had just written it. A plain `#[inline]` left it out of line.
+    #[inline(always)]
     fn encode(&self, cmd: IcbRenderCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -1601,9 +2231,10 @@ impl IndirectRenderCommand<VulkanPlatform> for VulkanIndirectRenderCommand {
     }
 }
 
-impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
+impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand<'_> {
     /// One runtime setter per command. A nil pipeline state, which the runtime's setter takes
-    /// none of, dies.
+    /// none of, dies. Inlined always, as [`IndirectRenderCommand::encode`] is.
+    #[inline(always)]
     fn encode(&self, cmd: IcbComputeCmd<'_, VulkanPlatform>) -> RaiseResult<()> {
         let sel = cmd.selector();
         let c = &self.raw;
@@ -1619,7 +2250,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                         crate::gpu::size(threads_per_threadgroup),
                     )
                 })?;
-                self.icb.words_set(self.index, Tail::dispatch);
+                self.icb.words_set(self.index, Tail::DISPATCH);
                 Ok(())
             }
             IcbComputeCmd::ConcurrentDispatchThreads {
@@ -1632,7 +2263,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                         crate::gpu::size(threads_per_threadgroup),
                     )
                 })?;
-                self.icb.words_set(self.index, Tail::dispatch);
+                self.icb.words_set(self.index, Tail::DISPATCH);
                 Ok(())
             }
             IcbComputeCmd::Reset => {
@@ -1644,12 +2275,12 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
             IcbComputeCmd::SetComputePipelineState { pipeline_state } => {
                 let state = some(sel, pipeline_state, "pipeline state");
                 set(sel, || c.set_compute_pipeline_state(&state.raw))?;
-                self.icb.words_set(self.index, Tail::pipeline);
+                self.icb.words_set(self.index, Tail::PIPELINE);
                 Ok(())
             }
             IcbComputeCmd::SetImageblockWidth { width, height } => {
                 set(sel, || c.set_imageblock_size(width, height))?;
-                self.icb.words_set(self.index, Tail::imageblock);
+                self.icb.words_set(self.index, Tail::IMAGEBLOCK);
                 Ok(())
             }
             IcbComputeCmd::SetKernelBuffer {
@@ -1685,10 +2316,7 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
                 set(sel, || {
                     c.set_threadgroup_memory_length(length, index.low_u32())
                 })?;
-                match self.length_place(index) {
-                    Ok(_) => self.icb.record_set(self.flat(index)),
-                    Err(flat) => self.icb.tail_set(flat),
-                }
+                self.icb.length_set(self.index, index.low_u32());
                 Ok(())
             }
         }
@@ -1810,25 +2438,24 @@ impl IndirectComputeCommand<VulkanPlatform> for VulkanIndirectComputeCommand {
 /// the process, so under `cargo test`'s threads one test's states and releases reach another's.
 #[cfg(test)]
 mod tests {
+    use crate::core::platform::Platform;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::resource::{Buffer as _, ComputePipeline as _};
+    use crate::core::platform::types::{NsErrorText, NsRange};
+    use crate::core::raise::OnFault;
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
     use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::resource::{Buffer as _, ComputePipeline as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::raise::OnFault;
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::command::VulkanCommandBuffer;
     use crate::gpu::device::tests::dev;
     use crate::gpu::resource::{VulkanBuffer, VulkanComputePipeline};
 
-    const ADD: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_add.metallib");
+    const ADD: &[u8] = include_bytes!("../../../../tests/shaders/compute_add.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;
@@ -1871,7 +2498,7 @@ mod tests {
     /// (`metal_tests::identifiers_after_are_metals`)
     #[test]
     fn identifiers_after_a_scheduled_render_encoder_are_relayed() {
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
         let d = dev();
         let before = make::<VulkanPlatform>(&d, &compute_desc(), 1);
         assert_eq!(before.unique_identifier(), 0x10_0001_8000);
@@ -1900,25 +2527,68 @@ mod tests {
         assert_eq!(crate::answer::inexact_counts(), [(kind, 1)]);
     }
 
-    /// An isolated task that ends while its reservation is under way, once it holds
-    /// [`RESERVING`], still gives it to the runtime, which then hands out Metal's IDs to the
-    /// process's later buffers: 1 then 3, 2 reserved
+    /// The tail answers as the set of its places would, every place of a buffer's array of
+    /// lengths past the last command's: after each mark and clear of a command's words, of a
+    /// copy's, of every command's, and of places a copy past the buffer's end reaches; a
+    /// command's words marked by their bits ([`Tail::mark_words`]) as by their places.
     #[test]
-    fn a_task_that_ends_amid_its_reservation_leaves_the_runtimes_ids_metals() {
-        use reims_vgpu_core::tasks::isolation::life::TaskLife;
-
-        let d = dev();
-        let life = TaskLife::new();
-        AMID_RESERVATION.set(Some(|| {
-            assert!(TaskLife::current().unwrap().exit());
-        }));
-        let reserved = life.run(|| d.reserve_resource_indices(5, &[2]));
-        assert!(matches!(reserved, Some(Ok(()))), "{reserved:?}");
-        let made: Vec<VulkanIcb> = (0..2)
-            .map(|_| make::<VulkanPlatform>(&d, &compute_desc(), 1))
-            .collect();
-        let seen: Vec<u64> = made.iter().map(|b| b.gpu_resource_id()).collect();
-        assert_eq!(seen, [1, 3]);
+    fn the_tail_answers_as_a_set_of_its_places() {
+        let n = 5u64;
+        let (mut tail, mut set) = (Tail::of(n), BTreeSet::new());
+        let low = n * LENGTHS_A_COMMAND - 3;
+        let high = Tail::copied(n) + 24;
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = |m: u64| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed % m
+        };
+        for _ in 0..4000 {
+            let i = next(3 * n);
+            let kind = next(8);
+            // A command of the buffer's words, which a setter marks by their bits.
+            let bits = match kind {
+                0 => Some(Tail::PIPELINE),
+                1 => Some(Tail::DISPATCH),
+                2 => Some(Tail::IMAGEBLOCK),
+                _ => None,
+            }
+            .filter(|_| i < n);
+            let places: Vec<u64> = match kind {
+                0 => Tail::pipeline(n, i).collect(),
+                1 => Tail::dispatch(n, i).collect(),
+                2 => Tail::imageblock(n, i).collect(),
+                3 => Tail::dispatch_and_imageblock(n, i).collect(),
+                4 => vec![Tail::copied(n)],
+                5 => Tail::words(n).collect(),
+                6 => Tail::commands(n).collect(),
+                _ => vec![low + next(high - low)],
+            };
+            let range = places[0]..places[places.len() - 1] + 1;
+            match next(5) {
+                0 | 1 => {
+                    match bits {
+                        Some(bits) if next(2) == 0 => tail.mark_words(i as u32, bits),
+                        _ => tail.mark(places.iter().copied()),
+                    }
+                    set.extend(places.iter().copied());
+                }
+                2 | 3 => {
+                    tail.clear(range.clone());
+                    set.retain(|p| !range.contains(p));
+                }
+                _ => {
+                    tail.remove(places[0]);
+                    set.remove(&places[0]);
+                }
+            }
+            for place in low..high {
+                assert_eq!(tail.contains(place), set.contains(&place), "place {place}");
+            }
+            let within: Vec<u64> = set.range(range.clone()).map(|p| p - range.start).collect();
+            assert_eq!(tail.within(range), within);
+        }
     }
 
     /// A device the host releases and opens again is the one runtime device, whose IDs go on with
@@ -2199,15 +2869,34 @@ mod tests {
         (icb, pipeline)
     }
 
+    /// The commands of the longest buffer the device's records hold, to 2^20: the runtime keeps
+    /// a buffer's records, a header, a record a command and then a command's written flag, in one
+    /// buffer of the device's `max_buffer_length` (`written_flag_offset` of the size at the size),
+    /// and refuses one past it (`IndirectCommandBufferPastMaxBufferLength`). lavapipe's 2 GiB
+    /// holds 953,589 commands.
+    fn most_commands(d: &VulkanDevice) -> u64 {
+        use metal2vulkan::bind::indirect_commands::{
+            COMMAND_BUFFER_HEADER_BYTES, COMMAND_BYTES, WRITTEN_FLAG_BYTES, written_flag_offset,
+        };
+        let most = d.raw.properties().max_buffer_length;
+        let room = most - COMMAND_BUFFER_HEADER_BYTES as u64;
+        let n = (room / (COMMAND_BYTES + WRITTEN_FLAG_BYTES) as u64).min(1 << 20);
+        let fits = |n: u64| written_flag_offset(n as u32, n as u32) <= most;
+        assert!(fits(n) && (n == 1 << 20 || !fits(n + 1)), "{n} commands");
+        n
+    }
+
     /// A CPU reset of a range, one call however many commands it spans, leaves each command of it
-    /// fresh, as a command's reset leaves one: of 2^20 commands, command 0 dispatches nothing
-    /// after it, and its getters read a fresh command's
+    /// fresh, as a command's reset leaves one: of 2^20 commands, or as many as one buffer of the
+    /// device holds where that is fewer ([`most_commands`]), command 0 dispatches nothing after
+    /// it, and its getters read a fresh command's
     #[test]
     fn a_cpu_reset_of_a_range_leaves_its_commands_fresh() {
         let d = dev();
         let input = holding(&d, &[10, 20, 30, 40]);
         let out = holding(&d, &[0; 4]);
-        let (icb, _pipeline) = add_into(&d, 1 << 20, &out, &input);
+        let n = most_commands(&d);
+        let (icb, _pipeline) = add_into(&d, n, &out, &input);
         let resident = [
             Some(ResourceRef::Buffer(&input)),
             Some(ResourceRef::Buffer(&out)),
@@ -2215,7 +2904,7 @@ mod tests {
         ];
         execute_first(&d, &icb, &resident);
         assert_eq!(words(&out), [11, 21, 31, 41]);
-        icb.reset_with_range(0, 1 << 20).unwrap();
+        icb.reset_with_range(0, n).unwrap();
         let reset = icb.compute_command(0).unwrap().unwrap();
         assert_eq!(
             (
@@ -2285,11 +2974,8 @@ mod tests {
     }
 
     /// The same, in a buffer an encoder made resident for writing, which the runtime executes
-    /// from its records on the host. Ignored until the runtime runs the command there:
-    /// metal2vulkan c8a0481cf8 on MoltenVK runs nothing, the output keeping [0; 4], with no
-    /// error, where the buffer made resident for reading alone runs it reading zero
+    /// from its records on the host: the runtime runs the command there too, reading zero
     #[test]
-    #[ignore = "metal2vulkan's host replay runs no command naming a released buffer (handed to it 11-03)"]
     fn a_command_naming_a_released_buffer_reads_zero_in_a_buffer_resident_for_writing() {
         assert_eq!(released_input_read(3), [1; 4]);
     }
@@ -2298,15 +2984,16 @@ mod tests {
     /// `icb_encode.metal`.
     const ICB_ENCODE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icb_encode.metallib"));
 
-    /// Two states of `nothing` and two of `a_vertex` and `a_colour`, each made from a guest
-    /// descriptor that supports indirect command buffers (compute key 7, render key 25).
+    /// Two states of `nothing` and two of `a_vertex` and `a_colour` (colour 0 RGBA8Unorm), each
+    /// made from a value that supports indirect command buffers.
     fn twin_states<P: Platform>(
         d: &P::Device,
         library: &P::Library,
     ) -> (Vec<P::ComputePipeline>, Vec<P::RenderPipeline>) {
-        use crate::gpu::serialized::tests::{hex, pipeline_blob};
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::{
+            ColorAttachmentDesc, FullComputePipelineDesc, FullRenderPipelineDesc,
+        };
         let function = |name: &str| {
             library
                 .new_function(OnFault::Return, name)
@@ -2318,43 +3005,31 @@ mod tests {
             function("a_vertex"),
             function("a_colour"),
         );
-        let compute = hex("02 07 04 01000000 00 04 05000000");
-        // The basic blob with one more entry, key 25 set, before its three: the colour
-        // attachments' block, at the offset its key 8 holds (byte 3 on), moves past it.
-        let mut render = pipeline_blob("basic", 0x21, 0x22, 0);
-        render[0] += 1;
-        render[3] += 6;
-        render.splice(1..1, [25, 4, 1, 0, 0, 0]);
         let computes = (0..2)
             .map(|_| {
-                let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| kernel.clone_ref()));
-                let desc = d
-                    .deserialize_compute_pipeline_descriptor(Hold::NONE, &compute, &mut resolve)
-                    .unwrap()
-                    .unwrap();
-                d.new_compute_pipeline_state(Some(&desc), 0)
-                    .unwrap()
-                    .unwrap()
-                    .unwrap()
+                d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                    support_indirect_command_buffers: true,
+                    ..FullComputePipelineDesc::new(&kernel)
+                })
+                .unwrap()
+                .unwrap()
             })
             .collect();
         let renders = (0..2)
             .map(|_| {
-                let mut resolve = |_: Hold<'_>, r: u64| {
-                    Ok(match r {
-                        0x21 => Some(vertex.clone_ref()),
-                        0x22 => Some(fragment.clone_ref()),
-                        _ => None,
-                    })
-                };
-                let desc = d
-                    .deserialize_render_pipeline_descriptor(Hold::NONE, &render, &mut resolve)
-                    .unwrap()
-                    .unwrap();
-                d.new_render_pipeline_state_from_descriptor(Some(&desc), 0)
-                    .unwrap()
-                    .unwrap()
-                    .unwrap()
+                d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(
+                        0,
+                        ColorAttachmentDesc {
+                            pixel_format: 70,
+                            ..ColorAttachmentDesc::default()
+                        },
+                    )],
+                    support_indirect_command_buffers: true,
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                })
+                .unwrap()
+                .unwrap()
             })
             .collect();
         (computes, renders)
@@ -2369,15 +3044,35 @@ mod tests {
         icb: &P::Icb,
         state: u64,
     ) {
-        use reims_vgpu_core::platform::resource::Library as _;
+        let kernel = kernel_state::<P>(d, library, name);
+        encode_with_kernel::<P>(d, &kernel, icb, state);
+    }
+
+    /// The state of the kernel `name` of `library`, made on `d` without indirect command buffer
+    /// support.
+    fn kernel_state<P: Platform>(
+        d: &P::Device,
+        library: &P::Library,
+        name: &str,
+    ) -> P::ComputePipeline {
+        use crate::core::platform::resource::Library as _;
         let f = library
             .new_function(OnFault::Return, name)
             .unwrap()
             .unwrap();
-        let kernel = d
-            .new_compute_pipeline_state_for_function(Some(&f))
+        d.new_compute_pipeline_state_for_function(Some(&f))
             .unwrap()
-            .unwrap();
+            .unwrap()
+    }
+
+    /// Runs `kernel`, one of [`ICB_ENCODE`]'s encoding kernels, once on `d`, as
+    /// [`encode_by_kernel`] runs it.
+    fn encode_with_kernel<P: Platform>(
+        d: &P::Device,
+        kernel: &P::ComputePipeline,
+        icb: &P::Icb,
+        state: u64,
+    ) {
         let held = d
             .new_buffer_of_length(OnFault::Return, 16, 0)
             .unwrap()
@@ -2394,7 +3089,7 @@ mod tests {
         let resident = [Some(ResourceRef::Icb(icb))];
         for cmd in [
             ComputeCmd::SetComputePipelineState {
-                state: Some(&kernel),
+                state: Some(kernel),
             },
             ComputeCmd::SetBuffers {
                 buffers: &buffers,
@@ -2425,7 +3120,7 @@ mod tests {
     /// answer one identifier
     #[test]
     fn a_command_written_while_two_states_held_its_id_answers_their_identifier() {
-        use reims_vgpu_core::platform::resource::{ComputePipeline as _, Library as _};
+        use crate::core::platform::resource::{ComputePipeline as _, Library as _};
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         let (mut computes, renders) = twin_states::<VulkanPlatform>(&d, &library);
@@ -2489,26 +3184,20 @@ mod tests {
         drop((renders, later_renders));
     }
 
-    /// A state of `mark` of `library`, made from a guest descriptor that supports indirect
-    /// command buffers (compute key 7).
+    /// A state of `mark` of `library`, made from a value that supports indirect command buffers.
     fn marking_state<P: Platform>(d: &P::Device, library: &P::Library) -> P::ComputePipeline {
-        use crate::gpu::serialized::tests::hex;
-        use reims_vgpu_core::platform::resource::Library as _;
-        use reims_vgpu_core::rt::Hold;
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::values::FullComputePipelineDesc;
         let mark = library
             .new_function(OnFault::Return, "mark")
             .unwrap()
             .unwrap();
-        let compute = hex("02 07 04 01000000 00 04 05000000");
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| mark.clone_ref()));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(Hold::NONE, &compute, &mut resolve)
-            .unwrap()
-            .unwrap();
-        d.new_compute_pipeline_state(Some(&desc), 0)
-            .unwrap()
-            .unwrap()
-            .unwrap()
+        d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..FullComputePipelineDesc::new(&mark)
+        })
+        .unwrap()
+        .unwrap()
     }
 
     /// Commits, on `d`, an execution of `icb`'s command 0, which writes `out`, and waits for it.
@@ -2565,11 +3254,175 @@ mod tests {
         unsafe { *out.contents().as_ptr::<u32>() }
     }
 
+    /// An execution of a command a kernel encoded naming a state of `mark` the program released
+    /// before any command buffer that may write the buffer's records was encoded, whose ID no
+    /// state took since, on `d`: the command buffer's status and error, and what `out`'s first word
+    /// reads after it (1 where the released state's program ran). The indirect command buffer is
+    /// made before the release where `buffer_first`, so one of the device lives at it, and after
+    /// it otherwise, so none does.
+    fn released_before_the_write<P: Platform>(
+        d: &P::Device,
+        buffer_first: bool,
+    ) -> ((u64, Option<NsErrorText>), u32) {
+        let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
+        // The encoding kernel's state first: no state made after the release takes its ID.
+        let kernel = kernel_state::<P>(d, &library, "set_compute_state");
+        let state = marking_state::<P>(d, &library);
+        let out = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let made = || {
+            let icb = make::<P>(d, &compute_desc(), 1);
+            // The command borrows the buffer: it goes before the buffer moves out.
+            let command = icb.compute_command(0).unwrap().unwrap();
+            command
+                .encode(IcbComputeCmd::SetKernelBuffer {
+                    buffer: Some(&out),
+                    offset: 0,
+                    index: 0,
+                })
+                .unwrap();
+            drop(command);
+            icb
+        };
+        let first = buffer_first.then(made);
+        let id = state.gpu_resource_id();
+        drop(state);
+        let icb = first.unwrap_or_else(&made);
+        encode_with_kernel::<P>(d, &kernel, &icb, id);
+        let q = d.new_command_queue().unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Icb(&icb))],
+                usage: 1,
+            },
+            ComputeCmd::UseResources {
+                resources: &[Some(ResourceRef::Buffer(&out))],
+                usage: 3,
+            },
+            ComputeCmd::ExecuteCommandsInBuffer {
+                indirect_command_buffer: &icb,
+                execution_range: NsRange::new(0, 1),
+            },
+            ComputeCmd::EndEncoding,
+        ] {
+            e.encode(OnFault::Return, cmd).unwrap();
+        }
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        // SAFETY: the buffer's first Shared word, read after the execution completed.
+        let word = unsafe { *out.contents().as_ptr::<u32>() };
+        ((cb.status().0, cb.error()), word)
+    }
+
+    /// An execution of a command a kernel encoded naming a state the program released before any
+    /// command buffer that may write the buffer's records was encoded, while no indirect command
+    /// buffer of the device lived, whose ID no state took since, runs nothing: the runtime keeps
+    /// the program of a released state only while an indirect command buffer of the device lives
+    /// (`a_state_released_while_a_buffer_lives_runs_where_a_kernel_names_it`). The M3 Max and the
+    /// UHD Graphics 630 run the released state's program, and the Radeon Pro 5300M fails the
+    /// command buffer with a timeout (docs/graphics-kext/dgpu-oracle.md Q43), which the runtime's
+    /// host step, naming no command buffer, cannot give. By default that is relayed
+    /// (`ReleasedCommandState`, announced as the host step records the execution, on the runtime's
+    /// scheduler thread), counted once, and the process goes on: the command buffer completes with
+    /// no error, as the M3 Max's does, and the device runs the next one. A death there is no Mac's
+    /// answer
+    #[test]
+    fn released_command_states_are_relayed_by_default() {
+        let d = dev();
+        let released = rt::Degradation::ReleasedCommandState;
+        let (ended, word) = crate::answer::relaxed_process(|| {
+            released_before_the_write::<VulkanPlatform>(&d, false)
+        });
+        assert_eq!(ended, (COMPLETED, None), "the command buffer");
+        assert_eq!(word, 0, "the command ran nothing");
+        let counted = crate::answer::relayed_counts();
+        assert_eq!(counted, [(released, 1)], "the kinds of DIES relayed");
+        // The device goes on: a command the CPU encoded with a live state runs.
+        assert_eq!(released_state_marks::<VulkanPlatform>(&d), 1);
+    }
+
+    /// An execution of a command a kernel encoded naming a state the program released before any
+    /// command buffer that may write the buffer's records was encoded, while an indirect command
+    /// buffer of the device lived, whose ID no state took since, runs the released state's
+    /// program, as the M3 Max's and the UHD Graphics 630's does, where the Radeon Pro 5300M fails
+    /// the command buffer with a timeout (docs/graphics-kext/dgpu-oracle.md Q43): the device keeps
+    /// the program of each freed ID's last holder while an indirect command buffer of it lives,
+    /// and a buffer the GPU may write takes those at its first such write. Nothing is announced,
+    /// and the command buffer completes with no error, as the M3 Max's does
+    #[test]
+    fn a_state_released_while_a_buffer_lives_runs_where_a_kernel_names_it() {
+        let d = dev();
+        let (ended, word) = crate::answer::relaxed_process(|| {
+            released_before_the_write::<VulkanPlatform>(&d, true)
+        });
+        assert_eq!(ended, (COMPLETED, None), "the command buffer");
+        assert_eq!(word, 1, "the released state's program ran");
+        assert_eq!(
+            crate::answer::relayed_counts(),
+            [],
+            "the kinds of DIES relayed"
+        );
+    }
+
+    /// An indirect command buffer made with `MTLResourceOptions` bit 24, Metal's private option,
+    /// is made as without it, the runtime's `PrivateResourceOption`: in strict mode it dies at its
+    /// creator; by default it is relayed, counted once, and the process goes on. The buffer is
+    /// made, and a command the CPU encoded into it runs, its write landing, as on every Mac asked
+    /// (docs/graphics-kext/dgpu-oracle.md Q44)
+    #[test]
+    fn indirect_command_buffers_of_bit_24_are_relayed_by_default() {
+        use crate::gpu::resource::tests::BIT_24;
+        let d = dev();
+        let kind = rt::Degradation::PrivateResourceOption;
+        let made = || d.new_indirect_command_buffer(&compute_desc(), 1, BIT_24);
+        let site = crate::answer::dies_of(kind, made);
+        assert_eq!(
+            site.file,
+            "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:"
+        );
+        let icb = crate::answer::relaxed(made)
+            .unwrap()
+            .expect("a buffer, as without the bit");
+        let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
+        let state = marking_state::<VulkanPlatform>(&d, &library);
+        let out = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let command = icb.compute_command(0).unwrap().unwrap();
+        for cmd in [
+            IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: Some(&state),
+            },
+            IcbComputeCmd::SetKernelBuffer {
+                buffer: Some(&out),
+                offset: 0,
+                index: 0,
+            },
+            IcbComputeCmd::ConcurrentDispatchThreads {
+                threads_per_grid: MtlSize::new(1, 1, 1),
+                threads_per_threadgroup: MtlSize::new(1, 1, 1),
+            },
+        ] {
+            command.encode(cmd).unwrap();
+        }
+        execute_writing::<VulkanPlatform>(&d, &icb, &out);
+        // SAFETY: the buffer's first Shared word, read after the execution completed.
+        let word = unsafe { *out.contents().as_ptr::<u32>() };
+        assert_eq!(word, 1, "the command ran");
+        assert_eq!(crate::answer::relayed_counts(), [(kind, 1)]);
+    }
+
     /// An execution of a command a kernel encoded with a state the program released since, whose
     /// ID nothing took, runs the released state's program: the runtime keeps the program of a
     /// state of indirect command buffer support released after a command buffer that may write
     /// the buffer's records was encoded, and announces nothing (`ReleasedCommandState` covers
-    /// what it does not keep, [`crate::answer::DIES_BY_DEFAULT`]). Metal's is the same
+    /// what it does not keep: a state released while no indirect command buffer of the device
+    /// lived, `released_command_states_are_relayed_by_default`). Metal's is the same
     /// (`metal_tests`)
     #[test]
     fn an_execution_of_a_record_the_gpu_wrote_naming_a_released_state_runs_it() {
@@ -2582,7 +3435,7 @@ mod tests {
     /// reaches the later state, as Metal's does
     #[test]
     fn a_state_a_command_names_goes_at_the_guests_release() {
-        use reims_vgpu_core::platform::resource::ComputePipeline as _;
+        use crate::core::platform::resource::ComputePipeline as _;
         let d = dev();
         let library = d.new_library(ICB_ENCODE).unwrap().unwrap().unwrap();
         let (mut computes, renders) = twin_states::<VulkanPlatform>(&d, &library);
@@ -2649,6 +3502,430 @@ mod tests {
                 assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
             }
         }
+    }
+
+    /// A command's fields sent in one call ([`IndirectCommandBuffer::encode_compute_command`],
+    /// the runtime's `set_compute_command`) die where one call a field would, and leave the
+    /// command as it would: the runtime's refusal of a set dies at the set's selector, as the
+    /// first, a middle or the last set, the sets before it made and those after it not taken
+    /// (read back); a death of the platform's own before the runtime's call (a nil pipeline
+    /// state, a draw of primitive type 9) alike, the sets after it not taken; and the take of a
+    /// compute command of a buffer of render commands at `indirectComputeCommandAtIndex:`,
+    /// setting nothing. So the runtime is held to making the sets in turn, taking the next only
+    /// once it made the one before, and to leaving those after a refused one untaken, which the
+    /// decoder's refusal of a slot's field alone relies on.
+    #[test]
+    fn a_command_sent_in_one_call_dies_where_one_call_a_field_would() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let (a, b) = (holding(&d, &[1; 4]), holding(&d, &[2; 4]));
+        let kernel = |buffer, index| IcbComputeCmd::SetKernelBuffer {
+            buffer: Some(buffer),
+            offset: 0,
+            index,
+        };
+        let sets = |at: usize, state| {
+            let mut cmds = vec![kernel(&a, 0), kernel(&b, 1)];
+            let set = IcbComputeCmd::SetComputePipelineState {
+                pipeline_state: state,
+            };
+            cmds.insert(at, set);
+            cmds
+        };
+        let sel = "setComputePipelineState:";
+        // The runtime refuses a pipeline state of a buffer that inherits it.
+        let inherits = IcbDesc {
+            inherit_pipeline_state: true,
+            ..compute_desc()
+        };
+        let icb = make::<VulkanPlatform>(&d, &inherits, 3);
+        for at in 0..3 {
+            let index = at as u64;
+            let cmds = sets(at, Some(&pipeline));
+            let site =
+                catch_death(|| icb.encode_compute_command(index, cmds.into_iter())).unwrap_err();
+            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "at {at}");
+            let c = icb.compute_command(index).unwrap().unwrap();
+            let standing = [
+                c.kernel_buffer_address(0).unwrap() != 0,
+                c.kernel_buffer_address(1).unwrap() != 0,
+            ];
+            assert_eq!(standing, [at > 0, at > 1], "the refused set at {at}");
+        }
+        // The platform dies at a nil pipeline state before the runtime's call.
+        let icb = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let cmds = sets(1, None);
+        let site = catch_death(|| icb.encode_compute_command(0, cmds.into_iter())).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
+        let c = icb.compute_command(0).unwrap().unwrap();
+        assert_ne!(c.kernel_buffer_address(0).unwrap(), 0);
+        assert_eq!(c.kernel_buffer_address(1).unwrap(), 0);
+        // And at a draw of primitive type 9, between two vertex buffers.
+        let render = make::<VulkanPlatform>(&d, &render_desc(), 1);
+        let vertex = |buffer, index| IcbRenderCmd::SetVertexBuffer {
+            buffer: Some(buffer),
+            offset: 0,
+            index,
+        };
+        let nine = IcbRenderCmd::DrawPrimitives {
+            primitive_type: 9,
+            vertex_start: 0,
+            vertex_count: 3,
+            instance_count: 1,
+            base_instance: 0,
+        };
+        let cmds = [vertex(&a, 0), nine, vertex(&b, 1)];
+        let site = catch_death(|| render.encode_render_command(0, cmds.into_iter())).unwrap_err();
+        let draw = "drawPrimitives:vertexStart:vertexCount:instanceCount:baseInstance:";
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, draw));
+        let c = render.render_command(0).unwrap().unwrap();
+        assert_ne!(c.vertex_buffer_address(0).unwrap(), 0);
+        assert_eq!(c.vertex_buffer_address(1).unwrap(), 0);
+        // A compute command of a buffer of render commands.
+        let take = "indirectComputeCommandAtIndex:";
+        let site = catch_death(|| render.encode_compute_command(0, std::iter::once(kernel(&a, 0))))
+            .unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, take));
+    }
+
+    /// A compute command's fields sent in one call note what one call a field notes ([`After`]):
+    /// a buffer whose command took them one call a field and one whose command took them in one
+    /// call hold the same sides (a reset, the pipeline's, the dispatch's and the imageblock's
+    /// words, and threadgroup memory lengths of the record and past the last command's), and
+    /// answer the same.
+    #[test]
+    fn a_command_sent_in_one_call_notes_what_one_call_a_field_notes() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let cmds = || {
+            [
+                IcbComputeCmd::Reset,
+                IcbComputeCmd::SetComputePipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 64,
+                    index: 1,
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 128,
+                    index: 40,
+                },
+                IcbComputeCmd::SetImageblockWidth {
+                    width: 8,
+                    height: 8,
+                },
+                IcbComputeCmd::ConcurrentDispatchThreads {
+                    threads_per_grid: MtlSize::new(4, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(4, 1, 1),
+                },
+            ]
+        };
+        let one = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let c = one.compute_command(0).unwrap().unwrap();
+        for cmd in cmds() {
+            c.encode(cmd).unwrap();
+        }
+        let batched = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        assert!(
+            batched
+                .encode_compute_command(0, cmds().into_iter())
+                .unwrap()
+        );
+        let sides = |icb: &VulkanIcb| format!("{:?}", *icb.sides.lock());
+        assert_eq!(sides(&one), sides(&batched));
+        // The length past the last command's lies among the words the command's dispatch setter
+        // wrote after it, which its getter relays as inexact (a death in strict mode) on either
+        // buffer: the sides compared above hold it.
+        let read = |icb: &VulkanIcb| {
+            let c = icb.compute_command(0).unwrap().unwrap();
+            (
+                c.threadgroup_memory_length(1).unwrap(),
+                c.command_type(),
+                c.image_block_args(),
+            )
+        };
+        assert_eq!(read(&one), read(&batched));
+        assert_eq!(read(&batched).0, 64);
+    }
+
+    /// A command's fields sent in one call announce nothing between them: no degradation of the
+    /// runtime's, heard, counted or relayed, comes inside the call, so none moves from where one
+    /// call a field would meet it to the call's end. Of a compute command's every field and a
+    /// render command's every field but its pipeline state.
+    #[test]
+    fn a_command_sent_in_one_call_announces_nothing() {
+        let d = dev();
+        let pipeline = icb_pipeline(&d);
+        let (a, b) = (holding(&d, &[1; 4]), holding(&d, &[2; 4]));
+        let compute = make::<VulkanPlatform>(&d, &compute_desc(), 1);
+        let render = make::<VulkanPlatform>(&d, &render_desc(), 1);
+        let size = MtlSize::new(4, 1, 1);
+        let before = crate::answer::degradation_counts();
+        let (sent, heard) = crate::answer::hearing(|| {
+            let compute_cmds = [
+                IcbComputeCmd::Reset,
+                IcbComputeCmd::SetComputePipelineState {
+                    pipeline_state: Some(&pipeline),
+                },
+                IcbComputeCmd::SetKernelBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbComputeCmd::SetKernelBufferAttributeStride {
+                    buffer: Some(&b),
+                    offset: 16,
+                    stride: 4,
+                    index: 1,
+                },
+                IcbComputeCmd::SetThreadgroupMemoryLength {
+                    length: 64,
+                    index: 0,
+                },
+                IcbComputeCmd::SetStageInRegion {
+                    region: MtlRegion::new(MtlOrigin::new(0, 0, 0), MtlSize::new(1, 1, 1)),
+                },
+                IcbComputeCmd::SetImageblockWidth {
+                    width: 8,
+                    height: 8,
+                },
+                IcbComputeCmd::ConcurrentDispatchThreadgroups {
+                    threadgroups_per_grid: size,
+                    threads_per_threadgroup: size,
+                },
+                IcbComputeCmd::SetBarrier,
+                IcbComputeCmd::ClearBarrier,
+            ];
+            let render_cmds = [
+                IcbRenderCmd::Reset,
+                IcbRenderCmd::SetVertexBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbRenderCmd::SetVertexBufferAttributeStride {
+                    buffer: Some(&b),
+                    offset: 16,
+                    stride: 4,
+                    index: 1,
+                },
+                IcbRenderCmd::SetFragmentBuffer {
+                    buffer: Some(&a),
+                    offset: 0,
+                    index: 0,
+                },
+                IcbRenderCmd::DrawPrimitives {
+                    primitive_type: 3,
+                    vertex_start: 0,
+                    vertex_count: 3,
+                    instance_count: 1,
+                    base_instance: 0,
+                },
+                IcbRenderCmd::SetBarrier,
+                IcbRenderCmd::ClearBarrier,
+            ];
+            (
+                compute.encode_compute_command(0, compute_cmds.into_iter()),
+                render.encode_render_command(0, render_cmds.into_iter()),
+            )
+        });
+        assert_eq!((sent.0.unwrap(), sent.1.unwrap()), (true, true));
+        assert_eq!(heard, []);
+        assert_eq!(crate::answer::degradation_counts(), before);
+    }
+
+    /// A device of the platform's options but for indirect command buffers' records, which lie in
+    /// the runtime's own pages imported by their pointer wherever the device imports host
+    /// pointers, so a recovery keeps them (`indirect_records`, `IndirectRecordsPolicy::Carried`,
+    /// the exact form [`crate::platform::EXACT_FORMS`] names): a device of its own, as a recovery
+    /// moves every user of the device.
+    fn carried_records_device() -> VulkanDevice {
+        let mut options = crate::platform::device_options().clone();
+        options.policy.indirect_records = metal2vulkan::device::IndirectRecordsPolicy::Carried;
+        crate::gpu::device::tests::device_of_options(&options)
+    }
+
+    /// A recovery of the device while commands' sets are sent in one call each loses none of
+    /// them and ends no run, where the records lie where a recovery keeps them
+    /// ([`carried_records_device`]; under the default, a device whose held pointer import costs
+    /// every submission lays them in pooled memory, whose recovery resets every command:
+    /// `a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions`):
+    /// [`SENDERS`] threads each send their own commands' vertex and fragment buffers, nil at
+    /// offsets of the round and the command (a nil buffer's address is its offset), one call a
+    /// command, then read their commands back, round after round, while another thread recovers
+    /// the device again and again, each time once every sender finished a round more. Each
+    /// read-back, and each command at the end, holds the round last sent it.
+    #[test]
+    fn a_recovery_while_a_command_is_sent_in_one_call_loses_no_set() {
+        use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+        const SENDERS: u64 = 4;
+        const EACH: u64 = 16;
+        const RECOVERIES: u64 = 16;
+        let d = carried_records_device();
+        let icb = &make::<VulkanPlatform>(&d, &render_desc(), SENDERS * EACH);
+        // The four addresses of command `i` in `round`: its vertex and fragment buffers 0 and 1.
+        let at = |round: u64, i: u64| {
+            let first = (round * SENDERS * EACH + i) * 64;
+            [first, first + 16, first + 32, first + 48]
+        };
+        let sets = |round: u64, i: u64| {
+            let [v0, v1, f0, f1] = at(round, i);
+            let vertex = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetVertexBuffer {
+                buffer: None,
+                offset,
+                index,
+            };
+            let fragment = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetFragmentBuffer {
+                buffer: None,
+                offset,
+                index,
+            };
+            [
+                vertex(v0, 0),
+                vertex(v1, 1),
+                fragment(f0, 0),
+                fragment(f1, 1),
+            ]
+        };
+        let read = |i: u64| {
+            let c = icb.render_command(i).unwrap().unwrap();
+            let read = [
+                c.vertex_buffer_address(0),
+                c.vertex_buffer_address(1),
+                c.fragment_buffer_address(0),
+                c.fragment_buffer_address(1),
+            ];
+            read.map(Result::unwrap)
+        };
+        let rounds: Vec<AtomicU64> = (0..SENDERS).map(|_| AtomicU64::new(0)).collect();
+        let recovered = AtomicBool::new(false);
+        let last = std::thread::scope(|s| {
+            let senders: Vec<_> = (0..SENDERS)
+                .map(|sender| {
+                    let (rounds, recovered) = (&rounds[sender as usize], &recovered);
+                    s.spawn(move || {
+                        let commands = sender * EACH..(sender + 1) * EACH;
+                        let mut round = 0;
+                        loop {
+                            for i in commands.clone() {
+                                let cmds = sets(round, i).into_iter();
+                                assert!(icb.encode_render_command(i, cmds).unwrap());
+                            }
+                            for i in commands.clone() {
+                                assert_eq!(read(i), at(round, i), "command {i} in round {round}");
+                            }
+                            rounds.store(round + 1, Ordering::Release);
+                            if recovered.load(Ordering::Acquire) {
+                                return (commands, round);
+                            }
+                            round += 1;
+                        }
+                    })
+                })
+                .collect();
+            for n in 0..RECOVERIES {
+                let behind = || rounds.iter().any(|r| r.load(Ordering::Acquire) <= n);
+                while behind() && !senders.iter().any(|s| s.is_finished()) {
+                    std::thread::yield_now();
+                }
+                d.raw.recover_for_test().expect("the recovery");
+            }
+            recovered.store(true, Ordering::Release);
+            senders
+                .into_iter()
+                .map(|s| s.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        for (commands, round) in last {
+            for i in commands {
+                assert_eq!(
+                    read(i),
+                    at(round, i),
+                    "command {i}, sent last in round {round}"
+                );
+            }
+        }
+    }
+
+    /// A recovery of the device under the platform's own options, the runtime's default
+    /// `IndirectRecordsPolicy::Untaxed`, resets every command of an indirect command buffer on a
+    /// device whose check found that a held pointer import costs every submission (RADV; ANV on
+    /// i915: `rt::Device::releases_idle_pointer_imports`), where the runtime lays the records in
+    /// pooled memory, which the recovery loses with the `VkDevice` and writes again as a new
+    /// buffer's, where Metal keeps them (docs/accuracy-ledger.md); elsewhere, where they lie in
+    /// the runtime's own pages imported by their pointer, it keeps every command as the CPU left
+    /// it. The buffer is made once the check answered (before, the records lie in the runtime's
+    /// own pages whatever it will answer), and the commands are sent and read with no recovery
+    /// under way: one that came during a read of a command's four fields, or during a call's
+    /// four sets, would come between two of them. Either way the buffer goes on: commands sent
+    /// after the recovery read back as sent. Each command's vertex and fragment buffers 0 and 1
+    /// are nil at offsets of its own (a nil buffer's address is its offset). A device of its own,
+    /// as a recovery moves every user of the device.
+    #[test]
+    fn a_recovery_under_the_default_resets_every_command_where_an_import_taxes_submissions() {
+        const COMMANDS: u64 = 64;
+        let d = crate::gpu::device::tests::device_of_options(crate::platform::device_options());
+        let answered = d
+            .raw
+            .settle_submit_checks(std::time::Duration::from_secs(60));
+        assert!(answered, "the device's submission checks answered");
+        let pooled = d.raw.releases_idle_pointer_imports();
+        let icb = make::<VulkanPlatform>(&d, &render_desc(), COMMANDS);
+        // The four addresses of command `i` before the recovery (`round` 0) and after it (1).
+        let at = |round: u64, i: u64| {
+            let first = (round * COMMANDS + i + 1) * 64;
+            [first, first + 16, first + 32, first + 48]
+        };
+        let send = |round: u64| {
+            for i in 0..COMMANDS {
+                let [v0, v1, f0, f1] = at(round, i);
+                let vertex = |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetVertexBuffer {
+                    buffer: None,
+                    offset,
+                    index,
+                };
+                let fragment =
+                    |offset, index| IcbRenderCmd::<'_, VulkanPlatform>::SetFragmentBuffer {
+                        buffer: None,
+                        offset,
+                        index,
+                    };
+                let cmds = [
+                    vertex(v0, 0),
+                    vertex(v1, 1),
+                    fragment(f0, 0),
+                    fragment(f1, 1),
+                ];
+                assert!(icb.encode_render_command(i, cmds.into_iter()).unwrap());
+            }
+        };
+        let read = || {
+            (0..COMMANDS)
+                .map(|i| {
+                    let c = icb.render_command(i).unwrap().unwrap();
+                    let read = [
+                        c.vertex_buffer_address(0),
+                        c.vertex_buffer_address(1),
+                        c.fragment_buffer_address(0),
+                        c.fragment_buffer_address(1),
+                    ];
+                    read.map(Result::unwrap)
+                })
+                .collect::<Vec<_>>()
+        };
+        let sent = |round| (0..COMMANDS).map(|i| at(round, i)).collect::<Vec<_>>();
+        send(0);
+        assert_eq!(read(), sent(0), "before the recovery");
+        d.raw.recover_for_test().expect("the recovery");
+        let expected = match pooled {
+            true => vec![[0; 4]; COMMANDS as usize],
+            false => sent(0),
+        };
+        let taxed = format!("after the recovery, a held import taxing submissions: {pooled}");
+        assert_eq!(read(), expected, "{taxed}");
+        send(1);
+        assert_eq!(read(), sent(1), "sent after the recovery");
     }
 
     /// An execution range past the buffer's size, which Metal runs without validation, dies at
@@ -2768,7 +4045,9 @@ mod tests {
         e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
         cb.commit(OnFault::Return).unwrap();
         cb.wait_until_completed(OnFault::Return).unwrap();
-        let command = |icb: &VulkanIcb| icb.compute_command(1).unwrap().unwrap();
+        fn command(icb: &VulkanIcb) -> VulkanIndirectComputeCommand<'_> {
+            icb.compute_command(1).unwrap().unwrap()
+        }
         for icb in [&read, &written] {
             for index in [38, 58, 62] {
                 let length = IcbComputeCmd::SetThreadgroupMemoryLength { length: 16, index };
@@ -2916,7 +4195,7 @@ mod tests {
     /// intact is made resident
     #[test]
     fn a_buffer_a_copy_past_its_end_overwrote_dies_where_made_resident() {
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
         const USE: &str = "useResources:count:usage:";
         let d = dev();
         let p = crate::platform::tests::platform();
@@ -3142,8 +4421,8 @@ mod tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-        use reims_vgpu_core::platform::os::Clock as _;
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::os::Clock as _;
 
         let d = dev();
         let pipeline = icb_pipeline(&d);
@@ -3233,14 +4512,16 @@ mod tests {
     fn blits_move_lengths_past_the_record_as_they_run() {
         use std::sync::mpsc;
 
-        use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
+        use crate::core::platform::event::{EventRef, SharedEvent as _};
 
         let d = dev();
         let (a, b) = (
             make::<VulkanPlatform>(&d, &lengths_desc(), 2),
             make::<VulkanPlatform>(&d, &lengths_desc(), 2),
         );
-        let command = |icb: &VulkanIcb, i| icb.compute_command(i).unwrap().unwrap();
+        fn command(icb: &VulkanIcb, i: u64) -> VulkanIndirectComputeCommand<'_> {
+            icb.compute_command(i).unwrap().unwrap()
+        }
         let length = |length| IcbComputeCmd::SetThreadgroupMemoryLength { length, index: 33 };
         for i in [0, 1] {
             command(&a, i).encode(IcbComputeCmd::SetBarrier).unwrap();

@@ -6,7 +6,7 @@
 //!
 //! - **Asked for by name.** [`start`] makes the thread only where `REIMS_VGPU_LOG` names the
 //!   target itself at debug as the device is adopted (`info,reims_vgpu::work=debug`, the lane
-//!   benches' filter: `reims_vgpu_core::logging::names`). A lone level, such as the `debug` a
+//!   benches' filter: `crate::core::logging::names`). A lone level, such as the `debug` a
 //!   bug report's log asks for, and a pair of a target above it (`reims_vgpu=debug`) start none,
 //!   though they write the target's lines: reading the counts costs the draws it counts (below).
 //! - **Off, it costs nothing.** No thread is made, and the thread reads no count while the
@@ -26,10 +26,11 @@
 //!   RTX 5080, the effort's tip 14656f4d6, lane-gate's bench boots, 2026-11-04).
 
 use std::fmt::Write as _;
+use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::platform::os::clock::{Clock as _, MonoTime};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::os::clock::{Clock as _, Deadline, MonoTime};
 
 /// The log target of the lines, at debug, which the filter names to start them ([`start`]).
 pub(crate) const TARGET: &str = "reims_vgpu::work";
@@ -41,15 +42,19 @@ pub(crate) const PERIOD: Duration = Duration::from_secs(1);
 type Flat = Vec<(String, u64)>;
 
 /// Starts the thread that logs `device`'s counts (the module docs), where the filter names the
-/// target at debug and its lines are written.
-pub(crate) fn start(device: &rt::Device) {
-    if !(reims_vgpu_core::logging::names(TARGET, log::Level::Debug)
+/// target at debug and its lines are written; it ends at `stop`, as the device goes
+/// ([`crate::let_go`]).
+pub(crate) fn start(
+    device: &rt::Device,
+    stop: &Arc<crate::let_go::Stop>,
+) -> Option<std::thread::JoinHandle<()>> {
+    if !(crate::core::logging::names(TARGET, log::Level::Debug)
         && log::log_enabled!(target: TARGET, log::Level::Debug))
     {
-        return;
+        return None;
     }
-    let device = device.clone();
-    let _ = std::thread::Builder::new()
+    let (device, stop) = (device.clone(), Arc::clone(stop));
+    let spawned = std::thread::Builder::new()
         .name("reims-vgpu-work".into())
         .spawn(move || {
             let clock = crate::os::OsClock::new();
@@ -57,7 +62,9 @@ pub(crate) fn start(device: &rt::Device) {
             let mut tick = clock.now_mono();
             loop {
                 tick = tick.saturating_add(PERIOD);
-                clock.sleep_until(Deadline::Mono(tick));
+                if stop.wait_until(tick) {
+                    return;
+                }
                 if !log::log_enabled!(target: TARGET, log::Level::Debug) {
                     continue;
                 }
@@ -67,6 +74,7 @@ pub(crate) fn start(device: &rt::Device) {
                 }
             }
         });
+    spawned.ok()
 }
 
 /// The line before's counts and when they were read.

@@ -1,9 +1,8 @@
 //! Metal's GPU address space as this process's Metal lays it out: the model this platform
-//! places guest-visible buffers, heaps and textures by, so that every address the guest reads (a
-//! placement entry's first word, the replies to the info commands 461 and 463, the buffer
-//! addresses an indirect command buffer's write-back holds) is the one Metal hands out. The
-//! runtime's own choice starts at 2^32 and packs ranges page after page, which no recording
-//! shows.
+//! places the buffers, heaps and textures it makes by, so that each is made at the GPU address
+//! Metal would give it, or at the one its pin asks for where Metal makes a buffer there
+//! ([`placing`]). The runtime's own choice starts at 2^32 and packs ranges page after page, which
+//! no recording of Metal shows.
 //!
 //! Every buffer and heap a creator of the platform makes that Metal gives a range of its own takes
 //! its range here and is made at it (`AddressPlacement::At`): plain ones where the space places
@@ -13,17 +12,24 @@
 //! made at it, in the runtime's reservation of the pool ([`buffer_space`],
 //! [`Placing::pool_slot`]). A buffer placed in a heap takes none, and neither do the platform's
 //! own helper buffers, which lie outside Metal's space. Textures take theirs as Metal's do
-//! ([`texture_space`], [`surface`]).
+//! ([`texture_space`]).
 //! What Metal makes for its own work takes ranges too, at the first use of each kind of work
 //! ([`FirstUse`]). A buffer's or heap's range stays held until the runtime frees its own range of
-//! the resource, which drops the runtime's range token for it, a texture's over a surface until
-//! the runtime frees the buffer it is over too, and any other texture's while the platform's
-//! object lives ([`Hold`]).
+//! the resource, which drops the runtime's range token for it, and a texture's while the
+//! platform's object lives ([`Hold`]). Metal gives a texture over an IOSurface a plain range of
+//! the surface's allocation size, which every texture and buffer over the surface shares while
+//! one lives (`vaprobe surfaces`: a texture over a surface of 0x4000 bytes took 0x8000 of the
+//! space, one of 0x40000 bytes 0x48000, and a buffer made over the same surface after it
+//! answered the texture's address and took none; `vaprobe surfacetwo`: two buffers over one
+//! surface, both live, answered its address). The guest's surfaces reach this platform as
+//! buffers that stand for them (`new_texture_over_surface_plane`), whose textures take none where
+//! Metal's take their surface's range. No guest reads the difference: on the reims-graphics
+//! device the guest's bundle picks every GPU address and resource ID the guest reads, in its own
+//! part of the space from `RGFX_CONTEXT_VA_BASE` (2^46), and the host pins them there
+//! (docs/graphics-kext/design.md, Decided 6), where no range this model places from 2^40 reaches.
 //!
-//! One model per process ([`process`]): Metal has one device per GPU, so an isolated task's
-//! objects take ranges after the device's and every other task's (`interplay_decodewalk_52`:
-//! task 2, which runs first, takes the start; task 1's buffers come after task 2's and after
-//! what Metal took for task 2's work).
+//! One model per process ([`process`]): Metal has one device per GPU, so every object of the
+//! process takes its range after those made before it, whoever made them.
 //!
 //! What the probes (`vaprobe`, plain Metal) and the recordings of the suite's isolate cases
 //! settle, on the M3 Max, macOS 26.7 (the table test plays every row):
@@ -76,11 +82,11 @@ mod gaps;
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, Weak};
 
+use crate::core::platform::types::SizeAndAlign;
+use crate::core::sync::{Mutex, MutexGuard};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::types::SizeAndAlign;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 /// Metal's page on this host: a range holds whole pages.
 pub const PAGE: u64 = 0x4000;
@@ -125,8 +131,6 @@ pub enum TextureKind {
     /// texture's, which it keeps while it lives, past the texture and its handle (`vaprobe
     /// sharedrelease`) ([`Hold`]).
     FromSharedHandle,
-    /// Over an IOSurface: the surface's range ([`surface`]).
-    OverSurface,
 }
 
 /// What a texture takes of the space.
@@ -145,9 +149,6 @@ pub enum TextureSpace {
         /// Its bytes, before the slot's rounding.
         bytes: u64,
     },
-    /// Its surface's range, shared with every texture and buffer over the surface
-    /// ([`surface`]).
-    Surface,
 }
 
 /// The least heap size of a texture of memory of its own Metal gives a range of its own, of that
@@ -306,7 +307,6 @@ pub const fn texture_space(kind: TextureKind) -> TextureSpace {
         | TextureKind::View
         | TextureKind::Memoryless
         | TextureKind::FromSharedHandle => TextureSpace::None,
-        TextureKind::OverSurface => TextureSpace::Surface,
         TextureKind::OwnMemory { heap_size, class } if heap_size < OWN_HEAP_SIZE => {
             TextureSpace::Slot {
                 class,
@@ -625,8 +625,10 @@ struct Pool {
     /// Whether a first use made it, which Metal keeps for good.
     kept: bool,
     /// The runtime's reservations of its range (`rt::Device::reserve_address_pool`), one on each
-    /// device a buffer lies in it on, which those buffers' holds keep ([`Placing::pool_slot`]).
-    reserved: Vec<Weak<rt::AddressPool>>,
+    /// device a buffer lies in it on, which those buffers' holds keep ([`Placing::pool_slot`]),
+    /// each beside the device it was made through, named by the address of its properties
+    /// ([`Pool::reservation`]).
+    reserved: Vec<(Weak<rt::AddressPool>, usize)>,
 }
 
 impl Pool {
@@ -650,19 +652,23 @@ impl Pool {
     /// A device is one runtime device, not one physical device: each has a space of its own,
     /// and refuses a slot of another's reservation (`ForeignObject`). Their buffers' holds keep
     /// them, so a device keeps its reservation while a buffer of it lies in the pool, and none
-    /// after; a live reservation keeps its device, so the address of the device's properties
-    /// names it alone.
+    /// after. A reservation is named by the address of the properties of the device it was made
+    /// through, the platform's handle, which every clone of that handle answers: a live
+    /// reservation holds a handle of its device's generation, which keeps that device and its
+    /// properties where they are, so the address names it alone. The reservation's own device
+    /// (`rt::AddressPool::device`) is that generation's handle, whose properties are a copy of
+    /// its own at another address.
     fn reservation(&mut self, device: &rt::Device) -> Result<Arc<rt::AddressPool>, rt::Error> {
-        self.reserved.retain(|reserved| reserved.strong_count() > 0);
-        let live = (self.reserved.iter()).filter_map(Weak::upgrade);
-        let mut of_device =
-            live.filter(|r| std::ptr::eq(r.device().properties(), device.properties()));
-        if let Some(reserved) = of_device.next() {
+        let named = std::ptr::from_ref(device.properties()).addr();
+        self.reserved
+            .retain(|(reserved, _)| reserved.strong_count() > 0);
+        let live = (self.reserved.iter()).filter(|&&(_, of)| of == named);
+        if let Some(reserved) = live.filter_map(|(reserved, _)| reserved.upgrade()).next() {
             return Ok(reserved);
         }
         let at = rt::AddressPlacement::At(rt::GpuAddress(self.held.address()));
         let reserved = Arc::new(device.reserve_address_pool(at, POOL_BYTES)?);
-        self.reserved.push(Arc::downgrade(&reserved));
+        self.reserved.push((Arc::downgrade(&reserved), named));
         Ok(reserved)
     }
 
@@ -1143,7 +1149,7 @@ impl MetalSpace {
     }
 
     /// A texture of `kind` made: its descriptor ([`MetalSpace::texture_made`]), then the range
-    /// or slot it holds of its own, now held: nothing for one that takes none or its surface's
+    /// or slot it holds of its own, now held: nothing for one that takes none
     /// ([`texture_space`]), or where the space has no room for it. A texture of memory of its
     /// own, suballocated or not, or a shareable one, is a first use ([`FirstUse::Texture`]),
     /// before both.
@@ -1153,20 +1159,11 @@ impl MetalSpace {
         }
         self.texture_made();
         let made = match texture_space(kind) {
-            TextureSpace::None | TextureSpace::Surface => None,
+            TextureSpace::None => None,
             TextureSpace::Own(bytes) => self.place(bytes).map(Holding::Range),
             TextureSpace::Slot { class, bytes } => self.slot(class, bytes).map(Holding::Slot),
         };
         made.unwrap_or(Holding::Nothing)
-    }
-
-    /// The range of a surface of `alloc_size` bytes ([`SurfaceRange`]), now held, after the
-    /// first use a texture over it is ([`FirstUse::Texture`]). The first use a buffer over a
-    /// surface is, made before any queue or texture, is unmeasured: the model takes it as a
-    /// texture's, which the library's queues, made as it starts, make moot.
-    pub fn place_surface(&mut self, alloc_size: u64) -> Option<Held> {
-        self.first_use(FirstUse::Texture);
-        self.place(alloc_size)
     }
 
     /// `held`'s resource released, or never made after all: its whole span free again, a
@@ -1180,21 +1177,30 @@ impl MetalSpace {
 static PROCESS: Mutex<MetalSpace> = Mutex::new(MetalSpace::new());
 
 /// The device whose sampler ID pool Metal's sampler mempool follows ([`Samplers`]): the
-/// process's first, the one Metal's device is.
-static SAMPLER_IDS: OnceLock<rt::Device> = OnceLock::new();
+/// process's first, the one Metal's device is, until the platform lets go of its devices
+/// ([`crate::let_go`]). A leaf lock, taken under [`PROCESS`]'s.
+static SAMPLER_IDS: Mutex<Option<rt::Device>> = Mutex::new(None);
 
 /// `device` made: the process's sampler mempool follows its sampler ID pool, if it is the
-/// process's first ([`Samplers`]). Another runtime device of the process (a test's, with a shader
-/// cache of its own) has a pool of its own, which the space does not follow.
+/// process's first, or the first since the platform let go of its devices ([`Samplers`]). Another
+/// runtime device of the process (a test's, with a shader cache of its own) has a pool of its
+/// own, which the space does not follow.
 pub fn count_sampler_ids(device: &rt::Device) {
-    let _ = SAMPLER_IDS.set(device.clone());
+    SAMPLER_IDS.lock().get_or_insert_with(|| device.clone());
+}
+
+/// Takes the device whose sampler ID pool the space follows, for the platform's let-go of its
+/// devices ([`crate::let_go`]): the mempool keeps what it grew to, and follows the next device
+/// adopted.
+pub(crate) fn take_sampler_ids() -> Option<rt::Device> {
+    SAMPLER_IDS.lock().take()
 }
 
 /// The process's space, locked, after its sampler mempool grew to the process's device's
 /// sampler ID pool ([`Samplers`]).
 pub fn process() -> MutexGuard<'static, MetalSpace> {
     let mut space = PROCESS.lock();
-    if let Some(device) = SAMPLER_IDS.get() {
+    if let Some(device) = SAMPLER_IDS.lock().as_ref() {
         space.sampler_pool(device.sampler_id_pool_size());
     }
     space
@@ -1254,10 +1260,6 @@ impl FirstUse {
 /// space places a range again once the runtime has freed it too. A resource the runtime leaves
 /// to the process's exit keeps its range, as Metal's does.
 ///
-/// A texture over a surface holds its surface's range, which every texture and buffer over the
-/// surface shares ([`SurfaceRange`]), through the range token of the buffer it is over too, so
-/// the range goes once the runtime frees the last of them, as a buffer's does.
-///
 /// A texture of its own memory's range and a shareable texture's, which the runtime holds no
 /// range of, are placed before the runtime makes the texture and held by its range token too,
 /// which the runtime drops once the texture, every view of it and every texture opened from its
@@ -1287,9 +1289,6 @@ enum Kept {
     Nothing,
     /// Ranges of its own: one, or a sparse heap's two ([`SPARSE_STATE`]).
     Own(Vec<Held>),
-    /// Its surface's range, with whether it is a buffer at the range's address
-    /// ([`SurfaceRange::buffers`]).
-    Surface(Arc<SurfaceRange>, bool),
     /// A slot in one of Metal's pools ([`PoolClass`]), with the runtime's reservation of the pool
     /// a buffer in it lies in ([`Placing::pool_slot`]).
     Slot(Slot, Option<Arc<rt::AddressPool>>),
@@ -1324,7 +1323,6 @@ impl Hold {
         match &self.0 {
             Kept::Nothing => None,
             Kept::Own(held) => held.first().map(Held::address),
-            Kept::Surface(range, _) => Some(range.address()),
             Kept::Slot(slot, _) => Some(slot.address()),
             Kept::Shares(of) => of.address(),
         }
@@ -1346,11 +1344,6 @@ impl Drop for Hold {
                 space.free_slot(slot);
                 drop(reserved);
             }
-            Kept::Surface(range, buffer) => {
-                if buffer {
-                    *range.buffers.lock() -= 1;
-                }
-            }
         }
         if std::mem::take(&mut self.1.0) {
             process().texture_gone();
@@ -1358,125 +1351,8 @@ impl Drop for Hold {
     }
 }
 
-/// An IOSurface's range of the space: one plain range of the surface's allocation size, which
-/// every texture over the surface and every buffer over it (`newBufferWithIOSurface:`) shares
-/// while one lives, and which goes back with the last (`vaprobe surfaces`: a texture over a
-/// surface of 0x4000 bytes took 0x8000 of the space, one of 0x40000 bytes 0x48000, and the
-/// buffer made over the same surface after it answered the texture's address and took none).
-///
-/// A surface is one `IOSurfaceRef` here: whether Metal shares the range with another reference
-/// to the same surface (`IOSurfaceLookupFromMachPort`) is unmeasured.
-#[derive(Debug)]
-pub struct SurfaceRange {
-    /// The surface's key ([`surface`]).
-    key: u64,
-    /// The range, none where the space had no room for it.
-    held: Option<Held>,
-    /// The buffers over the surface at the range's address, until the runtime frees each one's
-    /// range: the first is made at the address, and each later one shares its range with a live
-    /// one ([`surface_buffer`]).
-    buffers: Mutex<u64>,
-}
-
-impl SurfaceRange {
-    /// Its address, 0 where the space had no room for it.
-    pub fn address(&self) -> u64 {
-        self.held.as_ref().map_or(0, Held::address)
-    }
-}
-
-impl Drop for SurfaceRange {
-    fn drop(&mut self) {
-        let mut surfaces = SURFACES.lock();
-        if let Some(live) = surfaces.get(&self.key)
-            && std::ptr::eq(live.as_ptr(), self)
-        {
-            surfaces.remove(&self.key);
-        }
-        drop(surfaces);
-        if let Some(held) = self.held.take() {
-            process().release(held);
-        }
-    }
-}
-
-/// Each surface's range while a texture or buffer over it lives, by the surface's key.
-static SURFACES: Mutex<BTreeMap<u64, Weak<SurfaceRange>>> = Mutex::new(BTreeMap::new());
-
-/// The range of the surface `key` (its `IOSurfaceRef`), of `alloc_size` bytes: the live one, or a
-/// new one placed now.
-fn surface_range(key: u64, alloc_size: u64) -> Arc<SurfaceRange> {
-    let mut surfaces = SURFACES.lock();
-    if let Some(live) = surfaces.get(&key).and_then(Weak::upgrade) {
-        return live;
-    }
-    let range = Arc::new(SurfaceRange {
-        key,
-        held: process().place_surface(alloc_size),
-        buffers: Mutex::new(0),
-    });
-    surfaces.insert(key, Arc::downgrade(&range));
-    range
-}
-
-/// A texture's hold on the surface `key`'s range, of `alloc_size` bytes ([`SurfaceRange`]), after
-/// its descriptor ([`MetalSpace::texture_made`]).
-pub fn surface(key: u64, alloc_size: u64) -> Hold {
-    {
-        let mut space = process();
-        space.first_use(FirstUse::Texture);
-        space.texture_made();
-    }
-    Hold::texture(Kept::Surface(surface_range(key, alloc_size), false))
-}
-
-/// Where a buffer over a surface is made ([`surface_buffer`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SurfacePlace {
-    /// At the placement: the surface's address, or where the runtime picks where the space had
-    /// no room for the surface's range.
-    At(rt::AddressPlacement),
-    /// At the address another buffer over the surface holds, sharing its range
-    /// (`BufferDescriptor::with_range_of`): the range is the runtime's once one buffer holds it,
-    /// and stays while one holds it.
-    Shared,
-}
-
-/// Where a buffer over the surface `key`, of `alloc_size` bytes, is made, and its hold on the
-/// surface's range ([`SurfaceRange`]), which its range token keeps ([`Hold`]): at the range's
-/// address while no buffer over the surface holds it, sharing the range of one that does where
-/// one does, or where the runtime picks where the space had no room for the range.
-///
-/// Metal answers the surface's address for every buffer over it (`vaprobe surfacetwo`: two
-/// buffers over one surface, both live, answered its address, with a texture over it made first
-/// and with none). The runtime holds one buffer at an address, so a buffer made while another
-/// holds it shares that one's range ([`SurfacePlace::Shared`]): a buffer holds the address while
-/// it lives, and after its release until the runtime frees its range, once the command buffers
-/// that used it completed.
-pub fn surface_buffer(key: u64, alloc_size: u64) -> (SurfacePlace, Hold) {
-    let range = surface_range(key, alloc_size);
-    let mut buffers = range.buffers.lock();
-    let place = match (&range.held, *buffers) {
-        (Some(_), 1..) => SurfacePlace::Shared,
-        (Some(held), 0) => {
-            SurfacePlace::At(rt::AddressPlacement::At(rt::GpuAddress(held.address())))
-        }
-        (None, _) => {
-            drop(buffers);
-            return (
-                SurfacePlace::At(rt::AddressPlacement::Any),
-                Hold::of(Kept::Surface(range, false)),
-            );
-        }
-    };
-    *buffers += 1;
-    drop(buffers);
-    (place, Hold::of(Kept::Surface(range, true)))
-}
-
 /// The hold of a texture of `kind`: its descriptor ([`Elements`]), and a range of its own, a slot
-/// in one of Metal's pools, or neither; for [`TextureKind::OverSurface`], its caller takes the
-/// surface's ([`surface`]).
+/// in one of Metal's pools, or neither.
 pub fn texture(kind: TextureKind) -> Hold {
     let kept = match process().place_texture(kind) {
         Holding::Nothing => Kept::Nothing,
@@ -1824,7 +1700,8 @@ mod tests {
         /// A sampler state placed at an ID, made and kept: the runtime's sampler ID pool as it
         /// answers after it, which a placed ID does not grow ([`Samplers`]).
         PlacedSampler,
-        /// A texture over a surface of that allocation size, made and kept ([`surface`]).
+        /// A texture over an IOSurface of that allocation size, made and kept: a plain range of
+        /// that size, after the first use a texture is (the module docs).
         Surface(&'static str, u64),
     }
 
@@ -3159,7 +3036,7 @@ mod tests {
                 Surface(name, alloc_size) => {
                     space.first_use(Texture);
                     space.texture_made();
-                    let held = space.place_surface(alloc_size).unwrap();
+                    let held = space.place(alloc_size).unwrap();
                     made.insert(name, Holding::Range(held));
                 }
                 Recorded(name, offset, value) => {
@@ -3712,10 +3589,6 @@ mod tests {
         for (kind, taken) in rows {
             assert_eq!(span(texture_space(kind)), taken, "{kind:?}");
         }
-        assert_eq!(
-            texture_space(TextureKind::OverSurface),
-            TextureSpace::Surface
-        );
     }
 
     /// Apple's layout as the runtime models it: 4x4 RGBA8 is 0x40 bytes (Apple's
@@ -3755,39 +3628,5 @@ mod tests {
             texture_allocation([1, 1], 16, [u64::MAX, u64::MAX, 1], false, 1, 1, 1),
             u64::MAX
         );
-    }
-
-    /// Every texture and buffer over one surface shares its range, which goes back with the last;
-    /// the first buffer over it is made at its address, and each made while one holds it shares
-    /// that one's range, until the last goes.
-    #[test]
-    fn a_surface_has_one_range_while_anything_over_it_lives() {
-        const KEY: u64 = 0xdead_0000;
-        let texture = surface(KEY, PAGE);
-        let at = texture.address().unwrap();
-        let (placement, buffer) = surface_buffer(KEY, PAGE);
-        let pinned = SurfacePlace::At(rt::AddressPlacement::At(rt::GpuAddress(at)));
-        assert_eq!(placement, pinned);
-        assert_eq!(buffer.address(), Some(at));
-        let (shared, second) = surface_buffer(KEY, PAGE);
-        assert_eq!(shared, SurfacePlace::Shared);
-        assert_eq!(second.address(), Some(at));
-        let other = surface(KEY, PAGE);
-        assert_eq!(other.address(), Some(at));
-        drop(texture);
-        drop(buffer);
-        // The second buffer holds the address still: a third shares it.
-        let (third, held) = surface_buffer(KEY, PAGE);
-        assert_eq!(third, SurfacePlace::Shared);
-        drop((second, held));
-        // The other texture keeps the range; no buffer holds its address.
-        let (again, held) = surface_buffer(KEY, PAGE);
-        assert_eq!(again, pinned);
-        drop((other, held));
-        // Nothing over the surface: its range is free.
-        let pin = process().pin(at, PAGE).unwrap();
-        process().release(pin);
-        // A new surface range for the key, wherever the space places it.
-        assert!(surface(KEY, PAGE).address().is_some());
     }
 }

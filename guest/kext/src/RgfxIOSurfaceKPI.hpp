@@ -68,6 +68,7 @@
 
 #include <IOKit/IOMemoryDescriptor.h>
 #include <IOKit/IOTypes.h>
+#include <libkern/c++/OSDictionary.h>
 
 // A surface's device cache (IOSurfaceDeviceCache), opaque here.
 struct RgfxDeviceCache;
@@ -113,6 +114,15 @@ void rgfxDeviceCacheSetCurrent(RgfxDeviceCache *cache)
     __asm__("__ZN20IOSurfaceDeviceCache10setCurrentEv");
 // IOSurface::getLockSeed() const: the surface's seed, as IOSurfaceGetSeed reads it.
 uint32_t rgfxIOSurfaceLockSeed(const OSObject *surface) __asm__("__ZNK9IOSurface11getLockSeedEv");
+// IOSurface::getUnlockSeed() const: the surface's unlock seed, which unlockSurface moves at each
+// read-write unlock, as lockSurface moves the lock seed at the lock, and which a GPU write moves
+// with the lock seed (set_current_device_cache, which logs a GPU write made current while the two
+// differ); 0 for a fresh surface, as the lock seed is (read from IOSurface's x86_64 code in macOS
+// 26.7.1's KDK, 25G241, where IOAcceleratorFamily2 and IOGPUFamily import it). Referenced weakly:
+// a release whose IOSurface does not export it binds it to gOSKextUnresolved or 0, and the kext
+// then reads no unlock seed (rgfxSurfaceUnlockSeedExported).
+uint32_t rgfxIOSurfaceUnlockSeed(const OSObject *surface)
+    __asm__("__ZNK9IOSurface13getUnlockSeedEv") __attribute__((weak_import));
 // IOSurface::lockSurface(unsigned int, unsigned int*) and unlockSurface(unsigned int, unsigned
 // int*): a CPU lock of the surface, as a process's, with IOSurface's lock options
 // (kRgfxIOSurfaceLockReadOnly), the seed after it in `*seed` where not null.
@@ -121,6 +131,55 @@ IOReturn rgfxIOSurfaceLock(OSObject *surface, uint32_t options, uint32_t *seed)
 IOReturn rgfxIOSurfaceUnlock(OSObject *surface, uint32_t options, uint32_t *seed)
     __asm__("__ZN9IOSurface13unlockSurfaceEjPj");
 }
+
+// A GL window's buffers (RgfxGLUserClients.cpp), made as IOGPU makes them (read from IOGPUFamily's
+// x86_64 code in macOS 26.7.1's KDK, IOGPUSurfaceMTL::shape_buffers and its callers): createSurface
+// in the window surface's task, clientRetain, and, when the buffer goes, release_surface_async
+// alone, which takes over the reference createSurface gave and the client retain (read from
+// IOSurface's code: it holds the surface in its pending set, releases the caller's reference, and
+// lets the rest go on a thread call of its own).
+extern "C" {
+// IOSurfaceRoot::createSurface(task*, OSDictionary*): a new IOSurface of `properties` in `task`,
+// retained for the caller, or null.
+OSObject *rgfxIOSurfaceRootCreate(void *root, task_t task, OSDictionary *properties)
+    __asm__("__ZN13IOSurfaceRoot13createSurfaceEP4taskP12OSDictionary");
+// IOSurfaceRoot::release_surface_async(IOSurface*): lets go of a surface createSurface made and
+// clientRetain held.
+void rgfxIOSurfaceRootReleaseAsync(void *root, OSObject *surface)
+    __asm__("__ZN13IOSurfaceRoot21release_surface_asyncEP9IOSurface");
+// IOSurfaceRoot::copyPortNameForSurfaceInTask(task*, IOSurface*, unsigned int*): a send right
+// to `surface` in `task`, its name in `*name`, which IOSurfaceLookupFromMachPort opens there.
+IOReturn rgfxIOSurfaceRootPortName(void *root, task_t task, OSObject *surface, uint32_t *name)
+    __asm__("__ZN13IOSurfaceRoot28copyPortNameForSurfaceInTaskEP4taskP9IOSurfacePj");
+// IOSurface::clientRetain(): one client more.
+void rgfxIOSurfaceClientRetain(OSObject *surface) __asm__("__ZN9IOSurface12clientRetainEv");
+// IOSurface::setValue(char const*, OSMetaClassBase const*, unsigned int*): one of the surface's
+// values, as IOSurfaceSetValue sets it, `*error` 0 or IOSurface's error.
+IOReturn rgfxIOSurfaceSetValue(OSObject *surface, const char *key, const OSMetaClassBase *value,
+                               uint32_t *error)
+    __asm__("__ZN9IOSurface8setValueEPKcPK15OSMetaClassBasePj");
+}
+
+// The rows IOSurface lays out (RgfxSurfaceRows.hpp), as a GPU's accelerator has IOSurface lay
+// them out at its start (read from the code of IOSurface and IOAcceleratorFamily2 in macOS 26.7's
+// KDK, 25G241): IOSurfaceRoot keeps two masks, one it aligns a surface's plane offsets to and one
+// it aligns the bytes per row it works out for a surface to, each the cache line's bytes less one
+// until an accelerator ORs more bits in, and answers both to IOSurfaceGetPropertyAlignment.
+extern "C" {
+// IOSurfaceRoot::updateLimits(unsigned int, unsigned int, unsigned int, unsigned int, unsigned
+// int): ORs `planeMask` into the plane offsets' mask and `rowMask` into the bytes per row's, and
+// lowers the root's three other limits, which IOSurfaceGetPropertyMaximum answers, to
+// `bytesPerRow` (kIOSurfaceBytesPerRow's), `width` (kIOSurfaceWidth's) and `height`
+// (kIOSurfaceHeight's) where those are less (kRgfxIOSurfaceNoLimit leaves each as it is). Which
+// limit each lowers is measured: a probe kext's three distinct values read back in a macOS
+// 13.7.8 guest.
+void rgfxIOSurfaceRootUpdateLimits(void *root, uint32_t planeMask, uint32_t rowMask,
+                                   uint32_t bytesPerRow, uint32_t width, uint32_t height)
+    __asm__("__ZN13IOSurfaceRoot12updateLimitsEjjjjj");
+}
+
+// What IOSurfaceRoot starts its three other limits at, which updateLimits lowers no further.
+constexpr uint32_t kRgfxIOSurfaceNoLimit = 0x7fffffff;
 
 // IOSurface's kIOSurfaceLockReadOnly.
 constexpr uint32_t kRgfxIOSurfaceLockReadOnly = 1;

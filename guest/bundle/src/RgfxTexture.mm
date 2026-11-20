@@ -24,6 +24,7 @@
 #include <algorithm>
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 /// Maps an MTLTextureDescriptor into the wire's RgfxTextureDescriptor. Each Metal
 /// enum is carried as its raw value (the wire's convention); the four swizzle
@@ -298,9 +299,19 @@ constexpr uint64_t kRgfxUnknownUsageAnswer = MTLTextureUsageShaderRead |
                                              MTLTextureUsageRenderTarget |
                                              MTLTextureUsagePixelFormatView;
 
+// The usage bits a texture made with them leaves out of its answer: ShaderAtomic, and 0x8, which
+// the SDK names none for; every other bit it was made with it answers (measured on the M3 Max
+// under macOS 27.0.1, and the AMD 5300M and the Intel UHD 630 under 26.7.1, oracle_surftex's
+// sixth and seventh rounds: R32Uint, R32Sint and RG32Uint textures over an IOSurface of each kind
+// and over none, in Managed, Shared and Private storage, and their views, of usage 0x23 answer 0x3,
+// 0x20 answers 0, 0x29 answers 0x1, 0x8 answers 0). The wire carries the usage the descriptor
+// gave, the atomic bit among them, which the host's texture takes.
+constexpr uint64_t kRgfxUnansweredUsage = MTLTextureUsageShaderAtomic | 0x8;
+
 uint64_t rgfxAnsweredUsage(uint64_t usage)
 {
-	return usage == MTLTextureUsageUnknown ? kRgfxUnknownUsageAnswer : usage;
+	return usage == MTLTextureUsageUnknown ? kRgfxUnknownUsageAnswer
+	                                       : usage & ~kRgfxUnansweredUsage;
 }
 
 uint32_t rgfxPackSwizzle(MTLTextureSwizzleChannels sw)
@@ -515,10 +526,29 @@ uint64_t rgfxDepthStencilBytes(uint64_t f)
 
 } // namespace
 
-void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
+RgfxLinearAlignmentAnswer rgfxLinearAlignmentAnswer(MTLPixelFormat format, id<MTLDevice> device)
 {
 	const uint64_t f = format;
 	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	if (rgfxAppleGPU(device)) {
+		// The M3 Max's (oracle_bundle Apple linalign, RgfxTexture.h).
+		const bool answered =
+		    f == 1 || in(10, 14) || f == 20 || in(22, 26) || in(30, 34) || in(40, 44) ||
+		    in(53, 55) || f == 60 || in(62, 66) || in(70, 74) || f == 80 || f == 81 || f == 84 ||
+		    f == 85 || in(90, 94) || in(103, 105) || f == 110 || in(112, 116) || in(123, 125) ||
+		    f == 263 || in(300, 304) || in(313, 315) || in(323, 325) || in(500, 510) ||
+		    in(520, 530) || in(540, 548) || in(550, 556) || f == 560 || in(562, 613) ||
+		    in(615, 629);
+		if (answered)
+			return RgfxLinearAlignmentAnswer::kAnswered;
+		if (in(130, 135) || in(140, 143) || in(150, 153) || in(160, 167) || f == 170 ||
+		    f == 172 || f == 174 || f == 176 || in(178, 183) || in(185, 200) || in(203, 218) ||
+		    in(221, 236) || in(240, 241))
+			return RgfxLinearAlignmentAnswer::kCompressed;
+		if (f == 250 || f == 252 || f == 253 || f == 260 || f == 261 || f == 651 || f == 652)
+			return RgfxLinearAlignmentAnswer::kDepthStencil;
+		return RgfxLinearAlignmentAnswer::kInvalid;
+	}
 	const bool answered =
 	    f == 1 || f == 10 || in(12, 14) || f == 20 || in(22, 25) || f == 30 || in(32, 34) ||
 	    f == 43 || in(53, 55) || f == 60 || in(62, 65) || in(70, 74) || f == 80 || f == 81 ||
@@ -526,13 +556,26 @@ void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format)
 	    in(123, 125) || in(300, 304) || in(313, 315) || in(323, 325) || f == 556 || f == 586 ||
 	    f == 587 || f == 628 || f == 629;
 	if (answered)
+		return RgfxLinearAlignmentAnswer::kAnswered;
+	if (in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241))
+		return RgfxLinearAlignmentAnswer::kCompressed;
+	if (f == 250 || f == 252 || f == 253 || f == 260 || f == 261)
+		return RgfxLinearAlignmentAnswer::kDepthStencil;
+	return RgfxLinearAlignmentAnswer::kInvalid;
+}
+
+void rgfxEndAtUnalignableLinearFormat(MTLPixelFormat format, id<MTLDevice> device)
+{
+	const RgfxLinearAlignmentAnswer a = rgfxLinearAlignmentAnswer(format, device);
+	if (a == RgfxLinearAlignmentAnswer::kAnswered)
 		return;
-	const bool compressed = in(130, 135) || in(140, 143) || in(150, 153) || in(240, 241);
-	const bool depth = f == 250 || f == 252 || f == 253 || f == 260 || f == 261;
-	RgfxMetalAssertionFailed("-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
-	                         compressed ? @"Linear textures do not support compressed pixel formats"
-	                         : depth    ? @"Linear textures do not support depth/stencil pixel formats"
-	                                    : @"MTLPixelFormatInvalid is not supported on this device.");
+	RgfxMetalAssertionFailed(
+	    "-[_MTLDevice minimumLinearTextureAlignmentForPixelFormat:]",
+	    a == RgfxLinearAlignmentAnswer::kCompressed
+	        ? @"Linear textures do not support compressed pixel formats"
+	    : a == RgfxLinearAlignmentAnswer::kDepthStencil
+	        ? @"Linear textures do not support depth/stencil pixel formats"
+	        : @"MTLPixelFormatInvalid is not supported on this device.");
 }
 
 namespace {
@@ -579,6 +622,9 @@ NSString *rgfxPixelFormatName(MTLPixelFormat format)
 {
 	if (format == MTLPixelFormatInvalid)
 		return @"MTLPixelFormatInvalid";
+	// The two-plane 4:2:0 Y'CbCr format, as the texture atomics rule names it (oracle_surftex).
+	if (static_cast<uint64_t>(format) == 500)
+		return @"MTLPixelFormatYCBCR8_420_2P";
 	for (const RgfxNamedFormat &f : kTexelFormats)
 		if (f.format == format)
 			return @(f.name);
@@ -611,11 +657,13 @@ bool rgfxPasses(NSRange range, uint64_t count)
 
 void rgfxEndAtViewMetalEnds(MTLPixelFormat from, MTLTextureType fromType, uint64_t levelCount,
                             uint64_t sliceCount, MTLPixelFormat format, MTLTextureType type,
-                            NSRange levels, NSRange slices, bool subrange)
+                            NSRange levels, NSRange slices, bool subrange, id<MTLDevice> device)
 {
 	RgfxFormatBlock a = {}, b = {};
 	NSString *rule = nil;
-	if (format == MTLPixelFormatInvalid) {
+	if (format == MTLPixelFormatInvalid && rgfxAppleGPU(device)) {
+		// An Apple GPU answers nil (RgfxTexture.h), which the view's creator answers too.
+	} else if (format == MTLPixelFormatInvalid) {
 		rule = [NSString stringWithFormat:@"texture view pixelFormat (MTLPixelFormatInvalid) not "
 		                                  @"castable.\nsource texture pixelFormat (%@) not "
 		                                  @"compatible with texture view pixelFormat "
@@ -684,12 +732,64 @@ uint64_t rgfxMaxLevels(uint64_t width, uint64_t height, uint64_t depth)
 
 } // namespace
 
+namespace {
+
+// The compressed formats an Apple GPU has beyond BC: PVRTC, EAC and ETC2, and ASTC (sRGB, LDR and
+// HDR), each of which the M3 Max makes (oracle_texdesc device, fmt.pvrtc, fmt.eac, fmt.etc2 and
+// fmt.astc4x4).
+bool rgfxAppleCompressedFormat(uint64_t f)
+{
+	auto in = [f](uint64_t lo, uint64_t hi) { return f >= lo && f <= hi; };
+	return in(160, 167) || f == 170 || f == 172 || f == 174 || f == 176 || in(178, 183) ||
+	       in(186, 190) || in(192, 200) || in(204, 208) || in(210, 218) || in(222, 226) ||
+	       in(228, 236);
+}
+
+} // namespace
+
+bool rgfxAppleGPU(id<MTLDevice> device)
+{
+#if defined(__arm64__)
+	if ([device respondsToSelector:@selector(rgfxAppleRules)] &&
+	    [(id<RgfxAppleRulesDevice>)device rgfxAppleRules])
+		return true;
+#endif
+	return device != nil && [device respondsToSelector:@selector(supportsFamily:)] &&
+	       [device supportsFamily:MTLGPUFamilyApple7];
+}
+
+bool rgfxBlockCompressedFormat(uint64_t format, id<MTLDevice> device)
+{
+	return (format >= 130 && format <= 135) || (format >= 140 && format <= 143) ||
+	       (format >= 150 && format <= 153) ||
+	       (rgfxAppleGPU(device) && rgfxAppleCompressedFormat(format));
+}
+
+bool rgfxDeviceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device,
+                                bool overBuffer)
+{
+	if (descriptor == nil || !rgfxAppleGPU(device))
+		return false;
+	const uint64_t format = descriptor.pixelFormat;
+	const bool xr10 = format == 550 || format == 551; // made but over a buffer (RgfxTexture.h)
+	return (rgfxTwoPlaneFormat(format) && (overBuffer || !xr10)) || format == 263;
+}
+
 // Metal's descriptor validation, `-[MTLTextureDescriptorInternal validateWithDevice:]`, which
 // every texture creator runs first: one assertion listing every rule the descriptor breaks, a line
-// each, in the order the x86 Macs list them. Measured on the AMD 5300M and the Intel 630 under
-// macOS 26.7.1, alike at the device's, a Private heap's and a Shared buffer's creators
-// (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases; the two differ
-// only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the lane does.
+// each, in the order the x86 Macs list them. Where `device` is an Apple GPU (rgfxAppleGPU), the
+// rules are the M3 Max's under macOS 27.0.1, which lists the rules it shares with the x86 Macs in
+// their words and order (oracle_texdesc, 11-09, every case but the 2 GiB and larger ones at the
+// device's, a Private heap's and a Shared buffer's creators): it has every format the x86 Macs
+// lack but Invalid, Depth24Unorm_Stencil8 and X24_Stencil8 (two-plane formats and Unspecialized
+// pass, and the creators answer nil for them but the XR10 ones, rgfxDeviceMakesNoTextureOf); it
+// makes multisample BGR5A1Unorm and RGB9E5Float textures, depth, stencil and multisample textures
+// in Shared and Managed storage, and Memoryless ones; and its compressed formats, which the type
+// and multisample rules take as the BC ones, include PVRTC, EAC, ETC2 and ASTC. Measured on the AMD
+// 5300M and the Intel 630 under macOS 26.7.1, alike at the device's, a Private heap's and a Shared
+// buffer's creators (oracle_texdesc), over an IOSurface (oracle_surftex, Q20) and in Q12's cases;
+// the two differ only in Depth24Unorm_Stencil8 and X24_Stencil8, which the Intel GPU lacks, as the
+// lane does.
 // Where the x86 Macs and the M3 Max differ (a format the x86 Macs lack, which they name by number
 // and the M3 by name), these are the x86 Macs' words. A sample count of a multisample texture is
 // checked against `device` where it answers supportsTextureSampleCount:, else against the counts
@@ -713,6 +813,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 		abort();
 	}
 	NSString *typeName = rgfxTextureTypeName(type);
+	const bool apple = rgfxAppleGPU(device);
 	const bool oneD = type == MTLTextureType1D || type == MTLTextureType1DArray;
 	const bool threeD = type == MTLTextureType3D;
 	const bool cube = type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray;
@@ -722,22 +823,31 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	                     type == MTLTextureTypeCubeArray ||
 	                     type == MTLTextureType2DMultisampleArray;
 	// A format the device lacks, which the x86 Macs name MTLPixelFormatInvalid: Invalid itself,
-	// the three-channel formats (Q12), and every two-plane format (Q13).
+	// the three-channel formats (Q12), and every two-plane format (Q13). An Apple GPU lacks
+	// Invalid, Depth24Unorm_Stencil8 and X24_Stencil8 alone of those the x86 Macs lack (the
+	// three-channel formats, which the M3 was not asked, are kept).
 	const bool threeChannel = (format >= 45 && format <= 48) ||
 	                          (format >= 95 && format <= 100) || (format >= 120 && format <= 122);
-	const bool lacked = format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) ||
-	                    rgfxTwoPlaneFormat(format) || threeChannel;
+	const bool lacked =
+	    apple ? format == MTLPixelFormatInvalid || format == MTLPixelFormatDepth24Unorm_Stencil8 ||
+	                format == MTLPixelFormatX24_Stencil8 || threeChannel
+	          : format == MTLPixelFormatInvalid || rgfxDeviceLacks(format) ||
+	                rgfxTwoPlaneFormat(format) || threeChannel;
 	const bool subsampled = format == MTLPixelFormatGBGR422 || format == MTLPixelFormatBGRG422;
-	// The compressed formats the device has (BC1 to BC7), and the 4:2:2 ones, which Metal counts
-	// among them.
-	const bool compressed = !lacked && ((format >= 130 && format <= 135) ||
-	                                    (format >= 140 && format <= 143) ||
-	                                    (format >= 150 && format <= 153) || subsampled);
+	// The compressed formats the device has (BC1 to BC7, and on an Apple GPU PVRTC, EAC, ETC2 and
+	// ASTC), and the 4:2:2 ones, which Metal counts among them.
+	const bool compressed =
+	    !lacked && ((format >= 130 && format <= 135) || (format >= 140 && format <= 143) ||
+	                (format >= 150 && format <= 153) || subsampled ||
+	                (apple && rgfxAppleCompressedFormat(format)));
 	const bool depthOrStencil = !lacked && rgfxDepthStencilBytes(format) != 0;
-	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides; one
-	// row for the 1D types and a texture buffer, one slice for every type but 3D, one element for
-	// every type but the arrays, 2048 elements for an array).
-	const uint64_t maxWidth = threeD ? 2048 : 16384;
+	// The largest side each type takes (measured: 16384 wide, 2048 for a 3D texture's sides, and
+	// a texture buffer 268435456 (2^28) elements wide, of any format, kRgfxMaxTextureBufferWidth;
+	// one row for the 1D types and a texture buffer, one slice for every type but 3D, one element
+	// for every type but the arrays, 2048 elements for an array).
+	const uint64_t maxWidth = threeD                               ? 2048
+	                          : type == MTLTextureTypeTextureBuffer ? kRgfxMaxTextureBufferWidth
+	                                                                : 16384;
 	const uint64_t maxHeight =
 	    (oneD || type == MTLTextureTypeTextureBuffer) ? 1 : threeD ? 2048 : 16384;
 	const uint64_t maxDepth = threeD ? 2048 : 1;
@@ -755,6 +865,35 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	side("height", height, maxHeight);
 	side("depth", depth, maxDepth);
 	side("arrayLength", arrayLength, maxArray);
+	// The usage bits Metal names none for, but 0x8, which it takes and leaves out of the
+	// texture's answer (rgfxAnsweredUsage), and 0x4000, 0x8000 and 0x10000, which it takes and
+	// answers: each other bit, every bit from 0x40 to 0x2000 and from 0x20000 up, ends the process,
+	// the bits named in one line (measured on the M3 Max under macOS 27.0.1, the AMD 5300M and the
+	// Intel UHD 630 under 26.7.1, oracle_surftex's sixth and seventh rounds, over an IOSurface and
+	// over none: 0x40, 0x80, 0x100, 0x200 to 0x2000 and 0x20000 to 0x100000 each, 0x1000000,
+	// 0x80000000, and 0x1c0 at once), in a line before the atomic bit's.
+	constexpr uint64_t kKnownUsage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite |
+	                                 MTLTextureUsageRenderTarget | 0x8 |
+	                                 MTLTextureUsagePixelFormatView |
+	                                 MTLTextureUsageShaderAtomic | 0x4000 | 0x8000 | 0x10000;
+	if ((usage & ~kKnownUsage) != 0)
+		[rules appendFormat:@"MTLTextureUsage has unknown bits 0x%llx.\n",
+		                    ull(usage & ~kKnownUsage)];
+	// ShaderAtomic takes R32Uint and R32Sint, and on an Apple GPU RG32Uint; any other format ends
+	// the process, the x86 Macs naming RG32Uint in words of its own, after the unknown bits and
+	// before a format the device lacks (measured as above: BGRA8Unorm, R32Float, RGBA8Uint,
+	// R8Uint, R16Uint, RG32Sint, RGBA32Uint and the two-plane format 500, over an IOSurface and
+	// over none).
+	const bool atomicFormat = format == MTLPixelFormatR32Uint || format == MTLPixelFormatR32Sint ||
+	                          (apple && format == MTLPixelFormatRG32Uint);
+	if ((usage & MTLTextureUsageShaderAtomic) != 0 && !atomicFormat) {
+		if (format == MTLPixelFormatRG32Uint)
+			[rules appendString:@"This device does not support ulong texture atomics, so "
+			                    @"MTLPixelFormatRG32Uint cannot be used with texture atomics\n"];
+		else
+			[rules appendFormat:@"%@ is not a valid format to be used with texture atomics.\n",
+			                    rgfxPixelFormatName(static_cast<MTLPixelFormat>(format))];
+	}
 	if (lacked)
 		[rules appendFormat:@"MTLTextureDescriptor has invalid pixelFormat (%llu).\n", ull(format)];
 	if (oneD && height != 1)
@@ -799,9 +938,9 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	const char *noMultisample = nullptr;
 	if (lacked)
 		noMultisample = "MTLPixelFormatInvalid";
-	else if (format == MTLPixelFormatBGR5A1Unorm)
+	else if (format == MTLPixelFormatBGR5A1Unorm && !apple)
 		noMultisample = "MTLPixelFormatBGR5A1Unorm";
-	else if (format == MTLPixelFormatRGB9E5Float)
+	else if (format == MTLPixelFormatRGB9E5Float && !apple)
 		noMultisample = "MTLPixelFormatRGB9E5Float";
 	else if (compressed)
 		for (const RgfxNamedFormat &f : kNoMultisample)
@@ -848,8 +987,9 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	if (subsampled && width % 2 != 0)
 		[rules appendString:@"MTLTextureDescriptor: MTLPixelFormat422 requires even width.\n"];
 	// The x86 Macs keep depth, stencil and multisample textures Private (oracle_bundle
-	// buftex.depth and devtex.*), and have no memoryless storage (Q5).
-	const bool cpuStorage = storage == MTLStorageModeShared || storage == MTLStorageModeManaged;
+	// buftex.depth and devtex.*), and have no memoryless storage (Q5); an Apple GPU makes each.
+	const bool cpuStorage =
+	    !apple && (storage == MTLStorageModeShared || storage == MTLStorageModeManaged);
 	if (depthOrStencil && cpuStorage)
 		[rules appendString:@"MTLTextureDescriptor: Depth, Stencil, DepthStencil textures cannot be "
 		                    @"allocated with MTLStorageModeShared or MTLStorageModeManaged on this "
@@ -857,7 +997,7 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 	if (multisample && cpuStorage)
 		[rules appendString:@"MTLTextureDescriptor: Multisample textures cannot be allocated with "
 		                    @"MTLStorageModeShared or MTLStorageModeManaged on this device.\n"];
-	if (storage == MTLStorageModeMemoryless)
+	if (storage == MTLStorageModeMemoryless && !apple)
 		[rules appendString:@"MTLTextureDescriptor: MTLResourceStorageModeMemoryless is not a "
 		                    @"supported storage mode on this device.\n"];
 	// A storage mode Metal has no name for, a line the x86 Macs give twice.
@@ -867,18 +1007,35 @@ void rgfxEndAtInvalidTextureDescriptor(MTLTextureDescriptor *descriptor, id<MTLD
 			                    @"MTLStorageModeManaged(1) MTLStorageModeMemoryless(3) "
 			                    @"MTLStorageModePrivate(2)\n",
 			                    ull(storage)];
-	// A usage bit Metal does not know: 0x80, the one measured (other bits past the SDK's may be
-	// the system's own, so they pass).
-	if ((usage & 0x80) != 0)
-		[rules appendString:@"MTLTextureUsage has unknown bits 0x80.\n"];
-	if (rules.length > 0)
+	if (rules.length > 0) {
+		// The descriptor, in the unified log, for the process's death the guest's log keeps.
+		// compressionType reached MTLTextureDescriptor in macOS 12.5. Asked by selector, as
+		// RgfxTexture's initializer asks: @available would link compiler-rt's version check,
+		// which opens a file (bundle_files_check.sh).
+		long long compression = -1;
+		if ([descriptor respondsToSelector:@selector(compressionType)])
+			compression = static_cast<long long>(descriptor.compressionType);
+		NSLog(@"RGFX: texture descriptor of format %llu, type %llu, %llux%llux%llu, %llu slices, "
+		      @"%llu levels, %llu samples, usage 0x%llx, storage %llu, CPU cache %llu, hazard "
+		      @"tracking %llu, options 0x%llx, GPU-optimized %d, compression %lld, on %s rules",
+		      ull(format), ull(type), ull(width), ull(height), ull(depth), ull(arrayLength),
+		      ull(levels), ull(samples), ull(usage), ull(storage), ull(descriptor.cpuCacheMode),
+		      ull(descriptor.hazardTrackingMode), ull(descriptor.resourceOptions),
+		      descriptor.allowGPUOptimizedContents ? 1 : 0, compression,
+		      apple ? "an Apple GPU's" : "the x86 Macs'");
 		RgfxMetalAssertionFailed("-[MTLTextureDescriptorInternal validateWithDevice:]",
 		                         [@"Texture Descriptor Validation\n" stringByAppendingString:rules]);
+	}
 }
 
-void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode)
+void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMode heapMode,
+                                  id<MTLDevice> device)
 {
 	if (descriptor == nil || descriptor.storageMode == heapMode)
+		return;
+	// An Apple GPU makes a Memoryless texture in a Private heap (the M3 Max under macOS 27.0.1,
+	// oracle_texdesc heap memoryless).
+	if (descriptor.storageMode == MTLStorageModeMemoryless && rgfxAppleGPU(device))
 		return;
 	RgfxMetalAssertionFailed(
 	    "-[MTLIOAccelHeap newSubResourceWithLength:alignment:options:offset:]",
@@ -886,6 +1043,19 @@ void rgfxEndAtHeapStorageMismatch(MTLTextureDescriptor *descriptor, MTLStorageMo
 	                               @"heap's mode (%s)",
 	                               rgfxStorageModeName(descriptor.storageMode),
 	                               rgfxStorageModeName(heapMode)]);
+}
+
+void rgfxEndAtLinearDepthStencil(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil || rgfxDepthStencilBytes(descriptor.pixelFormat) == 0 ||
+	    !rgfxAppleGPU(device))
+		return;
+	RgfxMetalAssertionFailed(
+	    "_mtlValidateStrideTextureParameters",
+	    [NSString stringWithFormat:@"Texture Descriptor Validation\nLinear texture: cannot create "
+	                               @"compressed, depth, or stencil textures, pixelFormat (%@) "
+	                               @"disallowed\n",
+	                               rgfxPixelFormatName(descriptor.pixelFormat)]);
 }
 
 // Metal checks a texture over a surface in three steps, each its own assertion, and lists every
@@ -903,9 +1073,15 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 	const uint64_t levels = descriptor.mipmapLevelCount;
 	auto ull = [](uint64_t n) { return static_cast<unsigned long long>(n); };
 	// A surface with planes passes the rest, a plane past its planes answering nil
-	// (RgfxIOSurfaceTexture).
-	if (IOSurfaceGetPlaneCount(surface) != 0)
+	// (RgfxIOSurfaceTexture), but for an Apple GPU's cubes over a plane (RgfxTexture.h).
+	if (IOSurfaceGetPlaneCount(surface) != 0) {
+		if (rgfxAppleGPU(device) && plane < IOSurfaceGetPlaneCount(surface) &&
+		    (type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray))
+			RgfxMetalAssertionFailed("-[IOGPUMetalTexture initWithDevice:descriptor:iosurface:plane:"
+			                         "field:args:argsSize:]",
+			                         @"carriesComplexTexture || numFaces == 1");
 		return;
+	}
 	// The texture's rows against the surface's: a format of one texel a block in this step, a
 	// compressed or 4:2:2 one, in its blocks, in the last.
 	const uint64_t bytesPerRow = IOSurfaceGetBytesPerRow(surface);
@@ -957,15 +1133,54 @@ void rgfxEndAtInvalidSurfaceTexture(MTLTextureDescriptor *descriptor, IOSurfaceR
 		RgfxMetalAssertionFailed(init, @"Descriptor height*arrayLength > IOSurface height");
 }
 
+namespace {
+
+// The two-plane formats of 4:2:0 and 4:2:2 chroma: rgfxTwoPlaneFormat's but the 4:4:4 ones (503,
+// 507, 510, 523, 527, 530, 542 and 545) and the XR10 ones.
+bool rgfxSubsampledTwoPlaneFormat(uint64_t f)
+{
+	switch (f) {
+	case 500: case 502: case 505: case 506: case 508: case 509: case 520: case 522: case 525:
+	case 526: case 528: case 529: case 540: case 541: case 543: case 544:
+		return true;
+	default:
+		return false;
+	}
+}
+
+} // namespace
+
+bool rgfxSurfaceMakesNoTextureOf(MTLTextureDescriptor *descriptor, id<MTLDevice> device)
+{
+	if (descriptor == nil || !rgfxAppleGPU(device))
+		return false;
+	const uint64_t format = descriptor.pixelFormat;
+	if (rgfxBlockCompressedFormat(format, device))
+		return true;
+	const bool odd = (descriptor.width % 2) != 0 || (descriptor.height % 2) != 0;
+	const bool written =
+	    (descriptor.usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) != 0;
+	return rgfxSubsampledTwoPlaneFormat(format) && odd && written;
+}
+
 @interface RgfxTexture () <RgfxMetalTextureInternals>
 @end
 
 namespace {
-// The bytes a texture of shape `d` of memory of its own takes, which its allocatedSize answers:
-// every level of every slice and sample, in its format's blocks (0 for a format not sized here).
+// The bytes a texel of RGB10A8_2P_XR10 or its sRGB twin (550, 551) takes in the texture's memory:
+// its colour's 32-bit word in the first plane and its alpha's byte in the second, both planes at
+// the texture's size (RgfxTexture.h). rgfxBlockShapeOf leaves the two unsized, as no CPU copy of
+// one is made.
+constexpr uint32_t kRgfxXR10TwoPlaneTexelBytes = 4 + 1;
+
+// The bytes a texture of shape `d` of memory of its own takes, which its allocatedSize answers
+// and its GPU address range holds: every level of every slice and sample, in its format's blocks,
+// and for a two-plane XR10 format both planes (0 for a format not sized here).
 uint64_t rgfxTextureBytes(const RgfxTextureDescriptor &d)
 {
 	RgfxBlockShape b = rgfxBlockShapeOf(static_cast<MTLPixelFormat>(d.pixel_format));
+	if (d.pixel_format == 550 || d.pixel_format == 551)
+		b = {kRgfxXR10TwoPlaneTexelBytes, 1, 1};
 	uint64_t slices = d.array_length ? d.array_length : 1;
 	if (d.texture_type == MTLTextureTypeCube || d.texture_type == MTLTextureTypeCubeArray) {
 		slices *= 6;
@@ -982,6 +1197,11 @@ uint64_t rgfxTextureBytes(const RgfxTextureDescriptor &d)
 	return total * slices * samples;
 }
 } // namespace
+
+bool rgfxTexturePastLength(MTLTextureDescriptor *d, uint64_t maxLength)
+{
+	return maxLength != 0 && rgfxTextureBytes(rgfxTextureDescriptorFromMTL(d)) > maxLength;
+}
 
 @implementation RgfxTexture {
 	RgfxTextureDescriptor _desc; // the mapped shape the getters answer from
@@ -1162,6 +1382,10 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	                                         serializer:serializer];
 	if (t != nil) {
 		t->_buffer = buffer;
+		// Its texels are the buffer's bytes: the buffers in flight that name either count for
+		// both (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
+		if (RgfxIsResource(buffer))
+			t->_rgfxInFlightAt = ((RgfxResource *)buffer)->_rgfxInFlightAt;
 		t->_bufferOffset = offset;
 		t->_bufferBytesPerRow = bytesPerRow;
 		[t rgfxTakeDescriptor:descriptor];
@@ -1172,12 +1396,6 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 - (id<MTLBuffer>)buffer
 {
 	return _parent != nil ? _parent.buffer : _buffer;
-}
-
-- (BOOL)rgfxOverOneCopy
-{
-	id<MTLBuffer> buffer = self.buffer;
-	return [buffer isKindOfClass:[RgfxBuffer class]] && [(RgfxBuffer *)buffer rgfxOneCopy];
 }
 
 // The bytes the texture takes: its buffer's, for one made over a buffer (measured on the M3 Max
@@ -1264,7 +1482,10 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		return;
 	}
 	_allowGPUOptimizedContents = descriptor.allowGPUOptimizedContents;
-	_compressionType = descriptor.compressionType;
+	// compressionType reached MTLTextureDescriptor in macOS 12.5; before it, the default lossless
+	// (set in init) stands, as the descriptor carries no other value there.
+	if ([descriptor respondsToSelector:@selector(compressionType)])
+		_compressionType = descriptor.compressionType;
 	_framebufferOnly = [descriptor respondsToSelector:@selector(framebufferOnly)] &&
 	                   [(id<RgfxMetalTextureDescriptor>)descriptor framebufferOnly];
 }
@@ -1336,6 +1557,13 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 - (MTLTextureUsage)usage
 {
 	return static_cast<MTLTextureUsage>(rgfxAnsweredUsage(_desc.usage));
+}
+
+- (uint32_t)swizzleKey
+{
+	const MTLTextureSwizzleChannels s = self.swizzle;
+	return static_cast<uint32_t>(s.red) | static_cast<uint32_t>(s.green) << 8 |
+	       static_cast<uint32_t>(s.blue) << 16 | static_cast<uint32_t>(s.alpha) << 24;
 }
 
 - (MTLTextureSwizzleChannels)swizzle
@@ -1418,7 +1646,8 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // Metal ends the process at a view it does not make (a failed assertion: levels or slices
 // outside the texture, a type of another family, a format of another class), and answers nil
 // for one in no format on the M3 Max. The bundle ends the process where the AMD 5300M and the
-// Intel 630 measurably do (rgfxEndAtViewMetalEnds), and answers nil, sending nothing, for the
+// Intel 630 measurably do, and on an Apple GPU where the M3 Max does (rgfxEndAtViewMetalEnds),
+// and answers nil, sending nothing, for the
 // others it can tell from the texture (rgfxView...); the host refuses any other its platform does
 // not make. It answers nil too for a view of more than one slice of a 2D array over a buffer,
 // which Metal asserts at on the M3 Max and an M4 (`sliceRange.length == 1`: read from
@@ -1440,7 +1669,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	const uint64_t parentLevels = self.mipmapLevelCount;
 	const uint64_t parentSlices = rgfxSlicesOf(parentType, self.arrayLength);
 	rgfxEndAtViewMetalEnds(self.pixelFormat, parentType, parentLevels, parentSlices, format, type,
-	                       levels, slices, subrange);
+	                       levels, slices, subrange, self.device);
 	RgfxViewRefusal refusal = kViews;
 	if (format == MTLPixelFormatInvalid) {
 		refusal = kNoFormat;
@@ -1532,6 +1761,9 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	                                            serializer:_serializer];
 	if (view != nil) {
 		view->_parent = self;
+		// Its texels are its texture's: the buffers in flight that name either count for both
+		// (RGFX_RESOURCE_SPI's isComplete and waitUntilComplete).
+		view->_rgfxInFlightAt = _rgfxInFlightAt;
 		// A view of a texture over an IOSurface writes and reads the surface's texels.
 		view->_rgfxSurfaceRoot = _rgfxSurfaceRoot;
 		view->_parentLevel = static_cast<NSUInteger>(base);
@@ -1936,6 +2168,13 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	return _parent != nil ? _parent.iosurface : nullptr;
 }
 
+// A texture over an IOSurface, or a view of one, goes from the host at once: a present of the
+// surface shows the newest live texture the host names it by, waiting for its destroy.
+- (BOOL)rgfxDestroysAtOnce
+{
+	return self.iosurface != nullptr;
+}
+
 - (NSUInteger)iosurfacePlane
 {
 	return _parent != nil ? _parent.iosurfacePlane : 0;
@@ -1953,6 +2192,24 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // the buffer's bytes, where its rows lie; any other (a Shared texture, or a Managed one with no
 // CPU copy) is copied through a staging buffer of the region's rows, by a blit the call waits
 // for, so the GPU's later work sees what was written and the bytes read are the GPU's.
+//
+// The bytes of a texture over a buffer past the buffer's length are copied so too: the host's
+// platform keeps them in a tail of the texture's own, which every GPU path reads and writes
+// (metal2vulkan's linear_plan.rs, "Length"), and the guest's memory past the buffer is another
+// allocation's, or none. Metal's CPU and GPU paths agree on those bytes inside the buffer's
+// allocation, the length rounded up to its pages (the Intel 630 and the AMD 5300M under macOS
+// 26.7.1, 4 KiB pages) or to the M3 Max's 16 KiB granule, a small buffer's 128 KiB pool, or a
+// heap's size (macOS 27.0.1): getBytes: reads what a kernel or a blit wrote there, and a kernel
+// reads what replaceRegion: wrote. Past the allocation the x86 Macs' paths part: the CPU's
+// reach the next allocation of the process's memory, or fault at a mapping's end, while the
+// GPU's reach memory of their own (zero or older words on the AMD, a page every process shares
+// on the Intel), and the AMD's blits of a 2D texture there fail (`oracle_pastlen DEVICE paths`,
+// docs/graphics-kext/dgpu-oracle.md, Q11). The device keeps the M3's one memory everywhere past
+// the length, at the cost of a blit the call waits for, for the bytes past the length alone.
+// A no-copy buffer's bytes past its length are the app's own memory, which Metal's CPU paths
+// reach in place on all three, each dying of SIGBUS where the app's mapping ends: the bundle
+// copies them in place too, so a copy past the mapping's end faults as Metal's does, while the
+// GPU's paths there use the host's tail.
 //
 // Over a Managed buffer, Metal's replaceRegion: reaches the GPU's next read of the texture with
 // no didModifyRange: of the app's (measured on the AMD 5300M, whose Managed buffers are two
@@ -1975,6 +2232,79 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 	const RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
 	const uint64_t rows = (std::max<uint64_t>(1, _desc.height) + b.height - 1) / b.height;
 	return (_bufferBytesPerRow * rows + 127) / 128 * 128;
+}
+
+// Copies `region` (of shape `shape`) of `level` and `slice` between the texture and the
+// caller's `caller`, rows `bytesPerRow` apart and images `imageBytes` apart, through a staging
+// buffer of the region's rows, packed, by a blit on the device's copy queue that the call waits
+// for: out of the texture when `toBytes`, else into it. NO where no staging buffer or command
+// buffer is made or the device fails the blit, each logged once, having copied nothing out.
+- (BOOL)rgfxCopyRegionByBlit:(MTLRegion)region
+                 mipmapLevel:(NSUInteger)level
+                       slice:(NSUInteger)slice
+                       shape:(RgfxCopyShape)shape
+                       bytes:(uint8_t *)caller
+                 bytesPerRow:(uint64_t)bytesPerRow
+                  imageBytes:(uint64_t)imageBytes
+                     toBytes:(BOOL)toBytes
+{
+	auto copyRows = [&](uint8_t *dst, uint64_t dstRow, uint64_t dstImage, const uint8_t *src,
+	                    uint64_t srcRow, uint64_t srcImage) {
+		for (uint64_t z = 0; z < shape.images; z++) {
+			for (uint64_t r = 0; r < shape.rows; r++) {
+				std::memcpy(dst + z * dstImage + r * dstRow, src + z * srcImage + r * srcRow,
+				            shape.rowBytes);
+			}
+		}
+	};
+	id<MTLDevice> device = self.device;
+	id<MTLCommandQueue> queue = rgfxCopyQueue(device);
+	uint64_t stageImage = shape.rowBytes * shape.rows;
+	id<MTLBuffer> stage = [device newBufferWithLength:stageImage * shape.images
+	                                          options:MTLResourceStorageModeShared];
+	uint8_t *staged = static_cast<uint8_t *>([stage contents]);
+	id<MTLCommandBuffer> cb = [queue commandBuffer];
+	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+	if (staged == nullptr || blit == nil) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"no staging buffer or command buffer for a CPU copy", self);
+		[blit endEncoding];
+		return NO;
+	}
+	if (toBytes) {
+		[blit copyFromTexture:self
+		                 sourceSlice:slice
+		                 sourceLevel:level
+		                sourceOrigin:region.origin
+		                  sourceSize:region.size
+		                    toBuffer:stage
+		           destinationOffset:0
+		      destinationBytesPerRow:shape.rowBytes
+		    destinationBytesPerImage:stageImage];
+	} else {
+		copyRows(staged, shape.rowBytes, stageImage, caller, bytesPerRow, imageBytes);
+		[blit copyFromBuffer:stage
+		           sourceOffset:0
+		      sourceBytesPerRow:shape.rowBytes
+		    sourceBytesPerImage:stageImage
+		             sourceSize:region.size
+		              toTexture:self
+		       destinationSlice:slice
+		       destinationLevel:level
+		      destinationOrigin:region.origin];
+	}
+	[blit endEncoding];
+	[cb commit];
+	[cb waitUntilCompleted];
+	if (cb.status != MTLCommandBufferStatusCompleted) {
+		static std::atomic<bool> logged{false};
+		rgfxNoteCopyRefused(logged, @"the device failed a CPU copy's blit", self);
+		return NO;
+	}
+	if (toBytes) {
+		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
+	}
+	return YES;
 }
 
 // Copies `region` of `level` and `slice` between the texture and the caller's `bytes`, rows
@@ -2008,96 +2338,123 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 		rgfxNoteCopyRefused(logged, @"a CPU copy past the texture or with rows too short", self);
 		return;
 	}
-	auto copyRows = [&](uint8_t *dst, uint64_t dstRow, uint64_t dstImage, const uint8_t *src,
-	                    uint64_t srcRow, uint64_t srcImage) {
-		for (uint64_t z = 0; z < shape.images; z++) {
-			for (uint64_t r = 0; r < shape.rows; r++) {
-				std::memcpy(dst + z * dstImage + r * dstRow, src + z * srcImage + r * srcRow,
-				            shape.rowBytes);
-			}
-		}
-	};
 	uint8_t *caller = static_cast<uint8_t *>(bytes);
 
-	if (_buffer != nil) {
-		// Its one level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a 2D
-		// array (the linear form's) rgfxBufferSlicePitch after the one before.
+	if (_buffer != nil && level == 0) {
+		// Its first level lies in the buffer, rows _bufferBytesPerRow apart, and each slice of a
+		// 2D array (the linear form's) rgfxBufferSlicePitch after the one before; the CPU reaches
+		// a tiled texture's level 0 there too, not in the device's copy. A tiled texture's other
+		// levels are the device's copy's, which a blit reaches (below).
 		uint8_t *contents = static_cast<uint8_t *>([_buffer contents]);
 		RgfxBlockShape b = rgfxBlockShapeOf(self.pixelFormat);
 		const uint64_t slices =
 		    rgfxSlicesOf(static_cast<MTLTextureType>(_desc.texture_type), _desc.array_length);
-		if (contents == nullptr || level != 0 || slice >= slices || shape.images != 1) {
+		if (contents == nullptr || slice >= slices || shape.images != 1) {
 			static std::atomic<bool> logged{false};
 			rgfxNoteCopyRefused(logged, @"a CPU copy of a texture over a buffer it cannot reach",
 			                    self);
 			return;
 		}
-		uint8_t *at = contents + _bufferOffset + slice * [self rgfxBufferSlicePitch] +
-		              region.origin.y / b.height * _bufferBytesPerRow +
-		              region.origin.x / b.width * b.bytes;
-		if (toBytes) {
-			copyRows(caller, bytesPerRow, imageBytes, at, _bufferBytesPerRow, 0);
-		} else {
-			copyRows(at, _bufferBytesPerRow, 0, caller, bytesPerRow, imageBytes);
-			// The rows' span, from the first row's first byte written to the last row's last,
-			// told as the buffer's didModifyRange: tells it: a Managed buffer's GPU copy takes
-			// it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the app's bytes),
-			// and a Shared buffer's posts nothing.
-			const uint64_t first = static_cast<uint64_t>(at - contents);
-			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
-			[_buffer didModifyRange:NSMakeRange(first, span)];
+		// The region's first byte in the buffer, and each row's bytes there that lie inside the
+		// buffer's length, which the CPU copies in place, every byte of a no-copy buffer's among
+		// them (above). Rows from `past` on run past the length; their bytes past it are the
+		// host's tail's, which a blit reaches (above). Every row after the first of those lies
+		// wholly past the length, as rows are no closer together than their bytes.
+		const uint64_t first = _bufferOffset + slice * [self rgfxBufferSlicePitch] +
+		                       region.origin.y / b.height * _bufferBytesPerRow +
+		                       region.origin.x / b.width * b.bytes;
+		const uint64_t length = [_buffer length];
+		const bool overCaller = [_buffer isKindOfClass:[RgfxBuffer class]] &&
+		                        [(RgfxBuffer *)_buffer rgfxOverCallerBytes];
+		auto inside = [&](uint64_t r) -> uint64_t {
+			const uint64_t start = first + r * _bufferBytesPerRow;
+			if (overCaller)
+				return shape.rowBytes;
+			return start >= length ? 0 : std::min<uint64_t>(shape.rowBytes, length - start);
+		};
+		uint64_t past = 0;
+		while (past < shape.rows && inside(past) == shape.rowBytes)
+			past++;
+		for (uint64_t r = 0; r < shape.rows; r++) {
+			const uint64_t n = inside(r);
+			if (n == 0)
+				break;
+			uint8_t *in = contents + first + r * _bufferBytesPerRow;
+			if (toBytes)
+				std::memcpy(caller + r * bytesPerRow, in, n);
+			else
+				std::memcpy(in, caller + r * bytesPerRow, n);
 		}
+		if (!toBytes && first < length) {
+			// The rows' span inside the length, from the first row's first byte written to the
+			// last row's last, told as the buffer's didModifyRange: tells it: a Managed buffer's
+			// GPU copy takes it (BUFFER_DID_MODIFY_RANGE, a no-copy one's block first taking the
+			// app's bytes), and a Shared buffer's posts nothing. The host refuses a range past
+			// the buffer whole, which would keep the bytes inside the length from the GPU's copy
+			// too.
+			const uint64_t span = (shape.rows - 1) * _bufferBytesPerRow + shape.rowBytes;
+			[_buffer didModifyRange:NSMakeRange(first, std::min(span, length - first))];
+		}
+		if (past < shape.rows) {
+			// The rows from `past` on, by a blit of the texture: in the host's tail past the
+			// length, and over the buffer's bytes inside it, which the in-place copy above read
+			// or wrote alike.
+			MTLRegion rest = region;
+			rest.origin.y += past * b.height;
+			rest.size.height -= std::min<NSUInteger>(rest.size.height, past * b.height);
+			RgfxCopyShape restShape = shape;
+			restShape.rows = shape.rows - past;
+			uint8_t *restBytes = caller + past * bytesPerRow;
+			if (!toBytes) {
+				(void)[self rgfxCopyRegionByBlit:rest
+				                     mipmapLevel:level
+				                           slice:slice
+				                           shape:restShape
+				                           bytes:restBytes
+				                     bytesPerRow:bytesPerRow
+				                      imageBytes:imageBytes
+				                         toBytes:NO];
+			} else {
+				// Read into a copy of the rows, of which the bytes past the length alone are
+				// taken: those inside it stay as the CPU read them in place, a Managed buffer's
+				// CPU copy's.
+				std::vector<uint8_t> read(restShape.rows * shape.rowBytes);
+				if ([self rgfxCopyRegionByBlit:rest
+				                   mipmapLevel:level
+				                         slice:slice
+				                         shape:restShape
+				                         bytes:read.data()
+				                   bytesPerRow:shape.rowBytes
+				                    imageBytes:read.size()
+				                       toBytes:YES]) {
+					for (uint64_t r = past; r < shape.rows; r++) {
+						const uint64_t n = inside(r);
+						std::memcpy(caller + r * bytesPerRow + n,
+						            read.data() + (r - past) * shape.rowBytes + n,
+						            shape.rowBytes - n);
+					}
+				}
+			}
+		}
+		// A tiled texture's copy of the bytes takes them again at its next use, as after its
+		// didModifyData (didModifyData, below): Metal's getBytes: and replaceRegion: of a tiled
+		// texture's level 0 read and write the buffer's bytes, not the copy, and the next GPU
+		// use after a replaceRegion: of level 0 reads every level made from the new bytes,
+		// where a CPU write of the bytes alone is not taken (measured on the AMD 5300M and the
+		// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11).
+		if (!toBytes && _desc.mipmap_level_count > 1 && _serializer != nullptr)
+			_serializer->textureDidModifyData([self rgfxObjId]);
 		return;
 	}
 
-	// Through a staging buffer of the region's rows, packed.
-	id<MTLDevice> device = self.device;
-	id<MTLCommandQueue> queue = rgfxCopyQueue(device);
-	uint64_t stageImage = shape.rowBytes * shape.rows;
-	id<MTLBuffer> stage = [device newBufferWithLength:stageImage * shape.images
-	                                          options:MTLResourceStorageModeShared];
-	uint8_t *staged = static_cast<uint8_t *>([stage contents]);
-	id<MTLCommandBuffer> cb = [queue commandBuffer];
-	id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
-	if (staged == nullptr || blit == nil) {
-		static std::atomic<bool> logged{false};
-		rgfxNoteCopyRefused(logged, @"no staging buffer or command buffer for a CPU copy", self);
-		[blit endEncoding];
-		return;
-	}
-	if (toBytes) {
-		[blit copyFromTexture:self
-		                 sourceSlice:slice
-		                 sourceLevel:level
-		                sourceOrigin:region.origin
-		                  sourceSize:region.size
-		                    toBuffer:stage
-		           destinationOffset:0
-		      destinationBytesPerRow:shape.rowBytes
-		    destinationBytesPerImage:stageImage];
-	} else {
-		copyRows(staged, shape.rowBytes, stageImage, caller, bytesPerRow, imageBytes);
-		[blit copyFromBuffer:stage
-		           sourceOffset:0
-		      sourceBytesPerRow:shape.rowBytes
-		    sourceBytesPerImage:stageImage
-		             sourceSize:region.size
-		              toTexture:self
-		       destinationSlice:slice
-		       destinationLevel:level
-		      destinationOrigin:region.origin];
-	}
-	[blit endEncoding];
-	[cb commit];
-	[cb waitUntilCompleted];
-	if (cb.status != MTLCommandBufferStatusCompleted) {
-		static std::atomic<bool> logged{false};
-		rgfxNoteCopyRefused(logged, @"the device failed a CPU copy's blit", self);
-		return;
-	}
-	if (toBytes) {
-		copyRows(caller, bytesPerRow, imageBytes, staged, shape.rowBytes, stageImage);
-	}
+	(void)[self rgfxCopyRegionByBlit:region
+	                     mipmapLevel:level
+	                           slice:slice
+	                           shape:shape
+	                           bytes:caller
+	                     bytesPerRow:bytesPerRow
+	                      imageBytes:imageBytes
+	                         toBytes:toBytes];
 }
 
 // --- the descriptor's members the wire does not carry -------------------------------
@@ -2126,8 +2483,7 @@ std::atomic<uint64_t> g_lastTextureNumber{0};
 // no program relies on (argument buffers name a texture by its gpuResourceID); the host places
 // none of the texture's memory there, so a shader that reaches the range through a pointer meets
 // no resource: on the Vulkan platform it reads zeros and its writes are dropped (metal2vulkan's
-// residency.rs, read), and on the Metal platform it touches GPU addresses nothing maps (not
-// measured).
+// residency.rs, read).
 - (uint64_t)gpuAddress
 {
 	if (_parent != nil) {
@@ -2204,6 +2560,52 @@ RGFX_RESOURCE_SPI
 	return _number;
 }
 
+// --- MTLTextureSPI ------------------------------------------------------------------------
+// The members of Metal's texture SPI that the AMD 5300M's and the Intel 630's textures both
+// answer (measured with respondsToSelector:, macOS 26.7.1, tools/oracle/oracle_spi_members.m).
+
+// Metal's IOAccel texture answers gpuResourceID with gpuHandle (read from code,
+// MTLIOAccelTexture, macOS 27.0.1), and both x86 Macs' fresh texture answers one value as its
+// handle, its resource index and its identifier (measured: macOS 26.7.1, oracle_spi_members
+// answers): the handle and the index are gpuResourceID's value, the id the host numbered the
+// texture by.
+- (uint64_t)gpuHandle
+{
+	return [self gpuResourceID]._impl;
+}
+
+- (uint64_t)resourceIndex
+{
+	return [self gpuResourceID]._impl;
+}
+
+// Six faces for a cube texture and a cube array's, one for any other, as Metal's IOAccel texture
+// counts them (read from code, MTLIOAccelTexture's initializers, macOS 27.0.1; measured: 1 for a
+// 2D texture, macOS 26.7.1).
+- (NSUInteger)numFaces
+{
+	const MTLTextureType type = [self textureType];
+	return type == MTLTextureTypeCube || type == MTLTextureTypeCubeArray ? 6 : 1;
+}
+
+// No colour space conversion and no compression: the base answers 0 for each (read from code,
+// _MTLResource and MTLIOAccelTexture, macOS 27.0.1), and so do both x86 Macs' textures (measured:
+// macOS 26.7.1, oracle_spi_members answers).
+- (uint64_t)colorSpaceConversionMatrix
+{
+	return 0;
+}
+
+- (NSInteger)compressionFeedback
+{
+	return 0;
+}
+
+- (NSUInteger)compressionFootprint
+{
+	return 0;
+}
+
 // The device's textures are no drawable's, and are shown unrotated: Metal answers NO and 0 for
 // every texture an app makes (private, shared, IOSurface and views).
 - (BOOL)isDrawable
@@ -2216,14 +2618,18 @@ RGFX_RESOURCE_SPI
 	return 0;
 }
 
-// The CPU wrote the texture's memory. Over a Managed buffer, Metal's uploads the whole buffer to
-// the GPU's copy (measured on the AMD 5300M under macOS 26.7.1, whose Managed buffers are two
-// copies: `oracle_storage AMD didmodify length` and `nocopy`; the Intel 630's are one), as the
-// buffer's didModifyRange: of all of it tells the host (BUFFER_DID_MODIFY_RANGE, a no-copy one's
-// block first taking the app's bytes); a view's is its texture's. Any other texture has nothing to
-// tell: one over a Shared buffer is the buffer's bytes, which the host reads in place, one over an
-// IOSurface takes the surface's bytes at a commit once a CPU has written them under a lock
-// (RgfxIOSurface.h), and no other texture's memory is the CPU's to write.
+// The CPU wrote the texture's memory. A mipmapped texture over a buffer (a tiled one, RgfxBuffer.mm)
+// is a copy of the buffer's bytes with every level made from them, taken at its first use, and
+// Metal's takes the bytes again at its next use after the call (measured on the AMD 5300M and the
+// Intel 630 under macOS 26.7.1, docs/graphics-kext/dgpu-oracle.md, Q11), which the host does where
+// it carries the message (TEXTURE_DID_MODIFY_DATA). Over a Managed buffer, Metal's uploads the
+// whole buffer to the GPU's copy (measured on the AMD 5300M under macOS 26.7.1, whose Managed
+// buffers are two copies: `oracle_storage AMD didmodify length` and `nocopy`; the Intel 630's are
+// one), as the buffer's didModifyRange: of all of it tells the host (BUFFER_DID_MODIFY_RANGE, a
+// no-copy one's block first taking the app's bytes); a view's is its texture's. Any other texture
+// has nothing to tell: one over a Shared buffer is the buffer's bytes, which the host reads in
+// place, one over an IOSurface takes the surface's bytes at a commit once a CPU has written them
+// under a lock (RgfxIOSurface.h), and no other texture's memory is the CPU's to write.
 - (void)didModifyData
 {
 	if (_parent != nil) {
@@ -2231,8 +2637,14 @@ RGFX_RESOURCE_SPI
 		return;
 	}
 	id<MTLBuffer> buffer = _buffer;
-	if (buffer != nil)
-		[buffer didModifyRange:NSMakeRange(0, buffer.length)];
+	if (buffer == nil)
+		return;
+	if (_desc.mipmap_level_count > 1) {
+		if (_serializer != nullptr)
+			_serializer->textureDidModifyData([self rgfxObjId]);
+		return;
+	}
+	[buffer didModifyRange:NSMakeRange(0, buffer.length)];
 }
 
 // Whether the GPU keeps the texture's contents losslessly compressed, by the rule Metal's follows
@@ -2251,8 +2663,9 @@ RGFX_RESOURCE_SPI
 	    self.storageMode == MTLStorageModeMemoryless || !_allowGPUOptimizedContents) {
 		return NO;
 	}
-	const MTLTextureUsage usage = self.usage;
-	const MTLTextureUsage uncompressed =
+	// The usage the texture was made with, ShaderAtomic among it, which its answer leaves out.
+	const uint64_t usage = _desc.usage;
+	const uint64_t uncompressed =
 	    MTLTextureUsageShaderWrite | MTLTextureUsagePixelFormatView | MTLTextureUsageShaderAtomic;
 	if (usage == MTLTextureUsageUnknown || (usage & uncompressed) != 0) {
 		return NO;

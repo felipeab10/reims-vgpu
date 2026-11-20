@@ -1,7 +1,8 @@
-//! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on Metal by
-//! default. The dylib's install name is `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc
-//! again after the name changes. `Libs.private` names every library the dylib links
-//! (`otool -L`).
+//! `cargo xtask dist` on macOS: the library for arm64 macOS [`DEPLOYMENT_TARGET`], on the Vulkan
+//! platform over MoltenVK, a build for development and tests. The dylib's install name is
+//! `@rpath/libreims_vgpu.dylib`, and it is signed ad hoc again after the name changes, both on a
+//! copy under the target dir that is then installed, so a dylib whose bytes come out the same is
+//! left as it was. `Libs.private` names every library the dylib links (`otool -L`).
 //!
 //! **The archive's symbols and classes.** The archive bundles what the library links statically:
 //! Rust's standard library and SDL3, which draws a display's window. A host that links the
@@ -37,15 +38,10 @@
 
 use std::path::{Path, PathBuf};
 
-use super::{
-    FIRMWARE, LIB, Options, Platform, ROM, c_api_args, firmware_args, install, layout, pc_file,
-    strs, strs_with, write,
-};
+use super::{LIB, Options, c_api_args, install, layout, pc_file, strs, strs_with, write};
 use crate::tools::Tools;
 use crate::util::Res;
 
-/// The platform `dist` builds when `--platform` names none: Metal, the product.
-pub const DEFAULT_PLATFORM: Platform = Platform::Metal;
 /// The shared library's extension: `lib/libreims_vgpu.dylib`.
 pub const SHARED_LIBRARY_EXTENSION: &str = "dylib";
 /// The macOS the library is built for (`MACOSX_DEPLOYMENT_TARGET`): rustc's own default for
@@ -183,15 +179,9 @@ pub fn libs_private(otool: &str, own: &str) -> Res<Vec<String>> {
     Ok(libs)
 }
 
-/// Builds and writes the tree with `tools`; `header` is the committed header and `firmware` the
-/// option ROM's driver. Returns the output directory.
-pub fn dist(
-    tools: &mut dyn Tools,
-    o: &Options,
-    target_dir: &Path,
-    header: &Path,
-    firmware: &Path,
-) -> Res<PathBuf> {
+/// Builds and writes the tree with `tools`; `header` is the committed header. Returns the output
+/// directory.
+pub fn dist(tools: &mut dyn Tools, o: &Options, target_dir: &Path, header: &Path) -> Res<PathBuf> {
     if !cfg!(target_arch = "aarch64") {
         return Err("the library is arm64 macOS only".to_owned());
     }
@@ -201,13 +191,6 @@ pub fn dist(
              flags that give SDL's Objective-C classes the library's names: unset it"
         ));
     }
-    // The ROM first: it takes a second, and a host without lld fails before the library builds.
-    let firmware_build = target_dir.join(FIRMWARE);
-    tools
-        .run("make", &firmware_args(firmware, &firmware_build))
-        .map_err(|e| {
-            format!("{e}: the option ROM did not build (it needs clang and lld: brew install lld)")
-        })?;
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".to_owned());
     // SDL builds again where the flags it was last built with here are not today's, or unknown.
     // The stamp is written once the archive is checked, so an SDL the flags did not reach is
@@ -221,7 +204,7 @@ pub fn dist(
     }
     tools.run(&cargo, &cargo_args(o))?;
     let built = target_dir.join(o.profile.dir());
-    let [archive, dylib, pc, include, rom] = layout().map(|p| o.out.join(p));
+    let [archive, dylib, pc, include] = layout().map(|p| o.out.join(p));
 
     localize(
         tools,
@@ -230,18 +213,19 @@ pub fn dist(
         &archive,
     )?;
     write(&stamp, &cflags)?;
-    install(&built.join("libreims_vgpu_c.dylib"), &dylib, 0o755)?;
+    let named = target_dir.join(LOCALIZED).join(format!("lib{LIB}.dylib"));
+    install(&built.join("libreims_vgpu_c.dylib"), &named, 0o755)?;
     // Cargo names the cdylib after the crate; the library's install name is its own.
     tools.run(
         "xcrun",
-        &strs_with(&["install_name_tool", "-id", INSTALL_NAME], &dylib),
+        &strs_with(&["install_name_tool", "-id", INSTALL_NAME], &named),
     )?;
-    tools.run("codesign", &strs_with(&["-s", "-", "-f"], &dylib))?;
+    tools.run("codesign", &strs_with(&["-s", "-", "-f"], &named))?;
+    install(&named, &dylib, 0o755)?;
     install(header, &include, 0o644)?;
     let otool = tools.output("xcrun", &strs_with(&["otool", "-L"], &dylib))?;
     let libs = libs_private(&otool, INSTALL_NAME)?;
     write(&pc, &pc_file(env!("CARGO_PKG_VERSION"), &libs))?;
-    install(&firmware_build.join(ROM), &rom, 0o644)?;
     Ok(o.out.clone())
 }
 
@@ -253,9 +237,10 @@ const LOCALIZED: &str = "dist-localized";
 const API_PREFIX: &str = "_rvg_";
 
 /// Writes `archive`, the archive installed, from `built`, Cargo's, in `work` (module doc): its
-/// members linked into one object whose globals are the C API's alone, archived alone, with mode
-/// 0644. Fails where the archive written defines no `rvg_` function, another global, or a class
-/// that keeps an SDL name ([`check_archive`]).
+/// members linked into one object whose globals are the C API's alone, archived alone in `work`
+/// with zero dates (`libtool -D`), and installed with mode 0644, so the same build gives the same
+/// bytes and leaves the installed archive as it was. Fails where the archive written defines no
+/// `rvg_` function, another global, or a class that keeps an SDL name ([`check_archive`]).
 fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) -> Res<()> {
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let exported = work.join("exported-symbols");
@@ -279,7 +264,7 @@ fn localize(tools: &mut dyn Tools, built: &Path, work: &Path, archive: &Path) ->
     if std::fs::symlink_metadata(&packed).is_ok() {
         std::fs::remove_file(&packed).map_err(|e| format!("{}: {e}", packed.display()))?;
     }
-    let mut pack = strs_with(&["libtool", "-static", "-o"], &packed);
+    let mut pack = strs_with(&["libtool", "-static", "-D", "-o"], &packed);
     pack.push(object.to_string_lossy().into_owned());
     tools.run("xcrun", &pack)?;
     install(&packed, archive, 0o644)?;
@@ -355,7 +340,7 @@ fn check_archive(nm: &str, archive: &Path) -> Res<()> {
 #[cfg(test)]
 mod tests {
     use super::super::testing::{Log, mode, put, tmp};
-    use super::super::{parse_args, strs};
+    use super::super::{DEFAULT_OUT, parse_args, strs};
     use super::*;
     use crate::tools::Profile;
 
@@ -373,8 +358,7 @@ mod tests {
     fn parse_args_defaults() {
         let o = parse_args(&[], Path::new("/t")).unwrap();
         assert_eq!(o.profile, Profile("release".into()));
-        assert_eq!(o.platform, Platform::Metal);
-        assert_eq!(o.out, PathBuf::from("/t/dist"));
+        assert_eq!(o.out, PathBuf::from("/t/dist-vulkan"));
     }
 
     /// The `--config` entry that renames SDL's Objective-C names.
@@ -394,20 +378,6 @@ mod tests {
             cargo_args(&o).join(" "),
             format!(
                 "build --profile release -p reims-vgpu-c --lib \
-                 --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
-                renames()
-            )
-        );
-    }
-
-    /// The Vulkan tree is the C API's crate with its vulkan feature
-    #[test]
-    fn cargo_args_on_vulkan_select_the_feature() {
-        let o = parse_args(&strs(&["--platform", "vulkan"]), Path::new("/t")).unwrap();
-        assert_eq!(
-            cargo_args(&o).join(" "),
-            format!(
-                "build --profile release -p reims-vgpu-c --lib --features reims-vgpu-c/vulkan \
                  --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
                 renames()
             )
@@ -491,11 +461,11 @@ mod tests {
     /// `nm --defined-only -P`'s listing of the localized archive: its member, the C API's
     /// functions, then static symbols, SDL's and a renamed class among them.
     const LOCALIZED_ARCHIVE: &str = "libreims_vgpu.a[reims_vgpu.o]:\n\
-        _rvg_device_create T 1000 20\n_rvg_status_message T 1020 8\n\
+        _rvg_graphics_device_create T 1000 20\n_rvg_status_message T 1020 8\n\
         _SDL_Init t 2000 40\n_OBJC_CLASS_$_RVGSDL3Window s 3000 28\n";
 
-    /// The programs as `dist` runs them: each call recorded; `libtool` writes the archive it
-    /// names, `nm` lists `nm`, and anything else answers otool's listing.
+    /// The programs as `dist` runs them: each call recorded; `libtool` writes the archive its
+    /// `-o` names, `nm` lists `nm`, and anything else answers otool's listing.
     struct Programs {
         log: Log,
         nm: String,
@@ -516,7 +486,8 @@ mod tests {
     impl Tools for Programs {
         fn run(&mut self, program: &str, args: &[String]) -> Res<()> {
             if args.first().map(String::as_str) == Some("libtool") {
-                put(Path::new(&args[3]), "localized");
+                let out = args.iter().position(|a| a == "-o").unwrap() + 1;
+                put(Path::new(&args[out]), "localized");
             }
             self.log.run(program, args)
         }
@@ -530,63 +501,53 @@ mod tests {
         }
     }
 
-    /// A tree the build would write: the libraries Cargo built, the header and the ROM.
-    fn built(name: &str) -> (PathBuf, PathBuf, PathBuf, PathBuf) {
+    /// A tree the build would write: the libraries Cargo built and the header.
+    fn built(name: &str) -> (PathBuf, PathBuf, PathBuf) {
         let root = tmp(name);
         let target = root.join("target");
         put(&target.join("release/libreims_vgpu_c.a"), "archive");
         put(&target.join("release/libreims_vgpu_c.dylib"), "dylib");
         let header = root.join("reims_vgpu.h");
         put(&header, "header");
-        // What the firmware's make writes.
-        put(&target.join("firmware/ReimsVgpu.rom"), "rom");
-        (root.clone(), target, header, root.join("firmware"))
+        (root.clone(), target, header)
     }
 
     #[test]
     fn dist_writes_the_tree_and_renames_the_dylib() {
-        let (root, target, header, firmware) = built("tree");
+        let (root, target, header) = built("tree");
         let o = parse_args(&[], &target).unwrap();
         // A previous tree's files are replaced.
         put(&o.out.join("lib/libreims_vgpu.a"), "old");
         let mut tools = Programs::new(LOCALIZED_ARCHIVE);
-        let out = dist(&mut tools, &o, &target, &header, &firmware).unwrap();
-        assert_eq!(out, target.join("dist"));
+        let out = dist(&mut tools, &o, &target, &header).unwrap();
+        assert_eq!(out, target.join(DEFAULT_OUT));
         let read = |p: &str| std::fs::read_to_string(out.join(p)).unwrap();
         assert_eq!(read("lib/libreims_vgpu.a"), "localized");
         assert_eq!(read("lib/libreims_vgpu.dylib"), "dylib");
         assert_eq!(read("include/reims_vgpu.h"), "header");
-        assert_eq!(read("share/reims-vgpu/ReimsVgpu.rom"), "rom");
         assert!(read("lib/pkgconfig/reims-vgpu.pc").contains(
             "Libs.private: -weak_framework AppKit -framework Metal -lSystem -liconv -lobjc\n"
         ));
         assert_eq!(mode(&out.join("lib/libreims_vgpu.dylib")), 0o755);
         assert_eq!(mode(&out.join("lib/libreims_vgpu.a")), 0o644);
-        assert_eq!(mode(&out.join("share/reims-vgpu/ReimsVgpu.rom")), 0o644);
         let dylib = out.join("lib/libreims_vgpu.dylib");
         let d = dylib.to_str().unwrap();
         let work = target.join("dist-localized");
+        let named = work.join("libreims_vgpu.dylib");
+        let n = named.to_str().unwrap();
         let exported = work.join("exported-symbols");
         assert_eq!(std::fs::read_to_string(&exported).unwrap(), "_rvg_*\n");
         let object = work.join("reims_vgpu.o");
         let packed = work.join("libreims_vgpu.a");
         let archive = out.join("lib/libreims_vgpu.a");
         let calls = tools.log.lines();
-        assert_eq!(
-            calls[0],
-            format!(
-                "make -C {} BUILD={} rom",
-                firmware.display(),
-                target.join("firmware").display()
-            )
-        );
         // SDL builds again, as no flags are known for it here.
         assert!(
-            calls[1].ends_with(" clean --profile release -p sdl3-sys"),
+            calls[0].ends_with(" clean --profile release -p sdl3-sys"),
             "{}",
-            calls[1]
+            calls[0]
         );
-        assert!(calls[2].ends_with(&format!(
+        assert!(calls[1].ends_with(&format!(
             " build --profile release -p reims-vgpu-c --lib \
              --config env.MACOSX_DEPLOYMENT_TARGET=\"11.0\" {}",
             renames()
@@ -596,7 +557,7 @@ mod tests {
             sdl_cflags()
         );
         assert_eq!(
-            calls[3..],
+            calls[2..],
             [
                 format!(
                     "xcrun ld -r -arch arm64 -platform_version macos 11.0 11.0 \
@@ -606,13 +567,13 @@ mod tests {
                     object.display()
                 ),
                 format!(
-                    "xcrun libtool -static -o {} {}",
+                    "xcrun libtool -static -D -o {} {}",
                     packed.display(),
                     object.display()
                 ),
                 format!("xcrun nm --defined-only -P {}", archive.display()),
-                format!("xcrun install_name_tool -id @rpath/libreims_vgpu.dylib {d}"),
-                format!("codesign -s - -f {d}"),
+                format!("xcrun install_name_tool -id @rpath/libreims_vgpu.dylib {n}"),
+                format!("codesign -s - -f {n}"),
                 format!("xcrun otool -L {d}"),
             ]
         );
@@ -622,7 +583,7 @@ mod tests {
     /// SDL is not built again where it was built with today's flags, and is where with others
     #[test]
     fn dist_rebuilds_sdl_only_for_other_flags() {
-        let (root, target, header, firmware) = built("stamp");
+        let (root, target, header) = built("stamp");
         let o = parse_args(&[], &target).unwrap();
         let stamp = target.join("dist-localized/sdl-cflags-release");
         let cleans = |tools: &Programs| {
@@ -635,11 +596,11 @@ mod tests {
         };
         put(&stamp, &sdl_cflags());
         let mut tools = Programs::new(LOCALIZED_ARCHIVE);
-        dist(&mut tools, &o, &target, &header, &firmware).unwrap();
+        dist(&mut tools, &o, &target, &header).unwrap();
         assert_eq!(cleans(&tools), 0);
         put(&stamp, "-DSDL3Window=OtherSDL3Window");
         let mut tools = Programs::new(LOCALIZED_ARCHIVE);
-        dist(&mut tools, &o, &target, &header, &firmware).unwrap();
+        dist(&mut tools, &o, &target, &header).unwrap();
         assert_eq!(cleans(&tools), 1);
         assert_eq!(std::fs::read_to_string(&stamp).unwrap(), sdl_cflags());
         std::fs::remove_dir_all(&root).unwrap();
@@ -648,12 +609,12 @@ mod tests {
     /// A global the archive still defines besides the C API's fails the dist, naming it
     #[test]
     fn dist_fails_where_the_archive_keeps_another_global() {
-        let (root, target, header, firmware) = built("leak");
+        let (root, target, header) = built("leak");
         let o = parse_args(&[], &target).unwrap();
-        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_device_create T 1000 20\n\
+        let leaky = "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_graphics_device_create T 1000 20\n\
                      _SDL_Init T 2000 40\n";
         let mut tools = Programs::new(leaky);
-        let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
+        let e = dist(&mut tools, &o, &target, &header).unwrap_err();
         assert!(e.contains("1 global symbols besides the C API's"), "{e}");
         assert!(e.contains("_SDL_Init"), "{e}");
         std::fs::remove_dir_all(&root).unwrap();
@@ -662,15 +623,15 @@ mod tests {
     /// A class that keeps an SDL name, static or not, fails the dist, naming it
     #[test]
     fn dist_fails_where_a_class_keeps_sdls_name() {
-        let (root, target, header, firmware) = built("class");
+        let (root, target, header) = built("class");
         let o = parse_args(&[], &target).unwrap();
         for class in ["SDL3Window", "Cocoa_PasteboardDataProvider", "SDL4Window"] {
             let named = format!(
-                "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_device_create T 1000 20\n\
+                "libreims_vgpu.a[reims_vgpu.o]:\n_rvg_graphics_device_create T 1000 20\n\
                  _OBJC_CLASS_$_{class} s 3000 28\n"
             );
             let mut tools = Programs::new(&named);
-            let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
+            let e = dist(&mut tools, &o, &target, &header).unwrap_err();
             assert!(e.contains("1 Objective-C classes under SDL's names"), "{e}");
             assert!(e.contains(class), "{e}");
         }
@@ -680,33 +641,11 @@ mod tests {
     /// An archive with no `rvg_` function is refused
     #[test]
     fn dist_refuses_an_archive_without_the_c_api() {
-        let (root, target, header, firmware) = built("noapi");
+        let (root, target, header) = built("noapi");
         let o = parse_args(&[], &target).unwrap();
         let mut tools = Programs::new("libreims_vgpu.a[reims_vgpu.o]:\n_SDL_Init t 2000 40\n");
-        let e = dist(&mut tools, &o, &target, &header, &firmware).unwrap_err();
+        let e = dist(&mut tools, &o, &target, &header).unwrap_err();
         assert!(e.contains("defines no _rvg_ function"), "{e}");
-        std::fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn dist_stops_before_the_library_when_the_rom_does_not_build() {
-        let root = tmp("norom");
-        let target = root.join("target");
-        put(&target.join("release/libreims_vgpu_c.a"), "archive");
-        put(&target.join("release/libreims_vgpu_c.dylib"), "dylib");
-        let header = root.join("reims_vgpu.h");
-        put(&header, "header");
-        let o = parse_args(&[], &target).unwrap();
-        let mut log = Log {
-            answer: OTOOL.to_owned(),
-            fail: Some("make"),
-            ..Log::default()
-        };
-        let e = dist(&mut log, &o, &target, &header, &root.join("firmware")).unwrap_err();
-        assert!(e.contains("make failed"), "{e}");
-        assert!(e.contains("brew install lld"), "{e}");
-        assert_eq!(log.calls.len(), 1, "{:?}", log.calls);
-        assert!(!o.out.exists());
         std::fs::remove_dir_all(&root).unwrap();
     }
 }

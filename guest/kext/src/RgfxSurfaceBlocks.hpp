@@ -50,6 +50,10 @@
 // RgfxPageRun, a run of physically contiguous bytes of a plane's pages, is the wire's: an
 // in-place block hands its runs to the device as they are.
 #include "reims_graphics_wire.h"
+// The span a holder's window maps of a block (rgfxWindowSpanLength).
+#include "RgfxWindowSpans.hpp"
+// A block's BLOCK_UNSHAREs not yet posted (rgfxBlockUnsharing).
+#include "RgfxBlockTable.hpp"
 
 // The most clients that hold one plane's block.
 constexpr uint32_t kRgfxSurfaceHolders = 16;
@@ -328,6 +332,19 @@ inline void rgfxSurfaceShared(RgfxSurfaceEntry &e, const void *client)
 	}
 }
 
+// Whether an ask of `client` waits before it holds the entry's block. It waits while its own new
+// hold's BLOCK_SHARE is not yet posted (rgfxSurfaceSharing). It also waits while a let-go's
+// BLOCK_UNSHARE of the block, posted out of the lock, is not yet posted (rgfxBlockUnsharing).
+// The device carries out a context's share and unshare of a block in ring order. An ask's share
+// posted ahead of an earlier hold's unshare is a no-op, as the context still holds the block. The
+// unshare then ends the new hold, and the device refuses the context's next message that names
+// the block.
+inline bool rgfxSurfaceAskWaits(const RgfxSurfaceEntry &e, const RgfxBlockTable &blocks,
+                                const void *client)
+{
+	return rgfxSurfaceSharing(e, client) || rgfxBlockUnsharing(blocks, e.offset);
+}
+
 enum RgfxSurfaceLetGo {
 	// The client holds no such block: nothing.
 	kRgfxSurfaceLetGoNotHeld = 0,
@@ -481,6 +498,13 @@ inline bool rgfxPagesNamingWired(RgfxPagesNaming n)
 inline bool rgfxSurfaceDeferFits(const RgfxSurfaceTable &t, uint64_t length, uint64_t budget)
 {
 	return budget != 0 && length <= budget && t.deferredBytes <= budget - length;
+}
+
+// Where a block's runs lie from its start, past the `size` bytes its holders use: past the span
+// their windows map of those (rgfxWindowSpanLength), so no page a holder maps holds a run.
+inline uint64_t rgfxSurfaceRunsFrom(uint64_t size)
+{
+	return rgfxWindowSpanLength(size);
 }
 
 // The bytes an in-place block of a plane of `length` bytes keeps for its runs past the part its
@@ -660,6 +684,52 @@ inline void rgfxSurfaceRunsNext(RgfxRunsWalk &w, uint64_t addr, uint64_t length)
 inline bool rgfxSurfaceRunsSame(const RgfxRunsWalk &w)
 {
 	return w.same && w.run + 1 == w.count && w.at == w.runs[w.run].length;
+}
+
+// Why the kext gives a process no shared copy block of a plane (an ask not in place): the
+// process then copies the surface in a block of its own, which no other holder shares, so
+// another process's GPU writes reach it only through the surface's pages.
+enum RgfxCopyRefusal : uint32_t {
+	kRgfxCopyRefusedShape = 0, // a plane length or block size the kext does not take
+	kRgfxCopyRefusedPages,     // the plane's range is not mapped in the task, or not wired
+	kRgfxCopyRefusedDiffers,   // the plane's block is of another size, or one in place
+	kRgfxCopyRefusedHolders,   // the plane's block has no room for another holder
+	kRgfxCopyRefusedTable,     // the table has no free entry
+	kRgfxCopyRefusedRoom,      // the region has no room
+	kRgfxCopyRefusedMap,       // the block does not map into the process's window
+	kRgfxCopyRefusedShare,     // the device was not told of the hold
+	kRgfxCopyRefusals,
+};
+
+inline const char *rgfxCopyRefusalName(uint32_t why)
+{
+	switch (why) {
+	case kRgfxCopyRefusedShape:
+		return "a plane length or block size the kext does not take";
+	case kRgfxCopyRefusedPages:
+		return "the plane's range is not mapped in the process, or not wired";
+	case kRgfxCopyRefusedDiffers:
+		return "the plane's block is of another size, or one in place";
+	case kRgfxCopyRefusedHolders:
+		return "the plane's block has no room for another holder";
+	case kRgfxCopyRefusedTable:
+		return "the surface table has no free entry";
+	case kRgfxCopyRefusedRoom:
+		return "the region has no room";
+	case kRgfxCopyRefusedMap:
+		return "the block does not map into the process's window";
+	case kRgfxCopyRefusedShare:
+		return "the device was not told of the hold";
+	default:
+		return "unknown";
+	}
+}
+
+// Whether `why` is the first refusal of its kind in `*logged`, one bit a reason, marking it.
+inline bool rgfxCopyRefusalFirst(uint32_t *logged, uint32_t why)
+{
+	const uint32_t bit = 1u << why;
+	return (__atomic_fetch_or(logged, bit, __ATOMIC_RELAXED) & bit) == 0;
 }
 
 #endif // RGFX_SURFACE_BLOCKS_HPP_

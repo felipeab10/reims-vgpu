@@ -1,7 +1,7 @@
 //! `heap-texture-lossless-layout`: the bytes a single-sample texture placed in a heap leaves in
 //! the heap's memory, as a buffer over the same bytes reads them.
 //!
-//! **Metal's rule** (this host, every probe below the same in each of [`RUNS`] runs, each run a
+//! **Metal's rule** (this host, every probe below the same in each of 5 runs, each run a
 //! new heap over new pages filled with `0xa5` first): a 64 by 64 `RGBA8Unorm` render target placed
 //! at offset 0 of a `Shared` placement heap over host pages, read from the pages:
 //! - **Deterministic.** The same texels written the same way leave the same bytes.
@@ -32,13 +32,16 @@
 //! compressed alike, not recorded here), mipmapped, array and multisample textures, levels past
 //! the first; offsets other than 0; other Apple GPU generations.
 //!
-//! **This platform today**: the runtime lays an uncompressed texture's texels out in Metal's
-//! tiles, Metal's bytes, and a compressed one's in a layout of its own, leaving the metadata's
-//! bytes as the heap held them, announcing `heap-texture-lossless-layout`, relayed for a
-//! single-sample texture ([`crate::answer::HEARD`]): its bytes are Metal's for no write probed,
-//! not even where Metal holds the texels in its tiles (a CPU write, texels that do not compress).
-//! The tests hold the uncompressed shapes' bytes to Metal's, and require the compressed shape's
-//! difference to come with the relayed kind.
+//! **This platform today**: a texture in a heap over host pages lies in the device's linear image
+//! bound to the pages wherever one serves, in the driver's rows with no copy, announcing
+//! `heap-texture-untiled-layout`: its bytes are its texels row by row at the driver's pitch, not
+//! Metal's tiles, compressed or not. Where no such image serves, an uncompressed texture is a
+//! shadow of its texels in Metal's tiles, Metal's bytes, and a compressed one's bytes are in a
+//! layout of the runtime's own, the metadata's bytes left as the heap held them, announcing
+//! `heap-texture-lossless-layout`. Both kinds are relayed for a single-sample texture
+//! ([`crate::answer::HEARD`]). The tests hold each shape's bytes to Metal's, or require the
+//! difference to come with a relayed kind: `heap-texture-untiled-layout`, with the texels in
+//! rows where the probe knows them, or, for the compressed shape, `heap-texture-lossless-layout`.
 //!
 //! **To answer as Metal**: in part, a compressed texture's texels laid out in Metal's tiles with
 //! each block's metadata marked as held as texels (`0x7f`, measured for `RGBA8Unorm` alone) is
@@ -47,16 +50,15 @@
 //! every format and sample count, by every path that writes (blits, a pass's store, a clear),
 //! with the block's unused bytes kept. No public specification of the encoding is known.
 
+use crate::core::platform::device::GpuDevice as _;
+use crate::core::platform::resource::Heap as _;
+use crate::core::platform::values::{HeapDesc, OptionSet};
+use crate::core::platform::{HostRange, Platform};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::device::GpuDevice as _;
-use reims_vgpu_core::platform::resource::Heap as _;
-use reims_vgpu_core::platform::types::ResourceAddressRange;
-use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
 
 use super::{
-    Aspect, CLEAR, Pass, READ, RGBA8, STORE, Shape, Step, TARGET, WRITE, heard, metal, once,
-    random_bytes, replace, run,
+    Aspect, CLEAR, Pass, READ, RGBA8, STORE, Shape, Step, TARGET, WRITE, heard, random_bytes,
+    replace, run,
 };
 use crate::gpu::device::tests::dev;
 use crate::platform::tests::platform;
@@ -97,22 +99,20 @@ fn heap_bytes<P: Platform>((p, d): (&P, &P::Device), shape: Shape, write: Write)
     let pages = p.vm().allocate_anywhere(HEAP).unwrap();
     let length = usize::try_from(HEAP).unwrap();
     // SAFETY: the new pages, `HEAP` bytes, which nothing else uses yet; left mapped until the
-    // process ends, as the heap's alias shares them.
+    // process ends, as the heap lies in them.
     unsafe { std::ptr::write_bytes(pages.as_ptr::<u8>(), 0xa5, length) };
-    let ranges = p
-        .new_address_range_array(&[ResourceAddressRange {
-            address: u64::try_from(pages.addr()).unwrap(),
-            length: HEAP,
-        }])
-        .unwrap();
+    // SAFETY: as above.
+    let over = unsafe { HostRange::new(pages, HEAP) };
     let heap = d
-        .new_heap(&HeapDesc {
-            size: HEAP,
-            heap_type: 1,
-            options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
-            address_ranges: Some(&ranges),
-            pinned_gpu_address: None,
-        })
+        .new_heap_over_host_memory(
+            over,
+            &HeapDesc {
+                size: HEAP,
+                heap_type: 1,
+                options: vec![OptionSet::StorageMode(0), OptionSet::HazardTrackingMode(0)],
+                pinned_gpu_address: None,
+            },
+        )
         .unwrap()
         .heap
         .unwrap();
@@ -148,12 +148,6 @@ fn heap_bytes<P: Platform>((p, d): (&P, &P::Device), shape: Shape, write: Write)
     (held, size)
 }
 
-/// How many of `texels`' 4-byte texels lie at some 4-byte-aligned place of `bytes`.
-fn texels_found(bytes: &[u8], texels: &[u8]) -> usize {
-    let held: std::collections::BTreeSet<&[u8]> = bytes.chunks(4).collect();
-    texels.chunks(4).filter(|t| held.contains(t)).count()
-}
-
 /// The shapes probed: compressed (Metal's default), with `allowGPUOptimizedContents` off, and of
 /// `ShaderWrite` usage, `RGBA8Unorm` 64 by 64; and 16 by 8, too narrow to compress.
 fn shapes() -> [(&'static str, Shape, bool); 4] {
@@ -180,17 +174,29 @@ fn shapes() -> [(&'static str, Shape, bool); 4] {
     ]
 }
 
+/// The pitch at which `held` holds `texels`, `rows` rows of `row` bytes each, row by row from its
+/// start: the least multiple of 16 bytes, from `row` to 16 times it, at which every row's bytes
+/// are the texels' own; `None` where none is.
+fn pitch_of_rows(held: &[u8], texels: &[u8], row: usize, rows: usize) -> Option<usize> {
+    (row..=16 * row).step_by(16).find(|&pitch| {
+        (0..rows).all(|y| {
+            let at = y * pitch;
+            held.get(at..at + row) == Some(&texels[y * row..(y + 1) * row])
+        })
+    })
+}
+
 /// A texture placed in a `Shared` heap over host pages leaves bytes there that are one value for
 /// the same writes, on this host's Metal in every run: an uncompressed texture's texels in
 /// Metal's tiles; a compressed one's, after a GPU blit or a stored clear of texels that compress,
 /// no permutation of them, each 16 by 16 block's bytes past its encoding keeping the heap's
 /// earlier bytes, and after a blit of texels that do not compress, or a CPU `replaceRegion`, the
-/// texels in Metal's tiles, the uncompressed texture's bytes. This platform's bytes are Metal's
-/// for the uncompressed shapes; for the compressed one they differ, and the runtime announced
-/// `heap-texture-lossless-layout`
+/// texels in Metal's tiles, the uncompressed texture's bytes. This platform's bytes are Metal's,
+/// or they differ and the runtime announced why: `heap-texture-untiled-layout`, the texture in the
+/// device's image over the pages, where the probe knows the texels, every row of them at one
+/// pitch; or, for the compressed shape, `heap-texture-lossless-layout`
 #[test]
 fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
-    let metal = metal();
     let (p, d) = (platform(), dev());
     let writes = [
         Write::BlitIndex,
@@ -202,73 +208,37 @@ fn heap_texture_bytes_are_metals_tiles_or_its_compressed_form() {
     let mut differ = Vec::new();
     for (name, shape, compresses) in shapes() {
         for write in writes {
-            let Some((mp, md)) = metal.as_ref() else {
-                return;
-            };
             let case = format!("{name} {write:?}");
-            let (m, size) = once(&case, || heap_bytes((mp, md), shape, write));
-            let length = shape.length();
-            let texels = texels(write, length);
-            let payload = &m[..length];
-            if compresses {
-                assert_eq!(
-                    size,
-                    u64::try_from(length).unwrap() + 128,
-                    "Metal: {case}: size"
-                );
-            } else {
-                assert_eq!(size, u64::try_from(length).unwrap(), "Metal: {case}: size");
-                assert!(
-                    m[length..].iter().all(|&b| b == 0xa5),
-                    "Metal: {case}: bytes past the texels"
-                );
-            }
-            let all = length / 4;
-            match (compresses, write) {
-                (_, Write::Cleared) => {}
-                (true, Write::BlitIndex | Write::BlitColour) => {
-                    let kept = payload.iter().filter(|&&b| b == 0xa5).count();
-                    assert!(kept > length / 2, "Metal: {case}: {kept} bytes kept");
-                    if write == Write::BlitIndex {
-                        let found = texels_found(payload, &texels);
-                        assert!(found < all / 2, "Metal: {case}: {found} texels found");
-                    }
-                }
-                _ => {
-                    let found = texels_found(payload, &texels);
-                    assert_eq!(found, all, "Metal: {case}: texels found");
-                }
-            }
             let (o, ours_size) = heap_bytes((&p, &d), shape, write);
-            assert_eq!(ours_size, size, "{case}: the texture's size in the heap");
-            if o[..usize::try_from(size).unwrap()] != m[..usize::try_from(size).unwrap()] {
-                let kind = rt::Degradation::HeapTextureLosslessLayout;
-                assert!(compresses && heard(kind), "{case}: off Metal's");
-                differ.push(case);
+            // The texture's size in the heap, Metal's.
+            crate::metal_check!(format!("{case}: size"), ours_size);
+            if !crate::metal_matches_bytes!(&case, &o[..usize::try_from(ours_size).unwrap()]) {
+                let untiled = heard(rt::Degradation::HeapTextureUntiledLayout);
+                let lossless = compresses && heard(rt::Degradation::HeapTextureLosslessLayout);
+                assert!(untiled || lossless, "{case}: off Metal's, no kind heard");
+                // The texels the probe wrote, where it knows them: a blit's or a CPU write's.
+                let known = !matches!(write, Write::Cleared);
+                if untiled && !lossless && known {
+                    let texels = texels(write, shape.length());
+                    let row = shape.length() / usize::try_from(shape.size.1).unwrap();
+                    let rows = usize::try_from(shape.size.1).unwrap();
+                    let pitch = pitch_of_rows(&o, &texels, row, rows);
+                    assert!(
+                        pitch.is_some(),
+                        "{case}: off Metal's, not its texels in rows"
+                    );
+                    differ.push(format!(
+                        "{case}: untiled, rows {} bytes apart",
+                        pitch.unwrap()
+                    ));
+                } else {
+                    differ.push(format!(
+                        "{case}: {}",
+                        if lossless { "lossless" } else { "untiled" }
+                    ));
+                }
             }
         }
     }
-    eprintln!("off Metal's, heap-texture-lossless-layout heard: {differ:#?}");
-}
-
-/// A CPU `replaceRegion` into a compressed texture in a heap leaves the texels in Metal's tiles:
-/// the same bytes a texture of `allowGPUOptimizedContents` off holds after a blit of them, on
-/// this host's Metal in every run
-#[test]
-fn cpu_written_compressed_textures_hold_the_uncompressed_bytes() {
-    let Some((mp, md)) = metal() else {
-        return;
-    };
-    let [(_, compressed, _), (_, off, _), ..] = shapes();
-    let length = compressed.length();
-    let (cpu, _) = once("CpuIndex", || {
-        heap_bytes((&mp, &md), compressed, Write::CpuIndex)
-    });
-    let (blit, _) = once("BlitIndex", || {
-        heap_bytes((&mp, &md), off, Write::BlitIndex)
-    });
-    assert!(
-        cpu[..length] == blit[..length],
-        "Metal: the payloads differ"
-    );
+    eprintln!("off Metal's, with the kind heard: {differ:#?}");
 }

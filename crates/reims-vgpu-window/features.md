@@ -6,9 +6,12 @@ it is done deliberately, in its own commit, with this file updated and the
 reason given.
 
 Each entry ends with its guard: `test: <module>::<name>`, a unit test in this
-crate (`features::features_md_guards_exist` fails when one is gone), or
-`manual`, a check on a VM boot. A change to this crate walks the `manual`
-entries it can reach. A bare `test` is a guard not yet written.
+crate; `test: <crate>::<module>::<name>`, a unit test in the workspace's crate
+in `crates/<crate>`, such as reims-vgpu's display tests, which drive the
+window from the guest's device; or `manual`, a check on a VM boot.
+`features::features_md_guards_exist` fails when a named test is gone. A change
+to this crate walks the `manual` entries it can reach. A bare `test` is a
+guard not yet written.
 
 The sections up to "On Linux" are the macOS window's, AppKit's. "On Linux"
 is the window on Linux, SDL3's on Wayland or X11, entry by entry against
@@ -21,16 +24,15 @@ them; its `manual` checks are on a Linux host's guest boot.
 | `REIMS_VGPU_WINDOW=0` | QEMU stays headless under `-display none` (QEMU reads it) |
 | `REIMS_VGPU_WINDOW_BORDERLESS=1` | borderless windows that fill their screens |
 | `REIMS_VGPU_WINDOW_SCREENS=1,0` | display i opens on the host screen the list's i-th entry names |
-| `REIMS_VGPU_WINDOW_REFRESH=120` | the refresh rate of the modes offered to the guest |
-| `resolution=2560x1600`, `resolution=2560x1600@200`, `resolution=host` | the guest's mode, and the density it is told (QEMU's apple-gfx property; 1920x1080 at 1× by default) |
+| `resolution=2560x1600` | the mode the window opens for, and the guest is offered until the window's pixels are known (QEMU's reims-graphics-pci property; 1920x1080 by default); with several displays, every window's |
+| `displays=2` | the reims-graphics device's displays, 1 to 4, a window each (QEMU's reims-graphics-pci property; 1 by default) |
 | `REIMS_VGPU_WINDOW_IMPL=sdl` | macOS, built with the `macos-sdl` feature (on by default): SDL3's window in place of AppKit's ("On macOS through SDL3" below) |
 
 Unset or unparsable values give the defaults below.
 `test: env::unset_or_unparsable_values_are_the_defaults`,
 `test: env::the_window_is_appkits_unless_sdl_is_named`,
 `test: env::borderless_takes_the_usual_words`,
-`test: env::the_screen_list_is_all_or_nothing`,
-`test: env::the_refresh_rate_is_a_positive_rate_up_to_1000`
+`test: env::the_screen_list_is_all_or_nothing`
 
 ## Opening
 
@@ -41,17 +43,13 @@ Unset or unparsable values give the defaults below.
   Input. `manual`
 - The title is "Reims vGPU", with " (port N)" for a display on port N above
   0. `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`
-- A new window shows a guest point per host point, shrunk to fit the
-  screen's visible area: on a Retina screen, a HiDPI guest one guest pixel
-  per screen pixel, a 1× guest (the default 1920×1080) scaled up on the GPU,
-  not opened at half size. The guest's scale is the one a macOS 13.6 guest
-  picks from the size it is told: the width in whole millimetres to nearest,
-  then in whole centimetres rounded up, HiDPI from 146.67 ppi across it for
-  a mode at least 1920 pixels wide.
+- A new window shows its mode a guest pixel per host point, shrunk to fit
+  the screen's visible area, on whole pixels, a multiple of 16 wide and even
+  high (the steps of the guest's modes, below): on a Retina screen the
+  default 1920×1080 opens at 1920×1080 points, 3840×2160 pixels, where they
+  fit, not at half size.
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
-  `test: geometry::a_new_window_shrinks_to_the_visible_area`,
-  `test: policy::the_guest_scale_follows_the_told_density`,
-  `test: policy::the_guest_scale_follows_its_reading_in_whole_centimetres`
+  `test: geometry::a_new_window_shrinks_to_the_visible_area`
 - Display i opens on host screen i, or on the main screen when there is no
   screen i. `test: screens::display_i_opens_on_screen_i`,
   `test: screens::a_missing_screen_is_the_main_one`,
@@ -62,19 +60,48 @@ Unset or unparsable values give the defaults below.
   guest's mode. `test: native::macos::shell::windows_on_one_screen_cascade`,
   `test: native::macos::shell::a_cascade_stays_on_the_screen`,
   `test: native::macos::shell::a_cascaded_window_shrinks_rather_than_overlap`
+- With several reims-graphics displays, each window is its own display's:
+  its guest display is offered the window's mode, at the refresh rate and
+  scale of the screen the window is on, whatever the other windows are, and
+  a resize changes only its own display's mode. Each display is offered at
+  most the largest mode of its window's ratio that its share of the device's
+  128 MiB of scanout holds (64 MiB each with two displays, so an 8K window
+  is offered 5440 × 3060, which it shows scaled to fit; 32 MiB each with
+  four, 3840 × 2160 at 16:9), as reims-vgpu-graphics' tests
+  `display::tests::a_display_offers_the_largest_mode_of_its_ratio_its_room_holds`
+  and `device::tests::displays::a_guest_that_took_multi_display_is_told_every_display_s_own_mode`
+  hold. `manual` (a VM with two displays)
+- A window whose display the guest does not drive shows black, as a monitor
+  with no signal does, and so does QEMU's screendump of its head: a guest
+  whose driver does not take the device's `MULTI_DISPLAY` drives display 0
+  alone, and the option ROM drives only display 0, so during boot the other
+  windows stay black. reims-vgpu's test
+  `graphics::tests::displays::each_display_reads_back_and_one_past_the_count_is_refused`
+  holds the black read-back. `manual` (a VM with two displays and a kext
+  that drives one)
 
 ## The picture
 
 - One GPU pass from the guest's frame into the window's drawable, with the
-  display's gamma and colour matrix; no CPU copy and no GPU copy. On the
-  Vulkan platform the pass draws into the image of a swapchain over the
-  window's layer, which is the drawable, as on Linux. `manual`
+  display's gamma and colour matrix, and no CPU copy. With the colour at
+  identity the pass is a GPU copy into the drawable, of the guest's scanout
+  or of a presented surface in the drawable's format (BGRA8, with or without
+  sRGB); otherwise it is a draw of the display's present or colour shaders.
+  The window makes no other copy of the frame: on the Vulkan platform the
+  pass writes the image of a swapchain over the window's layer, which is the
+  drawable, as on Linux. `manual`
 - Each guest frame is drawn as it arrives, up to the screen's refresh rate
   (120 Hz on ProMotion). `manual`
 - Colours are sRGB, not stretched over a P3 screen's gamut. `manual`
-- The window resizes freely while input is not captured (Capture). The
-  image keeps the guest mode's aspect ratio, centred on whole pixels between
-  black bars.
+- The window resizes while input is not captured (Capture), its content by
+  16 pixels wide and 2 high at a time (AppKit's content resize increments,
+  in points at the scale of the screen it opened on): the steps of the
+  guest's modes, so a window the person resizes shows the guest's whole
+  mode, with no black beside it. Zoom, full screen and tiling take no
+  increments, and a window moved to a screen of another scale can be 8
+  pixels off a step. The image keeps the guest mode's aspect ratio, centred
+  on whole pixels between black bars.
+  `test: native::macos::shell::a_windowed_window_resizes_by_a_mode_s_steps`,
   `test: geometry::keeps_the_guest_ratio`,
   `test: geometry::centres_the_image`,
   `test: geometry::the_image_is_on_whole_pixels`
@@ -90,57 +117,56 @@ Unset or unparsable values give the defaults below.
   takes the window's size in pixels as its mode) never follows the guest's
   mode: it opens sized for the first mode offered, and from then on a guest
   mode change re-fits the image, as after the person's resize. `manual`
+- That guest is offered the window's pixels with the width rounded down to
+  a multiple of 16 and the height to even, and a window of other pixels (a
+  resize without steps, a zoom or tiling, or a borderless window at a
+  fractional scale: 3841 × 2161
+  pixels are offered 3840 × 2160, 3662 × 2039 are offered 3648 × 2038)
+  shows that mode unscaled at its top left, beside up to 15 columns and a
+  row of black. 16 BGRA8 pixels are a 64-byte line of the GPU's memory: on
+  Intel's Vulkan driver a guest surface over the guest's RAM is drawn in
+  place only where each row starts and ends on a line, and the guest's
+  desktop surfaces are the mode's width (on homelab-ms01's Iris Xe the
+  3662-pixel desktop stayed a copy, 2.54 ms of GPU time a plain frame and
+  3.94 ms a frame that reads its own pixels; the owner's ruling of
+  2026-11-07 removes the cause). The guest's kext offers a mode HiDPI only
+  where its pixels halve exactly, and a guest given a 3841 × 2161 mode
+  never brought its display up, HiDPI or not.
+  `test: geometry::a_drawable_offers_a_mode_a_multiple_of_16_wide_drawn_unscaled`
+- That guest is told the scale of the screen the window was last drawn on,
+  and its display is as dense as that screen, 110 pixels per inch a point
+  of it. An arm64 guest runs at 1x on a screen at 1x and HiDPI on one above
+  1x, at every window size. An x86-64 guest starts HiDPI on a screen at 1.5x
+  or more at every window size from 2048 × 1536 pixels, and at 1x below that
+  and on a screen at 1.45x or less, up to 3840 × 2160 pixels, from which
+  macOS starts any display HiDPI. Each window size is a display of its own
+  to an x86-64 guest: a mode the person chooses is kept for that size,
+  through restarts, and comes back when the window is that size again, and a
+  resize to another size gives that size's mode. So on a screen above 1x and
+  under 1.5x a chosen HiDPI mode does not follow a resize. A window moved to
+  a screen of another scale gives the guest a new mode.
+  `test: geometry::the_layout_carries_the_screen_s_scale`, `manual`
 - Sharp on every screen: one drawable pixel per screen pixel, following the
   window across screens of different scale. `manual`
 - Native full screen (the green button, ⌃⌘F) keeps the ratio. `manual`
 - Nothing is drawn while the window is fully hidden; it redraws when it
   shows again. `test: native::macos::render::a_hidden_window_is_drawn_when_it_shows`,
   `manual` (occlusion)
+- While an x86-64 guest's display sleeps (`pmset displaysleepnow`, Energy
+  Saver's timer), the image is black and the guest's cursor does not show,
+  as on a monitor whose panel is off; at the guest's wake, the image shows
+  the guest's desktop again, with its cursor. `manual`
 
 ## Matching the host's screen
 
-- By default the guest runs 1920×1080 at 1×, offered first with the standard
-  sizes within it, at the screen's refresh rate; the window scales it on the
-  GPU. A 4K HiDPI guest runs much slower. The screen's rate is the one it is
-  set to (its current mode's): a ProMotion screen set to 60 Hz gives the
-  guest 60, not the 120 it offers; where the current mode gives no rate, the
-  highest of the screen's modes of its size, else 60 Hz.
-  `test: policy::a_chosen_mode_comes_first_with_the_sizes_within_it`,
-  `test: policy::a_chosen_mode_is_1x`,
-  `test: screens::a_screen_runs_at_its_current_mode_s_rate`
-- With `resolution=<w>x<h>@<ppi>`, the chosen mode is told that density in
-  place of 1×. Where the guest reads it as 146.67 ppi or more (its width in
-  whole millimetres to nearest, then in whole centimetres rounded up:
-  2560x1600@148, 440.39 mm, reads 44 cm, 147.8 ppi), it runs a HiDPI
-  desktop at the mode's pixels (2560x1600@200 looks like 1280x800), which a
-  windowed window on a Retina screen shows one guest pixel per screen pixel
-  where half the mode fits; below that (@146 reads 45 cm, 144.5 ppi), and
-  for a mode narrower than 1920 pixels (1280x800@220 ran 1×), a 1× desktop
-  the window scales up on the GPU, not one shown at half size. A borderless
-  window fits either to its screen.
-  `test: policy::a_chosen_mode_at_a_chosen_ppi`,
-  `test: policy::a_chosen_density_tells_the_scale_the_guest_runs`,
-  `test: policy::the_guest_scale_follows_its_reading_in_whole_centimetres`,
-  `manual` (a VM boot)
-- With `resolution=host`, the guest is offered modes that fill the
-  window's screen: the largest 16:10, 16:9 and 4:3 sizes within its pixels,
-  16:10 first, then smaller standard sizes of each ratio, at the screen's
-  refresh rate. Their density follows the screen's scale: a Retina
-  screen gets a HiDPI (2×) guest desktop, a 1× screen a 1× one.
-  `test: policy::offered_modes_for_a_built_in_retina_screen`,
-  `test: policy::offered_modes_for_a_5k_screen`,
-  `test: policy::offered_modes_for_a_1080p_screen`,
-  `test: policy::offered_modes_are_whole_and_distinct`,
-  `test: policy::the_refresh_rate_can_be_overridden`,
-  `test: policy::the_density_is_the_screens`
-- With no host screen to match (as for a VM started from an ssh shell, with
-  no window system to reach), the guest is still offered the chosen mode and
-  the sizes within it, or 1920×1080 at 1× with `resolution=host`, at 60 Hz
-  or `REIMS_VGPU_WINDOW_REFRESH`'s rate, so it boots.
-  `test: policy::a_chosen_mode_without_a_screen_runs_at_60_hz`,
+- The guest's mode runs at the refresh rate of the screen the window opens
+  on, the one the screen is set to (its current mode's): a ProMotion screen
+  set to 60 Hz gives the guest 60, not the 120 it offers; where the current
+  mode gives no rate, the highest of the screen's modes of its size, else
+  60 Hz. With no host screen (as for a VM started from an ssh shell, with no
+  window system to reach), 60 Hz.
+  `test: screens::a_screen_runs_at_its_current_mode_s_rate`,
   `manual` (a VM boot from an ssh shell)
-- Modes the host sets (QEMU's `display-modes`) replace the offered ones.
-  `manual`
 
 ## Borderless
 
@@ -174,7 +200,9 @@ Unset or unparsable values give the defaults below.
   `test: keymap::keys_map_by_position`,
   `test: keymap::fn_and_unknown_codes_have_no_usage`
 - On ISO keyboards, the key left of 1 and the key right of left Shift arrive
-  as on a real ISO keyboard. `test: keymap::iso_swaps_section_and_grave`
+  as on a real ISO keyboard, and a key goes up as it went down though
+  another keyboard was typed on between. `test: keymap::iso_swaps_section_and_grave`,
+  `test: native::macos::input::a_key_goes_up_as_it_went_down_across_a_keyboard_change`
 - Left and right Shift, Control, Option and Command are told apart.
   `test: keys::left_and_right_modifiers_are_told_apart`,
   `test: keys::a_synthesized_modifier_takes_its_side_from_the_key`
@@ -231,8 +259,8 @@ Unset or unparsable values give the defaults below.
 
 ## Scrolling
 
-Where the host takes smooth scrolling (QEMU's apple-gfx), and the guest's
-pointing device takes it (vmapple's `usb-vmapple-tablet`):
+Where the host takes smooth scrolling (QEMU's reims-graphics-pci), and the
+guest's pointing device takes it (vmapple's `usb-vmapple-tablet`):
 
 - Trackpads and the Magic Mouse scroll the guest as far as the host reports,
   event by event, with the gesture's phases and its momentum, so the guest
@@ -290,8 +318,10 @@ QEMU's `usb-tablet`, for which the host gets each event's notches too,
   cursor where it was moves nothing. The window's next pointer move gives the
   cursor back to the host's pointer.
   `test: handle::the_guest_leads_its_cursor_when_nothing_of_the_window_s_moved_it`,
-  `test: handle::a_doorbell_reads_the_guest_s_cursor_through_the_sink`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
+  `test: reims-vgpu::graphics::sink::the_guest_s_cursor_is_drawn_over_the_frame_in_a_pass_of_its_own`,
+  `test: reims-vgpu::graphics::sink::on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame`,
   `manual`
 - Over the bars and the title bar, it is the host's arrow. `manual`
 
@@ -320,21 +350,44 @@ runtime's own device. The switches above apply, and `resolution=` too.
   and the screen a display opens on are as above. The size is asked for in
   SDL's sizes: points on Wayland, and on X11 pixels, the desktop's content
   scale of them to the point, so an X11 desktop at 200% does not open the
-  window at half its size.
+  window at half its size. The size is made smaller to the largest that
+  comes to a multiple of 16 pixels wide and an even number high, the steps
+  of the guest's modes, as SDL rounds it: on Wayland the points times the
+  scale in 120ths, rounded half away from zero (at a fractional scale such
+  as 2.1, about one size in 16 comes to a multiple of 16 pixels); on X11
+  the pixels themselves. SDL takes no resize increments, so a window the
+  person resizes, or the compositor sizes otherwise, shows the guest's mode
+  beside up to 15 columns and a row of black.
+  `test: sdl::units::a_window_opens_a_multiple_of_16_pixels_wide_at_fractional_scales`,
   `test: handle::a_window_s_title_is_reims_vgpu_and_its_port`,
   `test: geometry::a_new_window_shows_a_guest_point_per_host_point`,
   `test: sdl::units::a_window_opens_a_guest_point_per_host_point_in_sdl_s_sizes`,
   `test: screens::display_i_opens_on_screen_i`, `manual` (X11 at a content
   scale above 1 among them)
 - Wayland lets no client place a windowed window: the compositor does.
-  Borderless windows fill the screen named, over its panels. `manual`
+  Borderless windows fill the screen named, over its panels. At a
+  fractional scale a borderless window is the compositor's points for the
+  screen rounded to whole points, so its pixels can pass the screen's by one
+  (3841 × 2161 on a 3840 × 2160 screen at 2.1); the reims-graphics guest is
+  offered the screen's own 3840 × 2160 (above). `manual`
 - The host's screens are SDL's: the primary first, then top to bottom and
   left to right, each at its scale (fractional ones included) and the
   refresh rate it is set to (its current mode's, as above); a change of
   screens lays every window out again. `manual`
 - The picture: one GPU pass from the guest's frame into the swapchain's
-  image, no copy, with the display's gamma and colour matrix, in sRGB.
-  `manual`
+  image, with the display's gamma and colour matrix, in sRGB: a GPU copy
+  where the colour is at identity and the frame is the guest's scanout or a
+  surface in the image's format, else a draw, as above; the window makes no
+  other copy of it where the compositor composites on the guest's GPU.
+  Where it composites on another GPU (a GPU in an eGPU enclosure or an x4
+  slot beside the screen's), the swapchain is that GPU's, and the guest's
+  GPU first brings a mirror of the presented frame in host memory up to
+  date, copying only its 64 × 64 tiles that changed; the pass then runs on
+  the compositor's GPU from the mirror (reims-vgpu's `graphics::mirror`).
+  The compositor cannot be handed the guest's surface in
+  place: it lies in guest RAM a page a run, and a dma-buf over a 3648 × 2038
+  surface's pages would take a udmabuf list of 7,261 entries, past the 1,024
+  the kernel takes by default. `manual`
 - It never tears and never makes the guest wait: MAILBOX with at least four
   images where the compositor offers it, else FIFO; the render thread alone
   waits for an image, and a window the compositor stops showing slows only
@@ -350,11 +403,15 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `manual`
 - A window that keeps its size (the reims-graphics display's) never follows
   the guest's mode, as on macOS. `manual`
+- With several reims-graphics displays, each window is its own display's,
+  offered its own mode, rate and scale and capped by its share of the
+  scanout, and a window whose display the guest does not drive shows black,
+  as on macOS (Opening). `manual` (a VM with two displays)
 - Nothing is drawn while the window is hidden or minimized, nor before it
   and its layout exist; it redraws when it shows.
-  `test: native::linux::render::a_hidden_window_is_drawn_when_it_shows`,
-  `test: native::linux::render::nothing_is_drawn_before_the_window_and_layout`,
-  `test: native::linux::render::what_asks_for_a_draw`
+  `test: native::sdl_thread::render::a_hidden_window_is_drawn_when_it_shows`,
+  `test: native::sdl_thread::render::nothing_is_drawn_before_the_window_and_layout`,
+  `test: native::sdl_thread::render::what_asks_for_a_draw`
 - Nothing is presented while the compositor suspends the window (Wayland's
   suspended state, as KWin and Mutter set it for a covered window or one on
   another desktop): from SDL's occluded event until it is exposed again, the
@@ -368,25 +425,25 @@ runtime's own device. The switches above apply, and `resolution=` too.
   when it shows, and holds none back.
   `test: sdl::shell::a_covered_window_stops_drawing_until_exposed`,
   `test: sdl::shell::the_last_show_or_hide_of_a_batch_decides`,
-  `test: native::linux::render::a_hidden_window_takes_no_retry`, `manual`
+  `test: native::sdl_thread::render::a_hidden_window_takes_no_retry`, `manual`
 - Pointer: absolute, held at the image's nearest edge; five buttons; a
   drag ends in the guest; the click that focuses the window is not sent;
   nothing is sent before the guest has a mode.
-  `test: native::linux::input::sdl_buttons_are_the_hosts_bits`,
-  `test: native::linux::input::a_drag_ends_in_the_guest_outside_the_window`,
-  `test: native::linux::input::the_click_that_focuses_the_window_is_not_sent`,
-  `test: native::linux::input::before_the_guest_has_a_mode_the_pointer_sends_nothing`,
-  `test: native::linux::input::moves_are_sent_where_the_guest_pixel_changes`
+  `test: native::sdl_thread::input::sdl_buttons_are_the_hosts_bits`,
+  `test: native::sdl_thread::input::a_drag_ends_in_the_guest_outside_the_window`,
+  `test: native::sdl_thread::input::the_click_that_focuses_the_window_is_not_sent`,
+  `test: native::sdl_thread::input::before_the_guest_has_a_mode_the_pointer_sends_nothing`,
+  `test: native::sdl_thread::input::moves_are_sent_where_the_guest_pixel_changes`
 - Keys by position, as evdev reports them, so the guest's layout applies and
   ISO keys arrive as on a real ISO keyboard; media keys are dropped.
-  `test: native::linux::keymap::scancodes_are_usb_usages`,
-  `test: native::linux::keymap::keys_off_the_keyboard_page_are_dropped`
+  `test: native::sdl_thread::keymap::scancodes_are_usb_usages`,
+  `test: native::sdl_thread::keymap::keys_off_the_keyboard_page_are_dropped`
 - Held keys repeat at the guest's rate; host repeats are dropped. No stuck
   keys: losing the keyboard, releasing capture or closing lifts every key.
-  `test: native::linux::input::host_repeats_are_dropped`,
-  `test: native::linux::input::losing_the_keyboard_leaves_nothing_stuck`,
-  `test: native::linux::input::closing_leaves_nothing_stuck`,
-  `test: native::linux::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
+  `test: native::sdl_thread::input::host_repeats_are_dropped`,
+  `test: native::sdl_thread::input::losing_the_keyboard_leaves_nothing_stuck`,
+  `test: native::sdl_thread::input::closing_leaves_nothing_stuck`,
+  `test: native::sdl_thread::sdl::a_close_the_person_asks_for_lifts_every_key_and_ends_capture`,
   `test: sdl::shell::a_close_sends_the_key_ups_and_ends_capture_before_the_host_hears_of_it`
 - Capture: a click in the image captures the keyboard and the pointer, and
   the window then grabs the keyboard, so the compositor's own shortcuts
@@ -400,15 +457,15 @@ runtime's own device. The switches above apply, and `resolution=` too.
   both, and the grab and the hold go with the capture before it hides; the
   title says whether input is captured, as on macOS, with Ctrl+Alt+Super to
   release.
-  `test: native::linux::input::a_click_in_the_image_captures_and_is_sent`,
-  `test: native::linux::input::ctrl_alt_super_releases_capture`,
+  `test: native::sdl_thread::input::a_click_in_the_image_captures_and_is_sent`,
+  `test: native::sdl_thread::input::ctrl_alt_super_releases_capture`,
   `test: sdl::shell::the_end_lets_go_of_the_grab_and_the_holds`,
   `test: sdl::shell::the_pointer_is_held_over_the_image_in_whole_points`,
   `manual` (the grab and the hold)
 - Scrolling: the wheel's notches, or, where the host takes smooth
   scrolling, its lines at 10 points each, in no gesture (SDL gives no
   phases); the guest gets the device's own direction.
-  `test: native::linux::input::the_wheel_sends_the_devices_own_direction`
+  `test: native::sdl_thread::input::the_wheel_sends_the_devices_own_direction`
 - Cursor: over the image the guest's glyph at the image's scale, with an
   image at the screen's own scale for HiDPI; hidden when the guest hides
   its own; the host's arrow over the bars and the title bar. Where the guest's
@@ -418,9 +475,30 @@ runtime's own device. The switches above apply, and `resolution=` too.
   `test: sdl::cursor::a_glyph_is_resampled_by_nearest_pixel`,
   `test: sdl::cursor::a_short_or_empty_glyph`,
   `test: handle::a_cursor_the_guest_moves_on_its_own_is_the_window_s_to_draw`,
+  `test: reims-vgpu::graphics::tests::the_window_draws_the_cursor_the_guest_moves_on_its_own`,
+  `test: reims-vgpu::graphics::sink::on_vulkan_the_cursor_s_pass_blends_the_glyph_over_the_frame`,
   `manual`
+- With several displays' windows open, the cursor is set only by the window
+  the pointer is in: SDL's cursor is the process's, so another window's guest
+  changing its cursor, or that window's layout changing, leaves the cursor
+  over the image the pointer is in as it is.
+  `test: sdl::shell::a_window_the_pointer_is_not_in_leaves_the_cursor`,
+  `manual` (a VM with two displays)
 - Leaving: closing a window asks the host to end the VM; the window closes
   at the display's release, once its swapchain is gone. `manual`
+- A GPU that stops answering with no loss from its driver (NVIDIA's Xid 109
+  CTX SWITCH TIMEOUT), which the library recovers from on a new device,
+  parking the old one: the window hides and a new one opens in its place,
+  as a window opens (on its screen, sized for the guest's mode, borderless
+  where the windows are), and the display goes on there. The old window's
+  swapchain stays held by work that never ends, so no new one can be made
+  over it; the old window is kept hidden, never destroyed. Keys and buttons
+  held lift and capture ends before it hides. A GPU the driver reports lost
+  keeps its window, its swapchain made again on the new device. On macOS the
+  window stays as it is after such a stop.
+  `test: present::a_parked_presenter_asks_for_a_new_window`,
+  `test: native::sdl_thread::render::a_parked_window_is_drawn_only_in_its_new_window`,
+  `manual` (a boot whose GPU stops: NVIDIA's Xid 109)
 
 Not on Linux: a menu bar, Dock icon or ⌘Tab entry (the compositor's task
 bar shows the window, as `reims-vgpu`), the camera-housing fit, and trackpad

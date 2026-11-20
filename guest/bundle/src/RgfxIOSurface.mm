@@ -3,6 +3,8 @@
  */
 
 #import "RgfxIOSurface.h"
+#include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
 
@@ -13,7 +15,6 @@
 #include <dispatch/dispatch.h>
 #include <map>
 #include <mutex>
-#include <os/log.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -183,6 +184,29 @@ bool placeInPlace(IOSurfaceRef s, std::vector<ShadowPlane> *planes, uint64_t ali
 	return true;
 }
 
+/// The layout of `s` whose planes lie in its own memory as `planes` places them (placeInPlace),
+/// as an ask whether its block needs a device cache sends it (RgfxSurfacePagesLayout): each plane's
+/// offset and rows, and the bytes of a row's elements, its width over its elements' rounded up,
+/// at most its rows' pitch. A surface of more planes than the layout holds sends none.
+bool pagesLayout(IOSurfaceRef s, const std::vector<ShadowPlane> &planes,
+                 RgfxSurfacePagesLayout *out)
+{
+	if (planes.empty() || planes.size() > RGFX_SURFACE_PAGES_PLANES) {
+		return false;
+	}
+	*out = {};
+	out->plane_count = static_cast<uint32_t>(planes.size());
+	const bool flat = IOSurfaceGetPlaneCount(s) == 0;
+	for (size_t k = 0; k < planes.size(); k++) {
+		const ShadowPlane &p = planes[k];
+		const uint64_t width = flat ? IOSurfaceGetWidth(s) : IOSurfaceGetWidthOfPlane(s, k);
+		const uint64_t ew = std::max<uint64_t>(p.shape.elementWidth, 1);
+		const uint64_t texels = (width + ew - 1) / ew * p.shape.bytesPerElement;
+		out->planes[k] = {p.offset, p.pitch, std::min(texels, p.pitch), p.shape.rows};
+	}
+	return true;
+}
+
 /// The surface's facts for a log line: its id, OSType, size, allocation and each plane's size
 /// and rows.
 std::string describe(IOSurfaceRef s)
@@ -236,8 +260,9 @@ NilLog &nilLog()
 }
 
 /// newTextureWithDescriptor:iosurface:plane: answers nil for `surface`, as Metal does a texture
-/// it cannot make, for `cause`, which `detail` says more of: logged once per surface and cause,
-/// so a texture asked for every frame logs once.
+/// it cannot make, for `cause`, which `detail` says more of: counted per surface and cause, and
+/// logged once per cause and pixel format in the process (docs/conventions.md), so a texture
+/// asked for every frame, over a surface new each frame or not, logs once.
 void logNoTexture(IOSurfaceRef surface, const char *cause, const std::string &detail)
 {
 	std::string line = describe(surface) + ": no texture (" + cause + "): " + detail;
@@ -254,7 +279,10 @@ void logNoTexture(IOSurfaceRef surface, const char *cause, const std::string &de
 		}
 		entry.second = line;
 	}
-	NSLog(@"RGFX: %s", line.c_str());
+	static char site;
+	const uint32_t format = surface != nullptr ? IOSurfaceGetPixelFormat(surface) : 0;
+	if (rgfxLogFirst(&site, rgfxLogKindOf(cause) ^ format))
+		NSLog(@"RGFX: %s", line.c_str());
 }
 
 /// The surface's YCbCr matrix as one of RGFX_YCBCR_MATRIX_*. CoreVideo keeps a pixel buffer's
@@ -387,8 +415,23 @@ private:
 std::atomic<uint64_t> gCopiedAlignment{0};   // a plane where no host texture lies over it
 std::atomic<uint64_t> gCopiedUnsupported{0}; // no view in place on the device, or of its pages
 std::atomic<uint64_t> gCopiedRefused{0};     // the kext gave no block in place
+// The copies made: in the surface's shared block, or, where the kext gave none, in a block of
+// the process's own, which no other holder shares (its GPU sees theirs only through the pages).
+std::atomic<uint64_t> gCopyShared{0};
+std::atomic<uint64_t> gCopyOwn{0};
+// Of the uploads, those made while a CPU held the surface locked for writing, each synced again
+// at the CPU's unlock.
+std::atomic<uint64_t> gUploadsMidWrite{0};
+// The uploads made because such a CPU had let go of its lock (the unlock seed moved).
+std::atomic<uint64_t> gSyncsAtUnlock{0};
+// The commits that asked the kext whether such a CPU had let go of its lock yet.
+std::atomic<uint64_t> gUnlockAsks{0};
+// Whether the kext answers surfaces' lock and unlock seeds to this process's device
+// (rgfxIOSurfaceNoteSurfaceSeeds): -1 where no device said yet.
+std::atomic<int> gSurfaceSeeds{-1};
 
-const uint64_t kCopyReportNs = 10ull * 1000 * 1000 * 1000;
+// A summary, at most once a minute (docs/conventions.md).
+const uint64_t kCopyReportNs = 60ull * 1000 * 1000 * 1000;
 
 uint64_t nowNs()
 {
@@ -400,9 +443,9 @@ uint64_t nowNs()
 void reportCopies(uint64_t now)
 {
 	static std::mutex lock;
-	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, wbCount = 0, wbBytes = 0,
-	                wbNs = 0, inPlace = 0, cached = 0, forAlignment = 0, unsupported = 0,
-	                refused = 0;
+	static uint64_t last = 0, upCount = 0, upBytes = 0, upNs = 0, upMidWrite = 0, syncsAtUnlock = 0,
+	                unlockAsks = 0, wbCount = 0, wbBytes = 0, wbNs = 0, inPlace = 0, cached = 0,
+	                forAlignment = 0, unsupported = 0, refused = 0, shared = 0, own = 0;
 	std::unique_lock<std::mutex> g(lock, std::try_to_lock);
 	if (!g.owns_lock()) {
 		return;
@@ -414,21 +457,29 @@ void reportCopies(uint64_t now)
 	if (now - last < kCopyReportNs) {
 		return;
 	}
-	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns;
+	uint64_t uc = gUploads.count, ub = gUploads.bytes, un = gUploads.ns, um = gUploadsMidWrite,
+	         ul = gSyncsAtUnlock, ua = gUnlockAsks;
+	const int seeds = gSurfaceSeeds.load(std::memory_order_relaxed);
 	uint64_t wc = gWriteBacks.count, wb = gWriteBacks.bytes, wn = gWriteBacks.ns;
 	uint64_t ip = gInPlace, cc = gCached, ca = gCopiedAlignment, cu = gCopiedUnsupported,
-	         cr = gCopiedRefused;
+	         cr = gCopiedRefused, cs = gCopyShared, co = gCopyOwn;
 	// The process's id and name are the log's own.
-	os_log_info(OS_LOG_DEFAULT,
-	            "RGFX: surface copies, %.1f s: %llu uploads %.1f MiB %.2f ms, %llu write-backs "
-	            "%.1f MiB %.2f ms; views made: %llu in place (%llu cached), copies %llu for "
-	            "alignment, %llu unsupported, %llu refused by the kext",
-	            (now - last) / 1e9, uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6,
-	            wc - wbCount, (wb - wbBytes) / 1048576.0, (wn - wbNs) / 1e6, ip - inPlace,
-	            cc - cached, ca - forAlignment, cu - unsupported, cr - refused);
+	os_log_info(rgfxLog(),
+	            "RGFX: surface copies, %.1f s, unlock seeds %{public}s: %llu uploads %.1f MiB "
+	            "%.2f ms (%llu mid-write, %llu synced again at the unlock, %llu asks for it), "
+	            "%llu write-backs %.1f MiB %.2f ms; views made: %llu in place (%llu cached), "
+	            "copies %llu for alignment, %llu unsupported, %llu refused by the kext; copy "
+	            "blocks: %llu shared, %llu own",
+	            (now - last) / 1e9, seeds > 0 ? "on" : seeds == 0 ? "off" : "unknown",
+	            uc - upCount, (ub - upBytes) / 1048576.0, (un - upNs) / 1e6, um - upMidWrite,
+	            ul - syncsAtUnlock, ua - unlockAsks, wc - wbCount, (wb - wbBytes) / 1048576.0,
+	            (wn - wbNs) / 1e6, ip - inPlace, cc - cached, ca - forAlignment, cu - unsupported,
+	            cr - refused, cs - shared, co - own);
 	last = now;
-	upCount = uc, upBytes = ub, upNs = un, wbCount = wc, wbBytes = wb, wbNs = wn;
+	upCount = uc, upBytes = ub, upNs = un, upMidWrite = um, syncsAtUnlock = ul, unlockAsks = ua;
+	wbCount = wc, wbBytes = wb, wbNs = wn;
 	inPlace = ip, cached = cc, forAlignment = ca, unsupported = cu, refused = cr;
+	shared = cs, own = co;
 }
 
 /// Counts a copy of `bytes` that started at `start`.
@@ -450,6 +501,14 @@ void countView(std::atomic<uint64_t> &c)
 
 } // namespace
 
+/// A CPU's write lock of a surface as a copy was synced with its pages: `held` where a CPU held the
+/// surface locked for writing then, and `unlockSeed` the surface's unlock seed then
+/// (RgfxRegion::surfaceSeeds), which the lock's unlock moves.
+struct SyncedWrite {
+	bool held = false;
+	uint32_t unlockSeed = 0;
+};
+
 /// What every process holding a surface's shared block agrees on, in the block past the planes'
 /// rows, or at its start in place (RgfxSurfaceShadow::header): for a copy, the surface's seed
 /// when the block last matched the surface's pages, valid where `serial` is the block's own (a
@@ -459,12 +518,17 @@ void countView(std::atomic<uint64_t> &c)
 /// surface names (rgfxIOSurfaceUses), and how many processes hold the surface, which the kext
 /// writes as it caches the block, as a process holds the block again and as each client of the
 /// surface goes (its kRgfxSurfaceClientsOffset; 0 where it wrote none), which WindowServer's keep
-/// reads.
+/// reads. And for a copy synced while a CPU held the surface locked for writing (its lock seed
+/// past its unlock seed, RgfxRegion::surfaceSeeds), `writeHeld` is 1 and `unlockSeed` the unlock
+/// seed then: the copy holds the pages as they were mid-write, and syncs again once the unlock
+/// seed moves (RgfxSurfaceShadow::changed).
 struct RgfxSurfaceHeader {
 	uint64_t serial;
 	uint32_t seed;
 	uint32_t clients;
 	uint64_t cpuGen;
+	uint32_t unlockSeed;
+	uint32_t writeHeld;
 };
 
 static_assert(offsetof(RgfxSurfaceHeader, cpuGen) == kRgfxSurfaceCpuGenOffset,
@@ -492,6 +556,10 @@ struct RgfxSurfaceShadow {
 	RgfxRegion *region = nullptr; // where the block goes back at the copy's end
 	id<MTLBuffer> buffer = nil; // the Shared buffer over the view: the pages, or the block
 	std::mutex lock;            // one sync at a time in this process
+	// Held by the thread that makes the view, from its entry in the registry until its buffer,
+	// and a copy's first upload, are made: a thread that finds the view meanwhile waits for it
+	// (shadowFor), as its texture names the buffer.
+	std::mutex making;
 	bool shared = false;        // the plane's shared block, else this process's own
 	bool inPlace = false;       // the GPU uses the surface's pages; the block holds no copy
 	bool cached = false;        // in place, and its GPU copy is the host's device cache
@@ -504,6 +572,7 @@ struct RgfxSurfaceShadow {
 	uint64_t serial = 0;        // the shared block's
 	RgfxSurfaceHeader *header = nullptr; // the shared block's, past the planes' rows of a copy
 	uint32_t seed = 0;          // this process's own block: the seed when it last matched
+	SyncedWrite ownWrite;       // and the write lock held then (RgfxSurfaceHeader::writeHeld)
 	RgfxSurfaceWriters *writers = nullptr; // past the header: the buffers a present waits for
 	uint64_t writersAt = 0;                 // their offset in the block
 	std::mutex writersLock;                 // one change of this process's slots at a time
@@ -724,38 +793,75 @@ struct RgfxSurfaceShadow {
 		return f;
 	}
 
-	/// The surface's seed when the block last matched its pages; false where it never has.
-	bool syncedSeed(uint32_t *out) const
+	/// The surface's seed when the block last matched its pages, and the write lock a CPU held
+	/// then; false where it never has.
+	bool syncedSeed(uint32_t *out, SyncedWrite *write = nullptr) const
 	{
 		if (!shared) {
 			*out = seed;
+			if (write != nullptr)
+				*write = ownWrite;
 			return true;
 		}
 		if (__atomic_load_n(&header->serial, __ATOMIC_ACQUIRE) != serial) {
 			return false;
 		}
 		*out = __atomic_load_n(&header->seed, __ATOMIC_ACQUIRE);
+		if (write != nullptr) {
+			write->held = __atomic_load_n(&header->writeHeld, __ATOMIC_ACQUIRE) != 0;
+			write->unlockSeed = __atomic_load_n(&header->unlockSeed, __ATOMIC_ACQUIRE);
+		}
 		return true;
 	}
 
-	/// The block matches the surface's pages as of seed `s`.
-	void setSynced(uint32_t s)
+	/// The block matches the surface's pages as of seed `s`, a CPU holding the surface locked
+	/// for writing then where `write.held` (until the unlock seed moves past `write.unlockSeed`).
+	void setSynced(uint32_t s, SyncedWrite write = {})
 	{
 		if (!shared) {
 			seed = s;
+			ownWrite = write;
 			return;
 		}
+		// The write lock first: a holder that reads the new seed reads the lock with it.
+		__atomic_store_n(&header->unlockSeed, write.unlockSeed, __ATOMIC_RELEASE);
+		__atomic_store_n(&header->writeHeld, write.held ? 1u : 0u, __ATOMIC_RELEASE);
 		__atomic_store_n(&header->seed, s, __ATOMIC_RELEASE);
 		__atomic_store_n(&header->serial, serial, __ATOMIC_RELEASE);
 	}
 
-	/// Whether the surface's seed moved since the block last matched it, in any process that
-	/// holds the block: a CPU wrote the surface under a lock. Caller holds `lock`.
-	bool changed() const
+	/// The write lock a CPU holds on the surface now, as the kext reads its seeds: held where the
+	/// lock seed is past the unlock seed (IOSurface moves the first at a write lock, the second at
+	/// its unlock, both at a GPU write). None known without the kext's seeds.
+	SyncedWrite writeNow() const
+	{
+		uint32_t lockSeed = 0, unlockSeed = 0;
+		if (region == nullptr || !region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed))
+			return {};
+		return {lockSeed != unlockSeed, unlockSeed};
+	}
+
+	/// Why the block no longer matches the surface's pages, in any process that holds the
+	/// block: the surface's seed moved since it last did (a CPU wrote the surface under a lock),
+	/// or it was synced while a CPU held its write lock, which the CPU has let go since (the
+	/// unlock seed moved): the copy holds the pages as they were mid-write. Caller holds `lock`.
+	enum class Change { None, Seed, Unlock };
+	Change change() const
 	{
 		uint32_t synced = 0;
-		return !syncedSeed(&synced) || IOSurfaceGetSeed(surface) != synced;
+		SyncedWrite write = {};
+		if (!syncedSeed(&synced, &write) || IOSurfaceGetSeed(surface) != synced)
+			return Change::Seed;
+		if (!write.held)
+			return Change::None;
+		gUnlockAsks.fetch_add(1, std::memory_order_relaxed);
+		uint32_t lockSeed = 0, unlockSeed = 0;
+		return region != nullptr && region->surfaceSeeds(surfaceId, &lockSeed, &unlockSeed) &&
+		               unlockSeed != write.unlockSeed
+		           ? Change::Unlock
+		           : Change::None;
 	}
+	bool changed() const { return change() != Change::None; }
 
 	/// Pages -> copy, under a read lock of the surface taken before `lock` (the views' lock
 	/// order, ViewLock), where `always` or the seed moved (changed) as `lock` is taken; records
@@ -771,7 +877,12 @@ struct RgfxSurfaceShadow {
 			return;
 		}
 		ViewLock g(lock);
-		const bool copies = always || changed();
+		const Change why = always ? Change::Seed : change();
+		const bool copies = why != Change::None;
+		// A CPU that holds the surface locked for writing as the copy is made may not have
+		// written all of it yet: the copy is synced again at its unlock (changed). One that
+		// locks it later moves the seed past `s`.
+		const SyncedWrite write = copies ? writeNow() : SyncedWrite{};
 		for (size_t k = 0; copies && k < planes.size(); k++) {
 			const ShadowPlane &p = planes[k];
 			const uint8_t *src = planeBase(surface, k);
@@ -781,8 +892,12 @@ struct RgfxSurfaceShadow {
 		}
 		IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, &s);
 		if (copies) {
-			setSynced(s);
+			setSynced(s, write);
 			countCopy(gUploads, planeBytes(), start);
+			if (write.held)
+				gUploadsMidWrite.fetch_add(1, std::memory_order_relaxed);
+			if (why == Change::Unlock)
+				gSyncsAtUnlock.fetch_add(1, std::memory_order_relaxed);
 		}
 	}
 
@@ -806,13 +921,16 @@ struct RgfxSurfaceShadow {
 			}
 		}
 		if (cpu != nullptr) {
-			setSynced(cpu->unlock());
+			const uint32_t s = cpu->unlock();
+			// Another process's CPU may hold its own write lock still.
+			setSynced(s, writeNow());
 		}
 		countCopy(gWriteBacks, planeBytes(), start);
 	}
 
-	/// Uploads when the surface's seed moved since the block last matched it, in any process
-	/// that holds the block: a CPU wrote the surface under a lock. Nothing in place.
+	/// Uploads where the block no longer matches the surface's pages (changed): a CPU wrote the
+	/// surface under a lock since, or let go of the write lock it held as the block was last
+	/// synced. Nothing in place.
 	void uploadIfChanged()
 	{
 		if (inPlace) {
@@ -909,14 +1027,21 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 	uint32_t surfaceId = IOSurfaceGetID(surface);
 	Registry &r = registry();
 	std::shared_ptr<RgfxSurfaceShadow> shadow;
+	// The new view's `making`, held from its entry in the registry until this returns; after
+	// `shadow`, so it is let go before a view not made dies.
+	std::unique_lock<std::mutex> making;
 	{
-		std::lock_guard<std::mutex> g(r.lock);
+		std::unique_lock<std::mutex> g(r.lock);
 		auto it = r.shadows.find(surfaceId);
 		if (it != r.shadows.end()) {
 			shadow = it->second.lock();
 			// A live copy holds its surface, so its id still names that surface.
 			if (shadow != nullptr) {
-				return shadow;
+				// Its maker may be making its buffer still: once it lets go, the buffer is
+				// made, or never will be (the maker logged why), and no view is given.
+				g.unlock();
+				std::lock_guard<std::mutex> made(shadow->making);
+				return shadow->buffer != nil ? shadow : nullptr;
 			}
 		}
 		shadow = std::make_shared<RgfxSurfaceShadow>();
@@ -939,10 +1064,15 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			// writes stays in its memory as a window does (design.md, "The device cache"). The
 			// outputs of the bundle's own video decoder ask none where the host lands no picture
 			// in a cache (RgfxAskUncachedScope), its decode writing their pages.
+			// Its layout goes with the ask, by which a host whose GPU shares the CPU's memory
+			// keeps a device cache only of a surface its textures cannot use in place.
 			const bool cacheable = tAskUncached == 0;
+			RgfxSurfacePagesLayout layout = {};
+			const bool laidOut = pagesLayout(surface, own, &layout);
 			RgfxRegion::PagesAnswer answer = RgfxRegion::kPagesRefused;
 			sharedBlock = region->acquireSurfacePages(IOSurfaceGetBaseAddress(surface), ownLength,
-			                                          ownSize, surfaceId, cacheable, &answer);
+			                                          ownSize, surfaceId, cacheable,
+			                                          laidOut ? &layout : nullptr, &answer);
 			if (sharedBlock.block.ok) {
 				shadow->inPlace = true;
 				// Whoever made the block decided: a block another holder made cached is cached
@@ -981,6 +1111,10 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 			if (!sharedBlock.block.ok) {
 				shadow->block = region->allocate(size);
 			}
+			if (sharedBlock.block.ok)
+				gCopyShared.fetch_add(1, std::memory_order_relaxed);
+			else if (shadow->block.ok)
+				gCopyOwn.fetch_add(1, std::memory_order_relaxed);
 			if (!shadow->block.ok && !sharedBlock.block.ok) {
 				uint64_t free = 0;
 				std::string room = region->freeBytes(&free)
@@ -1019,6 +1153,7 @@ std::shared_ptr<RgfxSurfaceShadow> shadowFor(IOSurfaceRef surface, RgfxRegion *r
 		shadow->readers = shadow->writers + 1;
 		if (!shadow->shared || sharedBlock.fresh)
 			std::memset(static_cast<void *>(shadow->writers), 0, 2 * sizeof(RgfxSurfaceWriters));
+		making = std::unique_lock<std::mutex>(shadow->making);
 		r.shadows[surfaceId] = shadow;
 	}
 	uint64_t offset = shadow->block.offset;
@@ -1356,8 +1491,14 @@ void rgfxIOSurfaceKeepCountClients(bool on)
 	gCountsClients.store(on ? 1 : 0, std::memory_order_relaxed);
 }
 
+void rgfxIOSurfaceNoteSurfaceSeeds(bool on)
+{
+	gSurfaceSeeds.store(on ? 1 : 0, std::memory_order_relaxed);
+}
+
 @interface RgfxIOSurfaceTexture ()
 - (std::shared_ptr<RgfxSurfaceShadow>)rgfxShadow;
+- (uint64_t)rgfxOffsetInPlane;
 @end
 
 @implementation RgfxIOSurfaceTexture {
@@ -1514,6 +1655,12 @@ static const std::shared_ptr<RgfxSurfaceShadow> &rgfxShadowOfRoot(
 	return _plane;
 }
 
+// Bytes from the plane's first byte to the texture's: 0 for a texture over its whole plane.
+- (uint64_t)rgfxOffsetInPlane
+{
+	return _offset;
+}
+
 // The bytes the texture takes: its copy of the surface in the region, or the surface's pages its
 // buffer lies over in place (SecurityAgent's RenderBox asks as it accounts a surface's texture).
 - (NSUInteger)allocatedSize
@@ -1650,6 +1797,39 @@ static void rgfxNoteSync(RgfxEncoder *enc, const std::shared_ptr<RgfxSurfaceShad
 		return;
 	view->syncedBy.store(stamp, std::memory_order_relaxed);
 	enc->noteSurfaceSync(view);
+}
+
+uint64_t rgfxPlaneRowsHeld(const uint64_t *offsets, size_t count, size_t plane, uint64_t pitch,
+                           uint64_t end)
+{
+	if (plane >= count || pitch == 0)
+		return 0;
+	const uint64_t first = offsets[plane];
+	for (size_t k = 0; k < count; k++) {
+		if (offsets[k] > first && offsets[k] < end)
+			end = offsets[k];
+	}
+	return end > first ? (end - first) / pitch : 0;
+}
+
+uint64_t rgfxIOSurfaceRowsHeld(__unsafe_unretained id texture)
+{
+	if (!RgfxIsResource(texture))
+		return 0;
+	__unsafe_unretained RgfxIOSurfaceTexture *root = ((RgfxResource *)texture)->_rgfxSurfaceRoot;
+	if (root == nil || root != texture)
+		return 0;
+	const std::shared_ptr<RgfxSurfaceShadow> &view = rgfxShadowOfRoot(root);
+	if (view == nullptr || !view->inPlace || [root rgfxOffsetInPlane] != 0)
+		return 0;
+	std::vector<uint64_t> offsets;
+	for (const ShadowPlane &p : view->planes)
+		offsets.push_back(p.offset);
+	const size_t plane = root.iosurfacePlane;
+	if (plane >= view->planes.size())
+		return 0;
+	return rgfxPlaneRowsHeld(offsets.data(), offsets.size(), plane, view->planes[plane].pitch,
+	                         IOSurfaceGetAllocSize(view->surface));
 }
 
 void rgfxIOSurfaceNoteWrite(RgfxEncoder *enc, __unsafe_unretained id texture)
@@ -1891,7 +2071,7 @@ void rgfxIOSurfaceWritesPosted(RgfxRegion *region, const std::vector<std::shared
 	region->noteSurfaceWrites(queueObjId, seqno, words.data(),
 	                          static_cast<uint32_t>(words.size() / 2));
 	// The kext moved each surface's seed for the GPU's write, which a copy holds: the copy now
-	// stands for the surface as of that seed.
+	// stands for the surface as of that seed, over any write a CPU's lock held meanwhile is for.
 	for (RgfxSurfaceShadow *s : named) {
 		if (s->inPlace) {
 			continue;

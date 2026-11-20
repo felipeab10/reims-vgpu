@@ -41,7 +41,7 @@ GFX=${GFX:--device reims-graphics-pci,id=gfx,bus=pcie.0,addr=0x4,romfile=$ROM}
 cat > "$B/run.sh" <<RUNEOF
 #!/bin/bash
 export WAYLAND_DISPLAY=wayland-1 DISPLAY=:0 XDG_RUNTIME_DIR=/run/user/1000 XDG_SESSION_TYPE=wayland DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus
-export REIMS_VGPU_LOG=\${REIMS_VGPU_LOG:-info} REIMS_VGPU_WINDOW_BORDERLESS=1
+export REIMS_VGPU_LOG=\${REIMS_VGPU_LOG:-info,reims_vgpu::graphics::shown=debug,reims_vgpu::graphics::library=debug,reims_vgpu::graphics::queues=debug} REIMS_VGPU_WINDOW_BORDERLESS=1
 export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
 # Powers QEMU (this shell's pid, which execs it) off after \$1 s. It ends when QEMU does, and kills
 # only the same process: the pid's start time (/proc stat field 22) must not have changed.
@@ -78,7 +78,7 @@ exec $QEMU -name rgk-$TAG \\
   -cpu Skylake-Client-noTSX-IBRS,kvm=on,vendor=GenuineIntel,+invtsc,vmware-cpuid-freq=on,vmx=on,+ssse3,+sse4.2,+popcnt,+avx,+aes,+xsave,+xsaveopt,check \\
   -smp 8,sockets=1,cores=8,threads=1 \\
   -global ICH9-LPC.acpi-pci-hotplug-with-bridge-support=off -global ICH9-LPC.disable_s3=1 \\
-  -device pcie-root-port,bus=pcie.0,addr=0x1,slot=1,x-speed=16,x-width=32 \\
+  -device pcie-root-port,bus=pcie.0,addr=0x1,slot=1,speed=16,width=32 \\
   -device 'isa-applesmc,osk=ourhardworkbythesewordsguardedpleasedontsteal(c)AppleComputerInc' \\
   -drive if=pflash,format=raw,readonly=on,file=/home/aneesiqbal/.local/share/reims-ctl/vms/macos-26/OVMF_CODE.fd \\
   -drive if=pflash,format=raw,file=$B/OVMF_VARS.fd \\

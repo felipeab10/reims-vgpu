@@ -7,7 +7,7 @@
 	<key>CFBundleExecutable</key>
 	<string>ReimsGraphics</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.steelbrain.ReimsGraphics</string>
+	<string>ai.aneesiqbal.ReimsGraphics</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
@@ -27,7 +27,7 @@
 		<key>ReimsGraphics</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.ReimsGraphics</string>
+			<string>ai.aneesiqbal.ReimsGraphics</string>
 			<key>IOClass</key>
 			<string>ReimsGraphics</string>
 			<key>IOMatchCategory</key>
@@ -42,7 +42,7 @@
 		<key>RgfxDeviceControl</key>
 		<dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.ReimsGraphics</string>
+			<string>ai.aneesiqbal.ReimsGraphics</string>
 			<key>IOClass</key>
 			<string>RgfxDeviceControl</string>
 			<key>IOMatchCategory</key>
@@ -56,42 +56,18 @@
 		</dict>
 		<key>RgfxAccelerator</key>
 		<dict>
-			<key>AcceleratorProperties</key>
-			<dict>
-				<key>IOAccelDisplayPipeCapabilities</key>
-				<dict>
-					<key>DisplayPipeSupported</key>
-					<true/>
-					<key>TransactionsSupported</key>
-					<true/>
-				</dict>
-				<key>IOMatchCategory</key>
-				<string>IOAccelerator</string>
-			</dict>
 			<key>CFBundleIdentifier</key>
-			<string>com.steelbrain.ReimsGraphics</string>
-			<key>DisplayPortCount</key>
-			<integer>1</integer>
+			<string>ai.aneesiqbal.ReimsGraphics</string>
 			<key>IOClass</key>
 			<string>RgfxAccelerator</string>
-			<key>IODVDBundleName</key>
-			<string>reims-graphics</string>
-			<key>IOGVACodec</key>
-			<string>RgfxVideo</string>
 			<key>IOMatchCategory</key>
 			<string>IOAccelerator</string>
-			<key>IOVARendererID</key>
-			<integer>16908292</integer>
 			<key>IOPCIPrimaryMatch</key>
 			<string>0x52471234</string>
 			<key>IOProbeScore</key>
 			<integer>30000</integer>
 			<key>IOProviderClass</key>
 			<string>IOPCIDevice</string>
-			<key>MetalPluginClassName</key>
-			<string>RgfxMetalDevice</string>
-			<key>MetalPluginName</key>
-			<string>reims-graphics</string>
 		</dict>
 	</dict>
 	<key>LSMinimumSystemVersion</key>
@@ -100,6 +76,8 @@
 	<dict>
 		<key>com.apple.AppleGraphicsDeviceControl</key>
 		<string>1.0.0</string>
+		<key>com.apple.iokit.IOAcceleratorFamily2</key>
+		<string>2.0.0</string>
 		<key>com.apple.iokit.IOGraphicsFamily</key>
 		<string>1.0.0b1</string>
 		<key>com.apple.iokit.IOPCIFamily</key>
@@ -113,6 +91,8 @@
 		<key>com.apple.kpi.libkern</key>
 		<string>20.0.0</string>
 		<key>com.apple.kpi.mach</key>
+		<string>20.0.0</string>
+		<key>com.apple.kpi.unsupported</key>
 		<string>20.0.0</string>
 	</dict>
 	<key>OSBundleRequired</key>

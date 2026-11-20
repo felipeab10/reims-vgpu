@@ -56,6 +56,38 @@ inline bool rgfxSubmitRoutesQueueDestroy(uint32_t type)
 	return type == RGFX_CMD_OBJECT_DESTROY;
 }
 
+// The size of a message of `type` kRgfxAccelMethodSubmitBatch takes, 0 for a type it does not
+// take: an OBJECT_DESTROY; the creates no one waits for that name no block, a BUFFER_AT_OFFSET
+// (the buffer a heap places at an offset), a TEXTURE_CREATE, a TEXTURE_VIEW, a
+// MANAGED_TEXTURE_CREATE and a MANAGED_BUFFER_CREATE; and a BUFFER_DID_MODIFY_RANGE, a write into
+// a Managed buffer the host carries out before any command buffer after it. None is waited for
+// nor names a block (rgfxRegionSpans), and each is of one size, which its header must name. A
+// TEXTURE_FROM_IOSURFACE is not taken: a present of the surface by any process waits for it on
+// the host, so it goes on the ring as it is made. The caller also checks each obj_id lies in the
+// sender's context, routes a queue's destroy as rgfxSubmitRoutesQueueDestroy says, and follows a
+// create with its destroy as rgfxSubmitDestroysBehind says.
+inline uint32_t rgfxSubmitBatchSize(uint32_t type)
+{
+	switch (type) {
+	case RGFX_CMD_OBJECT_DESTROY:
+		return sizeof(RgfxObjectDestroy);
+	case RGFX_CMD_BUFFER_AT_OFFSET:
+		return sizeof(RgfxBufferAtOffset);
+	case RGFX_CMD_TEXTURE_CREATE:
+		return sizeof(RgfxTextureCreate);
+	case RGFX_CMD_TEXTURE_VIEW:
+		return sizeof(RgfxTextureView);
+	case RGFX_CMD_MANAGED_TEXTURE_CREATE:
+		return sizeof(RgfxManagedTextureCreate);
+	case RGFX_CMD_MANAGED_BUFFER_CREATE:
+		return sizeof(RgfxManagedBufferCreate);
+	case RGFX_CMD_BUFFER_DID_MODIFY_RANGE:
+		return sizeof(RgfxBufferDidModifyRange);
+	default:
+		return 0;
+	}
+}
+
 // Whether an accepted `type` is a pipeline create: a render, mesh render or compute pipeline's,
 // which the device answers with a PIPELINE_REFLECTION, and which alone a client may post
 // deferred (kRgfxSubmitDeferred).
@@ -67,8 +99,10 @@ inline bool rgfxSubmitIsPipelineCreate(uint32_t type)
 
 // Whether a message of an accepted `type` makes a host object under its obj_id, which an
 // OBJECT_DESTROY of that id drops. The destroy, the queries (a heap texture's size, an argument
-// layout) and the writes into an object already made (a Managed range or region, a shared
-// event's value, an indirect command buffer's commands) make none. A type the wire does not name makes none: the device refuses it.
+// layout) and the writes into an object already made (a Managed range or region, a texture's
+// didModifyData, a shared event's value, an indirect command buffer's commands, a visible
+// function table's entries) make none. A
+// type the wire does not name makes none: the device refuses it.
 inline bool rgfxSubmitMakes(uint32_t type)
 {
 	switch (type) {
@@ -101,6 +135,10 @@ inline bool rgfxSubmitMakes(uint32_t type)
 	case RGFX_CMD_VIDEO_SESSION_CREATE:
 	case RGFX_CMD_BUFFER_OVER_PAGES:
 	case RGFX_CMD_ICB_CREATE:
+	case RGFX_CMD_RATE_MAP_CREATE:
+	case RGFX_CMD_FUNCTION_HANDLE_CREATE:
+	case RGFX_CMD_FUNCTION_TABLE_CREATE:
+	case RGFX_CMD_DYNAMIC_LIBRARY_CREATE:
 		return true;
 	default:
 		return false;

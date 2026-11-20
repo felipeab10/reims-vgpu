@@ -30,9 +30,26 @@
 //! (an RTX 5080 Laptop GPU's NVIDIA driver under KWin), while its feature, like any the runtime
 //! enables for a listed extension, would be one more a device could be refused for.
 //!
+//! **A compositor on another GPU (measured).** The swapchain is made on its queue's device: the
+//! runtime's, or, where the window system names another GPU the compositor composites on, a
+//! device of the window's own there, which presents the guest's frames from a mirror in host
+//! memory (reims-vgpu's `graphics::vulkan`, "The compositor's GPU"). On the runtime's device with the
+//! compositor on another GPU (a GPU in an eGPU enclosure or an x4 slot beside the integrated GPU
+//! that drives the screen, or a laptop's discrete GPU beside the panel's), each present crosses
+//! the GPU's link once. An RTX 3090 on PCIe 3.0 x4 under KWin on
+//! a Radeon 780M (NVIDIA 620.70.06, 2026-11-13) handed KWin four LINEAR XRGB8888 buffers of the
+//! window's size (3648 x 2039, 29.75 MB), and each present moved one of them; on a desktop walk
+//! the window presented 0.93 times for each of the guest's presents. The 3090's link carries
+//! 1.83 GB/s from the GPU to the host, whichever queue family copies, so a present of that size
+//! takes 16.4 ms of it: 61 presents a second at most, with nothing else crossing. Only its
+//! graphics family presents to the surface. Where the compositor runs on the runtime's GPU (an
+//! RTX 5080 Laptop GPU driving its panel), the buffers are the GPU's own tiled images, and
+//! nothing crosses. docs/graphics-kext/design.md (Decided, 14) has the walks, and the window
+//! shown by the compositor's GPU.
+//!
 //! **Pacing, on the render thread.** Each draw takes the next image with a fence, and waits for the
 //! fence, up to [`WAIT_NS`]: that is the render thread's wait for the compositor, as `nextDrawable`
-//! is on the Metal platform's window. Where the presentation engine has no image to give (every one
+//! is on a Metal window. Where the presentation engine has no image to give (every one
 //! queued or shown, as a FIFO-only surface's are when frames come faster than the screen shows
 //! them), the take waits for one in the window system, in calls of [`TAKE_NS`] each, for up to
 //! [`WAIT_NS`] in all, read on the monotonic clock ([`take_image`]): the draw goes on as the engine
@@ -65,8 +82,8 @@
 //! surface's. One the compositor reports out of date or suboptimal is made again at the next
 //! draw. Making a new one waits for the old one's frames to complete, then passes the old one as
 //! `oldSwapchain` and retires it (below). A swapchain the surface refuses for now (it has no
-//! pixels, as a minimized window's may) is tried again at the next draw; only a lost surface
-//! ends the swapchain's draws ([`Acquired::Failed`]).
+//! pixels, as a minimized window's may) is tried again at the next draw; only a lost surface, or
+//! the device's recovery (below), ends the swapchain's draws ([`Acquired::Failed`]).
 //!
 //! **Retiring one, with no wait on the queue.** A retired swapchain, its images' textures and
 //! their semaphores are destroyed once nothing uses them: its frames' command buffers have
@@ -106,6 +123,31 @@
 //! the loader's terminator, which finds the device by that word: it is called with the word put
 //! back too (`rt::Device::with_loader_word`).
 //!
+//! **Across the device's recoveries.** The swapchain's objects (the swapchain itself, its
+//! images' semaphores, its fences, the commands looked up) are of the generation of the device
+//! they were made on (`crate::generation`), and the runtime's textures over its images are too.
+//! Once the runtime has made its `VkDevice` again, the next take ends the swapchain's draws
+//! ([`Acquired::Failed`]): the window's render thread lets it go, which destroys its objects on
+//! the old `VkDevice`, and makes a new one, on the new `VkDevice`, at its next draw. A frame
+//! encoded on the new `VkDevice` signals no semaphore of the old one, and a present whose queue a
+//! recovery moved presents nothing. Before the new `VkDevice` serves, the runtime's recovery has
+//! waited for each of the old one's queues to idle, each under its lock, so a present made there
+//! is taken as complete as after any wait for the queue to idle (metal2vulkan's `device/line.rs`,
+//! read from its code).
+//!
+//! **A parked `VkDevice`.** Where the old `VkDevice` stopped with no loss from the driver and the
+//! runtime parked it (`crate::generation`, "A parked generation"), its queues never idle and its
+//! presents never complete: the swapchain, its images' semaphores and its fences stay in use by
+//! work that never ends. The next take then answers [`Acquired::Parked`], and the swapchain's end
+//! waits for nothing and destroys none of them, nor the surface they are made over (Vulkan
+//! destroys a surface only after its swapchains); it lets go only of the runtime's textures over
+//! its images and the command buffers of its frames, which the runtime leaves as they are on
+//! that device. A new swapchain over the same window would fail
+//! (`VK_ERROR_NATIVE_WINDOW_IN_USE_KHR` while the old one lives, and an `oldSwapchain` of another
+//! `VkDevice` is no valid one), so the window opens a new window and makes its swapchain there,
+//! leaving the old window, hidden, to the old swapchain (reims-vgpu-window's `present`). A
+//! recovery from a loss the driver reported (`VK_ERROR_DEVICE_LOST`) keeps the path above.
+//!
 //! **What the runtime announces.** Each batch that uses an image moves it from
 //! `PRESENT_SRC_KHR`, its layout between batches, into `GENERAL` and back: two whole-image
 //! barriers per frame, which the runtime announces once as a degradation of its own.
@@ -115,12 +157,13 @@ use std::ffi::c_void;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::core::platform::Handle as _;
+use crate::core::platform::os::Clock as _;
+use crate::core::sync::{Mutex, MutexGuard};
+use crate::generation::Generation;
 use ash::{khr, vk};
 use metal2vulkan::metal::{PixelFormat, TextureUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle as _;
-use reims_vgpu_core::platform::os::Clock as _;
-use reims_vgpu_core::sync::{Mutex, MutexGuard};
 
 use crate::gpu::command::{VulkanCommandBuffer, VulkanCommandQueue};
 use crate::gpu::device::VulkanDevice;
@@ -313,8 +356,23 @@ pub enum Acquired {
     /// No image yet: the compositor has not given one back in time, or the swapchain was made
     /// again. The draw is tried again.
     Retry,
-    /// No image, nor will there be: the surface is lost, or the device.
+    /// No image, nor will there be: the surface is lost, or the device, or the device recovered
+    /// on a new `VkDevice` (the module doc).
     Failed,
+    /// No image, nor will there be: the device stopped and recovered on a new `VkDevice`, the old
+    /// one parked, so the swapchain is left as it is and holds the window's surface for good (the
+    /// module doc, "A parked `VkDevice`"). The swapchain's end leaves its objects; a new swapchain
+    /// needs a new window.
+    Parked,
+}
+
+/// What a take answers once the swapchain's generation no longer serves the device: the old
+/// `VkDevice` parked ([`Acquired::Parked`]) or lost ([`Acquired::Failed`]) (the module doc).
+fn after_recovery(parked: bool) -> Acquired {
+    match parked {
+        true => Acquired::Parked,
+        false => Acquired::Failed,
+    }
 }
 
 /// An image a draw took, until it is presented or kept for the next draw.
@@ -378,7 +436,10 @@ impl Fences {
         match unsafe { vk.create_fence(&vk::FenceCreateInfo::default(), None) } {
             Ok(fence) => Some(fence),
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkCreateFence: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkCreateFence: {e}"
+                );
                 None
             }
         }
@@ -450,6 +511,9 @@ impl Presents {
 pub struct Swapchain {
     /// The presenting queue, whose `VkQueue` presents (the module doc).
     present: rt::CommandQueue,
+    /// The generation of the device the swapchain's objects are made on, with the presenting
+    /// queue's `VkQueue` there (the module doc, "Across the device's recoveries").
+    generation: Generation,
     /// The queue's device, whose textures the images are.
     device: VulkanDevice,
     /// The runtime's logical device.
@@ -488,6 +552,8 @@ pub struct Swapchain {
     lost: bool,
     /// The last making of the swapchain was refused, which was logged: the next refusal is not.
     refusing: bool,
+    /// The swapchain's `VkDevice` stopped and is parked: its objects are left (the module doc).
+    parked: bool,
 }
 
 impl std::fmt::Debug for Swapchain {
@@ -614,38 +680,50 @@ impl Swapchain {
         surface: vk::SurfaceKHR,
     ) -> Result<Swapchain, Refused> {
         let device = queue.device.clone_ref();
-        // SAFETY: the handles are the runtime's, used only while `device` lives, which the
-        // swapchain holds; nothing here destroys them.
-        let raw = unsafe { device.raw.raw() };
-        let surface_api = khr::surface::Instance::new(raw.entry, raw.instance);
-        let (vk, physical) = (raw.device.clone(), raw.physical_device);
-        let families = raw.queue_families.to_vec();
-        let Some(swapchain_api) = SwapchainFns::load(&device.raw) else {
+        let surface_api = {
+            // SAFETY: the instance's commands, of the instance every generation of the device
+            // shares, used only while `device` lives, which the swapchain holds; nothing here
+            // destroys them.
+            let raw = unsafe { device.raw.raw() };
+            khr::surface::Instance::new(raw.entry, raw.instance)
+        };
+        let unmade = |reason: Refused| {
             let _wsi = WSI.lock();
             // SAFETY: the surface is this call's, and nothing was made of it.
             unsafe { surface_api.destroy_surface(surface, None) };
-            return Err(Refused(
-                "the device has no swapchain commands (no VK_KHR_swapchain)".to_owned(),
-            ));
+            reason
         };
-        let drawables = crate::os::Drawables::load(&device.raw);
         let present = match device.raw.new_command_queue_for_presenting() {
             Ok(present) => present,
-            Err(e) => {
-                let _wsi = WSI.lock();
-                // SAFETY: the surface is this call's, and nothing was made of it.
-                unsafe { surface_api.destroy_surface(surface, None) };
-                return Err(Refused(format!("no presenting queue: {e}")));
-            }
+            Err(e) => return Err(unmade(Refused(format!("no presenting queue: {e}")))),
         };
+        let generation = match Generation::serving(&present) {
+            Ok(generation) => generation,
+            Err(e) => return Err(unmade(Refused(format!("no presenting queue: {e}")))),
+        };
+        let (vk, physical, families) = {
+            // SAFETY: the handles are the generation's, used only while it lives, which the
+            // swapchain holds; nothing here destroys them.
+            let raw = unsafe { generation.raw() };
+            (
+                raw.device.clone(),
+                raw.physical_device,
+                raw.queue_families.to_vec(),
+            )
+        };
+        let Some(swapchain_api) = SwapchainFns::load(generation.device()) else {
+            return Err(unmade(Refused(
+                "the device has no swapchain commands (no VK_KHR_swapchain)".to_owned(),
+            )));
+        };
+        let drawables = crate::os::Drawables::load(generation.device());
         let wsi = WSI.lock();
         let destroy = |reason: Refused| {
             // SAFETY: the surface is this call's, and nothing was made of it.
             unsafe { surface_api.destroy_surface(surface, None) };
             reason
         };
-        // SAFETY: the closure only reads the family; it submits nothing.
-        let family = unsafe { present.with_vk_queue(|_, family| family) };
+        let family = generation.family();
         // SAFETY: `surface` and `physical` are live, of one instance.
         let presents =
             unsafe { surface_api.get_physical_device_surface_support(physical, family, surface) }
@@ -679,6 +757,7 @@ impl Swapchain {
             crate::os::present_fences(crate::platform::device_options()).then(Fences::default);
         Ok(Swapchain {
             present,
+            generation,
             device,
             vk,
             physical,
@@ -698,6 +777,7 @@ impl Swapchain {
             held: None,
             lost: false,
             refusing: false,
+            parked: false,
         })
     }
 
@@ -753,13 +833,35 @@ impl Swapchain {
         if size.0 == 0 || size.1 == 0 {
             return Acquired::Retry;
         }
+        if self.parked {
+            return Acquired::Parked;
+        }
+        if !self.generation.serves(&self.present) {
+            let ended = after_recovery(self.generation.is_parked());
+            if let Acquired::Parked = ended {
+                self.parked = true;
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain",
+                    "the device stopped and recovered on a new VkDevice, the old one parked: the \
+                     window's swapchain is left on it, and the window opens again for one on the \
+                     new VkDevice"
+                );
+            } else {
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain",
+                    "the device recovered: the window's swapchain is made again on its new \
+                     VkDevice"
+                );
+            }
+            return ended;
+        }
         let current = self.chain.as_ref().map(|c| c.size);
         if self.stale || current != Some(size) {
             match self.remake(size) {
                 Ok(()) => self.refusing = false,
                 Err(e) if self.lost => {
                     log::warn!(
-                        target: "reims_vgpu_vulkan::swapchain",
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                         "no swapchain ({e}): the surface is lost"
                     );
                     return Acquired::Failed;
@@ -767,7 +869,7 @@ impl Swapchain {
                 Err(e) => {
                     if !self.refusing {
                         log::warn!(
-                            target: "reims_vgpu_vulkan::swapchain",
+                            target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                             "no swapchain yet ({e}): tried again at the next draw"
                         );
                     }
@@ -822,7 +924,7 @@ impl Swapchain {
             }
             Err(e) => {
                 log::warn!(
-                    target: "reims_vgpu_vulkan::swapchain",
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                     "vkAcquireNextImageKHR: {e}: the window stops presenting"
                 );
                 Acquired::Failed
@@ -837,7 +939,10 @@ impl Swapchain {
             Ok(()) => {
                 // SAFETY: the fence has signalled, and nothing else waits on it.
                 if let Err(e) = unsafe { self.vk.reset_fences(&[self.fence]) } {
-                    log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkResetFences: {e}");
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                        "vkResetFences: {e}"
+                    );
                     return Acquired::Failed;
                 }
                 self.pending = None;
@@ -851,7 +956,10 @@ impl Swapchain {
                 Acquired::Retry
             }
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkWaitForFences: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkWaitForFences: {e}"
+                );
                 Acquired::Failed
             }
         }
@@ -890,10 +998,15 @@ impl Swapchain {
 
     /// Encodes in `command_buffer` the signal of `frame`'s semaphore, after what it encoded:
     /// false where the runtime refuses it.
+    /// False too where the command buffer is of another generation of the device than the
+    /// swapchain's (the module doc, "Across the device's recoveries").
     pub fn encode_ready(&self, frame: Frame, command_buffer: &VulkanCommandBuffer) -> bool {
         let Some(image) = self.image(frame) else {
             return false;
         };
+        if !self.generation.is_of(command_buffer.raw.device()) {
+            return false;
+        }
         // SAFETY: the semaphore is a binary semaphore of the command buffer's device, which
         // lives until the swapchain's end, after every frame's completion; its present consumes
         // the signal.
@@ -919,7 +1032,7 @@ impl Swapchain {
             // The image stays taken, its semaphore perhaps never signalled: the swapchain is
             // made again, which gives every image back.
             log::warn!(
-                target: "reims_vgpu_vulkan::swapchain",
+                target: "reims_vgpu_vulkan::swapchain", kind:? = e;
                 "a window frame was not scheduled ({e:?}): the swapchain is made again"
             );
             self.stale = true;
@@ -950,15 +1063,25 @@ impl Swapchain {
         let api = &self.swapchain_api;
         let wsi = WSI.lock();
         // SAFETY: the present is the only submission inside, on the presenting queue's own
-        // `VkQueue`; the image was taken from this swapchain and its semaphore's signal is
-        // submitted. A fence is chained only where the device enabled `swapchainMaintenance1`
-        // ([`crate::os::present_fences`]), and is unsignalled with nothing pending on it.
+        // `VkQueue`, of the swapchain's generation; the image was taken from this swapchain and
+        // its semaphore's signal is submitted. A fence is chained only where the device enabled
+        // `swapchainMaintenance1` ([`crate::os::present_fences`]), and is unsignalled with nothing
+        // pending on it.
         let presented = unsafe {
-            self.present
-                .with_vk_queue(|q, _| api.queue_present(q, &info))
+            self.generation
+                .with_queue(&self.present, |q| api.queue_present(q, &info))
         };
         drop(wsi);
         image.last = Some(command_buffer);
+        let Some(presented) = presented else {
+            // A recovery moved the queue: nothing was presented, and the next take ends the
+            // swapchain's draws (the module doc, "Across the device's recoveries").
+            if let (Some(fences), Some(fence)) = (self.fences.as_mut(), fence) {
+                fences.free.push(fence);
+            }
+            self.stale = true;
+            return;
+        };
         // Numbered whatever the compositor answers: a present it rejects still waits on its
         // semaphore (the module doc).
         image.presented = self.presents.make();
@@ -969,7 +1092,10 @@ impl Swapchain {
             Ok(suboptimal) => self.stale |= suboptimal,
             Err(vk::Result::ERROR_OUT_OF_DATE_KHR) => self.stale = true,
             Err(e) => {
-                log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueuePresentKHR: {e}");
+                log::warn!(
+                    target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                    "vkQueuePresentKHR: {e}"
+                );
                 self.stale = true;
             }
         }
@@ -1069,13 +1195,16 @@ impl Swapchain {
             target: "reims_vgpu_vulkan::swapchain",
             "waiting for the presenting queue to idle: {why}"
         );
-        // SAFETY: the wait submits nothing; the queue is the swapchain's presenting queue.
+        // SAFETY: the wait submits nothing; the queue is the swapchain's presenting queue, the
+        // one the generation was taken with.
         let idle = unsafe {
-            self.present
-                .with_vk_queue(|q, _| self.vk.queue_wait_idle(q))
+            self.generation
+                .with_queue(&self.present, |q| self.vk.queue_wait_idle(q))
         };
-        if let Err(e) = idle {
-            log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkQueueWaitIdle: {e}");
+        // `None`: a recovery moved the queue, after it waited for the old one to idle (the
+        // module doc, "Across the device's recoveries").
+        if let Some(Err(e)) = idle {
+            log::warn!(target: "reims_vgpu_vulkan::swapchain", kind:? = e; "vkQueueWaitIdle: {e}");
         }
         self.presents.idle();
         // Every enqueued present's fence has signalled.
@@ -1094,7 +1223,10 @@ impl Swapchain {
                 Ok(true) => {}
                 Ok(false) => break,
                 Err(e) => {
-                    log::warn!(target: "reims_vgpu_vulkan::swapchain", "vkGetFenceStatus: {e}");
+                    log::warn!(
+                        target: "reims_vgpu_vulkan::swapchain", kind:? = e;
+                        "vkGetFenceStatus: {e}"
+                    );
                     break;
                 }
             }
@@ -1268,9 +1400,12 @@ impl Swapchain {
             // in UNDEFINED until its first frame, and it outlives the texture, which is dropped
             // before the swapchain is destroyed ([`Swapchain::destroy`]).
             let texture = match unsafe {
-                self.device
-                    .raw
-                    .new_texture_with_vk_image(&descriptor, raw, &info, layouts)
+                (self.generation.device()).new_texture_with_vk_image(
+                    &descriptor,
+                    raw,
+                    &info,
+                    layouts,
+                )
             } {
                 Ok(texture) => texture,
                 Err(e) => {
@@ -1280,6 +1415,15 @@ impl Swapchain {
                     ));
                 }
             };
+            // A recovery as the texture was made puts it on the new `VkDevice`, over an image of
+            // the old one.
+            if !self.generation.is_of(&texture.device()) {
+                drop(texture);
+                return Err(undo(
+                    images,
+                    Refused("the device recovered as the swapchain was made".to_owned()),
+                ));
+            }
             // SAFETY: a valid create info, on the runtime's live device.
             let ready = match unsafe {
                 self.vk
@@ -1290,9 +1434,7 @@ impl Swapchain {
             };
             images.push(Image {
                 raw,
-                texture: self
-                    .device
-                    .texture_of(texture, None, 0, Arc::new(Hold::NONE)),
+                texture: self.device.texture_of(texture, 0, Arc::new(Hold::NONE)),
                 ready,
                 last: None,
                 presented: 0,
@@ -1362,8 +1504,18 @@ impl Drop for Swapchain {
     /// The swapchain's end, on the render thread: its frames complete, and where a present is not
     /// known complete, the swapchain waits for its presents' fences, or for the presenting queue
     /// to idle (the module doc); then every swapchain's images' textures, its semaphores and the
-    /// swapchain go, then the fences and the surface.
+    /// swapchain go, then the fences and the surface. On a parked `VkDevice` it waits for nothing
+    /// and destroys none of its own objects, letting go only of the runtime's (the module doc, "A
+    /// parked `VkDevice`").
     fn drop(&mut self) {
+        if self.parked || self.generation.is_parked() {
+            log::debug!(
+                target: "reims_vgpu_vulkan::swapchain",
+                "a window's swapchain on a parked VkDevice ends: its swapchain, semaphores, fences \
+                 and surface are left"
+            );
+            return;
+        }
         let last = self.retire();
         self.retired.extend(last);
         // An image pending with no swapchain left: its fence is settled before it goes.
@@ -1399,11 +1551,11 @@ mod tests {
     /// lives takes the ID it takes without it
     #[test]
     fn a_swapchain_images_texture_takes_no_resource_id() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Texture as _;
-        use reims_vgpu_core::platform::values::TextureDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::device::GpuDevice as _;
+        use crate::core::platform::resource::Texture as _;
+        use crate::core::platform::values::TextureDesc;
+        use crate::core::raise::OnFault;
 
         let p = crate::platform::tests::platform();
         let d = crate::gpu::device::tests::dev();
@@ -1448,7 +1600,7 @@ mod tests {
             (d.raw).new_texture_with_vk_image(&image_descriptor(extent), image, &info, layouts)
         }
         .unwrap();
-        let texture = d.texture_of(texture, None, 0, Arc::new(Hold::NONE));
+        let texture = d.texture_of(texture, 0, Arc::new(Hold::NONE));
         assert_eq!(texture.unique_identifier(), 0);
         assert_eq!(guest(), without);
         drop(texture);
@@ -1473,6 +1625,29 @@ mod tests {
     /// The pixels of an extent, for comparing.
     fn pixels(extent: Option<vk::Extent2D>) -> Option<(u32, u32)> {
         extent.map(|e| (e.width, e.height))
+    }
+
+    /// A take after the device recovered ends the swapchain's draws by how the old `VkDevice`
+    /// ended: parked, the swapchain is left and the window opens again (`Parked`); lost, the window
+    /// makes a new swapchain over its own surface (`Failed`). A recovery from a loss, on the
+    /// runtime, parks nothing, so its take keeps today's path; the runtime parks only a device
+    /// whose work stopped, which no test here can make
+    #[test]
+    fn a_take_after_a_recovery_answers_how_the_old_device_ended() {
+        assert!(matches!(after_recovery(true), Acquired::Parked));
+        assert!(matches!(after_recovery(false), Acquired::Failed));
+        // A device of its own, as the recovery moves every user of the device.
+        let device = rt::Device::system_default().expect("a runtime device");
+        let present = device
+            .new_command_queue_for_presenting()
+            .expect("a presenting queue");
+        let generation = Generation::serving(&present).expect("a generation");
+        device.recover_for_test().expect("the recovery");
+        assert!(!generation.serves(&present));
+        assert!(matches!(
+            after_recovery(generation.is_parked()),
+            Acquired::Failed
+        ));
     }
 
     /// MAILBOX where the surface offers it, else FIFO; never a mode that tears

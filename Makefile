@@ -1,41 +1,18 @@
 # The Rust library and its tooling. The Cargo workspace is at the
-# repository root; the behaviour-lock suite (tests/suite) records what it
-# does in expected files, recorded from the checkout's own build.
+# repository root.
 #
-#   make        the library as a plain library (cargo xtask dist) in
-#               target/dist: libreims_vgpu.a and .dylib, reims_vgpu.h,
-#               reims-vgpu.pc and the option ROM
-#   make smoke  a guest workload linked with the library as QEMU links it,
-#               with an isolated guest task, against its expected values
-#               (cargo xtask smoke)
-#   make test   the behaviour-lock suite (tests/suite) on the library in
-#               target/dist, compared with its expected files;
-#               TEST=<patterns> selects scenarios or modules, e.g.
-#               TEST='fifo_*,display'
-#   make bless  record expected files from the library this checkout builds:
-#               those missing (a new scenario, or a new host key after an OS
-#               update) or recorded from other input (a changed scenario);
-#               ARGS=--update records the selected cases again for a
-#               deliberate change of behaviour, whose expected-file diff is
-#               reviewed in the same commit
-#   make coverage  the suite on the library built instrumented into
-#               build/cov/dist, with a line report per crate file
-#               (pgtest/coverage.py); ARGS=--per-case maps each line to the
-#               cases that reach it
+#   make        the library as a plain library (cargo xtask dist) in its dist
+#               tree, target/dist-vulkan: libreims_vgpu.a and the shared
+#               library (.so on Linux, .dylib on a Mac, over MoltenVK), with
+#               reims_vgpu.h and reims-vgpu.pc
 #   make qemu   the library as a plain library (cargo xtask dist), then
-#               vendor/qemu's qemu-system-aarch64 with apple-gfx on its C API,
-#               linked statically through pkg-config, in build/qemu
-#               (docs/qemu.md)
-#   make vm VM=<macosvm VM directory> [CLONE=<dir>]
-#               boot that macOS guest on make qemu's QEMU from APFS clones of
-#               its disks in CLONE (default build/vm, which must be on the
-#               VM's volume) (scripts/internal/run_vmapple.sh)
+#               vendor/qemu's qemu-system-x86_64 with reims-graphics-pci on
+#               its C API, linked statically through pkg-config, in
+#               build/qemu (docs/qemu.md)
 #   make clean  remove build/, QEMU's build included
 #
-# ARGS adds options to pgtest in test, bless and coverage, e.g.
-# ARGS='-j 8 --setup isolate'. QEMU_CONFIGURE adds options to QEMU's configure
-# and runs it again. CARGO_TARGET_DIR moves the build, and with it
-# RUST_TARGET, out of target.
+# QEMU_CONFIGURE adds options to QEMU's configure and runs it again.
+# CARGO_TARGET_DIR moves the build, and with it RUST_TARGET, out of target.
 
 BUILD := build
 # $(BUILD) made absolute without abspath, which splits a path with spaces.
@@ -44,81 +21,71 @@ QEMU_CONFIGURE ?=
 QEMU_BUILD := $(BUILD_DIR)/qemu
 QEMU_SRC := $(CURDIR)/vendor/qemu
 # Cargo's target directory, made absolute the same way: the dist tree is
-# under it, which the suite's runner and QEMU's config.status record, and
-# cargo resolves a relative one against the directory it runs in.
+# under it, which QEMU's config.status records, and cargo resolves a
+# relative one against the directory it runs in.
 RUST_TARGET_REL := $(or $(CARGO_TARGET_DIR),target)
 RUST_TARGET := $(if $(filter /%,$(RUST_TARGET_REL)),$(RUST_TARGET_REL),$(CURDIR)/$(RUST_TARGET_REL))
-RUST_DIST := $(RUST_TARGET)/dist
+# The dist tree cargo xtask dist writes (xtask/src/dist.rs).
+RUST_DIST := $(RUST_TARGET)/dist-vulkan
 
-.PHONY: all smoke test bless coverage qemu vm clean
+.PHONY: all qemu clean
 
 all:
 	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask dist
-
-smoke: all
-	CARGO_TARGET_DIR="$(RUST_TARGET)" cargo xtask smoke
-
-TEST ?=
-ARGS ?=
-PGTEST = cd tests/suite && python3 -m pgtest
-
-test: all
-	$(PGTEST) run -k "$(TEST)" --dist "$(RUST_DIST)" $(ARGS)
-
-# bless records from the library make builds, the one make test runs.
-bless: all
-	$(PGTEST) bless -k "$(TEST)" --dist "$(RUST_DIST)" $(ARGS)
-
-# pgtest cov builds its own instrumented dist tree, in build/cov/dist.
-coverage:
-	$(PGTEST) cov -k "$(TEST)" $(ARGS)
 
 vendor/qemu/configure:
 	@echo "vendor/qemu is empty: git submodule update --init vendor/qemu" >&2
 	@exit 1
 
 # QEMU finds reims-vgpu.pc in the dist tree and links libreims_vgpu.a, so the
-# binary records no path to the library; apple-gfx calls its C API
-# (reims_vgpu.h). It is configured with --enable-gnutls, which gives it its
-# ciphers: without a crypto library it has no AES, which vmapple's AES engine
-# needs, and refuses to start a vmapple VM. QEMU's build installs the package's
-# option ROM into its data directory, which the build tree's qemu-bundle
-# mirrors, as apple-gfx-pci's default romfile. Configure runs once, out of tree,
-# and again whenever QEMU_CONFIGURE is set or config.status was made from
-# another source or with another PKG_CONFIG_PATH, or names --apple-gfx-backend
-# or --pvg-framework, which vendor/qemu's configure does not take. It also runs
-# again when reims-vgpu.pc differs from the one it last read: meson keeps the
-# package's flags from configure, so a framework the library came to need (its
-# Libs.private) would otherwise be missing from QEMU's link.
+# binary records no path to the library; reims-graphics-pci calls its C API
+# (reims_vgpu.h). Configure runs once, out of tree, and again whenever
+# QEMU_CONFIGURE is set or config.status was made from another source or with
+# another PKG_CONFIG_PATH, or names an option vendor/qemu's configure no longer
+# takes (--enable-pvg, --apple-gfx-backend, --pvg-framework) or the
+# aarch64-softmmu target an earlier make qemu built. It also runs again when
+# reims-vgpu.pc differs from the one it last read: meson keeps the package's
+# flags from configure, so a framework the library came to need (its
+# Libs.private) would otherwise be missing from QEMU's link. And it runs again
+# where vendor/qemu's configure, the meson options it writes, its Python
+# dependencies or its VERSION are newer than config-host.mak, as QEMU's own
+# Makefile reruns it.
+#
+# ninja builds the binary, at its own default parallelism or a caller's -jN:
+# QEMU's Makefile hands ninja -j1 where make was given no -j, which took
+# 310 s for a clean build where ninja's default took 59 s (docs/qemu.md).
+# ninja has meson regenerate build.ninja where a meson file changed, as
+# install-ctl.sh's build relies on.
+#
+# vendor/qemu at another commit than the one build/qemu was configured from
+# builds in an empty directory, as install-ctl.sh's does: meson, configuring
+# or regenerating in place, deletes each file the last build made that the new
+# build.ninja does not name, even one it has just written at configure
+# (qemu-version.h of QEMU of 2026-11-13, docs/lessons.md). A clean build takes
+# about a minute, and edits not yet committed keep the directory.
 QEMU_PKG_CONFIG := $(RUST_DIST)/lib/pkgconfig
 QEMU_PC_READ := $(QEMU_BUILD)/reims-vgpu.pc.configured
+QEMU_CONFIGURE_INPUTS := configure scripts/meson-buildoptions.sh pythondeps.toml VERSION
 
 qemu: all vendor/qemu/configure
+	@src=$$(git -C "$(QEMU_SRC)" rev-parse HEAD 2>/dev/null); \
+		if [ -n "$$src" ] && [ "$$(cat "$(QEMU_BUILD)/qemu-source" 2>/dev/null)" != "$$src" ]; then \
+			rm -rf "$(QEMU_BUILD)"; \
+		fi
 	@mkdir -p "$(QEMU_BUILD)"
 	@if [ ! -f "$(QEMU_BUILD)/build.ninja" ] || [ -n "$(QEMU_CONFIGURE)" ] \
 			|| ! grep -qF -- "exec '$(QEMU_SRC)/configure'" "$(QEMU_BUILD)/config.status" 2>/dev/null \
 			|| ! grep -qxF -- "PKG_CONFIG_PATH='$(QEMU_PKG_CONFIG)'" "$(QEMU_BUILD)/config.status" \
-			|| grep -qE -- "'--(apple-gfx-backend|pvg-framework)=" "$(QEMU_BUILD)/config.status" \
-			|| ! cmp -s "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)"; then \
+			|| grep -qE -- "'--(enable-pvg|apple-gfx-backend=|pvg-framework=|target-list=aarch64-softmmu)" "$(QEMU_BUILD)/config.status" \
+			|| ! cmp -s "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)" \
+			|| [ -n "$$(cd "$(QEMU_SRC)" && find $(QEMU_CONFIGURE_INPUTS) -newer "$(QEMU_BUILD)/config-host.mak" 2>/dev/null)" ]; then \
 		cd "$(QEMU_BUILD)" && PKG_CONFIG_PATH="$(QEMU_PKG_CONFIG)" "$(QEMU_SRC)/configure" \
-			--target-list=aarch64-softmmu --enable-hvf --enable-pvg --enable-gnutls \
+			--target-list=x86_64-softmmu --enable-reims-vgpu \
 			--disable-docs $(QEMU_CONFIGURE) \
 			&& cp "$(QEMU_PKG_CONFIG)/reims-vgpu.pc" "$(QEMU_PC_READ)"; \
 	fi
-	$(MAKE) -C "$(QEMU_BUILD)" qemu-system-aarch64
-	@find -L "$(QEMU_BUILD)/qemu-bundle" -name ReimsVgpu.rom -type f | grep -q . \
-		|| { echo "make qemu: QEMU's build installed no ReimsVgpu.rom" >&2; exit 1; }
-
-VM ?=
-CLONE ?= $(BUILD_DIR)/vm
-
-vm:
-	@if [ -z "$(VM)" ]; then \
-		echo "usage: make vm VM=<macosvm VM directory> [CLONE=<dir>]" >&2; \
-		exit 1; \
-	fi
-	@$(MAKE) --no-print-directory qemu
-	QEMU="$(QEMU_BUILD)/qemu-system-aarch64" scripts/internal/run_vmapple.sh "$(VM)" "$(CLONE)"
+	@git -C "$(QEMU_SRC)" rev-parse HEAD >"$(QEMU_BUILD)/qemu-source" 2>/dev/null || rm -f "$(QEMU_BUILD)/qemu-source"
+	ninja -C "$(QEMU_BUILD)" $(filter-out -j,$(filter -j%,$(MAKEFLAGS))) qemu-system-x86_64
 
 clean:
 	rm -rf "$(BUILD_DIR)"

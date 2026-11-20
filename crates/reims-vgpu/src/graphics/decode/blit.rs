@@ -1,4 +1,4 @@
-//! The blit-encoder op decoder: one arm per [`reims_graphics::ops::blit`] op,
+//! The blit-encoder op decoder: one arm per [`reims_vgpu_graphics::ops::blit`] op,
 //! turning a wire op into a `BlitCmd` on the open `P::BlitEncoder`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). The command-buffer
 //! walk ([`super::cmdbuf`]) routes every blit-group op
@@ -14,14 +14,16 @@
 //! `ENCODER_END` (`endEncoding`, [`super::cmdbuf`]), so `BlitCmd::EndEncoding` has no
 //! arm here; every other `MTLBlitCommandEncoder` selector does.
 //!
-//! [`RGFX_OP_GROUP_BLIT`]: reims_graphics::ops::RGFX_OP_GROUP_BLIT
+//! [`RGFX_OP_GROUP_BLIT`]: reims_vgpu_graphics::ops::RGFX_OP_GROUP_BLIT
 
-use reims_graphics::ops::blit::*;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
-use reims_vgpu_core::platform::host_range::HostRange;
-use reims_vgpu_core::platform::types::{ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult};
+use reims_vgpu_graphics::ops::blit::*;
+use reims_vgpu_vulkan::core::platform::Platform;
+use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder, ResourceRef};
+use reims_vgpu_vulkan::core::platform::host_range::HostRange;
+use reims_vgpu_vulkan::core::platform::types::{
+    ClearColor, MtlOrigin, MtlRegion, MtlSize, NsRange,
+};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult};
 use zerocopy::FromBytes;
 
 use super::{GraphicsDecoder, op_fault};
@@ -44,7 +46,7 @@ fn short_body(tag: u16) -> Raise {
 }
 
 /// Decodes one blit-encoder op: `tag` its op, `payload` its body (the bytes after
-/// the [`RgfxOpHeader`](reims_graphics::ops::RgfxOpHeader)). `objs` resolves object
+/// the [`RgfxOpHeader`](reims_vgpu_graphics::ops::RgfxOpHeader)). `objs` resolves object
 /// references, `enc` is the open blit encoder, and `on` says how an encode's raise
 /// is taken. `Ok(true)` when the op was handled, `Ok(false)` for an unknown tag
 /// (the walk then faults); a platform raise propagates as `Err`.
@@ -75,6 +77,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyBufferToTexture = body(tag, payload)?;
             let source = objs.require_buffer(m.source_buffer_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTexture {
@@ -102,6 +105,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyBufferToTextureOptions = body(tag, payload)?;
             let source = objs.get_buffer(m.source_buffer_obj_id)?;
             let destination = objs.get_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyBufferToTextureOptions {
@@ -185,6 +189,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureRegion = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegion {
@@ -216,6 +221,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureRegionOptions = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureRegionOptions {
@@ -248,6 +254,7 @@ pub(crate) fn decode_op<P: Platform>(
             let m: RgfxBlitOpCopyTextureSlices = body(tag, payload)?;
             let source = objs.require_texture(m.source_texture_obj_id)?;
             let destination = objs.require_texture(m.destination_texture_obj_id)?;
+            objs.texture_written(m.destination_texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::CopyTextureSlices {
@@ -308,6 +315,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_TEXTURE => {
             let m: RgfxBlitOpFillTexture = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             // The `length` fill bytes follow the fixed head in the op body; a body
             // too short for them faults the exec.
             let start = RGFX_OP_BLIT_FILL_TEXTURE_BYTES_OFFSET as usize;
@@ -336,6 +344,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_FILL_TEXTURE_COLOR => {
             let m: RgfxBlitOpFillTextureColor = body(tag, payload)?;
             let texture = objs.require_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             enc.encode(
                 on,
                 BlitCmd::FillTextureColor {
@@ -358,6 +367,7 @@ pub(crate) fn decode_op<P: Platform>(
         RGFX_OP_BLIT_GENERATE_MIPMAPS => {
             let m: RgfxBlitOpGenerateMipmaps = body(tag, payload)?;
             let texture = objs.get_texture(m.texture_obj_id)?;
+            objs.texture_written(m.texture_obj_id);
             enc.encode(on, BlitCmd::GenerateMipmaps { texture })?;
         }
         RGFX_OP_BLIT_INVALIDATE_COMPRESSED_TEXTURE => {
@@ -530,17 +540,17 @@ fn clear_color(bits: [u64; 4]) -> ClearColor {
 mod tests {
     use std::sync::Arc;
 
-    use reims_graphics::ops::{RGFX_OP_BODY_OFFSET, RgfxOpHeader};
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::ops::{RGFX_OP_BODY_OFFSET, RgfxOpHeader};
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_BUFFER_CREATE, RGFX_CMD_FENCE_CREATE, RGFX_CMD_TEXTURE_CREATE, RgfxBufferCreate,
         RgfxMsgHeader, RgfxObjectCreate, RgfxTextureCreate, RgfxTextureDescriptor,
     };
-    use reims_vgpu_core::platform::Handle;
-    use reims_vgpu_core::platform::command::{CommandBuffer, CommandQueue};
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::values::IcbDesc;
-    use reims_vgpu_core::testkit::FakePlatform;
-    use reims_vgpu_core::testkit::calllog::Arg;
+    use reims_vgpu_vulkan::core::platform::Handle;
+    use reims_vgpu_vulkan::core::platform::command::{CommandBuffer, CommandQueue};
+    use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+    use reims_vgpu_vulkan::core::platform::values::IcbDesc;
+    use reims_vgpu_vulkan::core::testkit::FakePlatform;
+    use reims_vgpu_vulkan::core::testkit::calllog::Arg;
     use zerocopy::IntoBytes;
 
     use super::super::ObjHandle;
@@ -558,7 +568,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         for id in [2, 3] {

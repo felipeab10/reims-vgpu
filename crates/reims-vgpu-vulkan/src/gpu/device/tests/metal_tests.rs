@@ -1,6 +1,10 @@
-//! The tests of `device` that compare with Metal on this host: macOS only.
+//! The tests of `device` that compare with Metal on this host: macOS only. A surface is the
+//! buffer that stands for it ([`StandIn`]), as the reims-graphics device's surfaces reach this
+//! platform.
 
 use super::*;
+use crate::gpu::resource::tests::StandIn;
+use crate::gpu::ycbcr::measure::Surface;
 
 /// A reservation keeps its IDs from plain allocation of textures, sampler states and
 /// indirect command buffers, as Metal's does: only a type's first call counts, and none made
@@ -9,11 +13,9 @@ use super::*;
 /// own on Metal's device. Another type dies
 #[test]
 fn reservations_keep_ids_from_plain_allocation() {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::icb::IndirectCommandBuffer as _;
-    use reims_vgpu_core::platform::resource::{SamplerState as _, Texture as _};
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_metal::MetalPlatform;
+    use crate::core::platform::Platform;
+    use crate::core::platform::icb::IndirectCommandBuffer as _;
+    use crate::core::platform::resource::{SamplerState as _, Texture as _};
 
     fn ids<P: Platform>(d: &P::Device, texture: &P::TextureDescriptor) -> Vec<Vec<u64>> {
         for (kind, indices) in [
@@ -59,17 +61,6 @@ fn reservations_keep_ids_from_plain_allocation() {
         vec![1, 3, 4, 5],
         vec![1, 2, 4, 5, 7, 8],
     ];
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
-            pixel_format: 80,
-            width: 4,
-            height: 4,
-            usage: 0x13,
-            resource_options: Some(0),
-            ..TextureDesc::default()
-        });
-        assert_eq!(ids::<MetalPlatform>(&md, &desc), expected);
-    }
     let d = dev();
     let texture = crate::gpu::resource::tests::bgra(4, 4, 0);
     assert_eq!(ids::<VulkanPlatform>(&d, &texture), expected);
@@ -83,37 +74,17 @@ fn reservations_keep_ids_from_plain_allocation() {
     );
 }
 
-/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface` on the device `d`, as the
-/// guest's creator makes it.
+/// A `YCBCR8_420_2P` texture of `size` over plane `plane` of `surface`, as the guest's creator
+/// makes it.
 fn ycbcr8_420_on(
-    d: &VulkanDevice,
-    surface: &OsSurface,
+    surface: &Surface,
     plane: u64,
     size: (u64, u64),
 ) -> RaiseResult<Option<VulkanTexture>> {
-    use reims_vgpu_core::platform::Platform as _;
+    use crate::core::platform::Platform as _;
     let desc = crate::platform::tests::platform()
         .texture_descriptor(&crate::gpu::ycbcr::measure::desc(500, size));
-    d.new_texture_on_surface(&desc, Some(surface), plane)
-}
-
-/// A launcher no test launches through, for a Metal platform.
-pub(crate) struct NoLauncher;
-
-impl reims_vgpu_core::tasks::launcher::TaskLauncher<reims_vgpu_metal::MetalPlatform>
-    for NoLauncher
-{
-    fn launch(
-        &self,
-        _platform: &std::sync::Arc<reims_vgpu_metal::MetalPlatform>,
-        _host: std::sync::Arc<
-            dyn reims_vgpu_core::tasks::launcher::HostSide<reims_vgpu_metal::MetalPlatform>,
-        >,
-    ) -> std::sync::Arc<
-        dyn reims_vgpu_core::tasks::launcher::ServiceLink<reims_vgpu_metal::MetalPlatform>,
-    > {
-        panic!("no task is launched in these tests")
-    }
+    surface.texture(&desc, plane)
 }
 
 /// A probe of [`linear_samples`]: its grid, where it starts and its step, in texels.
@@ -173,7 +144,7 @@ fn blended(
 
 /// A linear sampler of `p`'s device `d`, clamped to the edge, of `normalized` coordinates or
 /// not, with a linear mip filter where `mipped`.
-fn linear<P: reims_vgpu_core::platform::Platform>(
+fn linear<P: crate::core::platform::Platform>(
     d: &P::Device,
     normalized: bool,
     mipped: bool,
@@ -200,7 +171,7 @@ type Linear = (String, Vec<u8>, Vec<(f32, f32)>);
 /// ([`minified`]) through the same three samplers; and a kernel's through a constexpr
 /// sampler; each into halves and into floats. A kernel's sample has no derivatives, so it
 /// reads level 0 magnified.
-fn linear_samples<P: reims_vgpu_core::platform::Platform>(
+fn linear_samples<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     t: &P::Texture,
@@ -272,15 +243,12 @@ fn linear_samples<P: reims_vgpu_core::platform::Platform>(
     ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
-    use crate::gpu::ycbcr::measure::metal::{metals, set_value};
+    use crate::gpu::ycbcr::measure::host::set_matrix;
     use crate::gpu::ycbcr::measure::{
         Shape, float_bits, float_texels, probe, read_floats, sampled_floats, texels,
     };
-    use crate::os::MATRIX_KEY;
-    use reims_vgpu_metal::MetalPlatform;
     let d = dev();
     let p = crate::platform::tests::platform();
-    let mp = MetalPlatform::new(Box::new(NoLauncher));
     for (ostype, size) in [(b"420v", (33, 17)), (b"420f", (64, 32))] {
         let shape = Shape::of(ostype);
         let matrices = [
@@ -292,12 +260,12 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
         ];
         for matrix in matrices {
             let case = format!("{} {size:?} {matrix:?}", String::from_utf8_lossy(ostype));
-            let s = shape.surface(size);
+            let mut s = shape.surface(&d, size);
             shape.fill_noise(&s, size, 7);
             if let Some(m) = matrix {
-                set_value(&s, MATRIX_KEY, m);
+                set_matrix(&mut s, m);
             }
-            let t = ycbcr8_420_on(&d, &s, 0, size).unwrap().unwrap();
+            let t = ycbcr8_420_on(&s, 0, size).unwrap().unwrap();
             let read = read_floats::<VulkanPlatform>(&d, &t, size);
             let centres = probe((0.5, 0.5), 1.0, size, false, 0);
             let nearest = (0, 0, false, 0);
@@ -318,19 +286,12 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
                 let blends = blended(&read, size, at, &float_texels(o));
                 assert!(blends > 0, "{how} reads no blend of texels: {case}");
             }
-            let Some((md, mt)) = metals(500, &s, 0, size) else {
-                continue;
-            };
-            let theirs = read_floats::<MetalPlatform>(&md, &mt, size);
-            assert_eq!(float_bits(&read), float_bits(&theirs), "{case}");
-            let theirs = sampled_floats::<MetalPlatform>(&md, &mt, nearest, size, &centres);
-            assert_eq!(float_bits(&centred), float_bits(&theirs), "nearest: {case}");
-            let theirs = linear_samples(&mp, &md, &mt, size, true);
-            assert_eq!(ours.len(), theirs.len(), "{case}");
-            for ((how, o, _), (_, m, _)) in ours.iter().zip(&theirs) {
-                let texel = if how.contains("float") { 16 } else { 8 };
-                let differ = o.chunks(texel).zip(m.chunks(texel)).filter(|(a, b)| a != b);
-                assert_eq!(differ.count(), 0, "{how}: {case}");
+            let key = format!("{case}: read");
+            crate::metal_check_raw!(key, float_bits(&read));
+            let key = format!("{case}: nearest");
+            crate::metal_check_raw!(key, float_bits(&centred));
+            for (how, o, _) in &ours {
+                crate::metal_check_bytes!(format!("{case}: {how}"), o);
             }
         }
     }
@@ -354,18 +315,17 @@ fn ycbcr8_420_textures_over_surfaces_read_as_metals() {
     ignore = "MoltenVK: the runtime records pixel-sampler-scaling, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::compute::ComputeCmd;
+    use crate::core::platform::render::RenderCmd;
+    use crate::core::platform::types::{MtlSize, Swizzle};
     use crate::gpu::ycbcr::measure::probed_texels;
     use crate::gpu::ycbcr::measure::{Shape, desc, drawn};
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::compute::ComputeCmd;
-    use reims_vgpu_core::platform::render::RenderCmd;
-    use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
-    use reims_vgpu_metal::MetalPlatform;
     let (d, _cache) = device_with_own_cache();
     let p = crate::platform::tests::platform();
     let size = (33, 17);
     let shape = Shape::of(b"420v");
-    let s = shape.surface(size);
+    let s = shape.surface(&d, size);
     shape.fill_noise(&s, size, 7);
     let mut swizzled = desc(500, size);
     swizzled.swizzle = Some(Swizzle {
@@ -374,13 +334,8 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
         blue: 2,
         alpha: 5,
     });
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let metals = reims_vgpu_metal::gpu::desc::texture_descriptor(&swizzled);
-        let made = md.new_texture_on_surface(&metals, Some(&s), 0).unwrap();
-        assert!(made.is_some(), "Metal makes it");
-    }
-    let t = d
-        .new_texture_on_surface(&p.texture_descriptor(&swizzled), Some(&s), 0)
+    let t = s
+        .texture(&p.texture_descriptor(&swizzled), 0)
         .unwrap()
         .unwrap();
     let sampler = linear::<VulkanPlatform>(&d, false, false);
@@ -433,86 +388,35 @@ fn ycbcr8_420_samples_the_exact_filter_does_not_reach_die() {
     }
 }
 
-/// A 'b3a8' surface of [`b3a8_spec`] made over fresh pages of the host's
-/// (`kIOSurfaceClientAddressRanges`), read-only for the GPU (`kIOSurfaceClientDirection` 2,
-/// as core makes one over the guest's pages), every byte `noise(seed)`'s, and those pages:
-/// their first byte and length, which the caller frees once the surface is gone.
-fn b3a8_read_only(
-    size: (u64, u64),
-    rows: (u64, u64),
-    seed: u64,
-) -> (crate::os::OsSurface, reims_vgpu_core::host::HostPtr, u64) {
-    use reims_vgpu_core::host::PhysicalMemoryRange;
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
-    let vm = crate::os::OsVm::new();
-    let page = vm.page_size();
-    let mut spec = b3a8_spec(size, rows);
-    let length = spec.alloc_size.next_multiple_of(page);
-    let pages = vm.allocate_anywhere(length).unwrap();
-    let first = u64::try_from(pages.addr()).unwrap();
-    spec.alloc_size = length;
-    spec.client_direction = Some(2);
-    spec.client_address_ranges = Some(
-        (0..length / page)
-            .map(|i| PhysicalMemoryRange {
-                physical_address: first + i * page,
-                physical_length: page,
-            })
-            .collect(),
-    );
-    let s = noisy_surface(&spec, seed);
-    assert!(crate::os::gpu_read_only(&s));
-    (s, pages, length)
-}
-
 /// A 2D descriptor of `format` of `size`, one level, usage `ShaderRead`, of the resource
 /// options `options` (0 `Shared`, 0x10 `Managed`).
 fn xr10_desc(
     format: u64,
     (width, height): (u64, u64),
     options: u64,
-) -> reims_vgpu_core::platform::values::TextureDesc {
-    reims_vgpu_core::platform::values::TextureDesc {
+) -> crate::core::platform::values::TextureDesc {
+    crate::core::platform::values::TextureDesc {
         texture_type: 2,
         pixel_format: format,
         width,
         height,
         usage: 1,
         resource_options: Some(options),
-        ..reims_vgpu_core::platform::values::TextureDesc::default()
+        ..crate::core::platform::values::TextureDesc::default()
     }
 }
 
 /// A texture of [`xr10_desc`] over plane `plane` of `surface`, made by this platform.
 fn xr10_over(
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &Surface,
     plane: u64,
     (size, options): ((u64, u64), u64),
 ) -> RaiseResult<Option<VulkanTexture>> {
-    use reims_vgpu_core::platform::Platform as _;
+    use crate::core::platform::Platform as _;
     let p = crate::platform::tests::platform();
     let desc = p.texture_descriptor(&xr10_desc(format, size, options));
-    dev().new_texture_on_surface(&desc, Some(surface), plane)
-}
-
-/// Metal's texture of [`xr10_desc`] over plane `plane` of `surface`, and its device; `None`
-/// with no Metal device or where Metal answers nil.
-fn xr10_metals(
-    format: u64,
-    surface: &crate::os::OsSurface,
-    plane: u64,
-    (size, options): ((u64, u64), u64),
-) -> Option<(
-    <reims_vgpu_metal::MetalPlatform as reims_vgpu_core::platform::Platform>::Device,
-    <reims_vgpu_metal::MetalPlatform as reims_vgpu_core::platform::Platform>::Texture,
-)> {
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device()?;
-    let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&xr10_desc(format, size, options));
-    let t = md
-        .new_texture_on_surface(&desc, Some(surface), plane)
-        .unwrap()?;
-    Some((md, t))
+    surface.texture(&desc, plane)
 }
 
 /// A texture of a two-plane XR10 format (550, 551) over plane 0 of a 'b3a8' surface, its
@@ -528,15 +432,11 @@ fn xr10_metals(
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn two_plane_xr10_textures_over_surfaces_read_as_metals() {
+    use crate::core::platform::resource::Texture as _;
     use crate::gpu::ycbcr::measure::{probe, read_floats, sampled_only_floats};
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_metal::MetalPlatform;
     let bits = |texels: Vec<[f32; 4]>| -> Vec<[u32; 4]> {
         texels.into_iter().map(|t| t.map(f32::to_bits)).collect()
     };
-    if MetalPlatform::system_default_device().is_none() {
-        return;
-    }
     let d = dev();
     for format in [550, 551] {
         for (size, rows, options, seed) in [
@@ -549,20 +449,16 @@ fn two_plane_xr10_textures_over_surfaces_read_as_metals() {
             let s = b3a8(size, rows, seed);
             let t = xr10_over(format, &s, 0, (size, options)).unwrap().unwrap();
             assert_eq!(t.pixel_format(), format, "{case}");
-            let Some((md, mt)) = xr10_metals(format, &s, 0, (size, options)) else {
-                panic!("Metal answers nil: {case}");
-            };
             let ours = bits(read_floats::<VulkanPlatform>(&d, &t, size));
-            let theirs = bits(read_floats::<MetalPlatform>(&md, &mt, size));
-            assert_eq!(ours, theirs, "read: {case}");
+            crate::metal_check_raw!(format!("read: {case}"), ours);
             let grid = ((size.0 + 4) * 3, (size.1 + 4) * 3);
             for filter in [0, 1] {
                 for (address, normalized) in [(0, false), (2, true)] {
                     let state = (filter, address, normalized, 0);
+                    let key = format!("{state:?}: {case}");
                     let at = probe((-2.0, -2.0), 1.0 / 3.0, grid, normalized, 0);
                     let ours = sampled_only_floats::<VulkanPlatform>(&d, &t, state, grid, &at);
-                    let theirs = sampled_only_floats::<MetalPlatform>(&md, &mt, state, grid, &at);
-                    assert_eq!(bits(ours), bits(theirs), "{state:?}: {case}");
+                    crate::metal_check_raw!(key, bits(ours));
                 }
             }
         }
@@ -582,50 +478,40 @@ fn two_plane_xr10_textures_over_surfaces_read_as_metals() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn two_plane_xr10_textures_over_unaligned_planes_are_metals() {
+    use crate::core::platform::resource::Texture as _;
     use crate::gpu::ycbcr::measure::{probe, read_floats, sampled_only_floats};
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_metal::MetalPlatform;
     let bits = |texels: Vec<[f32; 4]>| -> Vec<[u32; 4]> {
         texels.into_iter().map(|t| t.map(f32::to_bits)).collect()
     };
-    if MetalPlatform::system_default_device().is_none() {
-        return;
-    }
     let d = dev();
     let size = (33, 17);
     for format in [550, 551] {
         for (rows, seed) in [((132, 36), 7), ((136, 40), 8)] {
             let case = format!("{format} rows {rows:?}");
-            let s = noisy_surface(&b3a8_spec(size, rows), seed);
+            let s = noisy_surface(b3a8_spec(size, rows), seed);
             *crate::answer::LAST_LINE.lock() = None;
             let site = catch_death(|| xr10_over(format, &s, 0, (size, 0x10))).unwrap_err();
             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
             let sel = "newTextureWithDescriptor:iosurface:plane:";
             assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{case}");
             assert!(line.contains("OverlappingSurfaceRows"), "{case}: {line}");
-            let made = xr10_metals(format, &s, 0, (size, 0x10));
-            assert!(made.is_some(), "Metal makes it: {case}");
         }
         for (rows, alpha_offset, seed) in
             [((192, 64), 192 * 17 + 8, 9), ((144, 48), 144 * 17 + 4, 10)]
         {
             let case = format!("{format} rows {rows:?} plane 1 at {alpha_offset}");
-            let s = noisy_surface(&b3a8_spec_at(size, rows, alpha_offset), seed);
-            let Some((md, mt)) = xr10_metals(format, &s, 0, (size, 0x10)) else {
-                panic!("Metal answers nil: {case}");
-            };
+            let s = noisy_surface(b3a8_spec_at(size, rows, alpha_offset), seed);
             let t = xr10_over(format, &s, 0, (size, 0x10)).unwrap().unwrap();
             assert_eq!(t.pixel_format(), format, "{case}");
             let ours = bits(read_floats::<VulkanPlatform>(&d, &t, size));
-            let theirs = bits(read_floats::<MetalPlatform>(&md, &mt, size));
-            assert_eq!(ours, theirs, "read: {case}");
+            crate::metal_check_raw!(format!("read: {case}"), ours);
             let grid = ((size.0 + 4) * 3, (size.1 + 4) * 3);
             for filter in [0, 1] {
                 let state = (filter, 0, false, 0);
+                let key = format!("{state:?}: {case}");
                 let at = probe((-2.0, -2.0), 1.0 / 3.0, grid, false, 0);
                 let ours = sampled_only_floats::<VulkanPlatform>(&d, &t, state, grid, &at);
-                let theirs = sampled_only_floats::<MetalPlatform>(&md, &mt, state, grid, &at);
-                assert_eq!(bits(ours), bits(theirs), "{state:?}: {case}");
+                crate::metal_check_raw!(key, bits(ours));
             }
         }
     }
@@ -637,11 +523,11 @@ fn two_plane_xr10_textures_over_unaligned_planes_are_metals() {
 /// type ('420v'), and rotated (framebuffer only) over plane 0 of a 'b3a8' surface
 #[test]
 fn two_plane_xr10_textures_the_runtime_refuses_die() {
-    use reims_vgpu_core::platform::Platform as _;
+    use crate::core::platform::Platform as _;
     let size = (16, 16);
     let two = b3a8(size, (64, 64), 5);
-    let one = crate::os::tests::bgra_surface(16, 16);
-    let other = crate::gpu::ycbcr::measure::Shape::of(b"420v").surface(size);
+    let one = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
+    let other = crate::gpu::ycbcr::measure::Shape::of(b"420v").surface(&dev(), size);
     let sel = "newTextureWithDescriptor:iosurface:plane:";
     let refused = |case: &str, made: &dyn Fn() -> RaiseResult<Option<VulkanTexture>>| {
         *crate::answer::LAST_LINE.lock() = None;
@@ -654,19 +540,14 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
         );
         assert!(line.contains("Format"), "{case}: {line}");
     };
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device();
     for format in [550, 551] {
         for (surface, plane, case) in [(&two, 1, "plane 1"), (&one, 0, "BGRA"), (&other, 0, "420v")]
         {
             let case = format!("{format} {case}");
             refused(&case, &|| xr10_over(format, surface, plane, (size, 0x10)));
-            if metal.is_some() {
-                let made = xr10_metals(format, surface, plane, (size, 0x10));
-                assert!(made.is_some(), "Metal makes it: {case}");
-            }
         }
         // Metal aborts at a rotation of a descriptor not framebufferOnly.
-        let rotated = reims_vgpu_core::platform::values::TextureDesc {
+        let rotated = crate::core::platform::values::TextureDesc {
             usage: 0x5,
             framebuffer_only: Some(true),
             rotation: Some(1),
@@ -674,14 +555,7 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
         };
         let case = format!("{format} rotated");
         let p = crate::platform::tests::platform();
-        refused(&case, &|| {
-            dev().new_texture_on_surface(&p.texture_descriptor(&rotated), Some(&two), 0)
-        });
-        if let Some(md) = &metal {
-            let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&rotated);
-            let made = md.new_texture_on_surface(&desc, Some(&two), 0).unwrap();
-            assert!(made.is_some(), "Metal makes it: {case}");
-        }
+        refused(&case, &|| two.texture(&p.texture_descriptor(&rotated), 0));
     }
 }
 
@@ -689,23 +563,23 @@ fn two_plane_xr10_textures_the_runtime_refuses_die() {
 /// `RenderTarget` usage too (E26d's 0x5), after a pass of platform `p` that clears it to
 /// `color` and stores it: the surface's bytes from its base address to `length`, once the
 /// command buffer completed.
-fn cleared<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn cleared<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &StandIn<P>,
     (size, options): ((u64, u64), u64),
-    color: reims_vgpu_core::platform::types::ClearColor,
+    color: crate::core::platform::types::ClearColor,
     length: u64,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::values::ColorAttachmentSet;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::values::ColorAttachmentSet;
     let mut desc = xr10_desc(format, size, options);
     desc.usage = 0x5;
-    let t = d
-        .new_texture_on_surface(&p.texture_descriptor(&desc), Some(surface), 0)
+    let t = surface
+        .texture(&p.texture_descriptor(&desc), 0)
         .unwrap()
         .unwrap();
     let pass = p.render_pass_descriptor();
@@ -728,8 +602,7 @@ fn cleared<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
-    use reims_vgpu_core::platform::os::surface::Surface as _;
-    let base = surface.base_address().as_ptr::<u8>();
+    let base = surface.base();
     let length = usize::try_from(length).unwrap();
     // SAFETY: the surface's bytes, read after the command buffer that wrote them completed.
     unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
@@ -741,12 +614,8 @@ fn cleared<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface
 /// size, to a colour in and past 0 to 1
 #[test]
 fn a_cleared_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
-    use reims_vgpu_core::platform::types::ClearColor;
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
+    use crate::core::platform::types::ClearColor;
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -762,11 +631,9 @@ fn a_cleared_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
             let case = format!("{format} {size:?} options {options:#x}");
             let (rows, size): ((u64, u64), (u64, u64)) = (rows, size);
             let length = (rows.0 * size.1).next_multiple_of(4096) + rows.1 * size.1;
-            let (ours, theirs) = (b3a8(size, rows, seed), b3a8(size, rows, seed));
+            let ours = b3a8(size, rows, seed);
             let ours = cleared(&p, &d, format, &ours, (size, options), color, length);
-            let theirs = cleared(&mp, &md, format, &theirs, (size, options), color, length);
-            let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-            assert_eq!(differ, 0, "{case}");
+            crate::metal_check_bytes!(case, &ours);
         }
     }
 }
@@ -777,33 +644,29 @@ enum Pattern<'a> {
     /// `fillTexture:level:slice:region:bytes:length:`.
     Bytes(&'a [u8]),
     /// `fillTexture:level:slice:region:color:pixelFormat:`.
-    Color(reims_vgpu_core::platform::types::ClearColor, u64),
+    Color(crate::core::platform::types::ClearColor, u64),
 }
 
 /// What a fill of `region` (its origin and size) of a texture of `format` over plane 0 of
 /// `surface` (`size`, `options`) with `pattern` writes on `p`'s device `d`: the surface's
 /// bytes from its base address to `length`, once the command buffer completed.
 #[allow(clippy::too_many_arguments)]
-fn filled<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn filled<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    surface: &crate::os::OsSurface,
+    surface: &StandIn<P>,
     (size, options): ((u64, u64), u64),
     ([x, y], [w, h]): ([u64; 2], [u64; 2]),
     pattern: Pattern<'_>,
     length: u64,
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::os::surface::Surface as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let desc = p.texture_descriptor(&xr10_desc(format, size, options));
-    let t = d
-        .new_texture_on_surface(&desc, Some(surface), 0)
-        .unwrap()
-        .unwrap();
+    let t = surface.texture(&desc, 0).unwrap().unwrap();
     let q = d.new_command_queue().unwrap();
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
@@ -830,7 +693,7 @@ fn filled<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>
     cb.commit(OnFault::Die).unwrap();
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
-    let base = surface.base_address().as_ptr::<u8>();
+    let base = surface.base();
     let length = usize::try_from(length).unwrap();
     // SAFETY: the surface's bytes, read after the command buffer that wrote them completed.
     unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
@@ -844,12 +707,8 @@ fn filled<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>
 /// size
 #[test]
 fn a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
-    use reims_vgpu_core::platform::types::ClearColor;
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
+    use crate::core::platform::types::ClearColor;
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -875,12 +734,10 @@ fn a_filled_two_plane_xr10_texture_over_a_surface_writes_as_metals() {
                 for region in regions {
                     let case =
                         format!("{format} {size:?} options {options:#x} {pattern:?} {region:?}");
-                    let (ours, theirs) = (b3a8(size, rows, seed), b3a8(size, rows, seed));
+                    let ours = b3a8(size, rows, seed);
                     let shape = (size, options);
                     let ours = filled(&p, &d, format, &ours, shape, region, pattern, length);
-                    let theirs = filled(&mp, &md, format, &theirs, shape, region, pattern, length);
-                    let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                    assert_eq!(differ, 0, "{case}");
+                    crate::metal_check_bytes!(case, &ours);
                 }
             }
         }
@@ -918,18 +775,17 @@ impl Memory {
 /// blit encoder, of a texture of `format` over `memory` (a surface's of luma `size`, or a
 /// buffer's rows of `size`) write on `p`'s device `d`: every byte of the memory, which starts as
 /// `i * 37 % 251` at byte `i` on every platform, once the command buffer completed.
-fn memory_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn memory_fill_on<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     (format, size, memory): (u64, (u64, u64), Memory),
     fills: &[MemoryFill<'_>],
 ) -> Vec<u8> {
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::os::surface::Surface as _;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let texture_size = memory.texture_size(size);
     let desc = p.texture_descriptor(&crate::gpu::ycbcr::measure::desc(format, texture_size));
     let write = |to: *mut u8, length: u64| {
@@ -944,10 +800,12 @@ fn memory_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::Os
     let (surface, buffer, t, length);
     match memory {
         Memory::Plane(ostype, plane) => {
-            let made = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(size);
-            length = made.alloc_size();
-            write(made.base_address().as_ptr::<u8>(), length);
-            t = d.new_texture_on_surface(&desc, Some(&made), plane);
+            let shape = crate::gpu::ycbcr::measure::Shape::of(ostype);
+            let (facts, planes, alloc_size) = shape.layout(size);
+            let made = StandIn::<P>::shared(d, facts, planes, alloc_size);
+            length = alloc_size;
+            write(made.base(), length);
+            t = made.texture(&desc, plane);
             (surface, buffer) = (Some(made), None);
         }
         Memory::Buffer(row) => {
@@ -991,13 +849,13 @@ fn memory_fill_on<P: reims_vgpu_core::platform::Platform<Surface = crate::os::Os
     cb.wait_until_completed(OnFault::Die).unwrap();
     assert_eq!(cb.error(), None);
     let base = match (&surface, &buffer) {
-        (Some(s), _) => s.base_address(),
-        (_, Some(b)) => b.contents(),
+        (Some(s), _) => s.base(),
+        (_, Some(b)) => b.contents().as_ptr::<u8>(),
         _ => unreachable!(),
     };
     let length = usize::try_from(length).unwrap();
     // SAFETY: the memory's bytes, read after the command buffer that wrote them completed.
-    unsafe { std::slice::from_raw_parts(base.as_ptr::<u8>(), length) }.to_vec()
+    unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
 }
 
 /// The textures [`fills_of_ycbcr_and_padded_textures_are_metals`] fills, of `size`: of each
@@ -1051,13 +909,9 @@ fn memory_fill_textures(size: (u64, u64)) -> Vec<(u64, (u64, u64), Memory)> {
 /// writes nothing on either.
 #[test]
 fn fills_of_ycbcr_and_padded_textures_are_metals() {
-    use reims_vgpu_core::platform::types::ClearColor;
-    use reims_vgpu_core::testkit::capture::catch_death;
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
+    use crate::core::platform::types::ClearColor;
+    use crate::core::testkit::capture::catch_death;
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let d = dev();
     let color = ClearColor {
         red: 0.25,
@@ -1083,14 +937,10 @@ fn fills_of_ycbcr_and_padded_textures_are_metals() {
                 for &(origin, region) in &regions {
                     let fills: [MemoryFill<'_>; 1] = [((0, 0), origin, region, pattern)];
                     let what = format!("{texture:?} {fills:?}");
-                    let theirs = memory_fill_on(&mp, &md, texture, &fills);
                     let ours = catch_death(|| memory_fill_on(&p, &d, texture, &fills));
                     match ours {
-                        Ok(ours) if ours == theirs => {}
-                        Ok(ours) => {
-                            let n = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-                            differ.push(format!("{what}: {n} bytes differ"));
-                        }
+                        Ok(ours) if crate::metal_matches_bytes!(what, &ours) => {}
+                        Ok(_) => differ.push(format!("{what}: bytes differ from Metal's")),
                         Err(site) => {
                             let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
                             differ.push(format!("{what}: died at {}: {line}", site.file));
@@ -1110,12 +960,12 @@ fn fills_of_ycbcr_and_padded_textures_are_metals() {
 
 /// Runs `cmd` in a blit encoder of a command buffer of `d`'s queue `q` of its own, and waits
 /// for it.
-fn blit_one<P: reims_vgpu_core::platform::Platform>(
+fn blit_one<P: crate::core::platform::Platform>(
     q: &P::CommandQueue,
-    cmd: reims_vgpu_core::platform::blit::BlitCmd<'_, P>,
+    cmd: crate::core::platform::blit::BlitCmd<'_, P>,
 ) {
-    use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
     let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
     let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
     e.encode(OnFault::Die, cmd).unwrap();
@@ -1126,13 +976,13 @@ fn blit_one<P: reims_vgpu_core::platform::Platform>(
 }
 
 /// A copy of `size` texels from `from` at `at` into `to` at `to_at`.
-fn copy_region<'a, P: reims_vgpu_core::platform::Platform>(
+fn copy_region<'a, P: crate::core::platform::Platform>(
     (from, at): (&'a P::Texture, [u64; 2]),
     (to, to_at): (&'a P::Texture, [u64; 2]),
     [w, h]: [u64; 2],
-) -> reims_vgpu_core::platform::blit::BlitCmd<'a, P> {
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlSize};
-    reims_vgpu_core::platform::blit::BlitCmd::CopyTextureRegion {
+) -> crate::core::platform::blit::BlitCmd<'a, P> {
+    use crate::core::platform::types::{MtlOrigin, MtlSize};
+    crate::core::platform::blit::BlitCmd::CopyTextureRegion {
         source_texture: from,
         source_slice: 0,
         source_level: 0,
@@ -1145,13 +995,10 @@ fn copy_region<'a, P: reims_vgpu_core::platform::Platform>(
     }
 }
 
-/// The bytes of `surface` from its base address to `length`.
-fn surface_bytes(surface: &crate::os::OsSurface, length: u64) -> Vec<u8> {
-    use reims_vgpu_core::platform::os::surface::Surface as _;
-    let base = surface.base_address().as_ptr::<u8>();
-    let length = usize::try_from(length).unwrap();
-    // SAFETY: the surface's bytes, read after the command buffers that wrote them completed.
-    unsafe { std::slice::from_raw_parts(base, length) }.to_vec()
+/// The bytes of `surface` from its base address to `length`, read after the command buffers that
+/// wrote them completed.
+fn surface_bytes<P: crate::core::platform::Platform>(surface: &StandIn<P>, length: u64) -> Vec<u8> {
+    surface.bytes(length)
 }
 
 /// What copies between textures of `format` (`size`, `Managed`) over plane 0 of 'b3a8'
@@ -1172,23 +1019,17 @@ fn surface_bytes(surface: &crate::os::OsSurface, length: u64) -> Vec<u8> {
 /// times each at once, two copied zeros 1 and 2 times and four lost a command buffer to the
 /// recovery; copying the top quarter, none in 240 copies of each format; one process alone
 /// copying all of them, none in 200). The top quarter holds every byte the copy into `b` reads.
-fn surface_copies<P: reims_vgpu_core::platform::Platform<Surface = crate::os::OsSurface>>(
+fn surface_copies<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     format: u64,
-    (a, b): (&crate::os::OsSurface, &crate::os::OsSurface),
+    (a, b): (&StandIn<P>, &StandIn<P>),
     size: (u64, u64),
     length: u64,
 ) -> [Vec<u8>; 2] {
     let over = p.texture_descriptor(&xr10_desc(format, size, 0x10));
-    let ta = d
-        .new_texture_on_surface(&over, Some(a), 0)
-        .unwrap()
-        .unwrap();
-    let tb = d
-        .new_texture_on_surface(&over, Some(b), 0)
-        .unwrap()
-        .unwrap();
+    let ta = a.texture(&over, 0).unwrap().unwrap();
+    let tb = b.texture(&over, 0).unwrap().unwrap();
     // Metal's blit rows of a texture of its own memory are `⌊4 w / 16⌋ · 16` bytes apart, its
     // planes' rows `4 w` and `w` rounded up to 16: at a width a multiple of 4 they hold every
     // column, and no copy of it overlaps its rows or reads their padding, whose bytes Metal's
@@ -1224,11 +1065,7 @@ fn surface_copies<P: reims_vgpu_core::platform::Platform<Surface = crate::os::Os
 /// size
 #[test]
 fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let d = dev();
     for format in [550, 551] {
         for (size, rows, seed) in [((384, 256), (1536, 512), 11), ((33, 17), (192, 64), 13)] {
@@ -1236,12 +1073,10 @@ fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
             let (rows, size): ((u64, u64), (u64, u64)) = (rows, size);
             let length = (rows.0 * size.1).next_multiple_of(4096) + rows.1 * size.1;
             let pair = || (b3a8(size, rows, seed), b3a8(size, rows, seed + 1));
-            let (ours, theirs) = (pair(), pair());
+            let ours = pair();
             let ours = surface_copies(&p, &d, format, (&ours.0, &ours.1), size, length);
-            let theirs = surface_copies(&mp, &md, format, (&theirs.0, &theirs.1), size, length);
-            for (step, (ours, theirs)) in ours.iter().zip(&theirs).enumerate() {
-                let differ = ours.iter().zip(theirs).filter(|(a, b)| a != b).count();
-                assert_eq!(differ, 0, "{case}: copy {step}");
+            for (step, ours) in ours.iter().enumerate() {
+                crate::metal_check_bytes!(format!("{case}: copy {step}"), ours);
             }
         }
     }
@@ -1251,24 +1086,14 @@ fn copies_between_two_plane_xr10_textures_over_surfaces_write_as_metals() {
 /// surface dies at the copy, naming the runtime's refusal (`Format`), where Metal copies
 #[test]
 fn a_copy_within_a_two_plane_xr10_texture_over_a_surface_dies() {
-    use reims_vgpu_core::platform::Platform;
-    fn within<P: Platform<Surface = crate::os::OsSurface>>(
-        p: &P,
-        d: &P::Device,
-        format: u64,
-        surface: &crate::os::OsSurface,
-    ) {
+    use crate::core::platform::Platform;
+    fn within<P: Platform>(p: &P, d: &P::Device, format: u64, surface: &StandIn<P>) {
         let over = p.texture_descriptor(&xr10_desc(format, (33, 17), 0x10));
-        let t = d
-            .new_texture_on_surface(&over, Some(surface), 0)
-            .unwrap()
-            .unwrap();
+        let t = surface.texture(&over, 0).unwrap().unwrap();
         let q = d.new_command_queue().unwrap();
         blit_one::<P>(&q, copy_region::<P>((&t, [0, 0]), (&t, [16, 8]), [8, 4]));
     }
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     let d = dev();
     let sel = "copyFromTexture:sourceSlice:sourceLevel:sourceOrigin:sourceSize:toTexture:\
                destinationSlice:destinationLevel:destinationOrigin:";
@@ -1283,25 +1108,16 @@ fn a_copy_within_a_two_plane_xr10_texture_over_a_surface_dies() {
             "{format}: {line}"
         );
         assert!(line.contains("Format"), "{format}: {line}");
-        if let Some(md) = &md {
-            within(&mp, md, format, &b3a8((33, 17), (192, 64), 15));
-        }
     }
 }
 
 /// `replaceRegion:` of a texture of a two-plane XR10 format (550, 551) over plane 0 of a
 /// 'b3a8' surface, and its blits to and from a buffer, write the surface's bytes and the
-/// buffer's as Metal's do, byte for byte; and so does `replaceRegion:` over a 'b3a8' surface
-/// of one page made read-only for the GPU, which this platform writes itself
+/// buffer's as Metal's do, byte for byte
 #[test]
 fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_metals() {
     use crate::gpu::ycbcr::sampling::Op;
     use crate::gpu::ycbcr::sampling::written;
-    use reims_vgpu_core::platform::os::vm::HostVm as _;
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let (p, d) = (crate::platform::tests::platform(), dev());
     let (size, rows) = ((16, 8), (64, 16));
     for format in [550, 551] {
@@ -1309,21 +1125,9 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
             let pair = || (b3a8(size, rows, 21), b3a8(size, rows, 22));
             let (s, other) = pair();
             let ours = written(&p, &d, op, format, (&s, &other), size);
-            let (s, other) = pair();
-            let theirs = written(&mp, &md, op, format, (&s, &other), size);
-            assert!(ours == theirs, "{format} {op:?}");
+            let key = format!("{format} {op:?}");
+            assert!(crate::metal_matches_raw!(key, ours), "{key}");
         }
-        let vm = crate::os::OsVm::new();
-        let other = b3a8(size, rows, 22);
-        let (s, pages, length) = b3a8_read_only(size, rows, 23);
-        let ours = written(&p, &d, Op::Replace, format, (&s, &other), size);
-        drop(s);
-        assert!(vm.deallocate(pages, length).is_success());
-        let (s, pages, length) = b3a8_read_only(size, rows, 23);
-        let theirs = written(&mp, &md, Op::Replace, format, (&s, &other), size);
-        drop(s);
-        assert!(vm.deallocate(pages, length).is_success());
-        assert!(ours == theirs, "{format}: read-only for the GPU");
     }
 }
 
@@ -1335,11 +1139,16 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// an `x420` surface and a `BGRA` one's) and at the heap size query, which Metal answers, a
 /// texture the runtime refuses dies where it is made, naming the raw format and Metal's name
 /// for it, but at the size query of a format whose bytes the runtime counts though it holds no
-/// image of it (501, 624 and 627: `metal2vulkan::metal::format::footprint`), which answers
-/// Metal's size and alignment. `newSharedTextureWithDescriptor:` at `Shared` storage answers
+/// image of it (624 to 627: `metal2vulkan::metal::format::footprint`), which answers Metal's
+/// size and alignment. `newSharedTextureWithDescriptor:` at `Shared` storage answers
 /// nil, as Metal does.
 /// The formats: the plane formats 576 to 579 (`R10Unorm_X6`, `RG10Unorm_X12` and their sRGB
-/// twins), 501 (`YCBCR8_422_1P`), 624 (`RGB10A8_2P`) and 627 (`RGB10A8_2P_HLG`). The runtime
+/// twins), which the runtime makes, and 624 to 627 (`RGB10A8_2P` and its `_sRGB`, `_PQ` and
+/// `_HLG` twins), the formats Metal describes and makes textures of that the runtime holds no
+/// image of, but the packed 10-bit ones (588 and 589,
+/// `packed_10_bit_textures_over_memory_die_named`). The one-plane YCbCr formats, 501 among
+/// them, the runtime holds for copies alone (`crate::gpu::ycbcr`'s
+/// `one_plane_textures_are_made_and_copied_as_metals`). The runtime
 /// makes a texture of a plane format at each creator Metal makes one at: over a buffer or a
 /// surface, from a descriptor alone, a 2D texture or a texture buffer, the device's or a heap's,
 /// and the shared one at `Private` storage (`shareable_padded_textures_are_metals`), of the
@@ -1363,13 +1172,11 @@ fn cpu_writes_and_buffer_blits_of_two_plane_xr10_textures_over_surfaces_are_meta
 /// ("-[MTLDebugDevice newSharedTextureWithDescriptor:]:553") rather than answering nil.
 #[test]
 fn formats_the_runtime_lacks_die_where_textures_are_made() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet, TextureDesc};
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+    use crate::core::platform::values::{HeapDesc, OptionSet, TextureDesc};
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     let desc = |format, storage: u64| TextureDesc {
         texture_type: 2,
         pixel_format: format,
@@ -1401,9 +1208,9 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
             assert!(line.contains("Metal aborts at"), "{line}");
         }
     };
-    let x420 = crate::gpu::ycbcr::measure::Shape::of(b"x420").surface((16, 16));
-    let bgra = crate::os::tests::bgra_surface(16, 16);
-    for format in [576, 577, 578, 579, 501, 624, 627, 630, 640, 650] {
+    let x420 = crate::gpu::ycbcr::measure::Shape::of(b"x420").surface(&dev(), (16, 16));
+    let bgra = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
+    for format in [576, 577, 578, 579, 624, 625, 626, 627, 630, 640, 650] {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
         assert_eq!(ours.pixel_format(), format);
@@ -1421,7 +1228,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
             dev().new_texture(OnFault::Return, &ours).unwrap()
         });
         let sel = "heapTextureSizeAndAlignWithDescriptor:";
-        let size = match padded || matches!(format, 501 | 624 | 627) {
+        let size = match padded || matches!(format, 624..=627) {
             true => Some(dev().heap_texture_size_and_align(&ours).unwrap()),
             false => {
                 dies(sel, format, &|| {
@@ -1439,9 +1246,7 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         });
         let sel = "newTextureWithDescriptor:iosurface:plane:";
         for (surface, plane) in [(&x420, 0), (&x420, 1), (&bgra, 0)] {
-            made(sel, &|| {
-                (dev().new_texture_on_surface(&ours, Some(surface), plane)).unwrap()
-            });
+            made(sel, &|| (surface.texture(&ours, plane)).unwrap());
         }
         let described =
             crate::gpu::format_info::described("MTLPixelFormatGetInfoForDevice()", format);
@@ -1482,7 +1287,6 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
                 size: 1 << 20,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             });
             let heap = heap.unwrap().heap.unwrap();
@@ -1497,83 +1301,11 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
         }
         let two_d = p.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
         assert_eq!(two_d.unwrap().pixel_format(), format, "a 2D descriptor's");
-        let Some(md) = &md else { continue };
-        let two_d = mp.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
-        assert_eq!(
-            two_d.unwrap().pixel_format(),
-            format,
-            "Metal: a 2D descriptor's"
-        );
-        let metals = |d| reims_vgpu_metal::gpu::desc::texture_descriptor(d);
-        let (private, shared) = (metals(&private), metals(&shared));
-        assert_eq!(private.pixel_format(), format, "Metal's setter");
-        let format_of =
-            |t: Option<reims_vgpu_metal::gpu::resource::MetalTexture>| t.map(|t| t.pixel_format());
-        assert!(
-            md.new_shared_texture(&shared).unwrap().is_none(),
-            "Metal: shared"
-        );
-        let made = md.new_shared_texture(&private).unwrap();
-        if !described {
-            // Metal asserts at every other creator of these (measured one case a process).
-            assert!(made.is_none(), "Metal: shared at Private");
-            continue;
+        if let (Some(ours), true) = (size, described) {
+            crate::metal_check!(format!("{format}'s size"), ours);
         }
-        assert_eq!(format_of(made), Some(format), "Metal: shared at Private");
-        let made = md.new_texture(OnFault::Return, &private).unwrap();
-        assert_eq!(format_of(made), Some(format), "Metal");
-        let theirs = md.heap_texture_size_and_align(&private).unwrap();
-        assert_ne!(theirs.size, 0, "Metal: {format}'s size");
-        if let Some(ours) = size {
-            assert_eq!(ours, theirs, "{format}'s size");
-        }
-        if padded {
-            // Metal makes each texture in memory of its own, the shared creator's too, and
-            // answers a texture buffer's size, the runtime's.
-            let texture_buffer = metals(&TextureDesc {
-                texture_type: 9,
-                height: 1,
-                ..desc(format, 2)
-            });
-            let made = md.new_texture(OnFault::Return, &texture_buffer).unwrap();
-            assert_eq!(format_of(made), Some(format), "Metal: a texture buffer");
-            let made = md.new_shared_texture(&texture_buffer).unwrap();
-            assert_eq!(
-                format_of(made),
-                Some(format),
-                "Metal: a shared texture buffer"
-            );
-            let size = md.heap_texture_size_and_align(&texture_buffer).unwrap();
-            assert_ne!(size.size, 0, "Metal: a texture buffer's size");
-            assert_eq!(texture_buffer_size, Some(size), "a texture buffer's size");
-            let heap = md.new_heap(&HeapDesc {
-                size: 1 << 20,
-                heap_type: 1,
-                options: vec![OptionSet::StorageMode(2)],
-                address_ranges: None,
-                pinned_gpu_address: None,
-            });
-            let heap = heap.unwrap().heap.unwrap();
-            for (what, d) in [("texture buffer", &texture_buffer), ("2D", &private)] {
-                let made = heap.new_texture(d, 0).unwrap();
-                assert_eq!(format_of(made), Some(format), "Metal: a heap's {what}");
-            }
-        }
-        let buffer = md.new_buffer_of_length(OnFault::Die, 16 * 16 * 16, 0);
-        let made = buffer
-            .unwrap()
-            .unwrap()
-            .new_texture(OnFault::Return, &shared, 0, 256);
-        assert_eq!(
-            format_of(made.unwrap()),
-            Some(format),
-            "Metal: over a buffer"
-        );
-        for (surface, plane) in [(&x420, 0), (&x420, 1), (&bgra, 0)] {
-            let made = md
-                .new_texture_on_surface(&private, Some(surface), plane)
-                .unwrap();
-            assert_eq!(format_of(made), Some(format), "Metal: on plane {plane}");
+        if let Some(ours) = texture_buffer_size {
+            crate::metal_check!(format!("{format}: a texture buffer's size"), ours);
         }
     }
     for format in [2, 45, 48, 95, 100, 120, 122, 653, 2000] {
@@ -1601,12 +1333,9 @@ fn formats_the_runtime_lacks_die_where_textures_are_made() {
 /// 16 cases
 #[test]
 fn shareable_padded_textures_are_metals() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
-    let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() else {
-        return;
-    };
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::resource::Texture as _;
+    use crate::core::platform::values::TextureDesc;
     let p = crate::platform::tests::platform();
     let mut differ = Vec::new();
     for format in [576, 577, 578, 579] {
@@ -1622,15 +1351,7 @@ fn shareable_padded_textures_are_metals() {
             };
             let ours = dev().new_shared_texture(&p.texture_descriptor(&desc));
             let ours = ours.unwrap().map(|t| t.pixel_format());
-            let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            let theirs = md.new_shared_texture(&theirs).unwrap();
-            let theirs = theirs.map(|t| t.pixel_format());
-            assert_eq!(
-                theirs,
-                Some(format),
-                "Metal: {format}, type {texture_type}, {width}"
-            );
-            if ours != theirs {
+            if ours != Some(format) {
                 differ.push((format, texture_type, width, ours));
             }
         }
@@ -1639,19 +1360,15 @@ fn shareable_padded_textures_are_metals() {
 }
 
 /// A 64x64 2D descriptor of `format` at storage mode `storage`, of `usage`.
-fn packed_10(
-    format: u64,
-    storage: u64,
-    usage: u64,
-) -> reims_vgpu_core::platform::values::TextureDesc {
-    reims_vgpu_core::platform::values::TextureDesc {
+fn packed_10(format: u64, storage: u64, usage: u64) -> crate::core::platform::values::TextureDesc {
+    crate::core::platform::values::TextureDesc {
         texture_type: 2,
         pixel_format: format,
         width: 64,
         height: 64,
         usage,
         resource_options: Some(storage << 4),
-        ..reims_vgpu_core::platform::values::TextureDesc::default()
+        ..crate::core::platform::values::TextureDesc::default()
     }
 }
 
@@ -1664,10 +1381,8 @@ fn packed_10(
 /// either format
 #[test]
 fn packed_10_bit_textures_are_metals_or_die_named() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::resource::Texture as _;
+    use crate::core::platform::Platform as _;
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     for format in [588, 589] {
         for storage in [0, 2] {
             let ours = p.texture_descriptor(&packed_10(format, storage, 1));
@@ -1679,16 +1394,6 @@ fn packed_10_bit_textures_are_metals_or_die_named() {
             }
             let size = dev().heap_texture_size_and_align(&ours).unwrap();
             assert_eq!((size.size, size.align), (0, 16), "{format} at {storage}");
-            let Some(md) = &md else { continue };
-            let theirs =
-                reims_vgpu_metal::gpu::desc::texture_descriptor(&packed_10(format, storage, 1));
-            let made = md.new_texture(OnFault::Return, &theirs).unwrap();
-            assert!(made.is_none(), "Metal: {format} at {storage}");
-            if storage == 0 {
-                let made = md.new_shared_texture(&theirs).unwrap();
-                assert!(made.is_none(), "Metal: {format}: shared at {storage}");
-            }
-            assert_eq!(md.heap_texture_size_and_align(&theirs).unwrap(), size);
         }
         let memoryless = packed_10(format, 3, 4);
         let ours = p.texture_descriptor(&memoryless);
@@ -1701,14 +1406,6 @@ fn packed_10_bit_textures_are_metals_or_die_named() {
         let named = format!("pixel format {format} ({name}, Metal's");
         assert!(line.contains(&named), "{line}");
         assert!(line.contains("which the runtime refuses"), "{line}");
-        let Some(md) = &md else { continue };
-        let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&memoryless);
-        let made = md.new_texture(OnFault::Return, &theirs).unwrap();
-        assert_eq!(
-            made.map(|t| t.pixel_format()),
-            Some(format),
-            "Metal: memoryless"
-        );
     }
 }
 
@@ -1721,11 +1418,10 @@ fn packed_10_bit_textures_are_metals_or_die_named() {
 /// (`Unsupported`, `NotImplemented`): the runtime holds no image of a packed code stream
 #[test]
 fn packed_10_bit_textures_over_memory_die_named() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet};
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::resource::{Buffer as _, Heap as _};
+    use crate::core::platform::values::{HeapDesc, OptionSet};
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     // A placement heap's descriptor at `storage`, for this platform or Metal's.
     macro_rules! heap {
         ($storage:expr) => {
@@ -1733,7 +1429,6 @@ fn packed_10_bit_textures_over_memory_die_named() {
                 size: 1 << 22,
                 heap_type: 1,
                 options: vec![OptionSet::StorageMode($storage)],
-                address_ranges: None,
                 pinned_gpu_address: None,
             }
         };
@@ -1748,7 +1443,7 @@ fn packed_10_bit_textures_over_memory_die_named() {
         assert!(line.contains(&named), "{sel}: {line}");
         assert!(line.contains("which the runtime refuses"), "{sel}: {line}");
     };
-    let surface = crate::os::tests::bgra_surface(64, 64);
+    let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 64, 64);
     for format in [588, 589] {
         for storage in [0, 2] {
             let desc = packed_10(format, storage, 1);
@@ -1772,26 +1467,8 @@ fn packed_10_bit_textures_over_memory_die_named() {
                 },
             );
             dies("newTextureWithDescriptor:iosurface:plane:", format, &|| {
-                drop(dev().new_texture_on_surface(&ours, Some(&surface), 0));
+                drop(surface.texture(&ours, 0));
             });
-            let Some(md) = &md else { continue };
-            let theirs = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            let made = |what: &str, made: Option<u64>| {
-                assert_eq!(made, Some(format), "Metal: {what} of {format} at {storage}");
-            };
-            if storage == 2 {
-                let shared = md.new_shared_texture(&theirs).unwrap();
-                made("shared", shared.map(|t| t.pixel_format()));
-            }
-            let heap = md.new_heap(&heap!(storage)).unwrap().heap.unwrap();
-            let placed = heap.new_texture(&theirs, 0).unwrap();
-            made("a heap's", placed.map(|t| t.pixel_format()));
-            let buffer = md.new_buffer_of_length(OnFault::Die, 1 << 16, storage << 4);
-            let buffer = buffer.unwrap().unwrap();
-            let over = buffer
-                .new_texture(OnFault::Return, &theirs, 0, 256)
-                .unwrap();
-            made("a buffer's", over.map(|t| t.pixel_format()));
         }
     }
 }
@@ -1809,10 +1486,10 @@ fn packed_10_bit_textures_over_memory_die_named() {
     ignore = "MoltenVK: the runtime records device-pack-conversion, a death in strict mode; Mac-only test, off everywhere; ledger: MoltenVK strict deaths"
 )]
 fn padded_samples_are_metals() {
+    use crate::core::platform::Platform;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::values::TextureDesc;
     use crate::gpu::ycbcr::measure::{drawn, probe, probed_texels, sampler};
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
     // A texture of `format` over a Shared buffer of noise on `p`'s device `d`.
     fn over_buffer<P: Platform>(
         p: &P,
@@ -1892,27 +1569,22 @@ fn padded_samples_are_metals() {
         out
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
     for format in [576, 578] {
         let ours = samples(&p, &d, format);
-        let Some(md) = &md else { continue };
-        let theirs = samples(&mp, md, format);
-        assert_eq!(ours.len(), theirs.len());
-        for ((case, ours), (_, theirs)) in ours.iter().zip(&theirs) {
-            assert!(ours == theirs, "{format}: {case}");
+        for (case, ours) in &ours {
+            let key = format!("{format}: {case}");
+            assert!(crate::metal_matches_bytes!(key, ours), "{key}");
         }
     }
 }
 
 /// A shareable texture of a width of 0 is nil in `Shared`, `Managed` and `Memoryless`
 /// storage, as Metal's is, where Metal's shared creator answers nil for storage other than
-/// `Private` rather than abort at the size; in `Private` storage it dies where Metal aborts
-/// (Metal's side is not run, as its assertion ends the process).
+/// `Private` rather than abort at the size; in `Private` storage it dies where Metal aborts.
 #[test]
 fn a_shareable_texture_of_no_width_is_nil_but_private() {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::values::TextureDesc;
+    use crate::core::platform::Platform;
+    use crate::core::platform::values::TextureDesc;
     let desc = |storage: u64| TextureDesc {
         pixel_format: 80,
         width: 0,
@@ -1922,17 +1594,9 @@ fn a_shareable_texture_of_no_width_is_nil_but_private() {
         ..TextureDesc::default()
     };
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     for storage in [0, 1, 3] {
         let made = dev().new_shared_texture(&p.texture_descriptor(&desc(storage)));
         assert!(made.unwrap().is_none(), "storage {storage}");
-        if let Some(md) = &md {
-            let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc(storage));
-            assert!(
-                md.new_shared_texture(&metal).unwrap().is_none(),
-                "Metal: storage {storage}"
-            );
-        }
     }
     let private = p.texture_descriptor(&desc(2));
     let site = catch_death(|| dev().new_shared_texture(&private)).unwrap_err();
@@ -1966,13 +1630,13 @@ fn a_shareable_texture_of_no_width_is_nil_but_private() {
 /// through the swizzle, which the runtime does not build: those creators die naming the
 /// runtime's gap (`RuntimeGap::WriteSwizzle`), and the size query answers Metal's size and
 /// alignment. The shared creator dies where Metal's validation stops it (the runtime's
-/// measurement; Metal's side is not run, as its assertion ends the process).
+/// measurement).
 #[test]
 fn write_swizzles_are_made_where_read_alone() {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-    use reims_vgpu_core::platform::types::Swizzle;
-    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet, TextureDesc};
+    use crate::core::platform::Platform;
+    use crate::core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+    use crate::core::platform::types::Swizzle;
+    use crate::core::platform::values::{HeapDesc, OptionSet, TextureDesc};
     let desc = |usage, storage: u64| TextureDesc {
         texture_type: 2,
         pixel_format: 70,
@@ -2001,18 +1665,13 @@ fn write_swizzles_are_made_where_read_alone() {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         (buffer.unwrap().unwrap(), heap.unwrap().heap.unwrap())
     }
     // Each creator's texture's pixel format (0 for nil) of `desc` on `p`'s device `d`: the
     // device's, the shared one, a buffer's two, a heap's and the IOSurface one.
-    fn made<P: Platform<Surface = OsSurface>>(
-        p: &P,
-        d: &P::Device,
-        desc: &TextureDesc,
-    ) -> Vec<u64> {
+    fn made<P: Platform>(p: &P, d: &P::Device, desc: &TextureDesc) -> Vec<u64> {
         let format = |t: Option<P::Texture>| t.map_or(0, |t| t.pixel_format());
         let ours = p.texture_descriptor(desc);
         let shared = p.texture_descriptor(&TextureDesc {
@@ -2020,10 +1679,10 @@ fn write_swizzles_are_made_where_read_alone() {
             ..*desc
         });
         let (buffer, heap) = memory::<P>(d);
-        let surface = crate::os::tests::bgra_surface(16, 16);
+        let surface = StandIn::<P>::bgra(d, 16, 16);
         let on_buffer = buffer.new_texture(OnFault::Return, &shared, 0, 256);
         let linear = buffer.new_linear_texture(&shared, 0, 256, 4096);
-        let on_surface = d.new_texture_on_surface(&shared, Some(&surface), 0);
+        let on_surface = surface.texture(&shared, 0);
         vec![
             format(d.new_texture(OnFault::Return, &ours).unwrap()),
             format(d.new_shared_texture(&ours).unwrap()),
@@ -2034,24 +1693,17 @@ fn write_swizzles_are_made_where_read_alone() {
         ]
     }
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
-    let metals = |d: &TextureDesc| reims_vgpu_metal::gpu::desc::texture_descriptor(d);
     let read = desc(1, 2);
     let ours = made(&p, &dev(), &read);
     assert_eq!(ours, [70; 6], "read alone");
     let size = sized::<VulkanPlatform>(&dev(), &p.texture_descriptor(&read));
-    if let Some(md) = &md {
-        assert_eq!(made(&mp, md, &read), ours, "Metal: read alone");
-        let theirs = sized::<reims_vgpu_metal::MetalPlatform>(md, &metals(&read));
-        assert_eq!(size, theirs, "read alone: the size query");
-    }
+    crate::metal_check!("read alone: the size query", size);
     for (what, usage) in [("written", 3), ("rendered", 5)] {
         let d = dev();
         let written = p.texture_descriptor(&desc(usage, 2));
         let shared = p.texture_descriptor(&desc(usage, 0));
         let (buffer, heap) = memory::<VulkanPlatform>(&d);
-        let surface = crate::os::tests::bgra_surface(16, 16);
+        let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
         let creators: [(&str, &dyn Fn()); 6] = [
             ("newTextureWithDescriptor:", &|| {
                 let _ = d.new_texture(OnFault::Return, &written);
@@ -2072,7 +1724,7 @@ fn write_swizzles_are_made_where_read_alone() {
                 let _ = heap.new_texture(&written, 0);
             }),
             ("newTextureWithDescriptor:iosurface:plane:", &|| {
-                let _ = d.new_texture_on_surface(&shared, Some(&surface), 0);
+                let _ = surface.texture(&shared, 0);
             }),
         ];
         for (sel, make) in creators {
@@ -2088,27 +1740,7 @@ fn write_swizzles_are_made_where_read_alone() {
         }
         let size = sized::<VulkanPlatform>(&d, &written);
         assert_ne!(size.0, 0, "{what}: the size query");
-        let Some(md) = &md else { continue };
-        let metal = desc(usage, 2);
-        let (private, shared) = (metals(&metal), metals(&desc(usage, 0)));
-        let format = |t: Option<reims_vgpu_metal::gpu::resource::MetalTexture>| {
-            t.map_or(0, |t| t.pixel_format())
-        };
-        let (buffer, heap) = memory::<reims_vgpu_metal::MetalPlatform>(md);
-        let surface = crate::os::tests::bgra_surface(16, 16);
-        let on_buffer = buffer.new_texture(OnFault::Return, &shared, 0, 256);
-        let linear = buffer.new_linear_texture(&shared, 0, 256, 4096);
-        let on_surface = md.new_texture_on_surface(&shared, Some(&surface), 0);
-        let theirs = [
-            format(md.new_texture(OnFault::Return, &private).unwrap()),
-            format(on_buffer.unwrap()),
-            format(linear.unwrap()),
-            format(heap.new_texture(&private, 0).unwrap()),
-            format(on_surface.unwrap()),
-        ];
-        assert_eq!(theirs, [70; 5], "Metal: {what}");
-        let theirs = sized::<reims_vgpu_metal::MetalPlatform>(md, &private);
-        assert_eq!(size, theirs, "{what}: the size query");
+        crate::metal_check!(format!("{what}: the size query"), size);
     }
 }
 
@@ -2118,13 +1750,12 @@ fn write_swizzles_are_made_where_read_alone() {
 /// creator of both makes one.
 #[test]
 fn texture_setters_act_where_metal_does() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::resource::{Buffer as _, Heap as _, Texture as _};
-    use reims_vgpu_core::platform::types::Swizzle;
-    use reims_vgpu_core::platform::values::{HeapDesc, OptionSet, TextureDesc};
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::resource::{Buffer as _, Heap as _, Texture as _};
+    use crate::core::platform::types::Swizzle;
+    use crate::core::platform::values::{HeapDesc, OptionSet, TextureDesc};
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     let base = TextureDesc {
         texture_type: 2,
         pixel_format: 80,
@@ -2134,13 +1765,12 @@ fn texture_setters_act_where_metal_does() {
         resource_options: Some(0x20),
         ..TextureDesc::default()
     };
-    let surface = crate::os::tests::bgra_surface(16, 16);
+    let surface = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
     let heap = |d: &VulkanDevice| {
         let made = d.new_heap(&HeapDesc {
             size: 1 << 20,
             heap_type: 1,
             options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
             pinned_gpu_address: None,
         });
         made.unwrap().heap.unwrap()
@@ -2179,7 +1809,7 @@ fn texture_setters_act_where_metal_does() {
                 let _ = heap.new_texture(&ours, 0);
             }),
             ("newTextureWithDescriptor:iosurface:plane:", &|| {
-                let _ = d.new_texture_on_surface(&ours, Some(&surface), 0);
+                let _ = surface.texture(&ours, 0);
             }),
         ];
         for (sel, make) in creators {
@@ -2202,10 +1832,6 @@ fn texture_setters_act_where_metal_does() {
         let set = p.texture_descriptor(&base);
         set.set_texture_type(raw);
         assert_eq!(set.texture_type(), raw);
-        if md.is_some() {
-            let metals = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            assert_eq!(metals.texture_type(), raw, "Metal");
-        }
         every_creator_aborts(&desc, &format!("texture type {raw}"));
     }
     for channel in [6, 9] {
@@ -2219,17 +1845,14 @@ fn texture_setters_act_where_metal_does() {
             ..base
         };
         p.texture_descriptor(&desc);
-        if md.is_some() {
-            reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-        }
         every_creator_aborts(&desc, &format!("swizzle ({channel}, 3, 4, 5)"));
     }
     // What each creator answers on `d` for `desc`: made, nil, or the size query's answer.
-    fn answers<P: reims_vgpu_core::platform::Platform>(
+    fn answers<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         desc: &TextureDesc,
-        surface: &P::Surface,
+        surface: &StandIn<P>,
         heap: &P::Heap,
     ) -> Vec<String> {
         let ours = p.texture_descriptor(desc);
@@ -2249,7 +1872,7 @@ fn texture_setters_act_where_metal_does() {
         let mut out = vec![
             made(d.new_texture(OnFault::Return, &ours).unwrap()),
             made(d.new_shared_texture(&ours).unwrap()),
-            made(d.new_texture_on_surface(&ours, Some(surface), 0).unwrap()),
+            made(surface.texture(&ours, 0).unwrap()),
         ];
         if !placed {
             let size = d.heap_texture_size_and_align(&ours).unwrap();
@@ -2262,17 +1885,6 @@ fn texture_setters_act_where_metal_does() {
         }
         out
     }
-    let theirs = md.as_ref().map(|md| {
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
-        let heap = md.new_heap(&HeapDesc {
-            size: 1 << 20,
-            heap_type: 1,
-            options: vec![OptionSet::StorageMode(2)],
-            address_ranges: None,
-            pinned_gpu_address: None,
-        });
-        (mp, md, heap.unwrap().heap.unwrap())
-    });
     let d = dev();
     let our_heap = heap(&d);
     for desc in [
@@ -2304,16 +1916,15 @@ fn texture_setters_act_where_metal_does() {
             None => &["made at 0x700", "made at 0x700", "made at 0x700"],
         };
         assert_eq!(&ours[..expected.len()], expected, "{desc:?}");
-        if let Some((mp, md, heap)) = &theirs {
-            let metal = answers(mp, md, &desc, &surface, heap);
-            match desc.protection_options {
-                Some(_) => {
-                    assert_eq!(metal[..2], ["nil", "nil"], "Metal: {desc:?}");
-                    assert_eq!(ours[2..], metal[2..], "{desc:?}");
-                }
-                None => assert_eq!(ours, metal, "{desc:?}"),
-            }
-        }
+        // Metal's answers past its nil at the first two creators where protection options are
+        // set, all of them where not.
+        let compared = if desc.protection_options.is_some() {
+            2
+        } else {
+            0
+        };
+        let key = format!("{desc:?}");
+        crate::metal_check!(key, &ours[compared..]);
         if desc.protection_options.is_none() {
             continue;
         }
@@ -2322,26 +1933,6 @@ fn texture_setters_act_where_metal_does() {
         let made =
             crate::answer::relaxed(|| d.new_texture(OnFault::Return, &p.texture_descriptor(&desc)));
         assert_eq!(made.unwrap().unwrap().protection_options(), 0, "{desc:?}");
-        if let Some((mp, md, heap)) = &theirs {
-            let metals = mp.texture_descriptor(&desc);
-            let shared = mp.texture_descriptor(&TextureDesc {
-                resource_options: Some(0),
-                ..desc
-            });
-            let buffer = md.new_buffer_of_length(OnFault::Die, 0x4000, 0);
-            let buffer = buffer.unwrap().unwrap();
-            let made = [
-                heap.new_texture(&metals, 0).unwrap(),
-                md.new_texture_on_surface(&metals, Some(&surface), 0)
-                    .unwrap(),
-                buffer
-                    .new_texture(OnFault::Return, &shared, 0, 256)
-                    .unwrap(),
-            ];
-            for t in made {
-                assert_eq!(t.unwrap().protection_options(), 0, "Metal: {desc:?}");
-            }
-        }
     }
 }
 
@@ -2356,12 +1947,11 @@ fn texture_setters_act_where_metal_does() {
 /// dies, as Metal asserts.
 #[test]
 fn invalid_formats_are_metals() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
-    use reims_vgpu_core::platform::resource::Buffer as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::values::TextureDesc;
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     let desc = |format, storage: u64| TextureDesc {
         texture_type: 2,
         pixel_format: format,
@@ -2378,7 +1968,7 @@ fn invalid_formats_are_metals() {
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
         assert!(line.contains("Metal aborts at"), "{format}: {line}");
     };
-    let bgra = crate::os::tests::bgra_surface(16, 16);
+    let bgra = StandIn::<VulkanPlatform>::bgra(&dev(), 16, 16);
     for format in [255, 262, 0] {
         let (private, shared) = (desc(format, 2), desc(format, 0));
         let ours = p.texture_descriptor(&private);
@@ -2400,7 +1990,7 @@ fn invalid_formats_are_metals() {
             },
         );
         aborts("newTextureWithDescriptor:iosurface:plane:", format, &|| {
-            let _ = dev().new_texture_on_surface(&ours, Some(&bgra), 0);
+            let _ = bgra.texture(&ours, 0);
         });
         if format == 0 {
             assert!(dev().new_shared_texture(&ours).unwrap().is_none());
@@ -2410,14 +2000,6 @@ fn invalid_formats_are_metals() {
             });
         }
         assert!(dev().new_shared_texture(&theirs).unwrap().is_none());
-        let Some(md) = &md else { continue };
-        let metals = |d| reims_vgpu_metal::gpu::desc::texture_descriptor(d);
-        let (private, shared) = (metals(&private), metals(&shared));
-        assert_eq!(private.pixel_format(), format, "Metal's setter");
-        assert!(md.new_shared_texture(&shared).unwrap().is_none(), "Metal");
-        if format == 0 {
-            assert!(md.new_shared_texture(&private).unwrap().is_none(), "Metal");
-        }
     }
 }
 
@@ -2428,15 +2010,10 @@ fn invalid_formats_are_metals() {
 /// (measured one value a process with `MTL_DEBUG_LAYER` unset)
 #[test]
 fn the_setter_takes_what_metals_takes() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
     let p = crate::platform::tests::platform();
-    let ours = p.texture_descriptor(&reims_vgpu_core::platform::values::TextureDesc::default());
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|_| {
-        reims_vgpu_metal::gpu::desc::texture_descriptor(
-            &reims_vgpu_core::platform::values::TextureDesc::default(),
-        )
-    });
+    let ours = p.texture_descriptor(&crate::core::platform::values::TextureDesc::default());
     let mut taken = 0;
     for raw in 0..2048 {
         match catch_death(|| ours.set_pixel_format(raw)) {
@@ -2444,10 +2021,6 @@ fn the_setter_takes_what_metals_takes() {
                 taken += 1;
                 assert!(crate::gpu::format_info::setter_takes(raw), "{raw}");
                 assert_eq!(ours.pixel_format(), raw);
-                if let Some(metal) = &metal {
-                    metal.set_pixel_format(raw);
-                    assert_eq!(metal.pixel_format(), raw, "Metal");
-                }
             }
             Err(site) => {
                 assert!(!crate::gpu::format_info::setter_takes(raw), "{raw}");
@@ -2467,19 +2040,13 @@ fn the_setter_takes_what_metals_takes() {
 /// ([`crate::gpu::no_texture`])
 #[test]
 fn two_d_descriptors_keep_raw_formats_as_the_setter_does() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::descriptor::TextureDescriptor as _;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::descriptor::TextureDescriptor as _;
     let p = crate::platform::tests::platform();
-    let mp = reims_vgpu_metal::MetalPlatform::system_default_device()
-        .map(|_| reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher)));
     let raw = [505, 543].into_iter();
     for format in raw.chain(crate::gpu::no_texture::FORMATS) {
         let ours = p.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
         assert_eq!(ours.unwrap().pixel_format(), format);
-        if let Some(mp) = &mp {
-            let theirs = mp.texture_2d_descriptor(OnFault::Return, format, 16, 16, false);
-            assert_eq!(theirs.unwrap().pixel_format(), format, "Metal");
-        }
     }
 }
 
@@ -2490,9 +2057,8 @@ fn two_d_descriptors_keep_raw_formats_as_the_setter_does() {
 /// YCbCr family alike
 #[test]
 fn textures_over_planes_a_surface_lacks_are_metals() {
-    use reims_vgpu_core::platform::Platform as _;
+    use crate::core::platform::Platform as _;
     let p = crate::platform::tests::platform();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
     let size = (32, 16);
     for (format, ostype) in [
         (80, b"420v"),
@@ -2503,22 +2069,13 @@ fn textures_over_planes_a_surface_lacks_are_metals() {
         (543, b"x420"),
     ] {
         let desc = crate::gpu::ycbcr::measure::desc(format, size);
-        let two = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(size);
-        let made = dev()
-            .new_texture_on_surface(&p.texture_descriptor(&desc), Some(&two), 2)
-            .unwrap();
+        let two = crate::gpu::ycbcr::measure::Shape::of(ostype).surface(&dev(), size);
+        let made = two.texture(&p.texture_descriptor(&desc), 2).unwrap();
         assert!(made.is_none(), "{format}: plane 2 of a two-plane surface");
-        if let Some(md) = &md {
-            let metals = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            let made = md.new_texture_on_surface(&metals, Some(&two), 2).unwrap();
-            assert!(made.is_none(), "Metal: {format}");
-        }
-        let one = crate::os::tests::bgra_surface(size.0, size.1);
+        let one = StandIn::<VulkanPlatform>::bgra(&dev(), size.0, size.1);
         for plane in [1, 2] {
-            let site = catch_death(|| {
-                dev().new_texture_on_surface(&p.texture_descriptor(&desc), Some(&one), plane)
-            })
-            .unwrap_err();
+            let site =
+                catch_death(|| one.texture(&p.texture_descriptor(&desc), plane)).unwrap_err();
             assert_eq!(
                 (site.kind, site.file),
                 (
@@ -2536,13 +2093,11 @@ fn textures_over_planes_a_surface_lacks_are_metals() {
 /// of textures 5 and 40 has Metal give out IDs 1 to 4, then 1 again (measured here, Metal's
 /// side read first, before MoltenVK makes objects of its own on Metal's device). Each
 /// texture's `uniqueIdentifier` is its ID here, and Metal's are compared. Each test runs in a
-/// process of its own, so both platforms' IDs start fresh
+/// process of its own, so its IDs start fresh, as Metal's did
 #[test]
 fn a_texture_takes_a_live_ones_id_where_metal_gives_it() {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_metal::MetalPlatform;
+    use crate::core::platform::Platform;
+    use crate::core::platform::resource::Texture as _;
 
     /// The IDs and `uniqueIdentifier`s of five textures made after a queue and the
     /// reservation, which stay live.
@@ -2560,39 +2115,22 @@ fn a_texture_takes_a_live_ones_id_where_metal_gives_it() {
         ids
     }
     let ids = |answers: &[(u64, u64)]| answers.iter().map(|&(id, _)| id).collect::<Vec<_>>();
-    let theirs = MetalPlatform::system_default_device().map(|md| {
-        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
-            pixel_format: 80,
-            width: 4,
-            height: 4,
-            usage: 0x13,
-            resource_options: Some(0),
-            ..TextureDesc::default()
-        });
-        five::<MetalPlatform>(&md, &desc)
-    });
     let desc = crate::gpu::resource::tests::bgra(4, 4, 0);
     let ours = five::<VulkanPlatform>(&dev(), &desc);
     assert_eq!(ids(&ours), [1, 2, 3, 4, 1]);
     assert!(ours.iter().all(|&(id, unique)| id == unique), "{ours:?}");
-    if let Some(theirs) = theirs {
-        assert_eq!(ids(&theirs), [1, 2, 3, 4, 1]);
-        assert_eq!(ours, theirs);
-    }
 }
 
 /// A two-plane extended-range texture of type cube or cube array is nil where Metal answers
 /// nil: where it passes every check Metal was measured to make. One that fails one dies,
 /// where Metal's validation asserts, and so does a memoryless one, which Metal makes, and a
 /// multisample one, as every other type the runtime refuses for the format does: the runtime's
-/// answers. Metal's side runs for the nil ones and the memoryless one: its assert ends the
-/// process at the others
+/// answers
 #[test]
 fn two_plane_cubes_are_nil_where_metal_answers_nil() {
-    use reims_vgpu_core::platform::Platform as _;
-    use reims_vgpu_core::platform::types::Swizzle;
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_metal::MetalPlatform;
+    use crate::core::platform::Platform as _;
+    use crate::core::platform::types::Swizzle;
+    use crate::core::platform::values::TextureDesc;
 
     /// A cube of `RGB10A8_2P_XR10`, 16 x 16, one level, usage `ShaderRead | ShaderWrite`,
     /// storage `Private`, then `change`.
@@ -2677,14 +2215,8 @@ fn two_plane_cubes_are_nil_where_metal_answers_nil() {
     ];
     let d = dev();
     let platform = crate::platform::tests::platform();
-    let md = MetalPlatform::system_default_device();
     for (what, change) in nil {
         let desc = cube(change);
-        if let Some(md) = &md {
-            let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&desc);
-            let made = md.new_texture(OnFault::Return, &metal).unwrap();
-            assert!(made.is_none(), "Metal: {what}");
-        }
         let ours = platform.texture_descriptor(&desc);
         let made = d.new_texture(OnFault::Return, &ours).unwrap();
         assert!(made.is_none(), "{what}");
@@ -2696,11 +2228,6 @@ fn two_plane_cubes_are_nil_where_metal_answers_nil() {
         };
         assert_eq!(site.file, "newTextureWithDescriptor:", "{what}");
     }
-    if let Some(md) = &md {
-        let metal = reims_vgpu_metal::gpu::desc::texture_descriptor(&cube(MEMORYLESS));
-        let made = md.new_texture(OnFault::Return, &metal).unwrap();
-        assert!(made.is_some(), "Metal makes the memoryless one");
-    }
 }
 
 /// A reservation of textures or sampler states that holds an ID of 2^32 or more is dropped
@@ -2709,10 +2236,8 @@ fn two_plane_cubes_are_nil_where_metal_answers_nil() {
 /// and 3 reserved gives 1, 2, then 4 on
 #[test]
 fn a_reservation_past_32_bits_leaves_it_to_the_next_call() {
-    use reims_vgpu_core::platform::Platform;
-    use reims_vgpu_core::platform::resource::{SamplerState as _, Texture as _};
-    use reims_vgpu_core::platform::values::TextureDesc;
-    use reims_vgpu_metal::MetalPlatform;
+    use crate::core::platform::Platform;
+    use crate::core::platform::resource::{SamplerState as _, Texture as _};
 
     fn ids<P: Platform>(d: &P::Device, texture: &P::TextureDescriptor) -> Vec<Vec<u64>> {
         for (kind, indices) in [
@@ -2744,186 +2269,73 @@ fn a_reservation_past_32_bits_leaves_it_to_the_next_call() {
         ]
     }
     let expected = vec![vec![1, 3, 4], vec![1, 2, 4]];
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let desc = reims_vgpu_metal::gpu::desc::texture_descriptor(&TextureDesc {
-            pixel_format: 80,
-            width: 4,
-            height: 4,
-            usage: 0x13,
-            resource_options: Some(0),
-            ..TextureDesc::default()
-        });
-        assert_eq!(ids::<MetalPlatform>(&md, &desc), expected);
-    }
     let d = dev();
     let texture = crate::gpu::resource::tests::bgra(4, 4, 0);
     assert_eq!(ids::<VulkanPlatform>(&d, &texture), expected);
 }
 
-/// The blob of a state whose `attachment` (`colour`, `blended`, `depth`, `stencil` or
-/// `tile`) is pixel format `format`: a render blob's of vertex function 0x21 (and fragment
-/// function 0x22 with a colour attachment; `blended`'s with blending enabled, its factors and
-/// operations unset), or a tile blob's of tile function 0x31.
-fn attachment_blob(attachment: &str, format: u32) -> Vec<u8> {
-    use crate::gpu::serialized::tests::hex;
-    let colours = |entries: u8| format!("01000000 08000000 {entries:02x} 00 04 00000000 01 04");
-    let functions = "03 08 04 14000000 01 04 21000000 02 04 22000000 00";
-    let mut blob = hex(&match attachment {
-        "colour" => format!("{functions} {}", colours(2)),
-        "blended" => format!("{functions} {}", colours(3)),
-        "depth" => "02 01 04 21000000 09 04".to_owned(),
-        "stencil" => "02 01 04 21000000 0a 04".to_owned(),
-        _ => format!("02 03 04 10000000 01 04 31000000 000000 {}", colours(2)),
-    });
-    blob.extend(format.to_le_bytes());
-    if attachment == "blended" {
-        blob.extend(hex("02 04 01000000"));
-    }
-    blob
-}
-
-/// The state of [`attachment_blob`] on `d`: `v_plain` and `f_plain` of `refused.metallib`, or
-/// `slice_write` of `slice_write_repro.metallib` for a tile, by their refs.
-fn attachment_state<P: reims_vgpu_core::platform::Platform>(
+/// The state on `d` of `v_plain` and `f_plain` of `refused.metallib` whose `attachment`
+/// (`colour`, `blended`, `depth` or `stencil`) is pixel format `format`, the fragment function
+/// with a colour attachment alone; `blended`'s with blending enabled, its factors and operations
+/// Metal's defaults.
+fn attachment_state<P: crate::core::platform::Platform>(
     d: &P::Device,
     attachment: &str,
     format: u32,
-) -> Result<Option<P::RenderPipeline>, reims_vgpu_core::platform::types::NsErrorText> {
-    use reims_vgpu_core::platform::resource::Library as _;
-    let library = |bytes: &[u8]| d.new_library(bytes).unwrap().unwrap().unwrap();
-    let refused = library(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/refused.metallib"
-    )));
-    let slices = library(include_bytes!(concat!(
-        env!("OUT_DIR"),
-        "/slice_write_repro.metallib"
-    )));
-    let f = |l: &P::Library, name| l.new_function(OnFault::Return, name).unwrap().unwrap();
-    let functions = [
-        (0x21, f(&refused, "v_plain")),
-        (0x22, f(&refused, "f_plain")),
-        (0x31, f(&slices, "slice_write")),
-    ];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(functions
-            .iter()
-            .find(|(at, _)| *at == r)
-            .map(|(_, f)| f.clone_ref()))
+) -> Result<Option<P::RenderPipeline>, crate::core::platform::types::NsErrorText> {
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::values::FullRenderPipelineDesc;
+
+    use crate::gpu::device::tests::colours_of;
+    let refused = d
+        .new_library(include_bytes!(concat!(
+            env!("OUT_DIR"),
+            "/refused.metallib"
+        )))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let f = |name| {
+        refused
+            .new_function(OnFault::Return, name)
+            .unwrap()
+            .unwrap()
     };
-    let blob = attachment_blob(attachment, format);
-    if attachment == "tile" {
-        let desc =
-            d.deserialize_tile_render_pipeline_descriptor(Hold::NONE, &blob, 0x100, &mut resolve);
-        d.new_tile_render_pipeline_state(desc.unwrap().as_ref(), 0)
-            .unwrap()
-    } else {
-        let desc = d.deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve);
-        d.new_render_pipeline_state_from_descriptor(desc.unwrap().as_ref(), 0)
-            .unwrap()
-    }
+    let (vertex, fragment) = (f("v_plain"), f("f_plain"));
+    let format = u64::from(format);
+    let desc = match attachment {
+        "colour" | "blended" => FullRenderPipelineDesc {
+            colors: colours_of(&[&[
+                (1, format.try_into().unwrap()),
+                (2, u32::from(attachment == "blended")),
+            ]]),
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        },
+        "depth" => FullRenderPipelineDesc {
+            depth_pixel_format: format,
+            ..FullRenderPipelineDesc::new(&vertex, None)
+        },
+        _ => FullRenderPipelineDesc {
+            stencil_pixel_format: format,
+            ..FullRenderPipelineDesc::new(&vertex, None)
+        },
+    };
+    d.new_render_pipeline_state_full(&desc)
 }
 
-/// A serialized descriptor's pixel format Metal makes the state of where the runtime refuses
-/// it dies as the state is made, named by Metal's description: a render descriptor's colour
-/// attachment of 501, 556 or 624, its depth attachment of `AnyDepth` or its stencil
-/// attachment of `AnyStencil` (the runtime has each, and refuses it there). A render
-/// descriptor's colour attachment of 576 to 579, or of a bfloat format (26, 66, 116)
-/// unblended, which the runtime makes, and a tile descriptor's of 576 to 579,
-/// 26 or `RGBA16Float_XR`, makes the state, as Metal's does. A render descriptor's bfloat
-/// colour attachment that blends (blending enabled, of one and zero), which Metal's
-/// validation refuses and the runtime refuses (`Unsupported` of `Format`), dies as the state
-/// is made, naming the runtime's refusal; Metal's is not made here. A value Metal describes
-/// no format for, which the runtime holds raw ([`crate::gpu::serialized::RawFormat`]),
-/// decodes, as Metal's deserializer takes it, and the state's creation dies as Metal's
-/// assertion: 2, 255, 262, 630 to 650 and 2000 at a render descriptor's attachments (the
-/// 24-bit depth formats, 255 and 262, at its depth and stencil attachments too, which the
-/// runtime stops alike), 255, 630 and 645 at a tile descriptor's (measured one case
-/// a process:
-/// [`crate::gpu::serialized::RawFormat`]'s docs; 630 to 645 at a render descriptor's colour
-/// attachment, measured on this host again by the runtime:
-/// `validateWithDevice:` line 5044, "not a valid MTLPixelFormat")
+/// A colour attachment of 576 to 579, or of a bfloat format (26, 66, 116) unblended, which the
+/// runtime makes, makes the state, as Metal's does. A bfloat colour attachment that blends
+/// (blending enabled, of one and zero), which Metal's validation refuses by ending the process
+/// and the runtime refuses as a colour attachment Metal ends the process on, dies as the state
+/// is made, naming the runtime's refusal; Metal's is not made here
 #[test]
-fn raw_pipeline_formats_die_where_states_are_made() {
+fn pipeline_formats_the_runtime_makes_are_metals() {
     let d = dev();
-    let md = reims_vgpu_metal::MetalPlatform::system_default_device();
-    let named = [
-        ("colour", 501),
-        ("colour", 556),
-        ("colour", 624),
-        ("depth", 651),
-        ("stencil", 652),
-    ];
-    let asserted = [
-        ("colour", 2000),
-        ("colour", 255),
-        ("colour", 2),
-        ("depth", 2000),
-        ("depth", 255),
-        ("depth", 262),
-        ("stencil", 255),
-        ("stencil", 262),
-        ("tile", 630),
-        ("tile", 645),
-        ("tile", 255),
-    ];
-    let undescribed = (630..=650).map(|format| ("colour", format));
-    for (attachment, format) in named.into_iter().chain(asserted).chain(undescribed) {
-        *crate::answer::LAST_LINE.lock() = None;
-        let ours = catch_death(|| {
-            attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format)
-                .map(|s| s.is_some())
-        });
-        let Err(site) = ours else {
-            panic!("{attachment} {format}: {ours:?}");
-        };
-        let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-        let sel = match attachment {
-            "tile" => "newRenderPipelineStateWithTileDescriptor:options:reflection:error:",
-            _ => "newRenderPipelineStateWithDescriptor:options:reflection:error:",
-        };
-        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-        if named.contains(&(attachment, format)) {
-            let name = crate::gpu::format_info::name(sel, u64::from(format));
-            let named = format!("pixel format {format} ({name}, Metal's");
-            assert!(line.contains(&named), "{line}");
-            assert!(line.contains("which the runtime refuses"), "{line}");
-            if let Some(md) = &md {
-                let state =
-                    attachment_state::<reims_vgpu_metal::MetalPlatform>(md, attachment, format);
-                assert!(matches!(state, Ok(Some(_))), "Metal: {attachment} {format}");
-            }
-        } else {
-            let what = format!("pixel format {format}, which Metal describes no format for");
-            assert!(
-                line.contains("Metal aborts at") && line.contains(&what),
-                "{line}"
-            );
-        }
+    for format in [576, 577, 578, 579, 26, 66, 116] {
+        let made = attachment_state::<crate::platform::VulkanPlatform>(&d, "colour", format);
+        assert!(matches!(made, Ok(Some(_))), "colour {format}");
     }
-    for (attachment, format) in [
-        ("colour", 576),
-        ("colour", 577),
-        ("colour", 578),
-        ("colour", 579),
-        ("colour", 26),
-        ("colour", 66),
-        ("colour", 116),
-        ("tile", 576),
-        ("tile", 577),
-        ("tile", 578),
-        ("tile", 579),
-        ("tile", 26),
-        ("tile", 556),
-    ] {
-        let made = attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format);
-        assert!(matches!(made, Ok(Some(_))), "{attachment} {format}");
-        if let Some(md) = &md {
-            let made = attachment_state::<reims_vgpu_metal::MetalPlatform>(md, attachment, format);
-            assert!(matches!(made, Ok(Some(_))), "Metal: {attachment} {format}");
-        }
-    }
-    let sel = "newRenderPipelineStateWithDescriptor:options:reflection:error:";
+    let sel = "newRenderPipelineStateWithDescriptor:error:";
     for format in [26, 66, 116] {
         *crate::answer::LAST_LINE.lock() = None;
         let ours = catch_death(|| {
@@ -2936,63 +2348,28 @@ fn raw_pipeline_formats_die_where_states_are_made() {
         };
         assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
         assert!(
-            line.contains("runtime refuses") && line.contains("feature: Format"),
+            line.contains("the Vulkan runtime refused it")
+                && line.contains("ColorAttachment { index: 0, metal: EndsProcess }"),
             "blended {format}: {line}"
         );
     }
 }
 
-/// By default the states [`raw_pipeline_formats_die_where_states_are_made`] names, which Metal
-/// makes and the runtime refuses at an attachment it has the format of, are nil and the
-/// runtime's refusal as the `NSError`, each relayed as a gap at its creator and counted: the
-/// guest's creation fails, and the process goes on
-#[test]
-fn raw_pipeline_format_gaps_are_their_nserror_by_default() {
-    use crate::answer::{Inexact, RUNTIME_DOMAIN, inexact_counts, relaxed};
-    let counted = || {
-        (inexact_counts().into_iter())
-            .find(|&(k, _)| k == Inexact::RefusedCreate)
-            .map_or(0, |(_, n)| n)
-    };
-    let d = dev();
-    for (attachment, format) in [
-        ("colour", 501),
-        ("colour", 556),
-        ("colour", 624),
-        ("depth", 651),
-        ("stencil", 652),
-    ] {
-        let before = counted();
-        let made = relaxed(|| {
-            attachment_state::<crate::platform::VulkanPlatform>(&d, attachment, format)
-                .map(|s| s.is_some())
-        });
-        let Err(error) = made else {
-            panic!("{attachment} {format}: {made:?}");
-        };
-        assert_eq!((error.domain.as_str(), error.code), (RUNTIME_DOMAIN, 0));
-        assert!(
-            error.description.contains("feature: Format"),
-            "{attachment} {format}: {}",
-            error.description
-        );
-        assert_eq!(counted(), before + 1, "{attachment} {format}");
-    }
-}
-
 /// What a draw over 16 by 16 `ARGB8Unorm` (84) does on `p`'s device `d` under the state of
-/// a serialized descriptor whose colour attachment 0 is that format, blending zero over the
+/// a whole render value whose colour attachment 0 is that format, blending zero over the
 /// source colour and zero over the source alpha, adding (a multiply), of `v_plain` and
 /// `f_plain` of `refused.metallib`: the command buffer's status and error code once it
 /// completed.
-fn rotated_blend_draw<P: reims_vgpu_core::platform::Platform>(p: &P, d: &P::Device) -> (u64, u64) {
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::Library as _;
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+fn rotated_blend_draw<P: crate::core::platform::Platform>(p: &P, d: &P::Device) -> (u64, u64) {
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
 
-    use crate::gpu::serialized::tests::hex;
+    use crate::core::platform::values::FullRenderPipelineDesc;
+
+    use crate::gpu::device::tests::colours_of;
     let library = d.new_library(include_bytes!(concat!(
         env!("OUT_DIR"),
         "/refused.metallib"
@@ -3004,23 +2381,16 @@ fn rotated_blend_draw<P: reims_vgpu_core::platform::Platform>(p: &P, d: &P::Devi
             .unwrap()
             .unwrap()
     };
-    let functions = [(0x21, f("v_plain")), (0x22, f("f_plain"))];
-    let mut resolve = |_: Hold<'_>, r: u64| {
-        Ok(functions
-            .iter()
-            .find(|(at, _)| *at == r)
-            .map(|(_, f)| f.clone_ref()))
-    };
+    let (vertex, fragment) = (f("v_plain"), f("f_plain"));
     // Colour 0: format 84, blending on, rgb source Zero, destination SourceColor, alpha
     // source Zero, destination SourceAlpha, both operations Add.
-    let blob = hex(
-        "03 08 04 14000000 01 04 21000000 02 04 22000000 00 01000000 08000000 07 \
-         00 04 00000000 01 04 54000000 02 04 01000000 03 04 00000000 04 04 02000000 \
-         06 04 00000000 07 04 04000000",
-    );
-    let desc = d.deserialize_render_pipeline_descriptor(Hold::NONE, &blob, &mut resolve);
-    let state = d.new_render_pipeline_state_from_descriptor(desc.unwrap().as_ref(), 0);
-    let state = state.unwrap().unwrap().unwrap();
+    let state = d
+        .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            colors: colours_of(&[&[(1, 84), (2, 1), (3, 0), (4, 2), (6, 0), (7, 4)]]),
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        })
+        .unwrap()
+        .unwrap();
     let target = p.texture_descriptor(&TextureDesc {
         texture_type: 2,
         pixel_format: 84,
@@ -3078,10 +2448,6 @@ fn an_unmeasured_rotated_blend_dies_at_the_draw() {
     );
     let named = "(metal2vulkan-degrade-rotated-blend-rounding)";
     assert!(line.contains(named), "{line}");
-    if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
-        assert_eq!(rotated_blend_draw(&mp, &md), (4, 0), "Metal");
-    }
 }
 
 /// On a native device the same draw dies too, at the same op and naming the same kind: Apple's
@@ -3109,9 +2475,9 @@ fn an_unmeasured_rotated_blend_dies_on_a_native_device() {
 /// Whether `d` makes a no-copy buffer over two fresh pages after `case`: 0 leaves them
 /// readable and writable, 1 takes all access from the second, 2 from both, 3 unmaps the
 /// second, 4 leaves both read-only.
-fn no_copy_made<P: reims_vgpu_core::platform::Platform>(d: &P::Device, case: u8) -> bool {
-    use reims_vgpu_core::platform::os::vm::VmProt;
-    let vm = OsVm::new();
+fn no_copy_made<P: crate::core::platform::Platform>(d: &P::Device, case: u8) -> bool {
+    use crate::core::platform::os::vm::VmProt;
+    let vm = crate::remap::VulkanVm::new();
     let page = vm.page_size();
     let at = vm.allocate_anywhere(2 * page).unwrap();
     let second = at.wrapping_add(page);
@@ -3135,23 +2501,18 @@ fn no_copy_made<P: reims_vgpu_core::platform::Platform>(d: &P::Device, case: u8)
 }
 
 /// A no-copy buffer over memory with a page not mapped, or mapped without access, is nil,
-/// as the Metal platform answers; one over read-only pages is made, as Metal's is
+/// as Metal answers; one over read-only pages is made, as Metal's is
 #[test]
 fn no_copy_buffers_over_pages_without_access_are_nil_as_metals() {
     let expected = [true, false, false, false, true];
     let ours = [0, 1, 2, 3, 4].map(|case| no_copy_made::<VulkanPlatform>(&dev(), case));
     assert_eq!(ours, expected);
-    if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let theirs =
-            [0, 1, 2, 3, 4].map(|case| no_copy_made::<reims_vgpu_metal::MetalPlatform>(&md, case));
-        assert_eq!(theirs, expected);
-    }
 }
 
 /// A queue [`test_queue`] keeps: its platform, its device's identity and the queue.
 type TestQueue = (
     std::any::TypeId,
-    reims_vgpu_core::platform::ObjId,
+    crate::core::platform::ObjId,
     Box<dyn std::any::Any>,
 );
 
@@ -3170,7 +2531,7 @@ std::thread_local! {
 /// same command buffer's compute pass ran and it completed without an error. This platform's
 /// queues share the device's Vulkan queues and cost nothing; they are kept the same way so
 /// that both sides of a comparison run alike.
-pub(crate) fn test_queue<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> P::CommandQueue {
+pub(crate) fn test_queue<P: crate::core::platform::Platform>(d: &P::Device) -> P::CommandQueue {
     let at = (std::any::TypeId::of::<P>(), d.id());
     TEST_QUEUES.with(|queues| {
         let mut queues = queues.borrow_mut();
@@ -3190,44 +2551,31 @@ pub(crate) fn test_queue<P: reims_vgpu_core::platform::Platform>(d: &P::Device) 
 /// they make at their draws is the same on every run. Not
 /// kept for [`adopt`]: the process's other handles answer the shared device.
 pub(crate) fn device_with_own_cache() -> (VulkanDevice, OwnCache) {
-    static MADE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let home = std::env::var_os("HOME").expect("a home directory");
-    let n = MADE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let dir = std::path::PathBuf::from(home).join(format!(
-        ".cache/reims-vgpu-vulkan-tests-own/{}-{n}",
-        std::process::id()
-    ));
-    // One a process of the same ID left: this process's own, and emptied.
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).unwrap();
-    let mut options = crate::platform::device_options().clone();
-    options.shader_cache = rt::ShaderCacheOptions::in_directory(&dir);
+    let (options, cache) = options_with_own_cache();
     let raw = rt::Device::system_default_with(&options).unwrap();
     let device = Obj::new(DeviceObject {
         registry_id: registry_id(&raw),
         raw,
         caps: OnceLock::new(),
         awake: Default::default(),
+        threads: Default::default(),
+        rows_pitches: crate::core::sync::Mutex::default(),
+        guest_texture_ids: None,
     });
-    (device, OwnCache(dir))
+    (device, cache)
 }
 
-/// The directory of [`device_with_own_cache`]'s shader cache, removed as it drops.
-pub(crate) struct OwnCache(std::path::PathBuf);
-
-impl Drop for OwnCache {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.0);
-    }
-}
-
-/// The spec of a 'b3a8' surface of `size` (`kCVPixelFormatType_30RGBLE_8A_BiPlanar`): plane 0
-/// the 32-bit colour words, plane 1 the alpha bytes, rows `rows` bytes apart in each, plane 1
-/// after plane 0 at a multiple of 4096.
+/// The layout of a 'b3a8' surface of `size` (`kCVPixelFormatType_30RGBLE_8A_BiPlanar`): its
+/// facts, its planes and its length. Plane 0 the 32-bit colour words, plane 1 the alpha bytes,
+/// rows `rows` bytes apart in each, plane 1 after plane 0 at a multiple of 4096.
 fn b3a8_spec(
     size: (u64, u64),
     rows: (u64, u64),
-) -> reims_vgpu_core::platform::os::surface::SurfaceSpec {
+) -> (
+    crate::core::platform::values::SurfaceFacts,
+    Vec<(u64, u64)>,
+    u64,
+) {
     let alpha_offset = (rows.0 * size.1).next_multiple_of(4096);
     b3a8_spec_at(size, rows, alpha_offset)
 }
@@ -3237,56 +2585,218 @@ fn b3a8_spec_at(
     size: (u64, u64),
     rows: (u64, u64),
     alpha_offset: u64,
-) -> reims_vgpu_core::platform::os::surface::SurfaceSpec {
-    use reims_vgpu_core::platform::os::surface::{SurfacePlaneSpec, SurfaceSpec};
-    let (width, height) = size;
+) -> (
+    crate::core::platform::values::SurfaceFacts,
+    Vec<(u64, u64)>,
+    u64,
+) {
     let (color_row, alpha_row) = rows;
-    let plane = |offset, bytes_per_row, bytes_per_element| SurfacePlaneSpec {
-        base: offset,
-        offset,
-        width,
-        height,
-        size: bytes_per_row * height,
-        bytes_per_row,
-        bytes_per_element,
-        element_width: 1,
-        element_height: 1,
-        ..SurfacePlaneSpec::default()
-    };
-    SurfaceSpec {
-        planes: Some(vec![
-            plane(0, color_row, 4),
-            plane(alpha_offset, alpha_row, 1),
-        ]),
-        pixel_format: u32::from_be_bytes(*b"b3a8"),
-        alloc_size: (alpha_offset + alpha_row * height).next_multiple_of(16384),
-        width,
-        height,
-        bytes_per_element: 4,
-        bytes_per_row: color_row,
-        element_width: 1,
-        element_height: 1,
-        ..SurfaceSpec::default()
-    }
+    let planes = vec![(0, color_row), (alpha_offset, alpha_row)];
+    let facts = crate::gpu::resource::tests::facts_of(*b"b3a8", size, &planes);
+    let length = (alpha_offset + alpha_row * size.1).next_multiple_of(16384);
+    (facts, planes, length)
 }
 
-/// The surface of `spec`, every byte of its allocation `noise(seed)`'s.
+/// The surface of `layout` ([`b3a8_spec`]), every byte `noise(seed)`'s, the buffer that stands
+/// for it the process's device's.
 fn noisy_surface(
-    spec: &reims_vgpu_core::platform::os::surface::SurfaceSpec,
+    (facts, planes, length): (
+        crate::core::platform::values::SurfaceFacts,
+        Vec<(u64, u64)>,
+        u64,
+    ),
     seed: u64,
-) -> crate::os::OsSurface {
-    use reims_vgpu_core::platform::os::surface::{IoSurfaces as _, Surface as _};
-    let s = crate::os::OsSurfaces::new().create(spec).unwrap();
+) -> Surface {
+    let s = Surface::shared(&dev(), facts, planes, length);
     let mut next = crate::gpu::ycbcr::measure::noise(seed);
-    let base = s.base_address().as_ptr::<u8>();
-    for at in 0..usize::try_from(spec.alloc_size).unwrap() {
-        // SAFETY: inside the surface's allocation, which no GPU work uses yet.
+    let base = s.base();
+    for at in 0..usize::try_from(length).unwrap() {
+        // SAFETY: inside the buffer's Shared bytes, which no GPU work uses yet.
         unsafe { base.add(at).write(next().to_le_bytes()[0]) };
     }
     s
 }
 
-/// A host-only 'b3a8' surface of [`b3a8_spec`], every byte `noise(seed)`'s.
-fn b3a8(size: (u64, u64), rows: (u64, u64), seed: u64) -> crate::os::OsSurface {
-    noisy_surface(&b3a8_spec(size, rows), seed)
+/// A 'b3a8' surface of [`b3a8_spec`], every byte `noise(seed)`'s.
+fn b3a8(size: (u64, u64), rows: (u64, u64), seed: u64) -> Surface {
+    noisy_surface(b3a8_spec(size, rows), seed)
+}
+
+/// How [`read_through_another`] orders its two blits: in two encoders of one command buffer, or
+/// in command buffers of two queues, the read's committed first and waiting for an event the
+/// write's signals after its blit.
+#[derive(Clone, Copy, Debug)]
+enum Order {
+    OneCommandBuffer,
+    EventAcrossQueues,
+}
+
+/// What a texture over `surface` (a 'BGRA' one of `size`) reads where another texture over the
+/// same surface was written before it, on `p`'s device `d`: a blit of `texels` into the first
+/// texture, then a blit of the second texture's texels into a buffer, ordered as `order` says,
+/// the buffer's bytes answered once both command buffers completed. The two textures are made
+/// first, as a guest makes two over one surface.
+fn read_through_another<P: crate::core::platform::Platform>(
+    p: &P,
+    d: &P::Device,
+    surface: &StandIn<P>,
+    ((width, height), order): ((u64, u64), Order),
+    texels: &[u8],
+) -> Vec<u8> {
+    use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::event::EventRef;
+    use crate::core::platform::resource::Buffer as _;
+    use crate::core::platform::types::{MtlOrigin, MtlSize};
+    let desc = p.texture_descriptor(&crate::core::platform::values::TextureDesc {
+        texture_type: 2,
+        pixel_format: 80,
+        width,
+        height,
+        usage: 1,
+        ..crate::core::platform::values::TextureDesc::default()
+    });
+    let written = (surface.texture(&desc, 0)).unwrap().unwrap();
+    let reader = (surface.texture(&desc, 0)).unwrap().unwrap();
+    let length = u64::try_from(texels.len()).unwrap();
+    let buffer = || {
+        (d.new_buffer_of_length(OnFault::Die, length, 0))
+            .unwrap()
+            .unwrap()
+    };
+    let (up, down) = (buffer(), buffer());
+    // SAFETY: inside a Shared buffer of `length` bytes the GPU does not use yet.
+    unsafe {
+        std::ptr::copy_nonoverlapping(texels.as_ptr(), up.contents().as_ptr(), texels.len());
+    }
+    let (size, origin) = (MtlSize::new(width, height, 1), MtlOrigin::new(0, 0, 0));
+    let write = BlitCmd::CopyBufferToTexture {
+        source_buffer: &up,
+        source_offset: 0,
+        source_bytes_per_row: width * 4,
+        source_bytes_per_image: length,
+        source_size: size,
+        destination_texture: &written,
+        destination_slice: 0,
+        destination_level: 0,
+        destination_origin: origin,
+    };
+    let read = BlitCmd::CopyTextureToBuffer {
+        source_texture: &reader,
+        source_slice: 0,
+        source_level: 0,
+        source_origin: origin,
+        source_size: size,
+        destination_buffer: &down,
+        destination_offset: 0,
+        destination_bytes_per_row: width * 4,
+        destination_bytes_per_image: length,
+    };
+    let blit = |cb: &P::CommandBuffer, cmd| {
+        let e = cb.blit_encoder(OnFault::Die).unwrap().unwrap();
+        e.encode(OnFault::Die, cmd).unwrap();
+        e.encode(OnFault::Die, BlitCmd::EndEncoding).unwrap();
+    };
+    let q = d.new_command_queue().unwrap();
+    let cbs = match order {
+        Order::OneCommandBuffer => {
+            let cb = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            blit(&cb, write);
+            blit(&cb, read);
+            cb.commit(OnFault::Die).unwrap();
+            vec![cb]
+        }
+        Order::EventAcrossQueues => {
+            let event = d.new_event(OnFault::Die).unwrap().unwrap();
+            let other = d.new_command_queue().unwrap();
+            let reading = other.command_buffer(OnFault::Die).unwrap().unwrap();
+            reading
+                .encode_wait(Some(EventRef::Event(&event)), 1)
+                .unwrap();
+            blit(&reading, read);
+            reading.commit(OnFault::Die).unwrap();
+            let writing = q.command_buffer(OnFault::Die).unwrap().unwrap();
+            blit(&writing, write);
+            writing
+                .encode_signal(Some(EventRef::Event(&event)), 1)
+                .unwrap();
+            writing.commit(OnFault::Die).unwrap();
+            vec![writing, reading]
+        }
+    };
+    for cb in &cbs {
+        cb.wait_until_completed(OnFault::Die).unwrap();
+        assert_eq!(cb.error(), None);
+    }
+    // SAFETY: the buffer's `length` bytes, read once the command buffer that wrote them completed.
+    unsafe { std::slice::from_raw_parts(down.contents().as_ptr::<u8>(), texels.len()) }.to_vec()
+}
+
+/// The texels [`read_through_another`] writes: 64 by 64 'BGRA' texels, no byte 0.
+fn surface_texels() -> ((u64, u64), Vec<u8>) {
+    let size = (64, 64);
+    let texels = (0..64 * 64 * 4_u32)
+        .map(|i| u8::try_from(i * 7 % 255 + 1).unwrap())
+        .collect();
+    (size, texels)
+}
+
+/// A texture over a surface reads what a blit through another texture over the same surface
+/// wrote before it, as Metal's does, in a later encoder of one command buffer and in a command
+/// buffer of another queue that waits for an event the write signals: two textures over the
+/// buffer that stands for one surface are one memory, the surface over pages of the host's as a
+/// guest's mapper makes it
+#[test]
+fn a_texture_over_a_surface_reads_another_ones_writes_as_metals() {
+    use crate::gpu::resource::tests::{free_pages, host_pages};
+    let p = crate::platform::tests::platform();
+    let (size, texels) = surface_texels();
+    for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
+        let (pages, length) = host_pages(size.0 * size.1 * 4);
+        let ours = StandIn::<VulkanPlatform>::bgra_over(&dev(), size, pages, length);
+        let read = read_through_another(&p, &dev(), &ours, (size, order), &texels);
+        assert!(read == texels, "{order:?}: in place");
+        drop(ours);
+        free_pages(pages, length);
+    }
+}
+
+/// [`a_texture_over_a_surface_reads_another_ones_writes_as_metals`] where every import is
+/// refused, as Linux's views' gate refuses them past the headroom of the views' budget
+/// (`os/linux/import.rs`), so the runtime makes the buffer that stands for the surface over a
+/// copy of its pages (`copied-host-pages`): the texture read must still see the other's writes,
+/// as Metal's does
+#[test]
+fn a_texture_over_a_copied_surface_reads_another_ones_writes_as_metals() {
+    use crate::gpu::resource::tests::{free_pages, host_pages};
+    let p = crate::platform::tests::platform();
+    let (size, texels) = surface_texels();
+    let copies = || {
+        (crate::answer::relayed_counts().into_iter())
+            .find(|(kind, _)| *kind == rt::Degradation::CopiedHostPages)
+            .map_or(0, |(_, n)| n)
+    };
+    let mut stale = Vec::new();
+    for order in [Order::OneCommandBuffer, Order::EventAcrossQueues] {
+        let key = format!("{order:?}");
+        let before = copies();
+        let (pages, length) = host_pages(size.0 * size.1 * 4);
+        let read = crate::answer::relaxed(|| {
+            crate::os::refusing_imports(|| {
+                let ours = StandIn::<VulkanPlatform>::bgra_over(&dev(), size, pages, length);
+                read_through_another(&p, &dev(), &ours, (size, order), &texels)
+            })
+        });
+        assert!(
+            copies() > before,
+            "{order:?}: the runtime copied the surface's pages"
+        );
+        let metals = crate::metal_matches_bytes!(key, &read);
+        stale.push((order, metals, read.len()));
+        free_pages(pages, length);
+    }
+    assert!(
+        stale.iter().all(|&(_, metals, _)| metals),
+        "whether the bytes are Metal's, of all: {stale:?}"
+    );
 }

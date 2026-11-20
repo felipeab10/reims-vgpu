@@ -7,8 +7,8 @@
 //!   ([`guest_kexts`]): OpenCore loads them in that order.
 //!
 //! Embedded, they are the ones of the commit reims-ctl was built from, however
-//! scripts/install-ctl.sh installed it (`cargo install --path`, on macOS and on Linux, with or
-//! without the QEMU of that commit), and need nothing installed beside them.
+//! scripts/install-ctl.sh installed it (`cargo install --path`, with or without the QEMU of that
+//! commit), and need nothing installed beside them.
 //!
 //! Each is written where it is used, into the data directory's `prebuilt`, under a name of its
 //! content's hash: the ROM where a VM's QEMU command is made, the set where reims-util makes an

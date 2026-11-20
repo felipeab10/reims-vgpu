@@ -3,20 +3,18 @@
 //!
 //! **The screen.** A window opens on the `NSScreen` whose `deviceDescription["NSScreenNumber"]`
 //! is the CoreGraphics display [`screens::screen_for_port`] picks for the display's port, else on
-//! `NSScreen.mainScreen`, so the screen whose density the guest was told of is the one it opens
-//! on.
+//! `NSScreen.mainScreen`.
 //!
 //! **Windowed** (the default): titled, closable, miniaturizable and resizable, and able to go
 //! full screen; while its input is captured it is not resizable, and it is again once released
-//! ([`resizable_change`], which the view applies). Its content is the guest's mode, else the first mode the display offers, else
-//! 1920×1080, at one guest point per host point (a HiDPI guest's pixel is a screen pixel, a 1×
-//! guest's a point, which the draw scales on the GPU), shrunk to fit the screen's visible area
-//! less the title bar ([`geometry::initial_content_size`]), centred there. The guest's scale
-//! for a mode follows the size in millimetres the display told it ([`Window::told_size`]). A display offers its
-//! modes when it is made, before its window opens, and the guest sets a mode later, so a window
-//! opens at the mode offered first. A window whose top left would be another windowed window's
-//! moves 24 points right and down, made smaller, its ratio kept, where it would leave the
-//! visible area, but not below [`MIN_CONTENT`] ([`cascade`]).
+//! ([`resizable_change`], which the view applies). Its content is the guest's mode, else the
+//! first mode the display offers, else 1920×1080, at one guest pixel per host point (on a Retina
+//! screen a guest pixel is two screen pixels each way, scaled on the GPU), shrunk to fit the
+//! screen's visible area less the title bar ([`geometry::initial_content_size`]), centred there.
+//! A display offers its modes when it is made, before its window opens, and the guest sets a
+//! mode later, so a window opens at the mode offered first. A window whose top left would be
+//! another windowed window's moves 24 points right and down, made smaller, its ratio kept, where
+//! it would leave the visible area, but not below [`MIN_CONTENT`] ([`cascade`]).
 //!
 //! Until the person resizes it (an edge, tiling, zoom, full screen), a windowed window follows
 //! the guest's mode: each mode change resizes its content as the window would open on its
@@ -61,8 +59,8 @@ use objc2_app_kit::{
 use objc2_foundation::{
     NSNotification, NSNumber, NSObject, NSObjectProtocol, NSPoint, NSRect, NSSize, ns_string,
 };
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_metal::msg;
+use reims_vgpu_vulkan::core::rt::BlockEnv;
+use reims_vgpu_vulkan::os::msg;
 
 use super::main_thread::{MainOnly, responds, shared_app};
 use super::view::DisplayView;
@@ -417,8 +415,6 @@ const CASCADE: f64 = 24.0;
 struct Sizing {
     /// The guest's mode, whose ratio the content keeps.
     mode: (u16, u16),
-    /// The scale the guest runs the mode at: its pixels per point.
-    guest_scale: f64,
     /// The screen's backing scale.
     scale: f64,
     /// The title bar and borders: the frame less the content.
@@ -426,20 +422,32 @@ struct Sizing {
 }
 
 impl Sizing {
-    /// The content of a frame at most `room`: one guest point per host point, shrunk with its
-    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on whole pixels, so
-    /// the drawable is the content exactly.
+    /// The content of a frame at most `room`: one guest pixel per host point, shrunk with its
+    /// ratio kept where it does not fit ([`geometry::initial_content_size`]), on whole pixels, a
+    /// multiple of [`geometry::MODE_WIDTH_STEP`] wide and of [`geometry::MODE_HEIGHT_STEP`]
+    /// high, so the drawable is the content exactly and the mode the guest is offered for it
+    /// ([`geometry::offered_mode`]) is the whole drawable.
     fn content(&self, room: NSSize) -> NSSize {
         let (width, height) = geometry::initial_content_size(
             self.mode,
-            self.guest_scale,
             (
                 room.width - self.chrome.width,
                 room.height - self.chrome.height,
             ),
         );
-        let whole = |points: f64| ((points * self.scale).floor() / self.scale).max(1.0);
-        NSSize::new(whole(width), whole(height))
+        let whole = |points: f64, step: u64| {
+            let (pixels, step) = ((points * self.scale).floor(), step as f64);
+            let aligned = if pixels >= step {
+                pixels - pixels % step
+            } else {
+                pixels
+            };
+            (aligned / self.scale).max(1.0)
+        };
+        NSSize::new(
+            whole(width, geometry::MODE_WIDTH_STEP),
+            whole(height, geometry::MODE_HEIGHT_STEP),
+        )
     }
 
     /// The frame around `content`.
@@ -504,15 +512,10 @@ struct Fit {
     frame: NSSize,
 }
 
-/// The size of a windowed window showing a guest mode `mode`, which the guest runs at
-/// `guest_scale`, on `screen` (module doc): one guest point per host point, shrunk to fit the
-/// screen's visible area less the title bar, on whole pixels.
-fn windowed_fit(
-    screen: Option<&NSScreen>,
-    mode: (u16, u16),
-    guest_scale: u8,
-    mtm: MainThreadMarker,
-) -> Fit {
+/// The size of a windowed window showing a guest mode `mode` on `screen` (module doc): one guest
+/// pixel per host point, shrunk to fit the screen's visible area less the title bar, on whole
+/// pixels.
+fn windowed_fit(screen: Option<&NSScreen>, mode: (u16, u16), mtm: MainThreadMarker) -> Fit {
     let (visible, scale) = screen.map_or(
         (
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(1920.0, 1080.0)),
@@ -532,7 +535,6 @@ fn windowed_fit(
     });
     let sizing = Sizing {
         mode,
-        guest_scale: f64::from(guest_scale.max(1)),
         scale,
         chrome: NSSize::new(
             framed.size.width - probe.size.width,
@@ -548,13 +550,11 @@ fn windowed_fit(
     }
 }
 
-/// The frame of a windowed window for a guest mode `mode`, which the guest runs at
-/// `guest_scale`, on `screen`, clear of the frames `taken` (module doc): centred in the screen's
-/// visible frame, then cascaded.
+/// The frame of a windowed window for a guest mode `mode` on `screen`, clear of the frames
+/// `taken` (module doc): centred in the screen's visible frame, then cascaded.
 pub(crate) fn windowed_frame(
     screen: Option<&NSScreen>,
     mode: (u16, u16),
-    guest_scale: u8,
     taken: &[NSRect],
     mtm: MainThreadMarker,
 ) -> NSRect {
@@ -563,31 +563,29 @@ pub(crate) fn windowed_frame(
         sizing,
         frame: frame_size,
         ..
-    } = windowed_fit(screen, mode, guest_scale, mtm);
+    } = windowed_fit(screen, mode, mtm);
     let origin = NSPoint::new(
         visible.origin.x + ((visible.size.width - frame_size.width) / 2.0).floor(),
         visible.origin.y + ((visible.size.height - frame_size.height) / 2.0).floor(),
     );
     let frame = cascade(NSRect::new(origin, frame_size), &sizing, visible, taken);
     log::debug!(
-        "windowed: visible {visible:?} at scale {}, mode {mode:?} at guest scale \
-         {guest_scale}: frame {frame:?}",
+        "windowed: visible {visible:?} at scale {}, mode {mode:?}: frame {frame:?}",
         sizing.scale
     );
     frame
 }
 
-/// A windowed window for a guest mode `mode`, which the guest runs at `guest_scale`, on
-/// `screen`, clear of the frames `taken` (module doc).
+/// A windowed window for a guest mode `mode` on `screen`, clear of the frames `taken` (module
+/// doc).
 fn windowed(
     screen: Option<&NSScreen>,
     mode: (u16, u16),
-    guest_scale: u8,
     taken: &[NSRect],
     mtm: MainThreadMarker,
 ) -> Retained<DisplayWindow> {
     let style = windowed_style();
-    let frame = windowed_frame(screen, mode, guest_scale, taken, mtm);
+    let frame = windowed_frame(screen, mode, taken, mtm);
     let content_rect = msg::get("contentRectForFrameRect:styleMask:", || {
         NSWindow::contentRectForFrameRect_styleMask(frame, style, mtm)
     });
@@ -601,7 +599,37 @@ fn windowed(
     msg::get("setFrame:display:", || {
         window.setFrame_display(frame, false)
     });
+    step_resizes(&window);
     window
+}
+
+/// The content resize increments of a windowed window at backing scale `scale`: a step of the
+/// guest's modes each way ([`geometry::MODE_WIDTH_STEP`], [`geometry::MODE_HEIGHT_STEP`]) in
+/// points. A window opens on such steps ([`Sizing::content`]), and the person's drag of an edge
+/// changes its content by whole steps, so the mode the guest is offered for it
+/// ([`geometry::offered_mode`]) stays the whole drawable, with no black beside it. AppKit's zoom,
+/// full screen and tiling take no increments, and neither does a move to a screen of another
+/// scale: a content of whole steps at 2× can be 8 pixels off a step at 1×, whatever the
+/// increments there.
+fn resize_increments(scale: f64) -> NSSize {
+    let scale = if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    };
+    NSSize::new(
+        geometry::MODE_WIDTH_STEP as f64 / scale,
+        geometry::MODE_HEIGHT_STEP as f64 / scale,
+    )
+}
+
+/// Sets windowed `window`'s content resize increments for its backing scale as it opens
+/// ([`resize_increments`]).
+pub(crate) fn step_resizes(window: &NSWindow) {
+    let scale = msg::get("backingScaleFactor", || window.backingScaleFactor());
+    msg::get("setContentResizeIncrements:", || {
+        window.setContentResizeIncrements(resize_increments(scale));
+    });
 }
 
 /// `rect`, in AppKit's screen coordinates (y up), in [`geometry`]'s (y down).
@@ -622,20 +650,19 @@ fn y_up(rect: Rect) -> NSRect {
     )
 }
 
-/// Resizes windowed `window`, whose delegate is `delegate`, for the guest mode `mode`, which the
-/// guest runs at `guest_scale`, as it would open on its screen, keeping its top left corner, moved inside the screen's visible area
+/// Resizes windowed `window`, whose delegate is `delegate`, for the guest mode `mode`, as it would
+/// open on its screen, keeping its top left corner, moved inside the screen's visible area
 /// ([`geometry::resized_frame`]), then clear of the frames `taken` ([`cascade`]). The delegate
 /// knows the resize for the library's.
 fn follow(
     window: &DisplayWindow,
     delegate: &WindowDelegate,
     mode: (u16, u16),
-    guest_scale: u8,
     taken: &[NSRect],
     mtm: MainThreadMarker,
 ) {
     let frame = msg::get("frame", || window.frame());
-    let resized = followed_frame(window, mode, guest_scale, taken, mtm);
+    let resized = followed_frame(window, mode, taken, mtm);
     if resized != frame {
         delegate.ivars().resizing.set(true);
         msg::get("setFrame:display:", || {
@@ -645,19 +672,17 @@ fn follow(
     }
 }
 
-/// The frame windowed `window` takes for the guest mode `mode`, which the guest runs at
-/// `guest_scale`, as it would open on its screen, keeping its top left corner, moved inside the
-/// screen's visible area ([`geometry::resized_frame`]), then clear of the frames `taken`
-/// ([`cascade`]).
+/// The frame windowed `window` takes for the guest mode `mode`, as it would open on its screen,
+/// keeping its top left corner, moved inside the screen's visible area
+/// ([`geometry::resized_frame`]), then clear of the frames `taken` ([`cascade`]).
 pub(crate) fn followed_frame(
     window: &NSWindow,
     mode: (u16, u16),
-    guest_scale: u8,
     taken: &[NSRect],
     mtm: MainThreadMarker,
 ) -> NSRect {
     let screen = msg::get("screen", || window.screen()).or_else(|| main_screen(mtm));
-    let fit = windowed_fit(screen.as_deref(), mode, guest_scale, mtm);
+    let fit = windowed_fit(screen.as_deref(), mode, mtm);
     let frame = msg::get("frame", || window.frame());
     let resized = y_up(geometry::resized_frame(
         y_down(frame),
@@ -666,8 +691,7 @@ pub(crate) fn followed_frame(
     ));
     let resized = cascade(resized, &fit.sizing, fit.visible, taken);
     log::debug!(
-        "following guest mode {mode:?} at guest scale {guest_scale}, scale {}: content {:?}, \
-         frame {frame:?} to {resized:?}",
+        "following guest mode {mode:?}, scale {}: content {:?}, frame {frame:?} to {resized:?}",
         fit.sizing.scale,
         fit.content
     );
@@ -804,33 +828,14 @@ pub(crate) fn open(window: &Arc<Window>, mtm: MainThreadMarker) {
     } else {
         let taken = windowed_frames(None, mtm);
         let mode = window.mode().or(window.offered()).unwrap_or(DEFAULT_MODE);
-        windowed(
-            screen.as_deref(),
-            mode,
-            window.guest_scale(mode),
-            &taken,
-            mtm,
-        )
+        windowed(screen.as_deref(), mode, &taken, mtm)
     };
-    let sink = window.sink();
-    let device = sink.as_ref().and_then(|sink| sink.device());
-    let framebuffer_only = sink.as_ref().is_none_or(|sink| sink.render_target_only());
-    // Let go of the sink as soon as it has answered: when a release races the opening, this may
-    // be the sink's last reference, released on the main thread outside an entry.
-    drop(sink);
     let frame = msg::get("frame", || ns_window.frame());
     let bounds = msg::get("contentRectForFrameRect:", || {
         ns_window.contentRectForFrameRect(frame)
     })
     .size;
-    let view = DisplayView::new(
-        mtm,
-        Arc::clone(window),
-        borderless,
-        bounds,
-        device.as_deref(),
-        framebuffer_only,
-    );
+    let view = DisplayView::new(mtm, Arc::clone(window), borderless, bounds);
     msg::get("setContentView:", || ns_window.setContentView(Some(&view)));
     let delegate = WindowDelegate::new(mtm, view.clone(), borderless);
     msg::get("setDelegate:", || {
@@ -908,14 +913,7 @@ pub(crate) fn guest_mode_changed(id: u64, mtm: MainThreadMarker) {
         && let Some(mode) = view.guest_mode()
     {
         let taken = windowed_frames(Some(id), mtm);
-        follow(
-            &window,
-            &delegate,
-            mode,
-            view.guest_scale(mode),
-            &taken,
-            mtm,
-        );
+        follow(&window, &delegate, mode, &taken, mtm);
     }
     view.relayout();
 }
@@ -992,8 +990,7 @@ mod tests {
     fn windows_on_one_screen_cascade() {
         let visible = rect((0.0, 100.0), (1728.0, 962.0));
         let sizing = Sizing {
-            mode: (1920, 1080),
-            guest_scale: 2.0,
+            mode: (960, 540),
             scale: 2.0,
             chrome: NSSize::new(0.0, 32.0),
         };
@@ -1017,14 +1014,13 @@ mod tests {
         let visible = rect((0.0, 0.0), (400.0, 260.0));
         let sizing = Sizing {
             mode: (640, 400),
-            guest_scale: 1.0,
             scale: 1.0,
             chrome: NSSize::new(0.0, 30.0),
         };
         // The fit: 368x229 of content, centred.
         let first = rect((16.0, 0.0), (368.0, 259.0));
         let second = cascade(first, &sizing, visible, &[first]);
-        assert_eq!(second, rect((40.0, 1.0), (328.0, 234.0)));
+        assert_eq!(second, rect((40.0, 1.0), (320.0, 234.0)));
         // A third would have 289x181 of content, below the smallest.
         assert_eq!(cascade(first, &sizing, visible, &[first, second]), second);
         for frame in [first, second] {
@@ -1036,13 +1032,12 @@ mod tests {
 
     /// A window that fills the visible area does not open over another such window: it opens 24
     /// points right and down, made smaller from there, its content keeping the guest's ratio on
-    /// whole pixels
+    /// whole pixels, a multiple of 16 wide and even high
     #[test]
     fn a_cascaded_window_shrinks_rather_than_overlap() {
         let visible = rect((0.0, 100.0), (1728.0, 1110.0));
         let sizing = Sizing {
-            mode: (3456, 2160),
-            guest_scale: 2.0,
+            mode: (1728, 1080),
             scale: 2.0,
             chrome: NSSize::new(0.0, 30.0),
         };
@@ -1050,10 +1045,33 @@ mod tests {
         assert_eq!(content, NSSize::new(1728.0, 1080.0));
         let first = NSRect::new(visible.origin, sizing.frame(content));
         assert_eq!(first, visible);
-        // 1689.6x1056 of content, on whole pixels.
+        // 1689.6x1056 of content, on whole pixels a multiple of 16 wide: 3376x2112.
         let second = cascade(first, &sizing, visible, &[first]);
-        assert_eq!(second, rect((24.0, 100.0), (1689.5, 1086.0)));
+        assert_eq!(second, rect((24.0, 100.0), (1688.0, 1086.0)));
         let third = cascade(first, &sizing, visible, &[first, second]);
-        assert_eq!(third, rect((48.0, 100.0), (1651.0, 1062.0)));
+        assert_eq!(third, rect((48.0, 100.0), (1648.0, 1062.0)));
+    }
+
+    /// A windowed window's edges move by a step of the guest's modes in pixels: 16 wide and 2
+    /// high, in points at its scale
+    #[test]
+    fn a_windowed_window_resizes_by_a_mode_s_steps() {
+        assert_eq!(resize_increments(2.0), NSSize::new(8.0, 1.0));
+        assert_eq!(resize_increments(1.0), NSSize::new(16.0, 2.0));
+        assert_eq!(resize_increments(f64::NAN), NSSize::new(16.0, 2.0));
+        // A content on those steps stays on them at any count of steps.
+        let sizing = Sizing {
+            mode: (1728, 1080),
+            scale: 2.0,
+            chrome: NSSize::new(0.0, 30.0),
+        };
+        let content = sizing.content(NSSize::new(1700.0, 1100.0));
+        let step = resize_increments(2.0);
+        for n in 0..40 {
+            let width = (content.width - f64::from(n) * step.width) * 2.0;
+            let height = (content.height - f64::from(n) * step.height) * 2.0;
+            let drawable = (width as u64, height as u64);
+            assert_eq!(geometry::offered_mode(drawable), drawable, "{n}");
+        }
     }
 }

@@ -2,10 +2,8 @@
 //! over the runtime's.
 //!
 //! - **Handlers** run on the runtime's handler threads, in the queue's order. A completed
-//!   handler reads its buffer's `status` and `error` when it runs, as on the Metal platform, and
-//!   runs marked as ours, so a panic in it aborts. Its read of a failure that dies (below) is the
-//!   code of the isolated task that added it, if one did: once that task ended, nothing dies
-//!   there, as core's handlers of the task run none ([`completed_handler`]).
+//!   handler reads its buffer's `status` and `error` when it runs, as on Metal, and
+//!   runs marked as ours, so a panic in it aborts ([`completed_handler`]).
 //! - **`encodeSignalEventScheduled:value:`** is the runtime's: the event's value is set as the
 //!   buffer is scheduled, before its status reads `Scheduled` and before `waitUntilScheduled`
 //!   returns, as Metal's; sent once the buffer is committed, it sets nothing, as Metal's, and once
@@ -22,17 +20,30 @@
 //! - **A command buffer in parts** (`split`, which the graphics lane's walk asks for at an
 //!   encoder's end, `reims-vgpu`'s `decode/split.rs`): the work encoded so far is committed as
 //!   `commit` commits it, and a command buffer of the same queue goes on from it. The next part
-//!   takes the buffer's place among the releases of detached objects ([`Opened::next_part`]), so
-//!   its submissions fail by what the whole buffer's would, and numbers its runtime encoders from
-//!   0, as the runtime counts a command buffer's. The parts run in their commit order on the
+//!   numbers its runtime encoders from 0, as the runtime counts a command buffer's. The parts run in their commit order on the
 //!   queue, as one buffer's encoders do. The buffer is kept whole, `split` answering `None`, where
 //!   a part would answer otherwise than the whole ([`CommandBufferObject::splits`]): with an
 //!   encoder open; with a way Metal's GPU fails it from an encoder on, every encoder after it
 //!   running nothing (a [`Failing`], a draw of primitive type 9), which a later part would run;
 //!   with protection options set; with an execution of an indirect command buffer whose commands
-//!   its commit reads, or progress kept to its completion; with a unit of command predication
-//!   open, which a later compute encoder would go on; and with an event signalled as it is
-//!   scheduled.
+//!   its commit reads, or progress kept to its completion; with a block of command predication
+//!   open, or a unit an unbalanced record emptied ([`Predication::cuttable`]); and with an event
+//!   signalled as it is scheduled. A unit of compute encoders open at the cut, with no block
+//!   open, goes on in the next part ([`Predication::go_on`]), so a command buffer of compute
+//!   encoders alone, as Geekbench 7's Fluid Simulation commits 2,600 of in one, is cut too, and
+//!   its GPU work starts while the rest is walked. Each part is its own commit of the runtime's,
+//!   so a guest whose walk faults after a part was committed has that part's work run, as for a
+//!   buffer of render passes (`reims-vgpu`'s `decode/split.rs`); Metal would have run none of a
+//!   buffer it never committed. Only invalid input reaches that.
+//!
+//!   A later range of a buffer's work may be encoded at once, on another thread
+//!   (`decode/split.rs`, "Two threads at once"): `part` makes the command buffer it goes into on
+//!   the queue, uncommitted, where the buffer may be cut then, and at the end of the range before
+//!   it `commit_part` commits the buffer as a part where it may be cut, as `split` does, the later
+//!   one going on from it. Where only a way Metal's GPU fails it from an encoder on keeps it whole
+//!   ([`CommandBufferObject::fails_from_an_encoder`]), `commit_part` commits nothing and answers
+//!   so, and `fold` takes the later one's ways of failing into it, as though its encoders had
+//!   been made there, and lets the later one go uncommitted: its encoders run nothing either way.
 //! - **The records of an indirect command buffer an execution runs** are checked by the runtime
 //!   as they stand at commit, or, where the GPU may have written them, once the work before the
 //!   execution completed. A refusal at commit dies there naming the runtime's refusal, and says
@@ -42,9 +53,7 @@
 //!   buffer so, and it dies naming the runtime's refusal (`CommandBuffer::refusal`), never a
 //!   failure the guest could see. It dies as the command buffer completes, before any handler of
 //!   core's learns of it, at the selector of its first execution of an indirect command buffer
-//!   ([`Ending`]), and at `commit` where its status or error is read first ([`failure`]). An
-//!   isolated task's command buffer that completes after the task ended dies at neither, as
-//!   core's handlers of the task run none then.
+//!   ([`Ending`]), and at `commit` where its status or error is read first ([`failure`]).
 //! - **An execution's commands that decide a death** (a draw of points under a state whose points
 //!   Metal sizes none of; a command whose state can encode indirect commands in an encoder that
 //!   made resident for writing a buffer whose ID is not the runtime's) are read at the commit, as
@@ -52,7 +61,9 @@
 //!   buffer whose records the GPU may have written is asked at the runtime's host step instead,
 //!   which reads them once the work before it completed, and dies there, at `commit`, at a
 //!   command that decides a death ([`executions`]). An encoder the command buffer's failure runs
-//!   nothing of is not asked.
+//!   nothing of is not asked, whether this platform commits the failure or the runtime makes it
+//!   itself, at a draw of primitive type 9 or a pass's store into read-only memory
+//!   ([`CommandBufferObject::runs_nothing_from`]).
 //! - **A draw's or dispatch's pipeline the driver did not make**, which the runtime makes while
 //!   the command goes on and reports as the command buffer's failure
 //!   (`CommandBufferError::PipelineCreation`), dies
@@ -72,27 +83,6 @@
 //!   the runtime does not filter bicubically through an argument buffer's sampler, and fails a
 //!   command buffer whose function reached one, where Metal samples and fails none. A function
 //!   that never reaches one runs as Metal's.
-//! - **A command whose buffer over the guest's pages was rebound before its command buffer was
-//!   submitted, in an encoder the runtime cannot encode again**
-//!   (`CommandBufferError::EncodedUseRebound`) dies there too ([`encoded_use_rebound`]): the
-//!   runtime resolves a command's use of a buffer over the caller's host pages as the command is
-//!   encoded, and where the buffer is rebound (a backing replaced, `crate::gpu::backing`) before
-//!   the command buffer's first submission, it encodes the compute, blit and render encoders that
-//!   named it again from their calls, so they reach the new pages as Metal's do (a call refused at
-//!   its encoding is refused again, and the calls after it run), and a resource state encoder takes
-//!   no pages (an indirect mapping update reads its buffer as it runs). It fails only an encoder it
-//!   cannot encode again: a compute encoder of the runtime's command predication that shares its
-//!   unit, holds a loop or leaves work out (no record of ours reaches the runtime's predication:
-//!   this platform's is its own, [`crate::gpu::predication`]); a render pass that executes an
-//!   indirect command buffer, which the runtime records later, or whose end captured its draws'
-//!   tile reach; and one a call of which answers otherwise than at its encoding. An encoder whose
-//!   dispatch, draw or tile dispatch had its pipeline still being made at the commit is encoded
-//!   again as any other, its pipeline's making left to the submission: the replace waits for no
-//!   making. Each submission holding such an encoder runs nothing and the command
-//!   buffer fails, where Metal resolves the use as it submits and runs the command over the pages
-//!   the buffer lies in then. The runtime announces the first such failure (`EncodedUseRebound`,
-//!   [`crate::answer::DIES`]) on the thread that makes the submission, where it dies first, ending
-//!   the process.
 //! - **Every other failure of the runtime's own**, where Metal fails no command buffer, dies
 //!   there too, naming it ([`answered`]): a mesh draw's grid the device cannot launch where Metal
 //!   draws it (`MeshGridPastLimits`, which dies as unanswered); an emulated mesh draw past the
@@ -133,16 +123,21 @@
 //! - **How Metal's GPU fails a command buffer for what its encoders did** is injected at its
 //!   commit ([`rt::CommandBuffer::commit_failed`]): Metal's code, the first encoder that runs
 //!   nothing, every one after it running nothing too, and whether its event signals fire
-//!   ([`Failing`]). Measured on the M3 Max (macOS 26.7), `setProtectionOptions:` is kept here,
-//!   as the runtime has no protected content ([`CommandBufferObject::made_encoder`]). An encoder
-//!   made under options other than 0 runs nothing, nor does any after it, and fails the command
-//!   buffer with code 16 ("Protection Violation") below 0x10 and `MTLCommandBufferErrorInternal`
-//!   ("Invalid Input") from 0x10 up, none of its signals firing; options from 0x10 up fail it so
-//!   with no encoder made under them too, every encoder running. An encoder made before the
-//!   options runs. Under 1, 3 and 7 a compute or render encoder's creation, and a blit encoder's
-//!   first command, die, as Metal ends the process there. A protection failure reaches no later
-//!   command buffer: one committed on its queue while it is in flight runs, on Metal (measured
-//!   alike) as here.
+//!   ([`Failing`]). Measured on the M3 Max (macOS 26.7 and 27.0.1), `setProtectionOptions:` is
+//!   kept here, as the runtime has no protected content ([`CommandBufferObject::made_encoder`]).
+//!   An encoder made under options other than 0 runs nothing, nor does any after it, and fails
+//!   the command buffer with code 16 ("Protection Violation") below 0x10 and
+//!   `MTLCommandBufferErrorInternal` ("Invalid Input") from 0x10 up; the event signals encoded
+//!   before it fire, and none after it, so this platform sends none encoded after it
+//!   ([`CommandBufferObject::withholds_signals`]). Options from 0x10 up fail it so with no
+//!   encoder made under them too, every encoder running and every signal firing. An encoder made
+//!   before the options runs. The dGPU oracle (macOS 26.7.1, dgpu-oracle.md Q39) answers code 16
+//!   at 0x10 too, and completes a command buffer whose options no encoder was made under; its
+//!   AMD 5300M runs and signals as the M3 Max does, and its Intel UHD 630 runs every encoder and
+//!   fires every signal. Under 1, 3 and 7 a compute or render encoder's creation, and a blit
+//!   encoder's first command, die, as Metal ends the process there. A protection failure reaches
+//!   no later command buffer: one committed on its queue while it is in flight runs, on Metal
+//!   (measured alike) as here.
 //!
 //!   A render encoder's draw of primitive type 9, at which Metal's GPU hangs, faults or fails a
 //!   victim of its recovery, the runtime fails the command buffer at as Metal's GPU does
@@ -155,80 +150,58 @@
 //!   `AccessRevoked` (4), running nothing and signalling nothing, as Metal's
 //!   (`type_9_faults_revoke_queues_as_metals`). Such a draw is told to the command buffer
 //!   ([`CommandBufferObject::fails_at_type_9`]): one that fails another way too, by its own
-//!   encoders, its protection options, a use of a detached object at its commit, or another
-//!   type-9 draw's other failure, dies at the commit, as do two different ways at once of any
-//!   kind, which nothing measured.
-//! - **A submission that uses a detached buffer or heap** fails with
-//!   `MTLCommandBufferErrorOutOfMemory` (8), whose description is Metal's ("Insufficient
-//!   Memory"), as Metal fails it. Metal splits a command buffer into submissions, and decides
-//!   each as it submits it, once the event waits before it are met (measured on the M3 Max,
-//!   macOS 26.7, `tests/detach_backing.rs`):
-//!   - every render pass is a submission of its own;
-//!   - a run of consecutive blit encoders is one, and so is a run of consecutive compute
-//!     encoders;
-//!   - an event wait or signal ends a run.
+//!   encoders, its protection options, a store-out's fault or another type-9 draw's failure of
+//!   another code, dies at the commit, as nothing measured it (a type-9 draw hangs the GPU, which
+//!   no probe takes on).
 //!
-//!   The runtime splits a command buffer so, and checks each submission as it submits it, once
-//!   its event waits are met ([`backing::submission_check`]): a wait another command buffer's
-//!   GPU signal meets, once that signal landed, as Metal checks it once the signal happened. One
-//!   that uses a detached object, or one released detached since the command buffer was made,
-//!   runs nothing; every other submission runs, the event signals fire, the scheduled and
-//!   completed handlers run, and the command buffer completes in its queue's order with status
-//!   `Error`. The use can be a binding, a `useResource:` or `useHeap:`, a blit's operand, a
-//!   command of an indirect command buffer it executes, or a texture over the buffer, a view of
-//!   that texture, or a resource placed in the heap, as the runtime lists a submission's uses.
-//!   This platform differs from Metal where:
-//!   - the object is replaced after the command was encoded and before its command buffer's
-//!     first submission (committed after the replace, or committed before it and held behind an
-//!     event wait), in an encoder the runtime cannot encode again (the failure above): Metal
-//!     runs the submission over the new pages. The runtime resolved the command's use as it
-//!     encoded it, and fails the command buffer (`CommandBufferError::EncodedUseRebound`), which
-//!     dies ([`encoded_use_rebound`]); a compute, blit or render encoder it encodes again
-//!     reaches the new pages, as Metal's. The runtime decides each submission so as it submits
-//!     it, after the check: one the check fails, a use detached then, keeps code 8, as Metal's,
-//!     and a later one rebound so dies all the same, the command buffer keeping that code;
-//!   - a submission that executes an indirect command buffer the GPU may write is checked again
-//!     once the runtime recorded what its commands reach, and failing then, only what had not
-//!     run yet runs nothing. Metal decides it once, before any of it runs.
-//!
-//!   A command that reaches a detached object only through an address it loads names nothing the
-//!   check sees, so its submission runs, as Metal's does, reading 0 and dropping the write, on
-//!   every host: the runtime's detach leaves the object in no memory, replaced or never replaced,
-//!   and out of what such a command reaches until a command buffer uses it after a replace
-//!   (`backing`'s docs).
-//!
-//!   A texture over a buffer or placed in a heap, and a buffer placed in a heap, hold the buffer
-//!   or heap, as Metal's do, so a detached one is released only with the last of them, and a use
-//!   through one fails until then ([`crate::gpu::resource::Under`]).
-//!
-//!   A command buffer Metal's GPU fails for what its encoders did is decided at its commit, with
-//!   no check: one that uses a detached object then dies there, as one failing two ways does.
+//!   At a render pass that stores an attachment into read-only memory the runtime copies, or
+//!   resolves into a texture there (`Store`, `StoreAndMultisampleResolve`, a depth attachment's
+//!   `CustomSampleDepthStore`; a colour or stencil attachment's `MultisampleResolve` and
+//!   `StoreAndMultisampleResolve`, a depth attachment's `MultisampleResolve`: the store-outs of
+//!   `crate::gpu::writes`), the M3 Max's GPU faults the command buffer
+//!   (`kIOGPUCommandBufferCallbackErrorPageFault`, measured on the M3 Max, macOS 27.0.1, by
+//!   metal2vulkan's `probes/readonly_gpu_writes.m` and plain Metal, m3-max-29292 and
+//!   m3-max-29309), and the runtime faults it so itself
+//!   (`MTLCommandBufferErrorPageFault`, 3; the runtime's `store_out.rs`): its render encoder and
+//!   every encoder after it run nothing and every event signal fires, as a type-9 draw's page
+//!   fault does: the M3 Max runs the encoder after the faulting pass in 11 runs of 18 and not in
+//!   7, and fires every signal (dgpu-oracle.md Q39). Which encoders before the pass run is not
+//!   measured for this fault. Such a pass is told to the command buffer as a failure the runtime
+//!   makes ([`CommandBufferObject::faults_at_read_only_store`]). Beside a failure of its own, by
+//!   its protection options, the command buffer fails as that failure says, its code and its
+//!   signals, as the M3 Max's does whether the options came before the pass, after it or after
+//!   every encoder (Q39; the x86 Macs, whose GPU stores into such memory, fail it so too); beside
+//!   a type-9 draw's failure of another code it dies at the commit, as above. The fault counts against its queue as every page fault does: the
+//!   command buffers committed after it on the same queue, at once or 100 ms on, and on a new
+//!   queue run, and the queue's second fault revokes it, every later command buffer of that queue
+//!   failing with `AccessRevoked` (4), as Metal's (measured on the M3 Max, macOS 27.0.1, plain
+//!   Metal, `probes/readonly_gpu_writes.m` and `readonly_encode_answers.m`, m3-max-29110,
+//!   m3-max-28796 and m3-max-28797; the runtime's `command_buffer/revocation.rs`;
+//!   `read_only_faults_revoke_queues_as_metals`). Other queues serve on.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
+use crate::core::platform::Handle;
+use crate::core::platform::command::committing as committing_here;
+use crate::core::platform::command::{
+    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, KeptWhole, PartCut,
+    ScheduledHandler, run_completed,
+};
+use crate::core::platform::event::EventRef;
+use crate::core::platform::types::{CommandBufferStatus, NsErrorText};
+use crate::core::platform::values::ComputePassDesc;
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::refusals::{self, Carried};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
 use metal2vulkan::metal::DispatchType;
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::command::committing as committing_here;
-use reims_vgpu_core::platform::command::{
-    CommandBuffer, CommandQueue, CompletedHandler, CompletedInfo, ScheduledHandler, run_completed,
-};
-use reims_vgpu_core::platform::event::EventRef;
-use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
-use reims_vgpu_core::platform::values::ComputePassDesc;
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::refusals::{self, Carried};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
-use reims_vgpu_core::tasks::isolation::TaskLife;
 
 use crate::answer::{
-    Policy, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
-    unstopped_get,
+    Policy, get, hang, metal_aborts, plain, plain_at, refusal, refused, send, unrepresentable,
 };
-use crate::gpu::backing::{self, Opened};
 use crate::gpu::desc::VulkanRenderPassDescriptor;
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::encode_blit::{EncoderObject, VulkanBlitEncoder};
@@ -276,9 +249,8 @@ pub struct CommandBufferObject {
     progress: Mutex<Option<Arc<Progress>>>,
     /// Its command predication.
     pub(crate) predication: Arc<Predication>,
-    /// Its place among the releases of detached objects until it commits, which its submission
-    /// check then holds ([`backing::submission_check`]).
-    opened: Mutex<Option<Opened>>,
+    /// Whether it was committed: it is split no more ([`CommandBufferObject::splits`]).
+    committed: AtomicBool,
     /// How many runtime encoders it has made: each encoder of Metal's, or a part of one where
     /// [`predication`] ends a compute encoder's runtime encoder and makes another. As no two are
     /// open at once, each one's count before it is its place among the encoders the runtime
@@ -287,9 +259,13 @@ pub struct CommandBufferObject {
     /// How Metal's GPU fails it for what its encoders did ([`Failing`]), which its commit fails
     /// it with ([`CommandBufferObject::failure`]).
     failing: Mutex<Vec<Failing>>,
-    /// How Metal's GPU fails it at its draws of primitive type 9, which the runtime fails it
-    /// with itself ([`CommandBufferObject::fails_at_type_9`]).
-    type_9: Mutex<Vec<Failing>>,
+    /// How Metal's GPU fails it where the runtime fails it so itself at its draws of primitive
+    /// type 9 ([`CommandBufferObject::fails_at_type_9`]).
+    by_runtime: Mutex<Vec<Failing>>,
+    /// How Metal's GPU faults it where the runtime faults it so itself at its render passes'
+    /// stores into read-only memory the runtime copies
+    /// ([`CommandBufferObject::faults_at_read_only_store`]).
+    stores: Mutex<Vec<Failing>>,
     /// The protection options `setProtectionOptions:` set, which the runtime does not hold.
     protection: Mutex<Protection>,
     /// Whether it carries the submission handler that takes Metal's allocation for its work for
@@ -315,12 +291,11 @@ pub struct CommandBufferObject {
 /// buffer encoded once the process took the allocation carries none: the allocation is held for
 /// good, and a submission handler makes the runtime run the command buffer's transition to
 /// scheduled on a handler thread, woken for it, where it runs it on its scheduler thread as it
-/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). Every command
-/// buffer this platform commits carries a submission check ([`backing::submission_check`]), which
-/// the runtime runs just before it submits the command buffer, once its waits are met and the work
-/// ahead of it on its queue is submitted: inside `commit`, on the committing thread, where that
-/// thread makes the submission pass ([`CommandBuffer::commit`]), else on the runtime's scheduler
-/// thread after `commit` returns, as Metal submits on a thread of its own and tells the program
+/// submits the command buffer (`rt::WorkCounts::scheduled_where_submitted`). The thread that
+/// submits it, once its waits are met and the work ahead of it on its queue is submitted, is the
+/// committing thread, inside `commit`, where that thread makes the submission pass
+/// ([`CommandBuffer::commit`]), else the runtime's scheduler thread after `commit` returns, as
+/// Metal submits on a thread of its own and tells the program
 /// only through scheduled (the runtime's measurement on an M4). A range placed between the commit
 /// and the submission lies by the threads' timing, on Metal as here. A command buffer the runtime
 /// fails before its submission takes nothing.
@@ -349,7 +324,13 @@ pub(crate) struct Failing {
     pub code: u64,
     /// The first encoder that runs nothing, in the order the runtime ended them.
     pub from: usize,
-    /// Whether its event signals fire.
+    /// Whether the event signals encoded after its first failing encoder fire: true at a GPU
+    /// fault or hang, where every signal fires; false for an encoder made under protection
+    /// options, after which none fires, those encoded before it firing (dgpu-oracle.md Q39). The
+    /// runtime drops every signal of an injected failure whose signals do not fire
+    /// ([`rt::CommitFailure::signals`]), so this platform sends none encoded after such an
+    /// encoder ([`CommandBufferObject::withholds_signals`]) and injects the failure with its
+    /// signals firing.
     pub signals: bool,
 }
 
@@ -373,15 +354,13 @@ impl CommandBufferObject {
     /// Work for Metal's tiler encoded by `sel`, `first`: a render encoder made, or a blit's reset
     /// or copy of an indirect command buffer. Metal's own allocations for it the first time, and
     /// the command buffer's submission a first use too, which its submission handler takes, added
-    /// here while the process has not taken it ([`tiler_handler`]). Nothing here stops a thread
-    /// of a task that ended: a render encoder's runtime encoder is not in its handle yet
-    /// (`crate::gpu::encode_render`'s `make`), and dropped it would abandon the command buffer.
+    /// here while the process has not taken it ([`tiler_handler`]).
     pub(crate) fn tiler_work(&self, sel: &'static str, first: FirstUse) {
         metal_space::first_use(first);
         if !metal_space::taken(FirstUse::TilerSubmission)
             && !self.tiler.swap(true, Ordering::SeqCst)
         {
-            unstopped_get(sel, || self.raw.add_submission_handler(tiler_handler()));
+            get(sel, || self.raw.add_submission_handler(tiler_handler()));
         }
     }
 
@@ -402,9 +381,7 @@ impl CommandBufferObject {
     /// other than 0 fails the command buffer from it, with
     /// [`PROTECTION_VIOLATION`] below 0x10 and [`INVALID_INPUT`] from there up, its event
     /// signals firing none; under options that end the process at its first command (a blit
-    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at. Nothing here
-    /// stops a thread of a task that ended: the encoder is not in its handle yet, and dropped
-    /// it would abandon the command buffer.
+    /// encoder's, [`aborts_encoders`]) it answers them, which that command dies at.
     pub(crate) fn made_encoder(&self, whole: bool) -> (usize, Option<u64>) {
         let at = self.made.fetch_add(1, Ordering::SeqCst);
         if !whole {
@@ -436,24 +413,117 @@ impl CommandBufferObject {
     /// it for what its encoders did, nor a draw of primitive type 9, which fail it from an
     /// encoder on, every one after it running nothing; no protection options set; no execution
     /// of an indirect command buffer whose commands its commit reads, and no progress kept to
-    /// its completion (a rate map's reset, an indirect command buffer's numbers); no unit of
-    /// command predication open, which a later compute encoder would go on; and no event
-    /// signalled as it is scheduled. Not committed.
+    /// its completion (a rate map's reset, an indirect command buffer's numbers); no block of
+    /// command predication open, and no unit an unbalanced record emptied
+    /// ([`Predication::cuttable`]; a unit of compute encoders goes on in the next part); and no
+    /// event signalled as it is scheduled. Not committed.
     fn splits(&self) -> bool {
+        !self.fails() && self.kept_whole_by().is_none()
+    }
+
+    /// Whether a way Metal's GPU fails it for what its encoders did is noted: a [`Failing`] of
+    /// its own, a draw of primitive type 9, a store into read-only memory, each from an encoder
+    /// on ([`CommandBufferObject::splits`]).
+    fn fails(&self) -> bool {
         plain(|| {
-            self.open_encoders.load(Ordering::SeqCst) == 0
-                && self.failing.lock().is_empty()
-                && self.type_9.lock().is_empty()
-                && {
-                    let protection = self.protection.lock();
-                    protection.options == 0 && !protection.used
-                }
-                && self.executions.lock().is_empty()
-                && self.progress.lock().is_none()
-                && !self.predication.in_unit()
-                && !self.signals_scheduled.load(Ordering::SeqCst)
-                && self.opened.lock().is_some()
+            !self.failing.lock().is_empty()
+                || !self.by_runtime.lock().is_empty()
+                || !self.stores.lock().is_empty()
         })
+    }
+
+    /// Why it may not be cut, but for how Metal's GPU fails it ([`CommandBufferObject::fails`]):
+    /// the first of [`KeptWhole::ALL`] that holds ([`CommandBufferObject::splits`]); `None` where
+    /// none does.
+    fn kept_whole_by(&self) -> Option<KeptWhole> {
+        plain(|| {
+            let protection = *self.protection.lock();
+            [
+                self.open_encoders.load(Ordering::SeqCst) != 0,
+                protection.options != 0 || protection.used,
+                !self.executions.lock().is_empty(),
+                self.progress.lock().is_some(),
+                !self.predication.cuttable(),
+                self.signals_scheduled.load(Ordering::SeqCst),
+                self.committed.load(Ordering::SeqCst),
+            ]
+            .into_iter()
+            .zip(KeptWhole::ALL)
+            .find_map(|(holds, reason)| holds.then_some(reason))
+        })
+    }
+
+    /// Whether it is kept whole ([`CommandBufferObject::splits`]) only by how Metal's GPU fails it
+    /// for what its encoders did, a draw of primitive type 9 or a store into read-only memory,
+    /// each from an encoder on, every encoder after it running nothing: then a later range's
+    /// encoders run nothing in it either, and need only what they noted of how they fail
+    /// ([`CommandBufferObject::fold`]).
+    fn fails_from_an_encoder(&self) -> bool {
+        self.fails() && self.kept_whole_by().is_none()
+    }
+
+    /// Takes in what `later`, made for a later range of its work (`CommandBuffer::part`) and
+    /// encoded, noted of how Metal's GPU fails it, each failing encoder's place counted after
+    /// this one's encoders, and the encoders it made; and the tiler's submission handler, where
+    /// `later` took it and this one did not ([`CommandBufferObject::tiler_work`]): so its commit
+    /// answers as it would had `later`'s encoders been made in it ([`CommandBufferObject::failure`]),
+    /// a way of failing of `later`'s beside its own dying where two would. Called where it fails
+    /// from an encoder on ([`CommandBufferObject::fails_from_an_encoder`]), before every one of
+    /// `later`'s, which run nothing.
+    fn fold(&self, later: &CommandBufferObject) {
+        let base = self.made.load(Ordering::SeqCst);
+        let after = |ways: &Mutex<Vec<Failing>>| -> Vec<Failing> {
+            (ways.lock().iter())
+                .map(|w| Failing {
+                    from: w.from + base,
+                    ..*w
+                })
+                .collect()
+        };
+        plain(|| {
+            let (failing, by_runtime, stores) = (
+                after(&later.failing),
+                after(&later.by_runtime),
+                after(&later.stores),
+            );
+            self.failing.lock().extend(failing);
+            self.by_runtime.lock().extend(by_runtime);
+            self.stores.lock().extend(stores);
+        });
+        (self.made).fetch_add(later.made.load(Ordering::SeqCst), Ordering::SeqCst);
+        if later.tiler.load(Ordering::SeqCst) && !self.tiler.swap(true, Ordering::SeqCst) {
+            get("commit", || {
+                self.raw.add_submission_handler(tiler_handler())
+            });
+        }
+    }
+
+    /// The next part of it, made on its queue ([`CommandBuffer::split`], `CommandBuffer::part`):
+    /// a command buffer of no encoder yet, its predication going on from this one's, as the unit
+    /// of compute encoders open at a cut goes on in the next part. Its make waits while the
+    /// queue holds 64 uncompleted command buffers, as `commandBuffer` does.
+    fn next_part(&self) -> RaiseResult<VulkanCommandBuffer> {
+        let raw = waiting("commandBuffer", || {
+            self.raw.command_queue().command_buffer()
+        })?;
+        let predication = Predication::new(&self.device);
+        predication.go_on(&self.predication);
+        Ok(Obj::new(CommandBufferObject {
+            raw,
+            device: self.device.clone_ref(),
+            open_encoders: Arc::default(),
+            progress: Mutex::new(None),
+            predication,
+            committed: AtomicBool::new(false),
+            made: AtomicUsize::new(0),
+            failing: Mutex::new(Vec::new()),
+            by_runtime: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
+            protection: Mutex::new(Protection::default()),
+            tiler: AtomicBool::new(false),
+            executions: Mutex::new(Vec::new()),
+            signals_scheduled: AtomicBool::new(false),
+        }))
     }
 
     /// Records `failing`, which its commit fails it with ([`CommandBufferObject::failure`]).
@@ -461,11 +531,34 @@ impl CommandBufferObject {
         self.failing.lock().push(failing);
     }
 
+    /// Whether it sends no more event signals: one of its encoders fails it with signals that do
+    /// not fire after it ([`Failing::signals`]), as an encoder made under protection options does,
+    /// after which Metal's GPU fires none of its signals (the M3 Max and the AMD 5300M; the Intel
+    /// UHD 630 fires them all; dgpu-oracle.md Q39). Those encoded before it fire.
+    fn withholds_signals(&self) -> bool {
+        plain(|| self.failing.lock().iter().any(|f| !f.signals))
+    }
+
+    /// Records that the render pass at `from`, in the order the runtime ended its encoders, stores
+    /// an attachment into read-only memory the runtime copies, at which Metal's GPU faults it from
+    /// that pass on, its event signals firing, as the runtime faults it itself (the module docs):
+    /// a failure of its own, by its protection options, stands beside the fault, and its commit
+    /// dies where a type-9 draw fails it another way too ([`CommandBufferObject::failure`]).
+    pub(crate) fn faults_at_read_only_store(&self, from: usize) {
+        plain(|| {
+            self.stores.lock().push(Failing {
+                code: rt::CommandBufferError::PageFault.metal_code(),
+                from,
+                signals: true,
+            });
+        });
+    }
+
     /// Records `failing`, how a draw of primitive type 9 in it fails it, as Metal's GPU does,
     /// which the runtime fails it with itself (`crate::gpu::encode_render`'s `nine`): its
     /// commit dies where it fails another way too ([`CommandBufferObject::failure`]).
     pub(crate) fn fails_at_type_9(&self, failing: Failing) {
-        plain(|| self.type_9.lock().push(failing));
+        plain(|| self.by_runtime.lock().push(failing));
     }
 
     /// `execution`, a command of the encoder it made last, is checked at its commit, where its
@@ -476,18 +569,13 @@ impl CommandBufferObject {
     }
 
     /// Checks at its commit the executions [`CommandBufferObject::checked_at_commit`] took, in
-    /// their order, but those of an encoder `failed` runs nothing of; each whose records it read
-    /// for a death is held as read until it ends ([`executions::reads`]).
-    fn check_executions(&self, failed: Option<&rt::FailedEncoders>, progress: Option<&Progress>) {
+    /// their order, but those of an encoder from `failed` on, which run nothing; each whose
+    /// records it read for a death is held as read until it ends ([`executions::reads`]).
+    fn check_executions(&self, failed: Option<usize>, progress: Option<&Progress>) {
         let taken = std::mem::take(&mut *self.executions.lock());
-        let runs = |at: usize| match failed {
-            Some(rt::FailedEncoders::From(from)) => at < *from,
-            Some(rt::FailedEncoders::Set(set)) => !set.contains(&at),
-            _ => true,
-        };
         let read: Vec<_> = taken
             .into_iter()
-            .filter(|(at, _)| runs(*at))
+            .filter(|(at, _)| failed.is_none_or(|from| *at < from))
             .filter_map(|(_, execution)| execution.check())
             .collect();
         if let Some(progress) = progress {
@@ -499,52 +587,85 @@ impl CommandBufferObject {
 
     /// How Metal's GPU fails it, at its commit (`sel`): what its encoders did ([`Failing`]),
     /// and protection options with a bit from 0x10 up, which fail it with [`INVALID_INPUT`]
-    /// though no encoder was made under them (measured), all of its encoders running; `None`
-    /// where nothing does, or only its draws of primitive type 9, which the runtime fails it at
-    /// ([`CommandBufferObject::fails_at_type_9`]). Where either fails it, a use of a detached
-    /// object at the commit (`detached`, asked only then) is another way. Two different ways at
-    /// once, which nothing measured, die. A use of a detached object alone fails only its
-    /// submissions ([`backing::submission_check`]).
-    fn failure(
-        &self,
-        sel: &'static str,
-        detached: impl FnOnce() -> bool,
-    ) -> Option<rt::CommitFailure> {
-        let mut ways = plain(|| self.failing.lock().clone());
-        let options = plain(|| self.protection.lock().options);
-        if protection_code(options) == INVALID_INPUT {
-            ways.push(Failing {
+    /// though no encoder was made under them, all of its encoders running and every event signal
+    /// firing (measured on the M3 Max; dgpu-oracle.md Q39); `None` where nothing does, or only
+    /// the failures the runtime makes itself, at its draws of primitive type 9
+    /// ([`CommandBufferObject::fails_at_type_9`]) and its passes' stores into read-only memory
+    /// ([`CommandBufferObject::faults_at_read_only_store`]). Its event signals fire, but those
+    /// it never sent ([`CommandBufferObject::withholds_signals`]).
+    ///
+    /// A store-out's fault beside a failure of its own is answered by the latter, as Metal's GPU
+    /// answers it: its code and its signals, the encoders from its first failing one running
+    /// nothing, and from the faulting pass too, as the runtime runs nothing after it (the M3 Max
+    /// runs an encoder after the faulting pass in 11 runs of 18, alone and beside options set
+    /// after every encoder; dgpu-oracle.md Q39). The x86 Macs, whose GPU writes bit-24 memory,
+    /// answer the failure of its own alone. Two different ways at once that nothing measured
+    /// die: a type-9 draw's failure beside one of its own, or beside a type-9 failure or a
+    /// store-out's fault of another code. The encoders it fails are always
+    /// [`rt::FailedEncoders::From`] the first that runs nothing, never a `Set`.
+    ///
+    /// A command buffer that fails so is never cut into parts ([`CommandBufferObject::splits`]),
+    /// so what fails is the encoders of one commit of the runtime's: a failure from an encoder
+    /// on is passed as `From` its first. Each part of a buffer that was cut is a commit of its
+    /// own, whose encoders the runtime treats as any commit's: what it records together of a
+    /// commit's encoders (consecutive compute encoders, in one Vulkan command buffer) it records
+    /// within a part, never across a cut. The encoder that fails can directly follow compute
+    /// encoders the runtime records with it; the encoders before it run all the same
+    /// (`protection_options_fail_compute_encoders_from_the_one_made_under_them`).
+    fn failure(&self, sel: &'static str) -> Option<rt::CommitFailure> {
+        let mut own = plain(|| self.failing.lock().clone());
+        let protection = plain(|| *self.protection.lock());
+        // No encoder fails, and no signal follows the first that runs nothing.
+        if protection_code(protection.options) == INVALID_INPUT && !protection.used {
+            own.push(Failing {
                 code: INVALID_INPUT,
                 from: self.made.load(Ordering::SeqCst),
                 signals: false,
             });
         }
-        let own = ways.len();
-        ways.extend(plain(|| self.type_9.lock().clone()));
-        let first = *ways.first()?;
-        if detached() {
-            ways.push(Failing {
-                code: backing::DETACHED_USE,
-                from: 0,
-                signals: true,
-            });
-        }
-        if ways
-            .iter()
-            .any(|w| (w.code, w.signals) != (first.code, first.signals))
-        {
+        let nines = plain(|| self.by_runtime.lock().clone());
+        let stores = plain(|| self.stores.lock().clone());
+        let by_runtime: Vec<Failing> = nines.iter().chain(&stores).copied().collect();
+        let differ = |ways: &[Failing]| {
+            ways.first().is_some_and(|f| {
+                ways.iter()
+                    .any(|w| (w.code, w.signals) != (f.code, f.signals))
+            })
+        };
+        if (!own.is_empty() && !nines.is_empty()) || (own.is_empty() && differ(&by_runtime)) {
+            let mut ways = own.clone();
+            ways.extend(by_runtime);
             unrepresentable(
                 sel,
-                &format!("a command buffer Metal's GPU fails in more than one way: {ways:?}"),
+                &format!(
+                    "a command buffer Metal's GPU fails in more than one way, which nothing \
+                     measured: {ways:?}"
+                ),
             );
         }
-        ways.truncate(own);
-        let first = *ways.first()?;
+        let first = *own.first()?;
         let mut failure = rt::CommitFailure::new(first.code);
-        let from = ways.iter().map(|w| w.from).min().unwrap_or(first.from);
+        let from = own.iter().map(|w| w.from).min().unwrap_or(first.from);
         failure.encoders = rt::FailedEncoders::From(from);
-        failure.signals = first.signals;
+        failure.signals = true;
         Some(failure)
+    }
+
+    /// The first of its encoders that runs nothing, by its place among those the runtime ended:
+    /// the first that `failure` ([`CommandBufferObject::failure`]) fails, or that a failure the
+    /// runtime makes itself fails ([`CommandBufferObject::fails_at_type_9`],
+    /// [`CommandBufferObject::faults_at_read_only_store`]), each failing every encoder from its
+    /// own on; `None` where none fails.
+    fn runs_nothing_from(&self, failure: Option<&rt::CommitFailure>) -> Option<usize> {
+        let own = match failure.map(|f| &f.encoders) {
+            Some(rt::FailedEncoders::From(from)) => Some(*from),
+            _ => None,
+        };
+        let by_runtime = plain(|| {
+            let (nines, stores) = (self.by_runtime.lock(), self.stores.lock());
+            nines.iter().chain(stores.iter()).map(|w| w.from).min()
+        });
+        own.into_iter().chain(by_runtime).min()
     }
 
     /// Its progress ([`Progress`]), for `sel`, an encoder's command: made the first time one asks,
@@ -559,10 +680,9 @@ impl CommandBufferObject {
         let progress = Arc::new(Progress::default());
         let ending = Ending {
             progress: Some(Arc::clone(&progress)),
-            task: TaskLife::current(),
             carried: refusals::carry(),
             #[cfg(test)]
-            slot: reims_vgpu_core::testkit::capture::current_slot(),
+            slot: crate::core::testkit::capture::current_slot(),
         };
         let handler: rt::Handler = Box::new(move |cb: &rt::CommandBuffer| ending.run(cb));
         plain(|| self.raw.add_completed_handler(handler)).unwrap_or_else(|e| refused(sel, &e));
@@ -670,7 +790,7 @@ impl Progress {
 
     /// The command buffer ends at `stage`: its changes run if it completed, its failures' if it
     /// failed, what it held goes, then the stage is set. It runs on the runtime's thread, or
-    /// where the command buffer goes, and sends nothing, so it checks no task's end. Each change
+    /// where the command buffer goes, and sends nothing. Each change
     /// runs, and each object held is let go of, in the scope `carried` names, the one the
     /// command that made the progress carried (the graphics lane's): a death in one is refused
     /// there and logged, and the rest run and go, and the stage is set, all the same. Outside
@@ -702,7 +822,7 @@ impl Progress {
         };
         let refused = |what: &str, refusal: refusals::Refusal| {
             log::warn!(
-                target: "reims_vgpu::refused",
+                target: "reims_vgpu::refused", kind:% = refusal;
                 "a command buffer's {what} as it ended was refused: {refusal}"
             );
         };
@@ -730,16 +850,13 @@ impl Progress {
 struct Ending {
     /// The progress it ends, until it has.
     progress: Option<Arc<Progress>>,
-    /// The isolated task whose code made the progress, if one's did: the command buffer is the
-    /// task's, and its death in the handler is the task's code ([`as_task`]).
-    task: Option<Arc<TaskLife>>,
     /// The refusal scope of the op whose command made the progress (the graphics lane's), which
     /// the death in the handler refuses instead of ending the process; none outside every scope.
     /// The command buffer's own completed handlers then see its refused step as their failure.
     carried: Carried,
     /// The test's death slot, which a death in the handler lands in.
     #[cfg(test)]
-    slot: Option<Arc<reims_vgpu_core::testkit::capture::DeathSlot>>,
+    slot: Option<Arc<crate::core::testkit::capture::DeathSlot>>,
 }
 
 impl Ending {
@@ -761,43 +878,29 @@ impl Ending {
 
     /// Ends the progress at `stage`, after `refused`'s death at the selector of its first
     /// execution of an indirect command buffer where a host step refused the command buffer and
-    /// its commands execute one. The death is the task's code, so none comes once the task ended;
-    /// in the scope the progress carried, it is refused there, logged, and the progress ends.
+    /// its commands execute one. In the scope the progress carried, it is refused there, logged,
+    /// and the progress ends.
     fn end(&mut self, stage: Stage, refused: Option<impl Fn(&'static str)>) {
         let Some(progress) = self.progress.take() else {
             return;
         };
-        let task = self.task.take();
         let carried = self.carried;
         let end = || {
             if let Some(refused) = refused
                 && let Some(sel) = progress.first_execution()
-                && let Err(refusal) = carried.run(|| as_task(task.as_ref(), || refused(sel)))
+                && let Err(refusal) = carried.run(|| refused(sel))
             {
                 log::warn!(
-                    target: "reims_vgpu::refused",
+                    target: "reims_vgpu::refused", kind:% = refusal;
                     "a refused command buffer's execution of an indirect command buffer: {refusal}"
                 );
             }
             progress.end(stage, carried);
         };
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(self.slot.take(), end);
+        crate::core::testkit::capture::with_slot(self.slot.take(), end);
         #[cfg(not(test))]
         end();
-    }
-}
-
-/// Runs `f` as the code of `task`, the isolated task a command buffer is of (none outside
-/// isolation), as core carries its completed handlers (`TaskLife::carry`): not at all once the
-/// task ended, so that a task's command buffer that ends after it kills nothing. A platform death
-/// in `f` still ends the process, as on the Metal platform a crash inside Metal does.
-fn as_task(task: Option<&Arc<TaskLife>>, f: impl FnOnce()) {
-    match task {
-        Some(life) => {
-            let _ = life.run(f);
-        }
-        None => f(),
     }
 }
 
@@ -971,10 +1074,11 @@ impl CommandQueue<VulkanPlatform> for VulkanCommandQueue {
             open_encoders: Arc::default(),
             progress: Mutex::new(None),
             predication,
-            opened: Mutex::new(Some(Opened::new())),
+            committed: AtomicBool::new(false),
             made: AtomicUsize::new(0),
             failing: Mutex::new(Vec::new()),
-            type_9: Mutex::new(Vec::new()),
+            by_runtime: Mutex::new(Vec::new()),
+            stores: Mutex::new(Vec::new()),
             protection: Mutex::new(Protection::default()),
             tiler: AtomicBool::new(false),
             executions: Mutex::new(Vec::new()),
@@ -1003,7 +1107,7 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 
 /// Dies at `sel`, where a command buffer's failure `e` is read first, unless `e` is one of Metal's
 /// failures, which core then sees as Metal's: a failure this platform committed the command buffer
-/// with as Metal's GPU fails it ([`Failing`], a detached object's use), a lost device's, memory's,
+/// with as Metal's GPU fails it ([`Failing`]), a lost device's, memory's,
 /// an address fault, a GPU hang and a victim of the GPU's recovery, a revoked queue's, a render
 /// pass without attachments past 16384, a detached buffer's use, an encoder made under protection
 /// options, a unit of command predication left with a block open, a render pass without attachments
@@ -1015,8 +1119,7 @@ fn failure(cb: &rt::CommandBuffer) -> Option<rt::CommandBufferError> {
 /// other is the runtime's own (`rt::FailureOrigin::Runtime`), where Metal fails no command buffer,
 /// and dies naming it: an indirect draw's indices the index pool could not hold
 /// ([`pool_overflow`]), a sample through a cubic sampler an argument buffer holds
-/// ([`cubic_argument_sampler`]), a command's buffer rebound before the command buffer was submitted
-/// ([`encoded_use_rebound`]), an emulated mesh or tessellation draw past the records pool
+/// ([`cubic_argument_sampler`]), an emulated mesh or tessellation draw past the records pool
 /// ([`mesh_records_overflow`], [`tessellation_records_overflow`]), a Vulkan failure of a
 /// submission ([`vulkan_failure`]), and any other ([`unanswered`]). A host step's
 /// refusal and a draw's pipeline die before, where `cb` names them ([`refused_step`],
@@ -1042,7 +1145,6 @@ fn answered(sel: &'static str, e: rt::CommandBufferError, cb: Option<&rt::Comman
         }
         rt::CommandBufferError::IndexPoolOverflow => pool_overflow(sel),
         rt::CommandBufferError::CubicArgumentSampler => cubic_argument_sampler(sel),
-        rt::CommandBufferError::EncodedUseRebound => encoded_use_rebound(sel),
         rt::CommandBufferError::MeshRecordsOverflow(overflow) => {
             mesh_records_overflow(sel, overflow)
         }
@@ -1132,22 +1234,6 @@ fn cubic_argument_sampler(sel: &'static str) -> ! {
     )
 }
 
-/// The death at `sel` of a command buffer the runtime failed as it was first submitted, as a
-/// command of it named a buffer over the guest's pages that was rebound after the command was
-/// encoded, in an encoder the runtime could not encode again (the module docs): the runtime
-/// resolved the use as the command was encoded, and ran nothing of each submission holding such
-/// a command, where Metal resolves it as it submits the command buffer and runs the command over
-/// the pages the buffer lies in then.
-fn encoded_use_rebound(sel: &'static str) -> ! {
-    unrepresentable(
-        sel,
-        "a command naming a buffer over the guest's pages that was rebound after the command was \
-         encoded and before its command buffer was submitted, in an encoder the runtime could \
-         not encode again, whose use it resolved as it was encoded and ran nothing of, failing \
-         the command buffer, where Metal runs it over the pages the buffer lies in as it submits",
-    )
-}
-
 /// The death at `sel` of a command buffer an indexed indirect draw failed: the runtime keeps
 /// such a draw's indices, checked or rewritten by a pass before the render pass, in the command
 /// buffer's index pool, a sixty-fourth of the device's largest device-local heap, and draws
@@ -1224,23 +1310,20 @@ fn refused_step(sel: &'static str, cb: &rt::CommandBuffer) -> ! {
     }
 }
 
-/// The `NSError` of a failed command buffer: Metal's domain and code for the runtime's error,
-/// and Metal's description of a use of a detached buffer or heap. A failure the driver relayed
+/// The `NSError` of a failed command buffer: Metal's domain and code for the runtime's error. A
+/// failure the driver relayed
 /// (`Execution`, and the `PageFault` and `DeviceLost` the runtime maps codes 3 and 11 to) names
 /// the runtime's error and, beside it, Metal's `relayed` description of the failure, as the
 /// driver's message gave it (`rt::CommandBuffer::error_description`), where not empty. Core
 /// prints the description in its log lines of a failed command buffer; nothing else reads it.
 fn command_buffer_error(e: rt::CommandBufferError, relayed: Option<String>) -> NsErrorText {
-    let description = match (e, relayed.filter(|d| !d.is_empty())) {
-        (rt::CommandBufferError::Injected(backing::DETACHED_USE), _) => {
-            "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)".to_owned()
-        }
-        (e, Some(metal)) => {
+    let description = match relayed.filter(|d| !d.is_empty()) {
+        Some(metal) => {
             format!(
                 "the Vulkan runtime's command buffer failed: {e:?} (Metal's description: {metal})"
             )
         }
-        (e, None) => format!("the Vulkan runtime's command buffer failed: {e:?}"),
+        None => format!("the Vulkan runtime's command buffer failed: {e:?}"),
     };
     NsErrorText {
         domain: "MTLCommandBufferErrorDomain".to_owned(),
@@ -1256,23 +1339,17 @@ fn failure_error(cb: &rt::CommandBuffer) -> Option<NsErrorText> {
     Some(command_buffer_error(e, cb.error_description()))
 }
 
-/// The runtime's handler of core's completed handler `block`, added by the code of `task`, the
-/// isolated task whose code runs, if one's does: it hands `block` the command buffer's `status`
-/// and `error` as they are then, after `read`, its read of the failure, which dies for a failure
-/// that is none of Metal's ([`failure`]). The read is the task's code ([`as_task`]), as the
-/// death in [`Ending`] is: once the task ended, core's handlers of it run none
-/// (`TaskLife::carry`), so none reads the failure, and nothing dies; `block` is called all the
-/// same, with the failure as its code says ([`command_buffer_error`]), and decides itself
-/// whether it runs. Added inside a refusal scope (the graphics lane's), the read and `block` run
+/// The runtime's handler of core's completed handler `block`: it hands `block` the command
+/// buffer's `status` and `error` as they are then, after `read`, its read of the failure, which
+/// dies for a failure that is none of Metal's ([`failure`]). Added inside a refusal scope (the graphics lane's), the read and `block` run
 /// in one on the runtime's thread too ([`run_completed`]): the read's death fails the command
 /// buffer to `block` ([`CompletedInfo::refused`]) and the process goes on.
 fn completed_handler(
     block: CompletedHandler,
-    task: Option<Arc<TaskLife>>,
     read: impl FnOnce(&rt::CommandBuffer) + Send + 'static,
 ) -> rt::Handler {
     #[cfg(test)]
-    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    let slot = crate::core::testkit::capture::current_slot();
     let carried = refusals::carry();
     Box::new(move |cb: &rt::CommandBuffer| {
         // A callout on the runtime's thread: marked ours, so a panic here aborts.
@@ -1281,7 +1358,7 @@ fn completed_handler(
             run_completed(
                 carried,
                 || {
-                    as_task(task.as_ref(), || read(cb));
+                    read(cb);
                     let error = cb
                         .error()
                         .map(|e| command_buffer_error(e, cb.error_description()));
@@ -1299,7 +1376,7 @@ fn completed_handler(
             );
         };
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(slot, run);
+        crate::core::testkit::capture::with_slot(slot, run);
         #[cfg(not(test))]
         run();
     })
@@ -1310,12 +1387,12 @@ fn completed_handler(
 /// took its last batch.
 fn scheduled_handler(block: ScheduledHandler) -> rt::Handler {
     #[cfg(test)]
-    let slot = reims_vgpu_core::testkit::capture::current_slot();
+    let slot = crate::core::testkit::capture::current_slot();
     Box::new(move |_cb: &rt::CommandBuffer| {
         // A callout on the runtime's thread: marked ours, so a panic here aborts.
         let _env = BlockEnv::foreign();
         #[cfg(test)]
-        reims_vgpu_core::testkit::capture::with_slot(slot, block);
+        crate::core::testkit::capture::with_slot(slot, block);
         #[cfg(not(test))]
         block();
     })
@@ -1332,10 +1409,9 @@ fn event<'a>(sel: &'static str, event: Option<EventRef<'a, VulkanPlatform>>) -> 
 
 impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Refused once the buffer is committed, as Metal's validation refuses it. A failure that is
-    /// none of Metal's dies as the handler reads it, unless the isolated task whose code added
-    /// the handler ended ([`completed_handler`]).
+    /// none of Metal's dies as the handler reads it ([`completed_handler`]).
     fn add_completed_handler(&self, _on: OnFault, block: CompletedHandler) -> RaiseResult<()> {
-        let handler = completed_handler(block, TaskLife::current(), |cb| {
+        let handler = completed_handler(block, |cb| {
             failure(cb);
         });
         send("addCompletedHandler:", Policy::Dies, || {
@@ -1371,7 +1447,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         _on: OnFault,
         block: CompletedHandler,
     ) -> RaiseResult<()> {
-        let handler = completed_handler(block, TaskLife::current(), |cb| {
+        let handler = completed_handler(block, |cb| {
             failure(cb);
         });
         send("addCompletionSeenHandler", Policy::Dies, || {
@@ -1391,11 +1467,8 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
 
     /// Refused while an encoder is open or after a commit, as Metal's validation refuses it.
     /// Every refusal dies naming the runtime's, and one of the records of an indirect command
-    /// buffer it executes says so ([`committing`]). Its progress is committed past the send's
-    /// check of the task's end, where a thread of an ended task stops with the command buffer
-    /// never committed. One that Metal's GPU fails for what its encoders did is committed failed
-    /// ([`CommandBufferObject::failure`]); any other is committed with its submission check,
-    /// which fails a submission that uses a detached buffer or heap (module docs). A slow commit
+    /// buffer it executes says so ([`committing`]). One that Metal's GPU fails for what its encoders did is committed failed
+    /// ([`CommandBufferObject::failure`]); any other is committed as it is. A slow commit
     /// and a late completion are debug lines ([`timing::commit`]). One that holds work for
     /// Metal's tiler takes Metal's allocation for it as the runtime submits it
     /// ([`tiler_handler`]). One committed while a command buffer of its queue that Metal's GPU
@@ -1403,15 +1476,13 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// runtime commits it (the module docs). It is committed through the runtime's
     /// `commit_and_submit`, which, where no other submission pass is under way, submits on this
     /// thread the device's ready batches committed first, this one's among them, and runs their
-    /// submission checks and submission handlers here, inside the call, of whichever command
-    /// buffer, queue or thread they are; a batch whose checks wait for another submission's GPU
-    /// signal to land, and what is behind it, is the scheduler thread's. So no check or
-    /// submission handler of the process takes a lock a caller holds across a commit: the check
-    /// takes its command buffer's note and the detach registry's lock
-    /// ([`backing::submission_check`]), the tiler's handler the process's space
+    /// submission handlers here, inside the call, of whichever command buffer, queue or thread
+    /// they are; a batch that waits for another submission's GPU signal to land, and what is
+    /// behind it, is the scheduler thread's. So no submission handler of the process takes a lock
+    /// a caller holds across a commit: the tiler's handler takes the process's space
     /// ([`tiler_handler`]), and the decoder's handlers their records' locks and the completion
     /// ring's. The call is marked as one that runs submission handlers inside it
-    /// (`reims_vgpu_core::platform::command::committing`), so a handler of a buffer whose records
+    /// (`crate::core::platform::command::committing`), so a handler of a buffer whose records
     /// go to a guest knows it runs on the committing thread, which may be one that must not post
     /// them.
     fn commit(&self, _on: OnFault) -> RaiseResult<()> {
@@ -1420,27 +1491,17 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let progress = self.progress.lock().clone();
         encoding("commit", Policy::Dies, || {
             predication::boundary(&self.predication, "commit");
-            let opened = self.opened.lock().take();
-            let detached = || {
-                opened
-                    .as_ref()
-                    .is_some_and(|opened| backing::uses_detached(&self.raw, opened))
-            };
-            let failure = self.failure("commit", detached);
-            self.check_executions(failure.as_ref().map(|f| &f.encoders), progress.as_deref());
-            let check = match (&failure, opened) {
-                (None, Some(opened)) => Some(backing::submission_check(opened.commit())),
-                _ => None,
-            };
+            self.committed.store(true, Ordering::SeqCst);
+            let failure = self.failure("commit");
+            let failed = self.runs_nothing_from(failure.as_ref());
+            self.check_executions(failed, progress.as_deref());
             if let Some(progress) = &progress {
                 progress.committing();
             }
             committing(|| {
-                timing::commit(&self.raw, || match (failure, check) {
-                    (Some(failure), _) => self.raw.commit_failed(failure),
-                    (None, Some(check)) => (self.raw.set_submission_check(check))
-                        .and_then(|()| committing_here(|| self.raw.commit_and_submit())),
-                    (None, None) => committing_here(|| self.raw.commit_and_submit()),
+                timing::commit(&self.raw, || match failure {
+                    Some(failure) => self.raw.commit_failed(failure),
+                    None => committing_here(|| self.raw.commit_and_submit()),
                 })
             })
         })
@@ -1452,7 +1513,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     fn compute_encoder(&self, _on: OnFault) -> RaiseResult<Option<VulkanComputeEncoder>> {
         let raw = encoding("computeCommandEncoder", Policy::Dies, || {
             self.protected_creation("computeCommandEncoder");
-            self.raw.compute_command_encoder()
+            self.raw.compute_command_encoder().map(Box::new)
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
         Ok(Some(predication::encoder(raw, self)))
@@ -1465,39 +1526,76 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
     /// Commits the work encoded so far as it is committed at `commit`, and answers a command
     /// buffer of its queue that goes on from it (the module docs' "A command buffer in parts"),
     /// where it may be split ([`CommandBufferObject::splits`]); `None` otherwise, the command
-    /// buffer as it was. The next part takes the command buffer's place among the releases of
-    /// detached objects ([`Opened::next_part`]), so its submissions fail by what the whole
-    /// buffer's would. Its make waits while the queue holds 64 uncompleted command buffers, as
+    /// buffer as it was. Its make waits while the queue holds 64 uncompleted command buffers, as
     /// `commandBuffer` does: the caller leaves room.
+    /// The runtime's sync file of the command buffer's completion
+    /// ([`crate::gpu::sync_file`]); `false` where it refuses one: on a device that exports none
+    /// as a sync file (`RuntimeGap::SyncFileExport`, MoltenVK among them), after the commit, on
+    /// a lost device.
+    #[cfg(unix)]
+    fn add_completion_sync_file(&self) -> bool {
+        self.raw.add_completion_sync_file().is_ok()
+    }
+
+    /// The runtime's export of the sync file asked for ([`crate::gpu::sync_file`]); `None`
+    /// where it refuses it.
+    #[cfg(unix)]
+    fn export_completion_sync_file(&self) -> Option<Option<std::os::fd::OwnedFd>> {
+        self.raw.export_completion_sync_file().ok()
+    }
+
+    /// A semaphore of the command buffer's device, given `file` as a temporary import, waited for
+    /// before the command buffer's work ([`crate::gpu::sync_file`]).
+    #[cfg(unix)]
+    fn encode_wait_for_sync_file(&self, file: std::os::fd::OwnedFd) -> bool {
+        crate::gpu::sync_file::encode_wait(&self.raw, file)
+    }
+
     fn split(&self, on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
         if !self.splits() {
             return Ok(None);
         }
-        let Some(opened) = plain(|| self.opened.lock().as_ref().map(Opened::next_part)) else {
-            return Ok(None);
-        };
-        let raw = waiting("commandBuffer", || {
-            self.raw.command_queue().command_buffer()
-        })?;
-        let next = Obj::new(CommandBufferObject {
-            raw,
-            device: self.device.clone_ref(),
-            open_encoders: Arc::default(),
-            progress: Mutex::new(None),
-            predication: Predication::new(&self.device),
-            opened: Mutex::new(Some(opened)),
-            made: AtomicUsize::new(0),
-            failing: Mutex::new(Vec::new()),
-            type_9: Mutex::new(Vec::new()),
-            protection: Mutex::new(Protection::default()),
-            tiler: AtomicBool::new(false),
-            executions: Mutex::new(Vec::new()),
-            signals_scheduled: AtomicBool::new(false),
-        });
+        let next = self.next_part()?;
         self.commit(on)?;
         Ok(Some(next))
     }
 
+    /// The command buffer of its queue a later range of its work is encoded into while the rest
+    /// of its own is (`CommandBuffer::part`), made now where it may be cut now
+    /// ([`CommandBufferObject::splits`]), as `split` makes the next part, its predication going
+    /// on from this one's; `None` otherwise. The range before it holds no compute encoder, so
+    /// the unit carried is the one at the make.
+    fn part(&self, _on: OnFault) -> RaiseResult<Option<VulkanCommandBuffer>> {
+        if !self.splits() {
+            return Ok(None);
+        }
+        self.next_part().map(Some)
+    }
+
+    /// Commits it as a part where it may be cut ([`CommandBufferObject::splits`]); else nothing,
+    /// [`PartCut::Fails`] where it is kept whole only by how Metal's GPU fails it from one of its
+    /// encoders on ([`CommandBufferObject::fails_from_an_encoder`]), every encoder after it
+    /// running nothing.
+    fn commit_part(&self, on: OnFault) -> RaiseResult<PartCut> {
+        if let Some(reason) = self.kept_whole_by() {
+            return Ok(PartCut::Whole(reason));
+        }
+        if self.fails_from_an_encoder() {
+            return Ok(PartCut::Fails);
+        }
+        self.commit(on)?;
+        Ok(PartCut::Cut)
+    }
+
+    /// Takes in how Metal's GPU fails `later`'s encoders, as though they had been made in this
+    /// one after its own ([`CommandBufferObject::fold`]).
+    fn fold(&self, later: VulkanCommandBuffer) {
+        CommandBufferObject::fold(self, &later);
+    }
+
+    /// The runtime's, but once an encoder made under protection options failed it, after which
+    /// Metal's GPU fires none of its signals: then sent nowhere
+    /// ([`CommandBufferObject::withholds_signals`]).
     fn encode_signal(
         &self,
         event: Option<EventRef<'_, VulkanPlatform>>,
@@ -1506,10 +1604,14 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
         let sel = "encodeSignalEvent:value:";
         // evsig: command buffer, event, value
         trace_event("evsig", &self.raw, event.as_ref(), value);
+        let withheld = self.withholds_signals();
         encoding(sel, Policy::Dies, || {
             let event = self::event(sel, event);
             predication::boundary(&self.predication, sel);
-            self.raw.encode_signal_event(event, value)
+            match withheld {
+                true => Ok(()),
+                false => self.raw.encode_signal_event(event, value),
+            }
         })
     }
 
@@ -1667,6 +1769,7 @@ impl CommandBuffer<VulkanPlatform> for VulkanCommandBuffer {
             self.protected_creation(sel);
             self.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
+                .map(Box::new)
         })?;
         metal_space::first_use(FirstUse::ComputeEncoder);
         Ok(Some(predication::encoder(raw, self)))
@@ -1685,7 +1788,7 @@ fn trace_event(
     event: Option<&EventRef<'_, VulkanPlatform>>,
     value: u64,
 ) {
-    if !reims_vgpu_core::trace::on() {
+    if !crate::core::trace::on() {
         return;
     }
     let id = match event {
@@ -1697,17 +1800,17 @@ fn trace_event(
 }
 
 fn trace_event_id(kind: &str, cb: &rt::CommandBuffer, event: u64, value: u64) {
-    reims_vgpu_core::trace::event(kind, &[crate::gpu::timing::id(cb), event, value]);
+    crate::core::trace::event(kind, &[crate::gpu::timing::id(cb), event, value]);
 }
 
 #[cfg(test)]
 mod tests {
     use std::sync::mpsc;
 
-    use reims_vgpu_core::platform::device::GpuDevice;
-    use reims_vgpu_core::platform::event::{EventRef, SharedEvent as _};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::device::GpuDevice;
+    use crate::core::platform::event::{EventRef, SharedEvent as _};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -1770,21 +1873,19 @@ mod tests {
         }
     }
 
-    /// A commit runs the command buffer's submission check and its submission handler inside the
-    /// call, on the committing thread, where no other submission pass is under way
-    /// (`rt::CommandBuffer::commit_and_submit`): the handler finds a lock the caller holds across
-    /// the commit held, as the decoder's device caches hold theirs across an early copy, so a
-    /// check or handler that took a lock its commit's caller holds would deadlock there. Those of
-    /// this platform and the decoder take none: the check takes its command buffer's note and the
-    /// detach registry's lock ([`backing::submission_check`]), the decoder's handlers their
-    /// records' locks and the completion ring's, and the tiler's handler the process's space
-    /// ([`tiler_handler`]), none of which a commit's caller holds. The commit is marked on its
-    /// thread (`reims_vgpu_core::platform::command::committing`), so a decoder's handler run there
+    /// A commit runs the command buffer's submission handler inside the call, on the committing
+    /// thread, where no other submission pass is under way (`rt::CommandBuffer::commit_and_submit`):
+    /// the handler finds a lock the caller holds across the commit held, as the decoder's device
+    /// caches hold theirs across an early copy, so a handler that took a lock its commit's caller
+    /// holds would deadlock there. Those of this platform and the decoder take none: the
+    /// decoder's handlers their records' locks and the completion ring's, and the tiler's handler
+    /// the process's space ([`tiler_handler`]), none of which a commit's caller holds. The commit is marked on its
+    /// thread (`crate::core::platform::command::committing`), so a decoder's handler run there
     /// on a thread the host's raise is not named for hands its records over to post.
     #[test]
-    fn a_commit_checks_and_submits_inside_the_call_under_the_caller_s_locks() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+    fn a_commit_submits_inside_the_call_under_the_caller_s_locks() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         let d = dev();
         let q = d.new_command_queue().unwrap();
@@ -1805,12 +1906,11 @@ mod tests {
             OnFault::Return,
             Box::new(move || {
                 let held = lock.try_lock().is_none();
-                let inside = reims_vgpu_core::platform::command::inside_commit();
+                let inside = crate::core::platform::command::inside_commit();
                 *at.lock() = Some((std::thread::current().id(), held, inside));
             }),
         )
         .unwrap();
-        let checked = d.raw.work_counts().batches_checked_at_commit;
         let held = caller.lock();
         cb.commit(OnFault::Return).unwrap();
         let seen = ran.lock().take();
@@ -1820,11 +1920,6 @@ mod tests {
             Some((std::thread::current().id(), true, true)),
             "its handler ran inside the commit, on its thread, the caller's lock held, the commit \
              marked"
-        );
-        assert_eq!(
-            d.raw.work_counts().batches_checked_at_commit,
-            checked + 1,
-            "its check ran inside the commit"
         );
         cb.wait_until_completed(OnFault::Return).unwrap();
         assert_eq!(cb.status(), CommandBufferStatus::COMPLETED);
@@ -1839,8 +1934,7 @@ mod tests {
     #[cfg(target_os = "macos")]
     #[test]
     fn a_scheduled_signal_sent_after_the_commit_sets_nothing_as_metals() {
-        use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_metal::MetalPlatform;
+        use crate::core::platform::Platform;
 
         /// Whether the value reached the scheduled signal's 1 and the late one's 7, once the
         /// command buffer completed.
@@ -1876,9 +1970,6 @@ mod tests {
             (site.kind, site.file),
             (DeathKind::OutOfBounds, "encodeSignalEventScheduled:value:")
         );
-        if let Some(md) = MetalPlatform::system_default_device() {
-            assert_eq!(reached::<MetalPlatform>(&md).0, vulkan);
-        }
     }
 
     /// A command buffer whose first command waits for an unsignalled shared event is not
@@ -1891,10 +1982,10 @@ mod tests {
     /// handler, so the guest's buffer reads scheduled no earlier
     #[test]
     fn a_command_buffer_waiting_for_an_event_is_scheduled_at_its_signal() {
-        use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::Platform;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::resource::Buffer as _;
+        use crate::core::platform::types::NsRange;
 
         /// On `d`: the buffer's status 100 ms after its commit, then the order its scheduled
         /// and completed handlers ran in around the CPU's signal, and the first byte its blit
@@ -1954,10 +2045,6 @@ mod tests {
                 0x5a
             )
         );
-        #[cfg(target_os = "macos")]
-        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-            assert_eq!(held::<reims_vgpu_metal::MetalPlatform>(&md), vulkan);
-        }
     }
 
     /// A completed handler learns its buffer's GPU times, in nanoseconds of the host's clock: a
@@ -1965,9 +2052,9 @@ mod tests {
     /// Metal's on this host
     #[test]
     fn a_completed_handler_learns_the_gpu_times() {
-        use reims_vgpu_core::platform::Platform;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::Platform;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
 
         /// On `d`: the GPU times a blit fill's completed handler learned.
         fn learned<P: Platform>(d: &P::Device) -> Option<(u64, u64)> {
@@ -2004,11 +2091,63 @@ mod tests {
         };
         let vulkan = learned::<VulkanPlatform>(&dev());
         assert!(plausible(vulkan), "{vulkan:?}");
-        #[cfg(target_os = "macos")]
-        if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-            let metal = learned::<reims_vgpu_metal::MetalPlatform>(&md);
-            assert!(plausible(metal), "{metal:?}");
+    }
+
+    /// A command buffer's GPU times are its GPU's own timestamps, placed on the host's clock, on
+    /// a device whose driver's timestamps wait for no other queue's: the runtime announces no
+    /// `GpuTimesFromHost`. Where they wait for every queue's (the runtime's
+    /// `TimestampsWaitForEveryQueue`: MoltenVK on Apple's GPUs) it answers them from the host's
+    /// clock whatever [`crate::platform`]'s device options say, and announces so. Either way they
+    /// lie in the command buffer's life, from before its commit to its completed handler, within
+    /// what a calibration may state of its deviation
+    #[test]
+    fn gpu_times_are_the_gpus_where_its_timestamps_wait_for_no_other_queue() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
+
+        let d = dev();
+        let q = d.new_command_queue().unwrap();
+        let b = d
+            .new_buffer_of_length(OnFault::Return, 16, 0)
+            .unwrap()
+            .unwrap();
+        let cb = q.command_buffer(OnFault::Return).unwrap().unwrap();
+        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        for cmd in [
+            BlitCmd::FillBuffer {
+                buffer: &b,
+                range: NsRange::new(0, 16),
+                value: 0x5a,
+            },
+            BlitCmd::EndEncoding,
+        ] {
+            blit.encode(OnFault::Return, cmd).unwrap();
         }
+        let (done, completed) = mpsc::channel();
+        let handler: CompletedHandler = Box::new(move |info| {
+            done.send((info.gpu_times_ns, rt::host_time())).unwrap();
+        });
+        cb.add_completed_handler(OnFault::Return, handler).unwrap();
+        let committed = rt::host_time();
+        cb.commit(OnFault::Return).unwrap();
+        let (times, handled) = completed
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        let (start, end) = times.expect("the GPU times of a buffer that ran");
+        let (committed, handled) = CompletedInfo::gpu_times(committed, handled).unwrap();
+        // A calibration states up to about 125 us under full parallel suites (the runtime's
+        // `gpu_time.rs`); a reading further out is placed inside the life.
+        let slack = 5_000_000;
+        assert!(
+            committed.saturating_sub(slack) <= start && end <= handled + slack,
+            "GPU times {start}..{end} outside the life {committed}..{handled}"
+        );
+        let from_host = crate::answer::RELAYED
+            .lock()
+            .contains(&rt::Degradation::GpuTimesFromHost);
+        let waits = (d.raw.properties().description.driver_facts())
+            .contains(&metal2vulkan::device::DriverFact::TimestampsWaitForEveryQueue);
+        assert_eq!(from_host, waits, "{}", d.raw.name());
     }
 
     /// Metal takes its own allocation for a command buffer's first work for its tiler as it
@@ -2045,24 +2184,6 @@ mod tests {
         cb.wait_until_completed(OnFault::Return).unwrap();
     }
 
-    /// A command buffer's first work for the tiler, the process's first, adds its submission
-    /// handler without stopping a thread of an isolated task that ended: a render encoder's
-    /// runtime encoder is not in its handle yet as its work is taken (`encode_render`'s `make`)
-    #[test]
-    fn an_ended_tasks_work_for_the_tiler_stops_nothing() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        assert!(!metal_space::taken(FirstUse::TilerSubmission));
-        let sel = "renderCommandEncoderWithDescriptor:";
-        let life = TaskLife::new();
-        let went_on = life.run(|| {
-            life.exit();
-            cb.tiler_work(sel, FirstUse::RenderEncoder);
-        });
-        assert!(went_on.is_some());
-        assert!(cb.tiler.load(Ordering::SeqCst));
-    }
-
     /// Once the process took Metal's allocation for its work for the tiler, a command buffer
     /// with such work carries no submission handler for it: the runtime runs its transition to
     /// scheduled on its scheduler thread as it submits it, with no handler thread woken for it,
@@ -2096,10 +2217,10 @@ mod tests {
     /// is taken as the runtime submits its command buffer, before it reads scheduled
     #[test]
     fn a_render_encoders_tiler_work_is_taken_as_it_is_submitted() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-        use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-        use reims_vgpu_core::platform::values::{ColorAttachmentSet, TextureDesc};
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::values::{ColorAttachmentSet, TextureDesc};
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let p = crate::platform::tests::platform();
@@ -2308,8 +2429,8 @@ mod tests {
     /// runtime refuses: the wait dies at its selector, as Metal's answer there is not measured
     #[test]
     fn a_cycle_of_handlers_waits_dies() {
-        use reims_vgpu_core::raise::death::DeathSite;
-        use reims_vgpu_core::testkit::capture::expect_death;
+        use crate::core::raise::death::DeathSite;
+        use crate::core::testkit::capture::expect_death;
 
         let site = DeathSite {
             kind: DeathKind::Abort,
@@ -2358,7 +2479,7 @@ mod tests {
     /// can show.
     fn in_child(test: &str, body: impl FnOnce()) -> std::process::ExitStatus {
         if std::env::var("RVG_CHILD").as_deref() == Ok(test) {
-            reims_vgpu_core::testkit::capture::set_capture_enabled(false);
+            crate::core::testkit::capture::set_capture_enabled(false);
             body();
             std::process::exit(0);
         }
@@ -2419,12 +2540,11 @@ mod tests {
     }
 
     /// A host step's refusal of a command buffer that executes an indirect command buffer dies
-    /// as the command buffer ends, at the execution's selector, outside isolation and while the
-    /// command buffer's task runs; once the task ended, as core's handlers of it run none, it
-    /// dies at nothing, and the command buffer's progress ends all the same
+    /// as the command buffer ends, at the execution's selector; in the refusal scope the command
+    /// carried it is refused, and the command buffer's progress ends all the same
     #[test]
-    fn a_refused_command_buffer_of_an_ended_task_dies_at_nothing() {
-        use reims_vgpu_core::platform::values::IcbDesc;
+    fn a_refused_command_buffer_dies_at_its_execution() {
+        use crate::core::platform::values::IcbDesc;
 
         let d = dev();
         let desc = IcbDesc {
@@ -2434,12 +2554,11 @@ mod tests {
         };
         let icb = d.new_indirect_command_buffer(&desc, 1, 0).unwrap().unwrap();
         let sel = "executeCommandsInBuffer:withRange:";
-        let ending = |task| {
+        let ending = || {
             let progress = Arc::new(Progress::default());
             progress.executes(sel, icb.clone_ref());
             let ending = Ending {
                 progress: Some(Arc::clone(&progress)),
-                task,
                 carried: refusals::carry(),
                 slot: None,
             };
@@ -2448,19 +2567,12 @@ mod tests {
         let refused = |sel| {
             unrepresentable(sel, "a host step's refusal");
         };
-        let life = TaskLife::new();
-        for task in [None, Some(Arc::clone(&life))] {
-            let (_, mut e) = ending(task);
-            let site = catch_death(|| e.end(Stage::Failed, Some(refused))).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-        }
-        let (progress, mut e) = ending(Some(Arc::clone(&life)));
-        assert!(life.exit());
-        e.end(Stage::Failed, Some(refused));
-        assert_eq!(progress.stage(), Stage::Failed);
+        let (_, mut e) = ending();
+        let site = catch_death(|| e.end(Stage::Failed, Some(refused))).unwrap_err();
+        assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
         // Made by an op of the graphics lane's, in its refusal scope: the death is refused on the
         // handler's thread, and the progress ends all the same.
-        let (progress, mut e) = refusals::refusing(|| ending(None)).unwrap();
+        let (progress, mut e) = refusals::refusing(ending).unwrap();
         std::thread::Builder::new()
             .name("the runtime's progress".into())
             .spawn(move || e.end(Stage::Failed, Some(refused)))
@@ -2473,7 +2585,7 @@ mod tests {
     /// A command buffer's progress ends on the runtime's thread in the scope its command carried
     /// (the graphics lane's): a change that dies at the completion and an object whose release
     /// dies are refused there, the other changes run, the other objects go, and the stage is
-    /// set. Outside every scope (the paravirt device's), the same release dies, as before
+    /// set. Outside every scope the same release dies
     #[test]
     fn a_progress_ends_in_the_scope_its_command_carried() {
         /// An object whose release dies, as the platform's release of what a command used can.
@@ -2485,7 +2597,6 @@ mod tests {
         }
         let ending = |progress: &Arc<Progress>| Ending {
             progress: Some(Arc::clone(progress)),
-            task: None,
             carried: refusals::carry(),
             slot: None,
         };
@@ -2526,8 +2637,8 @@ mod tests {
 
     /// Core's completed handler added inside a refusal scope (the graphics lane's) reads a failure
     /// that dies in that scope on the runtime's thread: the handler is handed the command buffer
-    /// failed by the refusal, and the process goes on. Added outside every scope (the paravirt
-    /// device's), the same read dies, as before
+    /// failed by the refusal, and the process goes on. Added outside every scope, the same read
+    /// dies
     #[test]
     fn a_completed_handlers_read_in_a_scope_fails_its_command_buffer() {
         let q = dev().new_command_queue().unwrap();
@@ -2536,7 +2647,7 @@ mod tests {
         cb.wait_until_completed(OnFault::Return).unwrap();
         let handler = |seen: mpsc::Sender<CompletedInfo>| {
             let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
-            completed_handler(block, None, |_| {
+            completed_handler(block, |_| {
                 unrepresentable("commit", "a failure none of Metal's");
             })
         };
@@ -2562,106 +2673,27 @@ mod tests {
         assert!(rx.try_recv().is_err());
     }
 
-    /// Core's completed handler reads a failure that dies as the code of the isolated task that
-    /// added it: outside isolation and while the task runs it dies, and once the task ended it
-    /// dies at nothing, the handler still handed the command buffer's status
+    /// The work of a device that stopped with no loss from its driver (the runtime's wedge rule,
+    /// whose `VkDevice` it parks) fails as a lost device's, as Metal fails a GPU hang's: the
+    /// oldest command buffer in flight as the hang, `MTLCommandBufferErrorTimeout` (code 2), and
+    /// the rest as its victims, `MTLCommandBufferErrorInternal` (code 1). Each is one of Metal's
+    /// failures, which core sees and the guest's completion carries (`RGFX_CB_TIMEOUT` and
+    /// `RGFX_CB_INTERNAL`), at the commit's read and at the wait's, none dying
     #[test]
-    fn a_completed_handlers_read_of_an_ended_tasks_failure_dies_at_nothing() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        cb.commit(OnFault::Return).unwrap();
-        cb.wait_until_completed(OnFault::Return).unwrap();
-        let handler = |task, seen: mpsc::Sender<CompletedInfo>| {
-            let block: CompletedHandler = Box::new(move |info| seen.send(info).unwrap());
-            completed_handler(block, task, |_| {
-                unrepresentable("commit", "a failure none of Metal's");
-            })
-        };
-        let life = TaskLife::new();
-        for task in [None, Some(Arc::clone(&life))] {
-            let (tx, rx) = mpsc::channel();
-            let h = handler(task, tx);
-            let site = catch_death(|| h(&cb.raw)).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, "commit"));
-            assert!(rx.try_recv().is_err());
+    fn a_stopped_devices_work_fails_as_metals_hang_and_its_victims() {
+        use rt::CommandBufferError as E;
+        for (e, code) in [(E::GpuHang, 2), (E::GpuRecoveryVictim, 1)] {
+            assert_eq!(e.origin(), rt::FailureOrigin::Metal, "{e:?}");
+            for sel in ["commit", "waitUntilCompleted"] {
+                answered(sel, e, None);
+            }
+            let error = command_buffer_error(e, None);
+            assert_eq!(
+                (error.domain.as_str(), error.code),
+                ("MTLCommandBufferErrorDomain", code),
+                "{e:?}"
+            );
         }
-        // Added by the task's code, as core adds it: the task is the handler's.
-        let (tx, rx) = mpsc::channel();
-        let h = life.run(|| handler(TaskLife::current(), tx)).unwrap();
-        assert!(life.exit());
-        h(&cb.raw);
-        assert_eq!(rx.recv().unwrap().status, CommandBufferStatus::COMPLETED);
-    }
-
-    /// A thread of an isolated task that ended stops at a command buffer's send before anything
-    /// of it dies or takes effect: an event send of a nil event, an encoder's creation, and a
-    /// commit whose unit of compute encoders holds an open block of command predication, each
-    /// of which dies while the task runs, stop, and the command buffer stays uncommitted
-    #[test]
-    fn an_ended_tasks_sends_stop_before_they_die() {
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        let condition = crate::gpu::resource::tests::shared(16);
-        let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
-        let start = ComputeCmd::EncodeStartIf {
-            buffer: Some(&condition),
-            offset: 0,
-            comparison: 0,
-            reference_value: 0,
-        };
-        e.encode(OnFault::Return, start).unwrap();
-        e.encode(OnFault::Return, ComputeCmd::EndEncoding).unwrap();
-        let sends: [(&str, &dyn Fn()); 6] = [
-            ("encodeSignalEvent:value:", &|| {
-                let _ = cb.encode_signal(None, 1);
-            }),
-            ("encodeSignalEventScheduled:value:", &|| {
-                let _ = cb.encode_signal_when_scheduled(None, 1);
-            }),
-            ("encodeWaitForEvent:value:", &|| {
-                let _ = cb.encode_wait(None, 1);
-            }),
-            ("blitCommandEncoder", &|| {
-                let _ = cb.blit_encoder(OnFault::Return);
-            }),
-            ("renderCommandEncoderWithDescriptor:", &|| {
-                use reims_vgpu_core::platform::Platform as _;
-                let pass = crate::platform::tests::platform().render_pass_descriptor();
-                let _ = cb.render_encoder(OnFault::Return, &pass);
-            }),
-            ("commit", &|| {
-                let _ = cb.commit(OnFault::Return);
-            }),
-        ];
-        for (sel, send) in sends {
-            let site = catch_death(send).unwrap_err();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel));
-            let life = TaskLife::new();
-            let stopped = life.run(|| {
-                life.exit();
-                send();
-            });
-            assert!(stopped.is_none(), "{sel}");
-        }
-        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
-    }
-
-    /// A thread of an isolated task that ended stops at commit before the runtime's commit, and
-    /// the command buffer's progress stays uncommitted: what it uses is not held as the GPU's
-    #[test]
-    fn an_ended_tasks_commit_leaves_its_command_buffer_uncommitted() {
-        let q = dev().new_command_queue().unwrap();
-        let cb = buffer(&q);
-        let progress = cb.progress("test");
-        let life = TaskLife::new();
-        let stopped = life.run(|| {
-            life.exit();
-            cb.commit(OnFault::Return)
-        });
-        assert!(stopped.is_none());
-        assert_eq!(progress.stage(), Stage::Encoding);
-        assert_eq!(cb.status(), CommandBufferStatus::NOT_ENQUEUED);
     }
 
     /// A failure of the GPU's work the driver relayed reaches core with Metal's code where its
@@ -2689,7 +2721,7 @@ mod tests {
 
     /// A relayed failure's description and death line carry Metal's description beside the
     /// runtime's error, as the driver's message gave it (MoltenVK 1.4.1's forms), and the error
-    /// alone where the message gave none; a detached object's use keeps Metal's own description
+    /// alone where the message gave none
     #[test]
     fn relayed_failures_name_metals_description() {
         use rt::CommandBufferError as E;
@@ -2720,11 +2752,6 @@ mod tests {
                 "the Vulkan runtime's command buffer failed: Execution(9)"
             );
         }
-        let detached = command_buffer_error(E::Injected(backing::DETACHED_USE), Some(metal.into()));
-        assert_eq!(
-            detached.description,
-            "Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"
-        );
         assert!(relayed_line(13, Some(metal)).ends_with(
             "with code 13, which no failure of Metal's command buffers has (Metal's description: \
              Discarded (victim of GPU error/recovery))"
@@ -2816,8 +2843,8 @@ mod tests {
     /// A Shared buffer of 16 zero bytes, and a blit encoder of `cb` that fills it with `value`
     /// and ends.
     fn filled(cb: &VulkanCommandBuffer, value: u8) -> crate::gpu::resource::VulkanBuffer {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
-        use reims_vgpu_core::platform::types::NsRange;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::types::NsRange;
         let b = crate::gpu::resource::tests::shared(16);
         let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
         let range = NsRange::new(0, 16);
@@ -2833,7 +2860,7 @@ mod tests {
 
     /// The 16 bytes of a Shared buffer.
     fn sixteen(b: &crate::gpu::resource::VulkanBuffer) -> Vec<u8> {
-        use reims_vgpu_core::platform::resource::Buffer as _;
+        use crate::core::platform::resource::Buffer as _;
         // SAFETY: a Shared buffer of 16 bytes, read after its command buffer completed.
         unsafe { std::slice::from_raw_parts(b.contents().as_ptr::<u8>(), 16) }.to_vec()
     }
@@ -2847,16 +2874,18 @@ mod tests {
 
     /// Protection options fail a command buffer as Metal's GPU does: an encoder made under
     /// options below 0x10 runs nothing and fails it with code 16, one made before them runs,
-    /// and none of its event signals fires; options from 0x10 up fail it with code 1, with an
-    /// encoder or without; options below 0x10 with no encoder under them, or 0 again before
-    /// one, complete it
+    /// and of its event signals those encoded before that encoder fire and none after it;
+    /// options from 0x10 up fail it with code 1, with an encoder or without, every signal firing
+    /// where no encoder was made under them; options below 0x10 with no encoder under them, or 0
+    /// again before one, complete it (the M3 Max, dgpu-oracle.md Q39)
     #[test]
     fn protection_options_fail_command_buffers_as_metals_gpu_does() {
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let cb = buffer(&q);
-        let event = d.new_shared_event().unwrap();
+        let (first, event) = (d.new_shared_event().unwrap(), d.new_shared_event().unwrap());
         let before = filled(&cb, 0x5a);
+        cb.encode_signal(Some(EventRef::Shared(&first)), 3).unwrap();
         cb.set_protection_options(OnFault::Return, 2).unwrap();
         let under = filled(&cb, 0x6b);
         let signal = Some(EventRef::Shared(&event));
@@ -2866,7 +2895,7 @@ mod tests {
             (sixteen(&before), sixteen(&under)),
             (vec![0x5a; 16], vec![0; 16])
         );
-        assert_eq!(event.signaled_value(), 0);
+        assert_eq!((first.signaled_value(), event.signaled_value()), (3, 0));
         for options in [0x10, u64::MAX] {
             let cb = buffer(&q);
             cb.set_protection_options(OnFault::Return, options).unwrap();
@@ -2876,6 +2905,18 @@ mod tests {
             let under = filled(&cb, 0x6b);
             assert_eq!(completed(&cb), (5, Some(1)), "{options:#x}");
             assert_eq!(sixteen(&under), vec![0; 16]);
+            // Set after every encoder: each runs, and each signal fires.
+            let cb = buffer(&q);
+            let event = d.new_shared_event().unwrap();
+            let ran = filled(&cb, 0x5a);
+            cb.encode_signal(Some(EventRef::Shared(&event)), 5).unwrap();
+            cb.set_protection_options(OnFault::Return, options).unwrap();
+            assert_eq!(
+                completed(&cb),
+                (5, Some(1)),
+                "{options:#x}, after every encoder"
+            );
+            assert_eq!((sixteen(&ran), event.signaled_value()), (vec![0x5a; 16], 5));
         }
         let cb = buffer(&q);
         cb.set_protection_options(OnFault::Return, 2).unwrap();
@@ -2886,6 +2927,80 @@ mod tests {
         let after = filled(&cb, 0x7c);
         assert_eq!(completed(&cb), (4, None), "options 2, then 0");
         assert_eq!(sixteen(&after), vec![0x7c; 16]);
+    }
+
+    /// Under protection options, a compute encoder made right after another compute encoder
+    /// fails from itself on, as the blit encoders above do: the earlier encoder's work runs and
+    /// the later one's runs nothing, though the runtime records consecutive compute encoders
+    /// into one Vulkan command buffer
+    #[test]
+    fn protection_options_fail_compute_encoders_from_the_one_made_under_them() {
+        use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use crate::core::platform::resource::Library as _;
+        use crate::core::platform::types::{MtlSize, NsRange};
+        use crate::gpu::resource::VulkanBuffer;
+        use crate::gpu::resource::tests::shared;
+
+        // `inc_k`: one thread adds 1 to `c[0]`, and marks `c[n]` with `n * 0x11` below 16.
+        const INC: &[u8] = include_bytes!("../../../../tests/shaders/compute_inc.metallib");
+        let d = dev();
+        let f = d
+            .new_library(INC)
+            .unwrap()
+            .unwrap()
+            .unwrap()
+            .new_function(OnFault::Return, "inc_k")
+            .unwrap()
+            .unwrap();
+        let inc = d
+            .new_compute_pipeline_state_for_function(Some(&f))
+            .unwrap()
+            .unwrap();
+        let q = d.new_command_queue().unwrap();
+        let run = |cb: &VulkanCommandBuffer, c: &VulkanBuffer| {
+            let e = cb.compute_encoder(OnFault::Return).unwrap().unwrap();
+            let buffers = [Some(c)];
+            for cmd in [
+                ComputeCmd::SetComputePipelineState { state: Some(&inc) },
+                ComputeCmd::SetBuffers {
+                    buffers: &buffers,
+                    offsets: &[0],
+                    range: NsRange::new(0, 1),
+                },
+                ComputeCmd::DispatchThreads {
+                    threads_per_grid: MtlSize::new(1, 1, 1),
+                    threads_per_threadgroup: MtlSize::new(1, 1, 1),
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+        };
+        // A command buffer before them has the pipeline made, so the two encoders below meet it
+        // ready and the runtime records them together.
+        let warm = buffer(&q);
+        run(&warm, &shared(64));
+        assert_eq!(completed(&warm), (4, None));
+        let cb = buffer(&q);
+        let (before, under) = (shared(64), shared(64));
+        let folded = || d.raw.work_counts().encoders_folded;
+        let was = folded();
+        run(&cb, &before);
+        cb.set_protection_options(OnFault::Return, 2).unwrap();
+        run(&cb, &under);
+        assert_eq!(
+            folded() - was,
+            1,
+            "the runtime records the two encoders together"
+        );
+        assert_eq!(completed(&cb), (5, Some(16)));
+        assert_eq!(
+            (
+                sixteen(&before)[..8].to_vec(),
+                sixteen(&under)[..8].to_vec()
+            ),
+            (vec![1, 0, 0, 0, 0x11, 0, 0, 0], vec![0; 8])
+        );
     }
 
     /// A command buffer split at an encoder's end commits its work so far as a part, as its
@@ -2937,8 +3052,8 @@ mod tests {
     /// options from 0x10 up, die
     #[test]
     fn protection_options_that_end_the_process_die() {
-        use reims_vgpu_core::platform::Platform as _;
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         let q = dev().new_command_queue().unwrap();
         for options in [1, 3, 7] {
             let cb = buffer(&q);
@@ -2969,19 +3084,20 @@ mod tests {
     }
 
     /// A command buffer Metal's GPU fails in one way fails so at its commit, from the first
-    /// encoder that fails; one that only uses a detached object is left to its submissions, and
-    /// one only its draws of primitive type 9 fail, of one kind, to the runtime. One it would
-    /// fail in two, a use of a detached object and a failure of its own or a draw of type 9's,
-    /// or a draw of type 9's and another of its own or of another kind, dies at its commit, as
-    /// nothing measured it
+    /// encoder that fails, every signal it was sent firing; one nothing fails commits as it is,
+    /// and one only the runtime's own failures fail, of one kind (its draws of primitive type 9,
+    /// its passes' stores into read-only memory), is left to the runtime. A store-out's fault
+    /// beside a failure of its own fails it as its own says, as Metal's GPU does
+    /// (dgpu-oracle.md Q39). One it would fail in two ways nothing measured dies at its commit:
+    /// a type-9 draw's failure beside one of its own, or beside a type-9 failure or a store-out's
+    /// fault of another code. The first encoder that runs nothing is the first either fails,
+    /// whose executions are not checked
     #[test]
-    fn a_command_buffer_failing_two_ways_dies_at_its_commit() {
+    fn a_command_buffer_failing_two_ways_is_answered_where_measured() {
         let q = dev().new_command_queue().unwrap();
         let cb = buffer(&q);
-        assert!(
-            cb.failure("commit", || true).is_none(),
-            "a detached use alone"
-        );
+        assert!(cb.failure("commit").is_none(), "nothing fails it");
+        assert_eq!(cb.runs_nothing_from(None), None);
         for from in [3, 1] {
             cb.fail(Failing {
                 code: PROTECTION_VIOLATION,
@@ -2989,55 +3105,287 @@ mod tests {
                 signals: false,
             });
         }
-        let failure = cb.failure("commit", || false).unwrap();
+        let failure = cb.failure("commit").unwrap();
         assert_eq!(
-            (failure.code, failure.encoders, failure.signals),
-            (PROTECTION_VIOLATION, rt::FailedEncoders::From(1), false)
+            (failure.code, &failure.encoders, failure.signals),
+            (PROTECTION_VIOLATION, &rt::FailedEncoders::From(1), true)
         );
-        let site = catch_death(|| cb.failure("commit", || true)).unwrap_err();
-        assert_eq!(site.file, "commit");
+        assert_eq!(cb.runs_nothing_from(Some(&failure)), Some(1));
         let hang = Failing {
             code: rt::CommandBufferError::GpuHang.metal_code(),
             from: 2,
             signals: true,
         };
         cb.fails_at_type_9(hang);
-        let site = catch_death(|| cb.failure("commit", || false)).unwrap_err();
+        let site = catch_death(|| cb.failure("commit")).unwrap_err();
         assert_eq!(site.file, "commit");
         let cb = buffer(&q);
         for from in [2, 4] {
             cb.fails_at_type_9(Failing { from, ..hang });
         }
-        assert!(cb.failure("commit", || false).is_none(), "type 9 alone");
-        let site = catch_death(|| cb.failure("commit", || true)).unwrap_err();
-        assert_eq!(site.file, "commit");
-        cb.fails_at_type_9(Failing {
+        assert!(cb.failure("commit").is_none(), "type 9 alone");
+        assert_eq!(cb.runs_nothing_from(None), Some(2));
+        let fault = Failing {
             code: rt::CommandBufferError::PageFault.metal_code(),
             ..hang
-        });
-        let site = catch_death(|| cb.failure("commit", || false)).unwrap_err();
+        };
+        cb.fails_at_type_9(fault);
+        let site = catch_death(|| cb.failure("commit")).unwrap_err();
         assert_eq!(site.file, "commit");
+        // A pass's store into read-only memory, alone, beside a type-9 draw's page fault, and
+        // beside a failure of its own.
+        let cb = buffer(&q);
+        cb.faults_at_read_only_store(3);
+        assert!(cb.failure("commit").is_none(), "a read-only store alone");
+        assert_eq!(cb.runs_nothing_from(None), Some(3));
+        cb.fails_at_type_9(Failing { from: 1, ..fault });
+        assert!(cb.failure("commit").is_none(), "beside a type-9 page fault");
+        assert_eq!(cb.runs_nothing_from(None), Some(1));
+        cb.fail(Failing {
+            code: PROTECTION_VIOLATION,
+            from: 4,
+            signals: false,
+        });
+        let site = catch_death(|| cb.failure("commit")).unwrap_err();
+        assert_eq!(site.file, "commit");
+        // Beside a failure of its own alone, after the pass or before it, its own stands.
+        for (store, own) in [(1, 2), (2, 1)] {
+            let cb = buffer(&q);
+            cb.faults_at_read_only_store(store);
+            cb.fail(Failing {
+                code: PROTECTION_VIOLATION,
+                from: own,
+                signals: false,
+            });
+            let failure = cb.failure("commit").unwrap();
+            assert_eq!(
+                (failure.code, &failure.encoders, failure.signals),
+                (PROTECTION_VIOLATION, &rt::FailedEncoders::From(own), true),
+                "a store-out at {store}, its own failure at {own}"
+            );
+            assert_eq!(cb.runs_nothing_from(Some(&failure)), Some(1));
+        }
     }
 
-    /// A command buffer the runtime failed for a command's buffer rebound before its first
-    /// submission (`CommandBufferError::EncodedUseRebound`) dies at the selector where its
-    /// failure is read, at the commit's (a completed handler's, its status or error) and at the
-    /// wait, its line naming the rebind and where Metal runs the command
+    /// A command buffer that may be cut is committed as a part at a range's end
+    /// (`CommandBuffer::commit_part`), the one `part` made for its later range going on. One kept
+    /// whole only by a failure from an encoder on commits nothing and answers so, and takes in
+    /// the later one's ways of failing as though its encoders had followed its own
+    /// (`CommandBuffer::fold`): a type-9 draw of the later one's fails from its place counted
+    /// after this one's encoders, and one of another code beside this one's dies at the commit,
+    /// as in one command buffer. One kept whole by its protection options is neither.
     #[test]
-    fn an_encoded_use_rebound_dies_naming_the_rebind() {
-        for sel in ["commit", "waitUntilCompleted"] {
-            *crate::answer::LAST_LINE.lock() = None;
-            let site = catch_death(|| {
-                encoded_use_rebound(sel);
-            })
-            .unwrap_err();
-            let line = crate::answer::LAST_LINE.lock().take().unwrap_or_default();
-            assert_eq!((site.kind, site.file), (DeathKind::Abort, sel), "{line}");
-            assert!(
-                line.contains("rebound after the command was encoded"),
-                "{line}"
+    fn a_later_part_folds_into_a_buffer_that_fails_from_an_encoder_on() {
+        let q = dev().new_command_queue().unwrap();
+        let cb = buffer(&q);
+        let later = cb
+            .part(OnFault::Return)
+            .unwrap()
+            .expect("one that may be cut");
+        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Cut);
+        assert!(cb.committed.load(Ordering::SeqCst));
+        drop(later);
+        let hang = Failing {
+            code: rt::CommandBufferError::GpuHang.metal_code(),
+            from: 0,
+            signals: true,
+        };
+        let fault = Failing {
+            code: rt::CommandBufferError::PageFault.metal_code(),
+            ..hang
+        };
+        for (theirs, dies) in [(hang, false), (fault, true)] {
+            let cb = buffer(&q);
+            let later = cb.part(OnFault::Return).unwrap().unwrap();
+            cb.made.store(3, Ordering::SeqCst);
+            cb.fails_at_type_9(Failing { from: 2, ..hang });
+            later.made.store(2, Ordering::SeqCst);
+            later.fails_at_type_9(Failing { from: 1, ..theirs });
+            assert_eq!(cb.commit_part(OnFault::Return).unwrap(), PartCut::Fails);
+            assert!(!cb.committed.load(Ordering::SeqCst), "nothing committed");
+            cb.fold(later);
+            assert_eq!(cb.made.load(Ordering::SeqCst), 5);
+            let froms: Vec<usize> = cb.by_runtime.lock().iter().map(|w| w.from).collect();
+            assert_eq!(froms, [2, 4], "the later one's counted after this one's");
+            assert_eq!(cb.runs_nothing_from(None), Some(2));
+            match dies {
+                false => assert!(cb.failure("commit").is_none(), "type 9 of one code"),
+                true => assert!(catch_death(|| cb.failure("commit")).is_err(), "two codes"),
+            }
+        }
+        let cb = buffer(&q);
+        let later = cb.part(OnFault::Return).unwrap().unwrap();
+        cb.set_protection_options(OnFault::Return, 2).unwrap();
+        let whole = PartCut::Whole(KeptWhole::ProtectionOptions);
+        assert_eq!(cb.commit_part(OnFault::Return).unwrap(), whole);
+        assert!(cb.part(OnFault::Return).unwrap().is_none(), "no part made");
+        drop(later);
+    }
+
+    /// Each reason a command buffer is kept whole for, but how Metal's GPU fails it, answers
+    /// [`PartCut::Whole`] with that reason at a range's end, ahead of a failure from an encoder
+    /// on, and commits nothing: an open encoder, protection options, progress kept to the
+    /// completion, a signal as it is scheduled, a commit. (An indirect command buffer's
+    /// execution and command predication's blocks keep it whole as `split`'s tests show.)
+    #[test]
+    fn a_buffer_kept_whole_answers_why_at_a_range_s_end() {
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        let q = dev().new_command_queue().unwrap();
+        let whole = |cb: &VulkanCommandBuffer, reason: KeptWhole| {
+            cb.fails_at_type_9(Failing {
+                code: rt::CommandBufferError::GpuHang.metal_code(),
+                from: 0,
+                signals: true,
+            });
+            assert_eq!(
+                cb.commit_part(OnFault::Return).unwrap(),
+                PartCut::Whole(reason),
+                "{reason:?}"
             );
-            assert!(line.ends_with("the buffer lies in as it submits"), "{line}");
+        };
+        let cb = buffer(&q);
+        let blit = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+        whole(&cb, KeptWhole::OpenEncoder);
+        blit.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+        let cb = buffer(&q);
+        cb.set_protection_options(OnFault::Return, 0x10).unwrap();
+        whole(&cb, KeptWhole::ProtectionOptions);
+        let cb = buffer(&q);
+        drop(cb.progress("a test's command"));
+        whole(&cb, KeptWhole::Progress);
+        assert!(!cb.committed.load(Ordering::SeqCst), "nothing committed");
+        let cb = buffer(&q);
+        cb.signals_scheduled.store(true, Ordering::SeqCst);
+        whole(&cb, KeptWhole::ScheduledSignal);
+        let cb = buffer(&q);
+        cb.commit(OnFault::Return).unwrap();
+        cb.wait_until_completed(OnFault::Return).unwrap();
+        whole(&cb, KeptWhole::Committed);
+    }
+
+    /// Where protection options are set in a command buffer of [`read_only_store_beside`]:
+    /// before its pass, after it, or after every encoder.
+    #[cfg(any(target_os = "linux", windows))]
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    enum Options {
+        BeforeThePass,
+        AfterThePass,
+        AfterEveryEncoder,
+    }
+
+    /// What a command buffer of `q` shows that fills a buffer with 0x5a, signals an event, runs a
+    /// pass that clears and stores a colour attachment over a guest's read-only memory (made with
+    /// bit 24, `resource::tests::read_only_buffer`), signals a second event, fills a buffer with
+    /// 0x6b and signals a third, with protection `options` set `at` its place: its status and
+    /// error, each buffer's first byte, each signal's value and whether the pages stayed zeros.
+    #[cfg(any(target_os = "linux", windows))]
+    fn read_only_store_beside(q: &VulkanCommandQueue, options: u64, at: Options) -> String {
+        use crate::core::platform::Platform as _;
+        use crate::core::platform::descriptor::RenderPassDescriptor as _;
+        use crate::core::platform::os::vm::HostVm as _;
+        use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+        use crate::core::platform::types::ClearColor;
+        use crate::core::platform::values::ColorAttachmentSet;
+        use crate::gpu::resource::tests::{bgra_over, host_bytes_at, read_only_buffer};
+        use crate::os::PAGE;
+        use crate::platform::tests::platform;
+
+        let d = dev();
+        let (ro, pages) = read_only_buffer(1);
+        // `MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget`.
+        let target = bgra_over(&ro, 0x5);
+        let pass = platform().render_pass_descriptor();
+        let attachment = ColorAttachmentSet {
+            texture: Some(Some(&target)),
+            load_action: Some(2),
+            store_action: Some(1),
+            clear_color: Some(ClearColor {
+                red: 1.0,
+                green: 0.5,
+                blue: 0.25,
+                alpha: 1.0,
+            }),
+            ..ColorAttachmentSet::default()
+        };
+        pass.set_color_attachment(OnFault::Die, 0, &attachment)
+            .unwrap();
+        let events: Vec<_> = (0..3).map(|_| d.new_shared_event().unwrap()).collect();
+        let signal = |cb: &VulkanCommandBuffer, i: usize| {
+            let event = Some(EventRef::Shared(&events[i]));
+            cb.encode_signal(event, 1).unwrap();
+        };
+        let protect = |cb: &VulkanCommandBuffer, here: Options| {
+            if at == here {
+                cb.set_protection_options(OnFault::Return, options).unwrap();
+            }
+        };
+        let cb = buffer(q);
+        let before = filled(&cb, 0x5a);
+        signal(&cb, 0);
+        protect(&cb, Options::BeforeThePass);
+        let e = cb.render_encoder(OnFault::Die, &pass).unwrap().unwrap();
+        e.encode(OnFault::Die, RenderCmd::EndEncoding).unwrap();
+        signal(&cb, 1);
+        protect(&cb, Options::AfterThePass);
+        let after = filled(&cb, 0x6b);
+        signal(&cb, 2);
+        protect(&cb, Options::AfterEveryEncoder);
+        let (status, error) = completed(&cb);
+        let zeros = host_bytes_at(pages, 16 * 64).iter().all(|&b| b == 0);
+        let values: Vec<u64> = events.iter().map(|e| e.signaled_value()).collect();
+        let line = format!(
+            "status {status} error {error:?} before {:#x} after {:#x} signals {values:?} zeros \
+             {zeros}",
+            sixteen(&before)[0],
+            sixteen(&after)[0],
+        );
+        drop((pass, target, ro));
+        assert!(
+            crate::remap::VulkanVm::new()
+                .deallocate(pages, PAGE)
+                .is_success()
+        );
+        line
+    }
+
+    /// A pass that stores into a guest's read-only memory, which Metal's GPU faults, beside
+    /// protection options, fails its command buffer as the options say, as the M3 Max's does
+    /// (plain Metal, macOS 27.0.1, dgpu-oracle.md Q39): an encoder made under options below or
+    /// from 0x10 fails it with code 16 or 1, it and every encoder after it running nothing, and
+    /// of the event signals those encoded before it fire, whether the options came after the
+    /// pass or before it, where the pass runs nothing; options from 0x10 set after every encoder
+    /// fail it with code 1, every signal firing, and the encoder after the faulting pass runs
+    /// nothing, as one of Metal's runs does (the M3 Max ran it in 3 of 6). The pages stay zeros.
+    /// Linux's and Windows's: on macOS the pass goes to Metal
+    #[cfg(any(target_os = "linux", windows))]
+    #[test]
+    fn a_read_only_store_beside_protection_options_fails_as_the_options_say() {
+        for (options, at, line) in [
+            (
+                2,
+                Options::AfterThePass,
+                "status 5 error Some(16) before 0x5a after 0x0 signals [1, 1, 0] zeros true",
+            ),
+            (
+                0x10,
+                Options::AfterThePass,
+                "status 5 error Some(1) before 0x5a after 0x0 signals [1, 1, 0] zeros true",
+            ),
+            (
+                2,
+                Options::BeforeThePass,
+                "status 5 error Some(16) before 0x5a after 0x0 signals [1, 0, 0] zeros true",
+            ),
+            (
+                0x10,
+                Options::AfterEveryEncoder,
+                "status 5 error Some(1) before 0x5a after 0x0 signals [1, 1, 1] zeros true",
+            ),
+        ] {
+            // A queue of its own: a queue's second fault revokes it.
+            let q = dev().new_command_queue().unwrap();
+            let what = format!("{options:#x} {at:?}");
+            assert_eq!(read_only_store_beside(&q, options, at), line, "{what}");
         }
     }
 
@@ -3048,7 +3396,7 @@ mod tests {
     /// plain Metal asserts as the encoder goes (the runtime's statement)
     #[test]
     fn an_open_encoder_kills_what_metal_asserts_at() {
-        use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use crate::core::platform::blit::{BlitCmd, BlitEncoder as _};
         let d = dev();
         let q = d.new_command_queue().unwrap();
         let cb = buffer(&q);

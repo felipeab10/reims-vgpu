@@ -1,28 +1,29 @@
 #!/bin/bash
 # The lane gate's OpenCore image, made on the lane host: BASE, a SIP-on image of the lane's
 # OpenCore set, with the candidate's kexts in place of BASE's (opencore-add-kexts.sh replaces each
-# bundle of the same name in its own entry's place): the loader that matches the candidate's
-# ReimsGraphics, its IOGraphicsFamily and AppleGraphicsDeviceControl shims, ReimsGraphics itself
-# (the loader builder's staged copy, whose Info.plist carries no personalities: the loader holds
-# them), and RgfxGate, which carries the candidate's bundle as its payload. Checks that OUT
-# carries exactly the given binaries.
+# bundle of the same name in its own entry's place): Graft (guest/graft's committed build),
+# ReimsGraphics as its build stages it for Graft to bind (no personalities), and RgfxGate, which
+# carries the candidate's bundle as its payload. Checks that OUT carries exactly the given
+# binaries and no other kext: a BASE made before Graft (Lilu, a loader and its shims) is refused,
+# to be made again with `reims-ctl update-opencore`.
 #
 #   msi-image.sh OCADD BASE OUT KEXTS RGFXGATE
 #     OCADD     scripts/internal/opencore-add-kexts.sh
-#     KEXTS     the loader builder's kexts: AppleParavirtGPULoader.kext, ReimsGraphics.kext and
-#               the *Bridge.kext shims
+#     KEXTS     the set's kexts but RgfxGate: Graft.kext and ReimsGraphics.kext
 #     RGFXGATE  the candidate's RgfxGate.kext
 set -euo pipefail
 OCADD=$1 BASE=$2 OUT=$3 KEXTS=$4 GATEKEXT=$5
 [[ -f $BASE ]] || { echo "msi-image: no base image $BASE" >&2; exit 2; }
 rm -f "$OUT"
-shims=("$KEXTS"/*Bridge.kext)
-bash "$OCADD" "$BASE" "$OUT" "${shims[@]}" "$KEXTS/ReimsGraphics.kext" \
-  "$KEXTS/AppleParavirtGPULoader.kext" "$GATEKEXT" > "$OUT.entries"
+bash "$OCADD" "$BASE" "$OUT" "$KEXTS/Graft.kext" "$KEXTS/ReimsGraphics.kext" "$GATEKEXT" > "$OUT.entries"
 
 # What the image carries, read back from its ESP (the GPT's first partition).
 tmp=$(mktemp -d)
-trap 'rm -rf "$tmp"' EXIT
+# bash 3.2, macOS's, exits 0 from a set -u error where an EXIT trap is set, with $? 0 in the
+# trap too, so an aborted run would read as a pass (docs/lessons.md): the trap fails a run
+# that exits 0 short of its end, which sets `ended`.
+ended=0
+trap 'rc=$?; rm -rf "$tmp"; [[ $rc != 0 || $ended == 1 ]] || rc=1; exit $rc' EXIT
 qemu-img convert -O raw "$OUT" "$tmp/disk.raw"
 off=$(python3 -I - "$tmp/disk.raw" << 'EOF'
 import struct, sys
@@ -37,6 +38,16 @@ EOF
 )
 export MTOOLS_SKIP_CHECK=1
 mcopy -s -i "$tmp/disk.raw@@$off" ::/EFI/OC/Kexts "$tmp/"
+mcopy -i "$tmp/disk.raw@@$off" ::/EFI/OC/config.plist "$tmp/config.plist"
+others=$(python3 -I - "$tmp/config.plist" << 'EOF'
+import plistlib, sys
+with open(sys.argv[1], "rb") as f:
+    add = plistlib.load(f)["Kernel"]["Add"]
+ours = {"Graft.kext", "ReimsGraphics.kext", "RgfxGate.kext"}
+print(" ".join(e.get("BundlePath", "?") for e in add if e.get("BundlePath") not in ours))
+EOF
+)
+[[ -z $others ]] || { echo "msi-image: $BASE also carries $others: make it again with reims-ctl update-opencore" >&2; exit 1; }
 for k in "$KEXTS"/*.kext "$GATEKEXT"; do
   n=$(basename "$k" .kext)
   want=$(sha256sum < "$k/Contents/MacOS/$n" | cut -d' ' -f1)
@@ -44,4 +55,5 @@ for k in "$KEXTS"/*.kext "$GATEKEXT"; do
   [[ $want == "$got" ]] || { echo "msi-image: $OUT carries another $n ($got, not $want)" >&2; exit 1; }
   echo "IMAGE $n ${want:0:16}"
 done
+ended=1
 echo MSI_IMAGE_OK

@@ -1,10 +1,12 @@
 /*
  * RgfxMetalDevice (Resources): see RgfxMetalDevice+Resources.h. The device's
  * MTLDevice resource creators, each a thin forwarder to a wrapper factory, routing
- * through `-serializer`. Our own ObjC++.
+ * through `-serializer`. Each nil one answers is logged (noteNil). Our own ObjC++.
  */
 
 #import "RgfxMetalDevice+Resources.h"
+#include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBlockCall.h"
 #import "RgfxBuffer.h"
@@ -12,6 +14,8 @@
 #import "RgfxIOSurface.h"
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxMetalPrivate.h"
+#import "RgfxRasterizationRateMap.h"
+#import "RgfxResidencySet.h"
 #import "RgfxStateCache.h"
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
@@ -19,6 +23,76 @@
 #include "RgfxObjectModel.hpp" // RGFX_OBJ_NONE
 #include "RgfxRegion.hpp"
 #include "RgfxSerializer.hpp"
+
+#import <objc/message.h>
+
+#include <cstdio>
+#include <mutex>
+#include <set>
+#include <string>
+
+namespace {
+
+// A nil the device's creator `creator` answers for `cause`, asked for `asked`: logged at the info
+// level (`log show --info`) once per creator and cause in the process (docs/conventions.md), what
+// was asked the first time named, so a process that ends at a nil it was given (14.6.1's
+// WindowServer ends at a texture's, in SkyLight's MetalBacking::AbortWithTextureInfo) has the
+// device's answer named beside it. A creator asked every frame, the same or not, logs once.
+void noteNil(const char *creator, const char *cause, const std::string &asked)
+{
+	static char site;
+	if (!rgfxLogFirst(&site, rgfxLogKindOf(creator) ^ (rgfxLogKindOf(cause) * 31)))
+		return;
+	os_log_info(rgfxLog(),
+	            "RGFX: the device answers nil at %{public}s (%{public}s): %{public}s", creator,
+	            cause, asked.c_str());
+}
+
+// What a texture's descriptor asks, its protection options among it where the descriptor has
+// them (MTLTextureDescriptorInternal's protectionOptions, read from 14.6.1's Metal).
+std::string textureAsked(MTLTextureDescriptor *d)
+{
+	if (d == nil)
+		return "no descriptor";
+	unsigned long long protection = 0;
+	if ([d respondsToSelector:@selector(protectionOptions)])
+		protection =
+		    ((unsigned long long (*)(id, SEL))objc_msgSend)(d, @selector(protectionOptions));
+	char line[320];
+	snprintf(line, sizeof(line),
+	         "a texture of format %lu, type %lu, %lux%lux%lu, array length %lu, %lu levels, "
+	         "%lu samples, usage 0x%lx, storage %lu, options 0x%lx, protection 0x%llx",
+	         (unsigned long)d.pixelFormat, (unsigned long)d.textureType, (unsigned long)d.width,
+	         (unsigned long)d.height, (unsigned long)d.depth, (unsigned long)d.arrayLength,
+	         (unsigned long)d.mipmapLevelCount, (unsigned long)d.sampleCount,
+	         (unsigned long)d.usage, (unsigned long)d.storageMode,
+	         (unsigned long)d.resourceOptions, protection);
+	return line;
+}
+
+// What a buffer's creator asks.
+std::string bufferAsked(NSUInteger length, MTLResourceOptions options)
+{
+	char line[96];
+	snprintf(line, sizeof(line), "a buffer of %lu bytes, options 0x%lx", (unsigned long)length,
+	         (unsigned long)options);
+	return line;
+}
+
+// Why a device buffer's factory answered nil for `length` and `options` (RgfxBuffer's
+// bufferForDeviceWithLength:..., which says no more).
+const char *bufferCause(NSUInteger length, MTLResourceOptions options, NSUInteger maxLength)
+{
+	if (length == 0)
+		return "no bytes";
+	if (maxLength != 0 && length > maxLength)
+		return "more bytes than maxBufferLength";
+	if (RgfxMakesNoResourceOf(options))
+		return "options with bit 18";
+	return "no room in the slabs, or the device never got the create";
+}
+
+} // namespace
 
 @implementation RgfxMetalDevice (Resources)
 
@@ -29,13 +103,17 @@
 	// A Shared buffer in a slab of the device region, which the host sees in place, a Managed
 	// one with its CPU copy there, a Private one the GPU's alone; none where Metal makes none, nor
 	// where the region has no room (RgfxBuffer.h).
-	return [RgfxBuffer bufferForDeviceWithLength:length
-	                                     options:options
-	                                       bytes:nullptr
-	                                   maxLength:[self maxBufferLength]
-	                                       slabs:[self slabs]
-	                                      device:self
-	                                  serializer:[self serializer]];
+	id<MTLBuffer> buffer = [RgfxBuffer bufferForDeviceWithLength:length
+	                                                     options:options
+	                                                       bytes:nullptr
+	                                                   maxLength:[self maxBufferLength]
+	                                                       slabs:[self slabs]
+	                                                      device:self
+	                                                  serializer:[self serializer]];
+	if (buffer == nil)
+		noteNil("newBufferWithLength:options:",
+		        bufferCause(length, options, [self maxBufferLength]), bufferAsked(length, options));
+	return buffer;
 }
 
 - (id<MTLBuffer>)newBufferWithBytes:(const void *)pointer
@@ -45,15 +123,24 @@
 	// As newBufferWithLength:options:, its range seeded with the bytes; none for a Private one,
 	// whose bytes Metal's validation refuses, nor for no bytes at all, which Metal's validation
 	// refuses too and its copy faults at (measured on the M3 Max).
-	if (pointer == nullptr)
+	if (pointer == nullptr) {
+		noteNil("newBufferWithBytes:length:options:", "no bytes", bufferAsked(length, options));
 		return nil;
-	return [RgfxBuffer bufferForDeviceWithLength:length
-	                                     options:options
-	                                       bytes:pointer
-	                                   maxLength:[self maxBufferLength]
-	                                       slabs:[self slabs]
-	                                      device:self
-	                                  serializer:[self serializer]];
+	}
+	id<MTLBuffer> buffer = [RgfxBuffer bufferForDeviceWithLength:length
+	                                                     options:options
+	                                                       bytes:pointer
+	                                                   maxLength:[self maxBufferLength]
+	                                                       slabs:[self slabs]
+	                                                      device:self
+	                                                  serializer:[self serializer]];
+	if (buffer == nil)
+		noteNil("newBufferWithBytes:length:options:",
+		        (options & MTLResourceStorageModeMask) == MTLResourceStorageModePrivate
+		            ? "bytes for a Private buffer"
+		            : bufferCause(length, options, [self maxBufferLength]),
+		        bufferAsked(length, options));
+	return buffer;
 }
 
 - (id<MTLBuffer>)newBufferWithBytesNoCopy:(void *)pointer
@@ -63,22 +150,45 @@
 {
 	// Over the caller's bytes in place where they lie in a block of ours or the kext wires their
 	// pages, else over a range of a slab synced with them (RgfxBuffer.h).
-	return [RgfxBuffer bufferWithBytesNoCopy:pointer
-	                                  length:length
-	                                 options:options
-	                             deallocator:deallocator
-	                                  region:[self region]
-	                                   slabs:[self slabs]
-	                                  device:self
-	                              serializer:[self serializer]];
+	id<MTLBuffer> buffer = [RgfxBuffer bufferWithBytesNoCopy:pointer
+	                                                  length:length
+	                                                 options:options
+	                                             deallocator:deallocator
+	                                                  region:[self region]
+	                                                   slabs:[self slabs]
+	                                                  device:self
+	                                              serializer:[self serializer]];
+	if (buffer == nil)
+		noteNil("newBufferWithBytesNoCopy:length:options:deallocator:",
+		        "the buffer's factory made none", bufferAsked(length, options));
+	return buffer;
 }
 
 // --- textures ----------------------------------------------------------------
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
 {
-	// Where Metal's validation ends the process, so does the bundle, sending nothing.
+	// Where Metal's validation ends the process, so does the bundle, sending nothing; and none of
+	// options with bit 18, as the x86 Macs make none (RgfxMakesNoResourceOf).
 	rgfxEndAtInvalidTextureDescriptor(descriptor, self);
+	const char *creator = "newTextureWithDescriptor:";
+	if (descriptor != nil && RgfxMakesNoResourceOf(descriptor.resourceOptions)) {
+		noteNil(creator, "options with bit 18", textureAsked(descriptor));
+		return nil;
+	}
+	// None of a two-plane format but the XR10 ones, or Unspecialized, on an Apple GPU
+	// (rgfxDeviceMakesNoTextureOf).
+	if (rgfxDeviceMakesNoTextureOf(descriptor, self)) {
+		noteNil(creator, "a two-plane format or Unspecialized on an Apple GPU",
+		        textureAsked(descriptor));
+		return nil;
+	}
+	// None of more bytes than maxBufferLength, as the Intel 630 makes none
+	// (rgfxTexturePastLength).
+	if (descriptor != nil && rgfxTexturePastLength(descriptor, [self maxBufferLength])) {
+		noteNil(creator, "more bytes than maxBufferLength", textureAsked(descriptor));
+		return nil;
+	}
 	// A Managed texture's CPU copy is a Shared buffer of the slabs where the host reads a copy
 	// wherever its buffer lies (RGFX_FEATURE_MANAGED_TEXTURE_SLABS), so the copies take the
 	// process's own pages and not the region every process shares; else a region block. One of
@@ -96,11 +206,15 @@
 			return managed;
 		}
 	}
-	return [RgfxTexture textureWithDescriptor:descriptor
-	                                     heap:RGFX_OBJ_NONE
-	                               heapOffset:0
-	                                   device:self
-	                               serializer:[self serializer]];
+	RgfxTexture *texture = [RgfxTexture textureWithDescriptor:descriptor
+	                                                     heap:RGFX_OBJ_NONE
+	                                               heapOffset:0
+	                                                   device:self
+	                                               serializer:[self serializer]];
+	if (texture == nil)
+		noteNil(creator, "no route, no resource id left, or the device never got the create",
+		        textureAsked(descriptor));
+	return texture;
 }
 
 - (id<MTLTexture>)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor
@@ -111,6 +225,14 @@
 	// process's copy of the plane in the device region, synced with the surface's pages
 	// (RgfxIOSurface.h).
 	rgfxEndAtInvalidSurfaceTexture(descriptor, iosurface, plane, self);
+	// None of a compressed format, nor of a subsampled two-plane one of an odd side that is
+	// written, on an Apple GPU (rgfxSurfaceMakesNoTextureOf).
+	if (rgfxSurfaceMakesNoTextureOf(descriptor, self)) {
+		noteNil("newTextureWithDescriptor:iosurface:plane:",
+		        "a compressed format, or an odd written two-plane one, on an Apple GPU",
+		        textureAsked(descriptor));
+		return nil;
+	}
 	return [RgfxIOSurfaceTexture textureWithDescriptor:descriptor
 	                                         iosurface:iosurface
 	                                             plane:plane
@@ -146,24 +268,35 @@
                                           offset:(NSUInteger)offset
                                      bytesPerRow:(NSUInteger)bytesPerRow
 {
+	const char *creator = "newTiledTextureWithBytesNoCopy:length:deallocator:descriptor:offset:"
+	                      "bytesPerRow:";
 	if (deallocator != nil &&
 	    ![RgfxBlockArgumentTypes(deallocator) isEqualToArray:@[ @"^v", @"Q" ]]) {
 		RGFX_UNSUPPORTED("tiled textures with a deallocator of another type");
+		noteNil(creator, "a deallocator of another type", textureAsked(descriptor));
 		return nil;
 	}
-	if (descriptor == nil)
+	if (descriptor == nil) {
+		noteNil(creator, "no descriptor", textureAsked(descriptor));
 		return nil;
+	}
 	const MTLResourceOptions options =
 	    (descriptor.resourceOptions & ~MTLResourceStorageModeMask) | MTLResourceStorageModeShared;
 	id<MTLBuffer> buffer = [self newBufferWithBytesNoCopy:bytes
 	                                               length:length
 	                                              options:options
 	                                          deallocator:deallocator];
-	if (![(id)buffer isKindOfClass:[RgfxBuffer class]])
+	if (![(id)buffer isKindOfClass:[RgfxBuffer class]]) {
+		noteNil(creator, "no buffer over the bytes", textureAsked(descriptor));
 		return nil;
-	return [(id<RgfxMetalBufferInternals>)buffer newTiledTextureWithDescriptor:descriptor
-	                                                                   offset:offset
-	                                                              bytesPerRow:bytesPerRow];
+	}
+	id<MTLTexture> texture =
+	    [(id<RgfxMetalBufferInternals>)buffer newTiledTextureWithDescriptor:descriptor
+	                                                                 offset:offset
+	                                                            bytesPerRow:bytesPerRow];
+	if (texture == nil)
+		noteNil(creator, "the buffer's tiled texture creator made none", textureAsked(descriptor));
+	return texture;
 }
 
 - (id<MTLTexture>)newTiledTextureWithBytesNoCopy:(void *)bytes
@@ -186,7 +319,10 @@
 // where the wire handshake failed.
 - (id<MTLSamplerState>)newSamplerStateWithDescriptor:(MTLSamplerDescriptor *)descriptor
 {
-	return [[self stateCache] samplerWithDescriptor:descriptor];
+	id<MTLSamplerState> state = [[self stateCache] samplerWithDescriptor:descriptor];
+	if (state == nil)
+		noteNil("newSamplerStateWithDescriptor:", "no state made", "a sampler");
+	return state;
 }
 
 // --- depth/stencil state -----------------------------------------------------
@@ -194,7 +330,10 @@
 // As newSamplerStateWithDescriptor:.
 - (id<MTLDepthStencilState>)newDepthStencilStateWithDescriptor:(MTLDepthStencilDescriptor *)descriptor
 {
-	return [[self stateCache] depthStencilStateWithDescriptor:descriptor];
+	id<MTLDepthStencilState> state = [[self stateCache] depthStencilStateWithDescriptor:descriptor];
+	if (state == nil)
+		noteNil("newDepthStencilStateWithDescriptor:", "no state made", "a depth-stencil state");
+	return state;
 }
 
 // --- indirect command buffers ------------------------------------------------
@@ -206,18 +345,101 @@
                                                        maxCommandCount:(NSUInteger)maxCount
                                                                options:(MTLResourceOptions)options
 {
+	const char *creator = "newIndirectCommandBufferWithDescriptor:maxCommandCount:options:";
+	char asked[96];
+	snprintf(asked, sizeof(asked), "an indirect command buffer of %lu commands, options 0x%lx",
+	         (unsigned long)maxCount, (unsigned long)options);
 	if (([self caps]->features() & RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS) == 0) {
 		RGFX_UNSUPPORTED("indirect command buffers (the host offers none)");
+		noteNil(creator, "the host offers none", asked);
 		return nil;
 	}
-	// Slots where the host takes them, in blocks of the process's region.
-	const bool slots = ([self caps]->features() & RGFX_FEATURE_ICB_SLOTS) != 0;
-	return [RgfxIndirectCommandBuffer icbWithDescriptor:descriptor
-	                                    maxCommandCount:maxCount
-	                                            options:options
-	                                             device:self
-	                                         serializer:[self serializer]
-	                                        slotsRegion:slots ? [self region] : nullptr];
+	// Slots where the host takes them: in chunked pages blocks of the process's where it takes
+	// those too, else in blocks of the process's region.
+	const uint64_t features = [self caps]->features();
+	const bool slots = (features & RGFX_FEATURE_ICB_SLOTS) != 0;
+	id<MTLIndirectCommandBuffer> icb =
+	    [RgfxIndirectCommandBuffer icbWithDescriptor:descriptor
+	                                 maxCommandCount:maxCount
+	                                         options:options
+	                                          device:self
+	                                      serializer:[self serializer]
+	                                     slotsRegion:slots ? [self region] : nullptr
+	                                    slotsInPages:(features & RGFX_FEATURE_ICB_SLOTS_IN_PAGES) != 0];
+	if (icb == nil)
+		noteNil(creator, "the factory made none", asked);
+	return icb;
+}
+
+// --- rasterization rate maps -------------------------------------------------
+
+// Made on the host where it makes them (RATE_MAPS, which the kext takes for the bundle); nil
+// where it does not, as a device that supports no layer count answers.
+- (id<MTLRasterizationRateMap>)newRasterizationRateMapWithDescriptor:
+    (MTLRasterizationRateMapDescriptor *)descriptor
+{
+	const char *creator = "newRasterizationRateMapWithDescriptor:";
+	char asked[96];
+	snprintf(asked, sizeof(asked), "a map of %lu layers over %lux%lu",
+	         (unsigned long)descriptor.layerCount, (unsigned long)descriptor.screenSize.width,
+	         (unsigned long)descriptor.screenSize.height);
+	if (([self caps]->features() & RGFX_FEATURE_RATE_MAPS) == 0) {
+		noteNil(creator, "the host makes none", asked);
+		return nil;
+	}
+	id<MTLRasterizationRateMap> map = [RgfxRasterizationRateMap rateMapWithDescriptor:descriptor
+	                                                                          device:self
+	                                                                      serializer:[self serializer]];
+	if (map == nil)
+		noteNil(creator, "the factory made none", asked);
+	return map;
+}
+
+// The base device's form of a screen size and its layers (`@56@0:8{?=QQQ}16Q40r^@48`), which
+// Metal's public descriptor of the same arguments makes.
+- (id<MTLRasterizationRateMap>)
+    newRasterizationRateMapWithScreenSize:(MTLSize)screenSize
+                               layerCount:(NSUInteger)layerCount
+                                   layers:(const __unsafe_unretained id *)layers
+{
+	MTLRasterizationRateMapDescriptor *descriptor = [MTLRasterizationRateMapDescriptor
+	    rasterizationRateMapDescriptorWithScreenSize:screenSize
+	                                      layerCount:layerCount
+	                                          layers:(MTLRasterizationRateLayerDescriptor *const *)layers];
+	return [self newRasterizationRateMapWithDescriptor:descriptor];
+}
+
+// --- residency sets --------------------------------------------------------------------------
+
+// The arm64 device makes a set, as Apple silicon's Metal does, and sets the error out to nil,
+// whatever it held (measured: macOS 27.0.1, the M3 Max, AGXG15XFamilyResidencySet, a nil
+// descriptor's among them; RgfxResidencySet.h). The x86 device answers nil and sets the error out
+// to nil, as the x86 Macs do (measured: macOS 26.7.1, the AMD Radeon Pro 5300M and the Intel UHD
+// 630: an error out holding an error before the call holds nil after it).
+- (id<MTLResidencySet>)newResidencySetWithDescriptor:(MTLResidencySetDescriptor *)desc
+                                               error:(NSError **)error
+{
+	if (error != nullptr)
+		*error = nil;
+#if RgfxMakesResidencySets
+	return [[RgfxResidencySet alloc] initWithDevice:self descriptor:desc];
+#else
+	RGFX_UNSUPPORTED("residency sets on the x86 device, as the x86 Macs make none");
+	return nil;
+#endif
+}
+
+// The object Metal's base device inits a residency set of (`@16@0:8`; initWithDevice:descriptor:,
+// as the M3 Max's AGXResidencySet answers it): the arm64 device's set, and nil on the x86 device,
+// as its public form above.
+- (id)allocResidencySet
+{
+#if RgfxMakesResidencySets
+	return [RgfxResidencySet alloc];
+#else
+	RGFX_UNSUPPORTED("residency sets on the x86 device, as the x86 Macs make none");
+	return nil;
+#endif
 }
 
 // --- heaps -------------------------------------------------------------------
@@ -226,11 +448,19 @@
 {
 	// A Shared heap lives in the device region so the host sees its sub-resources in place, or
 	// is nil; any other storage mode is a device heap (createHeap).
-	return [RgfxHeap heapForDeviceWithDescriptor:descriptor
-	                                   maxLength:[self maxBufferLength]
-	                                      region:[self region]
-	                                      device:self
-	                                  serializer:[self serializer]];
+	id<MTLHeap> heap = [RgfxHeap heapForDeviceWithDescriptor:descriptor
+	                                               maxLength:[self maxBufferLength]
+	                                                  region:[self region]
+	                                                  device:self
+	                                              serializer:[self serializer]];
+	if (heap == nil) {
+		char asked[128];
+		snprintf(asked, sizeof(asked), "a heap of %lu bytes, type %ld, storage %lu",
+		         (unsigned long)descriptor.size, (long)descriptor.type,
+		         (unsigned long)descriptor.storageMode);
+		noteNil("newHeapWithDescriptor:", "the factory made none", asked);
+	}
+	return heap;
 }
 
 @end

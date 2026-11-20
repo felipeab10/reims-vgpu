@@ -4,6 +4,7 @@
  */
 
 #include "RgfxSerializer.hpp"
+#include "RgfxLogOnce.hpp"
 
 #include "RgfxIcbSlotTable.hpp"
 
@@ -251,7 +252,7 @@ RgfxCreated RgfxSerializer::createHeap(uint64_t size_bytes, uint32_t options, in
 	msg.obj_id = out.obj_id;
 	msg.gpu_address = out.gpu_address;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted = m_control.tryPost(RGFX_CMD_HEAP_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -273,7 +274,7 @@ RgfxCreated RgfxSerializer::createHeapOverHostMemory(uint64_t size_bytes, uint32
 	msg.gpu_address = out.gpu_address;
 	msg.region_offset = region_offset;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_HEAP_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
@@ -297,7 +298,7 @@ RgfxCreated RgfxSerializer::createHeapOverPages(uint64_t size_bytes, uint32_t op
 	msg.block_offset = block_offset;
 	msg.block_size = block_size;
 	msg.size_bytes = size_bytes;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	msg.heap_type = heap_type;
 	out.posted = m_control.tryPost(RGFX_CMD_HEAP_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -316,7 +317,7 @@ RgfxCreated RgfxSerializer::createBuffer(uint64_t length, uint32_t options, uint
 	msg.obj_id = out.obj_id;
 	msg.gpu_address = out.gpu_address;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
@@ -336,7 +337,7 @@ RgfxCreated RgfxSerializer::createBufferOverHostMemory(uint64_t length, uint32_t
 	msg.gpu_address = out.gpu_address;
 	msg.region_offset = region_offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_HOST_MEMORY, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -354,7 +355,7 @@ RgfxCreated RgfxSerializer::createBufferOverSurfacePages(uint64_t length, uint32
 	msg.block_offset = block_offset;
 	msg.block_size = block_size;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
@@ -378,30 +379,32 @@ RgfxCreated RgfxSerializer::createBufferManagedAtOffset(RgfxObjId heap, uint64_t
 	msg.heap_obj_id = heap;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted =
 	    m_control.tryPost(RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
 RgfxCreated RgfxSerializer::createManagedBuffer(RgfxObjId cpu_buffer, uint64_t length,
-                                                uint32_t options, uint64_t align)
+                                                uint32_t options, uint64_t align, uint64_t offset)
 {
 	RgfxCreated out = {};
-	// The GPU copy's address; no address left for it: no object, as for a buffer over host
-	// memory.
-	out.gpu_address = m_ids.allocAddress(length, align);
+	// The GPU copy's address, the pick holding the span from `offset` before it; no address left
+	// for it: no object, as for a buffer over host memory.
+	if (length > UINT64_MAX - offset)
+		return out;
+	out.gpu_address = m_ids.allocAddress(length + offset, align);
 	if (out.gpu_address == 0)
 		return out;
 	out.obj_id = m_ids.allocObjId();
 
 	RgfxManagedBufferCreate msg = {};
 	msg.obj_id = out.obj_id;
-	msg.gpu_address = out.gpu_address;
+	msg.gpu_address = out.gpu_address + offset;
 	msg.cpu_buffer_obj_id = cpu_buffer;
 	msg.length = length;
-	msg.options = options;
-	out.posted = m_control.tryPost(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
+	msg.options = RgfxHostResourceOptions(options);
+	out.posted = postUnwaited(RGFX_CMD_MANAGED_BUFFER_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -426,7 +429,7 @@ RgfxCreated RgfxSerializer::createBufferOverPages(uint64_t length, uint32_t opti
 	msg.block_size = block_size;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
+	msg.options = RgfxHostResourceOptions(options);
 	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_OVER_PAGES, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
@@ -444,9 +447,16 @@ RgfxCreated RgfxSerializer::createBufferAtOffset(RgfxObjId heap, uint64_t offset
 	msg.heap_obj_id = heap;
 	msg.offset = offset;
 	msg.length = length;
-	msg.options = options;
-	out.posted = m_control.tryPost(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
+	msg.options = RgfxHostResourceOptions(options);
+	out.posted = postUnwaited(RGFX_CMD_BUFFER_AT_OFFSET, &msg, sizeof(msg), &out.seqno);
 	return out;
+}
+
+bool RgfxSerializer::postUnwaited(uint32_t type, const void *message, uint32_t size,
+                                  uint64_t *out_seqno)
+{
+	return m_control.batches() ? m_control.postLater(type, message, size)
+	                           : m_control.tryPost(type, message, size, out_seqno);
 }
 
 void RgfxSerializer::releaseResourceId(uint64_t resource_id)
@@ -495,7 +505,7 @@ RgfxCreated RgfxSerializer::createTexture(const RgfxTextureDescriptor &desc, Rgf
 		msg.heap_obj_id = heap;
 		msg.heap_offset = heap_offset;
 	}
-	out.posted = m_control.tryPost(RGFX_CMD_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -506,7 +516,17 @@ bool RgfxSerializer::bufferDidModifyRange(RgfxObjId buffer, uint64_t location, u
 	msg.location = location;
 	msg.length = length;
 	uint64_t seqno = 0;
-	return m_control.tryPost(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
+	return postUnwaited(RGFX_CMD_BUFFER_DID_MODIFY_RANGE, &msg, sizeof(msg), &seqno);
+}
+
+bool RgfxSerializer::textureDidModifyData(RgfxObjId texture)
+{
+	if (!m_textureDidModifyData)
+		return false;
+	RgfxTextureDidModifyData msg = {};
+	msg.obj_id = texture;
+	uint64_t seqno = 0;
+	return m_control.tryPost(RGFX_CMD_TEXTURE_DID_MODIFY_DATA, &msg, sizeof(msg), &seqno);
 }
 
 RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &desc,
@@ -536,8 +556,7 @@ RgfxCreated RgfxSerializer::createManagedTexture(const RgfxTextureDescriptor &de
 	msg.block_height = block_height;
 	msg.flags = flags;
 	msg.desc = desc;
-	out.posted =
-	    m_control.tryPost(RGFX_CMD_MANAGED_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_MANAGED_TEXTURE_CREATE, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -614,7 +633,7 @@ RgfxCreated RgfxSerializer::createTextureView(const RgfxTextureView &view)
 	msg.header = {};
 	msg.obj_id = out.obj_id;
 	msg.resource_id = out.resource_id;
-	out.posted = m_control.tryPost(RGFX_CMD_TEXTURE_VIEW, &msg, sizeof(msg), &out.seqno);
+	out.posted = postUnwaited(RGFX_CMD_TEXTURE_VIEW, &msg, sizeof(msg), &out.seqno);
 	return out;
 }
 
@@ -652,26 +671,28 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	RgfxCreated out = {};
 	out.obj_id = m_ids.allocObjId();
 
-	RgfxSamplerCreate msg = {};
-	msg.obj_id = out.obj_id;
-	msg.min_filter = params.min_filter;
-	msg.mag_filter = params.mag_filter;
-	msg.mip_filter = params.mip_filter;
-	msg.s_address_mode = params.s_address_mode;
-	msg.t_address_mode = params.t_address_mode;
-	msg.r_address_mode = params.r_address_mode;
-	msg.border_color = params.border_color;
-	msg.compare_function = params.compare_function;
-	msg.max_anisotropy = params.max_anisotropy;
-	msg.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
-	msg.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
-	msg.flags = params.flags;
+	RgfxSamplerCreateWhole msg = {};
+	msg.create.obj_id = out.obj_id;
+	msg.create.min_filter = params.min_filter;
+	msg.create.mag_filter = params.mag_filter;
+	msg.create.mip_filter = params.mip_filter;
+	msg.create.s_address_mode = params.s_address_mode;
+	msg.create.t_address_mode = params.t_address_mode;
+	msg.create.r_address_mode = params.r_address_mode;
+	msg.create.border_color = params.border_color;
+	msg.create.compare_function = params.compare_function;
+	msg.create.max_anisotropy = params.max_anisotropy;
+	msg.create.lod_min_clamp_bits = floatBits(params.lod_min_clamp);
+	msg.create.lod_max_clamp_bits = floatBits(params.lod_max_clamp);
+	msg.create.flags = params.flags;
+	msg.ext.reduction_mode = params.reduction_mode;
+	msg.ext.lod_bias_bits = floatBits(params.lod_bias);
 	if (m_ask == nullptr) {
 		out.posted = m_control.tryPost(RGFX_CMD_SAMPLER_CREATE, &msg, sizeof(msg), &out.seqno);
 		return out;
 	}
-	msg.header.type = RGFX_CMD_SAMPLER_CREATE;
-	msg.header.size = sizeof(msg);
+	msg.create.header.type = RGFX_CMD_SAMPLER_CREATE;
+	msg.create.header.size = sizeof(msg);
 	RgfxSamplerState answer = {};
 	uint32_t length = 0;
 	out.posted = m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) &&
@@ -680,6 +701,111 @@ RgfxCreated RgfxSerializer::createSampler(const RgfxSamplerParams &params)
 	out.seqno = out.posted ? answer.header.seqno : 0;
 	out.resource_id = out.posted && answer.status == RGFX_STATUS_OK ? answer.gpu_resource_id : 0;
 	return out;
+}
+
+// One RATE_MAP_CREATE or RATE_MAP_RESET of `shape` under `obj_id` through `ask`: the head, the
+// layers' records, then their samples, each the bits of its float. Answers the RATE_MAP_STATE's
+// status, with the state in `*state`, or kRgfxNoAnswer (nothing posted where the message is past
+// `max_size`).
+static uint32_t askRateMap(RgfxSerializer::AskFn ask, void *askContext, uint32_t type,
+                           RgfxObjId obj_id, const RgfxRateMapShape &shape, uint32_t max_size,
+                           RgfxRateMapState *state)
+{
+	*state = {};
+	if (ask == nullptr)
+		return kRgfxNoAnswer;
+	const uint64_t layersOffset = sizeof(RgfxRateMapCreate);
+	uint64_t samplesOffset = layersOffset + shape.layers.size() * sizeof(RgfxRateMapLayer);
+	uint64_t total = samplesOffset;
+	for (const RgfxRateMapShape::Layer &layer : shape.layers)
+		total += layer.samples.size() * sizeof(uint32_t);
+	total = (total + 7) & ~uint64_t(7);
+	if (total > max_size)
+		return kRgfxNoAnswer;
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	RgfxRateMapCreate msg = {};
+	msg.header.type = type;
+	msg.header.size = static_cast<uint32_t>(total);
+	msg.obj_id = obj_id;
+	msg.screen_width = shape.screen_width;
+	msg.screen_height = shape.screen_height;
+	msg.screen_depth = shape.screen_depth;
+	msg.flags = shape.mutability_set ? RGFX_RATE_MAP_MUTABILITY_SET : 0;
+	msg.mutability = shape.mutability_set ? shape.mutability : 0;
+	msg.layer_count = static_cast<uint32_t>(shape.layers.size());
+	msg.layers_offset = static_cast<uint32_t>(layersOffset);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	for (size_t i = 0; i < shape.layers.size(); i++) {
+		const RgfxRateMapShape::Layer &layer = shape.layers[i];
+		RgfxRateMapLayer record = {};
+		record.horizontal_count = layer.horizontal_count;
+		record.vertical_count = layer.vertical_count;
+		record.samples_offset = static_cast<uint32_t>(samplesOffset);
+		std::memcpy(buf.data() + layersOffset + i * sizeof(record), &record, sizeof(record));
+		for (float sample : layer.samples) {
+			const uint32_t bits = floatBits(sample);
+			std::memcpy(buf.data() + samplesOffset, &bits, sizeof(bits));
+			samplesOffset += sizeof(bits);
+		}
+	}
+	RgfxRateMapState answer = {};
+	uint32_t length = 0;
+	if (!ask(askContext, buf.data(), static_cast<uint32_t>(total), &answer, sizeof(answer),
+	         &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_RATE_MAP_STATE)
+		return kRgfxNoAnswer;
+	*state = answer;
+	return answer.status;
+}
+
+RgfxCreated RgfxSerializer::createRateMap(const RgfxRateMapShape &shape, RgfxRateMapState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_rateMaps)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	out.status = askRateMap(m_ask, m_askContext, RGFX_CMD_RATE_MAP_CREATE, out.obj_id, shape,
+	                        m_control.dataSize() / 2, state);
+	out.posted = out.status != kRgfxNoAnswer;
+	out.seqno = out.posted ? state->header.seqno : 0;
+	return out;
+}
+
+uint32_t RgfxSerializer::resetRateMap(RgfxObjId map, const RgfxRateMapShape &shape,
+                                      RgfxRateMapState *state)
+{
+	*state = {};
+	if (!m_rateMaps)
+		return kRgfxNoAnswer;
+	return askRateMap(m_ask, m_askContext, RGFX_CMD_RATE_MAP_RESET, map, shape,
+	                  m_control.dataSize() / 2, state);
+}
+
+uint32_t RgfxSerializer::queryRateMap(RgfxObjId map, uint32_t query, uint64_t at,
+                                      RgfxObjId buffer, float x, float y, uint64_t values[3])
+{
+	values[0] = values[1] = values[2] = 0;
+	if (!m_rateMaps || m_ask == nullptr)
+		return kRgfxNoAnswer;
+	RgfxRateMapQuery msg = {};
+	msg.header.type = RGFX_CMD_RATE_MAP_QUERY;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = map;
+	msg.at = at;
+	msg.buffer_obj_id = buffer;
+	msg.query = query;
+	msg.x_bits = floatBits(x);
+	msg.y_bits = floatBits(y);
+	RgfxRateMapAnswer answer = {};
+	uint32_t length = 0;
+	if (!m_ask(m_askContext, &msg, sizeof(msg), &answer, sizeof(answer), &length) ||
+	    length < sizeof(answer) || answer.header.type != RGFX_EVT_RATE_MAP_ANSWER)
+		return kRgfxNoAnswer;
+	if (answer.status == RGFX_STATUS_OK)
+		std::memcpy(values, answer.values, sizeof(answer.values));
+	return answer.status;
 }
 
 RgfxCreated RgfxSerializer::createIcb(const RgfxIcbCreate &desc)
@@ -756,8 +882,10 @@ void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 	if (!m_control.tryPost(RGFX_CMD_ICB_WRITE, message.bytes.data(), size, nullptr)) {
 		// The kext refused it, or the ring had no room: the buffer's commands keep what they
 		// had, as a lost encode.
-		std::fprintf(stderr, "RGFX: ICB_WRITE of %u bytes into 0x%llx was not posted\n", size,
-		             static_cast<unsigned long long>(message.icb));
+		static char site;
+		if (rgfxLogFirst(&site))
+			std::fprintf(stderr, "RGFX: ICB_WRITE of %u bytes into 0x%llx was not posted\n",
+			             size, static_cast<unsigned long long>(message.icb));
 	}
 	if (flush != nullptr) {
 		flush->messages++;
@@ -769,24 +897,28 @@ void RgfxSerializer::postIcbMessage(IcbMessage &message, RgfxIcbFlush *flush)
 	}
 }
 
-void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxIcbFlush *flush)
+template <typename Run>
+void RgfxSerializer::postIcbSlots(uint32_t type, const std::vector<Run> &runs, RgfxIcbFlush *flush)
 {
 	const uint32_t cap = icbMessageCap();
-	const size_t most = (cap - sizeof(RgfxIcbSlots)) / sizeof(RgfxIcbSlotRun);
+	const size_t most = (cap - sizeof(RgfxIcbSlots)) / sizeof(Run);
 	std::vector<uint8_t> bytes;
 	for (size_t at = 0; at < runs.size(); at += most) {
 		const size_t n = std::min(most, runs.size() - at);
 		RgfxIcbSlots head = {};
 		head.obj_id = runs[at].icb_obj_id;
 		head.run_count = static_cast<uint32_t>(n);
-		const uint32_t size = static_cast<uint32_t>(sizeof(head) + n * sizeof(RgfxIcbSlotRun));
+		const uint32_t size = static_cast<uint32_t>(sizeof(head) + n * sizeof(Run));
 		bytes.resize(size);
 		std::memcpy(bytes.data(), &head, sizeof(head));
-		std::memcpy(bytes.data() + sizeof(head), &runs[at], n * sizeof(RgfxIcbSlotRun));
+		std::memcpy(bytes.data() + sizeof(head), &runs[at], n * sizeof(Run));
 		const auto start = std::chrono::steady_clock::now();
-		if (!m_control.tryPost(RGFX_CMD_ICB_SLOTS, bytes.data(), size, nullptr)) {
+		if (!m_control.tryPost(type, bytes.data(), size, nullptr)) {
 			// As a lost ICB_WRITE: the commands keep what they had.
-			std::fprintf(stderr, "RGFX: ICB_SLOTS of %zu runs was not posted\n", n);
+			static char site;
+			if (rgfxLogFirst(&site))
+				std::fprintf(stderr, "RGFX: %s of %zu runs was not posted\n",
+				             type == RGFX_CMD_ICB_SLOTS ? "ICB_SLOTS" : "ICB_SLOTS_IN_PAGES", n);
 		}
 		if (flush != nullptr) {
 			flush->messages++;
@@ -797,6 +929,14 @@ void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs, RgfxI
 			        .count());
 		}
 	}
+}
+
+void RgfxSerializer::postIcbSlots(const std::vector<RgfxIcbSlotRun> &runs,
+                                  const std::vector<RgfxIcbSlotPagesRun> &pagesRuns,
+                                  RgfxIcbFlush *flush)
+{
+	postIcbSlots(RGFX_CMD_ICB_SLOTS, runs, flush);
+	postIcbSlots(RGFX_CMD_ICB_SLOTS_IN_PAGES, pagesRuns, flush);
 }
 
 RgfxIcbFlush RgfxSerializer::flushIcbWrites()
@@ -810,12 +950,13 @@ RgfxIcbFlush RgfxSerializer::flushIcbWrites()
 	std::lock_guard<std::mutex> lock(m_icbLock);
 	if (!m_icbSlots.empty()) {
 		std::vector<RgfxIcbSlotRun> runs;
+		std::vector<RgfxIcbSlotPagesRun> pagesRuns;
 		for (RgfxIcbSlotTable *slots : m_icbSlots) {
 			slots->pending.store(false, std::memory_order_seq_cst);
-			slots->takeRuns(runs);
+			slots->takeRuns(runs, pagesRuns);
 		}
 		m_icbSlots.clear();
-		postIcbSlots(runs, &flush);
+		postIcbSlots(runs, pagesRuns, &flush);
 	}
 	for (IcbMessage &message : m_icbMessages)
 		postIcbMessage(message, &flush);
@@ -837,8 +978,9 @@ void RgfxSerializer::flushIcbSlots(RgfxIcbSlotTable *slots)
 {
 	std::lock_guard<std::mutex> lock(m_icbLock);
 	std::vector<RgfxIcbSlotRun> runs;
-	slots->takeRuns(runs);
-	postIcbSlots(runs, nullptr);
+	std::vector<RgfxIcbSlotPagesRun> pagesRuns;
+	slots->takeRuns(runs, pagesRuns);
+	postIcbSlots(runs, pagesRuns, nullptr);
 }
 
 void RgfxSerializer::forgetIcbSlots(RgfxIcbSlotTable *slots)
@@ -916,6 +1058,21 @@ RgfxCreated RgfxSerializer::createLibrary(const void *bytes, uint64_t byte_lengt
 	return out;
 }
 
+RgfxCreated RgfxSerializer::createDynamicLibrary(RgfxObjId library)
+{
+	RgfxCreated out = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_dynamicLibraries)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	RgfxDynamicLibraryCreate m = {};
+	m.obj_id = out.obj_id;
+	m.library_obj_id = library;
+	out.posted = m_control.tryPost(RGFX_CMD_DYNAMIC_LIBRARY_CREATE, &m, sizeof(m), &out.seqno,
+	                               &out.status);
+	return out;
+}
+
 RgfxCreated RgfxSerializer::lookupLibrary(const uint8_t *key, uint64_t slice_size)
 {
 	RgfxCreated out = {};
@@ -961,52 +1118,85 @@ namespace {
 /// one's name, constants, group name and specialized name, then their
 /// RgfxLinkedFunction records, whose offset it answers.
 template <typename Append>
+RgfxLinkedFunction linkedFunctionRecord(Append &append, const RgfxLinkedFunctionRef &r)
+{
+	RgfxLinkedFunction m = {};
+	m.library_obj_id = r.function.library;
+	const uint32_t len =
+	    r.function.entry_point ? static_cast<uint32_t>(std::strlen(r.function.entry_point)) : 0;
+	m.name_offset = append(r.function.entry_point, len);
+	m.name_len = len;
+	m.constants_offset =
+	    append(r.function.constants, r.function.constant_count * sizeof(RgfxFunctionConstant));
+	m.constant_count = r.function.constant_count;
+	m.list = r.list;
+	m.options = r.options;
+	if (r.list == RGFX_LINKED_GROUP && r.group != nullptr) {
+		const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
+		m.group_offset = append(r.group, glen);
+		m.group_len = glen;
+	}
+	if (r.specialized_name != nullptr) {
+		const uint32_t slen = static_cast<uint32_t>(std::strlen(r.specialized_name));
+		m.specialized_name_offset = append(r.specialized_name, slen);
+		m.specialized_name_len = slen;
+	}
+	return m;
+}
+
+template <typename Append>
 uint32_t appendLinkedFunctions(Append &append, const RgfxLinkedFunctionRef *refs, uint32_t count)
 {
 	std::vector<RgfxLinkedFunction> records(count);
-	for (uint32_t i = 0; i < count; i++) {
-		const RgfxLinkedFunctionRef &r = refs[i];
-		RgfxLinkedFunction &m = records[i];
-		m.library_obj_id = r.function.library;
-		const uint32_t len =
-		    r.function.entry_point ? static_cast<uint32_t>(std::strlen(r.function.entry_point)) : 0;
-		m.name_offset = append(r.function.entry_point, len);
-		m.name_len = len;
-		m.constants_offset =
-		    append(r.function.constants, r.function.constant_count * sizeof(RgfxFunctionConstant));
-		m.constant_count = r.function.constant_count;
-		m.list = r.list;
-		m.options = r.options;
-		if (r.list == RGFX_LINKED_GROUP && r.group != nullptr) {
-			const uint32_t glen = static_cast<uint32_t>(std::strlen(r.group));
-			m.group_offset = append(r.group, glen);
-			m.group_len = glen;
-		}
-		if (r.specialized_name != nullptr) {
-			const uint32_t slen = static_cast<uint32_t>(std::strlen(r.specialized_name));
-			m.specialized_name_offset = append(r.specialized_name, slen);
-			m.specialized_name_len = slen;
-		}
-	}
+	for (uint32_t i = 0; i < count; i++)
+		records[i] = linkedFunctionRecord(append, refs[i]);
 	return append(records.data(), count * sizeof(RgfxLinkedFunction));
 }
 
-// Posts the pipeline create of `type`, the `size` bytes at `message`, on `control` into `out`,
-// against `post`'s known pipelines where it has some and the route defers answers.
-void postPipeline(RgfxRingWriter &control, uint32_t type, const uint8_t *message, uint32_t size,
-                  RgfxCreated &out, RgfxPipelinePost *post)
+} // namespace
+
+void RgfxSerializer::setLibraryKey(RgfxObjId obj_id, const uint8_t *key)
 {
-	if (post != nullptr && post->known != nullptr && control.defers()) {
+	RgfxLibraryContentKey k;
+	std::memcpy(k.data(), key, k.size());
+	std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+	m_libraryKeys[obj_id] = k;
+}
+
+void RgfxSerializer::postPipeline(uint32_t type, const uint8_t *message, uint32_t size,
+                                  RgfxCreated &out, RgfxPipelinePost *post)
+{
+	if (post != nullptr && post->known != nullptr && m_control.defers()) {
 		post->key = RgfxKnownPipelines::keyOf(type, message, size);
 		post->keyed = true;
 		if (post->known->find(post->key, &post->reflection)) {
-			out.posted = control.tryPostKnown(type, message, size, &out.seqno, &post->deferred);
+			out.posted = m_control.tryPostKnown(type, message, size, &out.seqno, &post->deferred);
 			return;
 		}
 	}
-	out.posted = control.tryPost(type, message, size, &out.seqno);
+	// A create another process's equal create was answered for, where the kext keeps the answer:
+	// posted without waiting, and known to this process from then on.
+	RgfxPipelineKey shared;
+	if (post != nullptr && m_sharesPipelines && m_control.shares() &&
+	    rgfxSharedPipelineKey(
+	        type, message, size,
+	        [this](uint64_t id, RgfxLibraryContentKey *key) {
+		        std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+		        auto found = m_libraryKeys.find(id);
+		        if (found == m_libraryKeys.end())
+			        return false;
+		        *key = found->second;
+		        return true;
+	        },
+	        &shared)) {
+		out.posted = m_control.tryPostShared(type, message, size, shared, &out.seqno,
+		                                     &post->deferred, &post->reflection);
+		if (out.posted && post->deferred && post->keyed)
+			post->known->learn(post->key, post->reflection);
+		return;
+	}
+	out.posted = m_control.tryPost(type, message, size, &out.seqno);
 }
-} // namespace
 
 RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams &p,
                                                  RgfxPipelinePost *post)
@@ -1035,6 +1225,9 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	msg.obj_id = out.obj_id;
 	msg.vertex_library_obj_id = p.vertex.library;
 	msg.fragment_library_obj_id = p.fragment.library;
+	// The private state, where the create carries it, follows the head first of all.
+	if (p.private_state != nullptr)
+		(void)append(p.private_state, sizeof(*p.private_state));
 
 	uint32_t vlen = nameLen(p.vertex.entry_point);
 	msg.vertex_name_offset = append(p.vertex.entry_point, vlen);
@@ -1070,7 +1263,8 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 		msg.colors[i] = p.colors[i];
 	msg.depth_pixel_format = p.depth_pixel_format;
 	msg.stencil_pixel_format = p.stencil_pixel_format;
-	msg.flags = p.flags;
+	msg.flags = p.flags | (p.private_state != nullptr ? RGFX_RENDER_PIPELINE_PRIVATE_STATE : 0) |
+	            (m_sharesPipelines ? RGFX_RENDER_PIPELINE_ANSWER_KEY : 0);
 	msg.input_primitive_topology = p.input_primitive_topology;
 	msg.max_vertex_amplification_count = p.max_vertex_amplification_count;
 
@@ -1083,7 +1277,7 @@ RgfxCreated RgfxSerializer::createRenderPipeline(const RgfxRenderPipelineParams 
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_RENDER_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, post);
 	return out;
 }
@@ -1170,7 +1364,7 @@ RgfxCreated RgfxSerializer::createMeshRenderPipeline(const RgfxMeshRenderPipelin
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, nullptr);
 	return out;
 }
@@ -1203,7 +1397,7 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	msg.constants_offset =
 	    append(p.function.constants, p.function.constant_count * sizeof(RgfxFunctionConstant));
 	msg.constant_count = p.function.constant_count;
-	msg.flags = p.flags;
+	msg.flags = p.flags | (m_sharesPipelines ? RGFX_COMPUTE_PIPELINE_ANSWER_KEY : 0);
 	msg.max_total_threads_per_threadgroup = p.max_total_threads_per_threadgroup;
 	msg.max_call_stack_depth = p.max_call_stack_depth;
 	msg.stage_input_layouts_offset = append(
@@ -1216,6 +1410,22 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	msg.stage_input_index_buffer_index = p.stage_input_index_buffer_index;
 	msg.linked_offset = appendLinkedFunctions(append, p.linked, p.linked_count);
 	msg.linked_count = p.linked_count;
+	// The dynamic libraries end the message: their install names first, then, from a multiple of
+	// 8, the run of records the host reads from the message's end.
+	if (p.library_count > 0) {
+		std::vector<RgfxPipelineLibrary> records(p.library_count);
+		for (uint32_t i = 0; i < p.library_count; i++) {
+			records[i].obj_id = p.libraries[i].library;
+			if (const char *name = p.libraries[i].install_name) {
+				const uint32_t n = static_cast<uint32_t>(std::strlen(name));
+				records[i].name_offset = append(name, n);
+				records[i].name_len = n;
+			}
+		}
+		tail.resize(roundUp8(head + tail.size()) - head, 0);
+		append(records.data(), records.size() * sizeof(RgfxPipelineLibrary));
+		msg.library_count = p.library_count;
+	}
 
 	uint64_t total = roundUp8(head + tail.size());
 	if (total > m_control.dataSize() || total > UINT32_MAX) {
@@ -1226,9 +1436,113 @@ RgfxCreated RgfxSerializer::createComputePipeline(const RgfxComputePipelineParam
 	std::memcpy(buf.data(), &msg, sizeof(msg));
 	if (!tail.empty())
 		std::memcpy(buf.data() + head, tail.data(), tail.size());
-	postPipeline(m_control, RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
+	postPipeline(RGFX_CMD_COMPUTE_PIPELINE_CREATE, buf.data(),
 	             static_cast<uint32_t>(total), out, post);
 	return out;
+}
+
+// Asks `ask` the `size` bytes at `message`, a FUNCTION_HANDLE_CREATE or FUNCTION_TABLE_CREATE
+// whose header is stamped, into `out` and `*state`: the answer's status, or kRgfxNoAnswer.
+static void askFunctionPointer(RgfxSerializer::AskFn ask, void *askContext, const uint8_t *message,
+                               uint32_t size, RgfxCreated &out, RgfxFunctionPointerState *state)
+{
+	RgfxFunctionPointerState answer = {};
+	uint32_t length = 0;
+	out.posted = ask(askContext, message, size, &answer, sizeof(answer), &length) &&
+	             length >= sizeof(answer) &&
+	             answer.header.type == RGFX_EVT_FUNCTION_POINTER_STATE;
+	out.status = out.posted ? answer.status : kRgfxNoAnswer;
+	out.seqno = out.posted ? answer.header.seqno : 0;
+	if (out.posted) {
+		*state = answer;
+		out.resource_id = answer.status == RGFX_STATUS_OK ? answer.gpu_resource_id : 0;
+	}
+}
+
+RgfxCreated RgfxSerializer::createFunctionHandle(RgfxObjId pipeline,
+                                                 const RgfxLinkedFunctionRef &function,
+                                                 RgfxFunctionPointerState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_functionPointers || m_ask == nullptr)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	const uint32_t head = sizeof(RgfxFunctionHandleCreate);
+	std::vector<uint8_t> tail;
+	auto append = [&](const void *data, size_t n) -> uint32_t {
+		uint32_t off = static_cast<uint32_t>(head + tail.size());
+		if (n) {
+			const uint8_t *b = static_cast<const uint8_t *>(data);
+			tail.insert(tail.end(), b, b + n);
+		}
+		return off;
+	};
+	RgfxFunctionHandleCreate msg = {};
+	msg.obj_id = out.obj_id;
+	msg.pipeline_obj_id = pipeline;
+	msg.function = linkedFunctionRecord(append, function);
+	const uint64_t total = roundUp8(head + tail.size());
+	if (total > m_control.dataSize() / 2)
+		return out;
+	msg.header.type = RGFX_CMD_FUNCTION_HANDLE_CREATE;
+	msg.header.size = static_cast<uint32_t>(total);
+	std::vector<uint8_t> buf(static_cast<size_t>(total), 0);
+	std::memcpy(buf.data(), &msg, sizeof(msg));
+	if (!tail.empty())
+		std::memcpy(buf.data() + head, tail.data(), tail.size());
+	askFunctionPointer(m_ask, m_askContext, buf.data(), static_cast<uint32_t>(total), out, state);
+	return out;
+}
+
+RgfxCreated RgfxSerializer::createFunctionTable(RgfxObjId pipeline, uint64_t count,
+                                                RgfxFunctionPointerState *state)
+{
+	RgfxCreated out = {};
+	*state = {};
+	out.status = kRgfxNoAnswer;
+	if (!m_functionPointers || m_ask == nullptr)
+		return out;
+	out.obj_id = m_ids.allocObjId();
+	RgfxFunctionTableCreate msg = {};
+	msg.header.type = RGFX_CMD_FUNCTION_TABLE_CREATE;
+	msg.header.size = sizeof(msg);
+	msg.obj_id = out.obj_id;
+	msg.pipeline_obj_id = pipeline;
+	msg.function_count = count;
+	askFunctionPointer(m_ask, m_askContext, reinterpret_cast<const uint8_t *>(&msg), sizeof(msg),
+	                   out, state);
+	return out;
+}
+
+bool RgfxSerializer::setFunctionTable(RgfxObjId table, uint64_t first, const RgfxObjId *handles,
+                                      uint64_t count)
+{
+	if (!m_functionPointers)
+		return false;
+	const uint64_t head = sizeof(RgfxFunctionTableSet);
+	const uint64_t room = m_control.dataSize() / 2;
+	const uint64_t run = room > head ? (room - head) / sizeof(RgfxObjId) : 0;
+	if (run == 0)
+		return false;
+	uint64_t done = 0;
+	do {
+		const uint64_t n = std::min(count - done, run);
+		std::vector<uint8_t> buf(static_cast<size_t>(head + n * sizeof(RgfxObjId)), 0);
+		RgfxFunctionTableSet msg = {};
+		msg.obj_id = table;
+		msg.first = first + done;
+		msg.count = n;
+		std::memcpy(buf.data(), &msg, sizeof(msg));
+		if (n)
+			std::memcpy(buf.data() + head, handles + done, n * sizeof(RgfxObjId));
+		if (!m_control.tryPost(RGFX_CMD_FUNCTION_TABLE_SET, buf.data(),
+		                       static_cast<uint32_t>(buf.size()), nullptr))
+			return false;
+		done += n;
+	} while (done < count);
+	return true;
 }
 
 RgfxCreated RgfxSerializer::createEvent()
@@ -1296,11 +1610,51 @@ bool RgfxSerializer::postDestroy(RgfxObjId obj_id)
 	return m_control.tryPost(RGFX_CMD_OBJECT_DESTROY, &msg, sizeof(msg), nullptr);
 }
 
-bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
+bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after, bool atOnce)
 {
+	{
+		std::lock_guard<std::mutex> hold(m_libraryKeysLock);
+		m_libraryKeys.erase(obj_id);
+	}
 	// A waiting record may name the object (a pipeline or a buffer the app lets go after
 	// encoding it), so the records go first.
 	flushIcbWrites();
+	// Refused just now: it waits for the next destroy or commit.
+	auto noteRefused = [obj_id] {
+		static std::atomic<bool> logged{false};
+		if (!logged.exchange(true))
+			std::fprintf(stderr,
+			             "RGFX: the destroy of 0x%llx was not posted: it waits, and what the "
+			             "object lies over stays the host's, until a later destroy or commit posts "
+			             "it\n",
+			             static_cast<unsigned long long>(obj_id));
+	};
+	// Held to go with others, before anything the process posts after it: what it lay over goes
+	// back now, as anything that takes it again is posted after the destroy. Behind the destroys
+	// refused before, which go first; refused (they or the held before it were), it waits behind
+	// them.
+	if (m_control.batches()) {
+		bool posted = postWaitingDestroys();
+		if (posted) {
+			RgfxObjectDestroy msg = {};
+			msg.obj_id = obj_id;
+			const uint32_t type = RGFX_CMD_OBJECT_DESTROY;
+			posted = atOnce ? m_control.tryPost(type, &msg, sizeof(msg), nullptr)
+			                : m_control.postLater(type, &msg, sizeof(msg));
+		}
+		if (posted) {
+			if (after)
+				after();
+			return true;
+		}
+		{
+			std::lock_guard<std::mutex> lock(m_destroyLock);
+			m_destroys.push_back({obj_id, std::move(after)});
+			m_destroysWaiting.store(true, std::memory_order_release);
+		}
+		noteRefused();
+		return false;
+	}
 	// With none waiting, it goes at once; else behind those waiting, which go first.
 	const bool behind = m_destroysWaiting.load(std::memory_order_acquire);
 	if (!behind && postDestroy(obj_id)) {
@@ -1315,14 +1669,13 @@ bool RgfxSerializer::destroy(RgfxObjId obj_id, std::function<void()> after)
 	}
 	if (behind)
 		return postWaitingDestroys();
-	// Refused just now: it waits for the next destroy or commit.
-	static std::atomic<bool> logged{false};
-	if (!logged.exchange(true))
-		std::fprintf(stderr,
-		             "RGFX: the destroy of 0x%llx was not posted: it waits, and what the object "
-		             "lies over stays the host's, until a later destroy or commit posts it\n",
-		             static_cast<unsigned long long>(obj_id));
+	noteRefused();
 	return false;
+}
+
+bool RgfxSerializer::postHeldCreates()
+{
+	return m_control.flushLater() || !m_control.holdsBut(RGFX_CMD_OBJECT_DESTROY);
 }
 
 bool RgfxSerializer::postWaitingDestroys()

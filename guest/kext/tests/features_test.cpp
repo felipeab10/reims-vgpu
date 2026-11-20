@@ -15,6 +15,38 @@ static_assert(RGFX_REG_DEFERRED_BUDGET_LO == 0x030, "DEFERRED_BUDGET_LO");
 static_assert(RGFX_REG_DEFERRED_BUDGET_HI == 0x034, "DEFERRED_BUDGET_HI");
 static_assert(RGFX_SURFACE_PAGES_DEFERRED == (1u << 2), "SURFACE_PAGES_DEFERRED");
 static_assert(RGFX_SURFACE_PAGES_ATTACH == (1u << 3), "SURFACE_PAGES_ATTACH");
+static_assert(RGFX_SURFACE_PAGES_ASK_CACHE == (1u << 4), "SURFACE_PAGES_ASK_CACHE");
+static_assert(RGFX_FEATURE_SURFACE_CACHE_REFUSED == (1u << 29), "SURFACE_CACHE_REFUSED is bit 29");
+static_assert(RGFX_FEATURE_SURFACE_DEFERRED_ASK == (1u << 30), "SURFACE_DEFERRED_ASK is bit 30");
+static_assert(RGFX_FEATURE_SURFACE_DEFERRED_CARRY == (1ull << 32),
+              "SURFACE_DEFERRED_CARRY is bit 32");
+static_assert(RGFX_FEATURE_SCHEDULED_ASK == (1ull << 33), "SCHEDULED_ASK is bit 33");
+static_assert(RGFX_FEATURE_PAGES_16K == (1ull << 34), "PAGES_16K is bit 34");
+static_assert(RGFX_FEATURE_DISPLAY_SCALE == (1ull << 35), "DISPLAY_SCALE is bit 35");
+static_assert(RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA == (1ull << 36),
+              "TEXTURE_DID_MODIFY_DATA is bit 36");
+static_assert(RGFX_FEATURE_DISPLAY_POWER == (1ull << 37), "DISPLAY_POWER is bit 37");
+static_assert(RGFX_FEATURE_RATE_MAPS == (1ull << 38), "RATE_MAPS is bit 38");
+static_assert(RGFX_FEATURE_FUNCTION_POINTERS == (1ull << 39), "FUNCTION_POINTERS is bit 39");
+static_assert(RGFX_FEATURE_DYNAMIC_LIBRARIES == (1ull << 40), "DYNAMIC_LIBRARIES is bit 40");
+static_assert(RGFX_FEATURE_PIPELINE_KEYS == (1ull << 41), "PIPELINE_KEYS is bit 41");
+static_assert(RGFX_FEATURE_ICB_SLOTS_IN_PAGES == (1ull << 42), "ICB_SLOTS_IN_PAGES is bit 42");
+static_assert(RGFX_FEATURE_DOORBELL_ASKS == (1ull << 43), "DOORBELL_ASKS is bit 43");
+static_assert(RGFX_FEATURE_GUEST_TIMES == (1ull << 44), "GUEST_TIMES is bit 44");
+static_assert(RGFX_FEATURE_READ_ONLY_PAGES == (1ull << 45), "READ_ONLY_PAGES is bit 45");
+static_assert(RGFX_FEATURE_DOORBELL_PAGES == (1ull << 46), "DOORBELL_PAGES is bit 46");
+static_assert(RGFX_FEATURE_PIPELINE_ANSWERS == (1ull << 47), "PIPELINE_ANSWERS is bit 47");
+static_assert(RGFX_CMD_PIPELINE_ANSWERS == 0x2f9, "PIPELINE_ANSWERS");
+static_assert(sizeof(RgfxPipelineAnswersQuery) == 24, "PIPELINE_ANSWERS' query");
+static_assert(offsetof(RgfxPipelineAnswersQuery, first) == 16, "the query's first");
+static_assert(offsetof(RgfxPipelineAnswersQuery, most) == 20, "the query's most");
+static_assert(RGFX_DOORBELL_ASKS == 1, "an asking doorbell sets bit 0 of the ring's id");
+static_assert(sizeof(RgfxDisplayScale) == 8, "the display's scale record");
+static_assert(RGFX_STATUS_CACHE == 7, "STATUS_CACHE");
+static_assert(RGFX_SURFACE_PAGES_LAYOUT_OFFSET ==
+                  RGFX_SURFACE_PAGES_CACHE_OFFSET + sizeof(RgfxSurfacePagesCache),
+              "the layout follows the cache's part");
+static_assert(sizeof(RgfxSurfacePagesLayout) == 136, "SURFACE_PAGES' layout");
 static_assert(offsetof(RgfxRingHeader, producer_waiting) == 0x10, "producer_waiting");
 static_assert(offsetof(RgfxRingHeader, raise_all) == 0xc4, "raise_all");
 static_assert(RGFX_QUEUE_CREATE_FLAGS_OFFSET == sizeof(RgfxQueueCreate), "the tail's offset");
@@ -38,10 +70,19 @@ void check(bool ok, const char *what)
 	}
 }
 
+// PAGES_16K, which the arm64e kext carries (this test built with RGFX_GUEST_ARM64 set, as
+// features_arm64_test) and the x86-64 kext does not.
+constexpr uint64_t k16K = RGFX_FEATURE_PAGES_16K;
+constexpr uint64_t k16KCarried = RGFX_GUEST_ARM64 ? k16K : 0;
+// DISPLAY_POWER, which the x86-64 kext carries, its framebuffer telling the host when the
+// display's panel goes dark and lights, and the arm64e kext does not.
+constexpr uint64_t kDisplayPower = RGFX_FEATURE_DISPLAY_POWER;
+constexpr uint64_t kDisplayPowerCarried = RGFX_GUEST_ARM64 ? 0 : kDisplayPower;
 // Every bit the wire names from bit 3 that the kext does not carry out yet.
 constexpr uint64_t kNotCarried = RGFX_FEATURE_QUIET_SCHEDULED | RGFX_FEATURE_CONSUMED_DOORBELL |
                                  RGFX_FEATURE_QUEUE_BARRIER | RGFX_FEATURE_CB_PARTS |
-                                 RGFX_FEATURE_QUEUE_VECTORS;
+                                 RGFX_FEATURE_QUEUE_VECTORS | (k16K & ~k16KCarried) |
+                                 (kDisplayPower & ~kDisplayPowerCarried);
 // The ones it does: the bundle lays no-copy buffers over pages blocks the kext makes, orders its
 // command buffers over IOSurfaces and places its Managed buffers' CPU copies in its heaps, neither
 // of which needs anything of the kext, makes indirect command buffers, whose creates and writes,
@@ -69,9 +110,53 @@ constexpr uint64_t kSmallIds = RGFX_FEATURE_SMALL_ID_CHUNKS;
 constexpr uint64_t kColor = RGFX_FEATURE_DISPLAY_COLOR;
 constexpr uint64_t kMesh = RGFX_FEATURE_MESH_PIPELINES;
 constexpr uint64_t kShares = RGFX_FEATURE_SHARED_EVENT_NAMES;
+constexpr uint64_t kOpenCL = RGFX_FEATURE_OPENCL_MODE;
+constexpr uint64_t kPrivate = RGFX_FEATURE_PRIVATE_RENDER_STATE;
+// The kext asks a host whose GPU shares the CPU's memory whether a new cacheable block in place
+// needs a device cache, with the layout its bundle gives.
+constexpr uint64_t kCacheRefused = RGFX_FEATURE_SURFACE_CACHE_REFUSED;
+// And defers a fresh one there, asking with that layout.
+constexpr uint64_t kDeferredAsk = RGFX_FEATURE_SURFACE_DEFERRED_ASK;
+// And defers one fresh but for the resident pages its bundle lists, carrying them.
+constexpr uint64_t kDeferredCarry = RGFX_FEATURE_SURFACE_DEFERRED_CARRY;
+// Its bundle asks for a waited-for command buffer's scheduling.
+constexpr uint64_t kScheduledAsk = RGFX_FEATURE_SCHEDULED_ASK;
+// It gives the OS the display's density from its host screen's scale.
+constexpr uint64_t kDisplayScale = RGFX_FEATURE_DISPLAY_SCALE;
+// Its bundle tells the host a texture's didModifyData.
+constexpr uint64_t kDidModify = RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA;
+// Its bundle makes, resets and asks rasterization rate maps.
+constexpr uint64_t kRateMaps = RGFX_FEATURE_RATE_MAPS;
+// Its bundle makes a compute pipeline's function handles and visible function tables.
+constexpr uint64_t kFunctionPointers = RGFX_FEATURE_FUNCTION_POINTERS;
+// Its bundle makes dynamic libraries and names them in a compute pipeline's create.
+constexpr uint64_t kDynamicLibraries = RGFX_FEATURE_DYNAMIC_LIBRARIES;
+// Its bundle asks pipeline creates' answers with their keys, which the kext keeps for every process.
+constexpr uint64_t kPipelineKeys = RGFX_FEATURE_PIPELINE_KEYS;
+// Its bundle writes indirect command buffers' slots in chunked pages blocks of the kext's.
+constexpr uint64_t kSlotsInPages = RGFX_FEATURE_ICB_SLOTS_IN_PAGES;
+// Its bundle sets bit 0 of a doorbell's value where the buffer asks for its scheduling.
+constexpr uint64_t kDoorbellAsks = RGFX_FEATURE_DOORBELL_ASKS;
+// Its bundle stamps each command buffer with the guest's clock, and its framebuffer gives the host
+// the clocks' offset.
+constexpr uint64_t kGuestTimes = RGFX_FEATURE_GUEST_TIMES;
+// Its kext makes pages blocks of memory a process maps read-only, and its bundle lays its no-copy
+// buffers over read-only memory there.
+constexpr uint64_t kReadOnlyPages = RGFX_FEATURE_READ_ONLY_PAGES;
+// Its kext binds a doorbell page to each context and maps it into the process, where its bundle
+// rings its queues.
+constexpr uint64_t kDoorbellPages = RGFX_FEATURE_DOORBELL_PAGES;
+// Its framebuffer seeds the answers kept for every process with the device's of earlier runs.
+constexpr uint64_t kPipelineAnswers = RGFX_FEATURE_PIPELINE_ANSWERS;
 constexpr uint64_t kCarried = kPages | kOrder | kIcb | kUnshared | kManaged | kHeaps | kRoom |
                               kSlots | kCommits | kDeferred | kTime | kTextureSlabs |
-                              kBufferSlabs | kSmallIds | kColor | kMesh | kShares;
+                              kBufferSlabs | kSmallIds | kColor | kMesh | kShares | kOpenCL |
+                              kPrivate | kCacheRefused | kDeferredAsk | kDeferredCarry |
+                              kScheduledAsk | kDisplayScale | kDidModify | kRateMaps |
+                              kFunctionPointers | kDynamicLibraries | kPipelineKeys |
+                              kSlotsInPages | kDoorbellAsks | kGuestTimes | kReadOnlyPages |
+                              kDoorbellPages | kPipelineAnswers | kDisplayPowerCarried |
+                              k16KCarried;
 // Every bit the wire names from bit 3.
 constexpr uint64_t kNew = kNotCarried | kCarried;
 } // namespace
@@ -81,13 +166,21 @@ int main()
 	// Of the bits from 3 the kext carries out PAGES_BUFFERS, SURFACE_ORDER,
 	// INDIRECT_COMMAND_BUFFERS, UNSHARED_QUEUES, MANAGED_AT_OFFSET, HEAP_OVER_PAGES, SUBMIT_ROOM,
 	// ICB_SLOTS, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, MANAGED_TEXTURE_SLABS,
-	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES and
-	// SHARED_EVENT_NAMES, and writes each only where offered.
+	// MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, MESH_PIPELINES,
+	// SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, SURFACE_CACHE_REFUSED,
+	// SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, DISPLAY_SCALE,
+	// TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, PIPELINE_KEYS,
+	// ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, DOORBELL_PAGES,
+	// PIPELINE_ANSWERS and, the x86-64 kext, DISPLAY_POWER, and writes each only where offered.
 	check(kRgfxCarriedFeatures == kCarried,
 	      "the kext takes PAGES_BUFFERS, SURFACE_ORDER, ICBs, UNSHARED_QUEUES, MANAGED_AT_OFFSET, "
 	      "HEAP_OVER_PAGES, SUBMIT_ROOM, ICB slots, COMMIT_ORDER, SURFACE_DEFERRED, HOST_TIME, "
 	      "MANAGED_TEXTURE_SLABS, MANAGED_BUFFER_SLABS, SMALL_ID_CHUNKS, DISPLAY_COLOR, "
-	      "MESH_PIPELINES and SHARED_EVENT_NAMES from bit 3");
+	      "MESH_PIPELINES, SHARED_EVENT_NAMES, OPENCL_MODE, PRIVATE_RENDER_STATE, "
+	      "SURFACE_CACHE_REFUSED, SURFACE_DEFERRED_ASK, SURFACE_DEFERRED_CARRY, SCHEDULED_ASK, "
+	      "DISPLAY_SCALE, TEXTURE_DID_MODIFY_DATA, RATE_MAPS, FUNCTION_POINTERS, DYNAMIC_LIBRARIES, "
+	      "PIPELINE_KEYS, ICB_SLOTS_IN_PAGES, DOORBELL_ASKS, GUEST_TIMES, READ_ONLY_PAGES, "
+	      "DOORBELL_PAGES, PIPELINE_ANSWERS and, on x86-64, DISPLAY_POWER from bit 3");
 	check(RGFX_FEATURE_PAGES_BUFFERS == (1u << 7), "PAGES_BUFFERS is bit 7");
 	check(RGFX_FEATURE_SURFACE_ORDER == (1u << 11), "SURFACE_ORDER is bit 11");
 	check(RGFX_FEATURE_INDIRECT_COMMAND_BUFFERS == (1u << 12), "INDIRECT_COMMAND_BUFFERS is bit 12");
@@ -148,10 +241,149 @@ int main()
 	      "SHARED_EVENT_NAMES offered, written");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kShares, 0) == kRgfxOfferedFeatures,
 	      "SHARED_EVENT_NAMES offered but not taken is not in the word");
+	check(RGFX_FEATURE_OPENCL_MODE == (1u << 27), "OPENCL_MODE is bit 27");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kOpenCL) == kOpenCL,
+	      "OPENCL_MODE offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kOpenCL, 0) == kRgfxOfferedFeatures,
+	      "OPENCL_MODE offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kOpenCL, kOpenCL) == (kRgfxOfferedFeatures | kOpenCL),
+	      "OPENCL_MODE taken is in the word");
+	check(RGFX_FEATURE_PRIVATE_RENDER_STATE == (1u << 28), "PRIVATE_RENDER_STATE is bit 28");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPrivate) == kPrivate,
+	      "PRIVATE_RENDER_STATE offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kPrivate, 0) == kRgfxOfferedFeatures,
+	      "PRIVATE_RENDER_STATE offered but not taken is not in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCacheRefused) == kCacheRefused,
+	      "SURFACE_CACHE_REFUSED offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheRefused, 0) == kRgfxOfferedFeatures,
+	      "SURFACE_CACHE_REFUSED offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheRefused, kCacheRefused) ==
+	          (kRgfxOfferedFeatures | kCacheRefused),
+	      "SURFACE_CACHE_REFUSED taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kCacheRefused | kDeferredAsk) ==
+	          (kCacheRefused | kDeferredAsk),
+	      "SURFACE_DEFERRED_ASK offered beside SURFACE_CACHE_REFUSED, both written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kCacheRefused | kDeferredAsk, kCacheRefused) ==
+	          (kRgfxOfferedFeatures | kCacheRefused),
+	      "SURFACE_DEFERRED_ASK offered but not taken is not in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDeferred | kDeferredCarry) ==
+	          (kDeferred | kDeferredCarry),
+	      "SURFACE_DEFERRED_CARRY offered beside SURFACE_DEFERRED, both written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDeferred | kDeferredCarry, kDeferred) ==
+	          (kRgfxOfferedFeatures | kDeferred),
+	      "SURFACE_DEFERRED_CARRY offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDeferred | kDeferredCarry,
+	                      kDeferred | kDeferredCarry) ==
+	          (kRgfxOfferedFeatures | kDeferred | kDeferredCarry),
+	      "SURFACE_DEFERRED_CARRY taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kScheduledAsk) == kScheduledAsk,
+	      "SCHEDULED_ASK offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kScheduledAsk, 0) == kRgfxOfferedFeatures,
+	      "SCHEDULED_ASK offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kScheduledAsk, kScheduledAsk) ==
+	          (kRgfxOfferedFeatures | kScheduledAsk),
+	      "SCHEDULED_ASK taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayScale) == kDisplayScale,
+	      "DISPLAY_SCALE offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "DISPLAY_SCALE not offered, not written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDidModify) == kDidModify,
+	      "TEXTURE_DID_MODIFY_DATA offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDidModify, 0) == kRgfxOfferedFeatures,
+	      "TEXTURE_DID_MODIFY_DATA offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDidModify, kDidModify) ==
+	          (kRgfxOfferedFeatures | kDidModify),
+	      "TEXTURE_DID_MODIFY_DATA taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kRateMaps) == kRateMaps,
+	      "RATE_MAPS offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kRateMaps, 0) == kRgfxOfferedFeatures,
+	      "RATE_MAPS offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kRateMaps, kRateMaps) ==
+	          (kRgfxOfferedFeatures | kRateMaps),
+	      "RATE_MAPS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kFunctionPointers) ==
+	          kFunctionPointers,
+	      "FUNCTION_POINTERS offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kFunctionPointers, 0) == kRgfxOfferedFeatures,
+	      "FUNCTION_POINTERS offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kFunctionPointers, kFunctionPointers) ==
+	          (kRgfxOfferedFeatures | kFunctionPointers),
+	      "FUNCTION_POINTERS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDynamicLibraries) ==
+	          kDynamicLibraries,
+	      "DYNAMIC_LIBRARIES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDynamicLibraries, 0) == kRgfxOfferedFeatures,
+	      "DYNAMIC_LIBRARIES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDynamicLibraries, kDynamicLibraries) ==
+	          (kRgfxOfferedFeatures | kDynamicLibraries),
+	      "DYNAMIC_LIBRARIES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPipelineKeys) == kPipelineKeys,
+	      "PIPELINE_KEYS offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kPipelineKeys, 0) == kRgfxOfferedFeatures,
+	      "PIPELINE_KEYS offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kPipelineKeys, kPipelineKeys) ==
+	          (kRgfxOfferedFeatures | kPipelineKeys),
+	      "PIPELINE_KEYS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kSlotsInPages) == kSlotsInPages,
+	      "ICB_SLOTS_IN_PAGES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kSlotsInPages, 0) == kRgfxOfferedFeatures,
+	      "ICB_SLOTS_IN_PAGES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kSlotsInPages, kSlotsInPages) ==
+	          (kRgfxOfferedFeatures | kSlotsInPages),
+	      "ICB_SLOTS_IN_PAGES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDoorbellAsks) == kDoorbellAsks,
+	      "DOORBELL_ASKS offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDoorbellAsks, 0) == kRgfxOfferedFeatures,
+	      "DOORBELL_ASKS offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDoorbellAsks, kDoorbellAsks) ==
+	          (kRgfxOfferedFeatures | kDoorbellAsks),
+	      "DOORBELL_ASKS taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kGuestTimes) == kGuestTimes,
+	      "GUEST_TIMES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kGuestTimes, 0) == kRgfxOfferedFeatures,
+	      "GUEST_TIMES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kGuestTimes, kGuestTimes) ==
+	          (kRgfxOfferedFeatures | kGuestTimes),
+	      "GUEST_TIMES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kReadOnlyPages) == kReadOnlyPages,
+	      "READ_ONLY_PAGES offered, written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kReadOnlyPages, 0) == kRgfxOfferedFeatures,
+	      "READ_ONLY_PAGES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kReadOnlyPages, kReadOnlyPages) ==
+	          (kRgfxOfferedFeatures | kReadOnlyPages),
+	      "READ_ONLY_PAGES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDoorbellPages) == kDoorbellPages,
+	      "DOORBELL_PAGES offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "DOORBELL_PAGES not offered (a host that maps no BAR 4), not written");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDoorbellPages, 0) == kRgfxOfferedFeatures,
+	      "DOORBELL_PAGES offered but not taken is not in the word");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | kDoorbellPages, kDoorbellPages) ==
+	          (kRgfxOfferedFeatures | kDoorbellPages),
+	      "DOORBELL_PAGES taken is in the word");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPipelineAnswers) ==
+	          kPipelineAnswers,
+	      "PIPELINE_ANSWERS offered, written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kPipelineKeys) == kPipelineKeys,
+	      "PIPELINE_ANSWERS not offered, not written");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kDisplayPower) ==
+	          kDisplayPowerCarried,
+	      "DISPLAY_POWER offered, written by the x86-64 kext alone");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried) == 0,
+	      "DISPLAY_POWER not offered, not written");
+	// PAGES_16K: the arm64e kext writes it first where offered, and then with the rest; the
+	// x86-64 kext never writes it, and writes nothing first.
+	check(rgfxDriverFeaturesFirst(~0ull) == k16KCarried, "PAGES_16K first where carried");
+	check(rgfxDriverFeaturesFirst(~0ull & ~k16K) == 0, "nothing first where PAGES_16K is not offered");
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kScheduledAsk | k16K) ==
+	          (kScheduledAsk | k16KCarried),
+	      "PAGES_16K offered, written where carried");
+	check(rgfxFeatureWord(kRgfxOfferedFeatures | k16K, k16K) == (kRgfxOfferedFeatures | k16KCarried),
+	      "PAGES_16K taken is in the word where carried");
 	check(rgfxDriverFeatures(0) == 0, "nothing offered, nothing written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 40)) == 0,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | (1ull << 48)) == 0,
 	      "every other bit offered, none written");
-	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 40)) == kCarried,
+	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNew | (1ull << 48)) == kCarried,
 	      "every bit offered, the carried bits written");
 	check(rgfxDriverFeatures(kRgfxOfferedFeatures | kNotCarried | kPages) == kPages,
 	      "PAGES_BUFFERS offered, written");
@@ -192,7 +424,7 @@ int main()
 	      "SUBMIT_ROOM offered but not taken is not");
 	// A read-back of bits the kext never wrote, or of bits 0 to 2 the host does not offer, adds
 	// nothing.
-	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 40)) ==
+	check(rgfxFeatureWord(kRgfxOfferedFeatures, kNotCarried | (1ull << 48)) ==
 	          kRgfxOfferedFeatures,
 	      "taken bits the kext does not carry out are dropped");
 	check(rgfxFeatureWord(kRgfxOfferedFeatures | kNew, kNew) == (kRgfxOfferedFeatures | kCarried),

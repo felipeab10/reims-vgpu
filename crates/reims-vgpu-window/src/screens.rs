@@ -1,9 +1,9 @@
 //! The host's screens, which the OS's side lists (`native`): "screen i" is the i-th of them, the
 //! main one first, and the window of the display on port i opens on screen i
 //! ([`screen_for_port`]). On macOS they come from CoreGraphics, which answers on any thread; on
-//! Linux from SDL, on the library's UI thread, which takes a snapshot of them
-//! (`native/linux/ui.rs`). Where there are none (no window system to reach), a display matching
-//! its host screen offers its chosen mode, or `policy::UNMATCHED_MODE`, at 60 Hz (`policy`).
+//! Linux and Windows from SDL, on the library's UI thread, which takes a snapshot of them
+//! (`native/sdl_thread/ui.rs`). Where there are none (no window system to reach), there is no
+//! screen to open on ([`screen_for_port`]).
 //!
 //! A screen's refresh rate is the one it runs at ([`screen_refresh`]): its current mode's, so a
 //! screen the person set below its highest rate gives the guest the rate it was set to, as the
@@ -12,10 +12,13 @@
 use crate::env;
 use crate::native;
 
+/// The rate a screen runs at where the OS gives none, in Hz ([`screen_refresh`]).
+const DEFAULT_REFRESH_HZ: f64 = 60.0;
+
 /// A host screen.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct HostScreen {
-    /// Its display ID: CoreGraphics' on macOS, SDL's on Linux.
+    /// Its display ID: CoreGraphics' on macOS, SDL's on Linux and Windows.
     pub id: u32,
     /// Its current mode's size in pixels, width then height.
     pub pixels: (u32, u32),
@@ -49,8 +52,7 @@ pub fn pick_screen(port: u64, list: &[usize], count: usize) -> usize {
 /// the same pixels stands in, as the most a variable-rate screen runs at, the way ProMotion's
 /// current mode reports the top of its range. A mode of other pixels does not count, as the
 /// screen does not run its rate at its current size (a 4K screen listing 1920×1080 at 120 Hz runs
-/// 4K at 60). [`policy::DEFAULT_REFRESH_HZ`](crate::policy::DEFAULT_REFRESH_HZ) where every rate
-/// is unknown.
+/// 4K at 60). [`DEFAULT_REFRESH_HZ`] where every rate is unknown.
 pub(crate) fn screen_refresh(
     pixels: (u32, u32),
     current_hz: f64,
@@ -68,7 +70,7 @@ pub(crate) fn screen_refresh(
     if highest > 0.0 {
         highest
     } else {
-        crate::policy::DEFAULT_REFRESH_HZ
+        DEFAULT_REFRESH_HZ
     }
 }
 

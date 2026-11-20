@@ -3,7 +3,8 @@
 // kext does.
 //
 // The host stamps each VBLANK with the time of its refresh on its own monotonic clock, in
-// nanoseconds; the guest's mach_absolute_time counts nanoseconds too (x86-64). The two clocks
+// nanoseconds; the guest's clock is taken in nanoseconds too (an x86-64 guest's mach_absolute_time
+// counts them; the kext converts an arm64 guest's ticks to and from them). The two clocks
 // differ by an offset, and each refresh maps to its host time + that offset: a refresh's time is
 // when it happened, not when its interrupt was taken.
 //
@@ -24,9 +25,22 @@
 //
 // Either way no mapped time lies after its receipt, and a mapped time never goes back.
 //
+// Where the bundle stamps its command buffers with the guest's clock (GUEST_TIMES), the kext
+// hands the host the held reading's offset (offsetAt) in ring 0's header after each reading, its
+// bound widened by its age then, so the host maps those stamps to its own clock (design.md,
+// "Guest times").
+//
 // A display pipe transaction completes at the host's answer, which the host gives in the refresh
-// that showed its surface, right after that refresh's VBLANK: its time is that refresh's
-// (shownAt), where the answer comes within the refresh's period after the VBLANK's receipt.
+// that showed its surface, right after that refresh's VBLANK, or, a host with no window, as it
+// shows the surface: its time is the last refresh's at the answer's receipt (shownAt), the last
+// VBLANK's where the answer comes within a period of that VBLANK's receipt, else the refresh of
+// the VBLANK's grid a whole number of periods on (a VBLANK the ring had no room for, or one still
+// to come), up to kOffPeriods periods on; past that the VBLANKs are off, and the time is the
+// answer's own. The answers' times never go back, as the presents they complete are shown in
+// order: an answer that would map before the last one takes the last one's time. Mapped to its
+// own receipt instead, an answer a period after the last VBLANK's receipt came after the next
+// refresh's time, and the next answer, mapped to that refresh, went back (measured on a macOS
+// 14.6.1 arm64 guest with no host window: a frame info presentation time 6.3 ms back).
 //
 // Our own code.
 #ifndef RGFX_VBLANK_CLOCK_HPP_
@@ -48,6 +62,9 @@ public:
 	// tighter, and the offset follows the clocks' drift (measured on an x86-64 guest: 0.7 ppm
 	// between its clock and the host's raw monotonic one, which NTP does not slew).
 	static constexpr uint64_t kAgePpm = 50;
+	// How many periods past the last VBLANK's receipt an answer still maps to a refresh of its
+	// grid: VBLANKs that are on come a period apart.
+	static constexpr uint64_t kOffPeriods = 4;
 
 	// The host's clock from HOST_TIME's three reads, HI, LO and HI again: the second HI where LO
 	// is below 2^31 (where LO wrapped between the HI reads, it did so before LO was read), else
@@ -104,19 +121,46 @@ public:
 		return time;
 	}
 
+	// The held reading's offset (the guest's clock less the host's) and its bound at the guest's
+	// `now`, widened by kAgePpm of the reading's age: false, writing neither, before a reading
+	// was held.
+	bool offsetAt(uint64_t now, int64_t *offset, uint64_t *bound) const
+	{
+		if (!haveReading_)
+			return false;
+		*offset = readingOffset_;
+		*bound = readingBound_ + (now > readingAt_ ? (now - readingAt_) * kAgePpm / 1000000 : 0);
+		return true;
+	}
+
+	// A bound as ring 0's header holds it (RgfxRingHeader's guest_clock_bound_ns): at least 1 ns,
+	// as 0 there says no reading is held, and at most what 32 bits hold.
+	static uint32_t headerBound(uint64_t bound)
+	{
+		if (bound == 0)
+			return 1;
+		return bound > 0xffffffffull ? 0xffffffffu : static_cast<uint32_t>(bound);
+	}
+
 	// The last refresh's time (0 before any), and the next one's, a period after it.
 	uint64_t last() const { return have_ ? time_ : 0; }
 	uint64_t next() const { return have_ ? time_ + period_ : 0; }
 	uint64_t period() const { return period_; }
 
 	// The time of the refresh whose answer is taken at `now`: the last refresh's, where `now` is
-	// within its period after that refresh's VBLANK was taken; else `now` (no VBLANK came
-	// lately: the device's VBLANKs are off).
-	uint64_t shownAt(uint64_t now) const
+	// within its period after that refresh's VBLANK was taken; the refresh a whole number of
+	// periods after it, where `now` is that many periods after the receipt, up to kOffPeriods;
+	// else `now` (no VBLANK came lately: the device's VBLANKs are off). Never before the last
+	// answer's time: that, where it would be.
+	uint64_t shownAt(uint64_t now)
 	{
-		if (have_ && now >= receipt_ && now - receipt_ < period_)
-			return time_;
-		return now;
+		uint64_t time = now;
+		if (have_ && now >= receipt_ && now - receipt_ < kOffPeriods * period_)
+			time = time_ + (now - receipt_) / period_ * period_;
+		if (time < shown_)
+			time = shown_;
+		shown_ = time;
+		return time;
 	}
 
 private:
@@ -127,6 +171,8 @@ private:
 	uint64_t time_ = 0;
 	uint64_t receipt_ = 0;
 	uint64_t period_ = kDefaultPeriodNs;
+	// The last answer's time (shownAt).
+	uint64_t shown_ = 0;
 	// The held reading of the host's clock: its offset, its bound and when it was taken.
 	bool haveReading_ = false;
 	int64_t readingOffset_ = 0;

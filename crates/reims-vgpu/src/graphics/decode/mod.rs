@@ -1,14 +1,13 @@
 //! The stage-3 Metal-call decoder: it reads the guest bundle's serialised Metal
 //! calls off a command queue's ring and drives the library's `Platform`
 //! (docs/graphics-kext/design.md, "Stage 3 wire protocol"). It is generic over
-//! the platform, so it drives Metal on macOS and the Vulkan platform on Linux,
-//! the same trait the Apple lane's deserializer drives.
+//! the platform: the Vulkan platform in the library, the testkit's fake one in tests.
 //!
 //! The decoder keeps an `obj_id` → handle table: a create ([`GpuDevice`] and the
 //! resource creators) inserts the new handle, a destroy drops it (handles are
 //! refcounted, so the drop releases the object). Everything the decoder drives is
-//! the library's `Platform` directly — this lane keeps no resource manager of the
-//! Apple lane's; the handle table is the whole of an object's host lifetime.
+//! the library's `Platform` directly, with no resource manager between them: the
+//! handle table is the whole of an object's host lifetime.
 //!
 //! What this covers:
 //! - the descriptor-free **state objects** (events, fences, shared events,
@@ -23,12 +22,12 @@
 //! - the **object-resolution API** (the `require_*`/`get_*` methods below) the
 //!   encoder-op decoders call to turn a wire `obj_id` into a host handle.
 //!
-//! The decoder runs under a live raise handler, as the Apple lane's command
-//! processing does: a platform raise propagates out of [`GraphicsDecoder::decode`]
-//! for the caller to catch. An op-stream reference the host cannot honour faults
-//! the exec the same way ([`bad_reference`], [`op_fault`]), but for one of an object
-//! whose posted create the host refused, whose uses are dropped and whose command
-//! buffers go on ([`refused`]).
+//! The decoder runs under a live raise handler: a platform raise propagates out
+//! of [`GraphicsDecoder::decode`] for the caller to catch. An op-stream
+//! reference the host cannot honour faults the exec the same way
+//! ([`bad_reference`], [`op_fault`]), but for one of an object whose posted
+//! create the host refused, whose uses are dropped and whose command buffers go
+//! on ([`refused`]).
 //!
 //! [`super::GraphicsControl`] drives it from the device's threads: ring 0's messages on their
 //! context's lane (the presents on the presents' lane, a block's pages and downloads on the
@@ -83,69 +82,80 @@ use std::ptr::NonNull;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 
-use reims_graphics::region::Region;
-use reims_graphics::wire::{
+use reims_vgpu_graphics::region::Region;
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_BUFFER_AT_OFFSET, RGFX_CMD_BUFFER_CREATE, RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
     RGFX_CMD_BUFFER_MANAGED_AT_OFFSET, RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
     RGFX_CMD_BUFFER_OVER_PAGES, RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_COMMAND_BUFFER,
     RGFX_CMD_COMPUTE_PIPELINE_CREATE, RGFX_CMD_DEPTH_STENCIL_CREATE, RGFX_CMD_EVENT_CREATE,
-    RGFX_CMD_FENCE_CREATE, RGFX_CMD_HEAP_CREATE, RGFX_CMD_HEAP_OVER_HOST_MEMORY,
-    RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE, RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_WRITE,
-    RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_FENCE_CREATE, RGFX_CMD_FUNCTION_TABLE_SET, RGFX_CMD_HEAP_CREATE,
+    RGFX_CMD_HEAP_OVER_HOST_MEMORY, RGFX_CMD_HEAP_OVER_PAGES, RGFX_CMD_ICB_CREATE,
+    RGFX_CMD_ICB_SLOTS, RGFX_CMD_ICB_SLOTS_IN_PAGES, RGFX_CMD_ICB_WRITE, RGFX_CMD_LIBRARY_CREATE,
+    RGFX_CMD_LIBRARY_FROM_REGION, RGFX_CMD_LINEAR_TEXTURE_FROM_BUFFER,
     RGFX_CMD_MANAGED_BUFFER_CREATE, RGFX_CMD_MANAGED_TEXTURE_CREATE,
     RGFX_CMD_MESH_RENDER_PIPELINE_CREATE, RGFX_CMD_OBJECT_DESTROY, RGFX_CMD_QUEUE_CREATE,
     RGFX_CMD_RENDER_PIPELINE_CREATE, RGFX_CMD_RESOURCE_ID_CHUNK, RGFX_CMD_RESOURCE_ID_SMALL_CHUNK,
     RGFX_CMD_SAMPLER_CREATE, RGFX_CMD_SHARED_EVENT_CREATE, RGFX_CMD_SHARED_EVENT_SET_VALUE,
-    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_FROM_BUFFER, RGFX_CMD_TEXTURE_FROM_IOSURFACE,
-    RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW, RGFX_CMD_VIDEO_SESSION_CREATE,
+    RGFX_CMD_TEXTURE_CREATE, RGFX_CMD_TEXTURE_DID_MODIFY_DATA, RGFX_CMD_TEXTURE_FROM_BUFFER,
+    RGFX_CMD_TEXTURE_FROM_IOSURFACE, RGFX_CMD_TEXTURE_REPLACE_REGION, RGFX_CMD_TEXTURE_VIEW,
+    RGFX_CMD_VIDEO_SESSION_CREATE, RGFX_COMPUTE_PIPELINE_OPENCL_MODE,
     RGFX_COMPUTE_PIPELINE_SUPPORT_ICB, RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH,
     RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CONTEXT_OBJ_ID_SHIFT, RGFX_CURSOR_SPAN,
     RGFX_EVT_PIPELINE_REFLECTION, RGFX_EVT_SAMPLER_STATE, RGFX_EVT_SIZE_AND_ALIGN,
     RGFX_LINKED_BINARY_FUNCTIONS, RGFX_LINKED_FUNCTIONS, RGFX_LINKED_GROUP,
     RGFX_LINKED_PRIVATE_FUNCTIONS, RGFX_MESH_PIPELINE_MESH_TG_MULTIPLE_OF_EXEC_WIDTH,
-    RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PIPELINE_KIND_COMPUTE,
-    RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER, RGFX_PIPELINE_OK,
-    RGFX_PIPELINE_REFLECT_SUPPORT_ICB, RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE,
-    RGFX_PIPELINE_REFUSED, RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE,
-    RGFX_RENDER_PIPELINE_ALPHA_TO_ONE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
+    RGFX_MESH_PIPELINE_OBJECT_TG_MULTIPLE_OF_EXEC_WIDTH, RGFX_PAGE_RUN_ZEROS,
+    RGFX_PIPELINE_KIND_COMPUTE, RGFX_PIPELINE_KIND_MESH, RGFX_PIPELINE_KIND_RENDER,
+    RGFX_PIPELINE_OK, RGFX_PIPELINE_REFLECT_KEYED, RGFX_PIPELINE_REFLECT_SUPPORT_ICB,
+    RGFX_PIPELINE_REFLECT_THREADGROUP_MATCHES_TILE, RGFX_PIPELINE_REFUSED,
+    RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED, RGFX_PRIVATE_RENDER_LOGIC_OPERATION,
+    RGFX_PRIVATE_RENDER_OPENGL_MODE, RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT,
+    RGFX_RENDER_PIPELINE_ALPHA_TO_COVERAGE, RGFX_RENDER_PIPELINE_ALPHA_TO_ONE,
+    RGFX_RENDER_PIPELINE_PRIVATE_STATE, RGFX_RENDER_PIPELINE_RASTERIZATION_ENABLED,
     RGFX_RENDER_PIPELINE_SUPPORT_ICB, RGFX_RESOURCE_ID_CHUNK, RGFX_RESOURCE_ID_LIMIT,
-    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_STATUS_INVALID_ARGUMENT,
-    RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS,
+    RGFX_RESOURCE_ID_SMALL_CHUNK, RGFX_RESOURCE_ID_SMALL_CHUNKS, RGFX_SAMPLER_CREATE_EXT_OFFSET,
+    RGFX_STATUS_CACHE, RGFX_STATUS_INVALID_ARGUMENT, RGFX_STATUS_OK, RGFX_STATUS_REFUSED,
+    RGFX_SURFACE_FACTS_OFFSET, RGFX_SURFACE_NO_WRITERS, RGFX_SURFACE_PAGES_ASK_CACHE,
     RGFX_SURFACE_PAGES_ATTACH, RGFX_SURFACE_PAGES_CACHED, RGFX_SURFACE_PAGES_DEFERRED,
-    RGFX_SURFACE_PAGES_PRIVATE, RGFX_YCBCR_MATRIX_DCI_P3, RGFX_YCBCR_MATRIX_ITU_R_601_4,
-    RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020, RGFX_YCBCR_MATRIX_NONE,
-    RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65, RGFX_YCBCR_MATRIX_SMPTE_240M_1995,
-    RgfxBufferAtOffset, RgfxBufferCreate, RgfxBufferOverHostMemory, RgfxBufferOverPages,
-    RgfxCbComplete, RgfxCbScheduled, RgfxCbSubmitted, RgfxColorAttachmentDesc,
-    RgfxComputePipelineCreate, RgfxDepthStencilCreate, RgfxEventSignalled, RgfxFunctionConstant,
-    RgfxHeapCreate, RgfxHeapOverHostMemory, RgfxHeapTextureSizeAndAlign,
-    RgfxLinearTextureFromBuffer, RgfxLinkedFunction, RgfxMeshPipelineReflection,
-    RgfxMeshRenderPipelineCreate, RgfxMsgHeader, RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun,
-    RgfxPipelineReflection, RgfxQueueCreate, RgfxRenderPipelineCreate, RgfxResourceIdChunk,
-    RgfxSamplerCreate, RgfxSamplerState, RgfxSharedEventCreate, RgfxSharedEventSetValue,
-    RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts, RgfxSurfacePages, RgfxSurfaceWriter,
-    RgfxSurfaceWriters, RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureFromBuffer,
+    RGFX_SURFACE_PAGES_PRIVATE, RGFX_SURFACE_PAGES_READ_ONLY, RGFX_YCBCR_MATRIX_DCI_P3,
+    RGFX_YCBCR_MATRIX_ITU_R_601_4, RGFX_YCBCR_MATRIX_ITU_R_709_2, RGFX_YCBCR_MATRIX_ITU_R_2020,
+    RGFX_YCBCR_MATRIX_NONE, RGFX_YCBCR_MATRIX_OTHER, RGFX_YCBCR_MATRIX_P3_D65,
+    RGFX_YCBCR_MATRIX_SMPTE_240M_1995, RgfxBufferAtOffset, RgfxBufferCreate,
+    RgfxBufferOverHostMemory, RgfxBufferOverPages, RgfxCbComplete, RgfxCbScheduled,
+    RgfxCbSubmitted, RgfxColorAttachmentDesc, RgfxComputePipelineCreate, RgfxDepthStencilCreate,
+    RgfxEventSignalled, RgfxFunctionConstant, RgfxHeapCreate, RgfxHeapOverHostMemory,
+    RgfxHeapOverPages, RgfxHeapTextureSizeAndAlign, RgfxLinearTextureFromBuffer,
+    RgfxLinkedFunction, RgfxMeshPipelineReflection, RgfxMeshRenderPipelineCreate, RgfxMsgHeader,
+    RgfxObjectCreate, RgfxObjectDestroy, RgfxPageRun, RgfxPipelineReflection, RgfxQueueCreate,
+    RgfxRenderPipelineCreate, RgfxRenderPipelinePrivateState, RgfxResourceIdChunk,
+    RgfxSamplerCreate, RgfxSamplerCreateExt, RgfxSamplerState, RgfxSharedEventCreate,
+    RgfxSharedEventSetValue, RgfxSizeAndAlign, RgfxStencilDescriptor, RgfxSurfaceFacts,
+    RgfxSurfacePages, RgfxSurfacePagesLayout, RgfxSurfaceWriter, RgfxSurfaceWriters,
+    RgfxTextureCreate, RgfxTextureDescriptor, RgfxTextureDidModifyData, RgfxTextureFromBuffer,
     RgfxTextureFromIOSurface, RgfxVertexAttribute, RgfxVertexBufferLayout, RgfxVideoSessionCreate,
 };
-use reims_vgpu_core::host::HostPtr;
-use reims_vgpu_core::memory::map::MemoryMap;
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::event::{EventRef, SharedEvent};
-use reims_vgpu_core::platform::os::clock::{Clock as _, MonoTime};
-use reims_vgpu_core::platform::resource::{
-    Buffer, ComputePipeline, FunctionConstant, Heap, Library, RenderPipeline, SamplerState,
+use reims_vgpu_video::core::device_memory::MemoryLife;
+use reims_vgpu_vulkan::core::host::HostPtr;
+use reims_vgpu_vulkan::core::memory::map::MemoryMap;
+use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::event::{EventRef, SharedEvent};
+use reims_vgpu_vulkan::core::platform::os::clock::{Clock as _, MonoTime};
+use reims_vgpu_vulkan::core::platform::resource::{
+    Buffer, ComputePipeline, ConstantLane, FunctionConstant, Heap, Library, RenderPipeline,
+    SamplerState, Texture as _,
 };
-use reims_vgpu_core::platform::types::{MtlSize, Swizzle};
-use reims_vgpu_core::platform::values::{
+use reims_vgpu_vulkan::core::platform::types::{MtlSize, Swizzle};
+use reims_vgpu_vulkan::core::platform::values::{
     AttributeDesc, BufferDesc, BufferLayoutDesc, ColorAttachmentDesc, DepthStencilDesc,
-    FullComputePipelineDesc, FullMeshRenderPipelineDesc, FullRenderPipelineDesc, HeapDesc,
-    LinkedFunctionsDesc, OptionSet, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts,
-    SurfaceMatrix, SurfacePlane, TextureDesc, VertexDesc,
+    DynamicLibrariesDesc, FullComputePipelineDesc, FullMeshRenderPipelineDesc,
+    FullRenderPipelineDesc, HeapDesc, LinkedFunctionsDesc, OptionSet, PagesInPlace, PagesPlane,
+    PrivateRenderDesc, SamplerDesc, StageInputDesc, StencilDesc, SurfaceFacts, SurfaceMatrix,
+    SurfacePlane, TextureDesc, VertexDesc,
 };
-use reims_vgpu_core::platform::{Handle, HostRange, Platform};
-use reims_vgpu_core::raise::{OnFault, Raise, RaiseResult, refusals};
-use reims_vgpu_core::sync::Mutex;
+use reims_vgpu_vulkan::core::platform::{Handle, HostRange, Platform};
+use reims_vgpu_vulkan::core::raise::{OnFault, Raise, RaiseResult, refusals};
+use reims_vgpu_vulkan::core::sync::Mutex;
 use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 /// Metal's page on Apple silicon, to which a Shared heap's memory is rounded up: the guest's
@@ -165,17 +175,24 @@ mod commit_order;
 mod composite_cost;
 mod compute;
 #[cfg(test)]
+mod dispatch_cost;
+#[cfg(test)]
 pub(super) mod draw_cost;
+mod dynamic_library;
+mod function_table;
 #[cfg(test)]
 mod fuzz;
 #[cfg(test)]
 mod handler_cost;
+mod helpers;
 mod icb;
 #[cfg(test)]
 mod icb_slots_cost;
 mod lane;
 mod library;
 mod managed;
+mod pipeline_key;
+mod rate_map;
 mod refused;
 mod render;
 mod sequencer;
@@ -191,34 +208,50 @@ mod waits;
 mod work;
 pub(crate) mod worker;
 
-pub use video::{GraphicsVideo, GraphicsVideoSession, VideoDecode, VideoPlane};
+pub use video::{
+    Decoded, GraphicsVideo, GraphicsVideoSession, Landed, PlanePages, VideoDecode, VideoEncode,
+    VideoPlane,
+};
 
 pub(crate) use cmdbuf::Begun;
+pub(crate) use function_table::named_pipeline as function_table_pipeline;
+#[cfg(test)]
+pub(crate) use lane::{LANE_MOST, LANE_THREADS};
 use lane::{Lane, Turn};
 #[cfg(test)]
 pub(crate) use library::tests::{metallib as test_metallib, sha as test_sha};
 #[cfg(test)]
 pub(crate) use library::verified_key as test_key;
+#[cfg(test)]
+pub(crate) use library::whole_key as test_whole_key;
 use library::{Libraries, LibraryRef};
 pub(crate) use library::{LibraryJob, LibraryStart, MadeLibrary, complete, make_library};
 use managed::{STORAGE_MODE_MANAGED, storage_mode};
+use pipeline_key::PipelineKey;
 use sequencer::Sequencer;
 pub(crate) use sequencer::Ticket;
 use surface_cache::Caches;
 pub(crate) use surface_cache::{FillHook, FillWait};
-use tables::{Context, Entry, GuestBytes, QueueCounts, View};
+pub(crate) use surface_pages::Joined;
+use tables::{Context, Entry, GuestBytes, LaidUse, QueueCounts, View};
+
+/// What follows a record handed to a [`CompletionSink`] or a [`SignalSink`], which the sink runs
+/// once the record is on the ring, or dropped, on the thread that posted it.
+pub(crate) type Then = reims_vgpu_graphics::Then;
 
 /// A sink the decoder calls with each command buffer's completion record once its
-/// work finishes (the handler the stream's close registers). The ring loop sets
-/// one that writes the record to the queue's completion ring; until it is set, a
+/// work finishes (the handler the stream's close registers), and what follows it ([`Then`]). The
+/// ring loop sets one that writes the record to the queue's completion ring, waiting for nothing
+/// (`reims_vgpu_graphics::CompletionPoster::post_unwaiting`); until it is set, a
 /// completion is built and dropped.
-pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete) + Send + Sync>;
+pub(crate) type CompletionSink = Arc<dyn Fn(RgfxCbComplete, Then) + Send + Sync>;
 
 /// A sink the decoder calls with each shared event a command buffer signalled
 /// (`encodeSignalEvent:value:`), once the buffer's work finishes and before its completion record
-/// goes to the [`CompletionSink`]. The ring loop sets one that writes it to the queue's completion
-/// ring; until it is set, it is built and dropped.
-pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>;
+/// goes to the [`CompletionSink`], and what follows it ([`Then`]). The ring loop sets one that
+/// writes it to the queue's completion ring, waiting for nothing; until it is set, it is built and
+/// dropped.
+pub(crate) type SignalSink = Arc<dyn Fn(RgfxEventSignalled, Then) + Send + Sync>;
 
 /// A sink the decoder calls with each command buffer's `CB_SCHEDULED` record once the buffer is
 /// scheduled (its platform command buffer's scheduled handler), ahead of its completion record.
@@ -240,15 +273,20 @@ pub(crate) type ReflectionSink = Arc<dyn Fn(PipelineReply) + Send + Sync>;
 
 /// A `PIPELINE_REFLECTION` reply: its record, and, after it, a made mesh render pipeline's
 /// limits ([`RgfxMeshPipelineReflection`], at [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]), which
-/// no other reply carries.
+/// no other reply carries, or a keyed create's pipeline key (at
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]).
 ///
-/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
+/// [`RGFX_PIPELINE_REFLECTION_MESH_OFFSET`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET
+/// [`RGFX_PIPELINE_REFLECTION_KEY_OFFSET`]: reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_KEY_OFFSET
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct PipelineReply {
     /// The record.
     pub(crate) reflection: RgfxPipelineReflection,
     /// A made mesh render pipeline's limits.
     pub(crate) mesh: Option<RgfxMeshPipelineReflection>,
+    /// A made pipeline's key, where its create asked for one and could be keyed
+    /// ([`RGFX_PIPELINE_REFLECT_KEYED`] is then set in the record's flags).
+    pub(crate) key: Option<PipelineKey>,
 }
 
 impl PipelineReply {
@@ -257,22 +295,26 @@ impl PipelineReply {
         PipelineReply {
             reflection,
             mesh: None,
+            key: None,
         }
     }
 
-    /// The reply's bytes: the record, its header's size counting the mesh limits after it where
-    /// it carries them.
+    /// The reply's bytes: the record, its header's size counting the mesh limits or the key
+    /// after it where it carries them.
     pub(crate) fn bytes(&self) -> Vec<u8> {
         let mut reflection = self.reflection;
-        let mut out = Vec::with_capacity(
-            size_of::<RgfxPipelineReflection>() + size_of::<RgfxMeshPipelineReflection>(),
-        );
+        let mut out = Vec::with_capacity(size_of::<RgfxPipelineReflection>() + 32);
         if let Some(mesh) = &self.mesh {
             reflection.header.size = (size_of::<RgfxPipelineReflection>()
                 + size_of::<RgfxMeshPipelineReflection>())
                 as u32;
             out.extend_from_slice(reflection.as_bytes());
             out.extend_from_slice(mesh.as_bytes());
+        } else if let Some(key) = &self.key {
+            reflection.header.size = (size_of::<RgfxPipelineReflection>() + key.len()) as u32;
+            reflection.flags |= RGFX_PIPELINE_REFLECT_KEYED;
+            out.extend_from_slice(reflection.as_bytes());
+            out.extend_from_slice(key);
         } else {
             out.extend_from_slice(reflection.as_bytes());
         }
@@ -338,11 +380,11 @@ impl Drop for Drain {
 /// from 1.
 ///
 /// No context is failed for a failure of its work: a command buffer whose completion the
-/// platform refused on its own thread ([`CompletedInfo::refused`]), where the paravirt device ends
-/// the process, fails alone, as a buffer Metal could not run does, and its process's later work
+/// platform refused on its own thread ([`CompletedInfo::refused`]), which outside a refusal scope
+/// ends the process, fails alone, as a buffer Metal could not run does, and its process's later work
 /// is carried out (docs/graphics-kext/design.md, "Guest input the host refuses").
 ///
-/// [`CompletedInfo::refused`]: reims_vgpu_core::platform::command::CompletedInfo::refused
+/// [`CompletedInfo::refused`]: reims_vgpu_vulkan::core::platform::command::CompletedInfo::refused
 #[derive(Default)]
 pub(crate) struct ClosedContexts {
     /// The contexts closed since the device's reset.
@@ -471,10 +513,13 @@ fn new_sampler<P: Platform>(
     let Some(m) = read::<RgfxSamplerCreate>(message) else {
         return Ok(Err(DecodeError::Malformed));
     };
-    // Our wire sends the whole descriptor, so every field is set;
-    // the LOD clamps travel as `f32` bits, and `flags` packs the
-    // booleans. `reduction_mode` is not on the wire yet (the Metal
-    // default stands).
+    // Our wire sends the whole descriptor, so every field is set; the LOD clamps and bias travel
+    // as `f32` bits, and `flags` packs the booleans. The reduction mode and the bias are the
+    // create's extension ([`RGFX_SAMPLER_CREATE_EXT_OFFSET`]); a create without one leaves both
+    // unset, Metal's defaults.
+    let ext = message
+        .get(RGFX_SAMPLER_CREATE_EXT_OFFSET as usize..)
+        .and_then(read::<RgfxSamplerCreateExt>);
     let desc = SamplerDesc {
         min_filter: Some(m.min_filter.into()),
         mag_filter: Some(m.mag_filter.into()),
@@ -490,7 +535,8 @@ fn new_sampler<P: Platform>(
         normalized_coordinates: Some((m.flags & 1) != 0),
         lod_average: Some((m.flags & 2) != 0),
         support_argument_buffers: Some((m.flags & 4) != 0),
-        reduction_mode: None,
+        reduction_mode: ext.map(|e| e.reduction_mode.into()),
+        lod_bias: ext.map(|e| f32::from_bits(e.lod_bias_bits)),
         resource_index: None,
     };
     Ok(match device.new_sampler_state(&desc)? {
@@ -521,6 +567,22 @@ enum ObjHandle<P: Platform> {
     /// A video session ([`RGFX_CMD_VIDEO_SESSION_CREATE`]), which its command buffers' video
     /// encoders name, let go of on the video worker ([`video::SessionHold`]).
     VideoSession(video::SessionHold<P>),
+    /// A rasterization rate map
+    /// ([`RGFX_CMD_RATE_MAP_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_RATE_MAP_CREATE)), which
+    /// render passes name ([`rate_map`]).
+    RateMap(P::RateMap),
+    /// A compute pipeline state's handle of a function it links
+    /// ([`RGFX_CMD_FUNCTION_HANDLE_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_FUNCTION_HANDLE_CREATE)),
+    /// which its tables' entries name ([`function_table`]).
+    FunctionHandle(P::FunctionHandle),
+    /// A visible function table
+    /// ([`RGFX_CMD_FUNCTION_TABLE_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_FUNCTION_TABLE_CREATE)),
+    /// which compute encoders bind ([`function_table`]).
+    FunctionTable(P::VisibleFunctionTable),
+    /// A dynamic library
+    /// ([`RGFX_CMD_DYNAMIC_LIBRARY_CREATE`](reims_vgpu_graphics::wire::RGFX_CMD_DYNAMIC_LIBRARY_CREATE)),
+    /// which compute pipeline creates name ([`dynamic_library`]).
+    DynamicLibrary(P::DynamicLibrary),
     /// What an id stands for whose posted create the host refused ([`refused`]): what names it
     /// is dropped, not the command buffer that names it.
     Refused(refused::Refused),
@@ -548,15 +610,12 @@ pub enum DecodeError {
     ContextClosed,
 }
 
-/// How many `SURFACE_PAGES` pass between the logs of what the surface views did, at most
-/// ([`views_log_due`]).
-const VIEWS_LOGGED_EVERY: u64 = 256;
-/// The longest the logs of what the surface views did wait for [`VIEWS_LOGGED_EVERY`]
-/// `SURFACE_PAGES`: the first after it logs them too. Where dormant blocks keep most device
-/// caches, a desktop makes a few new ones a second, and 256 `SURFACE_PAGES` took minutes, so the
-/// lines bounded the caches' rates and never gave them. The kext logs its dormant blocks on the
+/// How long the logs of what the surface views did wait after the last: the first
+/// `SURFACE_PAGES` after it logs them ([`views_log_due`]). A summary at info comes at most once a
+/// minute, however many `SURFACE_PAGES` a desktop's churn sends (docs/conventions.md); a run
+/// that reads the counts reads lines up to a minute old. The kext logs its dormant blocks on the
 /// same interval.
-const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(10);
+const VIEWS_LOGGED_AFTER: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// How long a `SURFACE_PAGES` waits for a copy of a device cache into its pages still in flight
 /// ([`GraphicsDecoder::wait_copies_into`]): as long as the kext's new block over a surface's
@@ -568,12 +627,73 @@ const PAGES_COPY_WAIT: std::time::Duration = std::time::Duration::from_secs(10);
 /// lock of the surface in the guest waits for it.
 const SLOW_ANSWER: std::time::Duration = std::time::Duration::from_millis(500);
 
-/// Whether a `SURFACE_PAGES`, the `counted`th the views' counts hold, logs what the surface
-/// views did at `now`, the last log having been at `last`: every [`VIEWS_LOGGED_EVERY`]th, and
-/// the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
-fn views_log_due(counted: u64, now: MonoTime, last: MonoTime) -> bool {
-    counted.is_multiple_of(VIEWS_LOGGED_EVERY)
-        || now.saturating_duration_since(last) >= VIEWS_LOGGED_AFTER
+/// What a slow answer's line says of its block's device cache ([`GraphicsDecoder::timed`]): its
+/// planes, where its surface's layout named them, and its bytes.
+fn slow_cache(split: &surface_cache::CopySplit) -> String {
+    match split.cache {
+        Some((0, bytes)) => format!(" (a device cache of {bytes} bytes)"),
+        Some((planes, bytes)) => format!(" (a device cache of {planes} planes, {bytes} bytes)"),
+        None => " (no device cache)".to_owned(),
+    }
+}
+
+/// What a slow answer's line says of its copy phase ([`surface_cache::CopySplit`]): the copy it
+/// came with, its own or one in flight, how it reaches the pages, and the phase split into the
+/// time before the GPU had run it, the GPU's run of it, and a staging buffer's copy after it.
+fn slow_copy(split: &surface_cache::CopySplit) -> String {
+    let ms = |d: std::time::Duration| d.as_secs_f64() * 1e3;
+    let which = match (split.copies, split.users) {
+        (0, _) => return String::new(),
+        (_, Some(users)) => format!(
+            "its own copy, by {}, after the command buffers of {users} queues that used the cache",
+            split.into
+        ),
+        (copies, None) => format!("{copies} copies already in flight, by {}", split.into),
+    };
+    let times = match (split.wait, split.transfer) {
+        (Some(wait), Some(transfer)) => format!(
+            "{:.1} ms before the GPU had run it (the GPU's wait for those command buffers, and the \
+             transfer queue's work before it), {:.1} ms on the GPU",
+            ms(wait),
+            ms(transfer)
+        ),
+        _ => "the platform gave no GPU times".to_owned(),
+    };
+    format!(
+        " ({which}: {times}, {:.1} ms copying a staging buffer into the pages)",
+        ms(split.staged)
+    )
+}
+
+/// What `layout`, the layout a cached or deferred block's `SURFACE_PAGES` carries, gives the
+/// block's device cache ([`surface_cache::CacheLayout::Carried`]): its surface's planes, which
+/// place the cache and cut its copies into the pages to the surface's texels. A layout that does
+/// not lie in the surface's `length` bytes ([`surface_pages::layout_planes`]) gives nothing
+/// ([`surface_cache::CacheLayout::Unknown`]), which is logged and changes nothing else: the
+/// message is answered as with no layout, the layout only making the cache.
+fn carried_layout(
+    block: u64,
+    layout: &RgfxSurfacePagesLayout,
+    length: u64,
+) -> surface_cache::CacheLayout {
+    match surface_pages::layout_planes(layout, length) {
+        Some(planes) => surface_cache::CacheLayout::Carried(planes),
+        None => {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {block:#x}: named cached with a layout of {} planes that \
+                 does not lie in its {length:#x} bytes: its device cache is made as with none",
+                layout.plane_count
+            );
+            surface_cache::CacheLayout::Unknown
+        }
+    }
+}
+
+/// Whether a `SURFACE_PAGES` logs what the surface views did at `now`, the last log having been
+/// at `last`: the first [`VIEWS_LOGGED_AFTER`] or more after the last log.
+fn views_log_due(now: MonoTime, last: MonoTime) -> bool {
+    now.saturating_duration_since(last) >= VIEWS_LOGGED_AFTER
 }
 
 /// What a present of an IOSurface shows ([`GraphicsDecoder::surface_present`]).
@@ -584,15 +704,17 @@ pub(crate) struct SurfacePresent<P: Platform> {
     /// The region block it lies in (its buffer's): its offset and size.
     pub(crate) span: Option<(u64, u64)>,
     /// The command buffers committed that write the texture's copy, which the present waits for:
-    /// the slots of its [`RgfxSurfaceWriters`] that name a queue the decoder holds (a slot naming
-    /// another, or none, has nothing to wait for).
+    /// the slots of its [`RgfxSurfaceWriters`] that name a buffer (a seqno not 0). Which of them
+    /// name a queue the host holds the present queue decides (`present::PresentQueue::present`):
+    /// it knows a queue from its create's answer, the decoder only once the queue's service
+    /// thread has had it make the queue's handle.
     pub(crate) writers: Vec<RgfxSurfaceWriter>,
     /// The context that made the texture.
     pub(crate) owner: u32,
 }
 
 /// The context an object id lies in.
-fn context_of(obj_id: u64) -> u32 {
+pub(crate) fn context_of(obj_id: u64) -> u32 {
     (obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32
 }
 
@@ -629,17 +751,23 @@ pub(crate) struct Shared<P: Platform> {
     waits: waits::WaitWatch<P>,
     /// The contexts closed since the device's reset, and the resets ([`ClosedContexts`]).
     closed: ClosedContexts,
-    /// Whether a `Managed` resource is one copy, over its block
-    /// ([`GraphicsDecoder::set_unified_memory`]).
+    /// Whether the device's GPU shares the CPU's memory, where a `Managed` texture is one copy
+    /// over its CPU copy ([`GraphicsDecoder::set_unified_memory`]).
     unified_memory: AtomicBool,
     /// The views of the IOSurfaces whose blocks name their own guest pages ([`surface_pages`]).
     surface_views: Mutex<surface_pages::SurfaceViews<P>>,
+    /// The life of each block of the region a video decode's output lay in, by its offset, as the
+    /// host's video devices take its memory: made at the first such decode and ended at the
+    /// block's `BLOCK_RELEASE` ([`video`]).
+    block_lives: Mutex<HashMap<u64, MemoryLife>>,
     /// When what the surface views did was last logged, or the decoder made, in the platform
     /// clock's nanoseconds ([`views_log_due`]).
     views_logged_at: AtomicU64,
     /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
     /// were asked ([`GraphicsDecoder::timed`]; diagnostics only).
     slow_answers: Arc<AtomicU64>,
+    /// The copy phase of the last of them, as its line split it ([`surface_cache::CopySplit`]).
+    last_slow_copy: Arc<Mutex<Option<surface_cache::CopySplit>>>,
     /// The blocks whose `SURFACE_PAGES` is not yet carried out ([`worker::Unsettled`]).
     unsettled: Arc<worker::Unsettled>,
     /// The threads the views are made and let go of on, a block's jobs in their order
@@ -674,6 +802,9 @@ pub(crate) struct Shared<P: Platform> {
     shares: Arc<shares::Shares<P>>,
     /// The budget of the queues' lanes' extra threads ([`lane`]).
     lanes: Arc<lane::Budget>,
+    /// The threads that walk chunks of a command buffer beside the rest of its walk
+    /// ([`helpers`], [`split`]'s "Two threads at once").
+    helpers: Arc<helpers::Helpers>,
     /// The listener the command buffers' notifications of the values they signal run on, made at
     /// the first ([`Shared::listener`]).
     listener: OnceLock<P::SharedEventListener>,
@@ -683,6 +814,28 @@ pub(crate) struct Shared<P: Platform> {
     /// The tests' own [`split::SPLIT_AFTER`], where one is set ([`GraphicsDecoder::split_after`]).
     #[cfg(test)]
     split_after: Mutex<Option<std::time::Duration>>,
+    /// The parts the walks committed before their buffers' last (for the benches).
+    #[cfg(test)]
+    parts_cut: std::sync::atomic::AtomicU64,
+    /// The tests' own least op bytes of a command buffer dealt to two threads at once, where one
+    /// is set ([`GraphicsDecoder::deal_min_bytes`]).
+    #[cfg(test)]
+    deal_min_bytes: Mutex<Option<usize>>,
+    /// The tests' own least op bytes of a chunk dealt to a thread, where one is set
+    /// ([`GraphicsDecoder::deal_chunk_bytes`]).
+    #[cfg(test)]
+    deal_chunk_bytes: Mutex<Option<usize>>,
+    /// A walk dealt to two threads waits for a helper to start its chunks before it walks its
+    /// own (for the tests: [`GraphicsDecoder::set_helper_first`]).
+    #[cfg(test)]
+    helper_first: AtomicBool,
+    /// The command buffers' walks begun, each once a buffer, however many threads walk it (for
+    /// the tests).
+    #[cfg(test)]
+    walks_begun: std::sync::atomic::AtomicU64,
+    /// The helpers' chunks a dealt walk waited for at their commit (for the tests).
+    #[cfg(test)]
+    deal_waits: std::sync::atomic::AtomicU64,
     /// The device's BAR 2 region: the host memory the over-host-memory buffers
     /// and heaps are placed over. Held so it stays mapped while the decoder's
     /// objects live; declared last so the contexts drop before it (a buffer
@@ -770,6 +923,9 @@ pub struct GraphicsDecoder<P: Platform> {
     /// The command buffer's ticket in the commit order, where it was answered at its take; given
     /// back with the handle, after its commit or its stand-in's.
     ticket: RefCell<Option<Ticket>>,
+    /// The command buffer, where a thread that waits for it to be scheduled may ask for its
+    /// `CB_SCHEDULED` ([`cmdbuf::Askable`]), from its begin to its commit, or the handle's end.
+    asked: RefCell<Option<Arc<cmdbuf::Askable>>>,
     /// The command buffer's turn in its queue's lane ([`lane`]), from its begin; it passes with
     /// the handle, once the buffer's commit, stand-in or failure is done.
     turn: RefCell<Option<Turn>>,
@@ -793,13 +949,23 @@ pub struct GraphicsDecoder<P: Platform> {
     committed: RefCell<Option<(Arc<surface_order::Marks>, u64)>>,
     /// The entries the message found last ([`Recent`]).
     recent: Recent<P>,
+    /// The uses of textures over laid-out device caches or their wide homes by the encoder its
+    /// command buffer's walk is in ([`Self::note_laid`]), and the blocks the walk saw written so
+    /// far ([`Self::reconcile_laid`]).
+    laid_uses: RefCell<Vec<LaidUse>>,
+    laid_written: RefCell<Vec<u64>>,
+    /// The encoder being walked is a blit encoder, which writes only the destinations its ops
+    /// name ([`Self::texture_written`]), whatever its textures' usage.
+    laid_blit: Cell<bool>,
 }
 
 impl<P: Platform> Drop for GraphicsDecoder<P> {
-    /// As [`GraphicsDecoder::end_message`] does: its command buffer's queue's commit mark rises
+    /// As [`GraphicsDecoder::end_message`] does: a ticket an ask of its command buffer's
+    /// `CB_SCHEDULED` took is given back ([`cmdbuf::Askable`]), and its queue's commit mark rises
     /// before its turn passes, which a lane's job takes out of the handle first and lets go of
     /// after ([`commit_order`]).
     fn drop(&mut self) {
+        self.end_ask(false);
         self.note_committed();
     }
 }
@@ -856,7 +1022,7 @@ impl<P: Platform> Recent<P> {
 
 /// What the tests call after each op of a command buffer's walk, with its index, but for the
 /// render ops, which run inside their encoder's runs
-/// ([`reims_vgpu_core::platform::render::RenderEncoder::encoding`]) and are not counted.
+/// ([`reims_vgpu_vulkan::core::platform::render::RenderEncoder::encoding`]) and are not counted.
 #[cfg(test)]
 pub(crate) type WalkHook = Arc<dyn Fn(usize) + Send + Sync>;
 
@@ -867,6 +1033,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         work::start(&platform);
         let made_at = platform.clock().now_mono();
         let lanes = lane::Budget::of_host(platform.threads().handle());
+        let helpers = helpers::Helpers::new(Some(platform.threads().handle()));
         let shared = Arc::new(Shared {
             waits: waits::WaitWatch::new(Arc::clone(&platform)),
             platform,
@@ -883,13 +1050,15 @@ impl<P: Platform> GraphicsDecoder<P> {
             closed: ClosedContexts::default(),
             unified_memory: AtomicBool::new(false),
             surface_views: Mutex::new(surface_pages::SurfaceViews::new(None, None)),
+            block_lives: Mutex::new(HashMap::new()),
             views_logged_at: AtomicU64::new(made_at.as_nanos()),
             slow_answers: Arc::default(),
+            last_slow_copy: Arc::default(),
             unsettled: Arc::default(),
             surface_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-surfaces")),
             close_worker: worker::Worker::new("reims-vgpu.graphics-closes"),
             video_worker: Arc::new(worker::Worker::new("reims-vgpu.graphics-video")),
-            surface_caches: Arc::new(Caches::new(true)),
+            surface_caches: Arc::new(Caches::new()),
             sequencer: Arc::default(),
             split_gate: Arc::default(),
             surface_order: Mutex::new(surface_order::SurfaceOrder::new()),
@@ -897,10 +1066,23 @@ impl<P: Platform> GraphicsDecoder<P> {
             release_queue: OnceLock::new(),
             shares: Arc::default(),
             lanes,
+            helpers,
             #[cfg(test)]
             walk_hook: Mutex::new(None),
             #[cfg(test)]
             split_after: Mutex::new(None),
+            #[cfg(test)]
+            parts_cut: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            deal_min_bytes: Mutex::new(None),
+            #[cfg(test)]
+            deal_chunk_bytes: Mutex::new(None),
+            #[cfg(test)]
+            helper_first: AtomicBool::new(false),
+            #[cfg(test)]
+            walks_begun: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(test)]
+            deal_waits: std::sync::atomic::AtomicU64::new(0),
             region,
         });
         GraphicsDecoder::on(shared, None, Sinks::default())
@@ -919,6 +1101,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             mark: Cell::new(None),
             ranges: Cell::new(None),
             ticket: RefCell::new(None),
+            asked: RefCell::new(None),
             turn: RefCell::new(None),
             posted_at_doorbell: Cell::new(false),
             scheduled_at_doorbell: Cell::new(false),
@@ -927,7 +1110,21 @@ impl<P: Platform> GraphicsDecoder<P> {
             commit_after: RefCell::new(Vec::new()),
             committed: RefCell::new(None),
             recent: Recent::new(),
+            laid_uses: RefCell::new(Vec::new()),
+            laid_written: RefCell::new(Vec::new()),
+            laid_blit: Cell::new(false),
         }
+    }
+
+    /// A handle on this decoder's state for chunks of its message's command buffer walked on
+    /// another thread beside the rest ([`split`], "Two threads at once"): of the message's context,
+    /// its records going to the message's sinks, and its views twins of the message's
+    /// ([`View::twin`]), so it names what the message names; with nothing else of the message's
+    /// (no turn, ticket or mark: it commits nothing).
+    pub(crate) fn twin(&self) -> Self {
+        let twin = GraphicsDecoder::on(Arc::clone(&self.shared), self.context, self.sinks.clone());
+        *twin.views.borrow_mut() = self.views.borrow().iter().map(View::twin).collect();
+        twin
     }
 
     /// A handle on this decoder's state for a message from `context`, its records going to
@@ -950,6 +1147,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.mark.set(None);
         self.ranges.set(None);
         self.ticket.get_mut().take();
+        self.end_ask(false);
         // Its queue's commit mark rises before its turn passes, so a queue's buffers raise it in
         // its ring's order ([`commit_order`]).
         self.note_committed();
@@ -998,17 +1196,40 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.surface_caches.set_deferred_budget(budget);
     }
 
+    /// Has a deferred block ask with its surface's layout from now on, as the device offers
+    /// `SURFACE_DEFERRED_ASK` ([`Self::deferred_surface_pages`]): set once, at the device's make.
+    pub(crate) fn set_deferred_asks(&self) {
+        self.surface_caches.set_deferred_asks();
+    }
+
+    /// Has a deferral carry its surface's resident pages where it has some from now on, as the
+    /// device offers `SURFACE_DEFERRED_CARRY` ([`Self::deferred_surface_pages`]): set once, at
+    /// the device's make.
+    pub(crate) fn set_deferred_carries(&self) {
+        self.surface_caches.set_deferred_carries();
+    }
+
     /// Whether a cached block on `device` is named by its runs, with no view: the device copies
-    /// the guest's RAM by them and keeps caches (`surface_pages`, "By runs").
+    /// the guest's RAM by them (`surface_pages`, "By runs").
     fn copies_by_runs(&self, device: &P::Device) -> bool {
-        device.copies_guest_ram() && self.surface_caches.lock().on()
+        device.copies_guest_ram()
     }
 
     /// Whether `SURFACE_PAGES` makes views ([`RGFX_FEATURE_SURFACE_PAGES`]).
     ///
-    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
+    /// [`RGFX_FEATURE_SURFACE_PAGES`]: reims_vgpu_graphics::wire::RGFX_FEATURE_SURFACE_PAGES
     pub(crate) fn surface_pages_available(&self) -> bool {
         self.shared.surface_views.lock().available(&self.platform)
+    }
+
+    /// Whether the guest's runs must be whole 16 KiB pages for `SURFACE_PAGES`
+    /// ([`surface_pages::SurfaceViews::needs_16k_pages`]): the in-place features go only to a
+    /// guest that takes `PAGES_16K`.
+    pub(crate) fn surface_pages_need_16k(&self) -> bool {
+        self.shared
+            .surface_views
+            .lock()
+            .needs_16k_pages(&self.platform)
     }
 
     /// `SURFACE_PAGES` carried out here, at once ([`Self::begin_surface_pages`],
@@ -1021,10 +1242,25 @@ impl<P: Platform> GraphicsDecoder<P> {
         runs: &[RgfxPageRun],
         flags: u32,
     ) -> u32 {
+        self.surface_pages_laid_out(device, pages, runs, flags, None)
+    }
+
+    /// [`Self::surface_pages`] of a message that carries its surface's `layout` (an ask whether
+    /// its block needs a device cache, [`RGFX_SURFACE_PAGES_ASK_CACHE`]).
+    #[cfg(test)]
+    pub(crate) fn surface_pages_laid_out(
+        &self,
+        device: &P::Device,
+        pages: &RgfxSurfacePages,
+        runs: &[RgfxPageRun],
+        flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
+    ) -> u32 {
         self.wait_copies_into(pages.block_offset, runs);
         let settle = self.begin_surface_pages(pages.block_offset);
-        self.carry_out_surface_pages(device, pages, runs, flags, &settle)
-            .unwrap_or(RGFX_STATUS_REFUSED)
+        let status = self.carry_out_surface_pages(device, pages, runs, flags, layout, &settle);
+        drop(settle);
+        status.unwrap_or(RGFX_STATUS_REFUSED)
     }
 
     /// Waits, before the `SURFACE_PAGES` of the block at `block` over `runs` is begun, for every
@@ -1089,18 +1325,23 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// none, logged as a guest error; `None`, with nothing made, where the device was reset since
     /// its begin. `flags` are the message's `RGFX_SURFACE_PAGES_*`: a block marked
     /// [`RGFX_SURFACE_PAGES_PRIVATE`] is a pages block, its view made at its first
-    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]); else
+    /// `BUFFER_OVER_PAGES` and its buffers' alone, with no device cache ([`surface_pages`]), and
+    /// one marked [`RGFX_SURFACE_PAGES_READ_ONLY`] too a block of pages its process maps read-only,
+    /// which nothing over it writes (one so marked that is no pages block is
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`]); else
     /// one marked [`RGFX_SURFACE_PAGES_CACHED`] may be given a device cache, and with it one
     /// marked [`RGFX_SURFACE_PAGES_DEFERRED`] or [`RGFX_SURFACE_PAGES_ATTACH`] is a deferred
-    /// block or its pages ([`Self::deferred_surface_pages`]). A summary of what the views did is
-    /// logged every [`VIEWS_LOGGED_EVERY`], and at the first [`VIEWS_LOGGED_AFTER`] after the
-    /// last ([`views_log_due`]).
+    /// block or its pages ([`Self::deferred_surface_pages`]); and one marked
+    /// [`RGFX_SURFACE_PAGES_ASK_CACHE`], with its surface's `layout`, asks whether it needs one
+    /// ([`Self::asks_cache`]). A summary of what the views did is logged at the first
+    /// [`VIEWS_LOGGED_AFTER`] after the last ([`views_log_due`]).
     pub(crate) fn carry_out_surface_pages(
         &self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let clock = self.platform.clock();
@@ -1108,9 +1349,9 @@ impl<P: Platform> GraphicsDecoder<P> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let views = &self.shared.surface_views;
         let status = if flags & (RGFX_SURFACE_PAGES_DEFERRED | RGFX_SURFACE_PAGES_ATTACH) != 0 {
-            self.deferred_surface_pages(device, pages, runs, flags, settle)?
+            self.deferred_surface_pages(device, pages, runs, flags, layout.as_ref(), settle)?
         } else {
-            self.view_surface_pages(device, pages, runs, flags, settle)?
+            self.view_surface_pages(device, pages, runs, flags, layout.as_ref(), settle)?
         };
         log::debug!(
             target: "reims_vgpu::graphics::surface_pages",
@@ -1127,59 +1368,72 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ", a deferred block's pages"
             } else if flags & RGFX_SURFACE_PAGES_CACHED != 0 {
                 ", cached"
+            } else if flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0 {
+                ", asking whether it needs a device cache"
             } else {
                 ""
             },
             clock.now_mono().saturating_duration_since(start).as_micros(),
             start.saturating_duration_since(settle.begun).as_micros()
         );
-        let c = views.lock().counts();
-        let d = self.surface_caches.lock().counts();
-        // A deferred block, and a block named by its runs, make no view, so they are counted
-        // here too.
-        let counted = (c.made + c.reused + c.bad_runs + c.not_mapped + c.private + c.by_runs)
-            .saturating_add(d.deferred + d.deferred_refused);
         let now = clock.now_mono();
         let logged_at = &self.shared.views_logged_at;
         let last = logged_at.load(Ordering::Relaxed);
         // One message logs for each time due, where two blocks' lanes find it due at once.
-        if views_log_due(counted, now, MonoTime::from_nanos(last))
+        if views_log_due(now, MonoTime::from_nanos(last))
             && logged_at
                 .compare_exchange(last, now.as_nanos(), Ordering::Relaxed, Ordering::Relaxed)
                 .is_ok()
         {
+            let c = views.lock().counts();
+            let d = self.surface_caches.lock().counts();
             log::info!(
                 target: "reims_vgpu::graphics",
-                "IOSurface pages in place: {} views made, {} taken from the cache; {} pages \
-                 blocks' views made; {} named by their runs; refused: {} for bad runs, {} not \
-                 mapped",
-                c.made, c.reused, c.private, c.by_runs, c.bad_runs, c.not_mapped
+                "IOSurface pages in place: {} views made, {} taken from the cache, {} let go of \
+                 from it unheld for their mappings; {} pages blocks' views made, {} taken from \
+                 the cache; {} named by their runs; refused: {} for bad runs, {} not mapped; \
+                 asked whether they need a device cache: {} in place, {} in place while the \
+                 device's verdict was pending, {} answered a cache, {} of them for want of room \
+                 for their views; {} pages blocks' views imported as pieces of group dma-bufs, \
+                 in {} groups",
+                c.made, c.reused, c.idle_returned, c.private, c.private_reused, c.by_runs,
+                c.bad_runs, c.not_mapped, c.asked_in_place, c.asked_pending, c.asked_cache,
+                c.asked_room, c.grouped, c.groups
             );
             if d.made != 0 {
                 log::info!(
                     target: "reims_vgpu::graphics",
-                    "IOSurface device caches: {} made; {} fills of {} MiB ({} as made), {} \
-                     downloads of {} MiB, {} asked of a cache nothing wrote; {} fills or \
+                    "IOSurface device caches: {} made; {} fills of {} MiB ({} first fills or as \
+                     named again), {} first fills a decode wrote over instead, {} downloads of \
+                     {} MiB, {} asked of a cache nothing wrote; {} fills or \
                      downloads the host's devices' writes changed; {} written caches copied at a \
                      release with no client left; {} released held by the kext alone, as the \
                      kext counts them: {} of them written since their last copy, dropped \
                      uncopied ({} MiB), {} copied as taken again; {} copies out not made, the CPU's \
                      generation past the cache's; {} \
-                     deferred, {} refused, {} named their pages ({} copied), {} released \
-                     unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
+                     deferred ({} carrying pages), {} refused, {} refused as they might lie in \
+                     place, {} named their pages ({} copied), {} released unnamed; {} early copies of {} MiB ({} on the read-back queue), {} \
                      downloads they answered, {} unread; {} copy by runs, {} copies by runs \
                      refused; {} downloads or releases answered {} ms or more after they were \
                      asked; {} fills made behind the command buffers they followed, {} waits on \
                      the CPU for other command buffers' uses; at a doorbell, {} buffers using a \
-                     cache waited for no copy of it, {} for one",
-                    d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.downloads,
+                     cache waited for no copy of it, {} for one; {} made exportable for the \
+                     host's video, {} not; {} made a dma-buf for the host's video to decode \
+                     into, {} not; {} made with their surface's first plane on 256 bytes of \
+                     their memory; {} laid out at the GPU's pitch; the GPU's time in the \
+                     fills {} ms, in the copies out {} ms",
+                    d.made, d.fills, d.filled_bytes >> 20, d.made_fills, d.decode_firsts,
+                    d.downloads,
                     d.downloaded_bytes >> 20, d.clean, d.host_writes, d.unread,
                     d.unheld_released, d.unheld, d.unheld_bytes >> 20, d.retaken, d.behind,
-                    d.deferred, d.deferred_refused, d.attached, d.attached_copied, d.unattached,
+                    d.deferred, d.carried, d.deferred_refused, d.deferred_in_place, d.attached,
+                    d.attached_copied, d.unattached,
                     d.early, d.early_bytes >> 20, d.early_aside, d.early_read, d.early_unread,
                     d.by_runs, d.runs_refused,
                     self.shared.slow_answers.load(Ordering::Relaxed), SLOW_ANSWER.as_millis(),
-                    d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits
+                    d.fills_deferred, d.cpu_waits, d.doorbell_free, d.doorbell_waits,
+                    d.exportable, d.unexportable, d.dma_buf, d.no_dma_buf, d.aligned,
+                    d.repitched, d.fill_gpu_ns / 1_000_000, d.out_gpu_ns / 1_000_000
                 );
             }
         }
@@ -1193,18 +1447,96 @@ impl<P: Platform> GraphicsDecoder<P> {
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<&RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
-        let by_runs = cached && self.copies_by_runs(device);
+        // Pages a process maps read-only are a pages block's alone.
+        let read_only = flags & RGFX_SURFACE_PAGES_READ_ONLY != 0;
+        if read_only && !private {
+            log::warn!(
+                target: "reims_vgpu::graphics",
+                "the IOSurface block at {:#x}: marked read-only with flags {flags:#x}, which are \
+                 no pages block's: refused",
+                pages.block_offset
+            );
+            return Some(RGFX_STATUS_INVALID_ARGUMENT);
+        }
+        // An ask whether the block needs a device cache is a block in place's, with a layout
+        // that lies in the surface's bytes.
+        let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
+        let planes = match (ask, layout) {
+            (false, _) => None,
+            (true, Some(layout)) if !cached && !private => {
+                match surface_pages::layout_planes(layout, pages.length) {
+                    Some(planes) => Some(planes),
+                    None => {
+                        log::warn!(
+                            target: "reims_vgpu::graphics",
+                            "the IOSurface block at {:#x}: asked whether it needs a device cache \
+                             with a layout of {} planes that does not lie in its {:#x} bytes: \
+                             refused",
+                            pages.block_offset, layout.plane_count, pages.length
+                        );
+                        return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                    }
+                }
+            }
+            (true, _) => {
+                log::warn!(
+                    target: "reims_vgpu::graphics",
+                    "the IOSurface block at {:#x}: asked whether it needs a device cache with \
+                     flags {flags:#x}{}: refused",
+                    pages.block_offset,
+                    if layout.is_none() { " and no layout" } else { "" }
+                );
+                return Some(RGFX_STATUS_INVALID_ARGUMENT);
+            }
+        };
+        // A cached block's own layout, on a host that answers no asks, lays out its cache alone.
+        let carried = match (cached && !ask && !private, layout) {
+            (true, Some(layout)) => carried_layout(pages.block_offset, layout, pages.length),
+            _ => surface_cache::CacheLayout::Unknown,
+        };
         let views = &self.shared.surface_views;
+        // An ask whose textures would lie in place over no buffer of its pages the device makes
+        // is answered that it needs a device cache with no view made, which the answer would let
+        // go of unused; where its runs fail a view's checks, the view's path refuses them.
+        if let Some(planes) = &planes
+            && let Some(ram) =
+                surface_pages::SurfaceViews::ram_runs(views, &self.platform, pages, runs)
+            && let Some(why) = device.surface_pages_never_in_place(planes, &ram)
+        {
+            let block = pages.block_offset;
+            match surface_pages::SurfaceViews::cache_unmade(
+                views,
+                &self.platform,
+                pages,
+                runs,
+                planes,
+                settle,
+            ) {
+                None => return None,
+                Some(true) => {
+                    log::debug!(
+                        target: "reims_vgpu::graphics::surface_pages",
+                        "the IOSurface block at {block:#x} needs a device cache, with no view \
+                         made: {why}"
+                    );
+                    return Some(RGFX_STATUS_CACHE);
+                }
+                Some(false) => {}
+            }
+        }
+        let by_runs = cached && self.copies_by_runs(device);
         let made = if private {
             Ok(surface_pages::SurfaceViews::private_pages(
                 views,
                 &self.platform,
                 pages,
                 runs,
+                read_only,
                 settle,
             ))
         } else {
@@ -1216,6 +1548,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 runs,
                 settle,
                 by_runs,
+                planes.is_some(),
             )
         };
         let status = match made {
@@ -1224,14 +1557,36 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.uncache_surface(device, pages.block_offset);
                 RGFX_STATUS_OK
             }
-            Ok(Some(Ok(()))) => {
-                self.cache_surface(device, pages.block_offset, runs, cached);
-                RGFX_STATUS_OK
+            Ok(Some(Err(surface_pages::PagesRefusal::NoRoom))) => {
+                let mut v = views.lock();
+                v.asked(surface_pages::Asked::Room);
+                // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
+                if let Some(planes) = planes {
+                    v.laid_out(pages.block_offset, planes);
+                }
+                drop(v);
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "the IOSurface block at {:#x} needs a device cache: no room for its view's \
+                     {} runs",
+                    pages.block_offset,
+                    runs.len()
+                );
+                RGFX_STATUS_CACHE
             }
+            Ok(Some(Ok(()))) => match planes {
+                Some(planes) if !self.asks_cache(device, pages.block_offset, &planes) => {
+                    RGFX_STATUS_CACHE
+                }
+                _ => {
+                    self.cache_surface(device, pages.block_offset, runs, cached, carried);
+                    RGFX_STATUS_OK
+                }
+            },
             Ok(Some(Err(why))) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:? = why;
                     "the IOSurface block of {:#x} bytes at {:#x}: no view of its {:#x} bytes in \
                      {} runs ({why:?}); the surface takes a copy block",
                     pages.block_size, pages.block_offset, pages.length, runs.len()
@@ -1241,7 +1596,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             Err(raise) => {
                 self.uncache_surface(device, pages.block_offset);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "the IOSurface block of {:#x} bytes at {:#x}: the platform raised at the \
                      buffer over its view ({raise:?}); the surface takes a copy block",
                     pages.block_size, pages.block_offset
@@ -1256,9 +1611,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// of its pages ([`RGFX_SURFACE_PAGES_ATTACH`]), each marked [`RGFX_SURFACE_PAGES_CACHED`] too
     /// ([`surface_cache`]):
     /// - a deferred block, with no runs, gets a device cache of zeros and no view, any view it had
-    ///   going: [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no cache and no view, where
-    ///   the device keeps no caches, the deferred caches' budget has no room or the platform made
-    ///   none, and the kext then names the block's pages as any block's;
+    ///   going, made and its surface's first plane placed as the `layout` the message carries
+    ///   gives it ([`carried_layout`]): [`RGFX_STATUS_OK`], else [`RGFX_STATUS_REFUSED`] with no
+    ///   cache and no view, where the deferred caches' budget has no room or the platform made
+    ///   none, and the kext then names the block's pages as any block's. On a device that offers
+    ///   `SURFACE_DEFERRED_ASK` (its GPU shares the CPU's memory) the block asks
+    ///   ([`RGFX_SURFACE_PAGES_ASK_CACHE`]) with its surface's `layout`, and is deferred only
+    ///   where textures over the pages it comes to have would lie in place over none the device
+    ///   makes ([`GpuDevice::fresh_surface_never_in_place`]), so its pages, once named, would
+    ///   take a device cache all the same; any other is [`RGFX_STATUS_REFUSED`], counted, with
+    ///   nothing made, and the kext then names its pages asking, as any block's;
     /// - its pages, found by the block whatever context sends them (the maker's may have closed),
     ///   get a view, which the cache takes, keeping its bytes: [`RGFX_STATUS_OK`]. Where the host
     ///   makes no view of them, or no buffer over it, the cache takes them copied, through the
@@ -1268,15 +1630,27 @@ impl<P: Platform> GraphicsDecoder<P> {
     ///   [`RGFX_STATUS_INVALID_ARGUMENT`] for a block with no deferred cache whose pages are not
     ///   named, with no view made.
     ///
-    /// A message with both flags, or without `CACHED`, or a deferred block's with runs, is
-    /// [`RGFX_STATUS_INVALID_ARGUMENT`], and changes nothing. `None`, with nothing made, where the
-    /// device was reset since `settle` began it.
+    /// A deferral may carry its surface's resident pages, where the device offers
+    /// `SURFACE_DEFERRED_CARRY`: its runs are the surface's bytes in order, those of pages that
+    /// are not resident [`RGFX_PAGE_RUN_ZEROS`], and its cache owes a first fill of the others
+    /// ([`surface_cache::CarriedPages`]).
+    ///
+    /// A message with both flags, or without `CACHED`, or a deferred block's with runs where the
+    /// device offers no `SURFACE_DEFERRED_CARRY`, or with runs that are not whole guest pages
+    /// summing to the surface, in the guest's RAM the host maps, or that carry none, is
+    /// [`RGFX_STATUS_INVALID_ARGUMENT`], and changes nothing; so is a deferred block's that asks
+    /// where the device offers no `SURFACE_DEFERRED_ASK`, or with a layout that does not lie in
+    /// its bytes, or that does not ask where the device offers it, and pages that ask. `None`,
+    /// with nothing made, where the device was reset since `settle` began it.
+    ///
+    /// [`GpuDevice::fresh_surface_never_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::fresh_surface_never_in_place
     fn deferred_surface_pages(
         &self,
         device: &P::Device,
         pages: &RgfxSurfacePages,
         runs: &[RgfxPageRun],
         flags: u32,
+        layout: Option<&RgfxSurfacePagesLayout>,
         settle: &worker::Settle,
     ) -> Option<u32> {
         let block = pages.block_offset;
@@ -1284,7 +1658,18 @@ impl<P: Platform> GraphicsDecoder<P> {
         let attach = flags & RGFX_SURFACE_PAGES_ATTACH != 0;
         let cached = flags & RGFX_SURFACE_PAGES_CACHED != 0;
         let private = flags & RGFX_SURFACE_PAGES_PRIVATE != 0;
-        if !cached || private || (deferred && attach) || (deferred && !runs.is_empty()) {
+        let ask = flags & RGFX_SURFACE_PAGES_ASK_CACHE != 0;
+        let (asks, carries) = {
+            let caches = self.surface_caches.lock();
+            (caches.deferred_asks(), caches.deferred_carries())
+        };
+        if !cached
+            || private
+            || (deferred && attach)
+            || (deferred && !runs.is_empty() && !carries)
+            || (attach && ask)
+            || (deferred && ask != asks)
+        {
             log::warn!(
                 target: "reims_vgpu::graphics",
                 "the IOSurface block at {block:#x}: a SURFACE_PAGES of {} runs with flags \
@@ -1295,18 +1680,81 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         let views = &self.shared.surface_views;
         if deferred {
+            // An ask's layout, which must lie in the surface's bytes; the block is deferred only
+            // where its textures would lie in place over none of the pages it may come to have.
+            let planes = match (ask, layout) {
+                (false, _) => None,
+                (true, layout) => {
+                    let Some(planes) =
+                        layout.and_then(|l| surface_pages::layout_planes(l, pages.length))
+                    else {
+                        log::warn!(
+                            target: "reims_vgpu::graphics",
+                            "the IOSurface block at {block:#x}: asked to be deferred with no \
+                             layout, or one that does not lie in its {:#x} bytes: refused",
+                            pages.length
+                        );
+                        return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                    };
+                    let Some(why) = device.fresh_surface_never_in_place(&planes, pages.length)
+                    else {
+                        self.surface_caches.lock().deferred_in_place();
+                        log::debug!(
+                            target: "reims_vgpu::graphics::surface_pages",
+                            "the IOSurface block at {block:#x}: not deferred, as its textures \
+                             may lie in place over the pages it comes to have"
+                        );
+                        return Some(RGFX_STATUS_REFUSED);
+                    };
+                    log::debug!(
+                        target: "reims_vgpu::graphics::surface_pages",
+                        "the IOSurface block at {block:#x} is deferred, as it would need a \
+                         device cache: {why}"
+                    );
+                    Some(planes)
+                }
+            };
+            // The pages it carries, where it carries some.
+            let (carried, host_pages) = if runs.is_empty() {
+                (None, Vec::new())
+            } else {
+                let Some((carried, host_pages)) = self.carried_pages(runs, pages.length) else {
+                    log::warn!(
+                        target: "reims_vgpu::graphics",
+                        "the IOSurface block at {block:#x}: deferred carrying {} runs that are \
+                         not whole guest pages summing to its {:#x} bytes in the guest's RAM, or \
+                         carry none: refused",
+                        runs.len(),
+                        pages.length
+                    );
+                    return Some(RGFX_STATUS_INVALID_ARGUMENT);
+                };
+                (Some(carried), host_pages)
+            };
             if !surface_pages::SurfaceViews::deferred(views, block, settle) {
                 return None;
             }
-            let made =
-                self.surface_caches
-                    .make_deferred(device, block, pages.length, pages.block_size);
+            // An ask's planes lay out its cache; else the layout the block carries places it.
+            let layout = match (planes, layout) {
+                (Some(planes), _) => surface_cache::CacheLayout::Asked(planes),
+                (None, Some(layout)) => carried_layout(block, layout, pages.length),
+                (None, None) => surface_cache::CacheLayout::Unknown,
+            };
+            let made = self.surface_caches.make_deferred(
+                device,
+                block,
+                pages.length,
+                pages.block_size,
+                layout,
+                carried,
+                host_pages,
+            );
             return Some(match made {
                 Ok(true) => RGFX_STATUS_OK,
                 Ok(false) => RGFX_STATUS_REFUSED,
                 Err(raise) => {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "the IOSurface block at {block:#x}: the platform raised at its \
                          deferred device cache ({raise:?}); its pages are named instead"
                     );
@@ -1330,6 +1778,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             runs,
             settle,
             self.copies_by_runs(device),
+            false,
         );
         // Runs that are not whole guest pages summing to the surface, or with no guest RAM to map,
         // are refused; pages the host made no view of, or no buffer over, are copied instead.
@@ -1381,7 +1830,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             match taken {
                 Some(Some(true)) => {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = why;
                         "the IOSurface block at {block:#x}: its deferred device cache took its {} \
                          runs copied, the host's CPU moving its bytes: {why}",
                         runs.len()
@@ -1393,7 +1842,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
         }
         log::warn!(
-            target: "reims_vgpu::graphics",
+            target: "reims_vgpu::graphics", kind:% = why;
             "the IOSurface block at {block:#x}: its deferred device cache took none of its {} \
              runs: {why}; the cache keeps its bytes, its pages not named",
             runs.len()
@@ -1401,29 +1850,98 @@ impl<P: Platform> GraphicsDecoder<P> {
         Some(RGFX_STATUS_REFUSED)
     }
 
+    /// The pages a carrying deferral's `runs` carry, of a surface of `length` bytes
+    /// ([`Self::deferred_surface_pages`]): the guest pages of the runs that are not
+    /// [`RGFX_PAGE_RUN_ZEROS`], in runs of pages that follow one another both in the surface and
+    /// in the host's mapping of the guest's RAM, each as the surface's byte it starts at, its host
+    /// address in the guest's RAM and its bytes; and their host addresses as runs, which the cache
+    /// watches. `None` where a run is not whole guest pages, they do not sum to the surface's bytes
+    /// in whole pages, a page lies outside the guest's RAM the host maps, or none is carried.
+    fn carried_pages(
+        &self,
+        runs: &[RgfxPageRun],
+        length: u64,
+    ) -> Option<(surface_cache::CarriedPages, Vec<std::ops::Range<u64>>)> {
+        let page = surface_pages::GUEST_PAGE;
+        let whole = length.checked_next_multiple_of(page)?;
+        let mut at = 0u64;
+        let mut carried: Vec<(u64, HostPtr, u64)> = Vec::new();
+        let mut named = Vec::new();
+        let views = self.shared.surface_views.lock();
+        for run in runs {
+            if run.length == 0 || !run.length.is_multiple_of(page) {
+                return None;
+            }
+            if run.address != RGFX_PAGE_RUN_ZEROS {
+                if !run.address.is_multiple_of(page) {
+                    return None;
+                }
+                let mut from = at;
+                for (host, bytes) in views.host_pages_in_order(std::slice::from_ref(run))? {
+                    // A page that follows the one before it both in the surface and in the
+                    // host's mapping of the guest's RAM extends its run: one copy fills it.
+                    match carried.last_mut() {
+                        Some((start, first, so_far))
+                            if *start + *so_far == from && first.wrapping_add(*so_far) == host =>
+                        {
+                            *so_far += bytes;
+                        }
+                        _ => carried.push((from, host, bytes)),
+                    }
+                    from += bytes;
+                }
+                named.push(*run);
+            }
+            at = at.checked_add(run.length)?;
+        }
+        if at != whole {
+            return None;
+        }
+        let host_pages = views.host_runs(&named);
+        drop(views);
+        Some((
+            surface_cache::CarriedPages::new(carried, whole)?,
+            host_pages,
+        ))
+    }
+
     /// Gives the block at `block`, whose view of `runs` was just made, or which is named by its
-    /// runs, a device cache where the kext marked it `cached` and the device keeps caches
-    /// ([`surface_cache`]); else the block keeps its view alone, and its buffers lie over the
-    /// pages. A block named by its runs that gets no cache takes its view now.
-    fn cache_surface(&self, device: &P::Device, block: u64, runs: &[RgfxPageRun], cached: bool) {
-        if !cached || !self.surface_caches.lock().on() {
+    /// runs, a device cache where the kext marked it `cached` ([`surface_cache`]); else the block
+    /// keeps its view alone, and its buffers lie over the pages. A block named by its runs that gets no cache takes its view now.
+    /// The cache is laid out as the kext's ask gave its surface, where it asked; else as
+    /// `carried`, what its message's layout gave ([`carried_layout`],
+    /// [`surface_cache::CacheLayout`]).
+    fn cache_surface(
+        &self,
+        device: &P::Device,
+        block: u64,
+        runs: &[RgfxPageRun],
+        cached: bool,
+        carried: surface_cache::CacheLayout,
+    ) {
+        if !cached {
             self.uncache_surface(device, block);
             return;
         }
-        let (view, by_runs, pages) = {
-            let views = self.shared.surface_views.lock();
+        let (view, by_runs, pages, layout) = {
+            let mut views = self.shared.surface_views.lock();
             (
                 views.view(block),
                 views.by_runs(block),
                 views.host_runs(runs),
+                views.take_layout(block),
             )
+        };
+        let layout = match layout {
+            Some(planes) => surface_cache::CacheLayout::Asked(planes),
+            None => carried,
         };
         // The CPU's generation the kext wrote into the block's header as it cached the block, or
         // since, which the cache's first fill is of.
         let generation = surface_cache::cpu_generation(&self.shared.region, block).unwrap_or(0);
         let (made, length) = match (view, by_runs) {
             (Some(view), _) => (
-                (self.surface_caches).make(device, block, &view, pages, generation),
+                (self.surface_caches).make(device, block, &view, pages, generation, layout),
                 view.length(),
             ),
             (None, Some((runs, unmade))) => {
@@ -1435,6 +1953,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     Arc::clone(&unmade),
                     pages,
                     generation,
+                    layout,
                 );
                 if !matches!(made, Ok(true)) {
                     self.view_by_runs(device, block, &unmade);
@@ -1451,10 +1970,52 @@ impl<P: Platform> GraphicsDecoder<P> {
                  {length:#x} bytes; its buffers lie over its pages"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at its device cache \
                  ({raise:?}); its buffers lie over its pages"
             ),
+        }
+    }
+
+    /// Whether the block at `block`, just given its view in place, stays in place, its surface's
+    /// planes laid out as `planes` ([`RGFX_SURFACE_PAGES_ASK_CACHE`]): where the device answers
+    /// that a texture over the view would not lie in place for some access, where one over a
+    /// device cache would ([`GpuDevice::surface_pages_in_place`]), the block's view is taken
+    /// back, the cache of views keeping it for the block's cached `SURFACE_PAGES` to come, and
+    /// false is returned, for the answer [`RGFX_STATUS_CACHE`]; the device's verdict not known
+    /// yet keeps it in place, counted apart.
+    ///
+    /// [`GpuDevice::surface_pages_in_place`]: reims_vgpu_vulkan::core::platform::device::GpuDevice::surface_pages_in_place
+    fn asks_cache(&self, device: &P::Device, block: u64, planes: &[PagesPlane]) -> bool {
+        let views = &self.shared.surface_views;
+        let Some(import) = views.lock().import_of(block) else {
+            return true;
+        };
+        let answer = device.surface_pages_in_place(&import, planes);
+        drop(import);
+        let mut v = views.lock();
+        match answer {
+            PagesInPlace::Yes => {
+                v.asked(surface_pages::Asked::InPlace);
+                true
+            }
+            PagesInPlace::Pending => {
+                v.asked(surface_pages::Asked::Pending);
+                true
+            }
+            PagesInPlace::No(why) => {
+                v.asked(surface_pages::Asked::Cache);
+                let released = v.released(block, self.platform.vm().idle_view_mappings());
+                // The cache the block's cached `SURFACE_PAGES` makes copies out the texels alone.
+                v.laid_out(block, planes.to_vec());
+                drop(v);
+                drop(released);
+                log::debug!(
+                    target: "reims_vgpu::graphics::surface_pages",
+                    "the IOSurface block at {block:#x} needs a device cache: {why}"
+                );
+                false
+            }
         }
     }
 
@@ -1470,12 +2031,12 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.shared.surface_worker.drop_later(block, block, import);
             }
             Ok(Err(why)) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:? = why;
                 "the IOSurface block at {block:#x}: no device cache, and no view of its pages \
                  ({why:?}); its buffers are refused"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: no device cache, and the platform raised at \
                  the buffer over its view ({raise:?}); its buffers are refused"
             ),
@@ -1490,7 +2051,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         }
         if let Err(raise) = self.surface_caches.released(device, block, Box::new(|| {})) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "the IOSurface block at {block:#x}: the platform raised at the copy of its device \
                  cache into its pages ({raise:?})"
             );
@@ -1510,9 +2071,9 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(block);
-        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
+        let (ran, trace, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).download(device, block, region, ran, done, failed);
+        (self.surface_caches).download(device, block, region, ran, trace, done, failed);
     }
 
     /// [`Self::surface_download`] where it waits for nothing and commits no copy now
@@ -1530,26 +2091,33 @@ impl<P: Platform> GraphicsDecoder<P> {
             return false;
         }
         let asked = self.platform.clock().now_mono();
-        let (ran, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
+        let (ran, trace, done) = self.timed("SURFACE_DOWNLOAD", block, asked, done);
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).try_download(device, block, region, ran, done, failed)
+        (self.surface_caches).try_download(device, block, region, ran, trace, done, failed)
     }
 
     /// `done`, the answer of a `what` (`SURFACE_DOWNLOAD` or `BLOCK_RELEASE`) of the block at
-    /// `block` asked at `asked` and now let past the block's `SURFACE_PAGES`, timed; and what its
+    /// `block` asked at `asked` and now let past the block's `SURFACE_PAGES`, timed; what its
     /// copy out of the block's device cache runs as it is carried out, once the command buffers
-    /// that may write the cache have finished ([`surface_cache::Caches::download`]). An answer
-    /// that comes [`SLOW_ANSWER`] or more after it was asked is counted and logged, with how long
-    /// it waited for the `SURFACE_PAGES`, for those buffers, and then for its copy into the pages
-    /// (the transfer queue, and the GPU's wait for the buffers that used the cache). Diagnostics
-    /// only.
+    /// that may write the cache have finished ([`surface_cache::Caches::download`]); and the
+    /// trace the copy keeps of what it then waited for. An answer that comes [`SLOW_ANSWER`] or
+    /// more after it was asked is counted and logged, with the cache's planes and bytes, how
+    /// long it waited for the `SURFACE_PAGES`, for those buffers, and then for its copy into the
+    /// pages, that copy phase split as [`surface_cache::CopySplit`] gives it: before the GPU had
+    /// run the copy (the GPU's wait for the command buffers that used the cache, and the
+    /// transfer queue's work before it), the GPU's run of the copy, and the CPU's copy of a
+    /// staging buffer after it. Diagnostics only.
     fn timed(
         &self,
         what: &'static str,
         block: u64,
         asked: MonoTime,
         done: surface_cache::Answer,
-    ) -> (surface_cache::Answer, surface_cache::Answer) {
+    ) -> (
+        surface_cache::Answer,
+        Arc<surface_cache::CopyTrace>,
+        surface_cache::Answer,
+    ) {
         let settled = self.platform.clock().now_mono();
         let ran_at = Arc::new(AtomicU64::new(settled.as_nanos()));
         let platform = Arc::clone(&self.platform);
@@ -1559,27 +2127,38 @@ impl<P: Platform> GraphicsDecoder<P> {
                 ran_at.store(platform.clock().now_mono().as_nanos(), Ordering::Relaxed);
             })
         };
+        let trace = Arc::new(surface_cache::CopyTrace::new({
+            let platform = Arc::clone(&platform);
+            Arc::new(move || platform.clock().now_mono())
+        }));
+        let traced = Arc::clone(&trace);
         let slow = Arc::clone(&self.shared.slow_answers);
+        let last = Arc::clone(&self.shared.last_slow_copy);
         let done = Box::new(move || {
             let answered = platform.clock().now_mono();
             let took = answered.saturating_duration_since(asked);
             if took >= SLOW_ANSWER {
                 slow.fetch_add(1, Ordering::Relaxed);
                 let ran = MonoTime::from_nanos(ran_at.load(Ordering::Relaxed));
+                let copy = answered.saturating_duration_since(ran);
+                let split = traced.split(copy);
                 log::warn!(
-                    target: "reims_vgpu::graphics",
-                    "the IOSurface block at {block:#x}: a {what} answered {} ms after it was \
+                    target: "reims_vgpu::graphics", kind:% = what;
+                    "the IOSurface block at {block:#x}{}: a {what} answered {} ms after it was \
                      asked: {} ms for its SURFACE_PAGES, {} ms behind the command buffers that \
-                     may write its device cache, then {} ms for its copy into the pages",
+                     may write its device cache, then {} ms for its copy into the pages{}",
+                    slow_cache(&split),
                     took.as_millis(),
                     settled.saturating_duration_since(asked).as_millis(),
                     ran.saturating_duration_since(settled).as_millis(),
-                    answered.saturating_duration_since(ran).as_millis()
+                    copy.as_millis(),
+                    slow_copy(&split),
                 );
+                *last.lock() = Some(split);
             }
             done();
         });
-        (ran, done)
+        (ran, trace, done)
     }
 
     /// The `SURFACE_DOWNLOAD`s and `BLOCK_RELEASE`s answered [`SLOW_ANSWER`] or more after they
@@ -1589,12 +2168,18 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.slow_answers.load(Ordering::Relaxed)
     }
 
+    /// The copy phase of the last of [`Self::slow_answers`], split.
+    #[cfg(test)]
+    pub(crate) fn last_slow_copy(&self) -> Option<surface_cache::CopySplit> {
+        *self.shared.last_slow_copy.lock()
+    }
+
     /// The block at `offset` was released, its `RGFX_BLOCK_RELEASE_*` `flags`: its surface view,
     /// if any, goes once the buffers over it have, and its device cache once the pages hold what
     /// a command buffer wrote of it, whether its surface had a client left or not
-    /// ([`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
+    /// ([`RGFX_BLOCK_RELEASE_NO_CLIENT`](reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_NO_CLIENT), which
     /// is only counted). Where nothing but the kext held the surface
-    /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
+    /// ([`RGFX_BLOCK_RELEASE_UNHELD`](reims_vgpu_graphics::wire::RGFX_BLOCK_RELEASE_UNHELD)) the cache
     /// goes uncopied. There is no wait here for a buffer still walked; `done` then, or `failed`
     /// where the platform raised at the copy ([`surface_cache`]). The block's holds of them are
     /// let go of on the surface worker, where either may be the last of an import or a mapping.
@@ -1608,15 +2193,20 @@ impl<P: Platform> GraphicsDecoder<P> {
     ) {
         let asked = self.platform.clock().now_mono();
         self.settle_surface(offset);
-        let (ran, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
-        let gone = self.shared.surface_views.lock().released(offset);
+        let (ran, trace, done) = self.timed("BLOCK_RELEASE", offset, asked, done);
+        let idle_mappings = self.platform.vm().idle_view_mappings();
+        let gone = (self.shared.surface_views.lock()).released(offset, idle_mappings);
         if let Some(gone) = gone {
             self.shared.surface_worker.drop_later(offset, offset, gone);
         }
+        // What the host's video devices made of the block's memory goes with its life.
+        drop(self.shared.block_lives.lock().remove(&offset));
         let worker = Arc::clone(&self.shared.surface_worker);
         let let_go = Box::new(move |cache| worker.drop_later(offset, offset, cache));
         let region = Arc::clone(&self.shared.region);
-        (self.surface_caches).release(device, offset, flags, region, ran, done, failed, let_go);
+        (self.surface_caches).release(
+            device, offset, flags, region, ran, trace, done, failed, let_go,
+        );
     }
 
     /// Fills the device cache of the block the texture a present of IOSurface `iosurface_id`
@@ -1654,16 +2244,24 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// Sets the sink the decoder hands each command buffer's completion record to
     /// once its work finishes (the ring loop's, writing the queue's completion
     /// ring).
+    /// What follows each record is run as soon as `sink` returns.
     #[cfg(test)]
-    pub(crate) fn set_completion_sink(&mut self, sink: CompletionSink) {
-        self.sinks.completion = Some(sink);
+    pub(crate) fn set_completion_sink(&mut self, sink: Arc<dyn Fn(RgfxCbComplete) + Send + Sync>) {
+        self.sinks.completion = Some(Arc::new(move |record, then: Then| {
+            sink(record);
+            then();
+        }));
     }
 
     /// Sets the sink the decoder hands each shared event a command buffer signalled to, once the
     /// buffer's work finishes (the ring loop's, writing the queue's completion ring).
+    /// What follows each record is run as soon as `sink` returns.
     #[cfg(test)]
-    pub(crate) fn set_signal_sink(&mut self, sink: SignalSink) {
-        self.sinks.signal = Some(sink);
+    pub(crate) fn set_signal_sink(&mut self, sink: Arc<dyn Fn(RgfxEventSignalled) + Send + Sync>) {
+        self.sinks.signal = Some(Arc::new(move |record, then: Then| {
+            sink(record);
+            then();
+        }));
     }
 
     /// Sets the sink the decoder hands each command buffer's `CB_SCHEDULED` to once the buffer is
@@ -1719,7 +2317,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             && let Err(raise) = refusing(|| release.signal(queue, &self.shared.commit_cancel))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "queue {queue_obj_id:#x}'s surface timeline was ended, and its last signal \
                  faulted: {raise}"
             );
@@ -1914,7 +2512,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn caches(
         &self,
-    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
+    ) -> reims_vgpu_vulkan::core::sync::MutexGuard<'_, surface_cache::SurfaceCaches<P>> {
         self.surface_caches.lock()
     }
 
@@ -1927,7 +2525,8 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// Waits for the block at `block` to be as its `SURFACE_PAGES` left it, where the surface
     /// worker is still carrying one out ([`worker::Unsettled`]), and logs the wait: the guest's
-    /// kext names a block only once it is answered, so a wait is a message the guest posted before.
+    /// kext names a block only once it is answered, so a wait is a message the guest posted before
+    /// the answer, or one right after it while the worker lets go of the block.
     fn settle_surface(&self, block: u64) {
         if !self.shared.unsettled.any(std::iter::once(block)) {
             return;
@@ -1942,19 +2541,29 @@ impl<P: Platform> GraphicsDecoder<P> {
         );
     }
 
-    /// Whether the `BUFFER_OVER_PAGES` `message` makes its pages block's view (the block's first),
-    /// or follows its block's `SURFACE_PAGES` still being carried out on the surface worker: what
-    /// is carried out there ([`surface_pages`]).
-    pub(crate) fn buffer_over_pages_makes(&self, message: &[u8]) -> bool {
-        let Some(m) = read::<RgfxBufferOverPages>(message) else {
+    /// Whether the `BUFFER_OVER_PAGES` or `HEAP_OVER_PAGES` `message` makes its pages block's view
+    /// (the block's first; a heap over a block of one run makes none, as it lies over the guest's
+    /// RAM), or follows its block's `SURFACE_PAGES` still being carried out on the surface worker:
+    /// what is carried out there ([`surface_pages`]).
+    pub(crate) fn over_pages_makes(&self, message: &[u8]) -> bool {
+        let block = match read::<RgfxMsgHeader>(message).map(|h| h.r#type) {
+            Some(RGFX_CMD_BUFFER_OVER_PAGES) => {
+                read::<RgfxBufferOverPages>(message).map(|m| (m.block_offset, m.block_size, false))
+            }
+            Some(RGFX_CMD_HEAP_OVER_PAGES) => {
+                read::<RgfxHeapOverPages>(message).map(|m| (m.block_offset, m.block_size, true))
+            }
+            _ => None,
+        };
+        let Some((block, block_size, heap)) = block else {
             return false;
         };
-        self.shared.unsettled.any(std::iter::once(m.block_offset))
-            || self
-                .shared
-                .surface_views
-                .lock()
-                .private_unmade(m.block_offset)
+        if self.shared.unsettled.any(std::iter::once(block)) {
+            return true;
+        }
+        let views = self.shared.surface_views.lock();
+        views.private_unmade(block)
+            && !(heap && views.private_ram(block, block_size, None).is_some())
     }
 
     /// Hands `job`, of the block at `block`, to the surface worker, behind the block's jobs handed
@@ -1979,7 +2588,7 @@ impl<P: Platform> GraphicsDecoder<P> {
     #[cfg(test)]
     pub(crate) fn views_of_surfaces(
         &self,
-    ) -> reims_vgpu_core::sync::MutexGuard<'_, surface_pages::SurfaceViews<P>> {
+    ) -> reims_vgpu_vulkan::core::sync::MutexGuard<'_, surface_pages::SurfaceViews<P>> {
         self.shared.surface_views.lock()
     }
 
@@ -2013,6 +2622,73 @@ impl<P: Platform> GraphicsDecoder<P> {
         split::SPLIT_AFTER
     }
 
+    /// Has the walks deal a command buffer of `bytes` of ops at least to two threads at once
+    /// ([`Self::deal_min_bytes`]), or of [`cmdbuf::DEAL_MIN_BYTES`] where `None` (for the tests).
+    #[cfg(test)]
+    pub(crate) fn set_deal_min_bytes(&self, bytes: Option<usize>) {
+        *self.shared.deal_min_bytes.lock() = bytes;
+    }
+
+    /// The least op bytes of a command buffer dealt to two threads at once
+    /// ([`cmdbuf::DEAL_MIN_BYTES`]; the tests may set their own).
+    pub(crate) fn deal_min_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(bytes) = *self.shared.deal_min_bytes.lock() {
+            return bytes;
+        }
+        cmdbuf::DEAL_MIN_BYTES
+    }
+
+    /// Has the walks deal chunks of `bytes` of ops at least ([`Self::deal_chunk_bytes`]), or of
+    /// [`cmdbuf::DEAL_CHUNK_BYTES`] where `None` (for the tests).
+    #[cfg(test)]
+    pub(crate) fn set_deal_chunk_bytes(&self, bytes: Option<usize>) {
+        *self.shared.deal_chunk_bytes.lock() = bytes;
+    }
+
+    /// The least op bytes of a chunk dealt to a thread ([`cmdbuf::DEAL_CHUNK_BYTES`]; the tests
+    /// may set their own).
+    pub(crate) fn deal_chunk_bytes(&self) -> usize {
+        #[cfg(test)]
+        if let Some(bytes) = *self.shared.deal_chunk_bytes.lock() {
+            return bytes;
+        }
+        cmdbuf::DEAL_CHUNK_BYTES
+    }
+
+    /// Has a walk dealt to two threads wait for a helper to start its chunks before it walks its
+    /// own, so the chunks are walked at once however fast this thread's are (for the tests).
+    #[cfg(test)]
+    pub(crate) fn set_helper_first(&self, first: bool) {
+        self.shared.helper_first.store(first, Ordering::Relaxed);
+    }
+
+    /// The helpers' chunks the dealt walks waited for at their commit so far (for the tests).
+    #[cfg(test)]
+    pub(crate) fn deal_waits(&self) -> u64 {
+        (self.shared.deal_waits).load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// The command buffers' walks begun so far, once a buffer (for the tests).
+    #[cfg(test)]
+    pub(crate) fn walks_begun(&self) -> u64 {
+        (self.shared.walks_begun).load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Notes a part a walk committed before its buffer's last, which `parts_cut` counts in tests.
+    pub(crate) fn note_part_cut(&self) {
+        #[cfg(test)]
+        self.shared
+            .parts_cut
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The parts the walks committed before their buffers' last so far (for the benches).
+    #[cfg(test)]
+    pub(crate) fn parts_cut(&self) -> u64 {
+        (self.shared.parts_cut).load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// The texture a present of IOSurface `iosurface_id` shows ([`Self::surface_present`]).
     #[cfg(test)]
     pub(crate) fn surface_texture(&self, iosurface_id: u32) -> Option<P::Texture> {
@@ -2043,20 +2719,13 @@ impl<P: Platform> GraphicsDecoder<P> {
                 _ => None,
             })
             .flatten()?;
-        let is_queue = |queue: u64| {
-            self.context_state(context_of(queue))
-                .and_then(|c| {
-                    c.with_live(queue, |e| matches!(e.handle, ObjHandle::CommandQueue(_)))
-                })
-                .unwrap_or(false)
-        };
         let writers = writers_at
             .and_then(|at| self.region.surface_writers(at))
             .map(|record| {
                 record
                     .writers
                     .into_iter()
-                    .filter(|w| w.seqno != 0 && is_queue(w.queue_obj_id))
+                    .filter(|w| w.seqno != 0)
                     .collect()
             })
             .unwrap_or_default();
@@ -2182,7 +2851,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             ObjHandle::SharedEvent(event) => {
                 if let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX)) {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "context {context}'s shared event {id:#x} was not set past every value at \
                          its close: {raise}"
                     );
@@ -2223,7 +2892,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                  close: the platform made no command buffer"
             ),
             Err(raise) => log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = raise;
                 "context {context}'s {plain} events were not signalled past every value at its \
                  close: {raise}"
             ),
@@ -2250,7 +2919,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         self.shared.close_worker.flush();
     }
 
-    /// The device's reset (`reims_graphics::Host::device_reset`): every context's objects dropped
+    /// The device's reset (`reims_vgpu_graphics::Host::device_reset`): every context's objects dropped
     /// as at its close ([`Self::drop_context`]), the lowest context first, then what the decoder
     /// keeps beside them for the guest's processes: the surfaces' names, the libraries' chunks,
     /// makes and cache, the blocks' views of their surfaces' pages and their device caches
@@ -2279,7 +2948,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let states = std::mem::take(&mut *shared.contexts.lock());
         if let Err(refusal) = refusals::refusing(move || drop(states)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the contexts' tables were let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );
@@ -2288,7 +2957,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let cache = shared.libraries.lock().take_cache();
         if let Err(refusal) = refusals::refusing(move || drop(cache)) {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "the library cache was let go of at the device's reset, and a release was \
                  refused: {refusal}"
             );
@@ -2390,7 +3059,7 @@ impl<P: Platform> GraphicsDecoder<P> {
             Ok(sa) => answer(RGFX_STATUS_OK, sa.size, sa.align),
             Err(raise) => {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "heap texture size of format {}, type {}, {}x{}x{} not answered: {raise}",
                     m.desc.pixel_format,
                     m.desc.texture_type,
@@ -2488,7 +3157,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                     && let Err(raise) = refusing(|| event.set_signaled_value(u64::MAX))
                 {
                     log::warn!(
-                        target: "reims_vgpu::graphics",
+                        target: "reims_vgpu::graphics", kind:% = raise;
                         "shared event {:#x}, the last holder of a closed context's, was not set \
                          past every value at its destroy: {raise}",
                         m.obj_id
@@ -2563,7 +3232,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                 Ok(Ok(()))
             }
             RGFX_CMD_QUEUE_CREATE => {
-                use reims_graphics::wire::{
+                use reims_vgpu_graphics::wire::{
                     RGFX_QUEUE_CREATE_FLAGS_OFFSET, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
                 };
                 let Some(m) = read::<RgfxQueueCreate>(message) else {
@@ -2584,8 +3253,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                     device.new_command_queue()
                 };
                 if unshared && made.is_some() {
-                    log::info!(
-                        target: "reims_vgpu::graphics",
+                    // A debug line of its own target, which a run that counts the guest's
+                    // unshared queues names (`reims_vgpu::graphics::queues=debug`).
+                    log::debug!(
+                        target: "reims_vgpu::graphics::queues",
                         "queue {:#x}: made unshared (RGFX_QUEUE_UNSHARED)", m.obj_id
                     );
                 }
@@ -2625,7 +3296,9 @@ impl<P: Platform> GraphicsDecoder<P> {
             RGFX_CMD_SAMPLER_CREATE => self.make_sampler(device, message),
             RGFX_CMD_ICB_CREATE => Ok(self.new_icb(device, message, false)?.map(|_| ())),
             RGFX_CMD_ICB_WRITE => self.icb_write(message),
+            RGFX_CMD_FUNCTION_TABLE_SET => self.function_table_set(message),
             RGFX_CMD_ICB_SLOTS => self.icb_slots(message),
+            RGFX_CMD_ICB_SLOTS_IN_PAGES => self.icb_slots_in_pages(device, message),
             RGFX_CMD_DEPTH_STENCIL_CREATE => {
                 let Some(m) = read::<RgfxDepthStencilCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -2717,6 +3390,10 @@ impl<P: Platform> GraphicsDecoder<P> {
                 self.replace_region(message, drain)
             }
             RGFX_CMD_TEXTURE_VIEW => self.texture_view(device, message),
+            RGFX_CMD_TEXTURE_DID_MODIFY_DATA => {
+                let drain = self.command_buffer_drain();
+                self.texture_did_modify_data(message, drain)
+            }
             RGFX_CMD_HEAP_CREATE => {
                 let Some(m) = read::<RgfxHeapCreate>(message) else {
                     return Ok(Err(DecodeError::Malformed));
@@ -2727,7 +3404,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap(&desc)?.heap {
@@ -2773,7 +3449,6 @@ impl<P: Platform> GraphicsDecoder<P> {
                     size: m.size_bytes,
                     heap_type: host_heap_type(m.heap_type),
                     options: vec![OptionSet::ResourceOptions(m.options.into())],
-                    address_ranges: None,
                     pinned_gpu_address: (m.gpu_address != 0).then_some(m.gpu_address),
                 };
                 match device.new_heap_over_host_memory(bytes, &desc)?.heap {
@@ -2819,7 +3494,11 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Heap(heap)) = self.named(m.heap_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    heap.new_texture(&descriptor, m.heap_offset)?
+                    let made = heap.new_texture(&descriptor, m.heap_offset)?;
+                    if made.is_some() {
+                        self.log_placed_texture(device, &m, &descriptor);
+                    }
+                    made
                 } else {
                     // Device-placed at the guest-picked GPU address.
                     device.new_texture(OnFault::Return, &descriptor)?
@@ -2848,6 +3527,18 @@ impl<P: Platform> GraphicsDecoder<P> {
                 // offset: the guest's RAM where the heap lies over a pages block's, else the
                 // heap's block of the region. A heap of the GPU's own memory has neither.
                 let (span, ram) = (self.span_of(m.heap_obj_id), self.ram_of(m.heap_obj_id));
+                if let Some((first, _)) = ram {
+                    log::trace!(
+                        target: "reims_vgpu::graphics::surface_pages",
+                        "BUFFER_AT_OFFSET in the heap {:#x} over pages at {:#x}: object {:#x}, \
+                         {:#x} bytes at {:#x}",
+                        m.heap_obj_id,
+                        first.addr(),
+                        m.obj_id,
+                        m.length,
+                        m.offset
+                    );
+                }
                 let bytes = match (ram, span) {
                     (Some((first, _)), _) => Some(GuestBytes {
                         ram: Some(first),
@@ -2885,12 +3576,19 @@ impl<P: Platform> GraphicsDecoder<P> {
                     let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
-                    let made = buffer.new_texture(
-                        OnFault::Return,
-                        &descriptor,
-                        m.offset,
-                        m.bytes_per_row,
-                    )?;
+                    // A shape of more than one level is made by the platform's tiled form, the
+                    // one creator over a buffer that makes one (the guest sends it from
+                    // newTiledTextureWithDescriptor:offset:bytesPerRow: alone); one of one level
+                    // by the public form, which the tiled form makes alike.
+                    let made = match m.desc.mipmap_level_count > 1 {
+                        true => buffer.new_tiled_texture(&descriptor, m.offset, m.bytes_per_row)?,
+                        false => buffer.new_texture(
+                            OnFault::Return,
+                            &descriptor,
+                            m.offset,
+                            m.bytes_per_row,
+                        )?,
+                    };
                     if made.is_none() {
                         log_refused_texture(&TextureOverBuffer {
                             obj_id: m.obj_id,
@@ -3012,10 +3710,62 @@ impl<P: Platform> GraphicsDecoder<P> {
                         _ => return Ok(Err(DecodeError::Malformed)),
                     }
                 };
+                let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
+                let row_bytes = video::row_bytes(&info, m.desc.width, m.bytes_per_row);
+                // Over a device cache laid out at the GPU's pitch the texture lies at the same
+                // byte of the same row of its plane in the cache, its rows at the cache's pitch
+                // (`surface_cache::Repitched`); one past its plane's texels there lies over the
+                // block's wide home, at the surface's own place (`surface_cache`, "Wider than
+                // the plane").
+                let laid_out = self.entry(m.buffer_obj_id).and_then(|e| e.laid_out.clone());
+                let laid = laid_out.as_deref().map(|laid| {
+                    let rows = video::texel_rows(&info, m.desc.height);
+                    laid_plane(laid, plane, row_bytes, rows)
+                });
+                let wide = match (laid, span) {
+                    (Some(None), Some((block, _))) => {
+                        let Some(home) = self.surface_caches.wide_home(device, block)? else {
+                            log::warn!(
+                                target: "reims_vgpu::graphics",
+                                "the texture {:#x} over plane {} of the IOSurface {} passes its \
+                                 plane's texels in its device cache laid out at the GPU's pitch, \
+                                 and no wide home was made for it",
+                                m.obj_id, m.plane, m.iosurface_id
+                            );
+                            return Ok(Err(DecodeError::Refused));
+                        };
+                        Some(home)
+                    }
+                    _ => None,
+                };
+                let laid_use = match (laid, span) {
+                    (Some(_), Some((block, _))) => Some(LaidUse {
+                        block,
+                        wide: wide.is_some(),
+                        writes: m.desc.usage == 0
+                            || u64::from(m.desc.usage) & TEXTURE_USAGE_WRITES != 0,
+                    }),
+                    _ => None,
+                };
+                let plane = match laid {
+                    Some(Some(laid)) => laid,
+                    _ => plane,
+                };
+                // Over a home over the pages the texture is Shared, as the buffer over them is.
+                let descriptor = match &wide {
+                    Some((_, true)) => {
+                        desc.resource_options =
+                            Some(desc.resource_options.unwrap_or(0) & !surface_cache::STORAGE_MASK);
+                        self.platform.texture_descriptor(&desc)
+                    }
+                    _ => descriptor,
+                };
+                let at = (plane.offset, plane.bytes_per_row);
                 let made = {
-                    let Some(ObjHandle::Buffer(buffer)) = self.named(m.buffer_obj_id) else {
+                    let Some(ObjHandle::Buffer(cache)) = self.named(m.buffer_obj_id) else {
                         return Ok(Err(DecodeError::BadReference));
                     };
+                    let buffer = wide.as_ref().map_or(cache, |(home, _)| home);
                     let made = buffer.new_texture_over_surface_plane(
                         OnFault::Return,
                         &descriptor,
@@ -3040,15 +3790,26 @@ impl<P: Platform> GraphicsDecoder<P> {
                         // An id made again names only its new texture's surface.
                         self.forget_surface_texture(m.obj_id);
                         let mut entry = Entry::of(ObjHandle::Texture(texture)).over(span);
-                        let info = device.pixel_format_info(u64::from(m.desc.pixel_format));
-                        entry.place = Some(video::PlanePlace {
+                        // A texture over a wide home lies in no place of the buffer a video op
+                        // writes a picture through; one over the pages' view is let go of as a
+                        // buffer over it is, on the surface worker.
+                        entry.place = wide.is_none().then(|| video::PlanePlace {
                             buffer_obj_id: m.buffer_obj_id,
-                            offset: m.offset,
-                            bytes_per_row: m.bytes_per_row,
-                            row_bytes: video::row_bytes(&info, m.desc.width, m.bytes_per_row),
+                            offset: at.0,
+                            bytes_per_row: at.1,
+                            in_surface: (m.offset, m.bytes_per_row),
+                            row_bytes,
                             width: u64::from(m.desc.width),
                             height: u64::from(m.desc.height),
+                            whole: video::whole_plane(
+                                facts.as_ref(),
+                                m.plane,
+                                m.desc.width,
+                                m.desc.height,
+                            ),
                         });
+                        entry.laid_use = laid_use;
+                        entry.over_view = matches!(wide, Some((_, true)));
                         self.store(m.obj_id, entry);
                         if m.plane == 0 {
                             let mut names = self.shared.surfaces.lock();
@@ -3135,7 +3896,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         let run = move || {
             if let Err(raise) = refusing(op) {
                 log::warn!(
-                    target: "reims_vgpu::graphics",
+                    target: "reims_vgpu::graphics", kind:% = raise;
                     "{what} of object {obj_id:#x} was not carried out: the platform raised \
                      ({raise:?})"
                 );
@@ -3152,6 +3913,36 @@ impl<P: Platform> GraphicsDecoder<P> {
             }
             None => run(),
         }
+    }
+
+    /// `TEXTURE_DID_MODIFY_DATA`: the platform's `didModifyData` of the texture, which a
+    /// mipmapped texture over a buffer's bytes takes its copy of them again from at its next use,
+    /// after the context's buffers answered before it are committed and before every command
+    /// buffer of the context begun after it ([`Self::after_submitted`], which `drain` is held
+    /// through), as a `Managed` range is carried out. A bad reference for an object that is no
+    /// texture.
+    fn texture_did_modify_data(
+        &self,
+        message: &[u8],
+        drain: Option<Arc<Drain>>,
+    ) -> RaiseResult<Result<(), DecodeError>> {
+        let Some(m) = read::<RgfxTextureDidModifyData>(message) else {
+            return Ok(Err(DecodeError::Malformed));
+        };
+        // One whose create the host refused holds no copy to take again ([`refused`]).
+        if let Some(ObjHandle::Refused(r)) = self.named(m.obj_id) {
+            r.used(m.obj_id);
+            return Ok(Ok(()));
+        }
+        let Some(ObjHandle::Texture(texture)) = self.named(m.obj_id) else {
+            return Ok(Err(DecodeError::BadReference));
+        };
+        let texture = texture.clone_ref();
+        self.after_submitted("TEXTURE_DID_MODIFY_DATA", m.obj_id, drain, move || {
+            texture.did_modify_data();
+            Ok(())
+        });
+        Ok(Ok(()))
     }
 
     /// Inserts a new object's handle under its guest-picked id.
@@ -3286,6 +4077,41 @@ impl<P: Platform> GraphicsDecoder<P> {
 
     /// The region span `obj_id`'s object lies over, where it is one the current context may name
     /// and lies over one.
+    /// Logs, at trace, a texture `m` placed in a heap over pages (`HEAP_OVER_PAGES`): its
+    /// heap, offset and size there, so a run tells which of a heap's resources lie where in its
+    /// pages.
+    fn log_placed_texture(
+        &self,
+        device: &P::Device,
+        m: &RgfxTextureCreate,
+        descriptor: &P::TextureDescriptor,
+    ) {
+        let target = "reims_vgpu::graphics::surface_pages";
+        if !log::log_enabled!(target: target, log::Level::Trace) {
+            return;
+        }
+        let Some((first, _)) = self.ram_of(m.heap_obj_id) else {
+            return;
+        };
+        let size = device
+            .heap_texture_size_and_align(descriptor)
+            .map_or(0, |s| s.size);
+        log::trace!(
+            target: target,
+            "TEXTURE_CREATE in the heap {:#x} over pages at {:#x}: object {:#x}, {size:#x} bytes \
+             at {:#x}, {}x{}x{} format {} of {} levels",
+            m.heap_obj_id,
+            first.addr(),
+            m.obj_id,
+            m.heap_offset,
+            m.desc.width,
+            m.desc.height,
+            m.desc.depth,
+            m.desc.pixel_format,
+            m.desc.mipmap_level_count
+        );
+    }
+
     fn span_of(&self, obj_id: u64) -> Option<(u64, u64)> {
         self.entry(obj_id).and_then(|e| e.span)
     }
@@ -3434,9 +4260,16 @@ impl<P: Platform> GraphicsDecoder<P> {
     /// rasterization, input primitive topology, maximum vertex amplification count, indirect
     /// command buffer support, the vertex and fragment stages' linked functions, and its label;
     /// the compute form's function, threadgroup-size multiple, maximum threads per threadgroup,
-    /// maximum call stack depth, indirect command buffer support, stage-input descriptor and
-    /// linked functions. Each function is specialised by the index-keyed constants the wire
+    /// maximum call stack depth, indirect command buffer support, stage-input descriptor, linked
+    /// functions and OpenCL mode. Each function is specialised by the index-keyed constants the wire
     /// carries for it, and each linked function made with the options the guest made it with.
+    /// The key of pipeline create `message` ([`pipeline_key::pipeline_key`]): of the libraries it
+    /// names, each by the content key the device holds it under, where it holds every one so.
+    fn pipeline_key(&self, message: &[u8]) -> Option<PipelineKey> {
+        let libraries = self.shared.libraries.lock();
+        pipeline_key::pipeline_key(message, |id| libraries.key_of(id))
+    }
+
     pub(crate) fn prepare_pipeline(&self, message: &[u8]) -> Result<PipelineJob<P>, DecodeError> {
         let library = |obj_id: u64| self.library_ref(obj_id);
         let header = read::<RgfxMsgHeader>(message).ok_or(DecodeError::Malformed)?;
@@ -3448,15 +4281,18 @@ impl<P: Platform> GraphicsDecoder<P> {
             let constants = constants_tail(message, m.constants_offset, m.constant_count)
                 .ok_or(DecodeError::Malformed)?;
             let linked = self.linked_tail(message, m.linked_offset, m.linked_count)?;
+            let libraries = self.pipeline_libraries(message, &m)?;
             let stage_input = stage_input(message, &m)?;
             return Ok(PipelineJob {
                 obj_id: m.obj_id,
                 seqno: m.header.seqno,
+                key: self.pipeline_key(message),
                 shape: PipelineShape::Compute {
                     library,
                     name: name.to_owned(),
                     constants,
                     linked,
+                    libraries,
                     fields: ComputeFields {
                         threadgroup_size_is_multiple_of_execution_width: m.flags
                             & RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
@@ -3469,6 +4305,7 @@ impl<P: Platform> GraphicsDecoder<P> {
                             & RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
                             != 0,
                         stage_input,
+                        open_cl_mode: m.flags & RGFX_COMPUTE_PIPELINE_OPENCL_MODE != 0,
                     },
                 },
             });
@@ -3516,6 +4353,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            key: self.pipeline_key(message),
             shape: PipelineShape::Render {
                 vertex_library,
                 vertex_name: vertex_name.to_owned(),
@@ -3589,6 +4427,7 @@ impl<P: Platform> GraphicsDecoder<P> {
         Ok(PipelineJob {
             obj_id: m.obj_id,
             seqno: m.header.seqno,
+            key: None,
             shape: PipelineShape::Mesh(Box::new(MeshShape {
                 object,
                 mesh,
@@ -3733,11 +4572,18 @@ pub(crate) struct PipelineJob<P: Platform> {
     pub(crate) obj_id: u64,
     /// The create's seqno, which its reply carries.
     pub(crate) seqno: u64,
+    /// The create's key, which a made pipeline's reply carries ([`pipeline_key::pipeline_key`]).
+    key: Option<PipelineKey>,
     /// The pipeline's functions and descriptor.
     shape: PipelineShape<P>,
 }
 
 impl<P: Platform> PipelineJob<P> {
+    /// The create's key, where it asked for one and could be keyed.
+    pub(crate) fn key(&self) -> Option<PipelineKey> {
+        self.key
+    }
+
     /// [`RGFX_PIPELINE_KIND_RENDER`], [`RGFX_PIPELINE_KIND_MESH`] or
     /// [`RGFX_PIPELINE_KIND_COMPUTE`].
     pub(crate) fn kind(&self) -> u32 {
@@ -3768,6 +4614,8 @@ enum PipelineShape<P: Platform> {
         name: String,
         constants: Vec<FunctionConstant>,
         linked: Vec<LinkedRef<P>>,
+        /// The dynamic libraries the kernel links.
+        libraries: DynamicLibrariesDesc<P>,
         fields: ComputeFields,
     },
 }
@@ -3814,7 +4662,7 @@ enum LinkedList {
 
 /// A render pipeline create's descriptor past its functions and label, owned: the fields of
 /// [`FullRenderPipelineDesc`] the compile hands the platform with them.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RenderFields {
     vertex_descriptor: Option<VertexDesc>,
     colors: Vec<(u64, ColorAttachmentDesc)>,
@@ -3827,6 +4675,7 @@ struct RenderFields {
     input_primitive_topology: u64,
     max_vertex_amplification_count: u64,
     support_indirect_command_buffers: bool,
+    private_state: Option<PrivateRenderDesc>,
 }
 
 /// A compute pipeline create's descriptor past its function and linked functions: the fields of
@@ -3838,6 +4687,7 @@ struct ComputeFields {
     max_call_stack_depth: u64,
     support_indirect_command_buffers: bool,
     stage_input: Option<StageInputDesc>,
+    open_cl_mode: bool,
 }
 
 /// A mesh render pipeline create's descriptor past its functions, label and linked functions:
@@ -3868,7 +4718,8 @@ const LAST_VERTEX_INDEX: u32 = 30;
 
 /// A render create's descriptor fields ([`RenderFields`]): the colour attachments in use, the
 /// vertex descriptor's runs from the tail (none where it carries neither layouts nor
-/// attributes), and the rest from the head.
+/// attributes), the private state after the head where its flags carry
+/// [`RGFX_RENDER_PIPELINE_PRIVATE_STATE`], and the rest from the head.
 fn render_fields(
     message: &[u8],
     m: &RgfxRenderPipelineCreate,
@@ -3903,6 +4754,32 @@ fn render_fields(
         input_primitive_topology: m.input_primitive_topology.into(),
         max_vertex_amplification_count: m.max_vertex_amplification_count.into(),
         support_indirect_command_buffers: m.flags & RGFX_RENDER_PIPELINE_SUPPORT_ICB != 0,
+        private_state: if m.flags & RGFX_RENDER_PIPELINE_PRIVATE_STATE != 0 {
+            Some(private_render_state(message)?)
+        } else {
+            None
+        },
+    })
+}
+
+/// The [`RgfxRenderPipelinePrivateState`] after a render create's head, as the platform's value:
+/// each field the guest's raw value. A message too short to hold it is
+/// [`DecodeError::Malformed`].
+fn private_render_state(message: &[u8]) -> Result<PrivateRenderDesc, DecodeError> {
+    let at = size_of::<RgfxRenderPipelineCreate>();
+    let s = message
+        .get(at..)
+        .and_then(read::<RgfxRenderPipelinePrivateState>)
+        .ok_or(DecodeError::Malformed)?;
+    Ok(PrivateRenderDesc {
+        open_gl_mode_enabled: s.flags & RGFX_PRIVATE_RENDER_OPENGL_MODE != 0,
+        sample_mask: s.sample_mask,
+        sample_coverage: f32::from_bits(s.sample_coverage),
+        sample_coverage_invert: s.flags & RGFX_PRIVATE_RENDER_SAMPLE_COVERAGE_INVERT != 0,
+        logic_operation_enabled: s.flags & RGFX_PRIVATE_RENDER_LOGIC_OPERATION != 0,
+        logic_operation: s.logic_operation.into(),
+        depth_stencil_write_disabled: s.flags & RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED
+            != 0,
     })
 }
 
@@ -4031,6 +4908,8 @@ pub(crate) struct CompiledPipeline<P: Platform> {
     pub(crate) reflection: RgfxPipelineReflection,
     /// A made mesh render pipeline's limits, which its reply carries after the reflection.
     mesh: Option<RgfxMeshPipelineReflection>,
+    /// A made pipeline's key, which its reply carries after the reflection.
+    key: Option<PipelineKey>,
     /// Why it was refused, for the host's log; `None` for a made pipeline.
     refusal: Option<String>,
 }
@@ -4044,6 +4923,7 @@ impl<P: Platform> CompiledPipeline<P> {
             handle: None,
             reflection: refused_reflection(obj_id, seqno, kind),
             mesh: None,
+            key: None,
             refusal: Some(reason.into()),
         }
     }
@@ -4055,15 +4935,18 @@ impl<P: Platform> CompiledPipeline<P> {
             handle: Some(handle),
             reflection,
             mesh: None,
+            key: None,
             refusal: None,
         }
     }
 
-    /// The reply the create owes: its reflection, with a made mesh pipeline's limits after it.
+    /// The reply the create owes: its reflection, with a made mesh pipeline's limits or a made
+    /// pipeline's key after it.
     pub(crate) fn reply(&self) -> PipelineReply {
         PipelineReply {
             reflection: self.reflection,
             mesh: self.mesh,
+            key: self.key,
         }
     }
 
@@ -4085,12 +4968,16 @@ pub(crate) fn compile_refusing<P: Platform>(
     device: &P::Device,
     job: PipelineJob<P>,
 ) -> CompiledPipeline<P> {
-    let (obj_id, seqno, kind) = (job.obj_id, job.seqno, job.kind());
+    let (obj_id, seqno, kind, key) = (job.obj_id, job.seqno, job.kind(), job.key);
     let functions = job.functions();
     let mut compiled = match refusing(|| compile_pipeline::<P>(device, job)) {
         Ok(compiled) => compiled,
         Err(raise) => CompiledPipeline::refused(obj_id, seqno, kind, raise.to_string()),
     };
+    // A made pipeline's reply carries its key; a refusal's never does.
+    if !compiled.is_refused() {
+        compiled.key = key;
+    }
     if let Some(reason) = compiled.refusal.as_mut() {
         reason.push_str(&format!("; its functions: {functions}"));
     }
@@ -4098,7 +4985,12 @@ pub(crate) fn compile_refusing<P: Platform>(
 }
 
 /// A pipeline create's functions, for the host's log: each stage's function name and the
-/// constants it is specialised with, then each linked function's.
+/// constants it is specialised with, then each linked function's. A constant reads
+/// `index:Type=value (bytes)`, its value as its lanes read it, little-endian (an integer's in hex,
+/// a float's in decimal in as few digits as read back to it, a bool's as `true` or `false`; a
+/// vector's lanes in parentheses), then its bytes in the order they come:
+/// `114:UInt=0x08000251 (51020008)`. One of a type no function constant takes reads
+/// `index:data_type=bytes`, its `MTLDataType`'s number and its bytes alone.
 pub(crate) struct PipelineFunctions(Vec<(&'static str, String, Vec<FunctionConstant>)>);
 
 impl std::fmt::Display for PipelineFunctions {
@@ -4112,15 +5004,78 @@ impl std::fmt::Display for PipelineFunctions {
                 if j > 0 {
                     f.write_str(" ")?;
                 }
-                write!(f, "{}:{}=", c.index, c.data_type)?;
-                for b in c.bytes().unwrap_or(&c.value) {
-                    write!(f, "{b:02x}")?;
-                }
+                write_constant(f, c)?;
             }
             f.write_str("]")?;
         }
         Ok(())
     }
+}
+
+/// A pipeline function's constant `c`, as [`PipelineFunctions`] reads it.
+fn write_constant(f: &mut std::fmt::Formatter<'_>, c: &FunctionConstant) -> std::fmt::Result {
+    let (Some((lane, lanes)), Some(bytes)) = (FunctionConstant::lanes(c.data_type), c.bytes())
+    else {
+        write!(f, "{}:{}=", c.index, c.data_type)?;
+        return write_hex(f, &c.value);
+    };
+    write!(f, "{}:{}", c.index, lane.name())?;
+    if lanes > 1 {
+        write!(f, "{lanes}")?;
+    }
+    f.write_str("=")?;
+    if lanes > 1 {
+        f.write_str("(")?;
+    }
+    for (at, bits) in bytes.chunks_exact(lane.size()).enumerate() {
+        if at > 0 {
+            f.write_str(", ")?;
+        }
+        write_lane(f, lane, bits)?;
+    }
+    if lanes > 1 {
+        f.write_str(")")?;
+    }
+    f.write_str(" (")?;
+    write_hex(f, bytes)?;
+    f.write_str(")")
+}
+
+/// `bytes` in hex, in the order they come.
+fn write_hex(f: &mut std::fmt::Formatter<'_>, bytes: &[u8]) -> std::fmt::Result {
+    bytes.iter().try_for_each(|b| write!(f, "{b:02x}"))
+}
+
+/// One lane of a function constant, `bits` its little-endian bytes, as [`PipelineFunctions`]
+/// reads it.
+fn write_lane(
+    f: &mut std::fmt::Formatter<'_>,
+    lane: ConstantLane,
+    bits: &[u8],
+) -> std::fmt::Result {
+    let mut le = [0u8; 8];
+    le[..bits.len()].copy_from_slice(bits);
+    let raw = u64::from_le_bytes(le);
+    match lane {
+        ConstantLane::Bool => write!(f, "{}", raw != 0),
+        ConstantLane::Float => write!(f, "{:?}", f32::from_bits(raw as u32)),
+        ConstantLane::Half => write!(f, "{:?}", half_to_f32(raw as u16)),
+        _ => write!(f, "{raw:#0width$x}", width = 2 + 2 * bits.len()),
+    }
+}
+
+/// The `float` an IEEE 754 binary16 `half` of bits `h` reads as, exactly.
+fn half_to_f32(h: u16) -> f32 {
+    let sign = u32::from(h & 0x8000) << 16;
+    let exponent = u32::from((h >> 10) & 0x1f);
+    let fraction = u32::from(h & 0x3ff);
+    let magnitude = match exponent {
+        // Zero or subnormal: the fraction times 2^-24.
+        0 => f32::from(h & 0x3ff) * f32::from_bits(0x3380_0000),
+        0x1f => f32::from_bits(0x7f80_0000 | (fraction << 13)),
+        _ => f32::from_bits(((exponent + 112) << 23) | (fraction << 13)),
+    };
+    f32::from_bits(magnitude.to_bits() | sign)
 }
 
 impl<P: Platform> PipelineJob<P> {
@@ -4229,7 +5184,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
             let Some(vertex_library) = vertex_library.resolve() else {
                 return Ok(refused(no_library("vertex")));
             };
-            let Some(vertex) = specialised::<P>(&vertex_library, &vertex_name, &vertex_constants)?
+            let Some(vertex) =
+                stage_function::<P>(&vertex_library, &vertex_name, &vertex_constants)?
             else {
                 return Ok(refused(no_function(&vertex_name)));
             };
@@ -4239,7 +5195,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                     let Some(library) = library.resolve() else {
                         return Ok(refused(no_library("fragment")));
                     };
-                    let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+                    let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
                         return Ok(refused(no_function(&name)));
                     };
                     Some(function)
@@ -4270,6 +5226,7 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
                 vertex_linked,
                 fragment_linked,
+                private_state: fields.private_state,
             };
             // A nil state or an `NSError` refuses; a refusal Metal answers with none dies at the
             // send, inside the caller's refusal scope.
@@ -4305,16 +5262,15 @@ pub(crate) fn compile_pipeline<P: Platform>(
             }
             // Each stage's function: a library being made is waited for here, and one the
             // platform refused, or an entry point it makes no function of, refuses the pipeline.
-            let function =
-                |stage: &str,
-                 (library, name, constants): StageRef<P>|
-                 -> RaiseResult<Result<P::Function, String>> {
-                    let Some(library) = library.resolve() else {
-                        return Ok(Err(no_library(stage)));
-                    };
-                    Ok(specialised::<P>(&library, &name, &constants)?
-                        .ok_or_else(|| no_function(&name)))
+            let function = |stage: &str,
+                            (library, name, constants): StageRef<P>|
+             -> RaiseResult<Result<P::Function, String>> {
+                let Some(library) = library.resolve() else {
+                    return Ok(Err(no_library(stage)));
                 };
+                Ok(stage_function::<P>(&library, &name, &constants)?
+                    .ok_or_else(|| no_function(&name)))
+            };
             let object = match object.map(|f| function("object", f)).transpose()? {
                 None => None,
                 Some(Ok(made)) => Some(made),
@@ -4396,12 +5352,13 @@ pub(crate) fn compile_pipeline<P: Platform>(
             name,
             constants,
             linked,
+            libraries,
             fields,
         } => {
             let Some(library) = library.resolve() else {
                 return Ok(refused(no_library("kernel")));
             };
-            let Some(function) = specialised::<P>(&library, &name, &constants)? else {
+            let Some(function) = stage_function::<P>(&library, &name, &constants)? else {
                 return Ok(refused(no_function(&name)));
             };
             let linked = match linked_functions::<P>(linked)? {
@@ -4418,6 +5375,8 @@ pub(crate) fn compile_pipeline<P: Platform>(
                 support_indirect_command_buffers: fields.support_indirect_command_buffers,
                 stage_input: fields.stage_input,
                 linked,
+                libraries,
+                open_cl_mode: fields.open_cl_mode,
             };
             Ok(match device.new_compute_pipeline_state_full(&desc) {
                 Ok(Some(pipeline)) => {
@@ -4500,6 +5459,24 @@ fn constants_tail(message: &[u8], offset: u32, count: u32) -> Option<Vec<Functio
             })
             .collect(),
     )
+}
+
+/// A pipeline stage's function `name` of `library`, made with its constant values `constants`,
+/// none among them too, as the guest made it: the guest's bundle refuses a pipeline of a function
+/// made by name that declares constants, in Metal's words (`RgfxFunction`'s
+/// `rgfxUnspecialisedError`), so each stage function it names was made with constant values or by
+/// a descriptor, or declares none. Made with none, a function that declares constants reads them
+/// as undefined, and one that declares none is the function its name makes, at the same cost:
+/// Metal's `newFunctionWithName:constantValues:error:` makes both with values that set nothing,
+/// and a pipeline of each (measured: macOS 26.7.1, AMD Radeon Pro 5300M and Intel UHD Graphics
+/// 630). Made by name instead, a function that declares constants would have its pipeline refused
+/// on the Vulkan platform, as Metal ends its process there.
+fn stage_function<P: Platform>(
+    library: &P::Library,
+    name: &str,
+    constants: &[FunctionConstant],
+) -> RaiseResult<Option<P::Function>> {
+    library.new_function_with_constants(OnFault::Return, name, constants)
 }
 
 /// The function `name` of `library`, specialised by `constants` when there are any.
@@ -4716,7 +5693,7 @@ impl<P: Platform> Closed<P> {
             && let Err(refusal) = refusals::refusing(move || drop(views))
         {
             log::warn!(
-                target: "reims_vgpu::graphics",
+                target: "reims_vgpu::graphics", kind:% = refusal;
                 "context {context}'s pages blocks' views were let go of at its close, and a \
                  release was refused: {refusal}"
             );
@@ -4737,7 +5714,7 @@ pub(crate) fn drop_refused<T>(id: u64, value: T) {
 /// Logs the refused release of object `id` ([`drop_refused`]).
 fn refused_release(id: u64, refusal: &refusals::Refusal) {
     log::warn!(
-        target: "reims_vgpu::graphics",
+        target: "reims_vgpu::graphics", kind:% = refusal;
         "object {id:#x} was let go of, and its release was refused: {refusal}"
     );
 }
@@ -4750,14 +5727,17 @@ pub(crate) fn no_raise() -> Box<dyn FnOnce(Raise) + Send> {
 
 /// `op`, one guest op of the lane's, inside the refusal scope ([`refusals::refusing`]): a death
 /// on this thread inside it, a platform refusing a create or an encode among them, which ends
-/// the process at its call on the paravirt device, refuses the op instead, as a raise the
+/// the process at its call outside a scope, refuses the op instead, as a raise the
 /// caller's handler takes. So the op is refused to the guest at its op (a refused reflection, a
 /// `COMPLETE` with its status, a failed command buffer) and the process goes on
 /// (docs/graphics-kext/design.md, "Guest input the host refuses").
 pub(crate) fn refusing<T>(op: impl FnOnce() -> RaiseResult<T>) -> RaiseResult<T> {
-    refusals::refusing(op).unwrap_or_else(|refusal| {
-        Err(Raise::foreign("rgfx.platform.refused").with_detail(format!("refused: {refusal}")))
-    })
+    refusals::refusing(op).unwrap_or_else(|refusal| Err(refused_raise(&refusal)))
+}
+
+/// The raise an op a death in its scope refused answers ([`refusing`]).
+pub(crate) fn refused_raise(refusal: &refusals::Refusal) -> Raise {
+    Raise::foreign("rgfx.platform.refused").with_detail(format!("refused: {refusal}"))
 }
 
 /// The object-resolution API: the contract the encoder-op decoders
@@ -4802,9 +5782,65 @@ macro_rules! resolvers {
     };
 }
 
+impl<P: Platform> GraphicsDecoder<P> {
+    /// The texture `id` names; an exec fault when `id` is 0 or names no texture. A texture over
+    /// a plane of a laid-out device cache, or over its wide home, is noted among the uses of the
+    /// encoder being walked ([`Self::note_laid`]).
+    pub(crate) fn require_texture(&self, id: u64) -> RaiseResult<&P::Texture> {
+        match self.entry(id) {
+            Some(Entry {
+                handle: ObjHandle::Texture(h),
+                laid_use,
+                ..
+            }) => {
+                if let Some(used) = laid_use {
+                    self.note_laid(*used, false);
+                }
+                Ok(h)
+            }
+            Some(Entry {
+                handle: ObjHandle::Refused(r),
+                ..
+            }) => Err(r.reference(id)),
+            _ => Err(bad_reference()),
+        }
+    }
+
+    /// The texture `id` names, `None` for 0; an exec fault when a non-zero `id` names no texture.
+    /// Noted as [`Self::require_texture`] notes it.
+    pub(crate) fn get_texture(&self, id: u64) -> RaiseResult<Option<&P::Texture>> {
+        if id == 0 {
+            return Ok(None);
+        }
+        self.require_texture(id).map(Some)
+    }
+
+    /// The texture `id` names is a blit's destination or a render pass's attachment: noted as
+    /// written, whatever its usage ([`Self::note_laid`]). Nothing for 0.
+    pub(crate) fn texture_written(&self, id: u64) {
+        if let Some(used) = self.entry(id).and_then(|e| e.laid_use) {
+            self.note_laid(used, true);
+        }
+    }
+
+    /// Notes the use `used` of a texture over a plane of a laid-out device cache or its wide home
+    /// by the encoder being walked, written where `written` (a blit's destination, a render
+    /// pass's attachment) or, outside a blit encoder, where its usage lets a shader write it: at
+    /// the encoder's end the side written is copied into the other ([`Self::reconcile_laid`]). A
+    /// blit's source is no write: counted as one, its stale side was copied over the other's
+    /// write (oracle_surftex `alias.narrow-clear.wide.fence` on RADV, its surface left without
+    /// the clear).
+    fn note_laid(&self, mut used: LaidUse, written: bool) {
+        if !self.surface_caches.any_home() {
+            return;
+        }
+        used.writes = written || (used.writes && !self.laid_blit.get());
+        self.laid_uses.borrow_mut().push(used);
+    }
+}
+
 resolvers! {
     (require_buffer, get_buffer, Buffer, Buffer, "buffer"),
-    (require_texture, get_texture, Texture, Texture, "texture"),
     (require_sampler, get_sampler, Sampler, SamplerState, "sampler"),
     (require_depth_stencil, get_depth_stencil, DepthStencil, DepthStencilState, "depth/stencil state"),
     (require_render_pipeline, get_render_pipeline, RenderPipeline, RenderPipeline, "render pipeline"),
@@ -4814,6 +5850,9 @@ resolvers! {
     (require_heap, get_heap, Heap, Heap, "heap"),
     (require_library, get_library, Library, Library, "library"),
     (require_indirect_command_buffer, get_indirect_command_buffer, Icb, Icb, "indirect command buffer"),
+    (require_rate_map, get_rate_map, RateMap, RateMap, "rasterization rate map"),
+    (require_function_table, get_function_table, FunctionTable, VisibleFunctionTable, "visible function table"),
+    (require_function_handle, get_function_handle, FunctionHandle, FunctionHandle, "function handle"),
 }
 
 /// The line of a heap create the platform answered nil for (a size of 0, memory the device
@@ -4872,7 +5911,7 @@ const LAST_ASKED_PIXEL_FORMAT: u64 = 2047;
 /// value it does not take ("pixelFormat (2000) is not a valid MTLPixelFormat"), and every texture
 /// creator and the state's creation at one it takes but describes none for ("MTLTextureDescriptor
 /// has invalid pixelFormat (630)"; measured on the M3 Max, which the Vulkan platform imitates as
-/// deaths at the creator, `reims_vgpu_vulkan`'s `gpu::desc` and `gpu::serialized`). A Metal
+/// deaths at the op, `reims_vgpu_vulkan`'s `gpu::desc` and `gpu::states`). A Metal
 /// assertion is no death of the library's, so on a Mac host no refusal scope takes it: the lane
 /// refuses such an op itself, before any platform call (docs/graphics-kext/design.md, "Guest
 /// input the host refuses"). The guest's bundle sends only formats it read from a real
@@ -5059,6 +6098,50 @@ fn surface_plane(
     })
 }
 
+/// `MTLTextureUsageShaderWrite`: a texture of it may be written by a shader wherever it is bound.
+/// A render pass writes its attachments alone, which it names ([`GraphicsDecoder::texture_written`]).
+const TEXTURE_USAGE_WRITES: u64 = 0x2;
+
+/// The plane `plane` of the texture `m` makes over a buffer of a device cache laid out at the
+/// GPU's pitch, `laid`: its first byte, and its chroma plane's where its facts name a second
+/// plane, at the same byte of the same row of the same plane of the cache, its rows at the
+/// cache's pitch ([`surface_cache::Repitched::place`]). `None` where the texture does not lie
+/// in its plane's texels there: its first byte, or its chroma plane's, in no plane's texels, or
+/// its texels, `row_bytes` by `rows` from its first, past its plane's. Such a texture lies over the
+/// block's wide home at the surface's own place instead (`surface_cache`, "Wider than the
+/// plane"), as all three Macs make it: an RG8 texture of 128-byte rows over a 64-wide L008
+/// surface of 128-byte rows (oracle_surftex `l008.fmt.rg8`), or one 128 texels wide over a BGRA
+/// surface of 512-byte rows (`bgrapad.128x64`).
+fn laid_plane(
+    laid: &surface_cache::Repitched,
+    plane: SurfacePlane,
+    row_bytes: u64,
+    rows: u64,
+) -> Option<SurfacePlane> {
+    let chroma = match (plane.facts).filter(|f| f.plane_count >= 2) {
+        Some(f) => Some(laid.place(f.chroma_offset, f.chroma_bytes_per_row)?),
+        None => None,
+    };
+    let placed = laid.place(plane.offset, plane.bytes_per_row)?;
+    if row_bytes > placed.room.0 || rows > placed.room.1 {
+        return None;
+    }
+    let facts = plane.facts.map(|f| match chroma {
+        Some(c) => SurfaceFacts {
+            chroma_offset: c.offset,
+            chroma_bytes_per_row: c.bytes_per_row,
+            ..f
+        },
+        None => f,
+    });
+    Some(SurfacePlane {
+        offset: placed.offset,
+        bytes_per_row: placed.bytes_per_row,
+        facts,
+        ..plane
+    })
+}
+
 /// An OSType as its four characters, quoted, where each is printable ASCII; else its value in hex.
 fn four_characters(code: u32) -> String {
     let bytes = code.to_be_bytes();
@@ -5085,13 +6168,118 @@ fn stencil(s: &RgfxStencilDescriptor) -> StencilDesc {
 
 #[cfg(test)]
 mod tests {
+
+    /// A pipeline's functions read each constant's value as its type's lanes read it,
+    /// little-endian, before its bytes in order: a `uint` in hex, a `float` in decimal, a vector's
+    /// lanes each (a `half2`, a `bool3`, a `short2`), and a type no constant takes by its number
+    /// and bytes alone
+    #[test]
+    fn a_pipeline_s_functions_read_each_constant_s_value_by_its_type() {
+        use reims_vgpu_vulkan::core::platform::resource::FunctionConstant;
+
+        let constant = |index: u32, data_type: u32, bytes: &[u8]| {
+            let mut value = [0; FunctionConstant::MAX_BYTES];
+            value[..bytes.len()].copy_from_slice(bytes);
+            FunctionConstant {
+                index,
+                data_type,
+                value,
+            }
+        };
+        let functions = super::PipelineFunctions(vec![
+            (
+                "vertex",
+                "vs".to_owned(),
+                vec![
+                    constant(114, 33, &[0x51, 0x02, 0x00, 0x08]), // UInt
+                    constant(2, 3, &1.5f32.to_le_bytes()),        // Float
+                ],
+            ),
+            (
+                "fragment",
+                "fs".to_owned(),
+                vec![
+                    constant(0, 17, &[0x00, 0x3c, 0x01, 0xc0]), // Half2: 1.0, -2.001953125 exactly
+                    constant(1, 55, &[1, 0, 1]),                // Bool3
+                    constant(3, 38, &[0xff, 0xff, 0x02, 0x00]), // Short2
+                    constant(4, 121, &[0x80, 0x3f]),            // BFloat
+                ],
+            ),
+        ]);
+        // A type no constant takes: all of the value's bytes, as before.
+        let bfloat = format!("803f{}", "00".repeat(FunctionConstant::MAX_BYTES - 2));
+        assert_eq!(
+            functions.to_string(),
+            format!(
+                "vertex \"vs\" [114:UInt=0x08000251 (51020008) 2:Float=1.5 (0000c03f)], \
+                 fragment \"fs\" [0:Half2=(1.0, -2.0019531) (003c01c0) \
+                 1:Bool3=(true, false, true) (010001) 3:Short2=(0xffff, 0x0002) (ffff0200) \
+                 4:121={bfloat}]"
+            )
+        );
+        assert_eq!(super::half_to_f32(0x0001), f32::from_bits(0x3380_0000));
+        assert_eq!(super::half_to_f32(0x7c00), f32::INFINITY);
+        assert!(super::half_to_f32(0x7e00).is_nan());
+    }
+
+    /// A slow answer's line names the cache's planes and bytes, the copy it came with (its own,
+    /// after the queues it waited for, or copies already in flight) and how it reaches the pages,
+    /// and splits the copy phase into the time before the GPU had run it, the GPU's run and a
+    /// staging buffer's copy; it says so where the platform gave no GPU times, and says nothing
+    /// of a copy where the answer waited for none
+    #[test]
+    fn a_slow_answer_s_line_names_its_cache_and_splits_its_copy() {
+        use super::surface_cache::CopySplit;
+        let ms = std::time::Duration::from_millis;
+        let own = CopySplit {
+            cache: Some((2, 12_441_600)),
+            into: "runs",
+            users: Some(2),
+            copies: 1,
+            wait: Some(ms(560)),
+            transfer: Some(ms(33)),
+            staged: ms(0),
+        };
+        assert_eq!(
+            super::slow_cache(&own),
+            " (a device cache of 2 planes, 12441600 bytes)"
+        );
+        assert_eq!(
+            super::slow_copy(&own),
+            " (its own copy, by runs, after the command buffers of 2 queues that used the cache: \
+             560.0 ms before the GPU had run it (the GPU's wait for those command buffers, and \
+             the transfer queue's work before it), 33.0 ms on the GPU, 0.0 ms copying a staging \
+             buffer into the pages)"
+        );
+        let behind = CopySplit {
+            cache: Some((0, 4096)),
+            into: "a staging buffer",
+            users: None,
+            copies: 2,
+            wait: None,
+            transfer: None,
+            staged: ms(4),
+        };
+        assert_eq!(
+            super::slow_cache(&behind),
+            " (a device cache of 4096 bytes)"
+        );
+        assert_eq!(
+            super::slow_copy(&behind),
+            " (2 copies already in flight, by a staging buffer: the platform gave no GPU times, \
+             4.0 ms copying a staging buffer into the pages)"
+        );
+        let none = CopySplit::default();
+        assert_eq!(super::slow_cache(&none), " (no device cache)");
+        assert_eq!(super::slow_copy(&none), "");
+    }
     use std::sync::Arc;
 
-    use reims_graphics::wire::{
+    use reims_vgpu_graphics::wire::{
         RGFX_CMD_HEAP_TEXTURE_SIZE_AND_ALIGN, RGFX_LIBRARY_BYTES_OFFSET, RGFX_RESOURCE_ID_CHUNKS,
         RgfxLibraryCreate, RgfxLibraryFromRegion, RgfxTextureView,
     };
-    use reims_vgpu_core::testkit::{Arg, FakePlatform, Step};
+    use reims_vgpu_vulkan::core::testkit::{Arg, FakePlatform, Step};
     use zerocopy::IntoBytes;
 
     use super::*;
@@ -5103,7 +6291,7 @@ mod tests {
     /// none (0) is no attachment
     #[test]
     fn a_pixel_format_the_device_describes_none_for_is_refused_before_the_platform() {
-        use reims_vgpu_core::platform::types::PixelFormatInfo;
+        use reims_vgpu_vulkan::core::platform::types::PixelFormatInfo;
         const INFO: &str = "MTLPixelFormatGetInfoForDevice()";
         const MAKES: [&str; 3] = [
             "newTextureWithDescriptor:",
@@ -5114,7 +6302,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let grant = RgfxResourceIdChunk {
             header: RgfxMsgHeader {
@@ -5255,23 +6443,18 @@ mod tests {
         assert_eq!(check(fields(81, 0)), None);
     }
 
-    /// What the surface views did is logged at every 256th `SURFACE_PAGES`, and at the first one
-    /// ten seconds or more after the last log, however few came between.
+    /// What the surface views did is logged at the first `SURFACE_PAGES` a minute or more after
+    /// the last log, however many came between, and at no other
     #[test]
-    fn the_views_counts_are_logged_by_count_and_by_time() {
+    fn the_views_counts_are_logged_at_most_once_a_minute() {
         let last = MonoTime::from_nanos(5_000_000_000);
         let after = |d: std::time::Duration| last.saturating_add(d);
         let ms = std::time::Duration::from_millis;
-        // The 256th logs at once, and so do its multiples.
-        assert!(views_log_due(256, after(ms(1)), last));
-        assert!(views_log_due(512, last, last));
-        // Others wait for the interval.
-        assert!(!views_log_due(255, after(ms(1)), last));
-        assert!(!views_log_due(3, after(ms(9_999)), last));
-        assert!(views_log_due(3, after(ms(10_000)), last));
-        assert!(views_log_due(257, after(ms(60_000)), last));
+        assert!(!views_log_due(after(ms(1)), last));
+        assert!(!views_log_due(after(ms(59_999)), last));
+        assert!(views_log_due(after(ms(60_000)), last));
         // A clock that reads earlier than the last log waits as if no time had passed.
-        assert!(!views_log_due(3, MonoTime::from_nanos(1), last));
+        assert!(!views_log_due(MonoTime::from_nanos(1), last));
     }
 
     /// The closed contexts' runs hold each number inserted, joined with the runs it is next to,
@@ -5320,7 +6503,7 @@ mod tests {
         // cursor's span.
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let (staging, ack) = (blocks + 0x4000, blocks + 0x100);
         let air: Vec<u8> = (0..0x2345u32).map(|i| (i * 7) as u8).collect();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
@@ -5399,7 +6582,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let buffer = |obj_id: u64, region_offset: u64, length: u64| RgfxBufferOverHostMemory {
             header: RgfxMsgHeader {
@@ -5512,7 +6695,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         region.grant(1, blocks, 0x2_0000);
         dec.set_context(Some(1));
@@ -5586,7 +6769,7 @@ mod tests {
         let device = p.device();
         let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
         let size = blocks + 0x10_0000 + RGFX_CURSOR_SPAN;
-        let region = Arc::new(reims_graphics::region::Region::new(size as usize).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(size as usize).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         region.grant(1, blocks, 0x2_0000);
         dec.set_context(Some(1));
@@ -5640,14 +6823,14 @@ mod tests {
     /// way, is refused, and stores and makes nothing more.
     #[test]
     fn an_unshared_queue_create_makes_the_platforms_unshared_queue() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_QUEUE_QUIET_SCHEDULED, RGFX_QUEUE_UNSHARED, RgfxQueueCreateFlags,
         };
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let create = |obj_id: u64, flags: Option<u32>| {
             let mut bytes = RgfxQueueCreate {
@@ -5733,7 +6916,7 @@ mod tests {
     fn a_sampler_create_answers_the_platforms_id() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let create = |obj_id, seqno| RgfxSamplerCreate {
             header: RgfxMsgHeader {
@@ -5798,6 +6981,108 @@ mod tests {
         assert!(dec.sampler_state(&device, &[0u8; 8]).unwrap().is_none());
     }
 
+    /// A sampler create's extension reaches the platform's sampler: its reduction mode and LOD
+    /// bias are the descriptor's, on both the posted and the asked route; a create without the
+    /// extension leaves both unset, Metal's defaults.
+    #[test]
+    fn a_sampler_creates_extension_sets_its_reduction_and_bias() {
+        let p = Arc::new(FakePlatform::new());
+        let device = p.device();
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
+        let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
+        let create = |obj_id, size: usize| RgfxSamplerCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_SAMPLER_CREATE,
+                size: size as u32,
+                seqno: 3,
+            },
+            obj_id,
+            min_filter: 1,
+            mag_filter: 1,
+            mip_filter: 1,
+            max_anisotropy: 8,
+            flags: 0b001,
+            lod_max_clamp_bits: f32::MAX.to_bits(),
+            ..RgfxSamplerCreate::default()
+        };
+        let whole = |obj_id| {
+            let mut bytes = create(obj_id, RGFX_SAMPLER_CREATE_EXT_OFFSET as usize + 8)
+                .as_bytes()
+                .to_vec();
+            let ext = RgfxSamplerCreateExt {
+                reduction_mode: 1,
+                lod_bias_bits: (-1.5f32).to_bits(),
+            };
+            bytes.extend_from_slice(ext.as_bytes());
+            bytes
+        };
+        let made = |mark| -> SamplerDesc {
+            let calls = p.call_log().since(mark);
+            let calls: Vec<_> = calls
+                .iter()
+                .filter(|c| c.sel == "newSamplerStateWithDescriptor:")
+                .collect();
+            assert_eq!(calls.len(), 1);
+            let Some(Arg::Val(logged)) = calls[0].args.first() else {
+                panic!("no descriptor in {:?}", calls[0]);
+            };
+            let expected = |reduction_mode, lod_bias| SamplerDesc {
+                min_filter: Some(1),
+                mag_filter: Some(1),
+                mip_filter: Some(1),
+                s_address_mode: Some(0),
+                t_address_mode: Some(0),
+                r_address_mode: Some(0),
+                border_color: Some(0),
+                compare_function: Some(0),
+                max_anisotropy: Some(8),
+                lod_min_clamp: Some(0.0),
+                lod_max_clamp: Some(f32::MAX),
+                normalized_coordinates: Some(true),
+                lod_average: Some(false),
+                support_argument_buffers: Some(false),
+                reduction_mode,
+                lod_bias,
+                resource_index: None,
+            };
+            let with = expected(Some(1), Some(-1.5));
+            let without = expected(None, None);
+            if *logged == format!("{with:?}") {
+                with
+            } else {
+                assert_eq!(*logged, format!("{without:?}"));
+                without
+            }
+        };
+
+        let mark = p.call_log().mark();
+        dec.make_sampler(&device, &whole(31)).unwrap().unwrap();
+        let posted = made(mark);
+        assert_eq!(
+            (posted.reduction_mode, posted.lod_bias),
+            (Some(1), Some(-1.5))
+        );
+
+        dec.end_message();
+        let mark = p.call_log().mark();
+        let answer = dec.sampler_state(&device, &whole(32)).unwrap().unwrap();
+        assert_eq!(answer.status, RGFX_STATUS_OK);
+        let asked = made(mark);
+        assert_eq!(
+            (asked.reduction_mode, asked.lod_bias),
+            (Some(1), Some(-1.5))
+        );
+
+        dec.end_message();
+        let mark = p.call_log().mark();
+        let plain = create(33, size_of::<RgfxSamplerCreate>());
+        dec.make_sampler(&device, plain.as_bytes())
+            .unwrap()
+            .unwrap();
+        let bare = made(mark);
+        assert_eq!((bare.reduction_mode, bare.lod_bias), (None, None));
+    }
+
     /// A heap texture size query is answered at its seqno with the device's size and alignment
     /// for the shape, and makes nothing; one the device raises at is refused with both 0, and a
     /// query too short for its shape is an invalid argument.
@@ -5805,7 +7090,7 @@ mod tests {
     fn heap_texture_sizes_are_the_devices() {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x1_0000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x1_0000).unwrap());
         let dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), Arc::clone(&region));
         let query = RgfxHeapTextureSizeAndAlign {
             header: RgfxMsgHeader {
@@ -5890,10 +7175,10 @@ mod tests {
     /// message sees the destroy.
     #[test]
     fn a_message_names_what_its_own_destroys_and_makes_left() {
-        use reims_vgpu_core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
-        let region = Arc::new(reims_graphics::region::Region::new(0x10000).unwrap());
+        let region = Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap());
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
         dec.set_context(Some(1));
         let fence = || ObjHandle::Fence(device.new_fence().unwrap().unwrap());
@@ -5946,14 +7231,14 @@ mod tests {
     /// a reset sets those of the contexts it drops.
     #[test]
     fn a_gone_context_s_events_are_set_past_every_value() {
-        use reims_vgpu_core::testkit::Call;
-        use reims_vgpu_core::testkit::impls::device::UNSHARED_QUEUE;
+        use reims_vgpu_vulkan::core::testkit::Call;
+        use reims_vgpu_vulkan::core::testkit::impls::device::UNSHARED_QUEUE;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
         let obj = |context: u64, n: u64| context << RGFX_CONTEXT_OBJ_ID_SHIFT | n;
         let create = |ty: u32, obj_id: u64| {
@@ -6107,7 +7392,7 @@ mod tests {
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         let obj = |ty: u32, obj_id: u64| RgfxObjectCreate {
@@ -6491,7 +7776,7 @@ mod tests {
         );
         assert_eq!(format!("{:?}", dec.surface_texture(0x77).unwrap()), first);
         assert_eq!(
-            reims_vgpu_core::platform::resource::Texture::width(&shown),
+            reims_vgpu_vulkan::core::platform::resource::Texture::width(&shown),
             64
         );
         drop(shown);
@@ -6951,7 +8236,7 @@ mod tests {
             desc,
             writers_offset: RGFX_SURFACE_NO_WRITERS,
         };
-        let logs = reims_vgpu_core::testkit::logs::capture();
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         let script = p.script();
         script.push("newTextureWithDescriptor:offset:bytesPerRow:", Step::Nil);
         script.push(
@@ -7027,7 +8312,7 @@ mod tests {
     /// texture's warning names the facts it carried.
     #[test]
     fn a_surface_texture_reads_its_facts_by_the_message_size() {
-        use reims_graphics::wire::{
+        use reims_vgpu_graphics::wire::{
             RGFX_SURFACE_FACTS_OFFSET, RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts,
         };
         let p = Arc::new(FakePlatform::new());
@@ -7132,7 +8417,7 @@ mod tests {
         assert_eq!(made(), 2, "no platform call for a malformed message");
 
         // A refused texture's warning names the facts.
-        let logs = reims_vgpu_core::testkit::logs::capture();
+        let logs = reims_vgpu_vulkan::core::testkit::logs::capture();
         p.script()
             .push("newTextureWithDescriptor:iosurface:plane:", Step::Nil);
         assert_eq!(
@@ -7167,7 +8452,7 @@ mod tests {
     /// wire names no value for is malformed, and reaches no platform call.
     #[test]
     fn a_surface_texture_s_facts_reach_the_platform() {
-        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
@@ -7351,25 +8636,25 @@ mod tests {
     pub(super) fn pipeline_decoder() -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
-        Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
+        Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
     ) {
         pipeline_decoder_over(Arc::new(
-            reims_graphics::region::Region::new(0x10000).unwrap(),
+            reims_vgpu_graphics::region::Region::new(0x10000).unwrap(),
         ))
     }
 
     /// [`pipeline_decoder`] over `region`.
     pub(super) fn pipeline_decoder_over(
-        region: Arc<reims_graphics::region::Region>,
+        region: Arc<reims_vgpu_graphics::region::Region>,
     ) -> (
         Arc<FakePlatform>,
         GraphicsDecoder<FakePlatform>,
-        Arc<reims_vgpu_core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
+        Arc<reims_vgpu_vulkan::core::sync::Mutex<Vec<RgfxPipelineReflection>>>,
     ) {
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(Arc::clone(&p), region);
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.reflection);
@@ -7585,7 +8870,77 @@ mod tests {
             input_primitive_topology: 3,
             max_vertex_amplification_count: 2,
             support_indirect_command_buffers: true,
+            private_state: None,
         }
+    }
+
+    /// A render create with the private state after its head reaches the platform's creator with
+    /// it, each field the guest's raw value, and the tail past the record read as before; a
+    /// message that ends inside the record is malformed
+    #[test]
+    fn a_render_create_carries_its_private_state() {
+        let head = size_of::<RgfxRenderPipelineCreate>();
+        let state = RgfxRenderPipelinePrivateState {
+            sample_mask: 3,
+            sample_coverage: 0.5f32.to_bits(),
+            logic_operation: 10,
+            flags: RGFX_PRIVATE_RENDER_OPENGL_MODE
+                | RGFX_PRIVATE_RENDER_LOGIC_OPERATION
+                | RGFX_PRIVATE_RENDER_DEPTH_STENCIL_WRITE_DISABLED,
+            reserved_14: 0,
+        };
+        let name = b"vmain";
+        let name_at = head + size_of_val(&state);
+        let total = (name_at + name.len()).next_multiple_of(8);
+        let m = RgfxRenderPipelineCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_RENDER_PIPELINE_CREATE,
+                size: total as u32,
+                seqno: 9,
+            },
+            obj_id: 100,
+            vertex_library_obj_id: 1,
+            vertex_name_offset: name_at as u32,
+            vertex_name_len: name.len() as u32,
+            raster_sample_count: 1,
+            flags: RGFX_RENDER_PIPELINE_PRIVATE_STATE,
+            ..RgfxRenderPipelineCreate::default()
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(state.as_bytes());
+        message.extend_from_slice(name);
+        message.resize(total, 0);
+        let want = PrivateRenderDesc {
+            open_gl_mode_enabled: true,
+            sample_mask: 3,
+            sample_coverage: 0.5,
+            sample_coverage_invert: false,
+            logic_operation_enabled: true,
+            logic_operation: 10,
+            depth_stencil_write_disabled: true,
+        };
+        assert_eq!(
+            render_fields(&message, &m).map(|f| f.private_state),
+            Ok(Some(want))
+        );
+        let (p, mut dec, replies) = pipeline_decoder();
+        let device = p.device();
+        assert_eq!(dec.decode(&device, &message).unwrap(), Ok(()));
+        assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
+        let calls = p
+            .call_log()
+            .calls_to("newRenderPipelineStateWithDescriptor:error:");
+        let Arg::Val(logged) = &calls[0].args[0] else {
+            panic!("{:?}", calls[0].args);
+        };
+        assert!(
+            logged.contains(&format!("private_state: {:?}", Some(want))),
+            "{logged}"
+        );
+        assert_eq!(
+            render_fields(&message[..head + 8], &m).map(|f| f.private_state),
+            Err(DecodeError::Malformed)
+        );
     }
 
     /// Every field of a render create reaches the platform's creator, read from the wire as the
@@ -7701,10 +9056,10 @@ mod tests {
     /// kind, with no limits after it
     #[test]
     fn a_mesh_render_create_is_answered_with_its_mesh_limits() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, _) = pipeline_decoder();
         let device = p.device();
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.bytes());
@@ -7744,7 +9099,7 @@ lacks {part}"
             (100, RGFX_PIPELINE_OK, RGFX_PIPELINE_KIND_MESH)
         );
         let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
-            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+            &reply[reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
         )
         .unwrap();
         assert_eq!(
@@ -7767,7 +9122,7 @@ lacks {part}"
         );
         let reply = replies.lock()[1].clone();
         let (limits, _) = RgfxMeshPipelineReflection::read_from_prefix(
-            &reply[reims_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
+            &reply[reims_vgpu_graphics::wire::RGFX_PIPELINE_REFLECTION_MESH_OFFSET as usize..],
         )
         .unwrap();
         assert_eq!(
@@ -7820,7 +9175,7 @@ lacks {part}"
         const MAKE: &str = "newRenderPipelineStateWithMeshDescriptor:options:reflection:error:";
         let (p, mut dec, _) = pipeline_decoder();
         let device = p.device();
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies.lock().push(r.bytes());
@@ -7855,7 +9210,7 @@ lacks {part}"
     /// [`DecodeError::Refused`] with a refused reply, nothing is stored, and the next is made
     #[test]
     fn a_compile_the_platform_refuses_in_the_decoder_is_a_refused_reply() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, replies) = pipeline_decoder();
         let device = p.device();
         let faults = p.faults();
@@ -7870,7 +9225,12 @@ lacks {part}"
                 .unwrap(),
             Err(DecodeError::Refused)
         );
-        faults.at("MTLLibrary", "newFunctionWithName:", 0, Fault::Crash);
+        faults.at(
+            "MTLLibrary",
+            "newFunctionWithName:constantValues:error:",
+            0,
+            Fault::Crash,
+        );
         assert_eq!(
             dec.decode(&device, &whole_render_create(101, false))
                 .unwrap(),
@@ -7944,8 +9304,8 @@ lacks {part}"
     }
 
     /// Every field of a compute create reaches the platform's creator: the threadgroup-size
-    /// multiple, the maximum threads per threadgroup, the maximum call stack depth and indirect
-    /// command buffer support
+    /// multiple, the maximum threads per threadgroup, the maximum call stack depth, indirect
+    /// command buffer support and OpenCL mode
     #[test]
     fn a_compute_create_carries_its_whole_descriptor() {
         let (p, mut dec, replies) = pipeline_decoder();
@@ -7964,7 +9324,8 @@ lacks {part}"
             name_offset: head,
             name_len: name.len() as u32,
             flags: RGFX_COMPUTE_PIPELINE_TG_MULTIPLE_OF_EXEC_WIDTH
-                | RGFX_COMPUTE_PIPELINE_SUPPORT_ICB,
+                | RGFX_COMPUTE_PIPELINE_SUPPORT_ICB
+                | RGFX_COMPUTE_PIPELINE_OPENCL_MODE,
             max_total_threads_per_threadgroup: 256,
             max_call_stack_depth: 7,
             ..RgfxComputePipelineCreate::default()
@@ -7984,11 +9345,12 @@ lacks {part}"
                     max_total_threads_per_threadgroup: 256, max_call_stack_depth: 7, \
                     support_indirect_command_buffers: true, stage_input: None";
         assert!(logged.contains(part), "{logged}");
+        assert!(logged.contains("open_cl_mode: true"), "{logged}");
     }
 
     /// A linked function [`append_linked`] appends: its name, list, `MTLFunctionOptions`, group
     /// name (empty for none), constants and specialized name (empty for none).
-    type LinkedSpec<'a> = (
+    pub(super) type LinkedSpec<'a> = (
         &'a str,
         u32,
         u32,
@@ -8000,7 +9362,11 @@ lacks {part}"
     /// Appends to `bytes` the linked functions `specs` name ([`LinkedSpec`]), each of library
     /// `library`, then their records, and answers the records' offset and count; the message's
     /// size is set again, a multiple of 8.
-    fn append_linked(bytes: &mut Vec<u8>, library: u64, specs: &[LinkedSpec<'_>]) -> (u32, u32) {
+    pub(super) fn append_linked(
+        bytes: &mut Vec<u8>,
+        library: u64,
+        specs: &[LinkedSpec<'_>],
+    ) -> (u32, u32) {
         let mut records = Vec::new();
         for &(name, list, options, group, constants, specialized) in specs {
             let name_offset = bytes.len() as u32;
@@ -8038,7 +9404,7 @@ lacks {part}"
     }
 
     /// `message` with its fixed head of `T` edited by `f`.
-    fn edit_head<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
+    pub(super) fn edit_head<T: FromBytes + IntoBytes + KnownLayout + Immutable>(
         message: &mut [u8],
         f: impl FnOnce(&mut T),
     ) {
@@ -8142,7 +9508,8 @@ lacks {part}"
         let mark = p.call_log().mark();
         assert_eq!(dec.decode(&device, &bytes).unwrap(), Ok(()));
         assert_eq!(replies.lock()[0].status, RGFX_PIPELINE_OK);
-        // Each function made in the wire's order, the binary one with its options.
+        // Each function made in the wire's order, the kernel with its constant values (none), the
+        // binary one with its options.
         let made: Vec<_> = p
             .call_log()
             .since(mark)
@@ -8154,7 +9521,7 @@ lacks {part}"
         assert_eq!(
             sels,
             [
-                "newFunctionWithName:",
+                "newFunctionWithName:constantValues:error:",
                 "newFunctionWithName:",
                 "newFunctionWithDescriptor:error:",
                 "newFunctionWithName:",
@@ -8246,7 +9613,7 @@ lacks {part}"
     /// at refuses the create
     #[test]
     fn a_create_s_bad_linked_function_makes_nothing() {
-        use reims_vgpu_core::testkit::faults::Fault;
+        use reims_vgpu_vulkan::core::testkit::faults::Fault;
         let (p, mut dec, replies) = pipeline_decoder();
         let device = p.device();
         let with = |obj_id, library, list| {
@@ -8344,35 +9711,26 @@ lacks {part}"
         );
     }
 
-    /// On Metal, from the wire: a kernel that calls `linked_add_one`, which its library only
-    /// declares, is made with the callee library's `linked_add_two` linked as a private function
-    /// made with the specialized name `linked_add_one`, and with `linked_add_one` itself; it is
-    /// refused with `linked_add_two` linked under its own name, and with `linked_add_one` made
-    /// under another
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_linked_function_s_specialized_name_resolves_its_call() {
-        a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_metal::MetalPlatform>();
-    }
-
-    /// [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on the Vulkan
-    /// platform, whose answers are Metal's
-    #[cfg(feature = "vulkan")]
+    /// From the wire: a kernel that calls `linked_add_one`, which its library only declares, is
+    /// made with the callee library's `linked_add_two` linked as a private function made with the
+    /// specialized name `linked_add_one`, and with `linked_add_one` itself; it is refused with
+    /// `linked_add_two` linked under its own name, and with `linked_add_one` made under another,
+    /// as Metal answers
     #[test]
     fn on_vulkan_a_linked_function_s_specialized_name_resolves_its_call() {
         a_linked_function_s_specialized_name_resolves_its_call::<reims_vgpu_vulkan::VulkanPlatform>(
         );
     }
 
-    /// The cases of [`on_metal_a_linked_function_s_specialized_name_resolves_its_call`] on `P`.
+    /// The cases of [`on_vulkan_a_linked_function_s_specialized_name_resolves_its_call`] on `P`.
     fn a_linked_function_s_specialized_name_resolves_its_call<P: crate::platform::ApiPlatform>() {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies
@@ -8449,18 +9807,20 @@ lacks {part}"
     }
 
     /// The shell tests' stitchable functions (guest/bundle/tests/stitchable.metal): `fused`, a
-    /// stitched graph of two of them, is `(a + b) * c`, which `stitch_caller` writes of its inputs.
+    /// stitched graph of two of them, is `(a + b) * c`, which `stitch_caller` writes of its inputs;
+    /// `pair`, a graph of one, is `a + b`, which `stitch_caller_extra` writes of its inputs, calling
+    /// it with one argument more than it takes.
     #[cfg(target_os = "macos")]
     const STITCHABLE: &str = include_str!("../../../../../guest/bundle/tests/stitchable.metal");
 
-    /// `stitch_caller`'s inputs, and what `fused` makes of them.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    /// `stitch_caller`'s and `stitch_caller_extra`'s inputs: `fused` makes 20 of them, and `pair` 5.
     const STITCH_INPUTS: [f32; 3] = [2.0, 3.0, 4.0];
 
     /// What the guest sends of a stitched library, made on this Mac as the guest's route makes it
     /// (the bundle's `RgfxStitchOverShadows`): the caller's library, compiled by Metal, and the
-    /// library Metal's stitcher makes of the graph `fused` over that library's functions, each the
-    /// bytes Metal answers for it (`libraryDataContents`); and Metal's own device and libraries.
+    /// library Metal's stitcher makes of the graphs `fused` and `pair` over that library's
+    /// functions, each the bytes Metal answers for it (`libraryDataContents`); and Metal's own
+    /// device and libraries.
     #[cfg(target_os = "macos")]
     struct Stitched {
         device: objc2::rc::Retained<objc2::runtime::ProtocolObject<dyn objc2_metal::MTLDevice>>,
@@ -8522,13 +9882,20 @@ lacks {part}"
             Some(&product),
             &NSArray::<ProtocolObject<dyn MTLFunctionStitchingAttribute>>::new(),
         );
+        let pair = MTLFunctionStitchingGraph::initWithFunctionName_nodes_outputNode_attributes(
+            MTLFunctionStitchingGraph::alloc(),
+            &NSString::from_str("pair"),
+            &NSArray::new(),
+            Some(&call("stitch_add", &[input(0), input(1)])),
+            &NSArray::<ProtocolObject<dyn MTLFunctionStitchingAttribute>>::new(),
+        );
         let function = |name: &str| {
             caller
                 .newFunctionWithName(&NSString::from_str(name))
                 .unwrap()
         };
         let descriptor = MTLStitchedLibraryDescriptor::new();
-        descriptor.setFunctionGraphs(&NSArray::from_retained_slice(&[graph]));
+        descriptor.setFunctionGraphs(&NSArray::from_retained_slice(&[graph, pair]));
         // SAFETY: the functions are of a library of this device.
         unsafe {
             descriptor.setFunctions(&NSArray::from_retained_slice(&[
@@ -8550,17 +9917,17 @@ lacks {part}"
 
     /// Where a compute pipeline links `fused` from: one of the lists of `MTLLinkedFunctions`, or
     /// none.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const STITCH_LINKS: [Option<u32>; 3] = [
         Some(RGFX_LINKED_FUNCTIONS),
         Some(RGFX_LINKED_PRIVATE_FUNCTIONS),
         None,
     ];
 
-    /// Metal's own answers: for each of [`STITCH_LINKS`], whether Metal makes `stitch_caller`'s
-    /// pipeline with `fused` linked there, and what the pipeline writes of [`STITCH_INPUTS`].
+    /// Metal's own answers: for each of [`STITCH_LINKS`], whether Metal makes the pipeline of the
+    /// caller library's `kernel` with the stitched library's `linked` linked there, and what the
+    /// pipeline writes of [`STITCH_INPUTS`].
     #[cfg(target_os = "macos")]
-    fn metal_s_own_stitched_links(s: &Stitched) -> Vec<Option<f32>> {
+    fn metal_s_own_stitched_links(s: &Stitched, kernel: &str, linked: &str) -> Vec<Option<f32>> {
         use objc2_foundation::{NSArray, NSString};
         use objc2_metal::{
             MTLBuffer as _, MTLCommandBuffer as _, MTLCommandEncoder as _, MTLCommandQueue as _,
@@ -8569,11 +9936,11 @@ lacks {part}"
         };
         let kernel = s
             .caller
-            .newFunctionWithName(&NSString::from_str("stitch_caller"))
+            .newFunctionWithName(&NSString::from_str(kernel))
             .unwrap();
         let fused = s
             .stitched
-            .newFunctionWithName(&NSString::from_str("fused"))
+            .newFunctionWithName(&NSString::from_str(linked))
             .unwrap();
         STITCH_LINKS
             .iter()
@@ -8636,27 +10003,27 @@ lacks {part}"
 
     /// What the guest's stitched library gets through the decoder on `P`: the two library creates
     /// the guest sends (`caller`'s bytes, then `stitched`'s), then for each of [`STITCH_LINKS`] a
-    /// pipeline create of `stitch_caller` linking `fused` from the stitched library, and what each
-    /// pipeline made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    /// pipeline create of `caller`'s `kernel` linking `stitched`'s `linked`, and what each pipeline
+    /// made writes of [`STITCH_INPUTS`], run on the platform; `None` for one refused.
     fn stitched_links_through_the_decoder<P: crate::platform::ApiPlatform>(
-        caller: &[u8],
-        stitched: &[u8],
+        (caller, stitched): (&[u8], &[u8]),
+        kernel: &str,
+        linked: &str,
     ) -> Vec<Option<f32>> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::device::GpuDevice as _;
-        use reims_vgpu_core::platform::resource::Buffer as _;
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-        use reims_vgpu_core::platform::values::ComputePassDesc;
-        use reims_vgpu_core::raise::OnFault;
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
-        let replies = Arc::new(reims_vgpu_core::sync::Mutex::new(Vec::new()));
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
         let sink_replies = Arc::clone(&replies);
         dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
             sink_replies
@@ -8685,12 +10052,12 @@ lacks {part}"
         for (n, &list) in STITCH_LINKS.iter().enumerate() {
             let obj_id = 100 + n as u64;
             let mut bytes = compute_create(obj_id);
-            let name = b"stitch_caller";
+            let name = kernel.as_bytes();
             let at = bytes.len() as u32;
             bytes.extend_from_slice(name);
             bytes.resize(bytes.len().next_multiple_of(8), 0);
             let specs: Vec<LinkedSpec<'_>> = list
-                .map(|list| ("fused", list, 0, "", &[][..], ""))
+                .map(|list| (linked, list, 0, "", &[][..], ""))
                 .into_iter()
                 .collect();
             let tail = append_linked(&mut bytes, 2, &specs);
@@ -8764,64 +10131,248 @@ lacks {part}"
     }
 
     /// The Vulkan crate's metallibs of the shell tests' stitchable functions and of the library
-    /// Metal's stitcher makes of them (its build.rs, `stitched`), which a host without Metal takes.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    /// Metal's stitcher makes of them (that crate's build.rs, `stitched`), which a host without
+    /// Metal takes.
     const COMMITTED_STITCHED: [&[u8]; 2] = [
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitchable.metallib"),
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/stitched.metallib"),
     ];
 
-    /// On Metal, a guest's stitched library is a library like any other: the library Metal's
-    /// stitcher made in the guest, sent as its bytes, gives a function `stitch_caller`'s pipeline
-    /// links from either list, as Metal's own does, and the pipeline writes what Metal's writes;
-    /// with nothing linked, it is refused, as Metal refuses it. The Vulkan crate's committed
-    /// stitched metallibs get the same answers
+    /// On a Mac, a guest's stitched library is a library like any other: the library Metal's
+    /// stitcher makes here, as in the guest, sent as its bytes, gives a function
+    /// `stitch_caller`'s pipeline links from either list, as Metal's own does, and the pipeline
+    /// writes what Metal's writes; with nothing linked, it is refused, as Metal refuses it
     #[cfg(target_os = "macos")]
     #[test]
-    fn on_metal_a_stitched_function_links_and_computes_as_metal_s() {
-        use reims_vgpu_metal::MetalPlatform;
+    fn made_here_a_stitched_function_links_and_computes_as_metal_s() {
         let s = stitched_on_metal();
-        let metal = metal_s_own_stitched_links(&s);
+        let metal = metal_s_own_stitched_links(&s, "stitch_caller", "fused");
         assert_eq!(metal, [Some(20.0), Some(20.0), None]);
+        let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(&s.caller_bytes, &s.stitched_bytes),
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                made,
+                "stitch_caller",
+                "fused"
+            ),
             metal
         );
-        let [caller, stitched] = COMMITTED_STITCHED;
+    }
+
+    /// On a Mac, a stitched function of fewer parameters than its call passes arguments links
+    /// and computes: `stitch_caller_extra` calls `pair` with three arguments, Metal's stitcher
+    /// makes it of the two its graph takes, and Metal's own pipeline drops the third and writes
+    /// 2 + 3 from either list, as MPS's reduce_stitched calls the write_fn it stitches of two
+    /// inputs with three. The library stitched here, sent as its bytes, gets the same answers
+    /// through the decoder
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn made_here_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
+        let s = stitched_on_metal();
+        let metal = metal_s_own_stitched_links(&s, "stitch_caller_extra", "pair");
+        assert_eq!(metal, [Some(5.0), Some(5.0), None]);
+        let made = (s.caller_bytes.as_slice(), s.stitched_bytes.as_slice());
         assert_eq!(
-            stitched_links_through_the_decoder::<MetalPlatform>(caller, stitched),
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                made,
+                "stitch_caller_extra",
+                "pair"
+            ),
             metal
         );
     }
 
     /// On the Vulkan platform, a guest's stitched library gets Metal's answers
-    /// (`on_metal_a_stitched_function_links_and_computes_as_metal_s`): the runtime links the
+    /// (`made_here_a_stitched_function_links_and_computes_as_metal_s`): the runtime links the
     /// function Metal's stitcher made like any other, from either list, and the pipeline writes
     /// 20; with nothing linked, it is refused. The one linked signature the runtime still refuses
     /// (Unsupported, Feature::Linking), a linked-constants signature on a module that still
     /// declares function constants, is not this library's: it declares none
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_a_stitched_function_links_and_computes_as_metal_s() {
         let [caller, stitched] = COMMITTED_STITCHED;
         assert_eq!(
             stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
-                caller, stitched
+                (caller, stitched),
+                "stitch_caller",
+                "fused"
             ),
             [Some(20.0), Some(20.0), None]
         );
     }
 
+    /// On the Vulkan platform, a stitched function of fewer parameters than its call gets Metal's
+    /// answers (`made_here_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes`):
+    /// the runtime links `pair`, made of the two parameters its graph takes, to
+    /// `stitch_caller_extra`'s call of three by position, drops the third, and the pipeline writes
+    /// 2 + 3 from either list; with nothing linked, it is refused
+    #[test]
+    fn on_vulkan_a_stitched_function_of_fewer_parameters_than_its_call_links_and_computes() {
+        let [caller, stitched] = COMMITTED_STITCHED;
+        assert_eq!(
+            stitched_links_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(
+                (caller, stitched),
+                "stitch_caller_extra",
+                "pair"
+            ),
+            [Some(5.0), Some(5.0), None]
+        );
+    }
+
+    /// The Vulkan crate's metallib of a kernel that reads a function constant only where it is
+    /// defined (its `optional_constant.metal`), which a host without Metal takes as a Mac does.
+    const OPTIONAL_CONSTANT: &[u8] =
+        include_bytes!("../../../../reims-vgpu-vulkan/metallibs/optional_constant.metallib");
+
+    /// What [`OPTIONAL_CONSTANT`]'s `optional_constant` writes, made through the decoder on `P`
+    /// from a compute create of each of `cases`' constants: `None` where the create is refused.
+    fn optional_constant_through_the_decoder<P: crate::platform::ApiPlatform>(
+        cases: &[&[RgfxFunctionConstant]],
+    ) -> Vec<Option<i32>> {
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        use reims_vgpu_vulkan::core::platform::values::ComputePassDesc;
+        use reims_vgpu_vulkan::core::raise::OnFault;
+        let platform = P::process();
+        let device = platform.metal_device(None).unwrap();
+        let mut dec = GraphicsDecoder::<P>::new(
+            Arc::clone(&platform),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
+        );
+        let replies = Arc::new(reims_vgpu_vulkan::core::sync::Mutex::new(Vec::new()));
+        let sink_replies = Arc::clone(&replies);
+        dec.set_reflection_sink(Arc::new(move |r: PipelineReply| {
+            sink_replies
+                .lock()
+                .push((r.reflection.obj_id, r.reflection.status));
+        }));
+        let mut m = RgfxLibraryCreate {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_LIBRARY_CREATE,
+                size: (RGFX_LIBRARY_BYTES_OFFSET as usize + OPTIONAL_CONSTANT.len())
+                    .next_multiple_of(8) as u32,
+                seqno: 1,
+            },
+            obj_id: 1,
+            byte_length: OPTIONAL_CONSTANT.len() as u64,
+            ..RgfxLibraryCreate::default()
+        }
+        .as_bytes()
+        .to_vec();
+        m.extend_from_slice(OPTIONAL_CONSTANT);
+        m.resize(m.len().next_multiple_of(8), 0);
+        assert_eq!(dec.decode(&device, &m).unwrap(), Ok(()));
+        let mut made = Vec::new();
+        for (n, constants) in cases.iter().enumerate() {
+            let obj_id = 100 + n as u64;
+            let mut bytes = compute_create(obj_id);
+            let name = b"optional_constant";
+            let at = bytes.len() as u32;
+            bytes.extend_from_slice(name);
+            bytes.resize(bytes.len().next_multiple_of(8), 0);
+            let constants_at = bytes.len() as u32;
+            bytes.extend_from_slice(constants.as_bytes());
+            let size = bytes.len() as u32;
+            edit_head(&mut bytes, |m: &mut RgfxComputePipelineCreate| {
+                m.header.size = size;
+                (m.name_offset, m.name_len) = (at, name.len() as u32);
+                (m.constants_offset, m.constant_count) = (constants_at, constants.len() as u32);
+            });
+            let decoded = dec.decode(&device, &bytes).unwrap();
+            assert!(
+                decoded == Ok(()) || decoded == Err(DecodeError::Refused),
+                "{constants:?}: {decoded:?}"
+            );
+            let status = replies
+                .lock()
+                .pop()
+                .map(|(id, status)| (id == obj_id, status));
+            let Some(ObjHandle::ComputePipeline(pipeline)) = dec.object(obj_id) else {
+                assert_eq!(status, Some((true, RGFX_PIPELINE_REFUSED)), "{constants:?}");
+                made.push(None);
+                continue;
+            };
+            assert_eq!(status, Some((true, RGFX_PIPELINE_OK)), "{constants:?}");
+            let output = device
+                .new_buffer_of_length(OnFault::Return, 4, 0)
+                .unwrap()
+                .unwrap();
+            let queue = device.new_command_queue().unwrap();
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let enc = cb
+                .compute_encoder_for_pass(&ComputePassDesc::default())
+                .unwrap()
+                .unwrap();
+            let one = MtlSize::new(1, 1, 1);
+            for cmd in [
+                ComputeCmd::SetComputePipelineState {
+                    state: Some(pipeline),
+                },
+                ComputeCmd::SetBuffers {
+                    buffers: &[Some(&output)],
+                    offsets: &[0],
+                    range: NsRange {
+                        location: 0,
+                        length: 1,
+                    },
+                },
+                ComputeCmd::DispatchThreadgroups {
+                    threadgroups_per_grid: one,
+                    threads_per_threadgroup: one,
+                },
+                ComputeCmd::EndEncoding,
+            ] {
+                enc.encode(OnFault::Return, cmd).unwrap();
+            }
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            // SAFETY: the GPU wrote the buffer's 4 bytes, and is done.
+            made.push(Some(unsafe { output.contents().as_ptr::<i32>().read() }));
+        }
+        made
+    }
+
+    /// The constants [`optional_constant_through_the_decoder`]'s creates send: none, as the guest
+    /// sends a function made with constant values that set none of its constants, or by a
+    /// descriptor without them; then its constant, an `int` (`MTLDataTypeInt`) of 5.
+    fn optional_constant_cases() -> [Vec<RgfxFunctionConstant>; 2] {
+        let mut value = [0; reims_vgpu_graphics::wire::RGFX_FUNCTION_CONSTANT_VALUE_BYTES];
+        value[..4].copy_from_slice(&5i32.to_le_bytes());
+        [
+            Vec::new(),
+            vec![RgfxFunctionConstant {
+                index: 0,
+                data_type: 29,
+                value,
+            }],
+        ]
+    }
+
+    /// From the wire: a kernel that declares a function constant, sent with none, as the guest
+    /// sends a function made with constant values that set none of its constants, is made, and
+    /// reads it as undefined (7), as Metal makes one of such values; sent with it, it reads its
+    /// value (5)
+    #[test]
+    fn on_vulkan_a_stage_function_sent_with_no_constants_is_made_with_them_undefined() {
+        let cases = optional_constant_cases();
+        let cases: Vec<&[RgfxFunctionConstant]> = cases.iter().map(Vec::as_slice).collect();
+        assert_eq!(
+            optional_constant_through_the_decoder::<reims_vgpu_vulkan::VulkanPlatform>(&cases),
+            [Some(7), Some(5)]
+        );
+    }
+
     /// The Vulkan crate's metallib of the readers of a texture (its `ycbcr_probe.metal`), which a
     /// host without Metal takes as a Mac does.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PROBE_LIBRARY: &[u8] =
         include_bytes!("../../../../reims-vgpu-vulkan/metallibs/ycbcr_probe.metallib");
 
     /// What `kernel` of [`PROBE_LIBRARY`] reads of `texture` on `P`'s `device`, into floats: a
     /// texel for each of a grid of `grid`, with the sampler `sampler` and the probe bytes `probe`
     /// where given.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn kernel_reads<P: Platform>(
         device: &P::Device,
         kernel: &str,
@@ -8829,10 +10380,10 @@ lacks {part}"
         grid: (u64, u64),
         (sampler, probe): (Option<&P::SamplerState>, Option<&[u8]>),
     ) -> Vec<[f32; 4]> {
-        use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-        use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-        use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-        let _pool = reims_vgpu_core::rt::Pool::here();
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlSize, NsRange};
+        let _pool = reims_vgpu_vulkan::core::rt::Pool::here();
         let library = device.new_library(PROBE_LIBRARY).unwrap().unwrap().unwrap();
         let f = library.new_function(OnFault::Die, kernel).unwrap().unwrap();
         let state = device
@@ -8911,14 +10462,13 @@ lacks {part}"
     /// ids kept on it as a graphics device keeps them, and context 1's first chunk of resource ids
     /// granted. Each test runs in a process of its own, so this is the first use of the device's
     /// ids.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_decoder<P: crate::platform::ApiPlatform>() -> (GraphicsDecoder<P>, P::Device) {
         let platform = P::process();
         let device = platform.metal_device(None).unwrap();
         crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
         let mut dec = GraphicsDecoder::<P>::new(
             Arc::clone(&platform),
-            Arc::new(Region::new(0x10000).unwrap()),
+            Arc::new(crate::platform::test_region(&*platform, 0x10000)),
         );
         let grant = RgfxResourceIdChunk {
             header: RgfxMsgHeader {
@@ -8934,13 +10484,11 @@ lacks {part}"
     }
 
     /// Context 1's object `n`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const fn context_obj(n: u64) -> u64 {
         (1 << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
     }
 
     /// A Shared buffer of the decoder's, object `n`, holding `bytes` from its first.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn buffer_holding<P: Platform>(
         dec: &mut GraphicsDecoder<P>,
         device: &P::Device,
@@ -8969,7 +10517,6 @@ lacks {part}"
 
     /// A 2D texture descriptor of the wire: `format`, `size`, one level, usage `ShaderRead`,
     /// options 0 (Shared), the identity swizzle, as WindowServer asks for its surfaces' textures.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_desc(format: u32, (width, height): (u64, u64)) -> RgfxTextureDescriptor {
         RgfxTextureDescriptor {
             pixel_format: format,
@@ -8987,14 +10534,13 @@ lacks {part}"
 
     /// The `TEXTURE_FROM_IOSURFACE` of texture `n` (resource id `n`) over plane 0 of buffer 10,
     /// at offset 0 with rows `bytes_per_row` apart, of `desc`, carrying `facts`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_texture_message(
         n: u64,
         desc: RgfxTextureDescriptor,
         bytes_per_row: u64,
-        facts: &reims_graphics::wire::RgfxSurfaceFacts,
+        facts: &reims_vgpu_graphics::wire::RgfxSurfaceFacts,
     ) -> Vec<u8> {
-        use reims_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_SURFACE_FACTS_OFFSET, RgfxSurfaceFacts};
         let m = RgfxTextureFromIOSurface {
             header: RgfxMsgHeader {
                 r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
@@ -9019,17 +10565,15 @@ lacks {part}"
     /// What the guest's texture `n` of the decoder answers: its format, type, width, height,
     /// usage, resource options and storage mode, and the bits of every texel `read()` reads of it
     /// into floats.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     type TextureAnswer = ([u64; 7], Vec<[u32; 4]>);
 
     /// [`TextureAnswer`] of `texture`, of `size`, on `device`.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn texture_answer<P: Platform>(
         device: &P::Device,
         texture: &P::Texture,
         size: (u64, u64),
     ) -> TextureAnswer {
-        use reims_vgpu_core::platform::resource::{GpuResource as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::resource::{GpuResource as _, Texture as _};
         let t = texture;
         let getters = [
             t.pixel_format(),
@@ -9046,19 +10590,15 @@ lacks {part}"
 
     /// The pin's textures: 16 x 8, of BGRA8 (80) over a 'BGRA' surface and of RGBA16F (115) over
     /// an 'RGhA' one, with the surfaces' OSTypes and bytes a texel.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_CASES: [(u32, &[u8; 4], u64); 2] = [(80, b"BGRA", 4), (115, b"RGhA", 8)];
 
     /// The pin's size, and its rows: the bundle's copy of a surface without planes lays its rows
     /// 256 bytes apart (`alignUp(IOSurfaceGetBytesPerRow, 256)`).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_SIZE: (u64, u64) = (16, 8);
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const PIN_ROW: u64 = 256;
 
     /// The pin's bytes: each a value of its place, every row whole, so a half's bits are no NaN
     /// (RGBA16F's exponents stay below 31).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn pin_bytes() -> Vec<u8> {
         (0..PIN_ROW * PIN_SIZE.1)
             .map(|i| ((i * 37 + i / 7) % 0x7b) as u8)
@@ -9069,10 +10609,9 @@ lacks {part}"
     /// the decoder on `P`, both ways over the guest's copy of the surface, at offset 0 with rows
     /// [`PIN_ROW`] apart, options 0 (Shared): by today's buffer creator (`TEXTURE_FROM_BUFFER`),
     /// and by the IOSurface creator (`TEXTURE_FROM_IOSURFACE`, its facts saying no planes).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn surface_textures_without_planes<P: crate::platform::ApiPlatform>() -> Vec<[TextureAnswer; 2]>
     {
-        use reims_graphics::wire::RgfxSurfaceFacts;
+        use reims_vgpu_graphics::wire::RgfxSurfaceFacts;
         let (mut dec, device) = surface_decoder::<P>();
         buffer_holding(&mut dec, &device, 10, &pin_bytes());
         let answer = |dec: &GraphicsDecoder<P>, n: u64| {
@@ -9117,16 +10656,12 @@ lacks {part}"
     /// size), and the bundle's copy of its 'x420' surface: plane 0 at 0, plane 1 at
     /// [`YCBCR_CHROMA_AT`], each row `alignUp(IOSurfaceGetBytesPerRowOfPlane(k), 256)` apart, and
     /// each plane at a multiple of 256.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_SIZE: (u64, u64) = (16, 8);
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_ROW: u64 = 256;
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_CHROMA_AT: u64 = YCBCR_ROW * YCBCR_SIZE.1;
 
     /// The bundle's copy of the 505 texture's surface: 10-bit luma codes in the top bits of 16-bit
     /// samples, then interleaved Cb and Cr codes, one pair per 2 x 2 block, of a fixed noise.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_bytes() -> Vec<u8> {
         let mut seed = 0x2545_f491_4f6c_dd1d_u64;
         let mut code = || {
@@ -9159,11 +10694,9 @@ lacks {part}"
     /// The probe WindowServer's composite is like: a linear sample in normalized coordinates of an
     /// 8 x 5 grid of positions from (0.375, 0.375) texels, 1.875 apart, which meet each weight
     /// between two texels of a multiple of 1/8 and the edges.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     const YCBCR_GRID: (u64, u64) = (8, 5);
 
     /// [`YCBCR_GRID`]'s bytes (`Probe` in `ycbcr_probe.metal`).
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_probe() -> Vec<u8> {
         let floats = [0.375f32, 0.375, 1.875, 1.875].map(f32::to_le_bytes);
         let words = [YCBCR_GRID.0 as u32, YCBCR_GRID.1 as u32, 1, 0].map(u32::to_le_bytes);
@@ -9171,7 +10704,6 @@ lacks {part}"
     }
 
     /// The linear, clamp-to-edge sampler of normalized coordinates the probe samples through.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn linear_sampler<P: Platform>(device: &P::Device) -> P::SamplerState {
         let desc = SamplerDesc {
             min_filter: Some(1),
@@ -9188,9 +10720,8 @@ lacks {part}"
     /// ([`ycbcr_bytes`]) samples through the probe ([`ycbcr_probe`]) through the decoder on `P`,
     /// with the surface's facts in its `TEXTURE_FROM_IOSURFACE`; `None` where the create is
     /// refused.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn ycbcr_through_the_decoder<P: crate::platform::ApiPlatform>() -> Option<Vec<[f32; 4]>> {
-        use reims_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
+        use reims_vgpu_graphics::wire::{RGFX_YCBCR_MATRIX_ITU_R_2020, RgfxSurfaceFacts};
         let (mut dec, device) = surface_decoder::<P>();
         buffer_holding(&mut dec, &device, 10, &ycbcr_bytes());
         let facts = RgfxSurfaceFacts {
@@ -9225,10 +10756,8 @@ lacks {part}"
     }
 
     /// Metal's answer to [`ycbcr_through_the_decoder`]'s probe of the same bytes over a real
-    /// 'x420' surface of BT.2020 (`on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded`,
-    /// an Apple M3 Max under macOS 27.0.1): each sample's red, green and blue, as their bits,
-    /// in the grid's rows; every alpha is 1.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
+    /// 'x420' surface of BT.2020, recorded on an Apple M3 Max under macOS 27.0.1: each sample's
+    /// red, green and blue, as their bits, in the grid's rows; every alpha is 1.
     const METAL_505: [[u32; 3]; 40] = [
         [0x3f800000, 0x3f16c000, 0x00000000],
         [0x3e1b8000, 0x3f0d0000, 0x3e398000],
@@ -9272,72 +10801,1298 @@ lacks {part}"
         [0x3e728000, 0x3f800000, 0x3f194000],
     ];
 
-    /// On Metal, a texture over a surface's plane of BGRA8 or RGBA16F answers alike by the
-    /// buffer's creator over the guest's copy of a surface without planes, and by Metal's own
-    /// IOSurface creator over a real surface of the same bytes and rows, as the Metal platform's
-    /// IOSurface route over the copy (the buffer's creator) does: so its answers stay the
-    /// buffer's on the Vulkan platform too (`on_vulkan_surface_textures_without_planes_are_the_buffer_s`).
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_surface_textures_without_planes_are_the_buffer_s() {
-        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfaceSpec};
-        use reims_vgpu_metal::MetalPlatform;
-
-        use crate::platform::ApiPlatform as _;
-        let answers = surface_textures_without_planes::<MetalPlatform>();
-        let platform = MetalPlatform::process();
-        let device = platform.metal_device(None).unwrap();
-        for (&(format, ostype, texel), [from_buffer, from_surface]) in
-            PIN_CASES.iter().zip(&answers)
-        {
-            assert_eq!(from_buffer, from_surface, "{format}");
-            let spec = SurfaceSpec {
-                pixel_format: u32::from_be_bytes(*ostype),
-                alloc_size: 0x4000,
-                width: PIN_SIZE.0,
-                height: PIN_SIZE.1,
-                bytes_per_element: texel,
-                bytes_per_row: PIN_ROW,
-                element_width: 1,
-                element_height: 1,
-                ..SurfaceSpec::default()
-            };
-            let surface = platform.surfaces().create(&spec).unwrap();
-            assert_eq!(surface.bytes_per_row(), PIN_ROW);
-            let bytes = pin_bytes();
-            // SAFETY: the surface's allocation holds its rows, which no command uses yet.
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    surface.base_address().as_ptr::<u8>(),
-                    bytes.len(),
-                )
-            };
-            let desc = surface_desc(format, PIN_SIZE);
-            let descriptor = platform.texture_descriptor(&TextureDesc {
-                resource_index: None,
-                ..texture_desc(&desc, 0)
-            });
-            let own = device
-                .new_texture_on_surface(&descriptor, Some(&surface), 0)
-                .unwrap()
-                .unwrap();
-            let metal = texture_answer::<MetalPlatform>(&device, &own, PIN_SIZE);
-            assert_eq!(&metal, from_buffer, "{format}");
-        }
-    }
-
     /// On the Vulkan platform, a texture of BGRA8 or RGBA16F over the guest's copy of a surface
     /// without planes answers by the runtime's IOSurface creator what it answers by the buffer's
     /// creator, as Metal's own two creators answer alike
-    /// (`on_metal_surface_textures_without_planes_are_the_buffer_s`)
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_surface_textures_without_planes_are_the_buffer_s() {
         let answers = surface_textures_without_planes::<reims_vgpu_vulkan::VulkanPlatform>();
         for (&(format, ..), [from_buffer, from_surface]) in PIN_CASES.iter().zip(&answers) {
             assert_eq!(from_buffer, from_surface, "{format}");
         }
+    }
+
+    /// The shared surface's size, its copy's rows, and the composite's target, whose size
+    /// `render_ftex` takes (8 x 8): a copy of the bundle's lays a surface without planes in one
+    /// block of the region, its rows 256 bytes apart, which every process holding the surface lies
+    /// over (docs/graphics-kext/design.md, Decided 14, "The copy").
+    const SHARED_SIZE: (u64, u64) = (32, 16);
+    const SHARED_ROW: u64 = 256;
+    const SHARED_BLOCK: u64 = 0x4000;
+    const COMPOSITE_SIZE: u64 = 8;
+
+    /// Where the shared surface's bytes lie ([`shared_surface_composites`]): in a block of the
+    /// region both contexts hold, the bundle's copy of the surface; or in guest RAM, the surface's
+    /// own pages, which a block both hold names (`SURFACE_PAGES`) and each lies over
+    /// (`BUFFER_OVER_SURFACE_PAGES`).
+    #[derive(Clone, Copy, Debug)]
+    enum SharedPath {
+        Copy,
+        InPlace,
+    }
+
+    /// Context `context`'s object `n`.
+    const fn object_of(context: u64, n: u64) -> u64 {
+        (context << RGFX_CONTEXT_OBJ_ID_SHIFT) | n
+    }
+
+    /// A rectangle of texels, [x0, x1) x [y0, y1), and its premultiplied colour. Every component
+    /// is 0, 1/8, 1/4, 3/4 or 1: a half holds each exactly, and each is an 8-bit code with no tie
+    /// between two (0, 32, 64, 191, 255).
+    type SharedRect = ([u64; 4], [f32; 4]);
+
+    /// What the surface holds at each step: a colour over the whole of it, then rectangles over
+    /// that, among them some on each edge row and column and in each corner, where a clamped read
+    /// lands. Steps 0 and 3 are the guest's CPU's writes into the copy; 1 and 2 are drawn in the
+    /// first context.
+    fn shared_step(step: usize) -> ([f32; 4], Vec<SharedRect>) {
+        let (w, h) = SHARED_SIZE;
+        match step {
+            0 => (
+                [0.0, 0.0, 0.125, 1.0],
+                vec![([8, 24, 4, 12], [0.125, 0.25, 0.0, 0.25])],
+            ),
+            1 => (
+                [0.25, 0.125, 0.75, 1.0],
+                vec![
+                    ([5, 19, 3, 11], [0.75, 0.25, 0.125, 0.75]),
+                    ([0, 4, 0, 2], [1.0, 0.0, 0.0, 1.0]),
+                    ([w - 3, w, 0, 3], [0.0, 1.0, 0.0, 1.0]),
+                    ([0, 3, h - 3, h], [0.0, 0.0, 1.0, 1.0]),
+                    ([w - 4, w, h - 2, h], [1.0, 1.0, 1.0, 1.0]),
+                    ([0, w, 7, 8], [0.125, 0.125, 0.125, 0.25]),
+                    ([16, 17, 0, h], [0.0, 0.25, 0.25, 0.25]),
+                ],
+            ),
+            2 => (
+                [0.75, 0.75, 0.25, 0.75],
+                vec![
+                    ([0, w, 0, 1], [0.0, 0.125, 1.0, 1.0]),
+                    ([0, 1, 0, h], [1.0, 0.75, 0.0, 1.0]),
+                    ([0, w, h - 1, h], [0.25, 0.0, 0.25, 0.25]),
+                    ([w - 1, w, 0, h], [0.125, 0.0, 0.0, 0.125]),
+                    ([10, 30, 6, 13], [0.0, 0.0, 0.0, 0.0]),
+                ],
+            ),
+            _ => (
+                [1.0, 1.0, 1.0, 1.0],
+                vec![
+                    ([0, 2, 0, 2], [0.0, 0.0, 0.0, 1.0]),
+                    ([w - 2, w, h - 2, h], [0.25, 0.25, 0.25, 0.25]),
+                    ([12, 20, 0, h], [0.75, 0.0, 0.75, 0.75]),
+                ],
+            ),
+        }
+    }
+
+    /// The colour of texel (`x`, `y`) at `step`: the last rectangle over it, else the step's
+    /// colour.
+    fn shared_texel(step: usize, x: u64, y: u64) -> [f32; 4] {
+        let (clear, rects) = shared_step(step);
+        rects
+            .iter()
+            .rev()
+            .find(|([x0, x1, y0, y1], _)| (*x0..*x1).contains(&x) && (*y0..*y1).contains(&y))
+            .map_or(clear, |&(_, colour)| colour)
+    }
+
+    /// The bits of the half `v` is, for a `v` a half holds exactly.
+    fn exact_half(v: f32) -> u16 {
+        if v == 0.0 {
+            return 0;
+        }
+        let bits = v.to_bits();
+        let exponent = ((bits >> 23) & 0xff) as i32 - 127 + 15;
+        assert!(
+            bits & 0x1fff == 0 && (1..31).contains(&exponent),
+            "{v} is no half"
+        );
+        ((bits >> 16) & 0x8000) as u16 | ((exponent as u16) << 10) | ((bits >> 13) & 0x3ff) as u16
+    }
+
+    /// The copy's bytes at `step`, of BGRA8 (80) or RGBA16F (115): every texel in its row, the
+    /// bytes past each row's texels 0.
+    fn shared_bytes(format: u32, step: usize) -> Vec<u8> {
+        let (w, h) = SHARED_SIZE;
+        let mut bytes = vec![0u8; (SHARED_ROW * h) as usize];
+        for y in 0..h {
+            for x in 0..w {
+                let [r, g, b, a] = shared_texel(step, x, y);
+                let texel: Vec<u8> = match format {
+                    80 => [b, g, r, a].map(|v| (v * 255.0).round() as u8).to_vec(),
+                    _ => [r, g, b, a].map(exact_half).as_bytes().to_vec(),
+                };
+                let at = (y * SHARED_ROW) as usize + x as usize * texel.len();
+                bytes[at..at + texel.len()].copy_from_slice(&texel);
+            }
+        }
+        bytes
+    }
+
+    /// One op of a command buffer: its header, then its body.
+    fn shared_op(tag: u16, body: &[u8]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::RgfxOpHeader;
+        let mut v = RgfxOpHeader {
+            tag,
+            flags: 0,
+            len: u32::try_from(8 + body.len()).unwrap(),
+        }
+        .as_bytes()
+        .to_vec();
+        v.extend_from_slice(body);
+        v
+    }
+
+    /// The `COMMAND_BUFFER` of `ops` on context `context`'s queue (its object 1), command buffer
+    /// `cb` of it, the queue's `seqno`th.
+    fn shared_command_buffer(context: u64, cb: u64, seqno: u64, ops: &[u8]) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::{RGFX_COMMAND_BUFFER_OPS_OFFSET, RgfxCommandBuffer};
+        let m = RgfxCommandBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_COMMAND_BUFFER,
+                size: u32::try_from(RGFX_COMMAND_BUFFER_OPS_OFFSET as usize + ops.len()).unwrap(),
+                seqno,
+            },
+            queue_obj_id: object_of(context, 1),
+            cb_obj_id: object_of(context, cb),
+            op_bytes: ops.len() as u64,
+        };
+        let mut message = m.as_bytes().to_vec();
+        message.extend_from_slice(ops);
+        message
+    }
+
+    /// A render pass's ops over `target` of `size`, cleared to `clear`, with the pipeline
+    /// `pipeline`, each draw a strip of 4 vertices at a 64-byte slot of buffer `positions`
+    /// (`render_vbuf`'s buffer 0), its colour a 16-byte slot of buffer `colours` (its buffer 1),
+    /// and, where given, fragment texture 0 and sampler 0.
+    fn shared_pass(
+        target: u64,
+        size: (u64, u64),
+        clear: [f32; 4],
+        pipeline: u64,
+        (positions, colours): (u64, u64),
+        draws: &[(u64, u64)],
+        sampled: Option<(u64, u64)>,
+    ) -> Vec<u8> {
+        use reims_vgpu_graphics::ops::render::{
+            RGFX_OP_RENDER_DRAW_PRIMITIVES, RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES,
+            RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE, RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            RGFX_OP_RENDER_SET_VERTEX_BUFFER, RgfxOpDrawPrimitives, RgfxOpSetFragmentSamplerStates,
+            RgfxOpSetFragmentTexture, RgfxOpSetRenderPipelineState, RgfxOpSetVertexBuffer,
+            RgfxSamplerBinding,
+        };
+        use reims_vgpu_graphics::ops::{
+            RGFX_OP_ENCODER_BEGIN_RENDER, RGFX_OP_ENCODER_END, RGFX_PASS_FLAG_RT_SIZE,
+            RgfxRenderPassColorAttachment, RgfxRenderPassDesc,
+        };
+        let desc = RgfxRenderPassDesc {
+            color_count: 1,
+            flags: RGFX_PASS_FLAG_RT_SIZE,
+            render_target_width: size.0 as u32,
+            render_target_height: size.1 as u32,
+            ..RgfxRenderPassDesc::default()
+        };
+        let color = RgfxRenderPassColorAttachment {
+            texture_obj_id: target,
+            // Clear, then Store.
+            load_action: 2,
+            store_action: 1,
+            clear_color_bits: clear.map(|v| f64::from(v).to_bits()),
+            ..RgfxRenderPassColorAttachment::default()
+        };
+        let mut begin = desc.as_bytes().to_vec();
+        begin.extend_from_slice(color.as_bytes());
+        let mut ops = shared_op(RGFX_OP_ENCODER_BEGIN_RENDER, &begin);
+        let state = RgfxOpSetRenderPipelineState {
+            pipeline_obj_id: pipeline,
+        };
+        ops.extend(shared_op(
+            RGFX_OP_RENDER_SET_RENDER_PIPELINE_STATE,
+            state.as_bytes(),
+        ));
+        if let Some((texture, sampler)) = sampled {
+            let texture = RgfxOpSetFragmentTexture {
+                texture_obj_id: texture,
+                index: 0,
+            };
+            ops.extend(shared_op(
+                RGFX_OP_RENDER_SET_FRAGMENT_TEXTURE,
+                texture.as_bytes(),
+            ));
+            let mut samplers = RgfxOpSetFragmentSamplerStates {
+                range_location: 0,
+                range_length: 1,
+            }
+            .as_bytes()
+            .to_vec();
+            samplers.extend_from_slice(
+                RgfxSamplerBinding {
+                    sampler_obj_id: sampler,
+                }
+                .as_bytes(),
+            );
+            ops.extend(shared_op(
+                RGFX_OP_RENDER_SET_FRAGMENT_SAMPLER_STATES,
+                &samplers,
+            ));
+        }
+        for &(quad, colour) in draws {
+            for (buffer, offset, index) in [(positions, quad * 64, 0), (colours, colour * 16, 1)] {
+                let set = RgfxOpSetVertexBuffer {
+                    buffer_obj_id: buffer,
+                    offset,
+                    index,
+                };
+                ops.extend(shared_op(RGFX_OP_RENDER_SET_VERTEX_BUFFER, set.as_bytes()));
+            }
+            // A triangle strip.
+            let draw = RgfxOpDrawPrimitives {
+                primitive_type: 4,
+                vertex_start: 0,
+                vertex_count: 4,
+            };
+            ops.extend(shared_op(RGFX_OP_RENDER_DRAW_PRIMITIVES, draw.as_bytes()));
+        }
+        ops.extend(shared_op(RGFX_OP_ENCODER_END, &[]));
+        ops
+    }
+
+    /// The 4 positions of a strip over texels [x0, x1) x [y0, y1) of a target of `size`, in
+    /// normalized device coordinates (y up, row 0 at the top), each edge on a texel's.
+    fn shared_quad([x0, x1, y0, y1]: [u64; 4], (w, h): (u64, u64)) -> [f32; 16] {
+        let x = |v: u64| -1.0 + 2.0 * v as f32 / w as f32;
+        let y = |v: u64| 1.0 - 2.0 * v as f32 / h as f32;
+        [
+            x(x0),
+            y(y0),
+            0.0,
+            1.0,
+            x(x1),
+            y(y0),
+            0.0,
+            1.0,
+            x(x0),
+            y(y1),
+            0.0,
+            1.0,
+            x(x1),
+            y(y1),
+            0.0,
+            1.0,
+        ]
+    }
+
+    /// A Shared buffer of `device` holding `bytes`.
+    fn shared_buffer<P: Platform>(device: &P::Device, bytes: &[u8]) -> P::Buffer {
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        let length = (bytes.len() as u64).next_multiple_of(0x4000);
+        let buffer = device
+            .new_buffer_of_length(OnFault::Die, length, 0)
+            .unwrap()
+            .unwrap();
+        // SAFETY: a Shared buffer of at least `bytes.len()` bytes, which no command uses yet.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                buffer.contents().as_ptr::<u8>(),
+                bytes.len(),
+            )
+        };
+        buffer
+    }
+
+    /// The probe's minified linear read of the surface: 8 x 6 positions from texel (0, 0), the
+    /// last at (32, 15), each about 4.6 texels from the next across and 3 down, so the first and
+    /// last of each row and column lie on the surface's edges and each corner is read.
+    fn shared_probe() -> (u64, u64, Vec<u8>) {
+        let (columns, rows) = (8u32, 6u32);
+        let floats = [0.0f32, 0.0, 32.0 / 7.0, 3.0].map(f32::to_le_bytes);
+        let words = [columns, rows, 1, 0].map(u32::to_le_bytes);
+        (
+            u64::from(columns),
+            u64::from(rows),
+            [floats.concat(), words.concat()].concat(),
+        )
+    }
+
+    /// What `texture` of the decoder answers at a step: every texel `read()` reads, the probe's
+    /// samples through `sampler` ([`shared_probe`]), as their bits.
+    fn shared_reads<P: Platform>(
+        device: &P::Device,
+        texture: &P::Texture,
+        sampler: &P::SamplerState,
+    ) -> [Vec<[u32; 4]>; 2] {
+        let (columns, rows, probe) = shared_probe();
+        let read = kernel_reads::<P>(
+            device,
+            "read_texels_float",
+            texture,
+            SHARED_SIZE,
+            (None, None),
+        );
+        let sampled = kernel_reads::<P>(
+            device,
+            "sample_texels_float",
+            texture,
+            (columns, rows),
+            (Some(sampler), Some(&probe[..])),
+        );
+        [read, sampled].map(|v| v.iter().map(|t| t.map(f32::to_bits)).collect())
+    }
+
+    /// A surface drawn on one context's queue and composited on another's, as an app's layer or
+    /// WindowServer's own capture is drawn and then read as a backdrop, through the decoder on
+    /// `P`, of `format` over a surface of `ostype`, its bytes where `path` lays them: each context
+    /// has its own buffer over them (`BUFFER_OVER_HOST_MEMORY` over the copy's block, or
+    /// `BUFFER_OVER_SURFACE_PAGES` over the block that names its pages) and its own texture over
+    /// the buffer (`TEXTURE_FROM_IOSURFACE`), the first's a render target. At each step the
+    /// surface takes new contents (the guest's CPU writes its bytes, or the first context draws
+    /// it and its command buffer completes), and then the second context's command buffer
+    /// composites it: a linear, minified read of the whole surface, clamped at its edges, over a
+    /// target cleared to another colour, the target's border left uncovered. The same composite
+    /// of a texture over a block the CPU wrote with what the surface should hold, made fresh for
+    /// the step, is the reference. In place, the surface's pages are whole host pages, and the
+    /// bytes past its own must stay as they were. `Err` says the first difference.
+    fn shared_surface_composites<P: crate::platform::ApiPlatform>(
+        format: u32,
+        ostype: &[u8; 4],
+        path: SharedPath,
+    ) -> Result<(), String> {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        use reims_vgpu_graphics::wire::{
+            RGFX_CMD_BUFFER_OVER_SURFACE_PAGES, RGFX_CMD_SURFACE_PAGES,
+            RGFX_CONTEXT_ALLOCATIONS_OFFSET, RGFX_CURSOR_SPAN, RGFX_STATUS_OK,
+            RgfxBufferOverSurfacePages, RgfxPageRun, RgfxSurfaceFacts, RgfxSurfacePages,
+        };
+        use reims_vgpu_vulkan::core::memory::map::MemoryMap as CoreMemoryMap;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use super::surface_pages::Lease;
+        use super::surface_pages::costs::{RAM, guest_ram};
+
+        const STEPS: usize = 4;
+        let blocks = RGFX_CONTEXT_ALLOCATIONS_OFFSET;
+        assert!(blocks.is_multiple_of(SHARED_BLOCK));
+        // The shared block, then one reference block a step.
+        let block_at = |k: u64| blocks + k * SHARED_BLOCK;
+        let size = block_at(1 + STEPS as u64) + RGFX_CURSOR_SPAN;
+        let platform = P::process();
+        let region = Arc::new(crate::platform::test_region(&*platform, size as usize));
+        let device = platform.metal_device(None).unwrap();
+        crate::graphics::reserve_guest_texture_ids(platform.as_ref(), &device);
+        // The guest's RAM, where the surface lies in place, outlives the decoder and its views.
+        let mut ram = None;
+        let mut dec = GraphicsDecoder::<P>::new(Arc::clone(&platform), Arc::clone(&region));
+        let (tx, completed) = mpsc::channel();
+        let tx = reims_vgpu_vulkan::core::sync::Mutex::new(tx);
+        dec.set_completion_sink(Arc::new(move |m| {
+            let _ = tx.lock().send(m);
+        }));
+        // The first context draws, the second composites; each holds its resource ids.
+        let (drawer, compositor) = (1u64, 2u64);
+        dec.hold_resource_ids(drawer as u32, 0);
+        dec.hold_resource_ids(compositor as u32, 1);
+        let id_base = |context: u64| (context - 1) * RGFX_RESOURCE_ID_CHUNK;
+        for context in [drawer, compositor] {
+            region.share(context as u32, block_at(0), SHARED_BLOCK);
+        }
+        for k in 0..STEPS as u64 {
+            region.grant(compositor as u32, block_at(1 + k), SHARED_BLOCK);
+        }
+        // Where the surface's bytes lie: in the shared block, a copy; or in guest RAM, which the
+        // shared block names, in place: three host pages into the RAM, the surface's whole pages,
+        // the bytes past its own a sentinel no step may change.
+        let page = platform.vm().page_size().max(4096);
+        let own = SHARED_ROW * SHARED_SIZE.1;
+        let length = own.next_multiple_of(page);
+        // Every byte of the RAM is this until written.
+        const SENTINEL: u8 = 0x5a;
+        let surface: *mut u8 = match path {
+            // SAFETY: the shared block's bytes, in the region, which outlives every use here.
+            SharedPath::Copy => unsafe { region.base().add(block_at(0) as usize) },
+            SharedPath::InPlace => {
+                let r = ram.insert(guest_ram(16 * page, true));
+                let lease: Lease = Arc::from(platform.guest_memory(&r.map));
+                let core = CoreMemoryMap::new(Arc::clone(&platform), &r.map.to_core())
+                    .expect("a memory map");
+                dec.set_guest_memory(core, lease);
+                if !dec.surface_pages_available() {
+                    return Err(format!("no views of guest RAM on a host page of {page:#x}"));
+                }
+                // SAFETY: three pages into the RAM's `16 * page` bytes, which `ram` keeps mapped.
+                unsafe { r.at.add((3 * page) as usize) }
+            }
+        };
+        // SAFETY: `length` bytes at `surface`, which no command uses yet.
+        let write_surface = |bytes: &[u8]| unsafe {
+            std::ptr::copy_nonoverlapping(bytes.as_ptr(), surface, bytes.len())
+        };
+        // SAFETY: as above; read once the commands that wrote them completed.
+        let read_surface =
+            |n: u64| unsafe { std::slice::from_raw_parts(surface, n as usize).to_vec() };
+        write_surface(&shared_bytes(format, 0));
+        if let SharedPath::InPlace = path {
+            let blocks = RgfxSurfacePages {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_SURFACE_PAGES,
+                    size: 0,
+                    seqno: 0,
+                },
+                context: compositor as u32,
+                run_count: 1,
+                block_offset: block_at(0),
+                block_size: SHARED_BLOCK,
+                runs_offset: block_at(0) + SHARED_BLOCK / 2,
+                length,
+            };
+            let runs = [RgfxPageRun {
+                address: RAM + 3 * page,
+                length,
+            }];
+            dec.set_context(None);
+            let answer = dec.surface_pages(&device, &blocks, &runs, 0);
+            if answer != RGFX_STATUS_OK {
+                return Err(format!(
+                    "the surface's pages in place were answered {answer}"
+                ));
+            }
+        }
+
+        let decode = |dec: &mut GraphicsDecoder<P>, context: u64, message: &[u8]| {
+            dec.set_context(Some(context as u32));
+            let done = dec.decode(&device, message).unwrap();
+            assert_eq!(
+                done,
+                Ok(()),
+                "context {context}'s message {:?}",
+                &message[..8]
+            );
+        };
+        let insert = |dec: &mut GraphicsDecoder<P>, obj_id: u64, handle: ObjHandle<P>| {
+            dec.set_context(Some((obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT) as u32));
+            assert_eq!(dec.insert(obj_id, handle).unwrap(), Ok(()));
+        };
+        let over_block = |obj_id: u64, region_offset: u64| RgfxBufferOverHostMemory {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_BUFFER_OVER_HOST_MEMORY,
+                size: size_of::<RgfxBufferOverHostMemory>() as u32,
+                seqno: 0,
+            },
+            obj_id,
+            region_offset,
+            length: SHARED_BLOCK,
+            ..RgfxBufferOverHostMemory::default()
+        };
+        let facts = RgfxSurfaceFacts {
+            surface_pixel_format: u32::from_be_bytes(*ostype),
+            plane_count: 0,
+            width: SHARED_SIZE.0 as u32,
+            height: SHARED_SIZE.1 as u32,
+            ..RgfxSurfaceFacts::default()
+        };
+        // Texture `n` of `context` over its buffer `buffer`, of surface `surface`, with `usage`.
+        let over_surface = |context: u64, n: u64, buffer: u64, surface: u32, usage: u32| {
+            use reims_vgpu_graphics::wire::RGFX_SURFACE_FACTS_OFFSET;
+            let m = RgfxTextureFromIOSurface {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_TEXTURE_FROM_IOSURFACE,
+                    size: (RGFX_SURFACE_FACTS_OFFSET as usize + size_of::<RgfxSurfaceFacts>())
+                        as u32,
+                    seqno: 0,
+                },
+                obj_id: object_of(context, n),
+                resource_id: id_base(context) + n,
+                buffer_obj_id: object_of(context, buffer),
+                offset: 0,
+                bytes_per_row: SHARED_ROW,
+                iosurface_id: surface,
+                plane: 0,
+                desc: RgfxTextureDescriptor {
+                    usage,
+                    ..surface_desc(format, SHARED_SIZE)
+                },
+                writers_offset: RGFX_SURFACE_NO_WRITERS,
+            };
+            let mut bytes = m.as_bytes().to_vec();
+            bytes.extend_from_slice(facts.as_bytes());
+            bytes
+        };
+        // `MTLTextureUsageShaderRead`, and `| RenderTarget`.
+        let (sampled, target) = (1u32, 1u32 | 4);
+        const SURFACE: u32 = 0x51;
+
+        // Each context's queue, its buffer over the shared block and its texture over that, the
+        // compositor's first, as WindowServer's backdrop texture outlives the frames drawn into
+        // its surface.
+        for context in [compositor, drawer] {
+            let queue = RgfxQueueCreate {
+                header: RgfxMsgHeader {
+                    r#type: RGFX_CMD_QUEUE_CREATE,
+                    size: size_of::<RgfxQueueCreate>() as u32,
+                    seqno: 0,
+                },
+                obj_id: object_of(context, 1),
+                ..RgfxQueueCreate::default()
+            };
+            decode(&mut dec, context, queue.as_bytes());
+            match path {
+                SharedPath::Copy => {
+                    let buffer = over_block(object_of(context, 10), block_at(0));
+                    decode(&mut dec, context, buffer.as_bytes());
+                }
+                SharedPath::InPlace => {
+                    let buffer = RgfxBufferOverSurfacePages {
+                        header: RgfxMsgHeader {
+                            r#type: RGFX_CMD_BUFFER_OVER_SURFACE_PAGES,
+                            size: size_of::<RgfxBufferOverSurfacePages>() as u32,
+                            seqno: 0,
+                        },
+                        obj_id: object_of(context, 10),
+                        block_offset: block_at(0),
+                        block_size: SHARED_BLOCK,
+                        length,
+                        ..RgfxBufferOverSurfacePages::default()
+                    };
+                    decode(&mut dec, context, buffer.as_bytes());
+                }
+            }
+            let usage = if context == drawer { target } else { sampled };
+            decode(
+                &mut dec,
+                context,
+                &over_surface(context, 11, 10, SURFACE, usage),
+            );
+        }
+
+        // The drawer's pipeline (flat colours, no blending) and its quads: one strip a rectangle
+        // of each drawn step, and the colours of each.
+        let pipeline = |fragment: &str, color: ColorAttachmentDesc| {
+            let vertex = super::draw_cost::fixture::<P>(&device, "render_vbuf");
+            let fragment = super::draw_cost::fixture::<P>(&device, fragment);
+            device
+                .new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                    colors: vec![(0, color)],
+                    ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+                })
+                .unwrap()
+                .unwrap()
+        };
+        let flat = ColorAttachmentDesc {
+            pixel_format: u64::from(format),
+            ..ColorAttachmentDesc::default()
+        };
+        let mut quads = Vec::new();
+        let mut colours = Vec::new();
+        let mut draws = vec![Vec::new(); STEPS];
+        for (step, step_draws) in draws
+            .iter_mut()
+            .enumerate()
+            .filter(|(s, _)| *s == 1 || *s == 2)
+        {
+            for (rect, colour) in shared_step(step).1 {
+                step_draws.push((quads.len() as u64, colours.len() as u64));
+                quads.push(shared_quad(rect, SHARED_SIZE));
+                colours.push(colour);
+            }
+        }
+        let positions = shared_buffer::<P>(&device, quads.as_bytes());
+        let colours = shared_buffer::<P>(&device, colours.as_bytes());
+        insert(
+            &mut dec,
+            object_of(drawer, 20),
+            ObjHandle::RenderPipeline(pipeline("render_color", flat)),
+        );
+        insert(
+            &mut dec,
+            object_of(drawer, 21),
+            ObjHandle::Buffer(positions),
+        );
+        insert(&mut dec, object_of(drawer, 22), ObjHandle::Buffer(colours));
+
+        // The compositor's pipeline (the source over the target), its quad (the target less a
+        // border of one texel), its sampler, and its two targets: one the surface is composited
+        // into, one the reference is.
+        let composite = (COMPOSITE_SIZE, COMPOSITE_SIZE);
+        let inset = shared_quad([1, COMPOSITE_SIZE - 1, 1, COMPOSITE_SIZE - 1], composite);
+        let backdrop = [0.0f32, 0.125, 0.25, 1.0];
+        let over = super::draw_cost::over(u64::from(format));
+        insert(
+            &mut dec,
+            object_of(compositor, 20),
+            ObjHandle::RenderPipeline(pipeline("render_ftex", over)),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 21),
+            ObjHandle::Buffer(shared_buffer::<P>(&device, inset.as_bytes())),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 22),
+            ObjHandle::Buffer(shared_buffer::<P>(&device, &[0; 16])),
+        );
+        insert(
+            &mut dec,
+            object_of(compositor, 23),
+            ObjHandle::Sampler(linear_sampler::<P>(&device)),
+        );
+        for n in [30, 31] {
+            let desc = platform.texture_descriptor(&TextureDesc {
+                pixel_format: u64::from(format),
+                width: COMPOSITE_SIZE,
+                height: COMPOSITE_SIZE,
+                usage: u64::from(target),
+                ..TextureDesc::default()
+            });
+            let texture = device.new_texture(OnFault::Die, &desc).unwrap().unwrap();
+            insert(
+                &mut dec,
+                object_of(compositor, n),
+                ObjHandle::Texture(texture),
+            );
+        }
+        let sampler = linear_sampler::<P>(&device);
+
+        let mut seqnos = [0u64; 3];
+        let mut run = |dec: &mut GraphicsDecoder<P>, context: u64, ops: &[u8]| {
+            let seqno = &mut seqnos[context as usize];
+            *seqno += 1;
+            let cb = 0x100 + *seqno;
+            decode(
+                dec,
+                context,
+                &shared_command_buffer(context, cb, *seqno, ops),
+            );
+            let record = completed
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap_or_else(|_| {
+                    panic!("context {context}'s command buffer {cb:#x} never completed")
+                });
+            assert_eq!(record.cb_obj_id, object_of(context, cb));
+            assert_eq!(
+                record.status, 0,
+                "context {context}'s command buffer failed: {record:?}"
+            );
+        };
+        let texture_of = |dec: &GraphicsDecoder<P>, n: u64| -> P::Texture {
+            let Some(ObjHandle::Texture(t)) = dec.object(object_of(compositor, n)) else {
+                panic!("no texture {n} of the compositor's");
+            };
+            t.clone_ref()
+        };
+
+        for (step, step_draws) in draws.iter().enumerate() {
+            let expected = shared_bytes(format, step);
+            if step_draws.is_empty() {
+                // The guest's CPU writes the surface: its pages in place, or the copy, as the
+                // bundle syncs it from the pages before a commit.
+                write_surface(&expected);
+            } else {
+                let ops = shared_pass(
+                    object_of(drawer, 11),
+                    SHARED_SIZE,
+                    shared_step(step).0,
+                    object_of(drawer, 20),
+                    (object_of(drawer, 21), object_of(drawer, 22)),
+                    step_draws,
+                    None,
+                );
+                run(&mut dec, drawer, &ops);
+                // The draw is in the block when its command buffer is reported complete, where
+                // the bundle writes the copy back to the surface's pages.
+                let held = read_surface(expected.len() as u64);
+                let texel = if format == 80 { 4 } else { 8 };
+                for y in 0..SHARED_SIZE.1 {
+                    let row = (y * SHARED_ROW) as usize
+                        ..(y * SHARED_ROW + SHARED_SIZE.0 * texel) as usize;
+                    if held[row.clone()] != expected[row.clone()] {
+                        return Err(format!(
+                            "step {step}: row {y} of the copy after the draw's completion is \
+                             {:02x?}, not {:02x?}",
+                            &held[row.clone()],
+                            &expected[row]
+                        ));
+                    }
+                }
+            }
+            // The reference: a block the CPU wrote, under a texture made after the write.
+            let reference = block_at(1 + step as u64);
+            assert!(region.write(reference, &expected));
+            let (buffer, texture) = (40 + 2 * step as u64, 41 + 2 * step as u64);
+            decode(
+                &mut dec,
+                compositor,
+                over_block(object_of(compositor, buffer), reference).as_bytes(),
+            );
+            decode(
+                &mut dec,
+                compositor,
+                &over_surface(compositor, texture, buffer, 0x60 + step as u32, sampled),
+            );
+            let mut ops = Vec::new();
+            for (target, source) in [(30, 11), (31, texture)] {
+                ops.extend(shared_pass(
+                    object_of(compositor, target),
+                    composite,
+                    backdrop,
+                    object_of(compositor, 20),
+                    (object_of(compositor, 21), object_of(compositor, 22)),
+                    &[(0, 0)],
+                    Some((object_of(compositor, source), object_of(compositor, 23))),
+                ));
+            }
+            run(&mut dec, compositor, &ops);
+            dec.set_context(Some(compositor as u32));
+            let read = |n: u64| {
+                let t = texture_of(&dec, n);
+                kernel_reads::<P>(&device, "read_texels_float", &t, composite, (None, None))
+                    .iter()
+                    .map(|t| t.map(f32::to_bits))
+                    .collect::<Vec<_>>()
+            };
+            let (surface, wanted) = (read(30), read(31));
+            if surface != wanted {
+                return Err(format!(
+                    "step {step}: the composite of the shared surface is {surface:08x?}, not the \
+                     reference's {wanted:08x?}"
+                ));
+            }
+            // The reference's composite reads the surface: its inside is not the backdrop.
+            let backdrop_bits = backdrop.map(f32::to_bits);
+            assert!(
+                wanted.iter().any(|t| *t != backdrop_bits),
+                "step {step}: an empty reference"
+            );
+            // The second context's texture itself, read texel by texel and sampled minified.
+            let surface = texture_of(&dec, 11);
+            let reference = texture_of(&dec, texture);
+            let [read_s, sampled_s] = shared_reads::<P>(&device, &surface, &sampler);
+            let [read_r, sampled_r] = shared_reads::<P>(&device, &reference, &sampler);
+            if read_s != read_r {
+                return Err(format!(
+                    "step {step}: the second context's texture reads {read_s:08x?}, not the \
+                     reference's {read_r:08x?}"
+                ));
+            }
+            if sampled_s != sampled_r {
+                return Err(format!(
+                    "step {step}: the second context's texture samples {sampled_s:08x?}, not the \
+                     reference's {sampled_r:08x?}"
+                ));
+            }
+        }
+        // In place, nothing wrote past the surface's own bytes in its last page.
+        if ram.is_some() {
+            let tail = read_surface(length);
+            if let Some(at) = tail[own as usize..].iter().position(|&b| b != SENTINEL) {
+                return Err(format!(
+                    "the byte {:#x} past the surface's own {own:#x} in its page is {:#04x}",
+                    own as usize + at,
+                    tail[own as usize + at]
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// On the Vulkan platform, a test's region ([`crate::platform::test_region`]) is the
+    /// platform's memory, whose pages stay mapped past the region's drop while the import of a
+    /// no-copy buffer over them lives, and are unmapped once the runtime freed it, as the
+    /// device's region is: a test that drops its decoder, and with it its buffers, before its
+    /// region may still have an import of the region freed on another thread, as a completed
+    /// command buffer's handler lets go of the buffers it used (on a Radeon 780M an unmap under
+    /// that free faulted the kernel, `docs/lessons.md`)
+    #[test]
+    fn on_vulkan_a_test_region_outlives_the_imports_of_its_pages() {
+        use reims_vgpu_vulkan::core::platform::HostRange;
+        use reims_vgpu_vulkan::core::platform::device::GpuDevice as _;
+
+        use crate::platform::ApiPlatform as _;
+
+        // Whether the page at `at` is mapped, read without touching it.
+        let mapped = crate::platform::page_mapped;
+        let platform = reims_vgpu_vulkan::VulkanPlatform::process();
+        let device = platform.metal_device(None).unwrap();
+        let region = crate::platform::test_region(&*platform, 0x10000);
+        let base = region.base();
+        // SAFETY: the region's first 16 KiB, mapped until the import over them is freed.
+        let bytes = unsafe { HostRange::new(HostPtr::from_ptr(base), 0x4000) };
+        let buffer = device
+            .new_buffer_over_host_memory(OnFault::Die, bytes, 0, None)
+            .unwrap()
+            .unwrap();
+        drop(region);
+        assert!(
+            mapped(base),
+            "the region's pages outlive it while the buffer's import lives"
+        );
+        drop(buffer);
+        let first = std::ptr::NonNull::new(base).unwrap();
+        assert!(
+            reims_vgpu_vulkan::remap::wait_unimported(
+                first,
+                0x10000,
+                std::time::Duration::from_secs(30)
+            ),
+            "the runtime freed the import"
+        );
+    }
+
+    /// [`shared_surface_composites`] on the Vulkan platform by `path`, of BGRA8 and of RGBA16F:
+    /// every difference.
+    fn shared_cases(path: SharedPath) {
+        let mut failed = Vec::new();
+        for &(format, ostype, _) in &PIN_CASES {
+            let done = shared_surface_composites::<reims_vgpu_vulkan::VulkanPlatform>(
+                format, ostype, path,
+            );
+            if let Err(e) = done {
+                failed.push(format!("{path:?} {format}: {e}"));
+            }
+        }
+        assert!(failed.is_empty(), "{}", failed.join("\n"));
+    }
+
+    /// On the Vulkan platform, a surface's copy that one context draws and another composites
+    /// reads in the second as the first drew it, and as the guest's CPU wrote it, of BGRA8 and of
+    /// RGBA16F: texel by texel, sampled minified through a linear sampler, and composited over
+    /// another colour with its edge rows and columns clamped into the corners
+    #[test]
+    fn on_vulkan_another_context_composites_a_surface_copy_as_it_was_drawn() {
+        shared_cases(SharedPath::Copy);
+    }
+
+    /// On the Vulkan platform, a surface in place, its own pages of guest RAM, that one context
+    /// draws and another composites reads in the second as the first drew it, and as the guest's
+    /// CPU wrote its pages, as the copy does; and nothing lands past the surface's own bytes in its
+    /// last page
+    #[test]
+    fn on_vulkan_another_context_composites_a_surface_in_place_as_it_was_drawn() {
+        shared_cases(SharedPath::InPlace);
+    }
+
+    /// WindowServer's mipmapped tiled texture under the x86 Macs' feature profile (macOS 26): 54
+    /// x 54 BGRA8Unorm of 6 levels, usage `ShaderRead`, over a 16384-byte Shared buffer at 256
+    /// bytes a row, whose 40 bytes past each row's texels are padding.
+    const TILED_SIZE: u64 = 54;
+    const TILED_LEVELS: u32 = 6;
+    const TILED_ROW: u64 = 256;
+    const TILED_PAD: u8 = 0xee;
+
+    /// What [`tiled_texture_levels`] read and the buffer held at each step.
+    struct TiledLevels {
+        /// The texture's level count.
+        levels: u64,
+        /// Level 0 read by a blit after the CPU wrote [`tiled_texel`]'s into the buffer's rows,
+        /// the texture made: packed rows.
+        first: Vec<u8>,
+        /// Level 0 read by a blit after a blit wrote one colour into the whole of it: packed rows.
+        first_written: Vec<u8>,
+        /// The buffer's bytes after that write.
+        after_first_written: Vec<u8>,
+        /// Levels 1 to 5 read after `generateMipmapsForTexture:`, each packed rows.
+        generated: Vec<Vec<u8>>,
+        /// Level 3 read after a blit wrote [`tiled_texel`]'s of its size into it: packed rows.
+        third: Vec<u8>,
+        /// The buffer's bytes after that write.
+        after_third_written: Vec<u8>,
+    }
+
+    /// The BGRA8 texel at (`x`, `y`) of a pattern apart at every place, made opaque.
+    fn tiled_texel(x: u64, y: u64, seed: u8) -> [u8; 4] {
+        [
+            x as u8,
+            y as u8,
+            seed ^ (x as u8).wrapping_mul(7) ^ (y as u8),
+            0xff,
+        ]
+    }
+
+    /// The colour [`tiled_texture_levels`] writes into the whole of level 0.
+    const TILED_COLOUR: [u8; 4] = [0x10, 0x20, 0x30, 0x40];
+
+    /// Makes [`TILED_SIZE`]'s texture through the decoder on `P` (`TEXTURE_FROM_BUFFER` of
+    /// [`TILED_LEVELS`] levels, as the bundle sends it from
+    /// `newTiledTextureWithDescriptor:offset:bytesPerRow:`) over a buffer whose bytes past each
+    /// row's texels are [`TILED_PAD`], then, in order: the CPU writes a pattern into the rows and a
+    /// blit reads level 0; a blit writes [`TILED_COLOUR`] into level 0, which a blit reads, and the
+    /// buffer is read;
+    /// `generateMipmapsForTexture:` fills the other levels, which blits read; a blit writes a
+    /// pattern into level 3, which a blit reads back, and the buffer is read again.
+    fn tiled_texture_levels<P: crate::platform::ApiPlatform>() -> TiledLevels {
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::resource::{Buffer as _, Texture as _};
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+        let (mut dec, device) = surface_decoder::<P>();
+        let length = 0x4000u64;
+        buffer_holding(&mut dec, &device, 10, &vec![TILED_PAD; length as usize]);
+        let m = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(11),
+            resource_id: 11,
+            buffer_obj_id: context_obj(10),
+            offset: 0,
+            bytes_per_row: TILED_ROW,
+            desc: RgfxTextureDescriptor {
+                mipmap_level_count: TILED_LEVELS,
+                ..surface_desc(80, (TILED_SIZE, TILED_SIZE))
+            },
+        };
+        assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
+            panic!("no buffer");
+        };
+        let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+            panic!("no texture");
+        };
+        let contents = buffer.contents().as_ptr::<u8>();
+        // SAFETY: the buffer's `length` bytes, which no command uses while they are read.
+        let buffer_bytes =
+            || unsafe { std::slice::from_raw_parts(contents, length as usize) }.to_vec();
+        let queue = device.new_command_queue().unwrap();
+        let run = |cmds: Vec<BlitCmd<'_, P>>| {
+            let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+            let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+            for cmd in cmds {
+                e.encode(OnFault::Return, cmd).unwrap();
+            }
+            e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+            cb.commit(OnFault::Return).unwrap();
+            cb.wait_until_completed(OnFault::Return).unwrap();
+            assert!(cb.error().is_none(), "{:?}", cb.error());
+        };
+        let shared = |bytes: &[u8]| {
+            let b = device
+                .new_buffer_of_length(OnFault::Return, bytes.len() as u64, 0)
+                .unwrap()
+                .unwrap();
+            // SAFETY: a Shared buffer of `bytes.len()` bytes, which no command uses yet.
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr(),
+                    b.contents().as_ptr::<u8>(),
+                    bytes.len(),
+                )
+            };
+            b
+        };
+        let side = |level: u64| (TILED_SIZE >> level).max(1);
+        let read_level = |level: u64| {
+            let s = side(level);
+            let out = shared(&vec![0; (s * s * 4) as usize]);
+            run(vec![BlitCmd::CopyTextureToBuffer {
+                source_texture: t,
+                source_slice: 0,
+                source_level: level,
+                source_origin: MtlOrigin::new(0, 0, 0),
+                source_size: MtlSize::new(s, s, 1),
+                destination_buffer: &out,
+                destination_offset: 0,
+                destination_bytes_per_row: s * 4,
+                destination_bytes_per_image: s * s * 4,
+            }]);
+            // SAFETY: a Shared buffer's bytes, read after the blit completed.
+            unsafe {
+                std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize)
+            }
+            .to_vec()
+        };
+        let write_level = |level: u64, texels: &[u8]| {
+            let s = side(level);
+            let source = shared(texels);
+            run(vec![BlitCmd::CopyBufferToTexture {
+                source_buffer: &source,
+                source_offset: 0,
+                source_bytes_per_row: s * 4,
+                source_bytes_per_image: s * s * 4,
+                source_size: MtlSize::new(s, s, 1),
+                destination_texture: t,
+                destination_slice: 0,
+                destination_level: level,
+                destination_origin: MtlOrigin::new(0, 0, 0),
+            }]);
+        };
+        let pattern = |level: u64, seed: u8| {
+            let s = side(level);
+            (0..s * s)
+                .flat_map(|i| tiled_texel(i % s, i / s, seed))
+                .collect::<Vec<u8>>()
+        };
+        // The CPU's write of the rows, after the texture was made, as WindowServer draws a tile.
+        for y in 0..TILED_SIZE {
+            for x in 0..TILED_SIZE {
+                let texel = tiled_texel(x, y, 0x5a);
+                // SAFETY: inside the buffer's `length` bytes, which no command uses yet.
+                unsafe {
+                    std::ptr::copy_nonoverlapping(
+                        texel.as_ptr(),
+                        contents.add((y * TILED_ROW + x * 4) as usize),
+                        4,
+                    )
+                };
+            }
+        }
+        let levels = t.mipmap_level_count();
+        let first = read_level(0);
+        let colour: Vec<u8> = (0..TILED_SIZE * TILED_SIZE)
+            .flat_map(|_| TILED_COLOUR)
+            .collect();
+        write_level(0, &colour);
+        let first_written = read_level(0);
+        let after_first_written = buffer_bytes();
+        run(vec![BlitCmd::GenerateMipmaps { texture: Some(t) }]);
+        let generated = (1..u64::from(TILED_LEVELS)).map(read_level).collect();
+        write_level(3, &pattern(3, 0xa5));
+        let third = read_level(3);
+        let after_third_written = buffer_bytes();
+        TiledLevels {
+            levels,
+            first,
+            first_written,
+            after_first_written,
+            generated,
+            third,
+            after_third_written,
+        }
+    }
+
+    /// Whether `bytes`, the buffer's, hold `texel(x, y)` at each texel of level 0's rows and
+    /// [`TILED_PAD`] everywhere else; the first difference otherwise.
+    fn tiled_buffer_holds(bytes: &[u8], texel: impl Fn(u64, u64) -> [u8; 4]) -> Result<(), String> {
+        for (at, &byte) in bytes.iter().enumerate() {
+            let (y, x) = (at as u64 / TILED_ROW, at as u64 % TILED_ROW / 4);
+            let want = match y < TILED_SIZE && x < TILED_SIZE {
+                true => texel(x, y)[at % 4],
+                false => TILED_PAD,
+            };
+            if byte != want {
+                return Err(format!(
+                    "byte {at:#x} ({x}, {y}): {byte:#04x}, not {want:#04x}"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// On the Vulkan platform, a tiled texture of 6 levels over a buffer has 6 levels, and its
+    /// first level reads the texels the CPU wrote into the buffer's rows after it was made
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_first_level_reads_the_buffer_s_rows() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        assert_eq!(r.levels, u64::from(TILED_LEVELS));
+        for (i, texel) in r.first.chunks(4).enumerate() {
+            let (x, y) = (i as u64 % TILED_SIZE, i as u64 / TILED_SIZE);
+            assert_eq!(texel, tiled_texel(x, y, 0x5a), "({x}, {y})");
+        }
+    }
+
+    /// On the Vulkan platform, a blit's write of a tiled texture's first level stays in the
+    /// texture, which a blit reads back, and reaches none of the buffer's bytes, which keep the
+    /// rows the CPU wrote and the bytes between them, as the x86 Macs' (docs/graphics-kext/
+    /// dgpu-oracle.md, Q11: the texture is a copy of the bytes); nor does a write of its level 3
+    #[test]
+    fn on_vulkan_a_blit_write_of_a_tiled_texture_s_first_level_stays_in_the_texture() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        for (i, texel) in r.first_written.chunks(4).enumerate() {
+            assert_eq!(texel, TILED_COLOUR, "texel {i}");
+        }
+        let written = |x, y| tiled_texel(x, y, 0x5a);
+        tiled_buffer_holds(&r.after_first_written, written).unwrap();
+        tiled_buffer_holds(&r.after_third_written, written).unwrap();
+    }
+
+    /// On the Vulkan platform, a tiled texture's levels 1 and up are its own: generating its
+    /// mipmaps fills each with its first level's colour, and a blit's write of level 3 reads back
+    #[test]
+    fn on_vulkan_a_tiled_texture_s_other_levels_hold_what_blits_write() {
+        let r = tiled_texture_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        for (k, level) in r.generated.iter().enumerate() {
+            let side = (TILED_SIZE >> (k + 1)).max(1) as usize;
+            assert_eq!(level.len(), side * side * 4);
+            for (i, texel) in level.chunks(4).enumerate() {
+                assert_eq!(texel, TILED_COLOUR, "level {} texel {i}", k + 1);
+            }
+        }
+        let side = TILED_SIZE >> 3;
+        for (i, texel) in r.third.chunks(4).enumerate() {
+            let (x, y) = (i as u64 % side, i as u64 / side);
+            assert_eq!(texel, tiled_texel(x, y, 0xa5), "level 3 ({x}, {y})");
+        }
+    }
+
+    /// What [`tiled_modified_levels`] read of the texture's levels 0 and 1 at each step: packed
+    /// rows.
+    struct TiledModified {
+        /// At its first use, after the CPU wrote the rows of seed 0x5a.
+        first: [Vec<u8>; 2],
+        /// After the CPU wrote the rows of seed 0xa5, with no `didModifyData`.
+        unmarked: [Vec<u8>; 2],
+        /// After a `TEXTURE_DID_MODIFY_DATA`, then the CPU's write of the rows of seed 0x3c before
+        /// the next use.
+        marked: [Vec<u8>; 2],
+    }
+
+    /// Makes [`TILED_SIZE`]'s texture through the decoder on `P`, as [`tiled_texture_levels`]
+    /// does, then, in order: the CPU writes the rows of [`tiled_texel`]'s seed 0x5a, and blits read
+    /// levels 0 and 1; the CPU writes those of seed 0xa5, and blits read them again; the decoder
+    /// takes a `TEXTURE_DID_MODIFY_DATA` of the texture, the CPU writes the rows of seed 0x3c, and
+    /// blits read them once more.
+    fn tiled_modified_levels<P: crate::platform::ApiPlatform>() -> TiledModified {
+        use reims_vgpu_vulkan::core::platform::blit::{BlitCmd, BlitEncoder as _};
+        use reims_vgpu_vulkan::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+        use reims_vgpu_vulkan::core::platform::resource::Buffer as _;
+        use reims_vgpu_vulkan::core::platform::types::{MtlOrigin, MtlSize};
+        let (mut dec, device) = surface_decoder::<P>();
+        buffer_holding(&mut dec, &device, 10, &vec![TILED_PAD; 0x4000]);
+        let m = RgfxTextureFromBuffer {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_FROM_BUFFER,
+                size: size_of::<RgfxTextureFromBuffer>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(11),
+            resource_id: 11,
+            buffer_obj_id: context_obj(10),
+            offset: 0,
+            bytes_per_row: TILED_ROW,
+            desc: RgfxTextureDescriptor {
+                mipmap_level_count: TILED_LEVELS,
+                ..surface_desc(80, (TILED_SIZE, TILED_SIZE))
+            },
+        };
+        assert_eq!(dec.decode(&device, m.as_bytes()).unwrap(), Ok(()));
+        let Some(ObjHandle::Buffer(buffer)) = dec.object(context_obj(10)) else {
+            panic!("no buffer");
+        };
+        let contents = buffer.contents().as_ptr::<u8>();
+        let write_rows = |seed: u8| {
+            for y in 0..TILED_SIZE {
+                for x in 0..TILED_SIZE {
+                    let texel = tiled_texel(x, y, seed);
+                    // SAFETY: inside the buffer's 0x4000 bytes, which no command uses meanwhile.
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            texel.as_ptr(),
+                            contents.add((y * TILED_ROW + x * 4) as usize),
+                            4,
+                        )
+                    };
+                }
+            }
+        };
+        let queue = device.new_command_queue().unwrap();
+        let read = |dec: &GraphicsDecoder<P>| {
+            let Some(ObjHandle::Texture(t)) = dec.object(context_obj(11)) else {
+                panic!("no texture");
+            };
+            [0u64, 1].map(|level| {
+                let s = (TILED_SIZE >> level).max(1);
+                let out = device
+                    .new_buffer_of_length(OnFault::Return, s * s * 4, 0)
+                    .unwrap()
+                    .unwrap();
+                let cb = queue.command_buffer(OnFault::Return).unwrap().unwrap();
+                let e = cb.blit_encoder(OnFault::Return).unwrap().unwrap();
+                let copy = BlitCmd::CopyTextureToBuffer {
+                    source_texture: t,
+                    source_slice: 0,
+                    source_level: level,
+                    source_origin: MtlOrigin::new(0, 0, 0),
+                    source_size: MtlSize::new(s, s, 1),
+                    destination_buffer: &out,
+                    destination_offset: 0,
+                    destination_bytes_per_row: s * 4,
+                    destination_bytes_per_image: s * s * 4,
+                };
+                e.encode(OnFault::Return, copy).unwrap();
+                e.encode(OnFault::Return, BlitCmd::EndEncoding).unwrap();
+                cb.commit(OnFault::Return).unwrap();
+                cb.wait_until_completed(OnFault::Return).unwrap();
+                assert!(cb.error().is_none(), "{:?}", cb.error());
+                // SAFETY: a Shared buffer's bytes, read after the blit completed.
+                unsafe {
+                    std::slice::from_raw_parts(out.contents().as_ptr::<u8>(), (s * s * 4) as usize)
+                }
+                .to_vec()
+            })
+        };
+        write_rows(0x5a);
+        let first = read(&dec);
+        write_rows(0xa5);
+        let unmarked = read(&dec);
+        let modified = RgfxTextureDidModifyData {
+            header: RgfxMsgHeader {
+                r#type: RGFX_CMD_TEXTURE_DID_MODIFY_DATA,
+                size: size_of::<RgfxTextureDidModifyData>() as u32,
+                seqno: 0,
+            },
+            obj_id: context_obj(11),
+        };
+        assert_eq!(dec.decode(&device, modified.as_bytes()).unwrap(), Ok(()));
+        write_rows(0x3c);
+        let marked = read(&dec);
+        TiledModified {
+            first,
+            unmarked,
+            marked,
+        }
+    }
+
+    /// Whether `level`, level 1 of [`TILED_SIZE`]'s texture read as packed rows, holds the
+    /// average of each 2 x 2 texels of level 0 of [`tiled_texel`]'s `seed`, within 1 of each
+    /// channel; the first difference otherwise.
+    fn tiled_second_level_of(level: &[u8], seed: u8) -> Result<(), String> {
+        let side = TILED_SIZE / 2;
+        for (i, texel) in level.chunks(4).enumerate() {
+            let (x, y) = (i as u64 % side, i as u64 / side);
+            for (c, &got) in texel.iter().enumerate() {
+                let sum: u32 = [(0, 0), (1, 0), (0, 1), (1, 1)]
+                    .iter()
+                    .map(|&(dx, dy)| u32::from(tiled_texel(2 * x + dx, 2 * y + dy, seed)[c]))
+                    .sum();
+                let want = sum as f64 / 4.0;
+                if (f64::from(got) - want).abs() > 1.0 {
+                    return Err(format!("({x}, {y}) channel {c}: {got}, not {want}"));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// On the Vulkan platform, a tiled texture of more than one level is a copy of the buffer's
+    /// rows taken at its first use, every level made from them, which a later CPU write reaches
+    /// not; a `TEXTURE_DID_MODIFY_DATA` makes it take the rows again at its next use, the CPU's
+    /// writes after the message among them, as the x86 Macs' `didModifyData`
+    /// (docs/graphics-kext/dgpu-oracle.md, Q11)
+    #[test]
+    fn on_vulkan_a_tiled_texture_takes_the_rows_again_after_did_modify_data() {
+        let r = tiled_modified_levels::<reims_vgpu_vulkan::VulkanPlatform>();
+        let rows = |seed: u8| -> Vec<u8> {
+            (0..TILED_SIZE * TILED_SIZE)
+                .flat_map(|i| tiled_texel(i % TILED_SIZE, i / TILED_SIZE, seed))
+                .collect()
+        };
+        assert_eq!(r.first[0], rows(0x5a), "level 0 at the first use");
+        tiled_second_level_of(&r.first[1], 0x5a).unwrap();
+        assert_eq!(
+            r.unmarked[0],
+            rows(0x5a),
+            "level 0 after a write with no call"
+        );
+        assert_eq!(
+            r.unmarked[1], r.first[1],
+            "level 1 after a write with no call"
+        );
+        assert_eq!(r.marked[0], rows(0x3c), "level 0 after the message");
+        tiled_second_level_of(&r.marked[1], 0x3c).unwrap();
     }
 
     /// What a `SAMPLER_CREATE` costs the host, through the decoder as the guest's waited create
@@ -9347,9 +12102,8 @@ lacks {part}"
     /// not made. A measurement, run by hand (`--run-ignored only --no-capture`); it prints the
     /// mean, median and 99th percentile of each. `RVG_SAMPLER_BENCH_LIVE` (comma-separated) sets
     /// other live counts.
-    #[cfg(any(target_os = "macos", feature = "vulkan"))]
     fn sampler_create_cost<P: crate::platform::ApiPlatform>() {
-        use reims_vgpu_core::platform::os::Clock as _;
+        use reims_vgpu_vulkan::core::platform::os::Clock as _;
         let (mut dec, device) = surface_decoder::<P>();
         let platform = P::process();
         let now = || platform.clock().now_mono();
@@ -9425,137 +12179,10 @@ lacks {part}"
     }
 
     /// [`sampler_create_cost`] on the Vulkan platform.
-    #[cfg(feature = "vulkan")]
     #[test]
     #[ignore = "a measurement, run by hand"]
     fn on_vulkan_sampler_create_cost_by_live_samplers() {
         sampler_create_cost::<reims_vgpu_vulkan::VulkanPlatform>();
-    }
-
-    /// [`sampler_create_cost`] on Metal.
-    #[cfg(target_os = "macos")]
-    #[test]
-    #[ignore = "a measurement, run by hand"]
-    fn on_metal_sampler_create_cost_by_live_samplers() {
-        sampler_create_cost::<reims_vgpu_metal::MetalPlatform>();
-    }
-
-    /// On Metal, a texture of 505 over plane 0 of a real 'x420' surface of BT.2020 holding the
-    /// bundle's copy's bytes, at its planes' offsets and rows, samples through a linear sampler
-    /// as recorded ([`METAL_505`]), every alpha 1. Through the decoder the Metal platform refuses
-    /// the create: Metal makes no texture over a surface's plane from a buffer's bytes, and the
-    /// host holds no surface, only the guest's copy of it.
-    #[cfg(target_os = "macos")]
-    #[test]
-    fn on_metal_a_505_texture_over_an_x420_surface_samples_as_recorded() {
-        use std::ffi::c_void;
-
-        use reims_vgpu_core::platform::os::surface::{Surface as _, SurfacePlaneSpec, SurfaceSpec};
-        use reims_vgpu_metal::MetalPlatform;
-
-        use crate::platform::ApiPlatform as _;
-        // The guest's route first, which keeps the guest's texture ids on the device before any
-        // texture is made on it.
-        assert_eq!(ycbcr_through_the_decoder::<MetalPlatform>(), None);
-        #[link(name = "IOSurface", kind = "framework")]
-        unsafe extern "C" {
-            fn IOSurfaceSetValue(buffer: *const c_void, key: *const c_void, value: *const c_void);
-        }
-        #[link(name = "CoreFoundation", kind = "framework")]
-        unsafe extern "C" {
-            fn CFStringCreateWithBytes(
-                alloc: *const c_void,
-                bytes: *const u8,
-                num_bytes: isize,
-                encoding: u32,
-                is_external_representation: u8,
-            ) -> *const c_void;
-            fn CFRelease(cf: *const c_void);
-        }
-        // A UTF-8 CFString of `s`, +1.
-        let cf_string = |s: &str| {
-            // SAFETY: `s`'s bytes, live for the call, which copies them.
-            unsafe {
-                CFStringCreateWithBytes(
-                    std::ptr::null(),
-                    s.as_ptr(),
-                    s.len() as isize,
-                    0x0800_0100,
-                    0,
-                )
-            }
-        };
-        let platform = MetalPlatform::process();
-        let device = platform.metal_device(None).unwrap();
-        let (width, height) = YCBCR_SIZE;
-        let plane = |offset, (width, height): (u64, u64), element| SurfacePlaneSpec {
-            base: offset,
-            offset,
-            width,
-            height,
-            size: YCBCR_ROW * height,
-            bytes_per_row: YCBCR_ROW,
-            bytes_per_element: element,
-            element_width: 1,
-            element_height: 1,
-            ..SurfacePlaneSpec::default()
-        };
-        let spec = SurfaceSpec {
-            planes: Some(vec![
-                plane(0, YCBCR_SIZE, 2),
-                plane(YCBCR_CHROMA_AT, (width / 2, height / 2), 4),
-            ]),
-            pixel_format: u32::from_be_bytes(*b"x420"),
-            alloc_size: 0x4000,
-            width,
-            height,
-            bytes_per_element: 2,
-            bytes_per_row: YCBCR_ROW,
-            element_width: 1,
-            element_height: 1,
-            ..SurfaceSpec::default()
-        };
-        let surface = platform.surfaces().create(&spec).unwrap();
-        assert_eq!(surface.plane_count(), 2);
-        let ptr = std::ptr::with_exposed_provenance::<c_void>(surface.id().0 as usize);
-        let (key, value) = (cf_string("IOSurfaceYCbCrMatrix"), cf_string("ITU_R_2020"));
-        // SAFETY: the surface's IOSurfaceRef (its handle's id), live while `surface` is, and two
-        // CFStrings, released after the call, which retains what it keeps.
-        unsafe {
-            IOSurfaceSetValue(ptr, key, value);
-            CFRelease(key);
-            CFRelease(value);
-        }
-        let bytes = ycbcr_bytes();
-        // SAFETY: the surface's allocation holds both planes, which no command uses yet.
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                surface.base_address().as_ptr::<u8>(),
-                bytes.len(),
-            )
-        };
-        let desc = surface_desc(505, YCBCR_SIZE);
-        let descriptor = platform.texture_descriptor(&TextureDesc {
-            resource_index: None,
-            ..texture_desc(&desc, 0)
-        });
-        let own = device
-            .new_texture_on_surface(&descriptor, Some(&surface), 0)
-            .unwrap()
-            .unwrap();
-        let sampler = linear_sampler::<MetalPlatform>(&device);
-        let probe = ycbcr_probe();
-        let read = (Some(&sampler), Some(&probe[..]));
-        let metal =
-            kernel_reads::<MetalPlatform>(&device, "sample_texels_float", &own, YCBCR_GRID, read);
-        let bits: Vec<[u32; 3]> = metal
-            .iter()
-            .map(|t| [t[0], t[1], t[2]].map(f32::to_bits))
-            .collect();
-        eprintln!("METAL_505 = {bits:#010x?}");
-        assert!(metal.iter().all(|t| t[3] == 1.0), "{metal:?}");
-        assert_eq!(bits, METAL_505);
     }
 
     /// On the Vulkan platform, the 505 texture WindowServer composites the wallpaper's video
@@ -9565,7 +12192,6 @@ lacks {part}"
     /// of the sampling is printed: on a native device nothing of [`reims_vgpu_vulkan::answer::DIES`]
     /// is relayed but what a native device relays (`DeviceSampling` among them); on MoltenVK,
     /// Metal's own sampler's filter of the converted texels is `YCbCrFilterNotExact`'s, relayed.
-    #[cfg(feature = "vulkan")]
     #[test]
     fn on_vulkan_a_505_texture_over_the_bundle_s_copy_samples_as_metal_s() {
         use reims_vgpu_vulkan::answer::{self, native};
@@ -9610,13 +12236,13 @@ lacks {part}"
     /// non-library is a bad reference and makes nothing.
     #[test]
     fn render_and_compute_pipeline_creates() {
-        use reims_vgpu_core::sync::Mutex;
+        use reims_vgpu_vulkan::core::sync::Mutex;
 
         let p = Arc::new(FakePlatform::new());
         let device = p.device();
         let mut dec = GraphicsDecoder::<FakePlatform>::new(
             Arc::clone(&p),
-            Arc::new(reims_graphics::region::Region::new(0x10000).unwrap()),
+            Arc::new(reims_vgpu_graphics::region::Region::new(0x10000).unwrap()),
         );
 
         let replies = Arc::new(Mutex::new(Vec::<RgfxPipelineReflection>::new()));

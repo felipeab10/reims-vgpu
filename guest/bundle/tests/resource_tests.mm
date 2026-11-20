@@ -37,6 +37,7 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "reims_graphics_wire.h"
+#include "../../kext/src/RgfxSubmitGate.hpp"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
 
 void rgfxResourceTests();
@@ -127,6 +128,43 @@ void test_heap_answers()
 		CHECK([priv setPurgeableState:MTLPurgeableStateNonVolatile] == MTLPurgeableStateEmpty);
 		CHECK([priv setPurgeableState:MTLPurgeableStateKeepCurrent] ==
 		      MTLPurgeableStateNonVolatile);
+
+		// Metal's heap SPI: memory pool 0; a backing is neither detached nor replaced (each raises an
+		// unrecognized selector); the description is Metal's base heap's, field by field.
+		auto raises = [](void (^body)(void)) {
+			@try {
+				body();
+			} @catch (NSException *e) {
+				return [e.reason containsString:@"unrecognized selector"];
+			}
+			return false;
+		};
+		CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(priv, NSSelectorFromString(@"memoryPoolId")) == 0);
+		CHECK(raises(^{
+			((BOOL (*)(id, SEL))objc_msgSend)(priv, NSSelectorFromString(@"detachBacking"));
+		}));
+		CHECK(raises(^{
+			((BOOL (*)(id, SEL, id, BOOL))objc_msgSend)(
+			    priv, NSSelectorFromString(@"replaceBackingWithRanges:readOnly:"), @[], NO);
+		}));
+		priv.label = @"heap";
+		auto described = [](id heap, NSUInteger indent) {
+			return ((NSString * (*)(id, SEL, NSUInteger)) objc_msgSend)(
+			    heap, NSSelectorFromString(@"formattedDescription:"), indent);
+		};
+		NSString *text = described(priv, 0);
+		NSString *pad = @"\n   "; // a line break, padded to indent + 4
+		NSString *fields = [NSString
+		    stringWithFormat:@"%@ label = heap %@ type = MTLHeapTypePlacement %@ size = %lu %@ usedSize = 0 "
+		                     @"%@ cpuCacheMode = MTLCPUCacheModeDefaultCache %@ storageMode = "
+		                     @"MTLStorageModePrivate %@ hazardTrackingMode = ",
+		                     pad, pad, pad, (unsigned long)priv.size, pad, pad, pad, pad];
+		NSString *head = [NSString stringWithFormat:@"<RgfxHeap: %p>%@", priv, fields];
+		CHECK([text hasPrefix:head]);
+		CHECK([text containsString:[pad stringByAppendingString:@" resourceOptions = "]]);
+		CHECK([described(shared, 2) containsString:@"\n      label = <none> \n      type = MTLHeapTypeAutomatic"]);
+		// A heap Metal's base words no storage mode of: Shared.
+		CHECK([described(shared, 0) containsString:@"storageMode = Invalid"]);
 
 		// No acceleration structure: nil, logged, nothing posted.
 		drainRing(fx.ring);
@@ -234,6 +272,8 @@ void test_buffer_answers()
 		const uint64_t id0 = [internals(plain) allocationID], id1 = [internals(priv) allocationID];
 		CHECK(id0 != 0 && id1 != 0 && id0 != id1);
 		CHECK([internals(plain) resourceSize] == 0x1000 && [internals(plain) iosurface] == nullptr);
+		CHECK(((void *(*)(id, SEL))objc_msgSend)(plain, NSSelectorFromString(@"_aneIOSurface")) ==
+		      nullptr);
 		CHECK(plain.contents != nullptr && [internals(plain) virtualAddress] == plain.contents);
 		CHECK([internals(priv) virtualAddress] == nullptr);
 
@@ -673,11 +713,30 @@ void test_texture_answers()
 		CHECK([internals(managed) uniqueIdentifier] == first + 3);
 		const uint64_t a0 = [internals(priv) allocationID], a1 = [internals(shared) allocationID];
 		CHECK(a0 != 0 && a1 != 0 && a0 != a1);
+		// Metal's texture SPI: the handle and the index are gpuResourceID's value; one face but for
+		// a cube texture's six; no colour space conversion and no compression.
+		auto u64 = [](id object, NSString *name) {
+			return ((uint64_t (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		for (id t in @[ priv, shared, managed ]) {
+			CHECK(u64(t, @"gpuHandle") == [(id<MTLTexture>)t gpuResourceID]._impl &&
+			      u64(t, @"resourceIndex") == [(id<MTLTexture>)t gpuResourceID]._impl);
+			CHECK(u64(t, @"numFaces") == 1 && u64(t, @"colorSpaceConversionMatrix") == 0 &&
+			      u64(t, @"compressionFeedback") == 0 && u64(t, @"compressionFootprint") == 0);
+		}
 
 		// A view, at any level and slice, answers its texture's, under a number of its own, and
 		// keeps a purgeable state of its own.
 		id<MTLTexture> view = [priv newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 		CHECK(view != nil && [internals(view) uniqueIdentifier] == first + 4);
+		CHECK(u64(view, @"gpuHandle") == view.gpuResourceID._impl && u64(view, @"numFaces") == 1);
+		MTLTextureDescriptor *cd =
+		    [MTLTextureDescriptor textureCubeDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                          size:16
+		                                                     mipmapped:NO];
+		cd.storageMode = MTLStorageModePrivate;
+		RgfxTexture *cube = device(cd);
+		CHECK(cube != nil && u64(cube, @"numFaces") == 6);
 		CHECK([internals(view) gpuAddress] == [internals(priv) gpuAddress]);
 		CHECK([internals(view) allocationID] == a0);
 		CHECK([internals(view) resourceSize] == [internals(priv) resourceSize]);
@@ -795,6 +854,17 @@ void test_texture_answers()
 		id<MTLTexture> linearView = [linear newTextureViewWithPixelFormat:MTLPixelFormatBGRA8Unorm_sRGB];
 		CHECK(linearView != nil && [internals(linearView) gpuAddress] == [internals(linear) gpuAddress]);
 		CHECK([internals(linearView) virtualAddress] == [internals(linear) virtualAddress]);
+		// A command buffer in flight that names a view of a texture over a buffer names the
+		// texture's and the buffer's memory too: each answers NO (RGFX_RESOURCE_SPI), and
+		// another buffer and its texture YES.
+		RgfxInFlightBegin((RgfxResource *)linearView);
+		CHECK(![internals(buffer) isComplete] && ![internals(linear) isComplete] &&
+		      ![internals(linearView) isWriteComplete]);
+		CHECK([internals(privBuffer) isComplete] && [internals(privLinear) isComplete]);
+		RgfxInFlightEnd((RgfxResource *)linearView);
+		CHECK([internals(buffer) isComplete] && [internals(linear) isWriteComplete] &&
+		      [internals(linearView) isComplete]);
+		[internals(linearView) waitUntilComplete];
 
 		// Textures over one IOSurface plane, and a view of one, share an allocation and an address,
 		// with no CPU address, and alias nothing.
@@ -853,7 +923,7 @@ struct SamplerAnswer {
 		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
 		answer.status = RGFX_STATUS_OK;
 		answer.gpu_resource_id = static_cast<SamplerAnswer *>(context)->id;
-		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(size == sizeof(RgfxSamplerCreateWhole) && message != nullptr);
 		CHECK(capacity >= sizeof(answer));
 		std::memcpy(reply, &answer, sizeof(answer));
 		*reply_size = sizeof(answer);
@@ -862,11 +932,13 @@ struct SamplerAnswer {
 };
 
 // A device-placed texture's GPU address holds its allocatedSize: textures (Private, Shared and
-// Managed, of one level, mipmapped, arrays and up to 16 MiB) and buffers made in turn lie in GPU
-// address ranges of their bytes no two of which meet, each at a 4 KiB page or past it by
-// nothing, as both x86 Macs' are (oracle_bundle texaddr: the AMD 5300M and the Intel 630 under
-// macOS 26.7.1 place successive textures past each other's allocatedSize). A texture keeps its
-// address while it lives, and the range goes back once it is let go.
+// Managed, of one level, mipmapped, arrays, of the two-plane XR10 formats and up to 16 MiB) and
+// buffers made in turn lie in GPU address ranges of their bytes no two of which meet, each at a
+// 4 KiB page or past it by nothing, as both x86 Macs' are (oracle_bundle texaddr: the AMD 5300M
+// and the Intel 630 under macOS 26.7.1 place successive textures past each other's
+// allocatedSize). A two-plane XR10 texture takes both its planes, 4 bytes a texel of colour and 1
+// of alpha, at every level. A texture keeps its address while it lives, and the range goes back
+// once it is let go.
 void test_device_texture_addresses_hold_their_bytes()
 {
 	Fixture fx;
@@ -892,9 +964,17 @@ void test_device_texture_addresses_hold_their_bytes()
 		shared.storageMode = MTLStorageModeShared;
 		MTLTextureDescriptor *managed = texture2D(MTLPixelFormatRGBA8Unorm, 300, 300, read);
 		managed.storageMode = MTLStorageModeManaged;
+		MTLTextureDescriptor *xr10 = texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read);
+		xr10.pixelFormat = (MTLPixelFormat)550; // RGB10A8_2P_XR10
+		MTLTextureDescriptor *xr10Mips = texture2D(MTLPixelFormatRGBA8Unorm, 128, 128, read);
+		xr10Mips.pixelFormat = (MTLPixelFormat)551; // its sRGB twin
+		xr10Mips.mipmapLevelCount = 8;
+		CHECK(device(xr10).allocatedSize == 64 * 64 * 5);
+		CHECK(device(xr10Mips).allocatedSize ==
+		      (128 * 128 + 64 * 64 + 32 * 32 + 16 * 16 + 8 * 8 + 4 * 4 + 2 * 2 + 1) * 5);
 		NSArray<MTLTextureDescriptor *> *shapes = @[
 			texture2D(MTLPixelFormatRGBA8Unorm, 64, 64, read), mips, array, shared,
-			texture2D(MTLPixelFormatRGBA8Unorm, 2048, 2048, read), managed
+			texture2D(MTLPixelFormatRGBA8Unorm, 2048, 2048, read), managed, xr10, xr10Mips
 		];
 		struct Range {
 			id resource;
@@ -981,6 +1061,12 @@ void test_sampler_answers()
 		CHECK([ai uniqueIdentifier] == 2 && [bi uniqueIdentifier] == 2 && [ci uniqueIdentifier] == 3);
 		CHECK([ai uniqueIdentifier] == a.gpuResourceID._impl &&
 		      [ci uniqueIdentifier] == c.gpuResourceID._impl);
+		// Metal's sampler SPI: the handle and the index are its identifier.
+		for (RgfxSampler *x in @[ a, c ])
+			CHECK(((uint64_t (*)(id, SEL))objc_msgSend)(x, NSSelectorFromString(@"gpuHandle")) ==
+			          x.gpuResourceID._impl &&
+			      ((uint64_t (*)(id, SEL))objc_msgSend)(x, NSSelectorFromString(@"resourceIndex")) ==
+			          x.gpuResourceID._impl);
 		CHECK([ai gpuAddress] == 0 && [ci gpuAddress] == 0);
 		CHECK([ai pixelFormat] == MTLPixelFormatInvalid && [ci pixelFormat] == MTLPixelFormatInvalid);
 		CHECK(ringEmpty(fx.ring)); // asked, and the members post nothing
@@ -1008,7 +1094,7 @@ struct CountingSamplerAnswer {
 		answer.header = {RGFX_EVT_SAMPLER_STATE, sizeof(answer), 0};
 		answer.status = self->status.load();
 		answer.gpu_resource_id = answer.status == RGFX_STATUS_OK ? self->next++ : 0;
-		CHECK(size == sizeof(RgfxSamplerCreate) && message != nullptr);
+		CHECK(size == sizeof(RgfxSamplerCreateWhole) && message != nullptr);
 		CHECK(capacity >= sizeof(answer));
 		std::memcpy(reply, &answer, sizeof(answer));
 		*reply_size = sizeof(answer);
@@ -1311,6 +1397,54 @@ void test_state_labels()
 	drainRing(fx.ring);
 }
 
+// The rows a surface holds for a plane run from its first byte to the next plane's, or to the
+// allocation's end for the last, at its pitch: a 1080p NV12 surface AppleGVA extends by 8 rows
+// below holds 1088 luma rows before its chroma plane and 544 chroma rows to its end; planes out
+// of order take the nearest after each. A texture over a surface whose GPU view is a copy holds
+// its planes' own rows alone: 0, as for a texture over no surface.
+void test_surface_rows_held()
+{
+	const uint64_t nv12[] = {0x1000, 0x1000 + 1088 * 2048};
+	const uint64_t end = nv12[1] + 544 * 2048 + 100;
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 0, 2048, end) == 1088);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 1, 2048, end) == 544);
+	const uint64_t swapped[] = {nv12[1], nv12[0]};
+	CHECK(rgfxPlaneRowsHeld(swapped, 2, 1, 2048, end) == 1088);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 2, 2048, end) == 0);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 0, 0, end) == 0);
+	CHECK(rgfxPlaneRowsHeld(nv12, 2, 1, 2048, nv12[1]) == 0);
+	Fixture fx;
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	@autoreleasepool {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                                           iosurface:surface
+		                                                               plane:0
+		                                                              region:&region
+		                                                              device:nil
+		                                                          serializer:&fx.ser];
+		CHECK(t != nil && rgfxIOSurfaceRowsHeld(t) == 0);
+		CHECK(rgfxIOSurfaceRowsHeld(nil) == 0);
+		t = nil;
+		CFRelease(surface);
+	}
+	drainRing(fx.ring);
+}
+
 // A shared event answers itself as its IOSurface shared event, as Metal's; a plain event answers
 // no such member.
 void test_shared_event_answers()
@@ -1326,11 +1460,232 @@ void test_shared_event_answers()
 		CHECK(ringEmpty(fx.ring));
 		RgfxEvent *plain = [RgfxEvent eventWithDevice:nil serializer:&fx.ser];
 		CHECK(plain != nil && ![plain respondsToSelector:@selector(IOSurfaceSharedEvent)]);
+		// Metal's event SPI: a wait is a barrier until set otherwise; no event rolls back.
+		auto flag = [](id object, NSString *name) {
+			return ((BOOL (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+		};
+		CHECK(flag(plain, @"enableBarrier") && !flag(plain, @"supportsRollback"));
+		((void (*)(id, SEL, BOOL))objc_msgSend)(plain, NSSelectorFromString(@"setEnableBarrier:"), NO);
+		CHECK(!flag(plain, @"enableBarrier"));
+		CHECK(!flag(ev, @"supportsRollback"));
 	}
 	drainRing(fx.ring);
 }
 
 } // namespace
+
+// A stand-in for the kext over a ring: each Submit, and each SubmitBatch's messages in their
+// order, posted on the ring as the kext posts them.
+struct KextRing {
+	RgfxRingWriter &direct;
+
+	static bool submit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                   uint32_t *out_status)
+	{
+		KextRing *kext = static_cast<KextRing *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return kext->direct.tryPost(header.type, message, size, out_seqno);
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		KextRing *kext = static_cast<KextRing *>(context);
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			CHECK(header.size != 0 && header.size == rgfxSubmitBatchSize(header.type));
+			if (!kext->direct.tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+};
+
+// A ring and a serialiser over the kext's route, holding the destroys where `batches`, its timer
+// far past the test. Never freed, as Fixture.
+struct KextFixture {
+	TestRing &ring;
+	RgfxRingWriter &direct;
+	KextRing &kext;
+	RgfxRingWriter &writer;
+	RgfxIdSpace &ids;
+	RgfxSerializer &ser;
+
+	explicit KextFixture(bool batches)
+	    : ring(*new TestRing(0x8000)),
+	      direct(*new RgfxRingWriter(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID,
+	                                 TestRing::doorbell, nullptr)),
+	      kext(*new KextRing{direct}),
+	      writer(*new RgfxRingWriter(&KextRing::submit, &kext, 0x4000)),
+	      ids(*new RgfxIdSpace()), ser(*new RgfxSerializer(writer, ids))
+	{
+		ring.setConsumerIdle(1);
+		if (batches)
+			writer.setBatch(&KextRing::batch, 4096, 600ull * 1000000000);
+	}
+};
+
+// The messages waiting on `ring`, each its type and obj_id, in order.
+std::vector<std::pair<uint32_t, uint64_t>> wire(TestRing &ring)
+{
+	std::vector<std::pair<uint32_t, uint64_t>> out;
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	while (ring.next(&h, &bytes)) {
+		uint64_t obj = 0;
+		if (bytes.size() >= sizeof(h) + sizeof(obj))
+			std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		out.emplace_back(h.type, obj);
+	}
+	return out;
+}
+
+// What the guest reads around destroys and what the host is sent, through a route that holds
+// them or one that posts each.
+struct HeldRun {
+	std::vector<uint64_t> answers;
+	std::vector<std::pair<uint32_t, uint64_t>> sent;
+	bool heldUntilTheCreate = false;
+};
+
+HeldRun heldDestroysRun(bool batches)
+{
+	KextFixture fx(batches);
+	HeldRun run;
+	@autoreleasepool {
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:heapDescriptor(MTLStorageModePrivate,
+		                                                             MTLHeapTypeAutomatic)
+		                                       device:nil
+		                                   serializer:&fx.ser];
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64
+		                                                      height:64
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		auto heapAnswers = [&] {
+			run.answers.push_back(heap.usedSize);
+			run.answers.push_back(heap.currentAllocatedSize);
+			run.answers.push_back([heap maxAvailableSizeWithAlignment:256]);
+		};
+		heapAnswers();
+		@autoreleasepool {
+			id<MTLBuffer> a = [heap newBufferWithLength:0x10000
+			                                    options:MTLResourceStorageModePrivate];
+			id<MTLTexture> t = [RgfxTexture textureWithDescriptor:td
+			                                                 heap:RGFX_OBJ_NONE
+			                                           heapOffset:0
+			                                               device:nil
+			                                           serializer:&fx.ser];
+			CHECK(a != nil && t != nil);
+			heapAnswers();
+			run.answers.push_back(a.gpuAddress);
+			run.answers.push_back(t.gpuResourceID._impl);
+			run.sent = wire(fx.ring);
+		}
+		// Let go: what they lay over is back at once, whether their destroys are held or not.
+		heapAnswers();
+		const auto released = wire(fx.ring);
+		run.heldUntilTheCreate = released.empty();
+		run.sent.insert(run.sent.end(), released.begin(), released.end());
+		// Made again over the same bytes and id, created after the destroys.
+		id<MTLBuffer> b = [heap newBufferWithLength:0x10000 options:MTLResourceStorageModePrivate];
+		id<MTLTexture> u = [RgfxTexture textureWithDescriptor:td
+		                                                 heap:RGFX_OBJ_NONE
+		                                           heapOffset:0
+		                                               device:nil
+		                                           serializer:&fx.ser];
+		CHECK(b != nil && u != nil);
+		heapAnswers();
+		run.answers.push_back(b.gpuAddress);
+		run.answers.push_back(u.gpuResourceID._impl);
+		// What is still held goes, as a commit posts it (the buffer and the texture are held
+		// too).
+		CHECK(fx.ser.postHeldCreates());
+		const auto made = wire(fx.ring);
+		run.sent.insert(run.sent.end(), made.begin(), made.end());
+	}
+	return run;
+}
+
+// Destroys held to go together (RgfxRingWriter::postLater), with the buffers and textures held
+// too, change nothing the guest reads or the host is sent: a heap's usedSize, currentAllocatedSize
+// and maxAvailableSize drop at the release, and a buffer and a texture made after it take the
+// same bytes and resource id, created after the destroys on the ring, as where each is posted at
+// once. A residency set keeps its allocations, so no destroy is held while it counts them.
+void test_held_destroys_change_nothing_seen()
+{
+	const HeldRun posted = heldDestroysRun(false);
+	const HeldRun held = heldDestroysRun(true);
+	CHECK(!posted.heldUntilTheCreate && held.heldUntilTheCreate);
+	CHECK(held.answers == posted.answers);
+	// The ids differ by fixture (each its own id space): the order of types on the wire, and
+	// each destroy's place against the creates, are the same.
+	CHECK(held.sent.size() == posted.sent.size());
+	for (size_t i = 0; i < held.sent.size() && i < posted.sent.size(); i++)
+		CHECK(held.sent[i].first == posted.sent[i].first);
+	// The bytes and the id are taken again.
+	CHECK(posted.answers.size() == 16);
+	CHECK(posted.answers[6] == posted.answers[14] && posted.answers[7] == posted.answers[15]);
+	CHECK(posted.answers[0] == posted.answers[8] && posted.answers[3] == posted.answers[11]);
+}
+
+// A texture over an IOSurface goes from the host at once, behind the destroys held before it: a
+// present of the surface waits for its destroy (RgfxResource's rgfxDestroysAtOnce).
+void test_surface_texture_destroys_go_at_once()
+{
+	KextFixture fx(true);
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x400000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	uint64_t held = 0, over = 0;
+	@autoreleasepool {
+		NSDictionary *props = @{
+			(id)kIOSurfaceWidth : @16,
+			(id)kIOSurfaceHeight : @16,
+			(id)kIOSurfaceBytesPerElement : @4,
+			(id)kIOSurfacePixelFormat : @(static_cast<uint32_t>('BGRA')),
+		};
+		IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)props);
+		CHECK(surface != nullptr);
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+		                                                       width:16
+		                                                      height:16
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModeShared;
+		RgfxIOSurfaceTexture *t = [RgfxIOSurfaceTexture textureWithDescriptor:d
+		                                                           iosurface:surface
+		                                                               plane:0
+		                                                              region:&region
+		                                                              device:nil
+		                                                          serializer:&fx.ser];
+		CHECK(t != nil && [t rgfxDestroysAtOnce]);
+		over = [(RgfxResource *)t rgfxObjId];
+		@autoreleasepool {
+			id<MTLBuffer> b = [RgfxBuffer bufferWithLength:4096 options:0 device:nil
+			                                    serializer:&fx.ser];
+			CHECK(b != nil && ![(RgfxResource *)b rgfxDestroysAtOnce]);
+			held = [(RgfxResource *)b rgfxObjId];
+		}
+		drainRing(fx.ring);
+		t = nil;
+		CFRelease(surface);
+	}
+	const auto sent = wire(fx.ring);
+	const auto at = [&](uint64_t obj) {
+		for (size_t i = 0; i < sent.size(); i++)
+			if (sent[i] == std::make_pair(uint32_t{RGFX_CMD_OBJECT_DESTROY}, obj))
+				return static_cast<long>(i);
+		return -1L;
+	};
+	CHECK(at(held) >= 0 && at(over) > at(held));
+}
 
 void rgfxResourceTests()
 {
@@ -1341,6 +1696,7 @@ void rgfxResourceTests()
 	test_buffer_linear_textures();
 	test_texture_compression();
 	test_surface_copies_lock_the_surface_first();
+	test_surface_rows_held();
 	test_texture_answers();
 	test_device_texture_addresses_hold_their_bytes();
 	test_sampler_answers();
@@ -1350,4 +1706,6 @@ void rgfxResourceTests()
 	test_state_cache_threads();
 	test_state_labels();
 	test_shared_event_answers();
+	test_held_destroys_change_nothing_seen();
+	test_surface_texture_destroys_go_at_once();
 }

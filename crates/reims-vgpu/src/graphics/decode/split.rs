@@ -23,6 +23,40 @@
 //! each shape and run: 100 µs cost the walk 5% more instructions and gained nothing, 500 µs left
 //! 0.2-0.4 ms on the table.
 //!
+//! A buffer of compute encoders alone is cut too, its unit of command predication going on in the
+//! next part (`gpu/command.rs` of the Vulkan platform, "A command buffer in parts"). Measured the
+//! same way by `dispatch_cost`'s `fluid` shape, a buffer shaped like Geekbench 7's Fluid
+//! Simulation's, of 2,600 encoders of one dispatch each, 6 a run, five runs: from the first
+//! message's take to its completion, the median fell from 87.0 ms whole to 34.8 ms in parts, and
+//! the walk's CPU time a dispatch from 14.7 to 8.8 µs (164.2k to 110.6k instructions): the runtime
+//! measured (metal2vulkan c796a88d6a) does more work for an encoder the more encoders its command
+//! buffer holds before it, and a part holds fewer.
+//!
+//! **How many parts.** A part is cut each [`SPLIT_AFTER`] however many of the buffer's parts are
+//! out, up to its queue's room for command buffers (`TAKE_IN_FLIGHT_MAX`, [`super::cmdbuf`]). A
+//! limit on the parts out, under which the walk goes on into a longer part while the GPU is
+//! behind, gained nothing measured. `dispatch_cost` (the decoder alone, release, the median of 5
+//! runs of 6 repetitions) measured its fluid shape and its heavy one, whose GPU work outlasts its
+//! walk as Fluid Simulation's does on a Radeon 780M, with at most 2 or 16 parts out against no
+//! limit, on metal2vulkan afba68e6e4:
+//! - Radeon 780M (RADV): the heavy shape's latency 166.8 and 167.0 ms against 166.2 ms, its walk
+//!   6.6 and 7.0 µs a dispatch against 7.3 µs; the fluid shape's GPU keeps up, so neither limit
+//!   was reached;
+//! - Iris Xe (ANV): heavy 252.4 and 252.2 ms against 253.0 ms; fluid as on the 780M;
+//! - M3 Max (MoltenVK): the latency rose from 33.8 to 44.3 and 35.7 ms (fluid) and from 121.9 to
+//!   132.2 and 127.2 ms (heavy), the cuts waiting for MoltenVK's late completions. Parts that
+//!   double in length (250, 500, 1,000 µs and on) lost there too: 45.6 and 139.2 ms against 34.4
+//!   and 122.3 ms.
+//!
+//! A walk in parts takes no more instructions than a whole one, but it stalls longer. Each
+//! part's commit, and its GPU work beside the walk, cost the walk 110 to 210 thousand cycles on
+//! the Iris Xe and the Radeon 780M (the fluid shape in 88 and 72 parts, against whole).
+//! At metal2vulkan bc12f6d95a a busy GPU stalled the walk far more: on the Radeon 780M the heavy
+//! shape's walk took 55.8 thousand cycles a dispatch against fluid's 34.5 thousand, for 55.7 and
+//! 59.0 thousand instructions. Fluid Simulation's walk there took 33.6 µs a dispatch in parts
+//! against 17.2 µs whole (perfscout5's dp-gbr-780m against perfscout4's gbr-780m). At
+//! afba68e6e4 the heavy shape's walk takes 30.2 thousand cycles against fluid's 33.3 thousand.
+//!
 //! **What stays as it was.** The parts run in their order on the queue, as the encoders of one
 //! buffer do, and each part is committed only where the whole buffer could be committed then,
 //! waiting for nothing (`GraphicsDecoder::may_commit_now`): its turn on its queue is next, every
@@ -31,13 +65,32 @@
 //! waits between parts. Its handlers, records and tickets are the last part's, and come as they
 //! came: its `CB_SUBMITTED`, `CB_SCHEDULED` and `CB_COMPLETE` once each, its ticket given back
 //! at the last commit, its commit marks raised there. Its outcome is all the parts' ([`Parts`]):
-//! the first failed part's error, else the last part's; the first part's GPU start, and the last
-//! part's GPU end. A signal of a shared event stays in the part it was encoded in, before the
+//! the first failed part's error, else the last part's; and GPU times that start at the first
+//! part's start and span the parts' GPU time summed, never ending after the last part's end
+//! (below, "Its GPU times"). A signal of a shared event stays in the part it was encoded in, before the
 //! cut, and its value goes to the guest as the event reaches it, as a whole buffer's does; one
 //! of a shared event whose create the host refused goes with the buffer's completion, after its
 //! last part. A buffer whose walk faults after a part has its failure at its stand-in's
 //! completion, as any buffer whose walk faults; the parts committed before the fault ran, as the
 //! encoders before a fault of Metal's GPU run.
+//!
+//! **Its GPU times.** Each part runs once the walk has handed it over, so the GPU waits between
+//! parts for the walk of the next: from the first part's start to the last part's end the buffer
+//! spans the host's walk of it, which a Mac, whose GPU is handed the whole buffer at its commit,
+//! never waits for. The guest's compositor reads these times: macOS's SkyLight and QuartzCore,
+//! which composite WindowServer's frames, reference `GPUStartTime` and `GPUEndTime` (read from
+//! their selector references on macOS 27), and the bundle answers them with the record's span
+//! (`rgfxNoteGPUTimes:`). On a Mac one buffer spans its encoders' GPU time summed: on both x86
+//! Macs (macOS 26.7.1, an AMD Radeon Pro 5300M and an Intel UHD Graphics 630), a buffer of 8 or
+//! 32 compute encoders or render passes spanned what the same encoders committed one buffer each
+//! summed (AMD: 32 compute encoders 6.31 ms whole, 7.37 summed; 32 passes 11.04 and 10.89; Intel:
+//! 13.05 and 12.41; 59.56 and 59.99), the CPU's time encoding it never counted, and its
+//! `GPUStartTime` came 0.08 to 0.40 ms after its commit (measured, `oracle_cmdbuf DEVICE
+//! gputimes`; docs/graphics-kext/dgpu-oracle.md, Q7). So the record starts at the first part's
+//! start, which the GPU reached soonest after the commit, and spans the parts' GPU time summed,
+//! each part's end less its start: the time the buffer's work kept the GPU, as a buffer committed
+//! whole answers it. It never ends after the last part's end, where parts that overlap on the GPU
+//! sum to more.
 //!
 //! **What another message sees** ([`SplitGate`]). While a buffer of a context has parts out, from
 //! its first part's commit to its last, no other command buffer of the context is committed, and
@@ -51,14 +104,62 @@
 //! is), that waits for no event and is behind no buffer of its queue that does ([`super::cmdbuf`]'s
 //! `Held`), and whose queue holds room for another command buffer, so the platform's make of the
 //! next part waits for none.
+//!
+//! **Two threads at once.** A walk in parts still runs on one thread, and the runtime's lowering
+//! is most of it: WindowServer's frame in Launchpad's open view, one command buffer of about 107
+//! render passes, took a walk of 14.9 ms at the median, 91% of it in the runtime's calls, so its
+//! present was answered two refreshes on (an RTX 3090 host, every driver listed, metal2vulkan
+//! pin 92; m3-max-30753, measured). So a buffer that may be cut, of
+//! [`DEAL_MIN_BYTES`](super::cmdbuf::DEAL_MIN_BYTES) of ops and
+//! [`DEAL_MIN_ENCODERS`](super::cmdbuf::DEAL_MIN_ENCODERS) at least, all of them render and
+//! blit encoders that hold no event, rate map, indirect command buffer or residency of
+//! resources (`cmdbuf.rs`'s `deal`), is cut at encoder ends into chunks of
+//! [`DEAL_CHUNK_BYTES`](super::cmdbuf::DEAL_CHUNK_BYTES) of ops or more, dealt to the lane's
+//! thread and a helper thread ([`super::helpers`]), handed over at once as the walk starts: the
+//! first chunk to the lane's thread, then the longest first, each to the thread dealt fewer bytes
+//! so far (`cmdbuf.rs`'s `helper_chunks`), so the longest starts at once on the thread that is
+//! free (chunks of one length go in turn, the odd ones to the helper), and each thread walks its
+//! chunks in their order. Each chunk goes into a command buffer of its own on the
+//! buffer's queue, which the platform makes before any chunk is walked (`CommandBuffer::part`),
+//! each while the queue holds room, as a cut's make does, so no make waits on the queue's room
+//! while parts of the buffer wait uncommitted (where the room runs out first, the buffer is
+//! walked as a whole is); the first chunk goes into the buffer's own;
+//! the helper walks its chunks on a handle whose view of the context's table is a twin of the
+//! buffer's (`View::twin`), so it names what the buffer names. After each of its own chunks the
+//! lane's thread commits every chunk walked, in their order, each but the last as a part
+//! (`CommandBuffer::commit_part`), waiting for the helper only for the chunk it is to commit
+//! next, so the GPU runs each part while the rest is walked: a split into two ranges walked at
+//! once, the later range's work reaching the GPU only at their join, took the walk's end from
+//! 14.8 to 8.2 ms but left the later range's GPU work, 3.7 ms, after it (m3-max-31216 against
+//! m3-max-31226). A part goes where the whole buffer could be committed then, as a cut does; at
+//! the walk's end, once every wait of the buffer's commit is met. The last chunk's command buffer
+//! is the buffer's last part. The runtime takes command buffers of one queue encoded on several
+//! threads at once and committed in order from one (metal2vulkan's answer, 11-14).
+//!
+//! What stays as it was is what a walk in parts keeps (above): the parts run in their order on
+//! the queue, their outcome is all of theirs, the last part carries the buffer's handlers,
+//! records and tickets, and the context's gate is held from its first part's commit to its last.
+//! No chunk signals or waits for an event, so no value goes to the guest from a helper. A walk
+//! that faults or stops in a chunk answers as the first such chunk in their order does, as a
+//! whole walk that faults there after its parts: the parts committed before it ran, and nothing
+//! at or after it is committed. Where a part fails from one of its encoders on (a draw of
+//! primitive type 9, a store into read-only memory), the platform keeps it whole and every later
+//! chunk's command buffer is folded into it in their order (`CommandBuffer::fold`): every
+//! encoder after the failing one runs nothing, in it as in a whole buffer, and its commit answers
+//! as one buffer's. Chunks no helper has started by the end of the lane's first are taken back
+//! and walked by the lane's thread into the buffer's current part, as a walk goes on, so a walk
+//! never waits for a helper to come free. Each op is walked once, on one thread or the other:
+//! what a walk does once a buffer (its names found, its uses of laid-out device caches told at
+//! the commit, in the chunks' order) is done once. A `cbpar` trace event gives each buffer's
+//! chunks and their walks, and a `cbdeal` event each chunk's.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use reims_vgpu_core::platform::command::{CompletedHandler, CompletedInfo};
-use reims_vgpu_core::platform::types::{CommandBufferStatus, NsErrorText};
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::command::{CompletedHandler, CompletedInfo};
+use reims_vgpu_vulkan::core::platform::types::{CommandBufferStatus, NsErrorText};
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 
 use super::sequencer::RangeOp;
 
@@ -88,6 +189,8 @@ struct Gate {
     deferred: Vec<RangeOp>,
     /// The commits waiting for `split`'s end.
     waiting: usize,
+    /// The buffers waiting to take the gate for their parts ([`SplitGate::split`]).
+    splitting: usize,
 }
 
 impl SplitGate {
@@ -146,10 +249,37 @@ impl SplitGate {
         })
     }
 
+    /// The gate of `context` for a buffer's parts, once no buffer of the context has parts out
+    /// and no commit or range message of it is under way: waits, with no lock of the caller's
+    /// held. Taken by a buffer dealt to two threads at once ("Two threads at once") whose parts
+    /// could not take it as they were walked ([`Self::try_split`]), at the walk's end, once every
+    /// wait of its commit is met: a buffer whose parts are out commits its last part, and a
+    /// commit or range message under way ends, waiting for nothing of it.
+    pub(crate) fn split(self: &Arc<Self>, context: u32) -> SplitHold {
+        let mut contexts = self.contexts.lock();
+        loop {
+            let gate = contexts.entry(context).or_default();
+            if !gate.split && gate.under_way == 0 {
+                gate.split = true;
+                return SplitHold {
+                    gate: Arc::clone(self),
+                    context,
+                };
+            }
+            gate.splitting += 1;
+            self.changed.wait(&mut contexts);
+            contexts.entry(context).or_default().splitting -= 1;
+        }
+    }
+
     /// The gate of `context` is free and holds nothing, so its entry goes.
     fn prune(contexts: &mut HashMap<u32, Gate>, context: u32) {
         if contexts.get(&context).is_some_and(|g| {
-            !g.split && g.under_way == 0 && g.deferred.is_empty() && g.waiting == 0
+            !g.split
+                && g.under_way == 0
+                && g.deferred.is_empty()
+                && g.waiting == 0
+                && g.splitting == 0
         }) {
             contexts.remove(&context);
         }
@@ -170,10 +300,15 @@ pub(crate) struct UnderWay {
 }
 
 impl Drop for UnderWay {
+    /// The last commit or range message under way lets a buffer waiting to take the gate go
+    /// ([`SplitGate::split`]).
     fn drop(&mut self) {
         let mut contexts = self.gate.contexts.lock();
         if let Some(g) = contexts.get_mut(&self.context) {
             g.under_way -= 1;
+            if g.under_way == 0 && g.splitting > 0 {
+                self.gate.changed.notify_all();
+            }
         }
         SplitGate::prune(&mut contexts, self.context);
     }
@@ -221,6 +356,8 @@ pub(crate) struct Parts {
 struct Seen {
     /// The GPU start of the first part that has GPU times.
     gpu_start: Option<u64>,
+    /// The GPU time of the parts seen that have GPU times, summed: each one's end less its start.
+    gpu_busy: u64,
     /// The error of the first part that failed.
     error: Option<NsErrorText>,
 }
@@ -232,8 +369,9 @@ impl Parts {
         let parts = Arc::clone(self);
         Box::new(move |info: CompletedInfo| {
             let mut seen = parts.seen.lock();
-            if seen.gpu_start.is_none() {
-                seen.gpu_start = info.gpu_times_ns.map(|(start, _)| start);
+            if let Some((start, end)) = info.gpu_times_ns {
+                seen.gpu_start.get_or_insert(start);
+                seen.gpu_busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
             }
             if seen.error.is_none() {
                 seen.error = info.error;
@@ -244,9 +382,11 @@ impl Parts {
     }
 
     /// `handler`, the last part's, handed the whole buffer's outcome: the first failed part's
-    /// error, and status, where a part before the last failed, else the last part's; and the GPU
-    /// times from the first part's start to the last part's end. The platform runs a queue's
-    /// completion handlers in its commit order, so every part before the last has been seen.
+    /// error, and status, where a part before the last failed, else the last part's; and GPU
+    /// times that start at the first part's start and span every part's GPU time summed, ending no
+    /// later than the last part's end (the module docs, "Its GPU times"). The platform runs
+    /// a queue's completion handlers in its commit order, so every part before the last has been
+    /// seen.
     pub(crate) fn merged(self: Arc<Self>, handler: CompletedHandler) -> CompletedHandler {
         Box::new(move |mut info: CompletedInfo| {
             let seen = std::mem::take(&mut *self.seen.lock());
@@ -254,8 +394,10 @@ impl Parts {
                 info.error = Some(error);
                 info.status = CommandBufferStatus::ERROR;
             }
-            if let (Some(start), Some((_, end))) = (seen.gpu_start, info.gpu_times_ns) {
-                info.gpu_times_ns = Some((start.min(end), end));
+            if let (Some(first), Some((start, end))) = (seen.gpu_start, info.gpu_times_ns) {
+                let busy = seen.gpu_busy.saturating_add(end.saturating_sub(start));
+                let first = first.min(end);
+                info.gpu_times_ns = Some((first, first.saturating_add(busy).min(end)));
             }
             handler(info);
         })
@@ -267,6 +409,33 @@ mod tests {
     use std::sync::atomic::{AtomicBool, Ordering};
 
     use super::*;
+
+    /// A buffer's take of its context's gate for its parts waits while a commit of the context is
+    /// under way, and while another buffer of it has parts out, and takes the gate once that
+    /// ended; the gate's entry goes once it is let go.
+    #[test]
+    fn a_take_of_the_gate_waits_for_commits_under_way_and_parts_out() {
+        let gate = Arc::new(SplitGate::default());
+        for parts_out in [false, true] {
+            let commit = (!parts_out).then(|| gate.commit(1));
+            let hold = parts_out.then(|| gate.try_split(1).expect("the gate is free"));
+            let took = AtomicBool::new(false);
+            std::thread::scope(|scope| {
+                scope.spawn(|| {
+                    let _hold = gate.split(1);
+                    took.store(true, Ordering::Release);
+                });
+                std::thread::sleep(Duration::from_millis(50));
+                assert!(
+                    !took.load(Ordering::Acquire),
+                    "taken early (parts out: {parts_out})"
+                );
+                drop((commit, hold));
+            });
+            assert!(took.load(Ordering::Acquire));
+            assert!(gate.contexts.lock().is_empty(), "its entry gone");
+        }
+    }
 
     /// A commit of a context waits while a buffer of it has parts out, and a commit of another
     /// context does not.
@@ -344,8 +513,9 @@ mod tests {
         }
     }
 
-    /// The whole buffer's outcome: the first failed part's error, and the GPU times from the
-    /// first part's start to the last part's end.
+    /// The whole buffer's outcome: the first failed part's error, and GPU times that start at the
+    /// first part's start and span the parts' GPU time summed, no later than the last part's end:
+    /// the gaps between parts, where the GPU waited for the walk, are not the buffer's.
     #[test]
     fn a_buffer_s_outcome_is_all_its_parts() {
         let outcome = |parts: [CompletedInfo; 3]| {
@@ -368,15 +538,34 @@ mod tests {
             error: Some(error(code)),
             gpu_times_ns: Some((start, end)),
         };
-        assert_eq!(outcome([ok(10, 20), ok(25, 40), ok(45, 60)]), ok(10, 60));
+        assert_eq!(
+            outcome([ok(10, 20), ok(25, 40), ok(45, 60)]),
+            ok(10, 50),
+            "10 + 15 + 15 of GPU time, from the first part's start"
+        );
         assert_eq!(
             outcome([ok(10, 20), failed(25, 40, 8), failed(45, 60, 3)]),
-            failed(10, 60, 8),
+            failed(10, 50, 8),
             "the first failed part's error"
         );
         assert_eq!(
             outcome([ok(10, 20), ok(25, 40), failed(45, 60, 3)]),
-            failed(10, 60, 3)
+            failed(10, 50, 3)
+        );
+        assert_eq!(
+            outcome([ok(10, 30), ok(20, 45), ok(40, 60)]),
+            ok(10, 60),
+            "parts that overlap end no later than the last part"
+        );
+        let untimed = CompletedInfo {
+            status: CommandBufferStatus::COMPLETED,
+            error: None,
+            gpu_times_ns: None,
+        };
+        assert_eq!(
+            outcome([untimed.clone(), ok(30, 40), ok(50, 60)]),
+            ok(30, 50),
+            "a part with no GPU times adds none"
         );
     }
 }

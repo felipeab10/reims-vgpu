@@ -36,8 +36,21 @@
 //   rp.warm          one descriptor made again.
 //   rp.async.8       8 pipelines of fresh libraries asked at once through the completion-handler
 //             form: the wall time until the last handler, and the median handler latency.
+//   rt.query         heapTextureSizeAndAlignWithDescriptor: of a fresh width each repetition: a
+//             query a device answers with no compile (on a guest, its round trip to the host).
 //   cp.lib, cp.const, cp.warm, cp.async.8   the same for k_blur's compute pipeline (its weights
 //             a function constant).
+//   mps.fn           the kernels Vision's person segmentation makes first, from the libraries it
+//             loads them from (MPSNeuralNetwork's, Espresso's and MPSCore's default.metallib,
+//             each kernel from the first that holds it): each one's newFunctionWithName: (fn, its
+//             first in this process, then again: fn2), newFunctionWithName:constantValues:error:
+//             with each of its function constants 0 (spec), its compute pipeline (cp, then again:
+//             cp2). A second process shows what outlives the first (the host's caches). Metal
+//             refuses the zeros of a kernel they put two present arguments of at one location
+//             (cnnConvArray_32x32_128's: "texture argument src has invalid location (<0,1>)",
+//             measured: macOS 26.7.1, the AMD Radeon Pro 5300M): listed as spec_refused, its
+//             first error line after it, and it makes no pipeline. A pipeline refused fails the
+//             case.
 //   draw.first       a pipeline of a fresh library, then a command buffer of one draw into a
 //             256 x 256 target, commit to completed (first), then the same buffer again (next):
 //             the first draw's stall is first - next.
@@ -543,6 +556,134 @@ static NSString *computeCase(int kind)
 	return stat(@"ms", times);
 }
 
+// The kernels Vision's person segmentation makes first, in its order (macOS 26.7.2 guest).
+static NSString *const kMpsKernels[] = {
+	@"cnnConvArray_32x32_128",
+	@"depthwise_convolution_3x3_no_stride_no_dilation_no_multiplier",
+	@"dequantizeGeneric",
+	@"depthwise_convolution_3x3_2stridex_no_dilation_no_multiplier",
+	@"TARR_elementwise_add_f16_pack4",
+	@"depthwise_convolution_3x3_no_multiplier",
+	@"MPSCNNPooling_new_tex2darray_tex2darray_max_2x2_2",
+	@"TARR_concat_kernel_f16",
+	@"TARR_activation_step_f16_pack4",
+	@"TARR_read_tex2darray_4h_unpacked",
+	@"TARR_write_tex2darray_4h_unpacked",
+	@"TARR_image_scale_bias",
+};
+
+// Each of `function`'s constants 0.
+static MTLFunctionConstantValues *zeroConstants(id<MTLFunction> function)
+{
+	MTLFunctionConstantValues *v = [MTLFunctionConstantValues new];
+	static const uint8_t zeros[64] = {0};
+	[function.functionConstantsDictionary
+	    enumerateKeysAndObjectsUsingBlock:^(NSString *name, MTLFunctionConstant *c, BOOL *stop) {
+		    [v setConstantValue:zeros type:c.type withName:name];
+	    }];
+	return v;
+}
+
+// The libraries Vision's person segmentation loads its kernels from, in its order.
+static NSString *const kMpsLibraries[] = {
+	@"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+	@"MPSNeuralNetwork.framework/Resources/default.metallib",
+	@"/System/Library/PrivateFrameworks/Espresso.framework/Versions/Current/Resources/default.metallib",
+	@"/System/Library/Frameworks/MetalPerformanceShaders.framework/Versions/A/Frameworks/"
+	@"MPSCore.framework/Resources/default.metallib",
+};
+
+static NSString *mpsFunctions(void)
+{
+	NSMutableArray<id<MTLLibrary>> *libs = [NSMutableArray array];
+	NSMutableArray *libMs = [NSMutableArray array];
+	for (size_t i = 0; i < sizeof kMpsLibraries / sizeof kMpsLibraries[0]; i++) {
+		if (![[NSFileManager defaultManager] fileExistsAtPath:kMpsLibraries[i]])
+			continue;
+		NSError *err = nil;
+		const double t0 = now();
+		id<MTLLibrary> lib = [gDevice newLibraryWithURL:[NSURL fileURLWithPath:kMpsLibraries[i]] error:&err];
+		[libMs addObject:@(ms(t0))];
+		if (lib != nil)
+			[libs addObject:lib];
+	}
+	if (libs.count == 0)
+		return @"SKIP none of the MPS and Espresso libraries loads";
+	NSMutableArray *fn = [NSMutableArray array], *fn2 = [NSMutableArray array],
+	               *spec = [NSMutableArray array], *cp = [NSMutableArray array],
+	               *cp2 = [NSMutableArray array];
+	int absent = 0, refused = 0, constants = 0;
+	NSMutableArray<NSString *> *specRefused = [NSMutableArray array];
+	for (size_t i = 0; i < sizeof kMpsKernels / sizeof kMpsKernels[0]; i++) {
+		NSString *name = kMpsKernels[i];
+		id<MTLLibrary> lib = nil;
+		for (id<MTLLibrary> l in libs)
+			if (lib == nil && [l.functionNames containsObject:name])
+				lib = l;
+		if (lib == nil) {
+			absent++;
+			continue;
+		}
+		NSError *err = nil;
+		double t0 = now();
+		id<MTLFunction> f = [lib newFunctionWithName:name];
+		[fn addObject:@(ms(t0))];
+		t0 = now();
+		f = [lib newFunctionWithName:name];
+		[fn2 addObject:@(ms(t0))];
+		MTLFunctionConstantValues *values = zeroConstants(f);
+		constants += (int)f.functionConstantsDictionary.count;
+		t0 = now();
+		id<MTLFunction> s = [lib newFunctionWithName:name constantValues:values error:&err];
+		[spec addObject:@(ms(t0))];
+		if (s == nil) {
+			NSString *why = [err.localizedDescription componentsSeparatedByString:@"\n"].firstObject ?: @"no error";
+			[specRefused addObject:[NSString stringWithFormat:@"%@ (%@ %ld: %@)", name, err.domain,
+			                                                  (long)err.code, why]];
+			continue;
+		}
+		t0 = now();
+		id<MTLComputePipelineState> p = [gDevice newComputePipelineStateWithFunction:s error:&err];
+		[cp addObject:@(ms(t0))];
+		t0 = now();
+		id<MTLComputePipelineState> again = [gDevice newComputePipelineStateWithFunction:s error:&err];
+		[cp2 addObject:@(ms(t0))];
+		if (p == nil || again == nil)
+			refused++;
+	}
+	NSMutableArray *libText = [NSMutableArray array];
+	for (NSNumber *m in libMs)
+		[libText addObject:[NSString stringWithFormat:@"%.2f", m.doubleValue]];
+	return [NSString stringWithFormat:@"%@lib_ms=%@ kernels=%lu absent=%d refused=%d constants=%d %@ %@ %@ %@ %@ "
+	                                  @"spec_refused=%lu %@",
+	                                  refused ? @"FAIL a pipeline refused: " : @"",
+	                                  [libText componentsJoinedByString:@","], (unsigned long)fn.count,
+	                                  absent, refused, constants, stat(@"fn", fn), stat(@"fn2", fn2),
+	                                  stat(@"spec", spec), stat(@"cp", cp), stat(@"cp2", cp2),
+	                                  (unsigned long)specRefused.count, [specRefused componentsJoinedByString:@"; "]];
+}
+
+// heapTextureSizeAndAlignWithDescriptor: of a private RGBA8 texture of a fresh width each
+// repetition, which no cache answers.
+static NSString *queryCase(void)
+{
+	NSMutableArray *times = [NSMutableArray array];
+	for (int r = 0; r < gReps; r++) {
+		MTLTextureDescriptor *d =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:64 + (gNext++ & 4095u)
+		                                                      height:64
+		                                                   mipmapped:NO];
+		d.storageMode = MTLStorageModePrivate;
+		const double t0 = now();
+		const MTLSizeAndAlign sa = [gDevice heapTextureSizeAndAlignWithDescriptor:d];
+		[times addObject:@(ms(t0))];
+		if (sa.size == 0)
+			return @"FAIL a size of 0";
+	}
+	return stat(@"ms", times);
+}
+
 // `count` pipelines of fresh libraries asked at once: the wall time to the last handler, and each
 // handler's latency.
 static NSString *asyncCase(BOOL compute, int count)
@@ -785,10 +926,12 @@ int main(int argc, char **argv)
 		runCase(@"rp.state", ^{ return renderCase(2, @"f_tex"); });
 		runCase(@"rp.warm", ^{ return renderCase(3, @"f_tex"); });
 		runCase(@"rp.async.8", ^{ return asyncCase(NO, 8); });
+		runCase(@"rt.query", ^{ return queryCase(); });
 		runCase(@"cp.lib", ^{ return computeCase(0); });
 		runCase(@"cp.const", ^{ return computeCase(1); });
 		runCase(@"cp.warm", ^{ return computeCase(3); });
 		runCase(@"cp.async.8", ^{ return asyncCase(YES, 8); });
+		runCase(@"mps.fn", ^{ return mpsFunctions(); });
 		runCase(@"draw.first", ^{ return drawFirst(); });
 		runCase(@"draw.topology", ^{ return drawTopology(); });
 		runCase(@"dispatch.first", ^{ return dispatchFirst(); });

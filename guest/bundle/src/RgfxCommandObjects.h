@@ -42,7 +42,10 @@
  * takes the ring itself only where no thread drives it (a unit test, or its thread has
  * ended), where the taker runs the record too.
  * `presentDrawable:` and its variants present the drawable from a scheduled handler,
- * unless the buffer failed by then (see the .mm).
+ * unless the buffer failed by then, and the queue posts none of its later buffers until the
+ * drawable reports its present scheduled, as Metal's queue submits none (PRESENT HOLD, the .mm);
+ * from then on each buffer the queue commits asks for its submission, so the host schedules it
+ * at its take where it waits for nothing.
  *
  * Our own ObjC++; the only Apple names are the real Metal protocols these conform to.
  */
@@ -64,6 +67,7 @@ class RgfxIdSpace;
 class RgfxEncoder;
 class RgfxReplyReader;
 class RgfxRegion;
+class RgfxSlabs;
 #endif
 
 NS_ASSUME_NONNULL_BEGIN
@@ -98,6 +102,11 @@ NS_ASSUME_NONNULL_BEGIN
                        device:(nullable id<MTLDevice>)device
                    serializer:(nullable RgfxSerializer *)serializer NS_UNAVAILABLE;
 
+/// Takes what `descriptor`, the one the queue was made with, names beyond its command buffer
+/// count, as Metal's base queue does as it starts: its quality of service, its commit and
+/// completion queues, and its switches, each where the guest's descriptor answers it.
+- (void)rgfxTakeDescriptor:(MTLCommandQueueDescriptor *)descriptor;
+
 /// The reader of the completion ring this queue's command buffers wait on (borrowed by
 /// default). The queue's command buffers register their submission seqno with it on
 /// commit so their completion handlers fire and waitUntilCompleted wakes. Null in a unit
@@ -112,10 +121,27 @@ NS_ASSUME_NONNULL_BEGIN
 /// one: such a buffer then completes with an out-of-memory error.
 @property(nonatomic, nullable) RgfxRegion *region;
 
-/// Whether a command buffer of it that commitAndWaitUntilSubmitted commits asks the host for its
-/// submission (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then
-/// returns at the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
+/// The device's slabs (borrowed) the queue's upload chunks are Shared buffers of (RgfxUploads.h).
+/// Null in a unit test without them: the chunks are then blocks of the region.
+@property(nonatomic, nullable) RgfxSlabs *slabs;
+
+/// Whether a command buffer of it that commitAndWaitUntilSubmitted commits, or that it commits
+/// once one of its buffers has presented a drawable, asks the host for its submission
+/// (RGFX_OP_SUBMITTED), where the device has RGFX_FEATURE_CB_SUBMITTED: the call then returns at
+/// the host's RGFX_EVT_CB_SUBMITTED, else at the buffer's CB_SCHEDULED. NO by default.
 @property(nonatomic) BOOL asksSubmitted;
+
+/// Whether a thread that waits for a command buffer of it to be scheduled (waitUntilScheduled) asks
+/// the host for the buffer's CB_SCHEDULED (RGFX_CMD_SCHEDULED_ASK on the queue's ring), where the
+/// device's word holds RGFX_FEATURE_SCHEDULED_ASK: the host then posts it at once where the
+/// buffer waits for nothing, not at its platform's submission. NO by default.
+@property(nonatomic) BOOL asksScheduled;
+
+/// Whether its command buffers start their streams with the guest's times
+/// (RGFX_OP_GUEST_TIMES: made, committed and posted, on the guest's clock), where the device's
+/// word holds RGFX_FEATURE_GUEST_TIMES, a diagnostic the host splits the time before it takes
+/// each buffer by. NO by default.
+@property(nonatomic) BOOL stampsGuestTimes;
 
 /// The bytes the queue guesses a new command buffer's message takes (RgfxEncoder): the
 /// largest of the queue's recent messages, as its command buffers committed them. Each smaller
@@ -170,6 +196,13 @@ NS_ASSUME_NONNULL_BEGIN
 /// builds); the two names would collide in ObjC++.
 @interface RgfxCmdBuffer : RgfxResource <MTLCommandBuffer>
 
+/// MTLCommandBufferSPI's `commitAndHold`, which the system's GL renderer sends for the buffers of
+/// its preprocessing encoders: Metal's x86 devices commit the buffer and hold its submission until
+/// the queue's next commit (measured: macOS 26.7.1, an AMD 5300M and an Intel 630: Committed for
+/// 2 s, then Completed with the next buffer). The buffer commits as `commit` commits it: it
+/// runs in the same order, only no later than Metal's.
+- (void)commitAndHold;
+
 /// Made by the queue (see RgfxCommandQueue): binds the buffer to its queue, its
 /// guest-picked `cbObjId`, the queue's submission `ring`, and whether it retains its
 /// references. Constructs the RgfxEncoder over `ring` for (queue, cb).
@@ -190,7 +223,8 @@ NS_ASSUME_NONNULL_BEGIN
 /// Encodes the buffer's one encoder, a video encoder on the session `session`, of `codec`
 /// (RGFX_VIDEO_CODEC_*), holding one decode (RGFX_OP_VIDEO_DECODE_H264 or _H265): the access unit
 /// that is `bitstream`'s first `bytes` bytes, after the `size` bytes of parameter sets at
-/// `parameterSets`, into the surface `luma` and `chroma` lie over, which the buffer writes. The
+/// `parameterSets`, into the surface `luma` and `chroma` lie over, which the buffer writes, and
+/// whose planes hold `outputRows` luma rows (the op's output_rows; 0 for the textures' own). The
 /// video driver's (RgfxVideoChannel.hpp).
 - (void)rgfxEncodeVideoSession:(uint64_t)session
                          codec:(uint32_t)codec
@@ -199,7 +233,8 @@ NS_ASSUME_NONNULL_BEGIN
                      bitstream:(id<MTLBuffer>)bitstream
                        ofBytes:(uint64_t)bytes
                           luma:(id<MTLTexture>)luma
-                        chroma:(id<MTLTexture>)chroma;
+                        chroma:(id<MTLTexture>)chroma
+                    outputRows:(uint32_t)outputRows;
 
 @end
 
@@ -216,6 +251,12 @@ NS_ASSUME_NONNULL_BEGIN
 /// command buffer when it vends the encoder; `endEncoding` writes RGFX_OP_ENCODER_END
 /// — unless this encoder belongs to a parallel render encoder, which owns the framing.
 @interface RgfxRenderCommandEncoder : NSObject <MTLRenderCommandEncoder>
+/// The render encoder SPI the system's GL renderer sends after it clears the depth or the stencil
+/// attachment with a draw, which Metal's x86 encoders answer (measured: macOS 26.7.1, an AMD 5300M
+/// and an Intel 630, with no change to the pass): marks for the driver's own clear state, which the
+/// device does not keep. Each posts nothing.
+- (void)setDepthCleared;
+- (void)setStencilCleared;
 /// `enc` is the command buffer's RgfxEncoder (borrowed); `emitEnd` is NO for a
 /// sub-encoder of a parallel render encoder (the parallel encoder writes the END). The object
 /// and mesh stages' commands are sent where `device` makes mesh pipelines

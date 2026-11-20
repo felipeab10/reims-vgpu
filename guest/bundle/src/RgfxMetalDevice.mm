@@ -9,6 +9,8 @@
  */
 
 #import "RgfxMetalDevice.h"
+#include "RgfxLog.hpp"
+#include "RgfxLogOnce.hpp"
 
 #import "RgfxBuffer.h"
 #import "RgfxInterop.h"
@@ -28,11 +30,11 @@
 #include <mach/mach_vm.h>
 #include <memory>
 #include <mutex>
-#include <os/log.h>
 #include <vector>
 
 #include "RgfxCommitOrder.hpp"
 #include "RgfxCompletionThread.hpp"
+#include "RgfxFeatureProfile.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxKnownPipelines.hpp"
 #include "RgfxRegion.hpp"
@@ -40,11 +42,13 @@
 #include "RgfxRingWriter.hpp"
 #include "RgfxSerializer.hpp"
 #include "RgfxSlabs.hpp"
-#include "RgfxSuperpages.hpp"
 
 // The accelerator's user-client protocol, the kext's own header: its type, its selectors and
 // the kext's own feature bits.
+#include "../../kext/src/RgfxDeferCarry.hpp"
+#include "../../kext/src/RgfxQueuePublish.hpp"
 #include "../../kext/src/RgfxUserClientABI.hpp"
+#include "RgfxDoorbellPage.hpp"
 
 namespace {
 // The largest object-lifecycle message the kext takes (ReimsGraphics::kLifecycleMessageMax):
@@ -56,11 +60,26 @@ constexpr uint32_t kLifecycleMessageMax = RGFX_CONTROL_RING_DATA_SIZE / 2;
 // kext until the process takes it (rgfxKextAwaitAnswer, rgfxKextDrainAnswers), one take at a
 // time (`takeLock`), so a thread that waits for an answer another is handing on waits for that.
 struct RgfxKextLink {
-	io_connect_t conn;
-	RgfxReplyReader *reader;
+	io_connect_t conn = IO_OBJECT_NULL;
+	RgfxReplyReader *reader = nullptr;
 	std::mutex takeLock;
 	std::atomic<uint32_t> deferredPosts{0};
+	// The control ring, whose held destroys (RgfxRingWriter::postLater) go before any other call
+	// of the process's into the kext (rgfxKextConn); null until it is made.
+	RgfxRingWriter *control = nullptr;
 };
+
+// The connection of the link at `context`, for a call into the kext, once the destroys the
+// control ring holds are posted: every call of the process's comes after them, as each of its
+// posts does (RgfxRingWriter::postLater). The kext's answer to a call may hang on what a held
+// destroy lets go of (a block's free, a queue's close), and the host's on the order of the ring.
+io_connect_t rgfxKextConn(void *context)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	if (link->control != nullptr)
+		link->control->flushLater();
+	return link->conn;
+}
 
 // The answers to deferred creates one take carries at most: an inline struct out (4 KiB).
 constexpr size_t kAnswersMax = 4096;
@@ -77,8 +96,8 @@ uint32_t rgfxKextTakeAnswers(RgfxKextLink *link, uint64_t waitFor)
 	size_t size = sizeof(answers);
 	uint64_t count = 0;
 	uint32_t outCount = 1;
-	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodTakeAnswers, &waitFor, 1, nullptr, 0,
-	                        &count, &outCount, answers, &size) != KERN_SUCCESS)
+	if (IOConnectCallMethod(rgfxKextConn(link), kRgfxAccelMethodTakeAnswers, &waitFor, 1, nullptr,
+	                        0, &count, &outCount, answers, &size) != KERN_SUCCESS)
 		return 0;
 	for (size_t at = 0; at + sizeof(RgfxMsgHeader) <= size;) {
 		RgfxMsgHeader header = {};
@@ -138,6 +157,40 @@ bool rgfxKextSubmitDeferred(void *context, const void *message, uint32_t size,
 	return true;
 }
 
+// The control ring's shared post (RgfxRingWriter::setShared): a pipeline create posted with
+// kRgfxSubmitShared and its pipeline key, which returns at once with the answer the kext keeps for
+// an equal create of any process, its own answer then kept as a deferred create's. Where the kext
+// keeps none, or no slot for the answer, it posted and answered it as any create, and the answer
+// goes to the reader as rgfxKextSubmit's.
+bool rgfxKextSubmitShared(void *context, const void *message, uint32_t size, const uint8_t *key,
+                          uint64_t *out_seqno, bool *out_deferred,
+                          RgfxPipelineReflection *out_reflection)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	uint64_t in[1 + kRgfxSubmitKeyWords] = {kRgfxSubmitShared};
+	std::memcpy(&in[1], key, kRgfxSubmitKeyWords * sizeof(uint64_t));
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	uint8_t reply[128];
+	size_t replySize = sizeof(reply);
+	kern_return_t kr = IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmit, in,
+	                                       1 + kRgfxSubmitKeyWords, message, size, out, &outCount,
+	                                       reply, &replySize);
+	if (kr != KERN_SUCCESS)
+		return false;
+	*out_seqno = out[0];
+	*out_deferred = outCount == 2 && out[1] == 1 && replySize >= sizeof(RgfxPipelineReflection);
+	if (*out_deferred) {
+		std::memcpy(out_reflection, reply, sizeof(*out_reflection));
+		if (link->deferredPosts.fetch_add(1, std::memory_order_relaxed) % kDrainEvery ==
+		    kDrainEvery - 1)
+			rgfxKextDrainAnswers(link);
+	} else if (replySize >= sizeof(RgfxMsgHeader) && link->reader) {
+		link->reader->deliver(reply, static_cast<uint32_t>(replySize));
+	}
+	return true;
+}
+
 // The control ring's answer wait (RgfxRingWriter::setDeferred): every answer the kext keeps for
 // the process, after the one at `seqno`, handed to the reader. True once taken; whether the one
 // at `seqno` came is its state's to see.
@@ -150,7 +203,7 @@ bool rgfxKextAwaitAnswer(void *context, uint64_t seqno)
 }
 
 // Whether the kext keeps a deferred pipeline create's answer for later: its feature word
-// (Features, 0x10f) has kRgfxKextFeatureDeferredAnswers. An older kext's word is 0.
+// (kRgfxAccelMethodFeatures) has kRgfxKextFeatureDeferredAnswers.
 bool rgfxKextDefersAnswers(const RgfxCaps &caps)
 {
 	return (caps.kextFeatures() & kRgfxKextFeatureDeferredAnswers) != 0;
@@ -187,12 +240,49 @@ bool rgfxKextSubmit(void *context, const void *message, uint32_t size, uint64_t 
 	return true;
 }
 
+// The control ring's batch (RgfxRingWriter::setBatch): the messages it held (destroys, and the
+// creates and writes no one waits for that name no block), posted in one call
+// (kRgfxAccelMethodSubmitBatch), which they go before: how many the kext posted, from the first.
+uint32_t rgfxKextSubmitBatch(void *context, const void *messages, uint32_t bytes)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	uint64_t posted = 0;
+	uint32_t outCount = 1;
+	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmitBatch, nullptr, 0, messages, bytes,
+	                        &posted, &outCount, nullptr, nullptr) != KERN_SUCCESS ||
+	    outCount != 1)
+		return 0;
+	return static_cast<uint32_t>(posted);
+}
+
+// The control ring's batch with a queue's publish after it (RgfxRingWriter::setBatchPublish):
+// SubmitBatch with the queue, its producer and the publish's flags in, the kext publishing once it
+// posted every message (RgfxQueuePublish.hpp): how many it posted, `*out_published` whether it
+// published.
+uint32_t rgfxKextSubmitBatchPublish(void *context, const void *messages, uint32_t bytes,
+                                    const RgfxQueuePublish &publish, bool *out_published)
+{
+	RgfxKextLink *link = static_cast<RgfxKextLink *>(context);
+	const uint64_t in[3] = {publish.queue, publish.producer,
+	                        (publish.answered ? uint64_t(kRgfxPublishAnswered) : 0) |
+	                            (publish.asks ? uint64_t(kRgfxPublishAsks) : 0)};
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	*out_published = false;
+	if (IOConnectCallMethod(link->conn, kRgfxAccelMethodSubmitBatch, in, 3, messages, bytes, out,
+	                        &outCount, nullptr, nullptr) != KERN_SUCCESS ||
+	    outCount != 2)
+		return 0;
+	*out_published = out[1] == 1;
+	return static_cast<uint32_t>(out[0]);
+}
+
 // The serializer's queries: the kext posts the message on the control ring, stamping its seqno,
-// and hands back the device's answer, whole. `context` is the user client's connect.
+// and hands back the device's answer, whole. `context` is the kext link (rgfxKextConn).
 bool rgfxKextAsk(void *context, const void *message, uint32_t size, void *reply,
                  uint32_t capacity, uint32_t *reply_size)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t seqno = 0;
 	uint32_t outCount = 1;
 	size_t replySize = capacity;
@@ -203,13 +293,26 @@ bool rgfxKextAsk(void *context, const void *message, uint32_t size, void *reply,
 	return true;
 }
 
-// The kext's blocks, as RgfxRegion's block source; `context` is the user client's connect.
+// The kext's blocks, as RgfxRegion's block source; `context` is the kext link (rgfxKextConn).
 bool rgfxKextAlloc(void *context, uint64_t size, uint64_t align, uint64_t *offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[2] = {size, align};
 	uint32_t outCount = 1;
 	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 2, offset, &outCount) ==
+	       KERN_SUCCESS;
+}
+
+// The region's write-combined source (RgfxRegion::setWriteCombinedSource): the kext's Alloc with
+// its third input, the byte the block's write-combined part starts at
+// (kRgfxKextFeatureWriteCombined).
+bool rgfxKextAllocWriteCombined(void *context, uint64_t size, uint64_t align,
+                                uint64_t writeCombinedFrom, uint64_t *offset)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	uint64_t in[3] = {size, align, writeCombinedFrom};
+	uint32_t outCount = 1;
+	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodAlloc, in, 3, offset, &outCount) ==
 	       KERN_SUCCESS;
 }
 
@@ -225,22 +328,28 @@ bool rgfxRegionReclaim(void *context)
 }
 
 // The kext's chunks of texture resource ids, as RgfxIdSpace's chunk source; `context` is the
-// user client's connect. False once every chunk of the guest's pool is held.
-bool rgfxKextResourceIds(void *context, uint64_t *first_id)
+// kext link (rgfxKextConn). False once every chunk of the guest's pool is held.
+bool rgfxKextResourceIds(void *context, uint64_t *first_id, uint64_t *ids)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
-	uint32_t outCount = 1;
-	return IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, first_id,
-	                                 &outCount) == KERN_SUCCESS;
+	io_connect_t conn = rgfxKextConn(context);
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodResourceIds, nullptr, 0, out,
+	                              &outCount) != KERN_SUCCESS ||
+	    outCount != 2)
+		return false;
+	*first_id = out[0];
+	*ids = out[1];
+	return true;
 }
 
 // The completion thread's wait: the kext returns once a completion ring of the process's holds
 // records its last pass did not see (the wake count differs from `last`), or at once where it
-// already does. `context` is the user client's connect.
+// already does. `context` is the kext link (rgfxKextConn).
 RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t last,
                                                          uint64_t *now)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint32_t outCount = 1;
 	kern_return_t kr =
 	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodWaitCompletions, &last, 1, now, &outCount);
@@ -248,14 +357,16 @@ RgfxCompletionThread::WaitResult rgfxKextWaitCompletions(void *context, uint64_t
 		return RgfxCompletionThread::kWoke;
 	if (kr == kIOReturnAborted)
 		return RgfxCompletionThread::kRetry; // a signal broke the sleep
-	os_log_error(OS_LOG_DEFAULT, "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
+	os_log_error(rgfxLog(), "RGFX: the completion wait ended kr=0x%x; waiters take the rings",
 	             kr);
+	// A resource's wait has no ring to take: it waits no more.
+	RgfxResourceWaitsStop();
 	return RgfxCompletionThread::kStop;
 }
 
 void rgfxKextRelease(void *context, uint64_t offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodFree, &offset, 1, nullptr, nullptr);
 }
 
@@ -264,7 +375,7 @@ void rgfxKextRelease(void *context, uint64_t offset)
 bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uint64_t size,
                           uint64_t *offset, uint64_t *serial, bool *fresh)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {reinterpret_cast<uintptr_t>(plane), length, size};
 	uint64_t out[4] = {};
 	uint32_t outCount = 4;
@@ -284,25 +395,67 @@ bool rgfxKextSurfaceBlock(void *context, const void *plane, uint64_t length, uin
 	return true;
 }
 
+// The resident pages of the surface the process maps at `base`, `length` bytes, in the task's
+// pages, which are the kernel's: true where 1 to kRgfxCarryPagesMost are, listed in `resident`
+// (RgfxDeferCarry.hpp); false where none or more are, or the query fails. It stops at the first
+// page past those.
+bool rgfxResidentPagesAt(const void *base, uint64_t length, RgfxSurfaceResident *resident)
+{
+	const uint64_t page = vm_page_size;
+	const uint64_t pages = (length + page - 1) / page;
+	constexpr uint64_t kBatch = 1024;
+	int dispositions[kBatch];
+	*resident = {};
+	for (uint64_t at = 0; at < pages; at += kBatch) {
+		mach_vm_size_t count = std::min(kBatch, pages - at);
+		if (mach_vm_page_range_query(mach_task_self(),
+		                             reinterpret_cast<uintptr_t>(base) + at * page, count * page,
+		                             reinterpret_cast<mach_vm_address_t>(dispositions),
+		                             &count) != KERN_SUCCESS)
+			return false;
+		for (uint64_t i = 0; i < count; i++)
+			if ((dispositions[i] & VM_PAGE_QUERY_PAGE_PRESENT) != 0 &&
+			    !rgfxResidentAdd(*resident, (at + i) * page, page))
+				return false;
+	}
+	return resident->count != 0;
+}
+
 // The kext's shared blocks of surfaces in place, as RgfxRegion's surface pages source: the
 // block every process that holds the surface gets, found by the whole allocation it maps at
 // `base`, the device's GPU using those pages, and cached where the kext made it so (six inputs,
-// the surface's IOSurfaceID and whether it may be cached; a fifth output). Unsupported where the
-// device lacks the feature or refused the pages; no room where the kext had none, in the region
-// (kIOReturnNoSpace) or its tables (kIOReturnNoResources); refused for any other answer, among
-// them a kext that takes fewer inputs.
-RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
-                                             uint64_t size, uint32_t surfaceId, bool cacheable,
-                                             uint64_t *offset, uint64_t *serial, bool *fresh,
-                                             bool *cached)
+// the surface's IOSurfaceID and whether it may be cached; a fifth output), the surface's layout
+// its struct input where given, followed by the surface's resident pages where `resident` lists
+// them. Unsupported where the device lacks the feature or refused the pages; no room where the
+// kext had none, in the region (kIOReturnNoSpace) or its tables (kIOReturnNoResources); refused
+// for any other answer, among them a kext that takes fewer inputs.
+RgfxRegion::PagesAnswer rgfxKextSurfacePagesListing(void *context, const void *base,
+                                                    uint64_t length, uint64_t size,
+                                                    uint32_t surfaceId, bool cacheable,
+                                                    const RgfxSurfacePagesLayout *layout,
+                                                    const RgfxSurfaceResident *resident,
+                                                    uint64_t *offset, uint64_t *serial,
+                                                    bool *fresh, bool *cached)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[6] = {reinterpret_cast<uintptr_t>(base), length, size, 1, surfaceId,
 	                  cacheable ? 1u : 0u};
 	uint64_t out[5] = {};
 	uint32_t outCount = 5;
+	uint8_t given[sizeof(RgfxSurfacePagesLayout) + sizeof(RgfxSurfaceResident)] = {};
+	size_t givenSize = 0;
+	if (layout != nullptr) {
+		memcpy(given, layout, sizeof(*layout));
+		givenSize = sizeof(*layout);
+		if (resident != nullptr) {
+			memcpy(given + sizeof(*layout), resident, sizeof(*resident));
+			givenSize += sizeof(*resident);
+		}
+	}
 	kern_return_t kr =
-	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6, out, &outCount);
+	    IOConnectCallMethod(conn, kRgfxAccelMethodSurfaceBlock, in, 6,
+	                        givenSize != 0 ? given : nullptr, givenSize, out, &outCount,
+	                        nullptr, nullptr);
 	if (kr == kIOReturnUnsupported)
 		return RgfxRegion::kPagesUnsupported;
 	if (kr == kIOReturnNoSpace || kr == kIOReturnNoResources)
@@ -321,13 +474,43 @@ RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, ui
 	return RgfxRegion::kPagesGiven;
 }
 
+RgfxRegion::PagesAnswer rgfxKextSurfacePages(void *context, const void *base, uint64_t length,
+                                             uint64_t size, uint32_t surfaceId, bool cacheable,
+                                             const RgfxSurfacePagesLayout *layout,
+                                             uint64_t *offset, uint64_t *serial, bool *fresh,
+                                             bool *cached)
+{
+	return rgfxKextSurfacePagesListing(context, base, length, size, surfaceId, cacheable, layout,
+	                                   nullptr, offset, serial, fresh, cached);
+}
+
+// As rgfxKextSurfacePages, where a deferral may carry its surface's resident pages
+// (RGFX_FEATURE_SURFACE_DEFERRED_CARRY): a cacheable ask with its layout lists them, where 1 to
+// kRgfxCarryPagesMost are, and the kext defers the surface fresh but for them where it proves
+// them (RgfxDeferCarry.hpp). Measured, VTDecoderXPCService writes page 0 of each new decoder
+// output before its first decode, the rest not resident.
+RgfxRegion::PagesAnswer rgfxKextSurfacePagesCarrying(void *context, const void *base,
+                                                     uint64_t length, uint64_t size,
+                                                     uint32_t surfaceId, bool cacheable,
+                                                     const RgfxSurfacePagesLayout *layout,
+                                                     uint64_t *offset, uint64_t *serial,
+                                                     bool *fresh, bool *cached)
+{
+	RgfxSurfaceResident resident = {};
+	const bool listed =
+	    cacheable && layout != nullptr && rgfxResidentPagesAt(base, length, &resident);
+	return rgfxKextSurfacePagesListing(context, base, length, size, surfaceId, cacheable, layout,
+	                                   listed ? &resident : nullptr, offset, serial, fresh,
+	                                   cached);
+}
+
 // The region's pages block source (RgfxRegion::setPagesBlockSource): the kext's pages block of
 // the process's own memory (kRgfxAccelMethodPagesBlock), false where it makes none, for any
 // reason, and the memory then takes a shadow.
 bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, bool writable,
                         uint64_t *offset, uint64_t *size)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[3] = {reinterpret_cast<uintptr_t>(address), length, writable ? 1u : 0u};
 	uint64_t out[2] = {};
 	uint32_t outCount = 2;
@@ -340,22 +523,46 @@ bool rgfxKextPagesBlock(void *context, const void *address, uint64_t length, boo
 	return true;
 }
 
-// The pages source's memory (RgfxPagesMemory): 2 MiB superpages, zeroed and wired, each one run of
-// RAM, one kernel call each, so a refusal is safe in a process whose VM guard is on
-// (RgfxSuperpages.hpp).
-int rgfxSuperpages(void *, uint64_t size, uint8_t **bytes)
+// The region's chunked pages source (RgfxRegion::setChunkedPagesSource): the kext's chunks and
+// their pages block (kRgfxAccelMethodPagesChunked), false where it makes none, for any reason,
+// and the slab then takes plain pages.
+bool rgfxKextPagesChunked(void *context, uint64_t length, uint8_t **bytes, uint64_t *offset,
+                          uint64_t *size)
 {
-	return rgfxTakeSuperpages(rgfxKernelSuperpageVm(), size, bytes);
+	io_connect_t conn = rgfxKextConn(context);
+	uint64_t out[3] = {};
+	uint32_t outCount = 3;
+	kern_return_t kr =
+	    IOConnectCallScalarMethod(conn, kRgfxAccelMethodPagesChunked, &length, 1, out, &outCount);
+	if (kr != KERN_SUCCESS || outCount != 3)
+		return false;
+	*bytes = reinterpret_cast<uint8_t *>(static_cast<uintptr_t>(out[0]));
+	*offset = out[1];
+	*size = out[2];
+	return true;
+}
+
+// The pages source's memory (RgfxPagesMemory::pages): plain pages, zero-filled, tagged
+// VM_MEMORY_IOACCELERATOR, which the kext's pages block wires.
+int rgfxPlainPages(void *, uint64_t size, uint8_t **bytes)
+{
+	mach_vm_address_t at = 0;
+	const kern_return_t kr = mach_vm_allocate(mach_task_self(), &at, size,
+	                                          VM_FLAGS_ANYWHERE |
+	                                              VM_MAKE_TAG(VM_MEMORY_IOACCELERATOR));
+	if (kr == KERN_SUCCESS)
+		*bytes = reinterpret_cast<uint8_t *>(at);
+	return kr;
 }
 
 void rgfxUnmapPages(void *, uint8_t *bytes, uint64_t size)
 {
-	rgfxGiveSuperpages(rgfxKernelSuperpageVm(), bytes, size);
+	mach_vm_deallocate(mach_task_self(), reinterpret_cast<mach_vm_address_t>(bytes), size);
 }
 
 void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceBlockRelease, &offset, 1, nullptr,
 	                          nullptr);
 }
@@ -366,7 +573,7 @@ void rgfxKextSurfaceRelease(void *context, uint64_t offset)
 void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const uint64_t *writes,
                            uint32_t count)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	std::vector<uint64_t> words;
 	words.reserve(3 + 2 * static_cast<size_t>(count));
 	words.push_back(queue);
@@ -385,16 +592,34 @@ void rgfxKextSurfaceWrites(void *context, uint64_t queue, uint64_t seqno, const 
 
 void rgfxKextSurfaceRetire(void *context, uint64_t queue, uint64_t seqno)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	const uint64_t in[2] = {queue, seqno};
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceRetire, in, 2, nullptr, nullptr);
+}
+
+// The region's surface seeds source (RgfxRegion::setSurfaceSeedsSource): a surface's lock and
+// unlock seeds from the kext (kRgfxAccelMethodSurfaceSeeds), false where it answers none.
+bool rgfxKextSurfaceSeeds(void *context, uint32_t surfaceId, uint32_t *lockSeed,
+                          uint32_t *unlockSeed)
+{
+	io_connect_t conn = rgfxKextConn(context);
+	const uint64_t in = surfaceId;
+	uint64_t out[2] = {};
+	uint32_t outCount = 2;
+	if (IOConnectCallScalarMethod(conn, kRgfxAccelMethodSurfaceSeeds, &in, 1, out, &outCount) !=
+	        KERN_SUCCESS ||
+	    outCount != 2)
+		return false;
+	*lockSeed = static_cast<uint32_t>(out[0]);
+	*unlockSeed = static_cast<uint32_t>(out[1]);
+	return true;
 }
 
 // The serializer's queue closer: the kext stops watching the queue's completion ring and posts
 // its destroy on the control ring, behind the process's messages before it.
 void rgfxKextQueueCloser(void *context, RgfxObjId objId)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in = objId;
 	IOConnectCallScalarMethod(conn, kRgfxAccelMethodQueueDestroy, &in, 1, nullptr, nullptr);
 }
@@ -403,7 +628,7 @@ void rgfxKextQueueCloser(void *context, RgfxObjId objId)
 // returns once the device has its rings.
 bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 {
-	io_connect_t conn = static_cast<io_connect_t>(reinterpret_cast<uintptr_t>(context));
+	io_connect_t conn = rgfxKextConn(context);
 	uint64_t in[6] = {q.obj_id, q.submit_offset, q.complete_offset, q.submit_data_size,
 	                  q.complete_data_size, q.priority};
 	uint64_t status = ~0ull;
@@ -423,6 +648,11 @@ bool rgfxKextQueueOpener(void *context, const RgfxQueueCreate &q)
 - (uint64_t)rgfxListenQueue;
 @end
 
+#if defined(__arm64__)
+@interface RgfxMetalDevice () <RgfxAppleRulesDevice>
+@end
+#endif
+
 namespace {
 void rgfxDeviceDoorbell(void *context, uint32_t ring_id)
 {
@@ -437,6 +667,8 @@ struct RgfxEventShareLink {
 	// The device's own connection, which answers whether a port it is handed is a shared event's
 	// port of the kext's (rgfxKextTakeEvent).
 	io_connect_t connection = IO_OBJECT_NULL;
+	// The device's link, whose held destroys go before the port's calls (rgfxKextConn).
+	RgfxKextLink *kext = nullptr;
 	uint64_t context = 0;
 	__weak RgfxMetalDevice *device = nil;
 };
@@ -460,10 +692,13 @@ uint32_t rgfxKextShareEvent(void *context, RgfxObjId event)
 	const uint64_t in[3] = {link->context, event, listen};
 	uint64_t status = ~0ull;
 	uint32_t outCount = 1;
+	rgfxKextConn(link->kext);
 	kr = IOConnectCallScalarMethod(port, kRgfxSharedEventMethodExport, in, 3, &status, &outCount);
 	if (kr != KERN_SUCCESS || outCount != 1 || status != RGFX_STATUS_OK) {
-		os_log_error(OS_LOG_DEFAULT, "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
-		             (unsigned long long)event, kr, (unsigned long long)status);
+		static char site;
+		if (rgfxLogFirst(&site, (static_cast<uint64_t>(kr) << 32) ^ status))
+			os_log_error(rgfxLog(), "RGFX: shared event 0x%llx: no port (kr=0x%x status %llu)",
+			             (unsigned long long)event, kr, (unsigned long long)status);
 		IOServiceClose(port);
 		return MACH_PORT_NULL;
 	}
@@ -490,6 +725,7 @@ bool rgfxKextTakeEvent(void *context, uint32_t port, RgfxObjId event, uint64_t *
 	const uint64_t in[3] = {link->context, event, listen};
 	uint64_t out[2] = {~0ull, 0};
 	uint32_t outCount = 2;
+	rgfxKextConn(link->kext);
 	kern_return_t kr =
 	    IOConnectCallScalarMethod(port, kRgfxSharedEventMethodImport, in, 3, out, &outCount);
 	if (kr != KERN_SUCCESS || outCount != 2 || out[0] != RGFX_STATUS_OK)
@@ -530,6 +766,57 @@ RGFX_LOG_UNRECOGNIZED
 }
 @end
 
+namespace {
+
+// The device's GPU compiler target, which `targetDeviceArchitecture` answers (it says why).
+constexpr uint32_t kRgfxTargetCpuType = 0x0100'5247;
+constexpr uint32_t kRgfxTargetSubType = 0;
+constexpr uint64_t kRgfxTargetDriverVersion = 0x1'0000;
+
+// Metal's MTLTargetDeviceArchVersion, `{MTLTargetDeviceArchVersion=SCC}` (measured: its setter's
+// type on macOS 26.7.1 and 27.0.1): a 16-bit and two 8-bit fields, which its versionCombined
+// answers as field_00 << 16 | field_02 << 8 | field_03 (tests/inherited_tests.mm reads it back).
+struct RgfxTargetArchVersion {
+	uint16_t field_00;
+	uint8_t field_02;
+	uint8_t field_03;
+};
+static_assert(sizeof(RgfxTargetArchVersion) == 4, "MTLTargetDeviceArchVersion is 4 bytes");
+
+constexpr RgfxTargetArchVersion kRgfxTargetVersion = {1, 0, 0};
+
+// Whether `cls` has the instance method `sel` of the type encoding `types`.
+bool rgfxHasMethod(Class cls, SEL sel, const char *types)
+{
+	Method m = class_getInstanceMethod(cls, sel);
+	return m != nullptr && std::strcmp(method_getTypeEncoding(m), types) == 0;
+}
+
+// An MTLTargetDeviceArchitecture naming the device's target; nil where the guest's Metal has no
+// such class, or its setters are not the ones this sets.
+id rgfxTargetDeviceArchitecture()
+{
+	Class cls = objc_getClass("MTLTargetDeviceArchitecture");
+	if (cls == Nil || !rgfxHasMethod(cls, @selector(setCpuType:), "v20@0:8I16") ||
+	    !rgfxHasMethod(cls, @selector(setSubType:), "v20@0:8I16") ||
+	    !rgfxHasMethod(cls, @selector(setDriverVersion:), "v24@0:8Q16") ||
+	    !rgfxHasMethod(cls, @selector(setVersion:), "v20@0:8{MTLTargetDeviceArchVersion=SCC}16")) {
+		os_log_error(rgfxLog(), "RGFX: the guest's Metal has no MTLTargetDeviceArchitecture of the "
+		                        "setters the device sets; targetDeviceArchitecture answers nil");
+		return nil;
+	}
+	id a = [[cls alloc] init];
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, @selector(setCpuType:), kRgfxTargetCpuType);
+	((void (*)(id, SEL, uint32_t))objc_msgSend)(a, @selector(setSubType:), kRgfxTargetSubType);
+	((void (*)(id, SEL, uint64_t))objc_msgSend)(a, @selector(setDriverVersion:),
+	                                            kRgfxTargetDriverVersion);
+	((void (*)(id, SEL, RgfxTargetArchVersion))objc_msgSend)(a, @selector(setVersion:),
+	                                                         kRgfxTargetVersion);
+	return a;
+}
+
+} // namespace
+
 @implementation RgfxMetalDevice {
 	RgfxCaps _caps;              // host device caps; invalid until the region is read
 	RgfxVideoCaps _videoCaps;    // the host's video codecs; none until the region is read
@@ -549,6 +836,9 @@ RGFX_LOG_UNRECOGNIZED
 	std::unique_ptr<RgfxRingWriter> _controlRing; // the lifecycle, forwarded to the kext
 	mach_vm_address_t _mapBase;  // the window's base in this process (0 until the context opens)
 	mach_vm_size_t _mapSize;     // the window's size, the region's
+	// The context's doorbell page in this process (RgfxDoorbellPage.hpp): null where the kext
+	// mapped none, and the kext's doorbell call rings.
+	volatile uint32_t *_doorbellPage;
 	std::atomic<bool> _metalAssertions; // setMetalAssertionsEnabled:'s, read back
 	RgfxStateCache *_stateCache; // samplers and depth/stencil states; nil until the handshake
 	// The slabs Shared and Managed buffers lie in, and their sources: the region's, and the
@@ -570,7 +860,12 @@ RGFX_LOG_UNRECOGNIZED
 {
 	self = [super initWithAcceleratorPort:port];
 	if (self == nil) {
-		return nil; // Apple's base declined (or the port is not ours)
+		// Apple's IOGPU base declined the accelerator: its own device calls (RgfxIOGPUReplies.hpp)
+		// failed in this process, or its sandbox refused them.
+		os_log_error(rgfxLog(),
+		             "RGFX: the IOGPU base declined the accelerator; no Metal device in this "
+		             "process");
+		return nil;
 	}
 	_acceleratorPort = port;
 	_conn = IO_OBJECT_NULL;
@@ -579,61 +874,82 @@ RGFX_LOG_UNRECOGNIZED
 	_replyReader = nullptr;
 	_mapBase = 0;
 	_mapSize = 0;
+	_doorbellPage = nullptr;
 
-	// Wire transport handshake: open our own user client on the accelerator, read the caps blob
-	// the host wrote, open the process's context, whose window is where its part of the device
-	// region (BAR 2) lies in this task, and build the region allocator over the window and the
-	// device submission ring (RgfxSerializer) + device completion ring (RgfxReplyReader). With
-	// these non-null the resource / command-queue / command-buffer categories route over our
-	// wire instead of falling back to the IOGPUMetalDevice base (Apple's IOGPU kernel ABI). Any
-	// failure leaves the transport stubbed (the getters answer from defaults) rather than
-	// crashing.
+	// Wire transport handshake: open our own user client on the accelerator, take the kext's
+	// features and selector map, read the caps blob the host wrote, open the process's context,
+	// whose window is where its part of the device region (BAR 2) lies in this task, and build the
+	// region allocator over the window and the device submission ring (RgfxSerializer) + device
+	// completion ring (RgfxReplyReader); the resource / command-queue / command-buffer categories
+	// route over our wire. A step that fails refuses the device, logged: the process has no Metal
+	// device, the answer every Metal client handles, where a device that works by guesses fails
+	// later and elsewhere (a texture's id the kext never granted, a call another kext numbers
+	// otherwise).
 	kern_return_t kr = IOServiceOpen(port, mach_task_self(), kRgfxAccelUserClientType, &_conn);
 	if (kr != KERN_SUCCESS) {
-		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; transport stubbed",
+		os_log_error(rgfxLog(),
+		             "RGFX: IOServiceOpen(type=%u) failed kr=0x%x; no Metal device in this "
+		             "process",
 		             kRgfxAccelUserClientType, kr);
-		return self;
+		_conn = IO_OBJECT_NULL;
+		return nil;
+	}
+
+	// The device's feature word, the kext's own and the kext's selector map, first: a kext of
+	// another map, or a sandbox that refuses the call, leaves no number of this bundle's sure to
+	// mean its call there (RgfxUserClientABI.hpp).
+	uint64_t features[3] = {};
+	uint32_t featuresCount = 3;
+	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
+	                               &featuresCount);
+	if (!_caps.takeFeatures(kr, featuresCount, features)) {
+		os_log_error(rgfxLog(),
+		             "RGFX: the features call (selector %u) answered kr=0x%x, %u words, selector "
+		             "map %llu, where this bundle's map is %u: a kext of another selector map, or "
+		             "a sandbox that refuses the call; no Metal device in this process",
+		             (unsigned)kRgfxAccelMethodFeatures, kr, featuresCount,
+		             (unsigned long long)features[2], (unsigned)kRgfxSelectorMap);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return nil;
 	}
 
 	// The caps blob the host wrote (read once at init), which the kext reads for us: its page
-	// is no process's to map.
-	// The video caps follow it, where the kext reads them too; a kext older than them reads the
-	// device info alone, and the device then has no video codec.
+	// is no process's to map. The video caps follow it; where the host wrote them in another
+	// version, the device has no video codec.
 	struct {
 		RgfxDeviceInfo info;
 		RgfxVideoCaps video;
 	} blob = {};
 	static_assert(offsetof(decltype(blob), video) == sizeof(RgfxDeviceInfo), "no padding");
-	RgfxDeviceInfo &info = blob.info;
 	size_t infoSize = sizeof(blob);
 	kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &blob,
 	                               &infoSize);
-	if (kr != KERN_SUCCESS) {
-		blob = {};
-		infoSize = sizeof(info);
-		kr = IOConnectCallStructMethod(_conn, kRgfxAccelMethodDeviceInfo, nullptr, 0, &info,
-		                               &infoSize);
-	} else if (infoSize == sizeof(blob) && blob.video.version == RGFX_VIDEO_CAPS_VERSION) {
+	if (kr != KERN_SUCCESS || infoSize != sizeof(blob) || !_caps.load(blob.info)) {
+		os_log_error(rgfxLog(),
+		             "RGFX: the device info was not read (kr=0x%x, %zu of %zu bytes) or is of "
+		             "version %u, where this bundle reads %u; no Metal device in this process",
+		             kr, infoSize, sizeof(blob), (unsigned)blob.info.version,
+		             (unsigned)RGFX_DEVICE_INFO_VERSION);
+		IOServiceClose(_conn);
+		_conn = IO_OBJECT_NULL;
+		return nil;
+	}
+	if (blob.video.version == RGFX_VIDEO_CAPS_VERSION) {
 		_videoCaps = blob.video;
 		if (_videoCaps.codec_count > RGFX_VIDEO_CAPS_CODECS)
 			_videoCaps.codec_count = RGFX_VIDEO_CAPS_CODECS;
-		infoSize = sizeof(info);
+	} else if (blob.video.version == 0) {
+		// A host with no hardware video writes no caps: a macOS host, whose library has no
+		// video arm, or a Linux host where neither NVDEC nor VA-API opens on the GPU.
+		os_log(rgfxLog(),
+		       "RGFX: the host has no hardware video; this process's device has no video codec");
 	} else {
-		infoSize = sizeof(info);
+		os_log_error(rgfxLog(),
+		             "RGFX: the host's video caps are of version %u, where this bundle reads %u; "
+		             "this process's device has no video codec",
+		             (unsigned)blob.video.version, (unsigned)RGFX_VIDEO_CAPS_VERSION);
 	}
-	if (kr != KERN_SUCCESS || infoSize != sizeof(info) || !_caps.load(info))
-		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: caps blob not read (kr=0x%x) or invalid; using defaults", kr);
-	// The device's feature word and the kext's own, from the kext; a kext older than the call
-	// leaves the blob's bits 0 to 2 and no kext feature (RgfxCaps::takeFeatures).
-	uint64_t features[2] = {};
-	uint32_t featuresCount = 2;
-	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodFeatures, nullptr, 0, features,
-	                               &featuresCount);
-	if (kr == KERN_SUCCESS && featuresCount != 2)
-		kr = kIOReturnBadArgument;
-	_caps.takeFeatures(kr, features[0], features[1]);
 	// Where the host orders command buffers of different queues over the surfaces they share,
 	// this process names each one's order (rgfxIOSurfaceNameOrder).
 	rgfxIOSurfaceSetOrder((_caps.features() & RGFX_FEATURE_SURFACE_ORDER) != 0);
@@ -645,16 +961,17 @@ RGFX_LOG_UNRECOGNIZED
 	// The process's context: its id and address ranges, its window, its blocks and its chunks
 	// of texture resource ids, from the kext, so no two processes' rings, blocks or numbers
 	// meet, and this one maps nothing of the region but its own. The span of its GPU addresses
-	// comes sixth where the kext answers it; a kext that does not gives RGFX_CONTEXT_VA_SPAN.
-	const uint32_t ctxWanted = (_caps.kextFeatures() & kRgfxKextFeatureContextSpan) ? 6 : 5;
-	uint64_t ctx[6] = {0, 0, 0, 0, 0, RGFX_CONTEXT_VA_SPAN};
+	// comes sixth where the kext answers it; a kext that does not gives RGFX_CONTEXT_VA_SPAN. Its
+	// doorbell page comes seventh where the kext answers that (RgfxDoorbellPage.hpp).
+	const uint32_t ctxWanted = rgfxOpenContextOutputs(_caps.kextFeatures());
+	uint64_t ctx[7] = {0, 0, 0, 0, 0, RGFX_CONTEXT_VA_SPAN, 0};
 	uint32_t ctxCount = ctxWanted;
 	kr = IOConnectCallScalarMethod(_conn, kRgfxAccelMethodOpenContext, nullptr, 0, ctx, &ctxCount);
 	if (kr == kIOReturnNoResources) {
 		// The kext has no range of GPU addresses left for another process: no device here, the
 		// answer every Metal client handles, where a device whose every create answers nil
 		// stops the frameworks that make their first objects at its open.
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: OPEN_CONTEXT refused: the device holds as many processes as it "
 		             "can; no Metal device in this one");
 		IOServiceClose(_conn);
@@ -663,21 +980,25 @@ RGFX_LOG_UNRECOGNIZED
 	}
 	if (kr != KERN_SUCCESS || ctxCount != ctxWanted || ctx[3] == 0 ||
 	    ctx[4] < RGFX_ALLOCATIONS_OFFSET || ctx[5] == 0) {
-		os_log_error(OS_LOG_DEFAULT,
-		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); transport "
-		             "stubbed",
+		os_log_error(rgfxLog(),
+		             "RGFX: OPEN_CONTEXT failed kr=0x%x (window 0x%llx, %llu bytes); no Metal "
+		             "device in this process",
 		             kr, (unsigned long long)ctx[3], (unsigned long long)ctx[4]);
 		IOServiceClose(_conn);
 		_conn = IO_OBJECT_NULL;
-		return self;
+		return nil;
 	}
 	const mach_vm_address_t addr = ctx[3];
 	const mach_vm_size_t mapSize = ctx[4];
 	_mapBase = addr;
 	_mapSize = mapSize;
+	_doorbellPage = rgfxDoorbellPageOf(ctx, ctxCount);
 	volatile uint8_t *base = reinterpret_cast<volatile uint8_t *>(addr);
 	_ids.setBases(ctx[1], ctx[2], ctx[5]);
-	void *connContext = reinterpret_cast<void *>(static_cast<uintptr_t>(_conn));
+	// The kext's calls go through the link (rgfxKextConn), after the destroys the control ring
+	// holds once it is made.
+	_link.conn = _conn;
+	void *connContext = &_link;
 	// The kext's chunks are of RGFX_RESOURCE_ID_SMALL_CHUNK ids where it took
 	// RGFX_FEATURE_SMALL_ID_CHUNKS (RgfxUserClientABI.hpp, kRgfxAccelMethodResourceIds).
 	_ids.setResourceIdSource(&rgfxKextResourceIds, connContext,
@@ -686,32 +1007,77 @@ RGFX_LOG_UNRECOGNIZED
 	                             : RGFX_RESOURCE_ID_CHUNK);
 	_region = new RgfxRegion(base, mapSize);
 	_region->setBlockSource(&rgfxKextAlloc, &rgfxKextRelease, connContext);
+	// The bytes the process only writes in write-combined parts of their blocks, where the kext
+	// maps them so (RgfxRegion.hpp, WRITE-COMBINED PARTS).
+	if ((_caps.kextFeatures() & kRgfxKextFeatureWriteCombined) != 0)
+		_region->setWriteCombinedSource(&rgfxKextAllocWriteCombined);
 	_region->setSurfaceSource(&rgfxKextSurfaceBlock, &rgfxKextSurfaceRelease, connContext);
-	_region->setSurfacePagesSource(&rgfxKextSurfacePages, _caps.linearTextureAlignment(),
-	                               connContext);
+	// Its asks list their surfaces' few resident pages where a deferral may carry them.
+	_region->setSurfacePagesSource((_caps.features() & RGFX_FEATURE_SURFACE_DEFERRED_CARRY) != 0
+	                                   ? &rgfxKextSurfacePagesCarrying
+	                                   : &rgfxKextSurfacePages,
+	                               _caps.linearTextureAlignment(), connContext);
 	_region->setSurfaceWriteSource(&rgfxKextSurfaceWrites, &rgfxKextSurfaceRetire, connContext);
+	// A copy synced while a CPU held its surface locked for writing syncs again at the unlock,
+	// where the kext reads IOSurface's unlock seed (RgfxIOSurface.h).
+	const bool seeds = (_caps.kextFeatures() & kRgfxKextFeatureSurfaceSeeds) != 0;
+	if (seeds)
+		_region->setSurfaceSeedsSource(&rgfxKextSurfaceSeeds, connContext);
+	rgfxIOSurfaceNoteSurfaceSeeds(seeds);
 	// No-copy buffers over the process's own pages, where the kext makes pages blocks and the
 	// host took the feature that maps them.
 	if ((_caps.kextFeatures() & kRgfxKextFeaturePagesBlock) != 0 &&
-	    (_caps.features() & RGFX_FEATURE_PAGES_BUFFERS) != 0)
+	    (_caps.features() & RGFX_FEATURE_PAGES_BUFFERS) != 0) {
+#if defined(__arm64__)
+		// Whole 16 KiB pages where the kext took PAGES_16K, as it rounds the blocks' ranges then.
+		_region->setPagesPage((_caps.features() & RGFX_FEATURE_PAGES_16K) != 0 ? 0x4000 : 0x1000);
+#endif
 		_region->setPagesBlockSource(&rgfxKextPagesBlock, connContext);
+		// Slabs of the kext's chunks first, where it makes them.
+		if ((_caps.kextFeatures() & kRgfxKextFeaturePagesChunked) != 0)
+			_region->setChunkedPagesSource(&rgfxKextPagesChunked, connContext);
+	}
 
 	// The object lifecycle goes to the kext, which posts it on the control ring and hands back
 	// the replies (a pipeline's reflection).
 	_replyReader = new RgfxReplyReader();
-	_link.conn = _conn;
 	_link.reader = _replyReader;
 	_controlRing = std::make_unique<RgfxRingWriter>(&rgfxKextSubmit, &_link, kLifecycleMessageMax);
+	// The process's destroys, and its creates and writes no one waits for that name no block, go
+	// together, where the kext takes them in one call (RgfxRingWriter::postLater).
+	if ((_caps.kextFeatures() & kRgfxKextFeatureSubmitBatch) != 0) {
+		_controlRing->setBatch(&rgfxKextSubmitBatch, kRgfxSubmitBatchBytes);
+		_link.control = _controlRing.get();
+		// A commit behind held messages hands its buffer's publish to them, where the kext makes
+		// it after them (RgfxQueuePublish.hpp): one call, not the held and then the doorbell.
+		if ((_caps.kextFeatures() & kRgfxKextFeatureQueuePublish) != 0)
+			_controlRing->setBatchPublish(&rgfxKextSubmitBatchPublish);
+	}
 	// A pipeline create equal to one the device accepted is posted without waiting, where the
 	// kext keeps its answer for later (RgfxKnownPipelines.hpp).
 	if (rgfxKextDefersAnswers(_caps)) {
 		_controlRing->setDeferred(&rgfxKextSubmitDeferred, &rgfxKextAwaitAnswer, &_link);
 		_knownPipelines = std::make_shared<RgfxKnownPipelines>();
+		// An equal create of another process is posted without waiting too, where the kext keeps
+		// the answers by pipeline key and the host gives them (RgfxSharedPipelines.hpp).
+		if ((_caps.kextFeatures() & kRgfxKextFeatureSharedPipelines) != 0 &&
+		    (_caps.features() & RGFX_FEATURE_PIPELINE_KEYS) != 0)
+			_controlRing->setShared(&rgfxKextSubmitShared);
 	}
 	_serializer = new RgfxSerializer(*_controlRing, _ids);
 	_serializer->setQueueOpener(&rgfxKextQueueOpener, connContext);
 	_serializer->setQueueCloser(&rgfxKextQueueCloser, connContext);
 	_serializer->setAsker(&rgfxKextAsk, connContext);
+	_serializer->setCarriesPrivateRenderState((_caps.features() & RGFX_FEATURE_PRIVATE_RENDER_STATE) !=
+	                                          0);
+	_serializer->setCarriesTextureDidModifyData(
+	    (_caps.features() & RGFX_FEATURE_TEXTURE_DID_MODIFY_DATA) != 0);
+	_serializer->setCarriesRateMaps((_caps.features() & RGFX_FEATURE_RATE_MAPS) != 0);
+	_serializer->setSharesPipelines(_controlRing->shares());
+	_serializer->setCarriesFunctionPointers((_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) !=
+	                                        0);
+	_serializer->setCarriesDynamicLibraries((_caps.features() & RGFX_FEATURE_DYNAMIC_LIBRARIES) !=
+	                                        0);
 	// Shared events cross processes through the kext's ports where the kext makes them and the
 	// host took the feature that names their events (RgfxUserClientABI.hpp,
 	// kRgfxSharedEventUserClientType).
@@ -719,6 +1085,7 @@ RGFX_LOG_UNRECOGNIZED
 	    (_caps.features() & RGFX_FEATURE_SHARED_EVENT_NAMES) != 0) {
 		_shareLink.accelerator = port;
 		_shareLink.connection = _conn;
+		_shareLink.kext = &_link;
 		_shareLink.context = ctx[0];
 		_shareLink.device = self;
 		_serializer->setEventSharer(&rgfxKextShareEvent, &rgfxKextTakeEvent, &_shareLink);
@@ -732,13 +1099,13 @@ RGFX_LOG_UNRECOGNIZED
 	_slabSource = std::make_unique<RgfxRegionSlabSource>(*_region, *_serializer, managedAtOffset,
 	                                                     managedOverCopy);
 	_slabs = std::make_unique<RgfxSlabs>(*_slabSource);
-	// The slabs whose buffers lie in heaps, and large Shared buffers, are the process's own
-	// superpages, wired into pages blocks the host makes heaps or buffers over, where the region
-	// has a pages block source (above) and the device took HEAP_OVER_PAGES; else, and where the
-	// kernel has no superpage, the region's.
+	// The slabs whose buffers lie in heaps, and large Shared buffers, are the kext's chunks, or
+	// the process's own plain pages, wired into pages blocks the host makes heaps or buffers over,
+	// where the region has a pages block source (above) and the device took HEAP_OVER_PAGES; else
+	// the region's.
 	if (_region->hasPagesBlocks() && (_caps.features() & RGFX_FEATURE_HEAP_OVER_PAGES) != 0) {
 		RgfxPagesMemory memory;
-		memory.superpages = &rgfxSuperpages;
+		memory.pages = &rgfxPlainPages;
 		memory.unmap = &rgfxUnmapPages;
 		_pagesSource = std::make_unique<RgfxPagesSlabSource>(
 		    *_region, *_serializer, memory, [NSProcessInfo processInfo].physicalMemory,
@@ -746,14 +1113,15 @@ RGFX_LOG_UNRECOGNIZED
 		_slabs->setFirst(_pagesSource.get());
 	}
 	if (!_slabs->start())
-		os_log_error(OS_LOG_DEFAULT,
+		os_log_error(rgfxLog(),
 		             "RGFX: no slab thread; creates zero and frees let slabs go themselves");
 	// A block the kext has no room for is asked again once the slabs the process keeps went.
 	_region->setReclaim(&rgfxRegionReclaim, _slabs.get());
 	// The queues' completions, taken as the kext wakes the thread for them.
 	_completions = std::make_unique<RgfxCompletionThread>(&rgfxKextWaitCompletions, connContext);
 	if (!_completions->start()) {
-		os_log_error(OS_LOG_DEFAULT, "RGFX: no completion thread; waiters take the rings");
+		os_log_error(rgfxLog(), "RGFX: no completion thread; waiters take the rings");
+		RgfxResourceWaitsStop();
 		_completions.reset();
 	}
 	return self;
@@ -830,8 +1198,8 @@ RGFX_LOG_UNRECOGNIZED
 	uint64_t in[2] = {surfaceId, buffer};
 	uint64_t out[5] = {};
 	uint32_t outCount = 5;
-	kern_return_t kr =
-	    IOConnectCallScalarMethod(_conn, kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
+	kern_return_t kr = IOConnectCallScalarMethod(
+	    rgfxKextConn(&_link), kRgfxAccelMethodSurfaceScanout, in, 2, out, &outCount);
 	static std::atomic<int> logged{0};
 	if (logged.fetch_add(1) < 8) {
 		NSLog(@"RGFX: newTextureWithSurface:0x%lx buffer:%lu -> 0x%x: offset 0x%llx, %llu bytes, "
@@ -919,12 +1287,20 @@ RGFX_LOG_UNRECOGNIZED
 
 - (void)rgfxRingDoorbell:(uint32_t)ringId
 {
-	// Ring the ring's doorbell through our accelerator user client: the kext writes `ringId`
-	// to RGFX_REG_DOORBELL in BAR 0, waking the host's consumer of that ring.
 	if (_conn == IO_OBJECT_NULL)
 		return;
+	// After the destroys the control ring holds, as every call of the process's into the kext.
+	const io_connect_t conn = rgfxKextConn(&_link);
+	// At the context's doorbell page, where the kext mapped one: a store the host takes, waking
+	// its consumer of the ring, with no call into the kext (RgfxDoorbellPage.hpp).
+	if (_doorbellPage != nullptr) {
+		rgfxDoorbellPageRing(_doorbellPage, ringId);
+		return;
+	}
+	// Else through our accelerator user client: the kext writes `ringId` to RGFX_REG_DOORBELL in
+	// BAR 0.
 	uint64_t scalar = ringId;
-	IOConnectCallScalarMethod(_conn, kRgfxAccelMethodDoorbell, &scalar, 1, nullptr, nullptr);
+	IOConnectCallScalarMethod(conn, kRgfxAccelMethodDoorbell, &scalar, 1, nullptr, nullptr);
 }
 
 // --- identity ----------------------------------------------------------------
@@ -944,6 +1320,14 @@ RGFX_LOG_UNRECOGNIZED
 - (NSString *)familyName
 {
 	return [NSString stringWithUTF8String:rgfxFamilyNameOf(self.name.UTF8String).c_str()];
+}
+
+// The MTLDeviceSPI vendor name, the host GPU's vendor from the name the device answers
+// (rgfxVendorNameOf): "NVIDIA" for "NVIDIA GeForce RTX 5080 Laptop GPU". The IOGPU base answered
+// "Apple", on which the system's GL renderer ends every process that makes a GL context.
+- (NSString *)vendorName
+{
+	return [NSString stringWithUTF8String:rgfxVendorNameOf(self.name.UTF8String).c_str()];
 }
 
 - (uint64_t)registryID
@@ -986,6 +1370,30 @@ RGFX_LOG_UNRECOGNIZED
 		    &sup, @selector(architecture));
 	}
 	return [[RgfxArchitecture alloc] initWithArchitectureName:@""];
+}
+
+// The device's GPU compiler target, MTLDeviceSPI's `targetDeviceArchitecture`: an object of
+// Metal's own class, MTLTargetDeviceArchitecture, as every Mac's device answers (measured:
+// tools/oracle/oracle_archtype.m on the AMD 5300M, the Intel 630 and the M3 Max,
+// docs/graphics-kext/dgpu-oracle.md Q42). nil, which the IOGPU base answered, is outside that:
+// Metal's loader ends the process at it (+[MTLLoader sliceIDForDevice:legacyDriverVersion:
+// airntDriverVersion:], read from macOS 27's Metal), and MTLAssetUpgraderD, which asks Metal's
+// archive reader about every .metallib of an app it is told of for every device, ended with
+// SIGABRT at each app installed in the guest. Each Mac's answer names its own compiler's
+// target, so the device's names its own:
+// - cpuType 0x01005247: CPU_ARCH_ABI64 with the device's PCI device id, 0x5247. No Metal slice
+//   carries it (Apple's GPUs are 0x01000013, AMD's 0x01000014, Intel's 0x01000015, AIR
+//   0x01000017), so no archive or dynamic library holds a slice Metal reads as this device's:
+//   the device makes its pipelines from AIR on the host, and its archives are of its own format
+//   (RgfxBinaryArchiveFile.hpp).
+// - subType 0: the device has one target, whatever the host's GPU.
+// - version 1.0.0, versionCombined 0x10000, and driverVersion 0x10000, the same value, as the M3
+//   Max (0x30000) and the Intel 630 (0x1a0701) answer theirs.
+// Where the guest's Metal has no such class, nil.
+- (id)targetDeviceArchitecture
+{
+	static id answer = rgfxTargetDeviceArchitecture();
+	return answer;
 }
 
 - (BOOL)hasUnifiedMemory
@@ -1093,13 +1501,15 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.textureBufferAlignment(static_cast<uint64_t>(format));
 }
 
-// The device's linear alignment (256) for the formats the x86-64 Macs answer, as both answer it;
-// Metal ends the process at every other (rgfxEndAtUnalignableLinearFormat). The bundle's own callers ask
+// The format's own linear alignment, the host GPU's (RgfxCaps::minimumLinearTextureAlignment),
+// for the formats the x86-64 Macs answer (both answer 256 for each), or in an arm64 guest those
+// the M3 Max answers (16 for each); Metal ends the process at every other
+// (rgfxEndAtUnalignableLinearFormat). The bundle's own callers ask
 // rgfxLinearTextureAlignmentForPixelFormat:, which ends nothing, as Metal's own texture creators
 // over a buffer do not end it there.
 - (NSUInteger)minimumLinearTextureAlignmentForPixelFormat:(MTLPixelFormat)format
 {
-	rgfxEndAtUnalignableLinearFormat(format);
+	rgfxEndAtUnalignableLinearFormat(format, self);
 	return [self rgfxLinearTextureAlignmentForPixelFormat:format];
 }
 
@@ -1116,6 +1526,23 @@ RGFX_LOG_UNRECOGNIZED
 - (NSUInteger)deviceLinearTextureAlignmentBytes
 {
 	return _caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes);
+}
+
+// Metal's 16 for both, never the host's answer (kRgfxIOSurfaceTextureAlignmentBytes says why):
+// CoreAnimation makes no texture of a surface whose rows are not at a multiple of it, and other
+// code's surfaces carry rows at IOSurface's own alignment, 64 bytes. CoreAnimation also rounds the
+// rows of its own backing stores' IOSurfaces to iosurfaceTextureAlignmentBytes, to no less than 64
+// bytes, so on a GPU that takes a linear image in place only at rows a multiple of 256 (RADV) many
+// of them are the runtime's shadows: measured in a macOS 11.7.11 guest on a Radeon 780M, 1399
+// textures over a cold boot and a 15 s Safari scroll, and 11 answering 512.
+- (NSUInteger)iosurfaceTextureAlignmentBytes
+{
+	return kRgfxIOSurfaceTextureAlignmentBytes;
+}
+
+- (NSUInteger)iosurfaceReadOnlyTextureAlignmentBytes
+{
+	return kRgfxIOSurfaceTextureAlignmentBytes;
 }
 
 - (MTLSize)sparseTileSizeWithTextureType:(MTLTextureType)textureType
@@ -1162,6 +1589,16 @@ RGFX_LOG_UNRECOGNIZED
 - (BOOL)isFramebufferReadSupported
 {
 	return _caps.valid() && _caps.flag(kRgfxFlagIsFramebufferReadSupported);
+}
+
+// Programmable blending, a fragment function reading its own colour attachments, is answered as
+// framebuffer reads are: Metal's devices give both the same answer, YES on the M3 Max and the
+// Intel UHD 630 and NO on the AMD Radeon Pro 5300M (measured with respondsToSelector: and the
+// method). So it follows the host's isFramebufferReadSupported flag, which the host gives an
+// arm64 guest from its GPU and an x86-64 guest as NO.
+- (BOOL)supportsProgrammableBlending
+{
+	return [self isFramebufferReadSupported];
 }
 
 - (BOOL)supportsTileShaders
@@ -1229,14 +1666,19 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.identityFlag(kRgfxIdentitySupportsRaytracing);
 }
 
+// The host's answer, where it makes a compute pipeline's handles and tables (its
+// FUNCTION_POINTERS feature taken).
 - (BOOL)supportsFunctionPointers
 {
-	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointers);
+	return (_caps.features() & RGFX_FEATURE_FUNCTION_POINTERS) != 0 &&
+	       _caps.identityFlag(kRgfxIdentitySupportsFunctionPointers);
 }
 
+// NO: the bundle carries no render stage's handles or tables (a render pipeline's are
+// RGFX_UNSUPPORTED), as the AMD Radeon Pro 5300M answers (measured: macOS 26.7.1, oracle_fnptr).
 - (BOOL)supportsFunctionPointersFromRender
 {
-	return _caps.identityFlag(kRgfxIdentitySupportsFunctionPointersFromRender);
+	return NO;
 }
 
 - (BOOL)supportsRaytracingFromRender
@@ -1261,6 +1703,15 @@ RGFX_LOG_UNRECOGNIZED
 	return _caps.supportsFamily(static_cast<int64_t>(gpuFamily));
 }
 
+#if defined(__arm64__)
+// In an arm64 guest, Metal's rules are an Apple GPU's (RgfxAppleRulesDevice): textures, over a
+// surface too, views, Shared heaps and linear alignments (rgfxAppleGPU; dgpu-oracle.md, Q34).
+- (BOOL)rgfxAppleRules
+{
+	return YES;
+}
+#endif
+
 - (BOOL)supportsFeatureSet:(MTLFeatureSet)featureSet
 {
 	return _caps.supportsFeatureSet(static_cast<uint64_t>(featureSet));
@@ -1278,8 +1729,11 @@ RGFX_LOG_UNRECOGNIZED
 	return count <= largest;
 }
 
+// The layer counts the host makes maps of, where it makes them (its RATE_MAPS feature taken).
 - (BOOL)supportsRasterizationRateMapWithLayerCount:(NSUInteger)layerCount
 {
+	if ((_caps.features() & RGFX_FEATURE_RATE_MAPS) == 0)
+		return NO;
 	return layerCount >= 1 && layerCount <= _caps.size(kRgfxSizeLargestRasterizationRateMapLayerCount);
 }
 
@@ -1386,6 +1840,11 @@ RGFX_LOG_UNRECOGNIZED
 	return (_caps.features() & RGFX_FEATURE_MESH_PIPELINES) != 0;
 }
 
+- (BOOL)rgfxMakesOpenCLModePipelines
+{
+	return (_caps.features() & RGFX_FEATURE_OPENCL_MODE) != 0;
+}
+
 // Mesh shaders where the host makes mesh pipelines, as the M3 Max, the AMD 5300M and the Intel 630
 // answer YES (measured, tools/base_answers_probe.m, 11-05). Their SPI's supportsMeshShadersInICB
 // the x86 Macs answer NO and the M3 Max YES; the device leaves it to the base's NO, as no mesh
@@ -1459,6 +1918,16 @@ RGFX_LOG_UNRECOGNIZED
 - (BOOL)supportsResourceHeaps
 {
 	return _caps.spiFeature(kRgfxSpiResourceHeaps);
+}
+
+// NO, as the AMD 5300M and the Intel 630 answer (measured: macOS 26.7.1, tools/base_answers_probe.m
+// and oracle_caps), where the IOGPU base answered YES here (measured: the x86-64 guest's device,
+// tools/base_answers_probe.m) and the M3 Max answers YES: the device's heaps neither detach nor
+// replace their backing (RgfxHeap's detachBacking and replaceBackingWithRanges:readOnly: raise an
+// unrecognized selector, as Metal's base heap), so a caller told YES that sends them would end.
+- (BOOL)supportsResourceDetachBacking
+{
+	return NO;
 }
 
 - (BOOL)supportsSamplerCompareFunction
@@ -1575,13 +2044,22 @@ RGFX_LOG_UNRECOGNIZED
 // SkyLight, Core Image and MPS send these; each answers what Metal's device answers, measured
 // on the M3 Max (macOS 27), unless it says otherwise.
 
-// The host's answers, from the device info: its Metal device's own, or, where no Metal device
-// stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a Metal device that does
-// not respond to one. Measured on the M3 Max (macOS 27): feature profile 10, FP configs 0xe
+// The feature profile is the x86 Macs' that the guest's Metal knows (RgfxFeatureProfile.hpp), on
+// every host. The others are the host's answers, from the device info: its Metal device's own,
+// or, where no Metal device stands for its GPU, the M3 Max's (the Vulkan platform's), and 0 for a
+// Metal device that does not respond to one. Measured on the M3 Max (macOS 27): FP configs 0xe
 // (half), 0x54 (single) and 0 (double), 40 cores.
 - (NSUInteger)featureProfile
 {
-	return _caps.size(kRgfxSizeFeatureProfile);
+	static const bool metalHasArchitecture = objc_getClass("MTLArchitecture") != Nil;
+	const uint64_t profile = rgfx_profile::forGuest(metalHasArchitecture);
+	static std::atomic<bool> logged{false};
+	if (!logged.exchange(true)) {
+		NSLog(@"RGFX: feature profile %llu: the guest's Metal %s the MTLArchitecture class "
+		      @"(logged once a process)",
+		      (unsigned long long)profile, metalHasArchitecture ? "has" : "lacks");
+	}
+	return profile;
 }
 
 - (NSUInteger)halfFPConfig

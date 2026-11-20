@@ -120,28 +120,28 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::{Deref, Range};
 use std::sync::{Arc, Weak};
 
+use crate::core::num::Truncate;
+use crate::core::platform::Handle;
+use crate::core::platform::blit::ResourceRef;
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::types::{MtlRegion, MtlSize, NsRange};
+use crate::core::raise::death::{DeathId, DeathKind, fatal_with_detail};
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::rt::BlockEnv;
+use crate::core::sync::Mutex;
 use metal2vulkan::metal::{BarrierScope, DispatchType, ResourceUsage};
 use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::Truncate;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::blit::ResourceRef;
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::types::{MtlRegion, MtlSize, NsRange};
-use reims_vgpu_core::raise::death::{DeathId, DeathKind, fatal_with_detail};
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::rt::BlockEnv;
-use reims_vgpu_core::sync::Mutex;
 
 use crate::answer::{Policy, metal_aborts, plain, refused, send};
 use crate::gpu::command::{CommandBufferObject, VulkanCommandBuffer};
 use crate::gpu::device::VulkanDevice;
 use crate::gpu::encode_blit::EncoderObject;
 use crate::gpu::encode_compute::VulkanComputeEncoder;
+use crate::gpu::function_table::VulkanVisibleFunctionTable;
 use crate::gpu::icb::{Inherits, VulkanIcb};
 use crate::gpu::resource::{
     VulkanBuffer, VulkanComputePipeline, VulkanHeap, VulkanSamplerState, VulkanTexture,
 };
-use crate::gpu::writes::{Bound, Slot, Whether, texture_bound};
 use crate::gpu::{metal_value, region, resource_options, size};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -348,6 +348,8 @@ struct Bindings {
     pipeline: Option<VulkanComputePipeline>,
     /// Each buffer with its offset and attribute stride.
     buffers: BTreeMap<u32, (VulkanBuffer, u64, u64)>,
+    /// Each visible function table, at a buffer index no buffer holds.
+    tables: BTreeMap<u32, VulkanVisibleFunctionTable>,
     textures: BTreeMap<u32, VulkanTexture>,
     /// Each sampler state with the LOD clamps its bind set.
     samplers: BTreeMap<u32, (VulkanSamplerState, Option<(f32, f32)>)>,
@@ -376,6 +378,11 @@ impl Bindings {
                 .iter()
                 .map(|(i, (b, o, s))| (*i, (b.clone_ref(), *o, *s)))
                 .collect(),
+            tables: self
+                .tables
+                .iter()
+                .map(|(i, t)| (*i, t.clone_ref()))
+                .collect(),
             textures: self
                 .textures
                 .iter()
@@ -396,11 +403,26 @@ impl Bindings {
         }
     }
 
+    /// `buffer` at buffer index `at`, from `offset`, with attribute stride `stride`, in place of
+    /// any buffer or table there; nil unbinds the index. The buffer the index holds already (an
+    /// upload chunk bound again at its next offset) keeps its reference, as the new one would hold
+    /// the same object: only its offset and stride change.
     fn bind_buffer(&mut self, at: u32, buffer: Option<&VulkanBuffer>, offset: u64, stride: u64) {
+        self.tables.remove(&at);
         match buffer {
-            Some(b) => {
-                self.buffers.insert(at, (b.clone_ref(), offset, stride));
-            }
+            Some(b) => match self.buffers.entry(at) {
+                std::collections::btree_map::Entry::Occupied(mut bound) => {
+                    let bound = bound.get_mut();
+                    if bound.0.id() != b.id() {
+                        bound.0 = b.clone_ref();
+                    }
+                    bound.1 = offset;
+                    bound.2 = stride;
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert((b.clone_ref(), offset, stride));
+                }
+            },
             None => {
                 self.buffers.remove(&at);
             }
@@ -419,6 +441,19 @@ impl Bindings {
             }
             None => {
                 self.samplers.remove(&at);
+            }
+        }
+    }
+
+    /// A table at buffer index `at`, in place of any buffer there; nil unbinds the index.
+    fn bind_table(&mut self, at: u32, table: Option<&VulkanVisibleFunctionTable>) {
+        self.buffers.remove(&at);
+        match table {
+            Some(t) => {
+                self.tables.insert(at, t.clone_ref());
+            }
+            None => {
+                self.tables.remove(&at);
             }
         }
     }
@@ -529,6 +564,22 @@ impl Bindings {
                     self.threadgroup_lengths.insert(at, length);
                 }
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index: at,
+            } => {
+                if let Some(at) = index(at) {
+                    self.bind_table(at, function_table);
+                }
+            }
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => {
+                for (at, t) in indices(range).zip(function_tables) {
+                    self.bind_table(at, *t);
+                }
+            }
             _ => {}
         }
     }
@@ -576,6 +627,24 @@ fn restore(
                 }
                 None => e.set_buffer(None, 0, at)?,
             }
+        }
+    }
+    // A table where `to` holds one, after the buffers: a step's buffer at its index, or a buffer
+    // `from` held there, is replaced; one `from` held where `to` holds nothing is unbound.
+    let step_slots = if stepped { 0..STEP_SLOTS } else { 0..0 };
+    let slots: BTreeSet<u32> = from
+        .tables
+        .keys()
+        .chain(to.tables.keys())
+        .copied()
+        .chain(step_slots)
+        .collect();
+    for at in slots {
+        let (was, now) = (from.tables.get(&at), to.tables.get(&at));
+        let stepped_over = stepped && at < STEP_SLOTS && now.is_some();
+        let moved_off = was.is_some() && now.is_none() && !to.buffers.contains_key(&at);
+        if stepped_over || moved_off || (now.is_some() && !same(was, now)) {
+            e.set_visible_function_table(now.map(|t| &**t), at)?;
         }
     }
     let slots: BTreeSet<u32> = from
@@ -726,6 +795,8 @@ enum Owned {
     SetTexture(Option<VulkanTexture>, u64),
     SetTextures(Vec<Option<VulkanTexture>>, NsRange),
     SetThreadgroupMemoryLength(u64, u64),
+    SetTable(Option<VulkanVisibleFunctionTable>, u64),
+    SetTables(Vec<Option<VulkanVisibleFunctionTable>>, NsRange),
     UseHeaps(Vec<Option<VulkanHeap>>),
     UseResources(Vec<Option<Resource>>, u64),
 }
@@ -875,6 +946,14 @@ impl Owned {
             ComputeCmd::SetThreadgroupMemoryLength { length, index } => {
                 Owned::SetThreadgroupMemoryLength(length, index)
             }
+            ComputeCmd::SetVisibleFunctionTable {
+                function_table,
+                buffer_index,
+            } => Owned::SetTable(function_table.map(Handle::clone_ref), buffer_index),
+            ComputeCmd::SetVisibleFunctionTables {
+                function_tables,
+                range,
+            } => Owned::SetTables(held(function_tables), range),
             ComputeCmd::UseHeaps { heaps } => Owned::UseHeaps(held(heaps)),
             ComputeCmd::UseResources {
                 resources: list,
@@ -1069,6 +1148,23 @@ impl Owned {
                     index: *index,
                 },
             ),
+            Owned::SetTable(table, index) => enc.encode(
+                on,
+                ComputeCmd::SetVisibleFunctionTable {
+                    function_table: table.as_ref(),
+                    buffer_index: *index,
+                },
+            ),
+            Owned::SetTables(tables, range) => {
+                let tables = lent(tables);
+                enc.encode(
+                    on,
+                    ComputeCmd::SetVisibleFunctionTables {
+                        function_tables: &tables,
+                        range: *range,
+                    },
+                )
+            }
             Owned::UseHeaps(heaps) => {
                 let heaps = lent(heaps);
                 enc.encode(on, ComputeCmd::UseHeaps { heaps: &heaps })
@@ -1111,13 +1207,24 @@ struct Gpu {
     checked: bool,
 }
 
-/// The step kernel's pipeline of each device, by registry ID: made once.
-static PIPELINES: Mutex<Vec<(u64, rt::ComputePipelineState)>> = Mutex::new(Vec::new());
+/// The step kernel's pipeline of each device, by registry ID, with the process's device
+/// recoveries when it was made ([`crate::answer::recoveries`]): made once, made again after a
+/// recovery, whose new `VkDevice` refuses a pipeline made before it (the runtime's
+/// `MadeBeforeRecovery`), and kept until the platform lets go of its devices ([`crate::let_go`]).
+static PIPELINES: Mutex<Vec<(u64, u64, rt::ComputePipelineState)>> = Mutex::new(Vec::new());
+
+/// Takes the step kernel's pipelines made so far, for the platform's let-go of its devices
+/// ([`crate::let_go`]): a device of the same registry ID made after it makes its own.
+pub(crate) fn take_pipelines() -> Vec<(u64, u64, rt::ComputePipelineState)> {
+    std::mem::take(&mut *PIPELINES.lock())
+}
 
 /// The step kernel's pipeline of `device`; for `sel`, whose step it is first made for.
 fn pipeline(device: &VulkanDevice, sel: &'static str) -> rt::ComputePipelineState {
+    let recoveries = crate::answer::recoveries();
     let mut pipelines = PIPELINES.lock();
-    if let Some((_, p)) = pipelines.iter().find(|(id, _)| *id == device.registry_id) {
+    pipelines.retain(|(id, at, _)| *id != device.registry_id || *at == recoveries);
+    if let Some((.., p)) = pipelines.iter().find(|(id, ..)| *id == device.registry_id) {
         return p.clone();
     }
     let p = made(sel, || {
@@ -1139,7 +1246,7 @@ fn pipeline(device: &VulkanDevice, sel: &'static str) -> rt::ComputePipelineStat
             },
         )
     });
-    pipelines.push((device.registry_id, p.clone()));
+    pipelines.push((device.registry_id, recoveries, p.clone()));
     p
 }
 
@@ -1202,10 +1309,36 @@ impl Predication {
         })
     }
 
-    /// Whether a unit of compute encoders is open: one began since its last end, and a compute
-    /// encoder after it would go on in it.
-    pub(crate) fn in_unit(&self) -> bool {
-        self.unit.lock().first_type.is_some()
+    /// Whether the command buffer may be cut here into parts, its work so far committed and a
+    /// command buffer of its queue going on from it (`CommandBuffer::split`,
+    /// [`crate::gpu::command`]): no block is open, nor a loop's body being laid down again, and
+    /// no unbalanced record emptied the unit. A unit of compute encoders open at the cut goes on
+    /// in the next part ([`Predication::go_on`]).
+    ///
+    /// Only with no block open: the GPU's skip counter is then 0, as commands run, so the next
+    /// part's own counter, which its first step resets, stands for the cut part's. Inside a block
+    /// the counter may stand above 0, and a part's work after the cut would read another's.
+    pub(crate) fn cuttable(&self) -> bool {
+        let u = self.unit.lock();
+        u.stack.is_empty() && u.cursor.is_none() && !u.emptied
+    }
+
+    /// Carries on, in this, the next part's predication, the unit of compute encoders open in
+    /// `cut`'s, the part just cut where it was [`cuttable`](Self::cuttable): the dispatch type of
+    /// its first encoder, whether it sent work and whether an indirect dispatch went through, and
+    /// the numbering of its encoders and block records. So what Metal decides by the unit dies in
+    /// the next part as in a command buffer kept whole: a record that empties the unit after its
+    /// work, a first indirect dispatch in an encoder of another dispatch type than the unit's
+    /// first. Its steps use GPU objects of the next part's own, its counter reset at its first
+    /// step.
+    pub(crate) fn go_on(&self, cut: &Predication) {
+        let before = cut.unit.lock();
+        let mut u = self.unit.lock();
+        u.first_type = before.first_type;
+        u.work = before.work;
+        u.indirect = before.indirect;
+        u.records = before.records;
+        u.encoders = before.encoders;
     }
 }
 
@@ -1232,10 +1365,6 @@ struct Unit {
     encoders: u64,
     bindings: Bindings,
     used: Vec<Use>,
-    /// Whether a texture `used` holds lies on a surface whose GPU writes never reach its memory,
-    /// or is one whose writes the runtime refuses ([`Unit::reaches_dropped_texels`]), which a
-    /// texture answers alike for its life: asked once, as it is made resident.
-    used_dropped: bool,
     /// Whether the runtime encoder holds a pipeline the guest did not set.
     foreign: bool,
     /// The dispatch type of the unit's first compute encoder, once it has one.
@@ -1449,19 +1578,9 @@ impl Unit {
         }
     }
 
-    /// Whether a texture the open encoder's next work binds or made resident lies on a surface
-    /// whose GPU writes never reach its memory ([`crate::os::gpu_read_only`]). A kernel's stores
-    /// into a buffer on one are dropped, as on Metal, and are sent ([`crate::os::dropped_write`]).
-    fn reaches_dropped_texels(&self) -> bool {
-        self.used_dropped || self.bindings.textures.values().any(drops_texels)
-    }
-
     /// The open encoder made `list` resident with `usage`: kept until the encoder ends, as a fresh
-    /// runtime encoder is given it again ([`Unit::refresh`]), with whether one of its textures
-    /// drops texels ([`Unit::reaches_dropped_texels`]).
+    /// runtime encoder is given it again ([`Unit::refresh`]).
     fn made_resident(&mut self, list: Vec<Resource>, usage: ResourceUsage) {
-        self.used_dropped |=
-            (list.iter()).any(|r| matches!(r, Resource::Texture(t) if drops_texels(t)));
         self.used.push(Use::Resources(list, usage));
     }
 
@@ -1470,105 +1589,6 @@ impl Unit {
         self.encoder = None;
         self.bindings = Bindings::default();
         self.used.clear();
-        self.used_dropped = false;
-    }
-
-    /// What the open encoder's next work may write through textures, `inherits` what an
-    /// execution's commands take of the encoder, one entry an object, with whether it does: the
-    /// textures bound at slots its kernel writes, by its pipeline's slot writes (every bound
-    /// texture where the kernel writes any and they cannot tell; none where the
-    /// commands run pipeline states of their own, as Metal makes no state that supports
-    /// indirect command buffers of a kernel with a texture argument, measured: the render
-    /// encoder's `Reach::at_slots`), and the textures made resident with write usage.
-    fn texel_writes(&self, inherits: Option<Inherits>) -> Vec<(Whether, Bound)> {
-        let mut written = Vec::new();
-        let kernel = match inherits {
-            Some(i) if !i.pipeline => None,
-            _ => self.bindings.pipeline.as_ref(),
-        };
-        if inherits.is_none_or(|i| i.pipeline) {
-            let writes_textures = kernel.is_some_and(|k| plain(|| k.raw.writes_textures()));
-            for (&slot, t) in &self.bindings.textures {
-                let whether = match kernel {
-                    Some(k) => Whether::Slot(
-                        Arc::clone(&k.reflection),
-                        Slot {
-                            stage: 0,
-                            texture: true,
-                            slot: u64::from(slot),
-                            untold: writes_textures,
-                        },
-                    ),
-                    None => Whether::Writes,
-                };
-                written.push((whether, texture_bound(t)));
-            }
-        }
-        for u in &self.used {
-            if let Use::Resources(list, usage) = u
-                && usage.contains(ResourceUsage::WRITE)
-            {
-                let textures = list.iter().filter_map(|r| match r {
-                    Resource::Texture(t) => Some(texture_bound(t)),
-                    Resource::Buffer(_) | Resource::Icb(_) => None,
-                });
-                written.extend(textures.map(|m| (Whether::Writes, m)));
-            }
-        }
-        written.retain(|(_, m)| m.meets);
-        written
-    }
-
-    /// How the open encoder's next work, `inherits` what an execution's commands take of the
-    /// encoder, writes through an object over memory the runtime imports through a writable twin
-    /// of read-only pages ([`crate::gpu::writes::kept_write`]), the first found: a texture bound
-    /// at a slot its kernel writes, as [`Self::texel_writes`] reads them; a buffer bound at a slot
-    /// the kernel writes, by its slot writes (every slot where they cannot tell, and
-    /// every bound buffer an execution's commands take where they run pipeline states of their
-    /// own); and a texture or buffer made resident with write usage (a heap made resident is
-    /// read, as Metal's are). `None` where it writes none, and where no pipeline state is set for
-    /// it, which the runtime refuses.
-    fn kept_write_through(&self, inherits: Option<Inherits>) -> Option<Whether> {
-        use crate::gpu::writes::{buffer_kept, texture_kept};
-        let kernel = match inherits {
-            Some(i) if !i.pipeline => None,
-            _ => Some(self.bindings.pipeline.as_ref()?),
-        };
-        let at = |texture: bool, slot: u32, untold: bool| match kernel {
-            Some(k) => Whether::Slot(
-                Arc::clone(&k.reflection),
-                Slot {
-                    stage: 0,
-                    texture,
-                    slot: u64::from(slot),
-                    untold,
-                },
-            ),
-            None => Whether::Writes,
-        };
-        let mut written = Vec::new();
-        if inherits.is_none_or(|i| i.pipeline) {
-            let writes_textures = kernel.is_some_and(|k| plain(|| k.raw.writes_textures()));
-            let textures = (self.bindings.textures.iter()).filter(|(_, t)| texture_kept(t));
-            written.extend(textures.map(|(&slot, _)| at(true, slot, writes_textures)));
-        }
-        if inherits.is_none_or(|i| i.buffers) {
-            let buffers = (self.bindings.buffers.iter()).filter(|(_, (b, ..))| buffer_kept(b));
-            written.extend(buffers.map(|(&slot, _)| at(false, slot, true)));
-        }
-        for u in &self.used {
-            if let Use::Resources(list, usage) = u
-                && usage.contains(ResourceUsage::WRITE)
-                && list.iter().any(|r| match r {
-                    Resource::Texture(t) => texture_kept(t),
-                    Resource::Buffer(b) => buffer_kept(b),
-                    Resource::Icb(_) => false,
-                })
-            {
-                written.push(Whether::Writes);
-            }
-        }
-        written.into_iter().find(Whether::holds)
     }
 
     /// The runtime encoder's bindings moved to `to`, which the guest's become.
@@ -1600,6 +1620,7 @@ impl Unit {
         let mut fresh = made(sel, || {
             cb.raw
                 .compute_command_encoder_with_dispatch_type(dispatch_type)
+                .map(Box::new)
         });
         cb.made_encoder(false);
         made(sel, || {
@@ -1611,18 +1632,16 @@ impl Unit {
     }
 }
 
-/// Whether `t` lies on a surface whose GPU writes never reach its memory, or is one whose writes
-/// the runtime refuses ([`Unit::reaches_dropped_texels`]).
-fn drops_texels(t: &VulkanTexture) -> bool {
-    t.gpu_read_only() || t.writes_refused()
-}
-
 /// `id<MTLComputeCommandEncoder>`'s object: the runtime's encoder, with its command buffer's
 /// predication.
 #[derive(Debug)]
 pub struct PredicatedEncoder {
-    /// The runtime's encoder.
-    pub encoder: EncoderObject<rt::ComputeCommandEncoder>,
+    /// The runtime's encoder, boxed as the blit encoder's is
+    /// ([`crate::gpu::encode_blit::VulkanBlitEncoder`]): moved by value, its every move between
+    /// its making and its end copied it whole, about 1 us of the encoding thread's for each encoder
+    /// of a command buffer of 2,600 compute encoders (`reims-vgpu`'s `dispatch_cost`, on the M3
+    /// Max).
+    pub encoder: EncoderObject<Box<rt::ComputeCommandEncoder>>,
     predication: Arc<Predication>,
     /// Its command buffer, held weakly as the encoder holds it: once the runtime's encoder ended,
     /// an encoder that outlives its command buffer holds no slot of its queue.
@@ -1632,8 +1651,8 @@ pub struct PredicatedEncoder {
 }
 
 impl Deref for PredicatedEncoder {
-    type Target = EncoderObject<rt::ComputeCommandEncoder>;
-    fn deref(&self) -> &EncoderObject<rt::ComputeCommandEncoder> {
+    type Target = EncoderObject<Box<rt::ComputeCommandEncoder>>;
+    fn deref(&self) -> &EncoderObject<Box<rt::ComputeCommandEncoder>> {
         &self.encoder
     }
 }
@@ -1652,7 +1671,7 @@ impl Drop for PredicatedEncoder {
 /// A compute encoder of `command_buffer`, `raw`: its bindings start empty, and a loop's body
 /// open across encoders holds the change.
 pub fn encoder(
-    raw: rt::ComputeCommandEncoder,
+    raw: Box<rt::ComputeCommandEncoder>,
     command_buffer: &VulkanCommandBuffer,
 ) -> VulkanComputeEncoder {
     let predication = Arc::clone(&command_buffer.predication);
@@ -1785,17 +1804,7 @@ pub enum Work<'a> {
     },
 }
 
-impl Work<'_> {
-    /// What an execution's commands take of the encoder; `None` for a dispatch.
-    fn inherits(&self) -> Option<Inherits> {
-        match *self {
-            Work::Execute { inherits, .. } | Work::ExecuteIndirect { inherits, .. } => {
-                Some(inherits)
-            }
-            _ => None,
-        }
-    }
-}
+impl Work<'_> {}
 
 /// The 32-bit words of `s`: each axis modulo `2^32`, as the runtime and Metal take a grid and a
 /// threadgroup count.
@@ -2014,35 +2023,8 @@ pub fn work(enc: &VulkanComputeEncoder, sel: &'static str, work: Work<'_>) -> Ra
     if u.emptied {
         return Ok(());
     }
-    // An execution of no command runs nothing: it writes and samples nothing.
-    let empty = matches!(&work, Work::Execute { range, .. } if range.is_empty());
-    // A write through an object over memory the runtime imports through a writable twin of
-    // read-only pages dies, at every extent; with no such object, none is looked for.
-    if crate::os::TWINS_READ_ONLY
-        && !empty
-        && crate::gpu::writes::any_kept()
-        && let Some(whether) = u.kept_write_through(work.inherits())
-    {
-        drop(u);
-        let what = format!("a dispatch's write through {}, into", whether.through());
-        crate::gpu::writes::kept_write(sel, &what);
-    }
-    // A write of a texture on a surface whose GPU writes never reach its memory dies, and so does
-    // one of a 4:4:4 two-plane YCbCr texture whose writes the runtime refuses; a kernel's stores
-    // into a buffer on such a surface are sent and dropped, as Metal drops them.
-    if !empty && u.reaches_dropped_texels() {
-        let written = u.texel_writes(work.inherits());
-        let hit = (written.iter()).find(|(w, m)| (m.dropped || m.refused.is_some()) && w.holds());
-        if let Some((whether, m)) = hit {
-            let (through, refused) = (whether.through(), m.refused.filter(|_| !m.dropped));
-            drop(u);
-            let what = format!("a dispatch's write through {through}");
-            match refused {
-                None => crate::os::dropped_write(sel, &format!("{what}, on")),
-                Some(pf) => crate::gpu::ycbcr::refused_write(sel, &format!("{what}, into"), pf),
-            }
-        }
-    }
+    // A kernel's stores into a buffer over read-only memory the runtime copies, and its writes of
+    // a texture over such memory, are sent, and dropped, as Metal drops them.
     if u.foreign && u.bindings.pipeline.is_none() {
         u.refresh(enc, sel);
     }
@@ -2451,17 +2433,17 @@ pub fn end_do_while(
 
 #[cfg(test)]
 mod tests {
-    use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::event::EventRef;
-    use reims_vgpu_core::platform::icb::{
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::event::EventRef;
+    use crate::core::platform::icb::{
         IcbComputeCmd, IndirectCommandBuffer as _, IndirectComputeCommand as _,
     };
-    use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-    use reims_vgpu_core::platform::values::{ComputePassDesc, IcbDesc};
-    use reims_vgpu_core::raise::death::DeathKind;
-    use reims_vgpu_core::testkit::capture::catch_death;
+    use crate::core::platform::resource::{Buffer as _, Library as _};
+    use crate::core::platform::values::{ComputePassDesc, IcbDesc};
+    use crate::core::raise::death::DeathKind;
+    use crate::core::testkit::capture::catch_death;
+    use metal2vulkan::pipeline::{ComputePipelineDescriptor, StageSource};
 
     use super::*;
     use crate::gpu::command::{QueueObject, VulkanCommandBuffer};
@@ -2470,11 +2452,9 @@ mod tests {
     use crate::gpu::resource::tests::shared;
 
     /// `inc_k`: one thread adds 1 to `c[0]`, and marks `c[n]` with `n * 0x11` below 16.
-    const INC: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/compute_inc.metallib");
+    const INC: &[u8] = include_bytes!("../../../../tests/shaders/compute_inc.metallib");
     /// `double_gid`: `out[gid] = gid * 2`, so one thread zeroes `out[0]`.
-    const DOUBLE: &[u8] =
-        include_bytes!("../../../../tests/suite/fixtures/shaders/kernel.metallib");
+    const DOUBLE: &[u8] = include_bytes!("../../../../tests/shaders/kernel.metallib");
 
     /// `MTLCommandBufferStatusCompleted`.
     const COMPLETED: u64 = 4;
@@ -2934,6 +2914,92 @@ mod tests {
         }
     }
 
+    /// A command buffer of compute encoders is cut into parts between its encoders where no
+    /// block is open: each part's work runs, in order, and the unit goes on in the next part, so
+    /// an unbalanced record there after the unit's work dies, as it would whole
+    #[test]
+    fn a_unit_goes_on_in_the_next_part() {
+        let inc = kernel(INC, "inc_k");
+        let w = shared(64);
+        let cb = command_buffer();
+        let e = compute(&cb);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        let e = compute(&next);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        completes(&next);
+        assert_eq!(words(&w)[0], 2);
+
+        let cb = command_buffer();
+        let e = compute(&cb);
+        encode_all(
+            &e,
+            [
+                set(&inc),
+                bind(&[Some(&w)], &[0]),
+                one(),
+                ComputeCmd::EndEncoding,
+            ],
+        );
+        let next = cb.split(OnFault::Return).unwrap().expect("a part");
+        let e = compute(&next);
+        dies_at("encodeEndIf", || {
+            e.encode_end_if().unwrap();
+        });
+    }
+
+    /// With a block open across a unit's encoders, an If, a While or a DoWhile, the command
+    /// buffer is kept whole at an encoder's end, and runs as it would uncut
+    #[test]
+    fn a_block_open_keeps_a_command_buffer_whole() {
+        let inc = kernel(INC, "inc_k");
+        let cond = holding(&[0]);
+        for opens in 0..3 {
+            let w = shared(64);
+            let cb = command_buffer();
+            let e = compute(&cb);
+            let start = match opens {
+                0 => start_if(&cond, 0, 0, 0),
+                1 => start_while(&cond, 0, 0, 1),
+                _ => ComputeCmd::EncodeStartDoWhile,
+            };
+            encode_all(&e, [set(&inc), start, ComputeCmd::EndEncoding]);
+            assert!(
+                cb.split(OnFault::Return).unwrap().is_none(),
+                "block {opens} open"
+            );
+            let e = compute(&cb);
+            encode_all(&e, [set(&inc), bind(&[Some(&w)], &[0]), one()]);
+            let closed = match opens {
+                0 => e.encode_end_if(),
+                1 => e.encode_end_while(),
+                _ => e.encode_end_do_while(Some(&cond), 0, 0, 1),
+            };
+            assert!(closed.unwrap(), "block {opens} closes");
+            encode_all(&e, [ComputeCmd::EndEncoding]);
+            completes(&cb);
+            // The If's condition holds (0 == 0), the While's fails (0 == 1), and the DoWhile
+            // runs once.
+            assert_eq!(words(&w)[0], [1, 0, 1][opens], "block {opens}");
+        }
+    }
+
     /// An unbalanced record after its unit's work dies at its selector: Metal would drop that
     /// work too
     #[test]
@@ -3304,7 +3370,7 @@ mod tests {
         });
     }
 
-    reims_vgpu_core::death_test!(
+    crate::death_test!(
         /// A loop still running after its iterations laid down ends the process at the command
         /// buffer's completion, at its End's selector: Metal would run it on
         a_loop_past_its_copies_dies_at_completion,

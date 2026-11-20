@@ -1,7 +1,7 @@
 /*
  * RgfxReplyReader: the guest's end of a host-to-guest completion ring — the consumer
- * mirror of the host producer in crates/reims-graphics/src/ring.rs (Producer) and
- * crates/reims-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
+ * mirror of the host producer in crates/reims-vgpu-graphics/src/ring.rs (Producer) and
+ * crates/reims-vgpu-graphics/src/device.rs (ControlCompletionPoster). It reads the host's
  * reply messages off the ring and dispatches each to the wrapper that is waiting on
  * it:
  *   - RGFX_EVT_CB_SUBMITTED (RgfxCbSubmitted) -> the command buffer whose submission
@@ -121,6 +121,11 @@ public:
 	/// posts CB_SUBMITTED ahead of both, and none for a buffer it could not take.
 	void expectSubmitted(uint64_t seqno, SubmittedHandler handler);
 
+	/// Removes, unfired, what expectCompletion, expectScheduled and expectSubmitted registered for
+	/// `seqno`: a command buffer taken off its ring before the host saw it, whose seqno the next
+	/// buffer on the ring takes (RgfxRingWriter::tryPost's `via`).
+	void forget(uint64_t seqno);
+
 	/// Registers `handler` for the pipeline created at `seqno`; fired once, when its
 	/// RGFX_EVT_PIPELINE_REFLECTION arrives, then removed.
 	void expectReflection(uint64_t seqno, ReflectionHandler handler);
@@ -158,6 +163,10 @@ public:
 	/// Arms the ring (its `armed` set to 1, so the host raises the vector with its next
 	/// completion), then, after a full fence, whether the host published records this has
 	/// not taken: true means pump again before sleeping. False for a ringless reader.
+	/// A ring armed by an earlier call that found nothing, whose `producer` has not moved
+	/// since, is armed still, as the host clears `armed` only as it publishes a record: then
+	/// only `producer` is read, as the region's header is uncached memory to the guest and a
+	/// store there costs more than a load (RgfxRegion.hpp).
 	bool armAndCheck();
 
 	/// Whether the ring holds, among the records not yet taken, the host's word that the command
@@ -207,6 +216,10 @@ private:
 
 	std::mutex m_lock;
 	uint64_t m_consumed; // the guest's count: what it has taken
+	// The count at which an armAndCheck() that found nothing left the ring armed (kNotArmed:
+	// none did since a record came), so the next one need not arm it again (armAndCheck).
+	static constexpr uint64_t kNotArmed = ~0ull;
+	uint64_t m_armedAt = kNotArmed;
 	bool m_closed = false; // close(): the ring is not read again
 	std::atomic<bool> m_driven{false};
 

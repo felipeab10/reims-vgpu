@@ -5,10 +5,13 @@
 #import "RgfxFunction.h"
 
 #import "RgfxArgumentEncoder.h"
+#import "RgfxGLFunction.h"
 #import "RgfxLibrary.h"
+#import "RgfxMetalDevice.h"
 #import "RgfxUnsupported.h"
 
 #import "RgfxMetalError.h"
+#import "RgfxPipelineReflection.h"
 #import "RgfxReflection.h"
 
 #import <objc/message.h>
@@ -39,6 +42,66 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	NSLog(@"RGFX: answered by Metal's own function: -[%s %s]", class_getName(cls), sel_getName(cmd));
 }
 
+// Logs, once per reason, that a kernel's function of OpenCL mode was not made.
+void logClOnce(const std::string &why)
+{
+	static std::mutex lock;
+	static std::set<std::string> said;
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		if (!said.insert(why).second)
+			return;
+	}
+	NSLog(@"RGFX: an OpenCL kernel's function was not made: %s; answered nil", why.c_str());
+}
+
+NSArray<NSNumber *> *numbersOf(const std::vector<uint32_t> &values)
+{
+	NSMutableArray<NSNumber *> *a = [NSMutableArray arrayWithCapacity:values.size()];
+	for (uint32_t v : values)
+		[a addObject:@(v)];
+	return a;
+}
+
+// The plugin return data of a kernel's function of OpenCL mode, as Metal answers it
+// (RgfxClMode.hpp): its buffers', values', samplers' and images' indices, its entry's name and its
+// reqd_work_group_size, in a binary property list.
+NSData *clReturnData(const RgfxClBindings &b, const std::string &entry)
+{
+	NSMutableDictionary *d = [NSMutableDictionary dictionary];
+	if (!b.buffers.empty())
+		d[@"LinkerScript_buffer_bindings"] = numbersOf(b.buffers);
+	if (!b.byValue.empty())
+		d[@"LinkerScript_byVal_bindings"] = numbersOf(b.byValue);
+	if (!b.samplers.empty())
+		d[@"LinkerScript_sampler_bindings"] = numbersOf(b.samplers);
+	if (!b.textures.empty())
+		d[@"LinkerScript_texture_bindings"] = numbersOf(b.textures);
+	d[@"LinkerScript_function_name"] = @(entry.c_str());
+	if (b.hasWorkGroupSize)
+		d[@"air.work_group_size"] = @[ @(b.workGroupSize[0]), @(b.workGroupSize[1]), @(b.workGroupSize[2]) ];
+	return [NSPropertyListSerialization dataWithPropertyList:d
+	                                                  format:NSPropertyListBinaryFormat_v1_0
+	                                                 options:0
+	                                                   error:nil];
+}
+
+// The bitcodeType of an OpenCL kernel's function, and the plugin data the GL renderer gives it
+// (GLDComputeProgramRec::createKernel; measured: 32 bytes, the first u32 2, the rest 0).
+constexpr uint8_t kClBitcodeType = 2;
+constexpr size_t kClPluginDataLength = 32;
+
+bool isRendererPluginData(NSData *data)
+{
+	if (data.length != kClPluginDataLength)
+		return false;
+	const uint8_t *p = static_cast<const uint8_t *>(data.bytes);
+	for (size_t i = 0; i < kClPluginDataLength; i++)
+		if (p[i] != (i == 0 ? 2 : 0))
+			return false;
+	return true;
+}
+
 } // namespace
 
 @implementation RgfxFunction {
@@ -57,13 +120,18 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	std::string _specializedName;                 // the descriptor's, where it gave one
 	BOOL _haveSpecializedName;
 	id<MTLFunction> _shadow;                      // Metal's own, for Core Image's link
-	std::mutex _shadowLock;                       // guards _shadow, set once in use
+	MTLFunctionConstantValues *_shadowValues;     // the values it was made with, for its shadow
+	std::mutex _shadowLock;                       // guards the two above, set once in use
 	std::shared_ptr<const RgfxAirFunction> _air;  // its arguments, from the library's bitcode
 	std::shared_ptr<const RgfxAirVisible> _visible; // its signature, where it is a visible one
 	std::once_flag _reflected;                      // the two below, made once from _visible
 	id _returnType;                                 // what -returnType answers
 	NSArray *_arguments;                            // what -arguments and -bindings answer
 	BOOL _reflectedHere;                            // whether the two above are the answers
+	std::shared_ptr<const RgfxClBindings> _cl;      // a kernel's function of OpenCL mode's
+	NSData *_pluginData;                            //   bindings, and its plugin data
+	std::mutex _relocationsLock;                    // guards _relocations
+	NSArray *_relocations;                          // what -relocations answers, as set
 }
 
 + (instancetype)functionWithLibrary:(RgfxResource *)library
@@ -234,6 +302,19 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return nil;
 }
 
+// The MTLFunction SPI reflectionWithOptions:, which the system's GL renderer sends each kernel of
+// an OpenCL program it builds (gldBuildComputeProgram, with options 3, reading the arguments'
+// access, type, dataTypeDescription's isConstantBuffer and bufferDataSize; read from its code):
+// the function's arguments, as a pipeline's reflection of it lists them, in Metal's
+// MTLFunctionReflectionInternal (RgfxFunctionReflectionOf). Metal's answers one for options 0, 1
+// and 3 alike (measured: macOS 26.7.1, the AMD 5300M and the Intel 630), whose contents for 0 and
+// 1 were not compared: the answer is the same for every value. nil, logged, where it is not made.
+- (id)reflectionWithOptions:(NSUInteger)options
+{
+	(void)options;
+	return RgfxFunctionReflectionOf(self);
+}
+
 - (MTLPatchType)patchType
 {
 	return _patchType;
@@ -283,12 +364,46 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return _shadow;
 }
 
+- (void)rgfxSetShadowConstantValues:(MTLFunctionConstantValues *)values
+{
+	std::lock_guard<std::mutex> hold(_shadowLock);
+	_shadowValues = [values copy];
+}
+
+// The shadow of a function made with constant values or a specialized name is Metal's own
+// function of the same descriptor: its stitch finds a function by the name a graph's node gives,
+// the specialized one where there is one, and links the specialised body. The descriptor carries
+// no options and no archives, as the stitch over the shadows carries none
+// (RgfxStitchOverShadows): Metal reads the shadows' AIR alone.
 - (id<MTLFunction>)rgfxShadowOrMake
 {
 	std::lock_guard<std::mutex> hold(_shadowLock);
-	if (_shadow == nil && _constants.empty() && [_library isKindOfClass:[RgfxLibrary class]]) {
-		NSString *entry = [NSString stringWithUTF8String:_name.c_str()];
-		_shadow = [[(RgfxLibrary *)_library rgfxShadow] newFunctionWithName:entry];
+	if (_shadow != nil || ![_library isKindOfClass:[RgfxLibrary class]])
+		return _shadow;
+	id<MTLLibrary> metal = [(RgfxLibrary *)_library rgfxShadow];
+	if (metal == nil)
+		return nil;
+	NSString *entry = [NSString stringWithUTF8String:_name.c_str()];
+	if (_constants.empty() && _shadowValues == nil && !_haveSpecializedName) {
+		_shadow = [metal newFunctionWithName:entry];
+		return _shadow;
+	}
+	if (!_constants.empty() && _shadowValues == nil)
+		return nil; // specialised by values this function does not hold: no shadow, not a wrong one
+	MTLFunctionDescriptor *d = [MTLFunctionDescriptor functionDescriptor];
+	d.name = entry;
+	d.constantValues = _shadowValues;
+	if (_haveSpecializedName)
+		d.specializedName = [NSString stringWithUTF8String:_specializedName.c_str()];
+	NSError *error = nil;
+	_shadow = [metal newFunctionWithDescriptor:d error:&error];
+	if (_shadow == nil) {
+		static std::once_flag logged;
+		std::call_once(logged, [&] {
+			NSLog(@"RGFX: %s: Metal's own library made no function of its constant values: %@ "
+			      @"(logged once a process)",
+			      _name.c_str(), error.localizedDescription);
+		});
 	}
 	return _shadow;
 }
@@ -300,12 +415,27 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	id<MTLFunction> shadow = [self rgfxShadowOrMake];
 	if (![shadow respondsToSelector:cmd]) {
 		RgfxLogUnsupported([self class], cmd,
-		                   "no function of Metal's own answers it (one made with constant values, "
-		                   "or of a library Metal's own does not hold)");
+		                   "no function of Metal's own answers it (one of a library Metal's own "
+		                   "does not hold, or that Metal's own library made none of)");
 		return nil;
 	}
 	logAnsweredByShadow([self class], cmd);
 	return ((id (*)(id, SEL))objc_msgSend)(shadow, cmd);
+}
+
+// The shadow's answer to `cmd`, a member answering an integer, as rgfxShadowAnswer: asks one
+// answering an object; 0, logged, where there is none to ask.
+- (uint64_t)rgfxShadowScalar:(SEL)cmd
+{
+	id<MTLFunction> shadow = [self rgfxShadowOrMake];
+	if (![shadow respondsToSelector:cmd]) {
+		RgfxLogUnsupported([self class], cmd,
+		                   "no function of Metal's own answers it (one of a library Metal's own "
+		                   "does not hold, or that Metal's own library made none of)");
+		return 0;
+	}
+	logAnsweredByShadow([self class], cmd);
+	return ((uint64_t (*)(id, SEL))objc_msgSend)(shadow, cmd);
 }
 
 // --- MTLFunctionSPI, as Metal's own function answers it -----------------------------------
@@ -377,7 +507,66 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	return [self rgfxShadowAnswer:_cmd];
 }
 
-// Metal answers nil for a function specialised by values (measured), which has no shadow.
+// What Metal's own function reads from its library for its tools: the source file and line of the
+// entry point and the path of the library's unpacked sources (from a library built with them),
+// its debug instrumentation, the symbols it imports and the type of the render target array index
+// a vertex function writes (0 where it writes none). The shadow answers each, Metal's own function
+// of the same entry point over the same bytes (measured: M3 Max, macOS 27, nil and 0 for a function
+// of a library built without them).
+- (id)filePath
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)unpackedFilePath
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)debugInstrumentationData
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (id)importedSymbols
+{
+	return [self rgfxShadowAnswer:_cmd];
+}
+
+- (NSInteger)lineNumber
+{
+	return static_cast<NSInteger>([self rgfxShadowScalar:_cmd]);
+}
+
+- (NSUInteger)renderTargetArrayIndexType
+{
+	return static_cast<NSUInteger>([self rgfxShadowScalar:_cmd]);
+}
+
+// The relocations a link applies to the function: nil until set, then the array set itself, as
+// Metal's function keeps it (measured: M3 Max, macOS 27).
+- (NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_relocationsLock);
+	return _relocations;
+}
+
+- (void)setRelocations:(NSArray *)relocations
+{
+	std::lock_guard<std::mutex> hold(_relocationsLock);
+	_relocations = relocations;
+}
+
+// Metal's base function ends the process here, a failure Metal reports ("Driver needs to override
+// this"; read from code, _MTLFunction, macOS 27.0.1), which neither x86 Mac's function overrides:
+// a fresh one of the AMD 5300M's and of the Intel 630's ends the process at it (measured, macOS
+// 26.7.1, oracle_spi_members answers). So does this.
+- (id)functionHandle
+{
+	RgfxMetalAssertionFailed("-[_MTLFunction functionHandle]", @"Driver needs to override this");
+}
+
+// Metal answers nil for a function specialised by values (measured).
 - (NSArray *)functionConstants
 {
 	if (!_constants.empty())
@@ -386,10 +575,66 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 }
 
 // Metal answers nil for every function, one made of a descriptor with plugin data too (measured):
-// its setPluginData: ends the process.
+// its setPluginData: ends the process. A kernel's function of OpenCL mode holds the plugin data it
+// was made with (measured: macOS 26.7.1, newFunctionWithPluginData:bitcodeType:).
 - (id)pluginData
 {
-	return nil;
+	return _pluginData;
+}
+
+- (id<MTLFunction>)newFunctionWithPluginData:(NSData *)pluginData bitcodeType:(uint8_t)bitcodeType
+{
+	if (bitcodeType != kClBitcodeType || !isRendererPluginData(pluginData)) {
+		logClOnce("its plugin data or bitcodeType is not the GL renderer's");
+		return nil;
+	}
+	id device = self.device;
+	if (![device respondsToSelector:@selector(rgfxMakesOpenCLModePipelines)] ||
+	    ![(RgfxMetalDevice *)device rgfxMakesOpenCLModePipelines]) {
+		logClOnce("the host makes no pipeline of OpenCL mode");
+		return nil;
+	}
+	if (![_library isKindOfClass:[RgfxLibrary class]]) {
+		logClOnce("its library is not the device's");
+		return nil;
+	}
+	RgfxLibrary *library = (RgfxLibrary *)_library;
+	std::shared_ptr<const RgfxAirEntries> module = [library rgfxAirEntryNamed:_name];
+	const RgfxAirEntry *entry = nullptr;
+	if (module != nullptr)
+		for (const RgfxAirEntry &e : module->entries)
+			if (e.name == _name)
+				entry = &e;
+	if (entry == nullptr) {
+		logClOnce("its AIR names no entry " + _name);
+		return nil;
+	}
+	RgfxClBindings bindings;
+	std::string why;
+	if (!RgfxClBindingsOf(*entry, bindings, why)) {
+		logClOnce(why);
+		return nil;
+	}
+	id<MTLFunction> variant = [library newFunctionWithName:@(_name.c_str())];
+	if (![(id)variant isKindOfClass:[RgfxFunction class]]) {
+		logClOnce("its library has no function " + _name);
+		return nil;
+	}
+	[(RgfxFunction *)variant rgfxSetClBindings:std::make_shared<const RgfxClBindings>(bindings)
+	                                pluginData:[pluginData copy]];
+	RgfxGLSetPluginReturnData(variant, clReturnData(bindings, _name));
+	return variant;
+}
+
+- (void)rgfxSetClBindings:(std::shared_ptr<const RgfxClBindings>)bindings pluginData:(NSData *)pluginData
+{
+	_cl = std::move(bindings);
+	_pluginData = pluginData;
+}
+
+- (std::shared_ptr<const RgfxClBindings>)rgfxClBindings
+{
+	return _cl;
 }
 
 // Metal's function aborts here, for any argument, nil too (measured: macOS 27), and so does ours.
@@ -456,12 +701,14 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 	                                   serializer:[self serializer]];
 }
 
-// The encoder with the buffer's reflection: the binding of that buffer index in the function's
-// reflection, which its library answers from Metal's own over the same bytes, as both x86 Macs
-// answer one there, an MTLBufferBindingInternal (oracle_bundle argbuf.reflection: the AMD 5300M
-// and the Intel 630 under macOS 26.7.1). Their arrays' strides answer 0 there and the size of an
-// element in the library's reflection, which this answers. nil, logged, where the library keeps
-// no source to reflect.
+// The encoder with the buffer's reflection: the binding of that buffer index, an
+// MTLBufferBindingInternal, as a pipeline of the function reflects it, its argument buffer's
+// arrays of stride 0 where the library's reflection gives them their element's size (measured:
+// oracle_bundle argbuf.reflection against argbuf.binding and argbuf.binding.lib, the AMD 5300M and
+// the Intel 630 under macOS 26.7.1 and the M3 Max under macOS 27.0.1 alike). Built from the
+// function's AIR as its pipelines' reflection is (RgfxStageReflectionOf); the library's binding,
+// Metal's own over the same bytes, where that is not made; nil, logged, where the library keeps no
+// source to reflect either.
 - (id<MTLArgumentEncoder>)newArgumentEncoderWithBufferIndex:(NSUInteger)bufferIndex
                                                  reflection:(MTLAutoreleasedArgument *)reflection
 {
@@ -473,6 +720,16 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 
 - (MTLArgument *)rgfxArgumentOfBufferAtIndex:(NSUInteger)bufferIndex
 {
+	RgfxStageReflection stage;
+	NSString *why = nil;
+	if (RgfxStageReflectionOf(self, @"stageInBuffer", {}, stage, &why)) {
+		for (id binding in stage.bindings) {
+			if ([binding isKindOfClass:[MTLArgument class]] &&
+			    ((MTLArgument *)binding).type == MTLArgumentTypeBuffer &&
+			    ((MTLArgument *)binding).index == bufferIndex)
+				return (MTLArgument *)binding;
+		}
+	}
 	RgfxResource *library = [self rgfxLibrary];
 	const char *entry = [self rgfxEntryPointUTF8];
 	NSString *name = entry != nullptr ? @(entry) : nil;
@@ -491,6 +748,21 @@ void logAnsweredByShadow(Class cls, SEL cmd)
 
 @end
 
+RgfxLinkedFunctionRef RgfxLinkedFunctionRefOf(RgfxFunction *function, uint32_t list,
+                                              const char *group)
+{
+	RgfxLinkedFunctionRef r = {};
+	r.function.library = function.rgfxLibraryObjId;
+	r.function.entry_point = [function rgfxEntryPointUTF8];
+	r.function.constants = [function rgfxConstants];
+	r.function.constant_count = [function rgfxConstantCount];
+	r.list = list;
+	r.options = static_cast<uint32_t>(function.options);
+	r.group = group;
+	r.specialized_name = [function rgfxSpecializedNameUTF8];
+	return r;
+}
+
 id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinkedFunctionList &out)
 {
 	if (linked == nil)
@@ -500,17 +772,7 @@ id<MTLFunction> RgfxCollectLinkedFunctions(MTLLinkedFunctions *linked, RgfxLinke
 		for (id<MTLFunction> fn in functions) {
 			if (![(id)fn isKindOfClass:[RgfxFunction class]])
 				return fn;
-			RgfxFunction *rf = (RgfxFunction *)fn;
-			RgfxLinkedFunctionRef r = {};
-			r.function.library = rf.rgfxLibraryObjId;
-			r.function.entry_point = [rf rgfxEntryPointUTF8];
-			r.function.constants = [rf rgfxConstants];
-			r.function.constant_count = [rf rgfxConstantCount];
-			r.list = list;
-			r.options = static_cast<uint32_t>(rf.options);
-			r.group = group;
-			r.specialized_name = [rf rgfxSpecializedNameUTF8];
-			out.refs.push_back(r);
+			out.refs.push_back(RgfxLinkedFunctionRefOf((RgfxFunction *)fn, list, group));
 		}
 		return nil;
 	};

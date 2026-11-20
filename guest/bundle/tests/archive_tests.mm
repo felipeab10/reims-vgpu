@@ -355,6 +355,39 @@ void test_archive_keys_and_options()
 	CHECK([[copied description] containsString:@" Key: "]);
 	CHECK([[NSSet setWithArray:keys] count] == 4);
 
+	// Metal's archive SPI: its description counts its entries; no function IDs, pipeline
+	// collection or backing file of Metal's; nothing stored without its functions, nothing
+	// recompiled.
+	a.label = @"archive";
+	NSString *described = ((NSString * (*)(id, SEL, NSUInteger)) objc_msgSend)(
+	    a, NSSelectorFromString(@"formattedDescription:"), 0);
+	NSString *expected = [NSString stringWithFormat:@"<RgfxBinaryArchive: %p>\n    label = archive \n    count = 4", a];
+	CHECK([described isEqualToString:expected]);
+	NSArray *ids = ((NSArray * (*)(id, SEL)) objc_msgSend)(a, NSSelectorFromString(@"archiveFunctionIds"));
+	CHECK(ids != nil && ids.count == 0);
+	CHECK(((void *(*)(id, SEL))objc_msgSend)(a, NSSelectorFromString(@"pipelineCollection")) == nullptr);
+	__block int walked = 0;
+	void (^walk)(void) = ^{
+		walked++;
+	};
+	CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(a, NSSelectorFromString(@"enumerateArchivesFromBackingFile:"), walk));
+	CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(a, NSSelectorFromString(@"enumerateArchivesFromPipelineCollection:"), walk));
+	CHECK(walked == 0);
+	CHECK(!((BOOL (*)(id, SEL, id))objc_msgSend)(a, NSSelectorFromString(@"storeRenderPipelineDescriptor:"), render(nil)));
+	CHECK(a.keys.count == 4);
+	// Recompiled for another target: Metal's refusal of an archive of its own device's pipelines, at
+	// every URL, nil and one of no scheme among them, and nothing written.
+	NSURL *recompileTo[] = {at(@"recompiled.bin"), nil, [NSURL URLWithString:at(@"recompiled.bin").path]};
+	for (NSURL *to : recompileTo) {
+		NSError *recompiled = nil;
+		CHECK(!((BOOL (*)(id, SEL, id, NSError **))objc_msgSend)(
+		          a, NSSelectorFromString(@"recompileToArchiveWithURL:error:"), to, &recompiled) &&
+		      [recompiled.domain isEqualToString:MTLBinaryArchiveDomain] &&
+		      recompiled.code == MTLBinaryArchiveErrorInvalidFile &&
+		      [recompiled.localizedDescription isEqualToString:@"No recompilable artifacts found"]);
+	}
+	CHECK(![[NSFileManager defaultManager] fileExistsAtPath:at(@"recompiled.bin").path]);
+
 	// Loaded back, it answers the same keys; another architecture's archive answers none of them.
 	CHECK([a serializeToURL:at(@"keys.bin") error:&e]);
 	RgfxBinaryArchive *loaded = archive(at(@"keys.bin"), @"arch_a", &e);

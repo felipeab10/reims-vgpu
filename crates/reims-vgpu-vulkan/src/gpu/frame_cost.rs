@@ -1,7 +1,6 @@
 //! What one frame's work costs on the encoding thread, call by call, through this platform as
-//! core drives it, against the runtime alone on the same device and objects, and (on macOS)
-//! against the Metal platform through the same core traits: a measurement, run by hand in a
-//! release build (`cargo nextest run -p reims-vgpu-vulkan --release --run-ignored only -E
+//! core drives it, against the runtime alone on the same device and objects: a measurement, run
+//! by hand in a release build (`cargo nextest run -p reims-vgpu-vulkan --release --run-ignored only -E
 //! 'test(frame_cost)' --no-capture`).
 //!
 //! A frame is command buffers, each of a render pass of draws, two compute encoders of
@@ -21,27 +20,25 @@
 //! runs. A frame's work is waited for inside it, so the process's CPU is that frame's.
 //!
 //! The environment picks what runs: `FRAME_COST_RUNS` the runs (5), `FRAME_COST_SHAPE` one shape
-//! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform`, `runtime` or
-//! `metal`), `FRAME_COST_OPTIONS` other device options ([`product_device`]), and
-//! `FRAME_COST_RUNTIME_CHECK=1` a submission check on each of the runtime's command buffers
-//! ([`runtime_checks`]).
+//! (`wide` or `many`), `FRAME_COST_ONLY` one path, for a profile of it (`platform` or `runtime`),
+//! and `FRAME_COST_OPTIONS` other device options ([`product_device`]).
 
-use metal2vulkan::metal::{PrimitiveType, ResourceUsage};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Platform;
-use reims_vgpu_core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
-use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::os::Clock as _;
-use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-use reims_vgpu_core::platform::resource::{Buffer as _, Library as _};
-use reims_vgpu_core::platform::types::{MtlSize, NsRange};
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::Platform;
+use crate::core::platform::blit::{BlitCmd, BlitEncoder as _, ResourceRef};
+use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+use crate::core::platform::descriptor::RenderPassDescriptor as _;
+use crate::core::platform::device::GpuDevice;
+use crate::core::platform::os::Clock as _;
+use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+use crate::core::platform::resource::{Buffer as _, Library as _};
+use crate::core::platform::types::{MtlSize, NsRange};
+use crate::core::platform::values::{
     ColorAttachmentSet, RenderPipelineDesc, SamplerDesc, TextureDesc,
 };
-use reims_vgpu_core::raise::OnFault;
+use crate::core::raise::OnFault;
+use metal2vulkan::metal::{PrimitiveType, ResourceUsage};
+use metal2vulkan_runtime as rt;
 
 use crate::gpu::device::VulkanDevice;
 use crate::platform::VulkanPlatform;
@@ -133,6 +130,7 @@ impl Tally {
 }
 
 /// CPU time in nanoseconds: this thread's, the process's, and the monotonic clock's (wall).
+#[cfg(unix)]
 fn cpu_now() -> [u64; 3] {
     #[repr(C)]
     struct Timespec {
@@ -153,6 +151,52 @@ fn cpu_now() -> [u64; 3] {
         assert_eq!(unsafe { clock_gettime(clock, &mut at) }, 0);
         u64::try_from(at.sec).unwrap() * 1_000_000_000 + u64::try_from(at.nsec).unwrap()
     })
+}
+
+/// [`cpu_now`] on Windows: this thread's and the process's kernel and user times
+/// (`GetThreadTimes`, `GetProcessTimes`), and the monotonic clock's, the interrupt time
+/// (`QueryInterruptTimePrecise`), each in 100 ns units.
+#[cfg(windows)]
+fn cpu_now() -> [u64; 3] {
+    use windows_sys::Win32::Foundation::FILETIME;
+    use windows_sys::Win32::System::Threading::{
+        GetCurrentProcess, GetCurrentThread, GetProcessTimes, GetThreadTimes,
+    };
+    let nanos =
+        |t: FILETIME| ((u64::from(t.dwHighDateTime) << 32) | u64::from(t.dwLowDateTime)) * 100;
+    let zero = FILETIME {
+        dwLowDateTime: 0,
+        dwHighDateTime: 0,
+    };
+    let [mut made, mut ended, mut kernel, mut user] = [zero; 4];
+    // SAFETY: the running thread's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetThreadTimes(
+            GetCurrentThread(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    let thread = nanos(kernel) + nanos(user);
+    // SAFETY: the current process's pseudo-handle, and four live out-parameters.
+    let ok = unsafe {
+        GetProcessTimes(
+            GetCurrentProcess(),
+            &mut made,
+            &mut ended,
+            &mut kernel,
+            &mut user,
+        )
+    };
+    assert_ne!(ok, 0);
+    let process = nanos(kernel) + nanos(user);
+    let mut wall = 0u64;
+    // SAFETY: a live out-parameter; the call cannot fail.
+    unsafe { windows_sys::Win32::System::WindowsProgramming::QueryInterruptTimePrecise(&mut wall) };
+    [thread, process, wall * 100]
 }
 
 /// Runs `call`, adding the CPU it took ([`cpu_now`]) to `into`.
@@ -266,7 +310,6 @@ impl<P: Platform> Objects<P> {
                 vertex: &vertex,
                 fragment: &fragment,
                 color0_pixel_format: BGRA8,
-                blend_over: false,
                 resource_index: None,
             })
             .unwrap()
@@ -519,34 +562,19 @@ fn runtime_command_buffer(
     t.time(15, || {
         let handler = Box::new(move |_: &rt::CommandBuffer| tx.send(()).unwrap());
         cb.add_completed_handler(handler).unwrap();
-        if runtime_checks() {
-            cb.set_submission_check(std::sync::Arc::new(|_| None))
-                .unwrap();
-        }
         cb.commit().unwrap();
     });
     (cb, rx)
 }
 
-/// Whether the runtime alone commits each command buffer with a submission check that passes
-/// every submission (`FRAME_COST_RUNTIME_CHECK=1`), as the platform commits each with its own
-/// ([`crate::gpu::backing::submission_check`]): what the check costs the runtime, apart from what
-/// the platform's check does.
-fn runtime_checks() -> bool {
-    static ON: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var_os("FRAME_COST_RUNTIME_CHECK").is_some_and(|v| v == "1")
-    });
-    *ON
-}
-
 /// A device of the system default's physical device made with the product's options: the
 /// platform's, but announcing at every occurrence only what the product's device does (the kinds
-/// a call hears and those that die by default), where a test process's device announces every
-/// kind that dies, as in strict mode ([`crate::platform`]'s `announced_each`).
+/// a call hears), where a test process's device announces every kind that dies, as in strict
+/// mode ([`crate::platform`]'s `announced_each`).
 fn product_device() -> VulkanDevice {
-    use crate::answer::{DIES_BY_DEFAULT, HEARD};
+    use crate::answer::HEARD;
     let mut options = crate::platform::device_options().clone();
-    options.announce_each = DIES_BY_DEFAULT.iter().chain(&HEARD).copied().collect();
+    options.announce_each = HEARD.iter().copied().collect();
     // What the runtime costs under other options, for a measurement of the runtime alone:
     // `each` announcing every occurrence of nothing, `sink` without the message sink, `default`
     // the runtime's default options.
@@ -560,8 +588,8 @@ fn product_device() -> VulkanDevice {
 }
 
 /// Prints, in nanoseconds a call, each step's best mean over runs of [`FRAMES`] frames: through
-/// this platform as core drives it, through the runtime alone on the same objects, and through
-/// the Metal platform on macOS, frames of the three alternating.
+/// this platform as core drives it and through the runtime alone on the same objects, frames of the
+/// two alternating.
 #[test]
 #[ignore = "a measurement, run by hand in a release build: prints each step's cost"]
 fn frame_cost() {
@@ -569,20 +597,13 @@ fn frame_cost() {
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(5);
-    // One path alone, for a profile of it: `platform`, `runtime` or `metal`.
+    // One path alone, for a profile of it: `platform` or `runtime`.
     let only = std::env::var("FRAME_COST_ONLY").ok();
     let only = only.as_deref();
     let p = crate::platform::tests::platform();
     let d = product_device();
     let ours = crate::answer::relaxed(|| Objects::new(&p, &d));
     let raw_queue = d.raw.new_command_queue().unwrap();
-    #[cfg(target_os = "macos")]
-    let metal = reims_vgpu_metal::MetalPlatform::system_default_device().map(|md| {
-        use crate::gpu::device::tests::metal_tests::NoLauncher;
-        let mp = reims_vgpu_metal::MetalPlatform::new(Box::new(NoLauncher));
-        let objects = Objects::new(&mp, &md);
-        (mp, md, objects)
-    });
     // One shape alone: `wide` or `many`.
     let shape = std::env::var("FRAME_COST_SHAPE").ok();
     let shapes = [("wide", WIDE), ("many", MANY)];
@@ -590,16 +611,16 @@ fn frame_cost() {
         .into_iter()
         .filter(|(name, _)| shape.as_deref().is_none_or(|s| s == *name))
     {
-        let mut seen: [Vec<[f64; STEPS.len()]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut seen: [Vec<[f64; STEPS.len()]>; 2] = [Vec::new(), Vec::new()];
         // Each run's CPU a frame, by path: the encoding thread's, the process's, and wall time.
-        let mut cpu_runs: [Vec<[f64; 3]>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+        let mut cpu_runs: [Vec<[f64; 3]>; 2] = [Vec::new(), Vec::new()];
         let mut counts = Tally::default();
         for _ in 0..runs {
-            let mut tallies = [Tally::default(); 3];
-            let mut cpu = [[0u64; 3]; 3];
+            let mut tallies = [Tally::default(); 2];
+            let mut cpu = [[0u64; 3]; 2];
             for frame in 0..WARM + FRAMES {
-                let mut t = [Tally::default(); 3];
-                let mut c = [[0u64; 3]; 3];
+                let mut t = [Tally::default(); 2];
+                let mut c = [[0u64; 3]; 2];
                 if only.is_none_or(|o| o == "platform") {
                     cpu_of(&mut c[0], || {
                         crate::answer::relaxed(|| ours.frame(shape, &mut t[0]));
@@ -609,12 +630,6 @@ fn frame_cost() {
                     cpu_of(&mut c[1], || {
                         runtime_frame(&ours, &raw_queue, shape, &mut t[1]);
                     });
-                }
-                #[cfg(target_os = "macos")]
-                if let Some((_, _, objects)) = &metal
-                    && only.is_none_or(|o| o == "metal")
-                {
-                    cpu_of(&mut c[2], || objects.frame(shape, &mut t[2]));
                 }
                 if frame >= WARM {
                     for (cpu, c) in cpu.iter_mut().zip(c) {
@@ -643,18 +658,17 @@ fn frame_cost() {
                 runs.push(cpu.map(us_a_frame));
             }
         }
-        let [platform, runtime, metal_platform] = seen.map(|runs| best(&runs));
+        let [platform, runtime] = seen.map(|runs| best(&runs));
         println!(
             "{name} frames of {shape:?}, ns a call, best of {runs} runs of {FRAMES} frames: \
-             platform, runtime alone, ours above it, Metal platform"
+             platform, runtime alone, ours above it"
         );
         for (i, step) in STEPS.iter().enumerate() {
             println!(
-                "  {step:>28}: {:>9.0} {:>9.0} {:>9.0} {:>9.0}",
+                "  {step:>28}: {:>9.0} {:>9.0} {:>9.0}",
                 platform[i],
                 runtime[i],
-                platform[i] - runtime[i],
-                metal_platform[i]
+                platform[i] - runtime[i]
             );
         }
         #[expect(clippy::as_conversions, reason = "a sum, printed")]
@@ -662,12 +676,11 @@ fn frame_cost() {
             m.iter().zip(counts.0).map(|(v, (_, n))| v * n as f64).sum()
         };
         println!(
-            "  a frame's calls: platform {:.0} us, runtime alone {:.0} us, Metal platform {:.0} us",
+            "  a frame's calls: platform {:.0} us, runtime alone {:.0} us",
             frame(&platform) / 1000.0,
-            frame(&runtime) / 1000.0,
-            frame(&metal_platform) / 1000.0
+            frame(&runtime) / 1000.0
         );
-        let paths = ["platform", "runtime alone", "Metal platform"];
+        let paths = ["platform", "runtime alone"];
         for (path, runs) in paths.iter().zip(&cpu_runs) {
             if runs.is_empty() || runs.iter().all(|r| r[2] == 0.0) {
                 continue;

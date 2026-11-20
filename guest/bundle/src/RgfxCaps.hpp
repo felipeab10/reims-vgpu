@@ -197,6 +197,34 @@ enum RgfxSpiFeature : int {
 /// Graphics" for "Intel(R) UHD Graphics 630"). Where that leaves nothing, the whole name.
 std::string rgfxFamilyNameOf(const char *name);
 
+/// The MTLDeviceSPI `vendorName` of a device named `name`: the vendor its first word names, in
+/// the words Metal's devices answer, "NVIDIA", "AMD" or "Intel(R)" (measured: "AMD" for the AMD
+/// Radeon Pro 5300M, "Intel(R)" for the Intel UHD Graphics 630, macOS 26.7.1), for a name whose
+/// first word is "NVIDIA", "AMD", "Intel" or "Intel(R)"; "AMD" for any other. The system's GL
+/// renderer (AppleMetalOpenGLRenderer) picks its settings by finding "AMD" or "ATI", "NVIDIA" or
+/// "Intel" in the answer, else by the Apple GPU families 7 and 5, and ends every process that
+/// makes a GL context on any other device ("Unknown GPU!!", read from its code; measured with the
+/// IOGPU base's "Apple" beside Mac2 alone, macOS 26.6.1): a GPU of another vendor answers the one
+/// the x86 Macs' discrete GPUs answer, which the renderer runs gl_cases' cases with as it does
+/// with the others (tools/gl_cases.m, measured: macOS 26.6.1 on an RTX 5080 host).
+std::string rgfxVendorNameOf(const char *name);
+
+/// `iosurfaceTextureAlignmentBytes` and `iosurfaceReadOnlyTextureAlignmentBytes`: 16, as Metal's
+/// devices answer the first (measured: the AMD 5300M, the Intel 630 and the M3 Max,
+/// docs/graphics-kext/dgpu-oracle.md) and the IOGPU base answered both, whatever the host's GPU
+/// answers in the blob (kRgfxLimitIOSurfaceTextureAlignmentBytes and
+/// kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes). CoreAnimation makes no Metal texture of an
+/// IOSurface whose rows or planes are not at a multiple of the device's answer, and draws nothing
+/// of a layer it has no texture of; the surfaces other code makes carry rows of their own, which
+/// no answer of the device moves: IOSurface's own 64 bytes where the kext asks for no more (a host
+/// GPU of its own memory), and those of the video frames Safari shows. Measured in macOS 26.7.2
+/// guests answering the host's 128 (an RTX 3090 and an RTX 2080): WindowServer made no texture of
+/// surfaces with rows of 192 to 14272 bytes ("Row bytes (5312) not 128 aligned"), and Safari drew
+/// its pages blank and WebGL black, every time; answering the host's 256 on a Radeon 780M,
+/// WindowServer found Safari's 1920x1080 and 3840x2160 video frames without "the proper data
+/// alignment".
+constexpr uint64_t kRgfxIOSurfaceTextureAlignmentBytes = 16;
+
 class RgfxCaps {
 public:
 	RgfxCaps();
@@ -225,11 +253,14 @@ public:
 	/// texture-buffer alignment, the blob's answers; 0 where it has no linear answer.
 	uint64_t linearTextureAlignment() const;
 	/// `minimumLinearTextureAlignmentForPixelFormat:` of the raw `MTLPixelFormat` `format`: the
-	/// blob's `linearTextureAlignmentBytes`, for every format. A Radeon Pro 5300M, a UHD 630 and an
-	/// M3 Max each answer one value for every format they make linear textures of, and end the
-	/// process on any other (Metal's assertion, measured: compressed, depth and stencil formats,
-	/// Invalid, and formats the device lacks), never 0; so a guest reaches no other format on a
-	/// real Mac, and one that does gets no 0 to align up by.
+	/// blob's answer of the format, the host GPU's alignment for its texels, and the blob's
+	/// `linearTextureAlignmentBytes`, the largest of every format's, where it has none. A Radeon
+	/// Pro 5300M, a UHD 630 and an M3 Max each answer one value for every format they make linear
+	/// textures of, and end the process on any other (Metal's assertion, measured: compressed,
+	/// depth and stencil formats, Invalid, and formats the device lacks), never 0; a host GPU whose
+	/// linear images ask more of larger texels answers each format its own, so a texture of a
+	/// smaller texel at its own alignment is made, not nil. A guest reaches no format without an
+	/// answer on a real Mac, and one that does gets the largest, never a 0 to align up by.
 	uint64_t minimumLinearTextureAlignment(uint64_t format) const;
 	/// `sparseTileSizeWithTextureType:pixelFormat:sampleCount:sparsePageSize:` of `format` at
 	/// `samples` (1, 2 or 4) in pages of the raw `MTLSparsePageSize` `page` (101, 102 or 103),
@@ -258,12 +289,13 @@ public:
 	uint64_t registryId() const { return m_info.registry_id; }
 	/// FEATURES_LO's low byte (RGFX_FEATURE_*), as the host wrote it; 0 from an older host.
 	uint8_t featuresLo() const { return m_valid ? m_info.features_lo : 0; }
-	/// Takes the kext's answer to the features call (the accelerator's Features selector): `kr`
-	/// its return, 0 for success, `word` the device's feature word and `kext` the kext's own. A
-	/// kext older than the call answers kIOReturnUnsupported; on that, or any failure, the device's
-	/// word is `featuresLo()`'s bits 0 to 2, the ones the host acts on as it offers them, and the
-	/// kext's is 0.
-	void takeFeatures(int kr, uint64_t word, uint64_t kext);
+	/// Takes the kext's answer to the features call (kRgfxAccelMethodFeatures): `kr` its return,
+	/// 0 for success, and the `count` words it gave: the device's feature word, the kext's own and
+	/// the kext's selector map. True where it gave all three and the map is this bundle's
+	/// (kRgfxSelectorMap); else both words are 0, and the bundle has no device: a kext of another
+	/// map numbers its calls otherwise, and one of the map before it answers kIOReturnUnsupported
+	/// here, its features call having had another number (RgfxUserClientABI.hpp).
+	bool takeFeatures(int kr, uint32_t count, const uint64_t words[3]);
 	/// The RGFX_FEATURE_* bits this process works by: bits 0 to 2 as the host offers them, and
 	/// from bit 3 the ones the kext took for its bundle (takeFeatures); 0 before takeFeatures.
 	uint64_t features() const { return m_features; }

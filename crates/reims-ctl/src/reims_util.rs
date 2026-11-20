@@ -1,11 +1,11 @@
 //! reims-util (<https://github.com/steelbrain/reims-util>) makes what a new x86-64 VM boots from:
 //! an OpenCore image, with OVMF's code and variables beside it, and a macOS installer, downloaded
 //! from Apple and checked against Apple's chunklists. It also makes an existing VM a new OpenCore
-//! image presenting the same Mac (opencore.rs). An image holds Lilu and ReimsVgpu.kext, which
-//! reims-util adds itself, and, for a VM on reims-vgpu's own device, the guest's kexts reims-ctl
-//! carries, each given by `--add-kext` in the set's order ([`kext_args`]). reims-ctl runs it
-//! with `--json`: each line on its stdout is an event, `step`, `progress` or `note`, and the last
-//! is `done`, with what it made, or `error`.
+//! image presenting the same Mac (opencore.rs). For a VM on reims-vgpu's own device, an image
+//! holds the guest's kext set reims-ctl carries (Graft, ReimsGraphics and RgfxGate), each given
+//! by `--add-kext` in the set's order ([`kext_args`]); for one on another device, no kext.
+//! reims-ctl runs it with `--json`: each line on its stdout is an event, `step`, `progress` or
+//! `note`, and the last is `done`, with what it made, or `error`.
 //!
 //! It is installed beside reims-ctl, at [`REV`], by `cargo install` from its repository
 //! ([`install`]). `reims-ctl __record-install`, which scripts/install-ctl.sh runs last, installs
@@ -13,6 +13,11 @@
 //! ([`beside`]), which moves to [`REV`]. So the update that brings a reims-ctl that needs it
 //! installs it too, though that update runs the script it started with, which predates
 //! reims-util. `REIMS_CTL_UTIL` names a binary to use instead.
+//!
+//! A reims-ctl installed some other way (`cargo install --path`) runs whatever reims-util is
+//! beside it or on PATH, which can be from an older commit than [`REV`]: one that makes OpenCore
+//! images with what an earlier reims-ctl wanted. reims-ctl says so where cargo's records show it
+//! ([`stale`]): `doctor` fails on it, and the first run of it in a process says it.
 //!
 //! An install builds it in an empty target directory: cargo 1.98.1 judges a git package's binary
 //! up to date across commits (measured 2026-10-13): from a target directory an earlier commit was
@@ -40,7 +45,7 @@ use std::time::{Duration, Instant};
 
 pub const REPO: &str = "https://github.com/steelbrain/reims-util";
 /// The commit [`install`] installs.
-pub const REV: &str = "fe9bfe1a622ae1be8d254effa74b5354bd098e43";
+pub const REV: &str = "84e5c98ae7fa6b0b68e7be690525dda29697ab34";
 
 /// The reims-util binary: `REIMS_CTL_UTIL`, else the one beside reims-ctl, where both are
 /// installed, else the first on PATH.
@@ -52,7 +57,7 @@ pub fn binary() -> Result<PathBuf> {
     let on_path: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| {
             std::env::split_paths(&p)
-                .map(|d| d.join("reims-util"))
+                .map(|d| d.join(UTIL_FILE))
                 .collect()
         })
         .unwrap_or_default();
@@ -63,12 +68,61 @@ pub fn binary() -> Result<PathBuf> {
         .context("reims-util is not installed: run reims-ctl update, which installs it")
 }
 
+/// reims-util's file name: `reims-util`, and `reims-util.exe` on Windows.
+const UTIL_FILE: &str = if cfg!(windows) {
+    "reims-util.exe"
+} else {
+    "reims-util"
+};
+
 /// The reims-util beside the running reims-ctl, in the bin directory cargo installed both into.
 pub fn beside() -> Option<PathBuf> {
     std::env::current_exe()
         .ok()
-        .and_then(|e| e.parent().map(|d| d.join("reims-util")))
+        .and_then(|e| e.parent().map(|d| d.join(UTIL_FILE)))
         .filter(|p| p.is_file())
+}
+
+/// The commit cargo installed the reims-util at `bin` from, where it installed it from reims-util's
+/// repository: the install root holding `bin/` keeps cargo's record of each package it installed,
+/// `.crates2.json`, keyed "reims-util 0.1.0 (git+<repository>?rev=<rev>#<commit>)".
+pub fn installed_commit(bin: &Path) -> Option<String> {
+    let root = bin.parent()?.parent()?;
+    let text = std::fs::read_to_string(root.join(".crates2.json")).ok()?;
+    let record: serde_json::Value = serde_json::from_str(&text).ok()?;
+    record
+        .get("installs")?
+        .as_object()?
+        .iter()
+        .find_map(|(key, install)| {
+            let bins = install.get("bins")?.as_array()?;
+            if !bins.iter().any(|b| b.as_str() == Some("reims-util")) {
+                return None;
+            }
+            let source = key.split_once(" (")?.1.strip_suffix(')')?;
+            let git = source.strip_prefix("git+")?;
+            let (url, commit) = git.rsplit_once('#')?;
+            url.starts_with(REPO).then(|| commit.to_string())
+        })
+}
+
+/// Where the reims-util at `bin` is from a commit of reims-util's repository other than [`REV`],
+/// what to say: it may make what an earlier reims-ctl wanted. None where it is at [`REV`], or
+/// where cargo keeps no record of its commit (a build from a path, `REIMS_CTL_UTIL`'s binary).
+pub fn stale(bin: &Path) -> Option<String> {
+    if std::env::var_os("REIMS_CTL_UTIL").is_some() {
+        return None;
+    }
+    let commit = installed_commit(bin)?;
+    (commit != REV).then(|| {
+        format!(
+            "{} is reims-util's commit {}, not {}, the one this reims-ctl runs: reims-ctl update \
+             installs it (or scripts/install-ctl.sh, where reims-ctl was installed without it)",
+            bin.display(),
+            &commit[..commit.len().min(7)],
+            &REV[..7]
+        )
+    })
 }
 
 /// `reims-util --version`: "reims-util 0.1.0".
@@ -231,10 +285,9 @@ struct Smbios {
     serial: String,
 }
 
-/// The arguments that add kexts to the OpenCore image of a VM on `graphics`, beyond Lilu and
-/// ReimsVgpu.kext, which reims-util adds itself: on reims-vgpu's own device, each of the guest's
-/// kexts ([`prebuilt::guest_kexts`], written to the data directory first), in the set's order,
-/// which is the order OpenCore loads them in; none on another.
+/// The arguments that add kexts to the OpenCore image of a VM on `graphics`: on reims-vgpu's own
+/// device, each of the guest's kexts ([`prebuilt::guest_kexts`], written to the data directory
+/// first), in the set's order, which is the order OpenCore loads them in; none on another.
 pub fn kext_args(graphics: Graphics) -> Result<Vec<String>> {
     if graphics != Graphics::ReimsVgpu {
         return Ok(Vec::new());
@@ -298,24 +351,35 @@ pub fn opencore_as(
     kexts: &[String],
     progress: &mut dyn FnMut(&str),
 ) -> Result<()> {
-    let mut args = vec![
-        "--model",
-        &id.model,
-        "--serial",
-        &id.serial,
-        "--mlb",
-        &id.mlb,
-        "--uuid",
-        &id.uuid,
-        "--rom",
-        &id.rom,
-        "--no-ovmf",
-    ];
+    let mut args = identity_args(id);
+    args.push("--no-ovmf");
     if show_picker {
         args.push("--show-picker");
     }
     args.extend(kexts.iter().map(String::as_str));
     make_opencore(image, &args, progress)
+}
+
+/// Makes an OpenCore image at `image` presenting the Mac `id`, with `OVMF_CODE.fd` and
+/// `OVMF_VARS.fd` beside it, for a new VM whose disk's macOS ran on that Mac; `kexts` adds kexts
+/// ([`kext_args`]).
+pub fn opencore_presenting(
+    image: &Path,
+    id: &Identity,
+    kexts: &[String],
+    progress: &mut dyn FnMut(&str),
+) -> Result<()> {
+    let mut args = identity_args(id);
+    args.extend(kexts.iter().map(String::as_str));
+    make_opencore(image, &args, progress)
+}
+
+/// The arguments that make reims-util's image present the Mac `id`.
+fn identity_args(id: &Identity) -> Vec<&str> {
+    vec![
+        "--model", &id.model, "--serial", &id.serial, "--mlb", &id.mlb, "--uuid", &id.uuid,
+        "--rom", &id.rom,
+    ]
 }
 
 fn make_opencore(image: &Path, args: &[&str], progress: &mut dyn FnMut(&str)) -> Result<()> {
@@ -367,6 +431,13 @@ enum Event {
 /// last; returns its result.
 fn run(args: &[&OsStr], progress: &mut dyn FnMut(&str)) -> Result<serde_json::Value> {
     let bin = binary()?;
+    // A stale reims-util is said once a process, at the first run.
+    static SAID: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if let Some(note) = stale(&bin)
+        && !SAID.swap(true, std::sync::atomic::Ordering::Relaxed)
+    {
+        progress(&note);
+    }
     let mut cmd = Command::new(&bin);
     cmd.arg("--json")
         .args(args)
@@ -445,7 +516,7 @@ fn lower_first(s: &str) -> String {
 }
 
 /// "6 MB", "1.1 GB".
-fn size(bytes: u64) -> String {
+pub(crate) fn size(bytes: u64) -> String {
     if bytes < 1_000_000_000 {
         format!("{} MB", bytes.div_ceil(1_000_000))
     } else {
@@ -487,7 +558,6 @@ struct Lock {
 }
 
 fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
-    use std::os::fd::AsRawFd;
     let path = dir.join(".lock");
     let f = std::fs::OpenOptions::new()
         .create(true)
@@ -495,16 +565,10 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
         .write(true)
         .open(&path)
         .with_context(|| format!("open {}", path.display()))?;
-    // SAFETY: flock on a descriptor this function holds open.
-    if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+    if f.try_lock().is_err() {
         progress("waiting for another download of a macOS installer to end");
-        // SAFETY: as above.
-        if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX) } != 0 {
-            bail!(
-                "lock {}: {}",
-                path.display(),
-                std::io::Error::last_os_error()
-            );
+        if let Err(e) = f.lock() {
+            bail!("lock {}: {e}", path.display());
         }
     }
     Ok(Lock { _file: f })
@@ -513,6 +577,41 @@ fn lock(dir: &Path, progress: &mut dyn FnMut(&str)) -> Result<Lock> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// cargo's record of what it installed, beside `bin/`, gives the commit of a reims-util
+    /// installed from its repository; one at another commit than [`REV`] is stale, and one from
+    /// a path, or with no record, is not judged.
+    #[test]
+    fn a_reims_util_from_another_commit_is_stale() {
+        let env = crate::testenv::Env::new("util-stale");
+        let root = env.root.join("cargo");
+        std::fs::create_dir_all(root.join("bin")).unwrap();
+        let bin = root.join("bin/reims-util");
+        std::fs::write(&bin, "").unwrap();
+        let record = |source: &str| {
+            let key = format!("reims-util 0.1.0 ({source})");
+            let json = serde_json::json!({"installs": {
+                "reims-ctl 0.1.0 (path+file:///src/reims-ctl)": {"bins": ["reims-ctl"]},
+                key: {"bins": ["reims-util"]},
+            }});
+            std::fs::write(root.join(".crates2.json"), json.to_string()).unwrap();
+        };
+        assert_eq!(installed_commit(&bin), None);
+        assert_eq!(stale(&bin), None);
+        let old = "fe9bfe1a622ae1be8d254effa74b5354bd098e43";
+        record(&format!("git+{REPO}?rev={old}#{old}"));
+        assert_eq!(installed_commit(&bin).as_deref(), Some(old));
+        let note = stale(&bin).expect("stale");
+        assert!(
+            note.contains("fe9bfe1") && note.contains(&REV[..7]),
+            "{note}"
+        );
+        record(&format!("git+{REPO}?rev={REV}#{REV}"));
+        assert_eq!(stale(&bin), None);
+        record("path+file:///src/reims-util");
+        assert_eq!(installed_commit(&bin), None);
+        assert_eq!(stale(&bin), None);
+    }
 
     #[test]
     fn old_macos_gets_a_model_that_runs_it() {
@@ -591,7 +690,6 @@ mod tests {
         );
         let comma = vec![PathBuf::from("/d,e/A.kext")];
         assert!(add_kexts(&SET[..1], &comma).is_err());
-        assert!(kext_args(Graphics::AppleGfx).unwrap().is_empty());
         assert!(kext_args(Graphics::VmwareSvga).unwrap().is_empty());
     }
 
@@ -608,15 +706,10 @@ mod tests {
 
     /// A stand-in for reims-util that prints `lines` and exits with `code`.
     fn fake(dir: &Path, lines: &str, code: i32) -> PathBuf {
-        use std::os::unix::fs::PermissionsExt;
-        let p = dir.join("reims-util");
-        std::fs::write(
-            &p,
-            format!("#!/bin/sh\ncat <<'EOF'\n{lines}\nEOF\necho oops >&2\nexit {code}\n"),
+        crate::testenv::program(
+            &dir.join("reims-util"),
+            &format!("#!/bin/sh\ncat <<'EOF'\n{lines}\nEOF\necho oops >&2\nexit {code}\n"),
         )
-        .unwrap();
-        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
-        p
     }
 
     #[test]

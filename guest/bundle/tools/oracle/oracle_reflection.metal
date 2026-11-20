@@ -5,7 +5,9 @@
 // arguments under function constants, a vertex function's and a kernel's stage input, and an
 // object and a mesh function that share a payload; and the kinds tools/pipeline_reflection_check.mm
 // adds (nested argument buffers and their arrays, function and intersection tables, acceleration
-// structures, imageblocks, framebuffer fetch, and functions function constants specialise).
+// structures, imageblocks, framebuffer fetch, functions function constants specialise, and
+// post-tessellation vertex functions: their control points' and patch's attributes, in a struct of
+// both or as the control points alone, beside built-ins and bindings of their own).
 #include <metal_stdlib>
 #include <metal_raytracing>
 using namespace metal;
@@ -436,6 +438,46 @@ kernel void k_nested_more(device More &m [[buffer(0)]], device float *out [[buff
 	out[gid] = c.x + m.children[1]->data[gid] + m.deep.data[1][gid] + m.deeps[1].data[0][gid];
 }
 
+// A chain of seven argument buffers, each a pointer to the next: past 12 levels of the bundle's
+// AIR reader (a layout and a member's node each), the most macOS 27's frameworks take.
+struct Deep6 {
+	device float *data [[id(0)]];
+	float v [[id(1)]];
+};
+
+struct Deep5 {
+	device Deep6 *next [[id(0)]];
+};
+
+struct Deep4 {
+	device Deep5 *next [[id(0)]];
+};
+
+struct Deep3 {
+	device Deep4 *next [[id(0)]];
+};
+
+struct Deep2 {
+	device Deep3 *next [[id(0)]];
+};
+
+struct Deep1 {
+	device Deep2 *next [[id(0)]];
+	texture2d<float> t [[id(1)]];
+};
+
+struct Deep0 {
+	device Deep1 *next [[id(0)]];
+	Leaf leaf [[id(1)]];
+};
+
+kernel void k_deep_ab(device Deep0 &d [[buffer(0)]], device float *out [[buffer(1)]],
+                      uint gid [[thread_position_in_grid]])
+{
+	device Deep6 *last = d.next->next->next->next->next->next;
+	out[gid] = last->data[gid] + last->v + d.next->t.read(uint2(0)).x + d.leaf.t.sample(d.leaf.s, float2(0)).x;
+}
+
 [[visible]] float twice(float x)
 {
 	return 2 * x;
@@ -495,6 +537,79 @@ kernel void k_imageblock(imageblock<Block, imageblock_layout_implicit> block, de
 	out[0] = block.read(lid).c.x;
 }
 
+// An imageblock of an explicit layout, as Apple GPUs' compute kernels take one, alone and under a
+// function constant; and a fragment function's input of its tile's imageblock data.
+struct Pixel {
+	half4 v;
+};
+
+kernel void k_imageblock_explicit(imageblock<Pixel, imageblock_layout_explicit> block,
+                                  texture2d<half, access::write> out [[texture(0)]],
+                                  ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	block.data(lid)->v = half4(gid.x, gid.y, 0, 1);
+	threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+	out.write(block.data(lid ^ ushort2(1))->v, gid);
+}
+
+// The same imageblock as the kernel's second argument, the texture its first.
+kernel void k_imageblock_late(texture2d<half, access::write> out [[texture(1)]],
+                              imageblock<Pixel, imageblock_layout_explicit> block,
+                              ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	block.data(lid)->v = half4(0, gid.y, 0, 1);
+	threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+	out.write(block.data(lid ^ ushort2(1, 0))->v, gid);
+}
+
+constant bool kBlocks [[function_constant(6)]];
+
+kernel void k_imageblock_if(imageblock<Pixel, imageblock_layout_explicit> block [[function_constant(kBlocks)]],
+                            texture2d<half, access::write> out [[texture(0)]],
+                            ushort2 lid [[thread_position_in_threadgroup]], uint2 gid [[thread_position_in_grid]])
+{
+	half4 v = half4(1);
+	if (kBlocks) {
+		block.data(lid)->v = half4(gid.x, 0, 0, 1);
+		threadgroup_barrier(mem_flags::mem_threadgroup_imageblock);
+		v = block.data(lid)->v;
+	}
+	out.write(v, gid);
+}
+
+struct Stack {
+	half4 lo [[raster_order_group(0)]];
+	half4 hi [[raster_order_group(0)]];
+};
+
+fragment half4 f_imageblock_data(VertexOut in [[stage_in]], Stack s [[imageblock_data]])
+{
+	return s.lo + s.hi + half4(in.uv.x);
+}
+
+// Imageblock data that views a master struct of the tile's imageblock, its members named by their
+// user names; and a texture in a raster order group.
+struct Master {
+	half d [[user(depth), raster_order_group(0)]];
+	half4 c [[user(colour), raster_order_group(1)]];
+};
+
+struct DepthView {
+	half d [[user(depth)]];
+};
+
+fragment half4 f_imageblock_master(VertexOut in [[stage_in]], DepthView v [[imageblock_data(Master)]])
+{
+	return half4(v.d) + half4(in.uv.x);
+}
+
+fragment half4 f_rog_texture(VertexOut in [[stage_in]],
+                             texture2d<half, access::write> tex [[texture(3), raster_order_group(0)]])
+{
+	tex.write(half4(in.uv.x), uint2(in.position.xy));
+	return half4(in.uv.y);
+}
+
 struct Fetched {
 	float4 color [[color(0)]];
 	half4 extra [[color(1)]];
@@ -506,6 +621,19 @@ fragment Fetched f_fetch(VertexOut in [[stage_in]], float4 last [[color(0)]], ha
 	f.color = last * 0.5 + float4(other);
 	f.extra = other;
 	return f;
+}
+
+// A colour attachment's read in a raster order group, and one at an index a function constant gives.
+fragment float4 f_fetch_group(VertexOut in [[stage_in]], float4 last [[color(0), raster_order_group(0)]])
+{
+	return last * 0.5 + float4(in.uv, 0, 0);
+}
+
+constant uint kFetchAt [[function_constant(5)]];
+
+fragment float4 f_fetch_at(VertexOut in [[stage_in]], float4 last [[color(kFetchAt)]])
+{
+	return last * 0.25 + float4(in.uv, 0, 0);
 }
 
 fragment float4 f_tables(VertexOut in [[stage_in]], primitive_acceleration_structure primitives [[buffer(0)]],
@@ -559,5 +687,69 @@ vertex SpecialisedOut v_specialised(VertexIn in [[stage_in]], constant float4x4 
 	SpecialisedOut o;
 	o.position = mvp * in.position;
 	o.uv = kMode == 1 ? in.uv : (kMode == 2 ? uvs[vid] : float2(0));
+	return o;
+}
+
+// Post-tessellation vertex functions. A patch's control points are the attributes of a buffer whose
+// layout steps per control point (0 and 1, one unread), and a patch's own attributes those of a
+// buffer whose layout steps per patch (3): pipeline_reflection_check's r_patch_* cases.
+struct PatchPoint {
+	float4 position [[attribute(0)]];
+	float2 uv [[attribute(1)]];
+	float4 unread [[attribute(2)]];
+};
+
+struct PatchIn {
+	patch_control_point<PatchPoint> points;
+	float4 tint [[attribute(3)]];
+};
+
+[[patch(quad, 4)]] vertex VertexOut v_patch(PatchIn in [[stage_in]], float2 uv [[position_in_patch]],
+                                            uint patch [[patch_id]], constant float4x4 &mvp [[buffer(4)]],
+                                            texture2d<float> heights [[texture(1)]],
+                                            device const float *unusedBuffer [[buffer(5)]])
+{
+	VertexOut o;
+	float4 p = mix(mix(in.points[0].position, in.points[1].position, uv.x),
+	               mix(in.points[3].position, in.points[2].position, uv.x), uv.y);
+	o.position = mvp * (p + in.tint + heights.read(uint2(patch, 0)));
+	o.uv = in.points[0].uv;
+	return o;
+}
+
+[[patch(triangle, 3)]] vertex VertexOut v_patch_points(patch_control_point<PatchPoint> points [[stage_in]],
+                                                       float3 bc [[position_in_patch]],
+                                                       uint iid [[instance_id]])
+{
+	VertexOut o;
+	o.position = points[0].position * bc.x + points[1].position * bc.y + points[2].position * bc.z +
+	             float4(float(iid));
+	o.uv = points[1].uv;
+	return o;
+}
+
+[[patch(quad)]] vertex VertexOut v_patch_buffers(float2 uv [[position_in_patch]], uint patch [[patch_id]],
+                                                 device const float4 *points [[buffer(0)]])
+{
+	VertexOut o;
+	o.position = points[patch * 4] + float4(uv, 0, 0);
+	o.uv = uv;
+	return o;
+}
+
+[[patch(triangle, 3)]] vertex VertexOut v_patch_plain(patch_control_point<PatchPoint> points [[stage_in]])
+{
+	VertexOut o;
+	o.position = points[0].position + points[2].position;
+	o.uv = points[1].uv;
+	return o;
+}
+
+[[patch(quad, 4)]] vertex VertexOut v_patch_unused(patch_control_point<PatchPoint> points [[stage_in]],
+                                                   float2 uv [[position_in_patch]])
+{
+	VertexOut o;
+	o.position = points[0].position;
+	o.uv = points[3].uv;
 	return o;
 }

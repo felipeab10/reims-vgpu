@@ -29,7 +29,6 @@
  */
 
 #include <IOSurface/IOSurfaceRef.h>
-#include <os/log.h>
 #include <stdint.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -37,11 +36,13 @@
 
 #include <algorithm>
 #include <atomic>
+#include <functional>
 #include <initializer_list>
 #include <memory>
 #include <mutex>
 #include <vector>
 
+#include "RgfxLog.hpp"
 #include "RgfxVideoChannel.hpp"
 #include "RgfxVideoH264.hpp"
 #include "RgfxVideoH265.hpp"
@@ -477,8 +478,15 @@ struct Context {
 	uint32_t height;
 	rgfx::video::Session *session;
 	std::vector<uint8_t> sent;
-	// A decode of the session's failed on the host since its last failed schedule.
-	std::atomic<bool> failed_on_host{false};
+	// Where its HEVC pictures' frame records describe their surfaces, once a picture's has shown
+	// it (FrameDescription::packed), and 0 until then.
+	std::atomic<uint32_t> hevc_description{0};
+	// The layout its H.264 pictures' parsed SPS comes in (rgfx::video::h264::SpsLayout), once a
+	// picture's has shown it, and 0 until then.
+	std::atomic<uint8_t> h264_sps_layout{0};
+	// Held across a schedule of its pictures (ScheduleCommands): one list of the context's at a
+	// time, so they reach its session in AppleGVA's order, while other contexts' lists go on.
+	std::mutex schedule{};
 };
 
 // The live sessions, whose output textures go when AppleGVA frees its frames' pool.
@@ -566,12 +574,9 @@ void freePool(BitstreamBuffers &b)
 struct Token {
 	uint64_t seqno;
 	void *work;
-	bool failed;      // not sent, or answered failed on the host
-	Context *context; // its decode's session, or null
 };
 constexpr size_t kTokens = 1024;
 std::mutex g_tokenLock;
-std::mutex g_scheduleLock;
 Token g_tokens[kTokens];
 uint64_t g_seqno;
 
@@ -600,8 +605,7 @@ uint32_t bitstreamAlignment(uint64_t sub)
 // plane's pitch and size stay within 32 bits.
 constexpr uint32_t kMaxFrameSide = 16384;
 
-// Deletes `context`: its session closed and out of the live ones, and no token naming it, so a
-// later context at its address is never taken for it.
+// Deletes `context`: its session closed and out of the live ones.
 void deleteContext(Context *context)
 {
 	if (context && context->session) {
@@ -612,12 +616,6 @@ void deleteContext(Context *context)
 					g_sessions.erase(it);
 					break;
 				}
-		}
-		{
-			std::lock_guard<std::mutex> hold(g_tokenLock);
-			for (Token &t : g_tokens)
-				if (t.context == context)
-					t.context = nullptr;
 		}
 		rgfx::video::closeSession(context->session);
 	}
@@ -641,7 +639,7 @@ const Command *decodeCommand(const Command *c)
 void notSent(std::atomic<bool> &said, const char *why)
 {
 	if (!said.exchange(true))
-		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a picture not sent: %{public}s", why);
+		os_log_error(rgfxLog(), "RGFX: video: a picture not sent: %{public}s", why);
 }
 
 // Logs, once a process, that a schedule failed for a decode (RgfxVideoStatus.hpp), `why`.
@@ -649,7 +647,7 @@ void scheduleFailed(const char *why)
 {
 	static std::atomic<bool> said;
 	if (!said.exchange(true))
-		os_log_error(OS_LOG_DEFAULT, "RGFX: video: a decode reported to AppleGVA as failed: %{public}s",
+		os_log_error(rgfxLog(), "RGFX: video: a decode reported to AppleGVA as failed: %{public}s",
 		             why);
 }
 
@@ -660,23 +658,106 @@ IOSurfaceRef outputSurface(const Command *c)
 	return out ? (IOSurfaceRef)u64At(out, 0x10) : nullptr;
 }
 
-// The surface AppleGVA decodes an HEVC picture into. An HEVC decode command carries no output on
-// the command (c->output is null and there is no following transfer command, unlike H.264); the
-// output frame is named in the decode's parameters, in AppleGVA's own decoded-picture record. The
-// record pointer is at P+0x10, its current frame at the record's +0x08 (`field_08`), and that
-// frame's global IOSurface id at the frame's +0x88 (`field_88`). Measured on the RTX 5080
-// (2026-11-03): the id there is the IOSurface VideoToolbox hands back for the picture (picture 0
-// -> id 7, picture 1 -> id 27, matching the decoder's output). The returned surface is retained;
-// the caller releases it.
-IOSurfaceRef hevcOutputSurface(const uint8_t *P)
+// Where an HEVC frame record of AppleGVA's describes its surface (hevcOutputSurface). Every
+// release measured describes it with the same seven fields, in order: the surface's global id, a
+// size, its width, its height, a pitch, 8 bytes and its pixel format. Where the fields start in
+// the frame and how wide each is differ by release; each is read as a u32 at its start:
+// - fields of 4 bytes from +0x70 on macOS 11.7.10 and 11.7.11, from +0x78 on 12.7.6 and from
+//   +0x80 on 13.7.8 (measured on 11 and 12 on the RTX 5080, 2026-11-08, for 1024x1024 '420f' and
+//   320x240 '420v' surfaces; on 13.7.8 on the 780M, ids 6, 7, 9 and 15 for 6016x6016 and
+//   1024x1024 '420f' and 320x240 '420v' surfaces);
+// - fields of 8 bytes from +0x80 on macOS 14.8.9 (measured on the RTX 5080, 2026-11-08: ids 10
+//   and 33 for 3840x2160 'x420' and 320x240 '420v' surfaces);
+// - fields of 8 bytes from +0x88 on macOS 15.8.2 and 26.7.2 (measured on the RTX 5080 and the
+//   780M, 2026-11-08: ids 14 and 22 on 26.7.2 for 3840x2160 'x420' and 320x240 '420v'
+//   surfaces; and on the RTX 5080, 2026-11-03: the id is that of the IOSurface VideoToolbox hands
+//   back for the picture, 7 for picture 0, 27 for picture 1).
+// So the driver finds the layout instead of listing them: every start from kDescriptionFirst to
+// kDescriptionLast in steps of 4, with fields of 4 or 8 bytes, the farthest read the pixel format
+// of 8-byte fields from kDescriptionLast, at +0xd0. The window starts two 8-byte steps below the
+// lowest start measured (11's +0x70), for the 11 releases before 11.7.10, which no base boots. In
+// the frames of every release measured, no start and width but the release's own reads the
+// surface's width, height and pixel format (their words from +0x60 to +0xdc, read on each release
+// above but 11.7.10).
+struct FrameDescription {
+	uint32_t start, fieldBytes;
+	size_t field(size_t index) const { return start + index * fieldBytes; }
+	size_t id() const { return field(0); }
+	size_t width() const { return field(2); }
+	size_t height() const { return field(3); }
+	size_t format() const { return field(6); }
+	// As Context::hevc_description keeps it, never 0.
+	uint32_t packed() const { return start << 8 | fieldBytes; }
+	static FrameDescription unpacked(uint32_t p) { return {p >> 8, p & 0xff}; }
+};
+constexpr uint32_t kDescriptionFirst = 0x60, kDescriptionLast = 0xa0;
+constexpr uint32_t kFieldBytes[] = {4, 8};
+
+// The frame AppleGVA's decoded-picture record names for an HEVC picture: the record pointer is at
+// P+0x10 and its current frame at the record's +0x08 (`field_08`). Null where either is.
+const uint8_t *hevcFrame(const uint8_t *P)
 {
 	const uint8_t *record = (const uint8_t *)u64At(P, 0x10);
-	if (!record)
+	return record ? (const uint8_t *)u64At(record, 0x08) : nullptr;
+}
+
+// The surface description `d` of `frame` names, where it is one whose width, height and pixel
+// format `d` gives: retained, or null.
+IOSurfaceRef describedSurface(const uint8_t *frame, FrameDescription d)
+{
+	IOSurfaceRef surface = IOSurfaceLookup(u32At(frame, d.id()));
+	if (!surface)
 		return nullptr;
-	const uint8_t *frame = (const uint8_t *)u64At(record, 0x08);
+	if (IOSurfaceGetWidth(surface) == u32At(frame, d.width()) &&
+	    IOSurfaceGetHeight(surface) == u32At(frame, d.height()) &&
+	    IOSurfaceGetPixelFormat(surface) == u32At(frame, d.format()))
+		return surface;
+	CFRelease(surface);
+	return nullptr;
+}
+
+// Why an HEVC picture's frame record gave no output surface.
+enum class NoOutput { kNone, kMany, kNotInSessionLayout };
+
+// The surface AppleGVA decodes an HEVC picture into. An HEVC decode command carries no output on
+// the command (c->output is null and there is no following transfer command, unlike H.264); the
+// output frame is named in the decode's parameters, in AppleGVA's own decoded-picture record
+// (hevcFrame), which describes its surface (FrameDescription). The first picture of `context`'s
+// whose frame describes a surface in exactly one layout of the search window shows the session's
+// layout, which `context` keeps; a later picture's surface is the one its frame describes in that
+// layout. A frame that describes none, or describes one in more than one layout, gives none, and
+// *why says which. The returned surface is retained; the caller releases it.
+IOSurfaceRef hevcOutputSurface(Context *context, const uint8_t *P, NoOutput *why)
+{
+	*why = NoOutput::kNone;
+	const uint8_t *frame = hevcFrame(P);
 	if (!frame)
 		return nullptr;
-	return IOSurfaceLookup(u32At(frame, 0x88));
+	if (const uint32_t known = context->hevc_description.load(std::memory_order_relaxed)) {
+		IOSurfaceRef surface = describedSurface(frame, FrameDescription::unpacked(known));
+		if (!surface)
+			*why = NoOutput::kNotInSessionLayout;
+		return surface;
+	}
+	IOSurfaceRef only = nullptr;
+	FrameDescription found = {};
+	for (uint32_t bytes : kFieldBytes)
+		for (uint32_t start = kDescriptionFirst; start <= kDescriptionLast; start += 4) {
+			IOSurfaceRef surface = describedSurface(frame, {start, bytes});
+			if (!surface)
+				continue;
+			if (only) {
+				CFRelease(only);
+				CFRelease(surface);
+				*why = NoOutput::kMany;
+				return nullptr;
+			}
+			only = surface;
+			found = {start, bytes};
+		}
+	if (only)
+		context->hevc_description.store(found.packed(), std::memory_order_relaxed);
+	return only;
 }
 
 // Where in its output surface an HEVC picture lands, in luma samples: its tile's place in an HEIF
@@ -749,6 +830,48 @@ void *commitPicture(Context *context, std::vector<uint8_t> &sets, const uint8_t 
 	return work;
 }
 
+// Whether the host takes the HEVC picture whose slice segments are the `size` bytes at `au`, of
+// `sps` and `pps`, by what its caps say it decodes. It refuses, saying why once a reason: its
+// coded size outside the caps' least and largest; a tile column of the PPS narrower than the
+// caps' narrowest (RgfxVideoDecodeCaps); or, where its first slice segment's header gives
+// NumPicTotalCurr (h265::currentReferences), more current references than the caps'
+// max_references. A bound the caps leave 0 refuses nothing, and a header or PPS the driver cannot
+// read leaves the verdict to the host. AppleGVA's HEVC decoder hears of a refusal only as a failed
+// schedule (RgfxVideoStatus.hpp), so a picture the host would refuse fails its own: its frame and
+// every one after it carry kVTVideoDecoderMalfunctionErr, where a schedule that went ahead would
+// deliver it and the next one undecoded.
+bool hevcTaken(const rgfx::video::h265::Sps &sps, const rgfx::video::h265::Pps &pps,
+               const uint8_t *au, size_t size)
+{
+	const RgfxVideoCodecCaps *caps = rgfx::video::hostCodec(RGFX_VIDEO_CODEC_HEVC, RGFX_VIDEO_DECODE);
+	if (!caps)
+		return true;
+	const uint32_t coded[2] = {sps.pic_width_in_luma_samples, sps.pic_height_in_luma_samples};
+	for (int i = 0; i < 2; i++)
+		if ((caps->min_size[i] && coded[i] < caps->min_size[i]) ||
+		    (caps->max_size[i] && coded[i] > caps->max_size[i])) {
+			static std::atomic<bool> said;
+			notSent(said, "its coded size is outside the sizes the host decodes");
+			return false;
+		}
+	const RgfxVideoDecodeCaps bounds = rgfx::video::decodeCaps(RGFX_VIDEO_CODEC_HEVC);
+	uint32_t narrowest;
+	if (bounds.min_tile_width && rgfx::video::h265::narrowestTileColumn(sps, pps, &narrowest) &&
+	    narrowest != 0 && narrowest < bounds.min_tile_width) {
+		static std::atomic<bool> said;
+		notSent(said, "a tile column of its PPS is narrower than the host decodes");
+		return false;
+	}
+	uint32_t current;
+	if (caps->max_references && rgfx::video::h265::currentReferences(sps, pps, au, size, &current) &&
+	    current > caps->max_references) {
+		static std::atomic<bool> said;
+		notSent(said, "its current reference sets hold more pictures than the host decodes");
+		return false;
+	}
+	return true;
+}
+
 // Commits the HEVC picture `c` decodes on its context's session: its work on the host, or null
 // where it could not be sent. Its slice segments lie one after another in one bitstream buffer,
 // each named by a record of the picture's.
@@ -756,15 +879,26 @@ void *decodeHevcPicture(const Command *c)
 {
 	Context *context = (Context *)c->context;
 	const uint8_t *P = c->parameters;
-	if (!context || !context->session || !P)
+	if (!context || !context->session || !P) {
+		static std::atomic<bool> said;
+		notSent(said, "its command names no decode session or no picture record");
 		return nullptr;
+	}
 	constexpr size_t kSliceRecord = 0x328;
 	const uint32_t slices = u32At(P, 0x28);
 	const uint8_t *records = (const uint8_t *)u64At(P, 0x30);
 	const uint8_t *bytes;
 	size_t bufferBytes;
-	if (!slices || !records || !hevcBitstreamBuffer(context->driver, u32At(records, 0x8), &bytes, &bufferBytes))
+	if (!slices || !records) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no slice count (+0x28) or no slice records (+0x30)");
 		return nullptr;
+	}
+	if (!hevcBitstreamBuffer(context->driver, u32At(records, 0x8), &bytes, &bufferBytes)) {
+		static std::atomic<bool> said;
+		notSent(said, "its first slice record names (+0x8) no bitstream buffer of the driver's");
+		return nullptr;
+	}
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
 		const uint8_t *r = records + i * kSliceRecord;
@@ -772,8 +906,11 @@ void *decodeHevcPicture(const Command *c)
 		first = offset < first ? offset : first;
 		end = offset + size > end ? offset + size : end;
 	}
-	if (end > bufferBytes || first >= end)
+	if (end > bufferBytes || first >= end) {
+		static std::atomic<bool> said;
+		notSent(said, "its slice segments are empty or run past their bitstream buffer");
 		return nullptr;
+	}
 	std::vector<uint8_t> sets;
 	const auto *sps = (const rgfx::video::h265::Sps *)u64At(P, 0x18);
 	const auto *pps = (const rgfx::video::h265::Pps *)u64At(P, 0x20);
@@ -783,51 +920,98 @@ void *decodeHevcPicture(const Command *c)
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
-	IOSurfaceRef output = hevcOutputSurface(P);
+	if (!hevcTaken(*sps, *pps, bytes + first, end - first))
+		return nullptr;
+	NoOutput why;
+	IOSurfaceRef output = hevcOutputSurface(context, P, &why);
+	if (!output) {
+		static_assert(kDescriptionFirst == 0x60 && kDescriptionLast == 0xa0,
+		              "the lines below name the search window");
+		static std::atomic<bool> none, many, session;
+		if (why == NoOutput::kMany)
+			notSent(many, "its frame record describes a surface in more than one layout "
+			              "from +0x60 to +0xa0");
+		else if (why == NoOutput::kNotInSessionLayout)
+			notSent(session, "its frame record describes no surface of its own "
+			                 "in its session's layout");
+		else
+			notSent(none, "its frame record describes no surface of its own "
+			              "from +0x60 to +0xa0");
+		return nullptr;
+	}
 	// A tile's place lies inside its canvas, of whole chroma samples, and the part of it that
 	// lands there is what the SPS's conformance window crops it to, which is what the host's copy
 	// lands.
 	const Place place = hevcTilePlace(P);
 	uint32_t width, height;
 	hevcPictureSize(*sps, &width, &height);
-	if (output) {
-		const uint32_t whole[2] = {width, height};
-		const size_t across = IOSurfaceGetWidth(output), down = IOSurfaceGetHeight(output);
-		if (place.x < across && place.y < down)
-			clipToSurface(place, across, down, &width, &height);
-		if (place.x % 2 || place.y % 2 || place.x >= across || place.y >= down || width == 0 ||
-		    height == 0) {
+	const uint32_t whole[2] = {width, height};
+	const size_t across = IOSurfaceGetWidth(output), down = IOSurfaceGetHeight(output);
+	if (place.x < across && place.y < down)
+		clipToSurface(place, across, down, &width, &height);
+	if (place.x % 2 || place.y % 2 || place.x >= across || place.y >= down || width == 0 ||
+	    height == 0) {
+		static std::atomic<bool> said;
+		notSent(said, "its place lies off its output surface");
+		CFRelease(output);
+		return nullptr;
+	}
+	// The SPS sent crops the picture to that part: its window grown on the right and the bottom,
+	// in chroma samples.
+	if (width != whole[0] || height != whole[1]) {
+		auto cropped = std::make_unique<rgfx::video::h265::Sps>(*sps);
+		if (!sps->conformance_window_flag) {
+			cropped->conformance_window_flag = 1;
+			cropped->conf_win_left_offset = cropped->conf_win_right_offset = 0;
+			cropped->conf_win_top_offset = cropped->conf_win_bottom_offset = 0;
+		}
+		cropped->conf_win_right_offset += (whole[0] - width) / 2;
+		cropped->conf_win_bottom_offset += (whole[1] - height) / 2;
+		sets.clear();
+		if (!rgfx::video::h265::writeSps(*cropped, sets) ||
+		    !rgfx::video::h265::writePps(*pps, sets)) {
 			static std::atomic<bool> said;
-			notSent(said, "its place lies off its output surface");
+			notSent(said, "its parameter sets are refused");
 			CFRelease(output);
 			return nullptr;
-		}
-		// The SPS sent crops the picture to that part: its window grown on the right and the
-		// bottom, in chroma samples.
-		if (width != whole[0] || height != whole[1]) {
-			auto cropped = std::make_unique<rgfx::video::h265::Sps>(*sps);
-			if (!sps->conformance_window_flag) {
-				cropped->conformance_window_flag = 1;
-				cropped->conf_win_left_offset = cropped->conf_win_right_offset = 0;
-				cropped->conf_win_top_offset = cropped->conf_win_bottom_offset = 0;
-			}
-			cropped->conf_win_right_offset += (whole[0] - width) / 2;
-			cropped->conf_win_bottom_offset += (whole[1] - height) / 2;
-			sets.clear();
-			if (!rgfx::video::h265::writeSps(*cropped, sets) ||
-			    !rgfx::video::h265::writePps(*pps, sets)) {
-				static std::atomic<bool> said;
-				notSent(said, "its parameter sets are refused");
-				CFRelease(output);
-				return nullptr;
-			}
 		}
 	}
 	void *work =
 	    commitPicture(context, sets, bytes + first, end - first, output, place, width, height);
-	if (output)
-		CFRelease(output);
+	CFRelease(output);
 	return work;
+}
+
+// The SPS of an H.264 picture of `context`'s that AppleGVA decodes into a `width` x `height`
+// surface, its parsed form at `record` and its PPS's seq_parameter_set_id `ppsSps`, in `sps`: read
+// in the session's layout, or in the one layout it fits where the session has none yet
+// (rgfx::video::h264::chooseSpsLayout), which the session then keeps. False, logged, where it fits
+// no layout, more than one, or not the session's.
+bool h264Sps(Context *context, const uint8_t *record, uint32_t ppsSps, uint32_t width,
+             uint32_t height, rgfx::video::h264::Sps *sps)
+{
+	using namespace rgfx::video::h264;
+	const uint8_t kept = context->h264_sps_layout.load();
+	if (kept) {
+		*sps = spsIn(record, (SpsLayout)kept);
+		if (spsFits(*sps, ppsSps, width, height))
+			return true;
+		static std::atomic<bool> said;
+		notSent(said, "its SPS does not describe its picture in its session's layout");
+		return false;
+	}
+	SpsLayout layout;
+	NoLayout why;
+	if (chooseSpsLayout(record, ppsSps, width, height, &layout, sps, &why)) {
+		context->h264_sps_layout.store((uint8_t)layout);
+		return true;
+	}
+	static std::atomic<bool> none, many;
+	if (why == NoLayout::kMany)
+		notSent(many, "its SPS describes its picture in both layouts of AppleGVA's");
+	else
+		notSent(none, "its SPS describes its picture in no layout of AppleGVA's");
+	return false;
 }
 
 // Commits the H.264 picture `c` decodes on its context's session: its work on the host, or null
@@ -836,37 +1020,64 @@ void *decodeH264Picture(const Command *c)
 {
 	Context *context = (Context *)c->context;
 	const uint8_t *P = c->parameters;
-	if (!context || !context->session || !P || !c->output)
+	if (!context || !context->session || !P || !c->output) {
+		static std::atomic<bool> said;
+		notSent(said, "its command names no decode session, no picture record or no output");
 		return nullptr;
+	}
 	// The access unit: the slices, which lie one after another in one bitstream buffer.
 	const uint8_t *bytes;
 	size_t bufferBytes;
 	const uint32_t pool = u32At(P, 0x270), index = u32At(P, 0x274), slices = u32At(P, 0x278);
 	const uint8_t *entries = (const uint8_t *)u64At(P, 0x290);
-	if (!slices || !entries || !bitstreamBuffer(context->driver, pool, index, &bytes, &bufferBytes))
+	if (!slices || !entries) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no slice count (+0x278) or no slice entries (+0x290)");
 		return nullptr;
+	}
+	if (!bitstreamBuffer(context->driver, pool, index, &bytes, &bufferBytes)) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record names (+0x270, +0x274) no bitstream buffer of the driver's");
+		return nullptr;
+	}
 	uint64_t first = UINT64_MAX, end = 0;
 	for (uint32_t i = 0; i < slices; i++) {
 		const uint8_t *e = (const uint8_t *)u64At(entries, i * 8);
-		if (!e)
+		if (!e) {
+			static std::atomic<bool> said;
+			notSent(said, "one of its slice entries is null");
 			return nullptr;
+		}
 		const uint64_t size = u32At(e, 0), offset = u32At(e, 4);
 		first = offset < first ? offset : first;
 		end = offset + size > end ? offset + size : end;
 	}
-	if (end > bufferBytes)
+	if (end > bufferBytes) {
+		static std::atomic<bool> said;
+		notSent(said, "its slices run past their bitstream buffer");
 		return nullptr;
+	}
 	// The parameter sets, sent where they differ from the last ones.
-	std::vector<uint8_t> sets;
-	const auto *sps = (const rgfx::video::h264::Sps *)u64At(P, 0x260);
+	const uint8_t *spsRecord = (const uint8_t *)u64At(P, 0x260);
 	const auto *pps = (const rgfx::video::h264::Pps *)u64At(P, 0x268);
-	if (!sps || !pps || !rgfx::video::h264::writeSps(*sps, sets) ||
-	    !rgfx::video::h264::writePps(*pps, *sps, sets)) {
+	IOSurfaceRef output = outputSurface(c);
+	if (!spsRecord || !pps || !output) {
+		static std::atomic<bool> said;
+		notSent(said, "its picture record holds no SPS (+0x260) or no PPS (+0x268), or its "
+		              "command no output surface");
+		return nullptr;
+	}
+	rgfx::video::h264::Sps sps;
+	if (!h264Sps(context, spsRecord, pps->seq_parameter_set_id, (uint32_t)IOSurfaceGetWidth(output),
+	             (uint32_t)IOSurfaceGetHeight(output), &sps))
+		return nullptr;
+	std::vector<uint8_t> sets;
+	if (!rgfx::video::h264::writeSps(sps, sets) || !rgfx::video::h264::writePps(*pps, sps, sets)) {
 		static std::atomic<bool> said;
 		notSent(said, "its parameter sets are refused");
 		return nullptr;
 	}
-	return commitPicture(context, sets, bytes + first, end - first, outputSurface(c));
+	return commitPicture(context, sets, bytes + first, end - first, output);
 }
 
 // Commits the picture `c` decodes, of its context's codec.
@@ -904,7 +1115,21 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 			                       : fi->sub_id == kCodecHevc                       ? RGFX_VIDEO_CODEC_HEVC
 			                                                                        : 0;
 			if (codec != 0) {
-				context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
+				// An H.264 stream of a coded size the host does not decode is refused here, where
+				// VideoToolbox hears of it and turns to its software decoder: AppleGVA's H.264
+				// decoder hears of no failure later (RgfxVideoStatus.hpp).
+				if (codec == RGFX_VIDEO_CODEC_H264 &&
+				    !rgfx::video::sizeTaken(rgfx::video::hostCodec(codec, RGFX_VIDEO_DECODE),
+				                            fi->width, fi->height)) {
+					static std::atomic<bool> said;
+					if (!said.exchange(true))
+						os_log_error(rgfxLog(),
+						             "RGFX: video: an H.264 decode of %ux%u refused at its create: "
+						             "the host decodes no picture of its coded size",
+						             fi->width, fi->height);
+				} else {
+					context->session = rgfx::video::openSession(codec, RGFX_VIDEO_DECODE);
+				}
 				if (!context->session) {
 					// The contexts made before it go with their sessions, which leave the
 					// live ones.
@@ -1008,16 +1233,40 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		// in a canvas lands at its place, hevcTilePlace): luma of the frame's size, chroma of
 		// half, in whole pairs; each plane's first byte and pitch at the alignment its texture and
 		// the copy take, one pitch for both planes.
-		const uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
+		uint32_t alignment = rgfx::video::outputPlaneAlignment(sampleBytes);
 		if (alignment == 0)
 			return kUnsupported;
-		const uint32_t chromaWidth = (r->width + 1) / 2, chromaHeight = (r->height + 1) / 2;
-		const uint32_t row = r->width * sampleBytes > chromaWidth * 2 * sampleBytes
-		                         ? r->width * sampleBytes
-		                         : chromaWidth * 2 * sampleBytes;
+		// Where the host decodes the codec in place (outputLayout), what the decode writes: the
+		// coded picture's whole rows and columns, in the host's units, at its planes' alignment,
+		// as AMD's driver on a Mac answers (rows of whole macroblocks, at 256 bytes): the planes'
+		// rows those, the frame's width as it is, and AppleGVA extends the planes below the
+		// frame by the rows past it.
+		const uint32_t codec = r->sub_id == kCodecHevc   ? RGFX_VIDEO_CODEC_HEVC
+		                       : r->sub_id == kCodecH264 ? RGFX_VIDEO_CODEC_H264
+		                                                 : 0;
+		const RgfxVideoOutputLayout layout = rgfx::video::outputLayout(codec);
+		uint32_t codedWidth = r->width, codedHeight = r->height;
+		if (layout.granularity[0] != 0 && layout.granularity[1] != 0 && layout.alignment != 0) {
+			const auto roundUp = [](uint32_t v, uint32_t unit) { return (v + unit - 1) / unit * unit; };
+			codedWidth = roundUp(r->width, layout.granularity[0]);
+			codedHeight = roundUp(r->height, layout.granularity[1]);
+			// A multiple of both: the textures' and the host's.
+			uint32_t a = alignment, b = layout.alignment;
+			while (b != 0) {
+				const uint32_t t = a % b;
+				a = b;
+				b = t;
+			}
+			alignment = alignment / a * layout.alignment;
+		}
+		const uint32_t chromaWidth = (r->width + 1) / 2, chromaHeight = (codedHeight + 1) / 2;
+		const uint32_t codedChroma = (codedWidth + 1) / 2;
+		const uint32_t row = codedWidth * sampleBytes > codedChroma * 2 * sampleBytes
+		                         ? codedWidth * sampleBytes
+		                         : codedChroma * 2 * sampleBytes;
 		const uint32_t pitch = (row + alignment - 1) / alignment * alignment;
 		r->widths[0] = r->width;
-		r->heights[0] = r->height;
+		r->heights[0] = codedHeight;
 		r->widths[1] = chromaWidth;
 		r->heights[1] = chromaHeight;
 		for (int p = 0; p < 2; p++) {
@@ -1037,28 +1286,54 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		TokenList *tl = (TokenList *)a2;
 		if (!cl || !tl || cl->count != tl->count || !tl->tokens)
 			return kBadArgument;
-		// One list at a time, so pictures reach their sessions in AppleGVA's order.
-		std::lock_guard<std::mutex> hold(g_scheduleLock);
-		for (uint32_t i = 0; i < cl->count; i++) {
-			const Command *decode = decodeCommand(cl->commands[i]);
-			Context *context = decode ? (Context *)decode->context : nullptr;
-			// A failure on the host since this session's last failed schedule fails this one,
-			// as AppleGVA hears of no failure at its query (RgfxVideoStatus.hpp).
-			const bool hostFailed = context && context->failed_on_host.exchange(false);
-			void *work = decode && !hostFailed ? decodePicture(decode) : nullptr;
-			{
-				std::lock_guard<std::mutex> tokens(g_tokenLock);
-				const uint64_t n = g_seqno++;
-				Token *t = &g_tokens[n % kTokens];
-				rgfx::video::releaseToken(t->work);
-				*t = {n, work, decode && !work, context};
-				tl->tokens[i] = t;
+		// The work of the list's HEVC decodes, held for the schedule to wait on its verdict
+		// (RgfxVideoStatus.hpp).
+		std::vector<void *> verdicts;
+		bool sent = true;
+		{
+			// One list of a context's at a time, so its pictures reach its session in AppleGVA's
+			// order: the schedule locks of the contexts the list names, taken in their order in
+			// memory. Another context's list goes on meanwhile, as a picture's work here can take
+			// milliseconds (the first textures over a new output surface wait for the host).
+			std::vector<Context *> contexts;
+			for (uint32_t i = 0; i < cl->count; i++) {
+				const Command *decode = decodeCommand(cl->commands[i]);
+				Context *context = decode ? (Context *)decode->context : nullptr;
+				if (context &&
+				    std::find(contexts.begin(), contexts.end(), context) == contexts.end())
+					contexts.push_back(context);
 			}
-			if (decode && rgfx::video::scheduleFails(work != nullptr, hostFailed)) {
-				scheduleFailed(hostFailed ? "an earlier decode of its session failed on the host"
-				                          : "the driver could not send it");
-				return rgfx::video::kNotSent;
+			std::sort(contexts.begin(), contexts.end(), std::less<Context *>());
+			std::vector<std::unique_lock<std::mutex>> holds;
+			holds.reserve(contexts.size());
+			for (Context *context : contexts)
+				holds.emplace_back(context->schedule);
+			for (uint32_t i = 0; i < cl->count && sent; i++) {
+				const Command *decode = decodeCommand(cl->commands[i]);
+				const Context *context = decode ? (const Context *)decode->context : nullptr;
+				void *work = decode ? decodePicture(decode) : nullptr;
+				{
+					std::lock_guard<std::mutex> tokens(g_tokenLock);
+					const uint64_t n = g_seqno++;
+					Token *t = &g_tokens[n % kTokens];
+					rgfx::video::releaseToken(t->work);
+					*t = {n, work};
+					tl->tokens[i] = t;
+				}
+				sent = !decode || work;
+				if (work && context && rgfx::video::waitsForHost(context->sub_id == kCodecHevc))
+					verdicts.push_back(rgfx::video::retainToken(work));
 			}
+		}
+		// Out of the lock, so other sessions' pictures go to the host meanwhile.
+		bool hostFailed = false;
+		for (void *work : verdicts) {
+			hostFailed = rgfx::video::waitToken(work) == -1 || hostFailed;
+			rgfx::video::releaseToken(work);
+		}
+		if (rgfx::video::scheduleFails(sent, hostFailed)) {
+			scheduleFailed(sent ? "the host failed its decode" : "the driver could not send it");
+			return rgfx::video::kNotSent;
 		}
 		return kOk;
 	}
@@ -1066,7 +1341,6 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 		QueryList *ql = (QueryList *)a1;
 		if (!ql || !ql->queries)
 			return kBadArgument;
-		std::vector<Context *> failed;
 		for (uint32_t i = 0; i < ql->count; i++) {
 			Query &q = ql->queries[i];
 			Token *t = (Token *)q.token;
@@ -1078,22 +1352,8 @@ uint64_t answer(int entry, uint64_t a0, uint64_t a1, uint64_t a2)
 				rgfx::video::releaseToken(t->work);
 				t->work = nullptr;
 			}
-			const rgfx::video::QueryReport report = rgfx::video::queryReport(status);
-			if (report.hostFailed && !t->failed && t->context) {
-				t->failed = true;
-				failed.push_back(t->context);
-			}
-			q.status = report.status;
+			q.status = rgfx::video::queryStatus(status);
 			q.field_14 = 0;
-		}
-		// The sessions of decodes that failed on the host, where they still are, fail their
-		// next schedule.
-		if (!failed.empty()) {
-			std::lock_guard<std::mutex> hold(g_sessionLock);
-			for (Context *context : failed)
-				for (Context *open : g_sessions)
-					if (open == context)
-						context->failed_on_host = true;
 		}
 		return kOk;
 	}

@@ -1,6 +1,8 @@
 // The native test of RgfxPagesBlock.hpp: a pages block's range rounded out to whole pages with
 // the call's offset in the first, its runs counted and then written as one per stretch of
-// contiguous segments, and its size in whole pages.
+// contiguous segments, and its size in whole pages; and a span's runs and length taken to the
+// end of its last 16 KiB page, as PAGES_16K names them; and how a block's pages are wired, and
+// marked, for memory the process maps writable or read-only.
 #include "RgfxPagesBlock.hpp"
 
 #include <cstdio>
@@ -80,6 +82,52 @@ int main()
 	check(rgfxPagesBlockSize(256, kPage) == kPage, "256 runs fill one");
 	check(rgfxPagesBlockSize(257, kPage) == 2 * kPage, "257 take two");
 	check(rgfxPagesBlockSize(1u << 24, kPage) == (1ull << 28), "a 64 GiB range of lone pages");
+
+	// PAGES_16K: a span named in whole 16 KiB pages, as the guest's IOSurfaces' lengths are not
+	// (0xfd2000 for 1920 x 1080 of 8 bytes, in 1013 runs whose last is 8 KiB).
+	check(rgfxToPageEnd(0xfd2000, kRgfxPage16K) == 0xfd4000, "a 1080p surface to its page's end");
+	check(rgfxToPageEnd(0x1000, kRgfxPage16K) == kRgfxPage16K, "a 4 KiB surface takes its page");
+	check(rgfxToPageEnd(0x8000, kRgfxPage16K) == 0x8000, "whole pages are themselves");
+	check(rgfxToPageEnd(0x1000, kPage) == 0x1000, "4 KiB pages leave 4 KiB lengths");
+	RgfxPageRun span[3] = {{0x8000'0000, 0x8000}, {0x9000'0000, 0x4000}, {0xa000'0000, 0x2000}};
+	rgfxRunsToPageEnd(span, 3, kRgfxPage16K);
+	check(span[0].address == 0x8000'0000 && span[0].length == 0x8000 &&
+	          span[1].address == 0x9000'0000 && span[1].length == 0x4000,
+	      "the runs before the last stay as they are");
+	check(span[2].address == 0xa000'0000 && span[2].length == 0x4000,
+	      "the last run ends at its page's end");
+	check(span[0].length + span[1].length + span[2].length ==
+	          rgfxToPageEnd(0x8000 + 0x4000 + 0x2000, kRgfxPage16K),
+	      "the runs cover the span's length taken to its page's end");
+	RgfxPageRun lone = {0x8000'2000, 0x1000};
+	rgfxRunsToPageEnd(&lone, 1, kRgfxPage16K);
+	check(lone.address == 0x8000'2000 && lone.length == 0x2000,
+	      "a run inside a page ends at that page's end, its start kept");
+	RgfxPageRun whole = {0x8000'0000, 0x4000};
+	rgfxRunsToPageEnd(&whole, 1, kRgfxPage16K);
+	check(whole.length == 0x4000, "a whole page stays whole");
+	rgfxRunsToPageEnd(nullptr, 0, kRgfxPage16K);
+
+	// Writable memory: wired for reading and writing, a block of the process's, whatever the
+	// word.
+	const uint64_t pagesWord = RGFX_FEATURE_PAGES_BUFFERS;
+	const uint64_t readOnlyWord = RGFX_FEATURE_PAGES_BUFFERS | RGFX_FEATURE_READ_ONLY_PAGES;
+	for (uint64_t word : {pagesWord, readOnlyWord}) {
+		const RgfxPagesWiring w = rgfxPagesWiring(true, word);
+		check(w.access == RgfxPagesAccess::kReadWrite && w.flags == RGFX_SURFACE_PAGES_PRIVATE,
+		      "writable memory is wired for reading and writing, unmarked");
+	}
+	// Read-only memory: wired for reading alone and marked read-only where the host took
+	// READ_ONLY_PAGES, which holds every object over the block to leave its pages as they are;
+	// else no block, as a host that does not know the mark would not hold it.
+	const RgfxPagesWiring ro = rgfxPagesWiring(false, readOnlyWord);
+	check(ro.access == RgfxPagesAccess::kRead &&
+	          ro.flags == (RGFX_SURFACE_PAGES_PRIVATE | RGFX_SURFACE_PAGES_READ_ONLY),
+	      "read-only memory is wired for reading alone, marked read-only");
+	check(rgfxPagesWiring(false, pagesWord).access == RgfxPagesAccess::kRefused,
+	      "read-only memory makes no block where the host did not take READ_ONLY_PAGES");
+	check(rgfxPagesWiring(false, 0).access == RgfxPagesAccess::kRefused,
+	      "nor with no feature at all");
 
 	std::printf("pages_block_test: OK (%d checks)\n", checks);
 	return 0;

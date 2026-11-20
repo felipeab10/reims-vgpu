@@ -185,6 +185,67 @@ void idsStayWithTheirModes()
 	check(m.modes[1].id == window, "the mode set's mode takes back its ID");
 }
 
+// The HiDPI flag is for the modes of a display on a host screen above 1x whose pixels halve
+// exactly, at any width: the window's on a screen at twice its points keeps it as it shrinks, one
+// on a screen at 1x never has it, and one of an odd size never does, which WindowServer would run
+// at half pixels.
+void hiDpiModesHalveExactly()
+{
+	constexpr uint32_t k1x = 120, k2x = 240, kKde = 252;
+	check(RgfxMode{0, 2880, 1800, 60000}.hiDpi(k2x), "2880x1800 at 2x");
+	check(RgfxMode{0, 3840, 2160, 60000}.hiDpi(k2x), "3840x2160 at 2x");
+	check(kWindow.hiDpi(kKde), "the window's 3840x2400 at 2.1x");
+	check(RgfxMode{0, 2878, 1800, 60000}.hiDpi(k2x), "below 2880 pixels wide at 2x");
+	check(RgfxMode{0, 2720, 1536, 60000}.hiDpi(kKde), "2720x1536 at 2.1x");
+	check(!RgfxMode{0, 3840, 2160, 60000}.hiDpi(k1x), "not 3840x2160 at 1x");
+	check(!kWindow.hiDpi(0), "not with no scale from the host");
+	check(!kOffered.hiDpi(0), "not the 1920x1080 offered before the window draws");
+	check(!RgfxMode{0, 3841, 2161, 60000}.hiDpi(k2x), "not an odd width and height");
+	check(!RgfxMode{0, 3662, 2039, 60000}.hiDpi(k2x), "not an odd height");
+	check(!RgfxMode{0, 3663, 2040, 60000}.hiDpi(k2x), "not an odd width");
+}
+
+// A mode the device no longer shows, which the framebuffer lists while it is the mode set, is
+// answered never shown and not valid, so no WindowServer restores it to a resized display; the
+// device's modes, and the mode set while the device shows it, keep their own flags.
+void aModeTheDeviceNoLongerShowsIsNeverShown()
+{
+	constexpr uint32_t kShownFlags = 0x02800007; // valid, safe, default, valid for HiDPI, native
+	check(rgfxListedModeFlags(kShownFlags, false) == kShownFlags, "a shown mode keeps its flags");
+	check(rgfxListedModeFlags(kShownFlags, true) == 0x80, "a stale one: never shown, no other flag");
+	check((rgfxListedModeFlags(0x00000003, true) & 0x7) == 0, "not valid, not safe, not default");
+
+	Modes none;
+	none.reset();
+	check(!none.stale(1), "before the device's first list nothing is stale");
+
+	Modes m = started(kWindow);
+	int32_t window = m.current.id;
+	check(!m.stale(window), "the mode set the device shows is not stale");
+	check(m.take(&kResized, 1, 0), "the resize is a change");
+	check(lists(m, window) && m.stale(window), "the old mode set is listed, and stale");
+	check(!m.stale(m.preferredId), "the device's new mode is not");
+	RgfxMode shown;
+	check(m.modeFor(m.preferredId, &shown), "the new mode has its information");
+	m.set(shown);
+	check(!lists(m, window) && !m.stale(m.current.id), "once set, the old one goes");
+	RgfxMode both[2] = {kResized, kWindow};
+	RgfxMode again;
+	check(m.take(both, 2, 0) && m.deviceMode(kWindow.width, kWindow.height, kWindow.refreshMhz,
+	                                          &again),
+	      "the device shows the window's size again");
+	check(!m.stale(again.id) && !m.stale(m.current.id), "neither is stale");
+
+	// A programmed timing of a size the device no longer shows is stale; one it shows is not.
+	Modes p = started(kWindow);
+	Timing timing = {3};
+	p.clearProgrammed();
+	check(p.addProgrammed(kProgrammed, kWindow, timing, kReservedBase), "the timing is programmed");
+	p.followProgrammed();
+	check(!p.stale(kProgrammed), "the programmed timing of the device's size is not stale");
+	check(p.take(&kResized, 1, 0) && p.stale(kProgrammed), "after the resize it is");
+}
+
 // A mode or depth the framebuffer does not hold is answered as Apple's paravirtual framebuffer
 // answers it: kIOReturnUnsupportedMode for the pixel information, kIOReturnError elsewhere.
 void anUnknownModeIsAnsweredAsApplesFramebufferDoes()
@@ -211,6 +272,8 @@ int main()
 	aChangeBetweenTheCurrentModeAndTheList();
 	aChangeAfterTheStartupModeIsSet();
 	idsStayWithTheirModes();
+	hiDpiModesHalveExactly();
+	aModeTheDeviceNoLongerShowsIsNeverShown();
 	anUnknownModeIsAnsweredAsApplesFramebufferDoes();
 	std::printf("display_modes_test: OK (%d checks)\n", checks);
 	return 0;

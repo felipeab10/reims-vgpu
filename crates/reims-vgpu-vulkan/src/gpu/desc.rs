@@ -1,7 +1,6 @@
-//! The descriptors core keeps as objects (D5): the texture descriptor, the render pass
-//! descriptor, and the pipeline descriptors Metal makes from serialized data. The runtime's
-//! descriptors are values, so each object holds its value behind a lock, which core's setters
-//! change in place.
+//! The descriptors core keeps as objects (D5): the texture descriptor and the render pass
+//! descriptor. The runtime's descriptors are values, so each object holds its value behind a lock,
+//! which core's setters change in place.
 //!
 //! **A texture descriptor** takes each raw value as the runtime's type at its setter, so a value
 //! the runtime cannot hold dies there, but where Metal's setter takes it and acts on it where a
@@ -89,7 +88,9 @@
 //!   RGBA8Unorm, RGBA16Float and Depth32Float compared). The texture's `usage` answers 0x4000,
 //!   0x8000 and 0x10000 among its bits and drops 0x8, and so do its views and a texture opened from
 //!   its shared handle: the runtime's texture keeps the four, answering its usage without 0x8, as
-//!   its views and shared opens do. A texture of 0x8 alone is no texture of `Unknown` usage: it
+//!   its views and shared opens do. A texture of `Unknown` usage answers `ShaderRead |
+//!   ShaderWrite | RenderTarget | PixelFormatView` (0x17), as Metal gives it, the runtime's
+//!   `effective_usage` (measured). A texture of 0x8 alone is no texture of `Unknown` usage: it
 //!   answers a usage of 0 and the heap's size query a compressed one's size (16512 bytes for a
 //!   64x64 BGRA8Unorm one in Private storage, where `Unknown` answers 16384), as a texture of
 //!   `ShaderRead` alone does, which reads, samples and renders alike (measured on the M3 Max under
@@ -112,27 +113,21 @@
 //! the pass by the map as the GPU runs it, and decides what it decides by the map's class at the
 //! encoder's creation ([`crate::gpu::rate_map`]).
 
-use metal2vulkan::metal::PixelFormat;
-use metal2vulkan::pipeline::{
-    ComputePipelineDescriptor, RenderPipelineDescriptor, TileRenderPipelineDescriptor,
-};
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::platform::Handle;
-use reims_vgpu_core::platform::descriptor::{
-    self, RenderPassDescriptor, TextureDescriptor, TileRenderPipelineDescriptor as TileTrait,
-};
-use reims_vgpu_core::platform::types::{ClearColor, MtlSamplePosition};
-use reims_vgpu_core::platform::values::TextureDesc;
-use reims_vgpu_core::platform::values::{
+use crate::core::platform::Handle;
+use crate::core::platform::descriptor::{RenderPassDescriptor, TextureDescriptor};
+use crate::core::platform::types::{ClearColor, MtlSamplePosition};
+use crate::core::platform::values::TextureDesc;
+use crate::core::platform::values::{
     AttachmentState, ColorAttachmentSet, DepthAttachmentSet, PassSet, StencilAttachmentSet,
 };
-use reims_vgpu_core::raise::{OnFault, RaiseResult};
-use reims_vgpu_core::sync::Mutex;
+use crate::core::raise::{OnFault, RaiseResult};
+use crate::core::sync::Mutex;
+use metal2vulkan::metal::PixelFormat;
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{Policy, metal_aborts, plain, send, unrepresentable};
 use crate::gpu::rate_map::VulkanRateMap;
-use crate::gpu::resource::{Under, VulkanBuffer, VulkanTexture};
-use crate::gpu::serialized::{Decoded, Ignored, RawFormat};
+use crate::gpu::resource::{OverSurface, Under, VulkanBuffer, VulkanTexture};
 use crate::gpu::{resource_options, texture_usage};
 use crate::platform::{Obj, VulkanPlatform};
 
@@ -232,7 +227,7 @@ pub(crate) fn lacked(sel: &'static str, raw: u64) -> ! {
     lacked_as(sel, "a texture of", raw, None)
 }
 
-/// Dies at `sel`, which makes `what` (`a texture of`, `a view of`, a state whose attachment is)
+/// Dies at `sel`, which makes `what` (`a texture of`, `a view of`)
 /// pixel format `raw`, which the runtime cannot make: named, with Metal's description's name for
 /// it, where Metal describes the format, and as Metal's abort where it describes none. `refusal`
 /// is the runtime's, where it refused the format ([`format_refused`]); without one, the value is
@@ -606,8 +601,8 @@ impl RawPass {
 }
 
 /// An attachment's texture or resolve texture as core set it, beyond the runtime's texture the
-/// attachment holds: whether a pass's writes through it reach its memory
-/// ([`Source::gpu_read_only`]). The default is nil's.
+/// attachment holds: whether its texels lie in read-only memory ([`Source::writes_kept`]), and
+/// what they lie in ([`Source::over`]). The default is nil's.
 #[derive(Debug, Default)]
 pub struct Source(Option<VulkanTexture>);
 
@@ -618,14 +613,8 @@ impl Clone for Source {
 }
 
 impl Source {
-    /// Whether the GPU's writes to its texels never reach their memory
-    /// ([`crate::gpu::resource::TextureObject::gpu_read_only()`]).
-    pub fn gpu_read_only(&self) -> bool {
-        self.0.as_ref().is_some_and(|t| t.gpu_read_only())
-    }
-
-    /// Whether the GPU's writes to its texels reach read-only memory, where Metal's drop them
-    /// ([`crate::gpu::writes::texture_kept`]).
+    /// Whether its texels lie in read-only memory whose writes this platform does not answer as
+    /// Metal's GPU does ([`crate::gpu::writes::texture_kept`]).
     pub fn writes_kept(&self) -> bool {
         (self.0.as_ref()).is_some_and(|t| crate::gpu::writes::texture_kept(t))
     }
@@ -638,14 +627,16 @@ impl Source {
     /// What its texture's texels lie in, as far as a pass tells them apart; `None` for nil.
     pub fn over(&self) -> Option<Over> {
         let t = self.0.as_ref()?;
-        Some(match (&t.under, &t.plane) {
+        Some(match &t.under {
             _ if t.raw.parent_texture().is_some() => Over::View,
-            (Some(Under::Buffer(..)), _) => Over::Buffer,
-            (Some(Under::Heap(..)), _) => Over::Heap,
-            (None, Some(plane)) if plane.planar => Over::Plane,
-            (None, Some(_)) => Over::Surface,
-            (None, None) if t.raw.is_shareable() => Over::Shareable,
-            (None, None) => Over::Own,
+            Some(Under::Buffer(..)) => match t.surface {
+                Some(OverSurface::Whole) => Over::Surface,
+                Some(OverSurface::Plane) => Over::Plane,
+                None => Over::Buffer,
+            },
+            Some(Under::Heap(..)) => Over::Heap,
+            None if t.raw.is_shareable() => Over::Shareable,
+            None => Over::Own,
         })
     }
 }
@@ -658,9 +649,10 @@ pub enum Over {
     /// Memory of its own, shareable: a texture of `newSharedTextureWithDescriptor:`, or one
     /// opened from its handle.
     Shareable,
-    /// An IOSurface without planes (`newTextureWithDescriptor:iosurface:plane:` at its plane 0).
+    /// An IOSurface without planes (`newTextureWithDescriptor:iosurface:plane:` at its plane 0,
+    /// over a buffer that stands for the surface).
     Surface,
-    /// A plane of an IOSurface with planes.
+    /// A plane of an IOSurface with planes, over a buffer that stands for the surface.
     Plane,
     /// A buffer's bytes (`newTextureWithDescriptor:offset:bytesPerRow:`).
     Buffer,
@@ -713,61 +705,6 @@ impl Clone for Sources {
 
 /// `MTLRenderPassDescriptor *`.
 pub type VulkanRenderPassDescriptor = Obj<RenderPassDescriptorObject>;
-
-/// A pipeline descriptor Metal makes from serialized data ([`crate::gpu::serialized`]): the
-/// translator's descriptor, the resource index core sets on it (`setResourceIndex:` then
-/// `setForceResourceIndex:`), and the blob's entries Metal ignores.
-#[derive(Debug)]
-pub struct PipelineDescriptorObject<D> {
-    /// The descriptor.
-    pub desc: Mutex<D>,
-    /// The resource index and its force flag, when set.
-    pub resource_index: Mutex<Option<(u64, bool)>>,
-    /// The entries of keys the format does not define, as the blob had them, the first
-    /// [`crate::gpu::serialized::KEPT_IGNORED`] alone: Metal ignores them.
-    pub ignored: Vec<Ignored>,
-    /// Whether the blob's `textureWriteRoundingMode` is `NEAREST_EVEN` (render blobs alone),
-    /// which a state made from it is decided for ([`crate::gpu::serialized`]).
-    pub nearest_even: bool,
-    /// The blob's label, if it has one, which a state made from the descriptor takes.
-    pub label: Option<String>,
-    /// A pixel format of the blob's the runtime holds raw, which the state's creation dies at.
-    pub raw_format: Option<RawFormat>,
-}
-
-impl<D> PipelineDescriptorObject<D> {
-    /// A descriptor decoded from a blob, with no resource index set.
-    pub fn new(decoded: Decoded<D>) -> PipelineDescriptorObject<D> {
-        PipelineDescriptorObject {
-            desc: Mutex::new(decoded.desc),
-            resource_index: Mutex::new(None),
-            ignored: decoded.ignored,
-            nearest_even: decoded.nearest_even,
-            label: decoded.label,
-            raw_format: decoded.raw_format,
-        }
-    }
-
-    /// Where a state made from the descriptor goes among the pipeline states' IDs: at the
-    /// resource index core set, forced or not (Metal places the state either way, the runtime's
-    /// `PipelineOptions::placement` says), else where the runtime picks.
-    pub fn placement(&self) -> rt::IdPlacement {
-        match *self.resource_index.lock() {
-            Some((index, _)) => rt::IdPlacement::At(rt::ResourceId(index)),
-            None => rt::IdPlacement::Any,
-        }
-    }
-}
-
-/// `MTLRenderPipelineDescriptor *`.
-pub type VulkanRenderPipelineDescriptor = Obj<PipelineDescriptorObject<RenderPipelineDescriptor>>;
-
-/// `MTLComputePipelineDescriptor *`.
-pub type VulkanComputePipelineDescriptor = Obj<PipelineDescriptorObject<ComputePipelineDescriptor>>;
-
-/// `MTLTileRenderPipelineDescriptor *`.
-pub type VulkanTileRenderPipelineDescriptor =
-    Obj<PipelineDescriptorObject<TileRenderPipelineDescriptor>>;
 
 impl TextureDescriptor<VulkanPlatform> for VulkanTextureDescriptor {
     fn set_resource_options(&self, options: u64) {
@@ -1158,21 +1095,3 @@ impl RenderPassDescriptor<VulkanPlatform> for VulkanRenderPassDescriptor {
         attachment_state(&raw, STENCIL, a.load_action, a.store_action)
     }
 }
-
-/// Kept for the state's creation, which places the state there
-/// ([`PipelineDescriptorObject::placement`]).
-impl descriptor::RenderPipelineDescriptor<VulkanPlatform> for VulkanRenderPipelineDescriptor {
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        plain(|| *self.resource_index.lock() = Some((resource_index, force)));
-    }
-}
-
-/// Kept for the state's creation, which places the state there
-/// ([`PipelineDescriptorObject::placement`]).
-impl descriptor::ComputePipelineDescriptor<VulkanPlatform> for VulkanComputePipelineDescriptor {
-    fn set_resource_index(&self, resource_index: u64, force: bool) {
-        plain(|| *self.resource_index.lock() = Some((resource_index, force)));
-    }
-}
-
-impl TileTrait<VulkanPlatform> for VulkanTileRenderPipelineDescriptor {}

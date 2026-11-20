@@ -9,24 +9,25 @@
 //!   (`blended-write-rounding`, relayed, a death in strict mode) and refuses a fragment
 //!   function's half-float and small-float texture writes, which die at their selector; a
 //!   half-float attachment it is not measured to store as Metal does is relayed as the state is
-//!   made, a death in strict mode ([`crate::gpu::serialized::rounded_writes`])), and, in
+//!   made, a death in strict mode), and, in
 //!   [`crate::gpu::format_info`], Apple's private pixel format description and level layout
 //!   (`Device::pixel_format_info`, `Device::texture_level_info`);
 //! - **the runtime's answer of Apple's private property** on the device
 //!   (`Device::private_properties`), read from what the runtime acts on: its argument tables'
 //!   entries, the texture sides and layers its descriptors take (Metal's, or the device's where
 //!   they are fewer), its viewports, its threadgroup memory table and alignment, its rate maps'
-//!   layers, the compile layer's threads per threadgroup, the linear and IOSurface alignment it
-//!   places textures at, and whether it takes a buffer's attribute stride per bind
-//!   (`supportsDynamicAttributeStride`: on every device, through the pipeline's static stride or
-//!   vertex pulling where the device lacks `VK_EXT_extended_dynamic_state`): [`computed`];
+//!   layers, the compile layer's threads per threadgroup, the linear alignment at which the
+//!   device's images hold a texture over a buffer in place (the largest of the formats'), the
+//!   IOSurface alignment it places textures at, and whether it takes a buffer's attribute stride
+//!   per bind (`supportsDynamicAttributeStride`: on every device, through the pipeline's static
+//!   stride or vertex pulling where the device lacks `VK_EXT_extended_dynamic_state`):
+//!   [`computed`];
 //! - **computed from documented facts** the runtime gives (its device's Vulkan description, the
 //!   compile layer's `MetalDeviceProperties`), for the other private properties: [`computed`];
 //! - **a stand-in** where no documented fact gives the answer, or where the runtime's answer is
-//!   not Metal's and the guest or the host sees it: the Metal platform's answer on the host the
-//!   stand-ins were read on, an Apple M3 Max (`stand_ins_are_the_metal_platforms_here` checks them
-//!   against the Metal platform on the host it runs on), but for the registry ID, which Metal
-//!   answers at run time on the host the library runs on.
+//!   not Metal's and the guest or the host sees it: Metal's answer on the host the stand-ins were
+//!   read on, an Apple M3 Max, but for the registry ID, which Metal answers at run time on the
+//!   host the library runs on.
 //!
 //! **This table lists every stand-in of the crate**, the `DeviceCaps` answers read here and the
 //! answers other modules give from Metal on the M3 Max, each beside the code that answers it:
@@ -37,12 +38,13 @@
 //! | `supportsFamily:` of Apple5 to Apple10, -1009 | yes, yes, yes, yes, yes, no, no | the runtime claims a family only where every row of Apple's table is exact, and claims none on MoltenVK. **Pending support** (below): what a family promises that the runtime refuses dies at its selector |
 //! | `supportsExtendedXR10Formats` | yes | **pending support** (below): the runtime makes textures of the XR10 formats (550 to 555), in heaps too, and of format 84 (plane 1's view format of the two-plane XR10 textures, 550 and 551), reads and writes them in kernels, samples them in 2D and gathers 552 to 555 as floats, unswizzled and under the four swizzles of the texture or a view the tests read through (`rgbx`'s `XR_SWIZZLES`, which move, repeat, drop and replace channels; no other swizzle is measured), as Metal does on the M3 (`rgbx`'s `extended_range_textures_read_as_metals`), reads 552 and 554 through an argument buffer as Metal does, and samples and gathers them so as Metal does through a sampler of one filter and no mip filter, samples other textures through one as Metal does while one lives that the command does not reach, and dies, naming the runtime's refusal, at a command that samples or gathers one it reaches (names or makes resident) through an argument buffer otherwise (a sampler of a mip filter among them), or reads an `_sRGB` twin or a swizzled one so (`rgbx`'s `extended_range_textures_an_argument_buffer_holds_read_as_metals`), copies 550's and 551's colour words to and from the CPU and buffers as Metal does, and renders to one where the fragment function writes all of its channels or none. It blends a `half4` output, and a `float4` one, into one in the shader, by its model of Metal's blend, and reads one it blends by framebuffer fetch. The model holds without fast math, each product rounded to `half` as Metal's compiler does there (`encode_render`'s `float4_extended_range_blends_are_metals_here` and `half4_extended_range_blends_are_metals_without_fast_math` compare `float4` and `half4` outputs with Metal across passes, into each linear form and each `_sRGB` twin), and under fast math for an output each of whose lanes is a load; where Metal may round the blend's source otherwise, under fast math an output the function computes, or a module that names no math mode, the render state announces the output's kind: for a `half4` one `extended-range-blend-source`, which the device relays for its reach ([`crate::answer`]): a computed `half4` misses Metal's by one code of a channel at 13 of the 66 blended configurations the tests draw, at 130 to 483 of 4096 texels each (`half4_extended_range_blends_announce_their_source`); for a `float4` one `extended-range-float-blend-source`, which the runtime announces at each draw that binds the state's variant, where the draw dies (the state is made), where a computed `float4` missed Metal's at 17 of the 66 (`float4_extended_range_blends_die_naming_their_source`). The tests draw the 22 blends of `XR_BLENDS` into each linear form and the 8 of `XR_SRGB_BLENDS` into each `_sRGB` twin; without fast math, where the runtime also draws a blend by the blend colour under a difference, and any blend into an `_sRGB` twin, they draw those of `XR_CONSTANT_DIFFERENCES` into each form and the rest of `XR_BLENDS` into each twin as Metal does (`extended_range_blends_drawn_without_fast_math_alone_are_metals`), and into each form and twin six blends under write masks of one colour channel and of two as Metal does, and a function's two outputs into colour 0, unblended, storing the first output's values as Metal does, the second nowhere, and without fast math under six blends of the second source as Metal does (`extended_range_masked_blends_and_two_output_states_are_metals`); the others are not measured. A draw that blends into or reads an attachment an earlier draw of its pass may have written, or that its `Clear` left between two codes, reads the `half` values the runtime holds through a pass of one sample and one layer without a rasterization-rate map, as Metal's tile memory does, announcing nothing, so its blends in one pass are Metal's (`encode_render`'s `float4_extended_range_blends_are_metals_here`, `a_blend_onto_a_clear_between_codes_is_metals`); otherwise (another such pass, after an execution of render commands or a tile dispatch, where an earlier render pass instance of the pass wrote the attachment, or a draw whose pipeline has no shadowed form) it sees the codes the runtime stored, where Metal holds the value through the pass, which the runtime announces and the device relays (`extended-range-blends-stored-codes`). A multisampled render target of one resolves by the runtime's own resolve of its codes after the pass: `BGR10_XR`'s and `BGRA10_XR`'s colour as Metal's, an alpha within a code and an `_sRGB` twin's colour within 7 (`encode_render`'s `drawn_extended_range_samples_resolve_as_metals`), which the runtime announces and the device relays (`extended-range-resolve`). The runtime refuses the rest, which dies at its selector; among it a render target of one unblended under a mask of some of its channels, blended under fast math under a mask of one colour channel, by a factor of the second source, by the blend colour under a difference, into an `_sRGB` form beyond the blends the runtime measured, or a `float4` output into one but by a blend whose colour lanes take one term alone, or from an output other than four `half` or `float` lanes; a state of a function that returns two outputs into colour 0 (a second, index 1, as a blend of the second source reads), blended by factors of the second source under fast math (`ExtendedRangeBlend(DualSource)`); a gather of 550 or 551, or as halves; and 550's and 551's views of another format, mipmaps, textures over a buffer and copies of a layout it has not measured; a copy between two textures of 550 or 551 dies at its selector too, whose alpha plane the runtime copies otherwise than Metal ([`crate::gpu::encode_blit`]) |
 //! | `supports_float16_bcubic_filtering` | yes | undocumented, unmeasured |
+//! | `minimumLinearTextureAlignmentForPixelFormat:` of `BGRA8Unorm`, and `minimumTextureBufferAlignmentForPixelFormat:` of each format a texture buffer takes ([`crate::gpu::identity`]) | 16 bytes, Metal's answer for every format a buffer backs (measured on the M3 Max and the M4), and the runtime's refusal of the others: a compressed, depth or stencil format, or one Metal describes none of ([`linear_alignment`]) | the runtime answers the alignment at which the device's images hold a texture over a buffer in place, at least Metal's (`Device::minimum_linear_texture_alignment_for_pixel_format`: 256 for most formats on RADV, 64 on lavapipe, 16 on MoltenVK), and the guest's frameworks lay out their linear textures and texture buffers by it: an answer stays as it was until the guests boot with the new one |
 //! | `is_rgb10a2_gamma_supported` (key 8) | yes | **pending support** (below): the runtime holds no texture of `RGB10A2Unorm_sRGB` (586), which Metal makes, so it answers no on every device (`Device::private_properties`), and a texture of it dies where it is made (measured on the M3 Max, of `ShaderRead` usage and of `ShaderRead` and `RenderTarget`) |
 //! | `is_large_mrt_supported`, `supports_conditional_load_store`, `supports_compute_compressed_texture_write` | yes, yes, no: Metal's answers, as the runtime records them (`PrivateAnswer::Metal`) | undocumented, unmeasured: the runtime has no answer of the device's for them |
 //! | `supports_texture_2d_multisample_array` | yes | undocumented |
 //! | `supportsPrimitiveType:` of the raw values 5 to 9 | yes, yes, yes, yes, no | no public `MTLPrimitiveType` is one; the runtime draws 5 to 8 as Metal does (`rt::DrawPrimitiveType`). **Pending support** (below): a draw of one the runtime cannot draw as Metal does, which it refuses, dies at the draw's selector (`encode_render`) |
-//! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536, Metal's answer, as the runtime records it (`PrivateAnswer::Metal`) | undocumented, and not the public `maxThreadgroupMemoryLength` (32768 on both platforms, the runtime's answer) |
-//! | `maxVertexAmplificationCount` (private, key 20) | 2, Metal's answer as the runtime records it (`PrivateAnswer::Metal`), or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on both platforms |
+//! | `maxComputeThreadgroupMemory` (Apple's private property, the guest's device-info key 31) | 65536, Metal's answer, as the runtime records it (`PrivateAnswer::Metal`) | undocumented, and not the public `maxThreadgroupMemoryLength` (32768, Metal's answer and the runtime's) |
+//! | `maxVertexAmplificationCount` (private, key 20) | 2, Metal's answer as the runtime records it (`PrivateAnswer::Metal`), or the largest count the public `supportsVertexAmplificationCount:` takes where that is less | undocumented: the public query takes 1 to 8 on Metal and on the runtime |
 //! | `supportsTileShaders`, `supportsNonSquareTileShaders`, `supportsImageBlocks` (private, keys 23 and 24) | yes | the runtime makes tile pipelines and imageblocks, a `half4` member over `RGBA8Unorm` among them. **Pending support** (below): it answers no on every device (`Device::private_properties`), as its audit of Apple9 refuses part of each row (`TileShaders` and `NonsquareTileDispatch` tile shading it has not built, `Imageblocks` imageblock masters), which dies at its selector |
 //! | the address an indirect command's arguments answer for a nil patch or control-point index buffer (`icb::NIL_BUFFER_ADDRESS`) | `0x1eeee1111` | Metal's private getters' answer, which no record holds |
 //!
@@ -71,12 +73,16 @@
 //!   as Metal answers it, a constant one and a runtime one. A guest told yes where a row is not
 //!   exact picks work that Metal runs and the runtime refuses or runs otherwise; told no, it
 //!   never makes that pipeline;
-//! - buffers and heaps over address ranges and detach backing (key 33's 0x8 and 0x10, and key 42,
-//!   which core sets from detach backing, not from the argument buffer tier) are yes where the
-//!   runtime imports host memory (`VK_EXT_external_memory_host`), which every heap over address
-//!   ranges and every replace of a detached backing is made over ([`crate::gpu::backing`]), as
-//!   on MoltenVK, where they are Metal's answers. A submission that uses a detached buffer or
-//!   heap fails as Metal's does; [`crate::gpu::command`]'s docs list where it differs;
+//! - buffers and heaps over address ranges are no, as the AMD Radeon Pro 5300M and the Intel UHD
+//!   630 answer (measured, macOS 26.7.1), where the M3 Max answers yes: this platform makes
+//!   neither, and the guest's bundle refuses a buffer descriptor with address ranges, its
+//!   answers to both selectors IOGPU's base device's (no on every guest measured), so nothing a
+//!   guest reads changes with these;
+//! - `supportsResourceDetachBacking` is no, as the AMD Radeon Pro 5300M and the Intel UHD 630
+//!   answer (measured, macOS 26.7.1), where the M3 Max answers yes: nothing detaches or replaces
+//!   a backing. This platform does neither, and the guest's heaps answer neither (the Metal
+//!   bundle's `RgfxHeap` raises an unrecognized selector, as Metal's base heap), so the bundle
+//!   answers no as well;
 //! - `heapTextureSizeAndAlignWithDescriptor:` of a depth or stencil texture with
 //!   `allowGPUOptimizedContents` off answers Metal's size, the runtime's model of Metal's answer,
 //!   which answers an X32_Stencil8 texture as a Stencil8 one of its shape, as the runtime's own
@@ -113,8 +119,7 @@
 //!   over a living one's does, the heap's cover, the buffer over all of it core makes with each
 //!   heap, included: such a texture dies in every heap core makes
 //!   ([`crate::gpu::resource::Placements`]); the heap's bytes there, read through the heap's
-//!   address, a replaced backing or the guest's pages under a heap over address ranges, are not its
-//!   texels either;
+//!   address or the guest's memory under a heap over it, are not its texels either;
 //! - a two-plane XR10 texture (550, 551) over plane 0 of a 'b3a8' surface is the runtime's, its
 //!   colour words in plane 0 and its alpha bytes in plane 1, read, sampled, cleared, filled and
 //!   copied to and from another texture of the format as Metal's (the tests compare them over the
@@ -147,28 +152,24 @@
 //! pinned runtime, which announces the layouts of a texture placed in a heap over no address
 //! ranges, whose bytes core copies to and from the guest's pages, that are not Metal's there
 //! (`heap-texture-untiled-layout`, `heap-texture-lossless-layout`, relayed). On Linux, read-only
-//! memory (a range core maps read-only, as the EFI framebuffer; the alias of a
-//! read-only replace or heap; a surface the GPU only reads) the runtime imports through a
-//! writable twin of its pages, as Linux drivers pin imported pages for writing: the GPU reads
-//! what Metal's reads, and its writes would reach the pages, where Metal drops them. Every
-//! command that may write through an object over such an import dies where it is encoded
-//! (`crate::gpu::writes::kept_write`; `resource`'s
-//! `a_fill_into_read_only_pages_dies_on_linux`), but a function's write through an address it
-//! loads into one not made resident for writing, which names nothing.
+//! memory (the guest's read-only objects, a heap or no-copy buffer made with bit 24, and a no-copy
+//! buffer or heap over pages mapped read-only) the runtime makes over a copy whose GPU writes it
+//! drops, announced (`copied-host-pages`), and what Metal answers otherwise there is
+//! `crate::gpu::writes`'s.
 
 use std::sync::Arc;
 
-use metal2vulkan::device::{VkExtension, VkFeature};
-use metal2vulkan::error::Feature;
-use metal2vulkan::metal::PixelFormat;
-use metal2vulkan_runtime as rt;
-use reims_vgpu_core::num::ToU64;
-use reims_vgpu_core::platform::caps::{
+use crate::core::num::ToU64;
+use crate::core::platform::caps::{
     DeviceCaps, FAMILIES, Flags, HEAP_QUERY_OPTIONS, Limits, PRIMITIVE_TYPE_COUNT, SAMPLE_COUNTS,
     WRITE_ROUNDING_MODES,
 };
-use reims_vgpu_core::platform::types::{MtlSize, SizeAndAlign};
-use reims_vgpu_core::raise::RaiseResult;
+use crate::core::platform::types::{MtlSize, SizeAndAlign};
+use crate::core::raise::RaiseResult;
+use metal2vulkan::device::VkFeature;
+use metal2vulkan::error::Feature;
+use metal2vulkan::metal::PixelFormat;
+use metal2vulkan_runtime as rt;
 
 use crate::answer::{Policy, refused, send};
 use crate::gpu::resource_options;
@@ -177,7 +178,7 @@ use crate::gpu::resource_options;
 /// runtime draws.
 const PUBLIC_PRIMITIVE_TYPES: u64 = 5;
 
-/// The stand-ins: the Metal platform's answers on an Apple M3 Max, where no documented fact
+/// The stand-ins: Metal's answers on an Apple M3 Max, where no documented fact
 /// gives one (the module's table). The registry ID, which Metal answers at run time, is the
 /// OS's ([`crate::os::default_registry_id`]).
 pub mod stand_in {
@@ -275,10 +276,6 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         props.supports_vertex_amplification_count(count)
     });
     let [simd_reduction, simd_shuffle_and_fill] = simd_rows_exact(device);
-    let imports_host_memory = device
-        .enabled()
-        .extensions
-        .contains(&VkExtension::ExtExternalMemoryHost);
     let refuses = |feature: Feature| {
         metal
             .unsupported_features
@@ -341,8 +338,9 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         is_framebuffer_read_supported: !refuses(Feature::FramebufferFetch),
         is_large_mrt_supported: flag(F::IsLargeMrtSupported),
         is_rgb10a2_gamma_supported: stand_in::RGB10A2_GAMMA,
-        supports_buffer_with_address_ranges: imports_host_memory,
-        // This platform makes a buffer at an IOSurface's base (`new_buffer_on_surface`).
+        supports_buffer_with_address_ranges: false,
+        // The guest makes a buffer over a surface's pages through the reims-graphics device
+        // (`RgfxBufferOverSurfacePages`), which this platform makes as any no-copy buffer.
         supports_buffer_with_iosurface: true,
         // The adapter builds command predication (`predication`).
         supports_command_buffer_jump: true,
@@ -351,7 +349,7 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
         supports_dynamic_attribute_stride: flag(F::SupportsDynamicAttributeStride),
         supports_extended_xr10_formats: stand_in::EXTENDED_XR10_FORMATS,
         supports_float16_bcubic_filtering: stand_in::FLOAT16_BCUBIC_FILTERING,
-        supports_heap_with_address_ranges: imports_host_memory,
+        supports_heap_with_address_ranges: false,
         supports_image_blocks: stand_in::IMAGE_BLOCKS,
         supports_memory_order_atomics: memory_order_atomics(private),
         supports_native_hardware_fp16: props.description.has(VkFeature::ShaderFloat16),
@@ -360,7 +358,8 @@ fn computed(device: &rt::Device, private: &rt::PrivateProperties) -> (u64, Limit
             "areProgrammableSamplePositionsSupported",
             props.are_programmable_sample_positions_supported(),
         ),
-        supports_resource_detach_backing: imports_host_memory,
+        // Nothing detaches or replaces a backing (the module's docs).
+        supports_resource_detach_backing: false,
         // The runtime's shared texture handle, in this process.
         supports_shared_texture_handles: true,
         supports_simd_reduction: simd_reduction,
@@ -401,6 +400,26 @@ fn gpu_core_count(name: &str, reported: Option<u32>, registry_id: u64) -> Option
         );
     }
     count
+}
+
+/// Metal's `minimumLinearTextureAlignmentForPixelFormat:` on an Apple GPU, the M3 Max's and the
+/// M4's, for every pixel format a buffer backs: a stand-in (the module's table). It is also the
+/// alignment the runtime holds a texture's rows over a buffer or a plane of an IOSurface without
+/// planes to, as Metal does (`BufferTextureProblem::RowPitchAlignment`), which a device cache laid
+/// out at the GPU's pitch has its rows meet (`GpuDevice::linear_rows_pitch`).
+pub(crate) const METAL_LINEAR_ALIGNMENT: u64 = 16;
+
+/// `minimumLinearTextureAlignmentForPixelFormat:` of `pf` as this platform answers it, a stand-in
+/// (the module's table): [`METAL_LINEAR_ALIGNMENT`] for each format the runtime's query answers,
+/// and the runtime's refusal of the others (`Invalid`, `BufferTextureProblem::NotLinear`: a
+/// compressed, depth or stencil format, or one Metal describes none of, at which Metal's query
+/// asserts). The runtime's own answer, the device's, is not taken here: the guest's IOSurface
+/// aligns the rows of the surfaces it lays out to it instead, where they lie in place in their
+/// pages (`GpuDevice::linear_row_alignment`).
+pub(crate) fn linear_alignment(device: &rt::Device, pf: PixelFormat) -> Result<u64, rt::Error> {
+    device
+        .minimum_linear_texture_alignment_for_pixel_format(pf)
+        .map(|_| METAL_LINEAR_ALIGNMENT)
 }
 
 /// `heapBufferSizeAndAlignWithLength:options:` of (`length`, `options`).
@@ -463,7 +482,7 @@ pub fn read(device: &rt::Device, registry_id: u64, page_size: u64) -> Arc<Device
         min_linear_alignment_bgra8: send(
             "minimumLinearTextureAlignmentForPixelFormat:",
             Policy::Caught,
-            || props.minimum_linear_texture_alignment_for_pixel_format(PixelFormat::BGRA8Unorm),
+            || linear_alignment(device, PixelFormat::BGRA8Unorm),
         ),
     })
 }
@@ -474,7 +493,7 @@ const _: () = assert!(PRIMITIVE_TYPE_COUNT == PUBLIC_PRIMITIVE_TYPES + 5);
 
 #[cfg(test)]
 mod tests {
-    use reims_vgpu_core::platform::device::GpuDevice;
+    use crate::core::platform::device::GpuDevice;
 
     use super::*;
     use crate::gpu::device::tests::dev;
@@ -514,10 +533,10 @@ mod tests {
     }
 
     /// Every count but four, and `supportsDynamicAttributeStride`, is the runtime's answer on
-    /// the device, read from what it acts on (`Device::private_properties`); the others are the
-    /// module's stand-ins, this platform's own (`gpuCoreCount`, predication, buffers and heaps
-    /// over address ranges and surfaces) or computed from the compile layer, each where its row
-    /// says
+    /// the device, read from what it acts on (`Device::private_properties`), no more than Metal's
+    /// but for an alignment, at least Metal's; the others are the module's stand-ins, this
+    /// platform's own (`gpuCoreCount`, predication, buffers and heaps over address ranges and
+    /// surfaces) or computed from the compile layer, each where its row says
     #[test]
     fn private_properties_are_the_runtimes_where_it_answers_them() {
         use rt::PrivateCount as C;
@@ -565,11 +584,27 @@ mod tests {
             };
             let answer = private.count(property);
             assert_eq!(Some(ours), answer.value(), "{}", property.selector());
-            assert!(
-                ours <= answer.metal(),
-                "{}: past Metal's",
-                property.selector()
-            );
+            // A texture's row alignment, linear or an IOSurface's, is the device's images' (256 on
+            // RADV), past Metal's 16.
+            if matches!(
+                property,
+                C::DeviceLinearTextureAlignmentBytes
+                    | C::LinearTextureAlignmentBytes
+                    | C::IosurfaceTextureAlignmentBytes
+                    | C::IosurfaceReadOnlyTextureAlignmentBytes
+            ) {
+                assert!(
+                    ours >= answer.metal(),
+                    "{}: below Metal's",
+                    property.selector()
+                );
+            } else {
+                assert!(
+                    ours <= answer.metal(),
+                    "{}: past Metal's",
+                    property.selector()
+                );
+            }
         }
         assert_eq!(
             Some(caps.flags.supports_dynamic_attribute_stride),

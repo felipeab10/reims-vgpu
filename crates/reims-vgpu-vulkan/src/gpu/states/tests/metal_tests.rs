@@ -2,53 +2,13 @@
 
 use super::*;
 
-/// A format the functions cannot write is the NSError Metal hands back; so is a nil
-/// descriptor, of Metal's code and text for one at each creator (compared on the host) in the
-/// runtime's domain
-#[test]
-fn guest_descriptor_refusals() {
-    let d = dev();
-    let functions = display_functions(&d);
-    let integer = guest_descriptor(&functions, PixelFormat::R32Uint, None);
-    let error = d
-        .new_render_pipeline_state_from_descriptor(Some(&integer), 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(error.domain, "metal2vulkan-runtime");
-    let nil = d
-        .new_render_pipeline_state_from_descriptor(None, 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(nil, nil_pipeline_descriptor());
-    let nil = d
-        .new_tile_render_pipeline_state(None, 0)
-        .unwrap()
-        .unwrap_err();
-    assert_eq!(nil, nil_pipeline_descriptor());
-    assert_eq!(nil.domain, crate::answer::RUNTIME_DOMAIN);
-    if let Some(md) = reims_vgpu_metal::MetalPlatform::system_default_device() {
-        let errors = [
-            md.new_compute_pipeline_state(None, 0).unwrap().err(),
-            md.new_render_pipeline_state_from_descriptor(None, 0)
-                .unwrap()
-                .err(),
-            md.new_tile_render_pipeline_state(None, 0).unwrap().err(),
-        ];
-        for error in errors {
-            let error = error.unwrap();
-            assert_eq!(error.code, nil.code, "{error}");
-            assert!(error.description.contains(&nil.description), "{error}");
-        }
-    }
-}
-
 /// `numbered_samplers.metal`'s functions, compiled by build.rs.
 const NUMBERED: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/numbered_samplers.metallib"));
 
 /// `f`'s value, made inside an autorelease pool of its own, as core runs each unit of work:
 /// what Metal autoreleases inside it goes at its end.
 fn pooled<T>(f: impl FnOnce() -> T) -> T {
-    let _pool = reims_vgpu_core::rt::Pool::here();
+    let _pool = crate::core::rt::Pool::here();
     f()
 }
 
@@ -57,8 +17,8 @@ fn pooled<T>(f: impl FnOnce() -> T) -> T {
 /// device's own sampler ID for good: at each step a sampler state of a descriptor no other
 /// equals is made and kept to the end, so it takes the lowest ID no holder holds, and its
 /// `gpuResourceID` is read. Each creation and release runs in a pool of its own.
-fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&'static str, u64)> {
-    use reims_vgpu_core::platform::values::RenderPipelineDesc;
+fn numbered_ids<P: crate::core::platform::Platform>(d: &P::Device) -> Vec<(&'static str, u64)> {
+    use crate::core::platform::values::RenderPipelineDesc;
     let _queue = pooled(|| d.new_command_queue().unwrap());
     let mut kept: Vec<P::SamplerState> = Vec::new();
     let mut ids = Vec::new();
@@ -139,7 +99,6 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
         vertex: &v,
         fragment: &fr,
         color0_pixel_format: 80,
-        blend_over: false,
         resource_index: None,
     };
     let r = pooled(|| d.new_render_pipeline_state(&desc).unwrap().unwrap());
@@ -159,18 +118,12 @@ fn numbered_ids<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> Vec<(&
 /// (made before the state or after it, past its library) and by every live library of the same
 /// bytes, and given back with its last holder, as Metal's are on this host. This platform's
 /// objects hold the runtime's libraries and functions exactly as long as the guest's handles
-/// to them live, which this checks. Metal's side runs first, before MoltenVK makes objects of
-/// its own on Metal's device
+/// to them live, which this checks
 #[test]
 fn sampler_ids_follow_pipeline_holders_as_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    reims_vgpu_metal::os::autorelease::install();
-    let theirs =
-        MetalPlatform::system_default_device().map(|md| numbered_ids::<MetalPlatform>(&md));
+    crate::os::install_process_services();
     let ours = numbered_ids::<VulkanPlatform>(&dev());
-    if let Some(theirs) = theirs {
-        assert_eq!(ours, theirs);
-    }
+    crate::metal_check!("ids", ours);
 }
 
 /// `five_samplers.metal`'s kernel, compiled by build.rs.
@@ -180,7 +133,7 @@ const FIVE: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/five_samplers.meta
 /// kernel's function and its state are made, after a command queue, which takes the device's
 /// own sampler ID, and 250 sampler states of argument buffer support, each of its own LOD
 /// clamp, kept to the end. Each creation and release runs in a pool of its own.
-fn five_samplers_move<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> u64 {
+fn five_samplers_move<P: crate::core::platform::Platform>(d: &P::Device) -> u64 {
     use crate::gpu::resource::tests::metal_tests::next_range;
     let _queue = pooled(|| d.new_command_queue().unwrap());
     let states: Vec<P::SamplerState> = (0..250u16)
@@ -216,46 +169,39 @@ fn five_samplers_move<P: reims_vgpu_core::platform::Platform>(d: &P::Device) -> 
 /// states, a kernel's five constexpr samplers bring the IDs to 256, which doubles the pool to
 /// 512 and grows the mempool's array to a page, a range of its own, so the next range moves
 /// on by 0x8000 ([`five_samplers_move`]), on Metal, where it runs, and here, where the
-/// runtime's pool holds 512 IDs. Metal's side runs first, before MoltenVK makes objects of its
-/// own on Metal's device
+/// runtime's pool holds 512 IDs
 #[test]
 fn pipeline_samplers_grow_metals_sampler_mempool() {
-    use reims_vgpu_metal::MetalPlatform;
-    reims_vgpu_metal::os::autorelease::install();
-    let theirs =
-        MetalPlatform::system_default_device().map(|md| five_samplers_move::<MetalPlatform>(&md));
+    crate::os::install_process_services();
     let d = dev();
     let ours = five_samplers_move::<VulkanPlatform>(&d);
     assert_eq!(
         (ours, plain(|| d.raw.sampler_id_pool_size())),
         (0x8000, 512)
     );
-    if let Some(theirs) = theirs {
-        assert_eq!(theirs, 0x8000, "Metal's");
-    }
 }
 
 /// A 16 by 8 `RGBA16Float` texture on `p`'s device `d`, its halves `seed`'s noise of every
 /// sign below 2 in magnitude, written by the CPU.
-fn noise_texture<P: reims_vgpu_core::platform::Platform>(
+fn noise_texture<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     seed: u64,
 ) -> P::Texture {
-    use reims_vgpu_core::platform::HostRange;
-    use reims_vgpu_core::platform::resource::Texture as _;
-    use reims_vgpu_core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
+    use crate::core::platform::HostRange;
+    use crate::core::platform::resource::Texture as _;
+    use crate::core::platform::types::{MtlOrigin, MtlRegion, MtlSize};
     let (w, h) = (16, 8);
     let t = d
         .new_texture(
             OnFault::Die,
-            &p.texture_descriptor(&reims_vgpu_core::platform::values::TextureDesc {
+            &p.texture_descriptor(&crate::core::platform::values::TextureDesc {
                 pixel_format: 115,
                 width: w,
                 height: h,
                 usage: 1,
                 resource_options: Some(0),
-                ..reims_vgpu_core::platform::values::TextureDesc::default()
+                ..crate::core::platform::values::TextureDesc::default()
             }),
         )
         .unwrap()
@@ -275,7 +221,7 @@ fn noise_texture<P: reims_vgpu_core::platform::Platform>(
 /// `d`, into floats, as their bits, by `kernel` (`sample_only_texels_float`, or
 /// `sample_texels_float`, which holds a gather too): at positions a third of a texel apart
 /// from two texels before the texture to two past it, normalized.
-fn cubic_samples<P: reims_vgpu_core::platform::Platform>(
+fn cubic_samples<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
@@ -321,16 +267,10 @@ fn filtered(min: u64, mag: u64, address: u64) -> SamplerDesc {
 ///
 /// Where the filter is cubic, this platform's sample dies at the dispatch naming
 /// `bicubic-filter-arithmetic` ([`crate::answer::DIES`]), which the runtime announces at every
-/// bicubic sample whose sums it has not pinned to Metal's rule for every format; Metal's side of
-/// each case runs
+/// bicubic sample whose sums it has not pinned to Metal's rule for every format
 #[test]
 fn cubic_samplers_sample_as_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
     let pairs = [(2, 2), (2, 0), (2, 1), (0, 2), (1, 2), (0, 0), (1, 1)];
     let modes = [(0, 0), (2, 0), (3, 0), (4, 0), (5, 0), (5, 1), (5, 2)];
@@ -340,7 +280,6 @@ fn cubic_samplers_sample_as_metals() {
                 border_color: Some(border),
                 ..filtered(min, mag, address)
             };
-            let theirs = cubic_samples(&mp, &md, &desc, SAMPLE_ONLY);
             let case = format!("min {min} mag {mag} address {address} border {border}");
             if min == 2 || mag == 2 {
                 let site =
@@ -352,8 +291,7 @@ fn cubic_samplers_sample_as_metals() {
                 continue;
             }
             let ours = cubic_samples(&p, &d, &desc, SAMPLE_ONLY);
-            let differ = ours.iter().zip(&theirs).filter(|(a, b)| a != b).count();
-            assert_eq!(differ, 0, "{case}");
+            crate::metal_check_raw!(case, ours);
         }
     }
     for compare in [1, 3, 7] {
@@ -361,7 +299,6 @@ fn cubic_samplers_sample_as_metals() {
             compare_function: Some(compare),
             ..filtered(2, 2, 0)
         };
-        cubic_samples(&mp, &md, &desc, SAMPLE_ONLY);
         let site = crate::answer::dies_of(kind, || cubic_samples(&p, &d, &desc, SAMPLE_ONLY));
         let case = format!("compare function {compare}");
         assert_eq!(
@@ -377,13 +314,12 @@ fn cubic_samplers_sample_as_metals() {
 ///
 /// This platform's draw dies naming `bicubic-filter-arithmetic` ([`crate::answer::DIES`]),
 /// which the runtime announces at every bicubic sample whose sums it has not pinned to Metal's
-/// rule for every format; Metal's side of each case runs
+/// rule for every format
 #[test]
 fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
     use crate::gpu::ycbcr::measure::{drawn, float_texels, probe};
-    use reims_vgpu_metal::MetalPlatform;
     /// What `sample_fragment_float` reads of [`noise_texture`] through a sampler of `desc`.
-    fn fragment_samples<P: reims_vgpu_core::platform::Platform>(
+    fn fragment_samples<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         desc: &SamplerDesc,
@@ -398,16 +334,11 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     for (address, border) in [(0, 0), (2, 0), (5, 2)] {
         let desc = SamplerDesc {
             border_color: Some(border),
             ..filtered(2, 2, address)
         };
-        fragment_samples(&mp, &md, &desc);
         let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
         let site = crate::answer::dies_of(kind, || fragment_samples(&p, &d, &desc));
         let case = format!("address {address} border {border}");
@@ -425,13 +356,12 @@ fn cubic_samplers_sample_in_a_fragment_function_as_metals() {
 ///
 /// This platform's dispatch dies naming `bicubic-filter-arithmetic` ([`crate::answer::DIES`]),
 /// which the runtime announces at every bicubic sample whose sums it has not pinned to Metal's
-/// rule for every format; Metal's side of each kernel runs
+/// rule for every format
 #[test]
 fn constexpr_bicubic_samplers_sample_as_metals() {
     use crate::gpu::ycbcr::measure::{float_texels, probe, probed_texels};
-    use reims_vgpu_metal::MetalPlatform;
     /// What `kernel` reads of [`noise_texture`] at the probe `at` over `grid`.
-    fn constexpr_samples<P: reims_vgpu_core::platform::Platform>(
+    fn constexpr_samples<P: crate::core::platform::Platform>(
         p: &P,
         d: &P::Device,
         kernel: &str,
@@ -444,17 +374,12 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
             .collect()
     }
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
     let grid = ((16 + 8) * 3, (8 + 8) * 3);
     let at = probe((-4.0, -4.0), 1.0 / 3.0, grid, true, 0);
     for kernel in [
         "sample_constexpr_bicubic",
         "sample_constexpr_repeat_bicubic",
     ] {
-        constexpr_samples(&mp, &md, kernel, (grid, &at));
         let kind = metal2vulkan_runtime::Degradation::BicubicFilterArithmetic;
         let site = crate::answer::dies_of(kind, || constexpr_samples(&p, &d, kernel, (grid, &at)));
         assert_eq!(
@@ -473,10 +398,7 @@ fn constexpr_bicubic_samplers_sample_as_metals() {
 /// samples through alone ([`cubic_samplers_sample_as_metals`]). The sampler state is made
 #[test]
 fn cubic_samplers_the_runtime_refuses_die_where_they_sample() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let md = MetalPlatform::system_default_device();
     let refused: [(&str, SamplerDesc, &str); 6] = [
         (
             "mip filter",
@@ -525,9 +447,6 @@ fn cubic_samplers_the_runtime_refuses_die_where_they_sample() {
             "{case}: {line}"
         );
         assert!(line.contains("SamplerBicubicFilter"), "{case}: {line}");
-        if let Some(md) = &md {
-            cubic_samples(&mp, md, &desc, kernel);
-        }
     }
 }
 
@@ -546,17 +465,17 @@ enum Held {
 /// What `sample()` through a sampler of `desc`, made for argument buffers and held by its
 /// resource ID in an argument buffer as `held` says, reads of [`noise_texture`] on `p`'s
 /// device `d`, into floats, as their bits, at [`cubic_samples`]'s positions.
-fn held_samples<P: reims_vgpu_core::platform::Platform>(
+fn held_samples<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
     held: Held,
 ) -> Vec<[u32; 4]> {
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::compute::{ComputeCmd, ComputeEncoder as _};
-    use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
-    use reims_vgpu_core::platform::types::{MtlSize, NsRange};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::compute::{ComputeCmd, ComputeEncoder as _};
+    use crate::core::platform::resource::{Buffer as _, Texture as _};
+    use crate::core::platform::types::{MtlSize, NsRange};
 
     use crate::gpu::ycbcr::measure::{PROBE, float_texels, probe};
     let t = noise_texture(p, d, 5);
@@ -647,23 +566,15 @@ fn held_samples<P: reims_vgpu_core::platform::Platform>(
 /// filter's, not the argument buffer's
 #[test]
 fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let ours = held_samples(&p, &d, &linear, Held::Both);
-    if let Some(md) = &md {
-        assert_eq!(ours, held_samples(&mp, md, &linear, Held::Both), "linear");
-    }
+    crate::metal_check_raw!("linear", ours);
     let cubic = filtered(2, 2, 0);
     let (sel, line) = death_line(|| held_samples(&p, &d, &cubic, Held::Both));
     assert_eq!(sel, "waitUntilCompleted", "{line}");
     let named = "a sample through a cubic sampler an argument buffer holds";
     assert!(line.contains(named), "{line}");
-    if let Some(md) = &md {
-        held_samples(&mp, md, &cubic, Held::Both);
-    }
 }
 
 /// While a cubic sampler state is alive on the device, one no argument buffer holds and no
@@ -673,19 +584,12 @@ fn a_cubic_sampler_in_an_argument_buffer_dies_where_its_failure_is_read() {
 /// is alive, the module's docs.)
 #[test]
 fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let md = MetalPlatform::system_default_device();
     let linear = filtered(1, 1, 0);
     let cubic = d.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
     let ours = held_samples(&p, &d, &linear, Held::Both);
     drop(cubic);
-    if let Some(md) = &md {
-        let cubic = md.new_sampler_state(&filtered(2, 2, 0)).unwrap().unwrap();
-        assert_eq!(ours, held_samples(&mp, md, &linear, Held::Both), "Metal");
-        drop(cubic);
-    }
+    crate::metal_check_raw!("linear", ours);
 }
 
 /// What a draw over 16 by 8 `BGRA8Unorm` does on `p`'s device `d` whose fragment function
@@ -693,19 +597,19 @@ fn a_live_cubic_sampler_leaves_argument_buffer_samples_metals() {
 /// argument buffer at fragment buffer 0 holds beside it (`sample_held_fragment`), a cubic
 /// sampler state made after the draw was encoded and before the commit where `cubic` says:
 /// the command buffer's status and error code once it completed.
-fn held_draw<P: reims_vgpu_core::platform::Platform>(
+fn held_draw<P: crate::core::platform::Platform>(
     p: &P,
     d: &P::Device,
     desc: &SamplerDesc,
     cubic: bool,
 ) -> (u64, u64) {
-    use reims_vgpu_core::platform::blit::ResourceRef;
-    use reims_vgpu_core::platform::command::{CommandBuffer as _, CommandQueue as _};
-    use reims_vgpu_core::platform::descriptor::RenderPassDescriptor as _;
-    use reims_vgpu_core::platform::render::{RenderCmd, RenderEncoder as _};
-    use reims_vgpu_core::platform::resource::{Buffer as _, Texture as _};
-    use reims_vgpu_core::platform::types::NsRange;
-    use reims_vgpu_core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
+    use crate::core::platform::blit::ResourceRef;
+    use crate::core::platform::command::{CommandBuffer as _, CommandQueue as _};
+    use crate::core::platform::descriptor::RenderPassDescriptor as _;
+    use crate::core::platform::render::{RenderCmd, RenderEncoder as _};
+    use crate::core::platform::resource::{Buffer as _, Texture as _};
+    use crate::core::platform::types::NsRange;
+    use crate::core::platform::values::{ColorAttachmentSet, RenderPipelineDesc, TextureDesc};
 
     use crate::gpu::ycbcr::measure::PROBE;
     let t = noise_texture(p, d, 5);
@@ -723,7 +627,6 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
             vertex: &vertex,
             fragment: &fragment,
             color0_pixel_format: 80,
-            blend_over: false,
             resource_index: None,
         })
         .unwrap()
@@ -804,7 +707,6 @@ fn held_draw<P: reims_vgpu_core::platform::Platform>(
 /// state alone, completes as Metal's does
 #[test]
 fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
     let linear = filtered(1, 1, 0);
     assert_eq!(held_draw(&p, &d, &linear, false), (4, 0));
@@ -813,16 +715,6 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
     assert!(line.contains("unlisted-argument-sampler"), "{line}");
     let relayed = crate::answer::relaxed(|| held_draw(&p, &d, &linear, true));
     assert_eq!(relayed, (4, 0));
-    if let Some(md) = MetalPlatform::system_default_device() {
-        let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-        for cubic in [false, true] {
-            assert_eq!(
-                held_draw(&mp, &md, &linear, cubic),
-                (4, 0),
-                "Metal: {cubic}"
-            );
-        }
-    }
 }
 
 /// A pipeline state of a kernel that samples a texture slot's texture through a sampler an
@@ -832,10 +724,7 @@ fn a_cubic_state_made_before_a_fragment_stages_commit_is_relayed_unlisted() {
 /// of that shape reaches at its pipeline state
 #[test]
 fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_made() {
-    use reims_vgpu_metal::MetalPlatform;
     let (p, d) = (crate::platform::tests::platform(), dev());
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
-    let md = MetalPlatform::system_default_device();
     for (case, desc) in [("linear", filtered(1, 1, 0)), ("cubic", filtered(2, 2, 0))] {
         let (sel, line) = death_line(|| held_samples(&p, &d, &desc, Held::Sampler));
         assert_eq!(
@@ -843,27 +732,24 @@ fn a_texture_slot_sampled_through_an_argument_buffers_sampler_dies_where_it_is_m
             "{case}: {line}"
         );
         assert!(line.contains("ArgumentBufferTextures"), "{case}: {line}");
-        if let Some(md) = &md {
-            held_samples(&mp, md, &desc, Held::Sampler);
-        }
     }
 }
 
 /// The functions each pipeline test of [`refusals_metal_answers_are_its_nserror_codes`]
-/// makes: kernels by `newComputePipelineStateWithFunction:error:` and by a guest descriptor,
-/// vertex and fragment pairs by a guest render descriptor, and tile functions by a guest tile
-/// descriptor.
-type Pipelines<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)], &'a [&'a str]);
+/// makes: kernels by `newComputePipelineStateWithFunction:error:` and by a whole compute value,
+/// and vertex and fragment pairs by a whole render value.
+type Pipelines<'a> = (&'a [&'a str], &'a [(&'a str, &'a str)]);
 
 /// What each creator answers on `d` for the functions `pipelines` names of the metallib
 /// `library`, by name: `Ok` for a state, `Err` of the `NSError`'s code.
-fn answers<P: reims_vgpu_core::platform::Platform>(
+fn answers<P: crate::core::platform::Platform>(
     d: &P::Device,
     library: &[u8],
-    (kernels, renders, tiles): Pipelines<'_>,
+    (kernels, renders): Pipelines<'_>,
 ) -> Vec<(String, Result<(), i64>)> {
-    use crate::gpu::serialized::tests::{hex, pipeline_blob};
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::values::FullComputePipelineDesc;
+
+    use crate::gpu::device::tests::render_value;
     let library = d.new_library(library).unwrap().unwrap().unwrap();
     let function = |name: &str| {
         library
@@ -883,16 +769,7 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
             format!("{name} by function"),
             made.map(|s| s.map(drop)),
         ));
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 5).then(|| f.clone_ref()));
-        let desc = d
-            .deserialize_compute_pipeline_descriptor(
-                Hold::NONE,
-                &hex("01 00 04 05000000"),
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_compute_pipeline_state(Some(&desc), 0).unwrap();
+        let made = d.new_compute_pipeline_state_full(&FullComputePipelineDesc::new(&f));
         out.push(answer(
             format!("{name} by descriptor"),
             made.map(|s| s.map(drop)),
@@ -900,41 +777,10 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
     }
     for &(vertex, fragment) in renders {
         let (v, f) = (function(vertex), function(fragment));
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            Ok(match r {
-                0x21 => Some(v.clone_ref()),
-                0x22 => Some(f.clone_ref()),
-                _ => None,
-            })
-        };
-        let desc = d
-            .deserialize_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("basic", 0x21, 0x22, 0),
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_render_pipeline_state_from_descriptor(Some(&desc), 0);
-        let made = made.unwrap().map(|s| s.map(drop));
-        out.push(answer(format!("{vertex} and {fragment}"), made));
-    }
-    for &name in tiles {
-        let t = function(name);
-        let mut resolve = |_: Hold<'_>, r: u64| Ok((r == 0x31).then(|| t.clone_ref()));
-        let desc = d
-            .deserialize_tile_render_pipeline_descriptor(
-                Hold::NONE,
-                &pipeline_blob("tile", 0, 0, 0x31),
-                0x100,
-                &mut resolve,
-            )
-            .unwrap()
-            .unwrap();
-        let made = d.new_tile_render_pipeline_state(Some(&desc), 0);
+        let made = d.new_render_pipeline_state_full(&render_value::<P>((&v, &f), 1, &[&[(1, 70)]]));
         out.push(answer(
-            format!("{name} by tile"),
-            made.unwrap().map(|s| s.map(drop)),
+            format!("{vertex} and {fragment}"),
+            made.map(|s| s.map(drop)),
         ));
     }
     out
@@ -946,12 +792,12 @@ fn answers<P: reims_vgpu_core::platform::Platform>(
 /// its install name exporting another symbol, or no file there) is the `NSError` at every
 /// creator, of Metal's code, the runtime's domain and its text; the functions beside them
 /// that Metal makes are made (a fragment's program-scope `threads_per_simdgroup` among them).
-/// Metal's answers are compared on the host
+/// Metal's answers are compared on the host, but one: an import the library at its install
+/// name's file exports, which Metal makes, is code 2 here, as the device opens no file a
+/// library names (`platform::device_options`, "No library file opened")
 #[test]
 fn refusals_metal_answers_are_its_nserror_codes() {
-    use reims_vgpu_metal::MetalPlatform;
     let d = dev();
-    let md = MetalPlatform::system_default_device();
     let refused: Pipelines<'_> = (
         &["k_cull", "k_depth_stencil", "k_draw"],
         &[
@@ -963,9 +809,8 @@ fn refusals_metal_answers_are_its_nserror_codes() {
             ("v_plain", "f_quad_lane16"),
             ("v_plain", "f_simd_width"),
         ],
-        &["t_cull", "t_draw"],
     );
-    let imports: Pipelines<'_> = (&["k_import"], &[("v_import", "f_import")], &["t_import"]);
+    let imports: Pipelines<'_> = (&["k_import"], &[("v_import", "f_import")]);
     // Read at run time: each names the build's `OUT_DIR` as its library's install name.
     let import = |name: &str| {
         std::fs::read(crate::gpu::device::tests::out_dir().join(format!("{name}.metallib")))
@@ -994,14 +839,13 @@ fn refusals_metal_answers_are_its_nserror_codes() {
                 Err(3),
                 Err(3),
                 Ok(()),
-                Err(3),
-                Ok(()),
             ]
             .as_slice(),
         ),
-        (&ext[..], imports, &[Ok(()); 4]),
-        (&other[..], imports, &[Err(2); 4]),
-        (&absent[..], imports, &[Err(2); 4]),
+        // Metal loads the exporting library from its install name's file; the device opens none.
+        (&ext[..], imports, &[Err(2); 3]),
+        (&other[..], imports, &[Err(2); 3]),
+        (&absent[..], imports, &[Err(2); 3]),
     ];
     let library = d
         .new_library(include_bytes!(concat!(
@@ -1023,11 +867,50 @@ fn refusals_metal_answers_are_its_nserror_codes() {
         let ours = answers::<crate::platform::VulkanPlatform>(&d, library, pipelines);
         let codes: Vec<_> = ours.iter().map(|(_, a)| *a).collect();
         assert_eq!(codes, expected, "{ours:?}");
-        if let Some(md) = &md {
-            let metal = answers::<MetalPlatform>(md, library, pipelines);
-            assert_eq!(ours, metal);
-        }
     }
+}
+
+/// A kernel whose import a dynamic library exports is made where that library is handed in under
+/// the install name the kernel's library records, as Metal makes it from the library at that
+/// name's file, with no file opened: the guest's bundle reads the file in its own process and
+/// hands its library in (`DynamicLibrariesDesc::loaded`), here the library made of the exporting
+/// dynamic library's bytes. With none handed in it is code 2
+/// (`refusals_metal_answers_are_its_nserror_codes`). The importer records the path the build
+/// script wrote the library at, which is where `OUT_DIR` leads: through kache's hermetic run of
+/// the script, a directory in its store that the target directory's `OUT_DIR` links to
+/// (docs/development.md, "Building through kache"), so the name handed in is that path resolved.
+#[test]
+fn a_kernel_links_the_dynamic_library_handed_in_under_its_install_name() {
+    use crate::core::platform::values::FullComputePipelineDesc;
+
+    let d = dev();
+    let dir = crate::gpu::device::tests::out_dir();
+    let read = |name: &str| std::fs::read(dir.join(format!("{name}.metallib"))).unwrap();
+    let export = d
+        .new_library(&read("librefused_link_ext"))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let dynamic = d.new_dynamic_library(&export).unwrap().unwrap().unwrap();
+    let importer = d
+        .new_library(&read("refused_import_ext"))
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    let kernel = importer
+        .new_function(OnFault::Return, "k_import")
+        .unwrap()
+        .unwrap();
+    let install_name = std::fs::canonicalize(dir.join("librefused_link_ext.metallib")).unwrap();
+    let mut desc = FullComputePipelineDesc::new(&kernel);
+    desc.libraries
+        .loaded
+        .push((install_name.to_str().unwrap().to_owned(), dynamic));
+    let made = d.new_compute_pipeline_state_full(&desc);
+    assert_eq!(
+        made.map(|s| s.is_some()).map_err(|e| e.description),
+        Ok(true)
+    );
 }
 
 /// Metal's `localizedDescription` for a state that supports indirect command buffers whose
@@ -1038,23 +921,47 @@ const DIRECT_ARGUMENT: [&str; 3] = [
     "Compute function cannot be used with indirect command buffers",
 ];
 
-/// A case of [`indirect_answers`]: its name, its serialized descriptor in hex, and the
-/// metallibs whose first function each ref resolves to.
-type IndirectCase<'a> = (&'a str, &'a str, &'a [(u64, &'a [u8])]);
+/// A case of [`indirect_answers`]: its name, its whole value, and the metallibs whose first
+/// function each ref is: 5 the kernel, 0x21 the vertex function and 0x22 the fragment function,
+/// where it has one.
+type IndirectCase<'a> = (&'a str, IndirectValue<'a>, &'a [(u64, &'a [u8])]);
+
+/// The whole value of an [`IndirectCase`]: a compute value where its name says so, else a
+/// render value into `colours` ([`colours_of`]), rasterizing where `rasterization` says; each
+/// with indirect command buffer support where `indirect` says.
+///
+/// [`colours_of`]: crate::gpu::device::tests::colours_of
+#[derive(Clone, Copy, Debug)]
+struct IndirectValue<'a> {
+    indirect: bool,
+    colours: &'a [&'a [(u8, u32)]],
+    rasterization: bool,
+}
+
+/// Colour 0 `RGBA8Unorm`, Metal's defaults elsewhere.
+const RGBA8: &[&[(u8, u32)]] = &[&[(1, 70)]];
+
+/// A render value into [`RGBA8`], rasterizing, with indirect command buffer support.
+const INDIRECT: IndirectValue<'static> = IndirectValue {
+    indirect: true,
+    colours: RGBA8,
+    rasterization: true,
+};
 
 /// A creator's answer in [`indirect_answers`]: `Ok` for a state, `Err` of the `NSError`'s
 /// code and which of [`DIRECT_ARGUMENT`] its description holds, in the order it holds them.
 type IndirectAnswer = Result<(), (i64, Vec<usize>)>;
 
-/// What the compute and render creators answer on `d` for each of `cases`, a serialized
-/// descriptor (compute where its name says so) and the fixture functions its refs 5 (a
-/// kernel), 0x21 (a vertex function) and 0x22 (a fragment function) resolve to, by name.
-fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
+/// What the compute and render creators answer on `d` for each of `cases`, a whole value
+/// (compute where its name says so) of the fixture functions its refs 5 (a kernel), 0x21 (a
+/// vertex function) and 0x22 (a fragment function, where it has one) are, by name.
+fn indirect_answers<P: crate::core::platform::Platform>(
     d: &P::Device,
     cases: &[IndirectCase<'_>],
 ) -> Vec<(String, IndirectAnswer)> {
-    use crate::gpu::serialized::tests::hex;
-    use reims_vgpu_core::rt::Hold;
+    use crate::core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
+
+    use crate::gpu::device::tests::colours_of;
     let function = |bytes: &[u8]| {
         let library = d.new_library(bytes).unwrap().unwrap().unwrap();
         let name = library.function_names().remove(0);
@@ -1064,26 +971,26 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
             .unwrap()
     };
     let mut out = Vec::new();
-    for &(name, blob, functions) in cases {
+    for &(name, value, functions) in cases {
         let functions: Vec<_> = functions.iter().map(|&(r, f)| (r, function(f))).collect();
-        let mut resolve = |_: Hold<'_>, r: u64| {
-            Ok(functions
-                .iter()
-                .find(|(at, _)| *at == r)
-                .map(|(_, f)| f.clone_ref()))
-        };
+        let at = |r: u64| functions.iter().find(|(at, _)| *at == r).map(|(_, f)| f);
         let made = if name.starts_with("compute") {
-            let desc = d
-                .deserialize_compute_pipeline_descriptor(Hold::NONE, &hex(blob), &mut resolve)
-                .unwrap();
-            let made = d.new_compute_pipeline_state(desc.as_ref(), 0).unwrap();
-            made.map(|s| s.is_some())
+            d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+                support_indirect_command_buffers: value.indirect,
+                ..FullComputePipelineDesc::new(at(5).expect("a kernel at 5"))
+            })
+            .map(|s| s.is_some())
         } else {
-            let desc = d
-                .deserialize_render_pipeline_descriptor(Hold::NONE, &hex(blob), &mut resolve)
-                .unwrap();
-            let made = d.new_render_pipeline_state_from_descriptor(desc.as_ref(), 0);
-            made.unwrap().map(|s| s.is_some())
+            d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+                colors: colours_of(value.colours),
+                rasterization_enabled: value.rasterization,
+                support_indirect_command_buffers: value.indirect,
+                ..FullRenderPipelineDesc::new(
+                    at(0x21).expect("a vertex function at 0x21"),
+                    at(0x22),
+                )
+            })
+            .map(|s| s.is_some())
         };
         let answer = made
             .map(|state| assert!(state, "{name}: nil"))
@@ -1101,7 +1008,7 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
     out
 }
 
-/// A state that supports indirect command buffers (compute key 7, render key 25) whose
+/// A state that supports indirect command buffers whose
 /// kernel, vertex or fragment function uses a direct texture and sampler argument once Metal
 /// links the pipeline is the `NSError` at its creator, of Metal's code (3) and Metal's
 /// description, in the runtime's domain: where both functions use one, the description names
@@ -1117,11 +1024,10 @@ fn indirect_answers<P: reims_vgpu_core::platform::Platform>(
 /// compared on the host
 #[test]
 fn indirect_states_of_direct_arguments_are_metals_nserror() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]
@@ -1132,104 +1038,99 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     let (render_vtex, render_ftex) = (shader!("render_vtex"), shader!("render_ftex"));
     let render_color = shader!("render_color");
     let colour_1 = &include_bytes!(concat!(env!("OUT_DIR"), "/icb_color1.metallib"))[..];
-    // Colour 0 `RGBA8Unorm`, and the functions at 0x21 and 0x22, with key 25 set to 1 or not.
-    let colour = "01000000 08000000 02 00 04 00000000 01 04 46000000";
-    let indirect =
-        format!("04 08 04 1c000000 01 04 21000000 02 04 22000000 19 04 01000000 000000 {colour}");
-    let direct = format!("03 08 04 14000000 01 04 21000000 02 04 22000000 00 {colour}");
+    let (indirect, direct) = (
+        INDIRECT,
+        IndirectValue {
+            indirect: false,
+            ..INDIRECT
+        },
+    );
+    let compute = IndirectValue {
+        colours: &[],
+        ..INDIRECT
+    };
     let cases: &[IndirectCase<'_>] = &[
+        ("compute", compute, &[(5, sample_k)]),
         (
-            "compute",
-            "02 07 04 01000000 00 04 05000000",
+            "compute plain",
+            IndirectValue {
+                indirect: false,
+                ..compute
+            },
             &[(5, sample_k)],
         ),
-        ("compute plain", "01 00 04 05000000", &[(5, sample_k)]),
-        (
-            "compute no texture",
-            "02 07 04 01000000 00 04 05000000",
-            &[(5, double_gid)],
-        ),
+        ("compute no texture", compute, &[(5, double_gid)]),
         (
             "fragment",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, render_ftex)],
         ),
         (
             "both",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, render_ftex)],
         ),
         (
             "fragment plain",
-            &direct,
+            direct,
             &[(0x21, tri_vert), (0x22, render_ftex)],
         ),
         (
             "no texture",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, tri_frag)],
         ),
         (
             "vertex plain",
-            &direct,
+            direct,
             &[(0x21, render_vtex), (0x22, render_color)],
         ),
     ];
     // A vertex function's sample: Metal refuses the state where it reaches a colour the
     // fragment function reads, and makes it where the fragment function reads none or there
     // is none. A fragment function's sample where no colour attachment is written: Metal
-    // makes the state. Two attachments: offsets 12 and 12 plus the first's length.
-    let indirect_with = |colours: &str| {
-        format!("04 08 04 1c000000 01 04 21000000 02 04 22000000 19 04 01000000 000000 {colours}")
+    // makes the state.
+    let indirect_with = |colours| IndirectValue {
+        colours,
+        ..INDIRECT
     };
-    let invalid = indirect_with("01000000 08000000 02 00 04 00000000 01 04 00000000");
-    let unwritten =
-        indirect_with("01000000 08000000 03 00 04 00000000 01 04 46000000 09 04 00000000");
-    let invalid_then_1 = indirect_with(
-        "02000000 0c000000 19000000 02 00 04 00000000 01 04 00000000 \
-         02 00 04 01000000 01 04 46000000",
-    );
-    let unwritten_then_1 = indirect_with(
-        "02000000 0c000000 1f000000 03 00 04 00000000 01 04 46000000 09 04 00000000 \
-         02 00 04 01000000 01 04 46000000",
-    );
+    let invalid = indirect_with(&[&[(1, 0)]]);
+    let unwritten = indirect_with(&[&[(1, 70), (9, 0)]]);
+    let invalid_then_1 = indirect_with(&[&[(1, 0)], &[(0, 1), (1, 70)]]);
+    let unwritten_then_1 = indirect_with(&[&[(1, 70), (9, 0)], &[(0, 1), (1, 70)]]);
     let fragment: &[(u64, &[u8])] = &[(0x21, tri_vert), (0x22, render_ftex)];
     let linked: &[IndirectCase<'_>] = &[
         (
             "vertex",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, render_color)],
         ),
         (
             "vertex unread",
-            &indirect,
+            indirect,
             &[(0x21, render_vtex), (0x22, tri_frag)],
         ),
-        (
-            "vertex alone",
-            "02 01 04 21000000 19 04 01000000",
-            &[(0x21, render_vtex)],
-        ),
+        ("vertex alone", indirect_with(&[]), &[(0x21, render_vtex)]),
         (
             "fragment, no colour attachment",
-            "03 01 04 21000000 02 04 22000000 19 04 01000000",
+            indirect_with(&[]),
             fragment,
         ),
-        ("fragment, colour 0 Invalid", &invalid, fragment),
-        ("fragment, colour 0 unwritten", &unwritten, fragment),
+        ("fragment, colour 0 Invalid", invalid, fragment),
+        ("fragment, colour 0 unwritten", unwritten, fragment),
         (
             "fragment, colour 0 Invalid, colour 1 written",
-            &invalid_then_1,
+            invalid_then_1,
             fragment,
         ),
         (
             "fragment, colour 0 unwritten, colour 1 written",
-            &unwritten_then_1,
+            unwritten_then_1,
             fragment,
         ),
         (
             "a fragment of colour 1, colour 0 alone",
-            &indirect,
+            indirect,
             &[(0x21, tri_vert), (0x22, colour_1)],
         ),
     ];
@@ -1256,54 +1157,34 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
     ];
     let answers: Vec<_> = ours.iter().map(|(_, a)| a.clone()).collect();
     assert_eq!(answers, expected, "{ours:?}");
-    let md = MetalPlatform::system_default_device();
-    if let Some(md) = &md {
-        assert_eq!(indirect_answers::<MetalPlatform>(md, &cases), ours);
-    }
     // Rasterization off, of a vertex function that returns a value: code 3, where Metal's
     // text names the fragment function's argument, the runtime's either refusal's.
-    let unrasterized = format!(
-        "05 08 04 20000000 01 04 21000000 02 04 22000000 07 04 00000000 19 04 01000000 00 \
-         {colour}"
-    );
-    let case = (
-        "fragment, rasterization off",
-        unrasterized.as_str(),
-        fragment,
-    );
+    let unrasterized = IndirectValue {
+        rasterization: false,
+        ..INDIRECT
+    };
+    let case = ("fragment, rasterization off", unrasterized, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert!(matches!(ours[0].1, Err((3, _))), "{ours:?}");
-    if let Some(md) = &md {
-        let metal = indirect_answers::<MetalPlatform>(md, &[case]);
-        assert_eq!(metal[0].1, Err((3, vec![0])), "Metal");
-    }
     // Colour 0 `R8Unorm` under a mask of alpha alone, which holds none of its format's
     // channels: no colour is written, so the sample reaches none, and the state is made, as
     // Metal makes it.
-    let masked = indirect_with("01000000 08000000 03 00 04 00000000 01 04 0a000000 09 04 01000000");
-    let case = ("fragment, R8Unorm of alpha", masked.as_str(), fragment);
+    let masked = indirect_with(&[&[(1, 10), (9, 1)]]);
+    let case = ("fragment, R8Unorm of alpha", masked, fragment);
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &[case]);
     assert_eq!(ours[0].1, Ok(()), "{ours:?}");
-    if let Some(md) = &md {
-        assert_eq!(indirect_answers::<MetalPlatform>(md, &[case]), ours);
-    }
     // The runtime's domain, as every pipeline `NSError` here carries.
     let d = dev();
     let library = d.new_library(sample_k).unwrap().unwrap().unwrap();
-    let f = library.new_function(OnFault::Return, "sample_k").unwrap();
-    let mut resolve =
-        |_: reims_vgpu_core::rt::Hold<'_>, _: u64| Ok(f.as_ref().map(|f| f.clone_ref()));
-    let blob = crate::gpu::serialized::tests::hex("02 07 04 01000000 00 04 05000000");
-    let desc = d
-        .deserialize_compute_pipeline_descriptor(
-            reims_vgpu_core::rt::Hold::NONE,
-            &blob,
-            &mut resolve,
-        )
+    let f = library
+        .new_function(OnFault::Return, "sample_k")
+        .unwrap()
         .unwrap();
     let error = d
-        .new_compute_pipeline_state(desc.as_ref(), 0)
-        .unwrap()
+        .new_compute_pipeline_state_full(&crate::core::platform::values::FullComputePipelineDesc {
+            support_indirect_command_buffers: true,
+            ..crate::core::platform::values::FullComputePipelineDesc::new(&f)
+        })
         .unwrap_err();
     assert_eq!(error.domain, crate::answer::RUNTIME_DOMAIN);
 }
@@ -1317,11 +1198,10 @@ fn indirect_states_of_direct_arguments_are_metals_nserror() {
 /// (`UnrasterizedVertexReturn`), with or without that support
 #[test]
 fn unrasterized_states_are_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]
@@ -1330,28 +1210,12 @@ fn unrasterized_states_are_metals() {
     let void_vertex = &include_bytes!(concat!(env!("OUT_DIR"), "/unrasterized.metallib"))[..];
     let (tri_vert, tri_frag) = (shader!("vert"), shader!("frag"));
     let (render_color, render_ftex) = (shader!("render_color"), shader!("render_ftex"));
-    // A render blob of rasterization off: the vertex function at 0x21, the fragment function
-    // at 0x22 where `fragment`, key 25 where `icb`, and colour 0 `RGBA8Unorm` where `colour`.
-    let blob = |fragment: bool, icb: bool, colour: bool| {
-        let mut entries = vec!["01 04 21000000"];
-        entries.extend(fragment.then_some("02 04 22000000"));
-        entries.push("07 04 00000000");
-        entries.extend(icb.then_some("19 04 01000000"));
-        let n = entries.len() + usize::from(colour);
-        let head = 1 + 6 * n;
-        let at = head.next_multiple_of(4);
-        let mut out = format!("{n:02x}");
-        if colour {
-            out += &format!(" 08 04 {at:02x}000000");
-        }
-        for entry in entries {
-            out = format!("{out} {entry}");
-        }
-        if colour {
-            out += &" 00".repeat(at - head);
-            out += " 01000000 08000000 02 00 04 00000000 01 04 46000000";
-        }
-        out
+    // A render value of rasterization off, with indirect command buffer support where `icb`,
+    // and colour 0 `RGBA8Unorm` where `colour`.
+    let value = |icb: bool, colour: bool| IndirectValue {
+        indirect: icb,
+        colours: if colour { RGBA8 } else { &[] },
+        rasterization: false,
     };
     // Each case: its name, blob, functions and the answer expected.
     let mut rows = Vec::new();
@@ -1369,25 +1233,22 @@ fn unrasterized_states_are_metals() {
                 };
                 let name = format!("{what}, icb {icb}, colour {colour}");
                 let functions = vec![(0x21, void_vertex), (0x22, function)];
-                rows.push((name, blob(true, icb, colour), functions, expected));
+                rows.push((name, value(icb, colour), functions, expected));
             }
         }
     }
     for icb in [false, true] {
         let name = format!("a vertex function's return, icb {icb}");
         let functions = vec![(0x21, tri_vert)];
-        rows.push((name, blob(false, icb, true), functions, Err((3, vec![]))));
+        rows.push((name, value(icb, true), functions, Err((3, vec![]))));
     }
     let cases: Vec<IndirectCase<'_>> = rows
         .iter()
-        .map(|(name, blob, functions, _)| (name.as_str(), blob.as_str(), &functions[..]))
+        .map(|(name, value, functions, _)| (name.as_str(), *value, &functions[..]))
         .collect();
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), &cases);
     for ((name, _, _, expected), (_, answer)) in rows.iter().zip(&ours) {
         assert_eq!(answer, expected, "{name}");
-    }
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(indirect_answers::<MetalPlatform>(&md, &cases), ours);
     }
 }
 
@@ -1397,11 +1258,10 @@ fn unrasterized_states_are_metals() {
 /// attachment, where the linking drops the read, the input reading zero
 #[test]
 fn an_input_no_vertex_output_writes_is_metals() {
-    use reims_vgpu_metal::MetalPlatform;
     macro_rules! shader {
         ($name:literal) => {
             &include_bytes!(concat!(
-                "../../../../../../tests/suite/fixtures/shaders/",
+                "../../../../../../tests/shaders/",
                 $name,
                 ".metallib"
             ))[..]
@@ -1412,22 +1272,25 @@ fn an_input_no_vertex_output_writes_is_metals() {
     let cases: &[IndirectCase<'_>] = &[
         (
             "colour 0 written",
-            "03 08 04 14000000 01 04 21000000 02 04 22000000 00 \
-             01000000 08000000 02 00 04 00000000 01 04 46000000",
+            IndirectValue {
+                indirect: false,
+                ..INDIRECT
+            },
             functions,
         ),
         (
             "no colour attachment",
-            "02 01 04 21000000 02 04 22000000",
+            IndirectValue {
+                indirect: false,
+                colours: &[],
+                rasterization: true,
+            },
             functions,
         ),
     ];
     let ours = indirect_answers::<crate::platform::VulkanPlatform>(&dev(), cases);
     let answers: Vec<_> = ours.iter().map(|(_, a)| a.clone()).collect();
     assert_eq!(answers, [Err((3, vec![])), Ok(())], "{ours:?}");
-    if let Some(md) = MetalPlatform::system_default_device() {
-        assert_eq!(indirect_answers::<MetalPlatform>(&md, cases), ours);
-    }
 }
 
 /// A state that supports indirect command buffers whose function's reflection the compile layer
@@ -1439,9 +1302,10 @@ fn an_input_no_vertex_output_writes_is_metals() {
 /// state of the vertex function alike
 #[test]
 fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
+    use crate::core::platform::device::GpuDevice as _;
+    use crate::core::platform::resource::Library as _;
+    use crate::core::platform::values::{FullComputePipelineDesc, FullRenderPipelineDesc};
     use metal2vulkan::error::{Error as Compile, Feature};
-    use reims_vgpu_core::platform::device::GpuDevice as _;
-    use reims_vgpu_core::platform::resource::Library as _;
 
     let d = dev();
     let library = d
@@ -1462,67 +1326,47 @@ fn states_whose_arguments_reflection_is_refused_are_decided_by_their_roles() {
         Err(Compile::Unsupported(u)) => assert_eq!(u.feature, Feature::Reflection),
         other => panic!("{other:?}"),
     }
-    let compute = |indirect| {
-        let mut desc = compute.clone();
-        desc.support_indirect_command_buffers = indirect;
-        Obj::new(PipelineDescriptorObject {
-            desc: Mutex::new(desc),
-            resource_index: Mutex::new(None),
-            ignored: Vec::new(),
-            nearest_even: false,
-            label: None,
-            raw_format: None,
-        })
-    };
     for indirect in [false, true] {
-        let made = d.new_compute_pipeline_state(Some(&compute(indirect)), 0);
-        assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
+        let made = d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
+            support_indirect_command_buffers: indirect,
+            ..FullComputePipelineDesc::new(&kernel)
+        });
+        assert!(matches!(made, Ok(Some(_))), "{indirect}: {made:?}");
     }
     let vertex = function("nested_arguments_vertex");
     let fragment = indirect_functions().1;
-    let render = guest_descriptor(&(vertex, fragment), PixelFormat::BGRA8Unorm, None);
     for indirect in [false, true] {
-        plain(|| render.desc.lock().support_indirect_command_buffers = indirect);
-        let made = d.new_render_pipeline_state_from_descriptor(Some(&render), 0);
-        assert!(matches!(made, Ok(Ok(Some(_)))), "{indirect}: {made:?}");
+        let made = d.new_render_pipeline_state_full(&FullRenderPipelineDesc {
+            colors: crate::gpu::device::tests::colours_of(&[&[(1, 80)]]),
+            support_indirect_command_buffers: indirect,
+            ..FullRenderPipelineDesc::new(&vertex, Some(&fragment))
+        });
+        assert!(matches!(made, Ok(Some(_))), "{indirect}: {made:?}");
     }
 }
 
 /// RenderBox's custom effect is Metal's: the fragment function that calls `custom_fn` links the
 /// function made under that specialized name and reads, at every pixel, the bits Metal's reads;
-/// with the function made under its own name or another, the pipeline is refused on both. (What
-/// each function answers as its name is Metal's too: the Metal platform's
-/// `a_specialized_name_resolves_a_kernel_s_call`.)
+/// with the function made under its own name or another, the pipeline is refused on both. What
+/// each function answers as its name is Metal's too (measured on the M3 Max, macOS 27.0.1)
 #[test]
 fn a_function_linked_under_a_specialized_name_is_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let mp = MetalPlatform::new(Box::new(crate::gpu::device::tests::metal_tests::NoLauncher));
     let (p, d) = (crate::platform::tests::platform(), dev());
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
     let (caller, callee) = (library(LINKED_CALLER), library(LINKED_CALLEE));
-    let metal_library = |bytes| md.new_library(bytes).unwrap().unwrap().unwrap();
-    let (metal_caller, metal_callee) = (metal_library(LINKED_CALLER), metal_library(LINKED_CALLEE));
     for specialized in [Some("custom_fn"), None, Some("other_fn")] {
+        let key = format!("{specialized:?}");
         let ours = gradient::<VulkanPlatform>(&callee, specialized).unwrap();
-        let metals = gradient::<MetalPlatform>(&metal_callee, specialized).unwrap();
         assert_eq!(ours.name(), specialized.unwrap_or("linked_gradient"));
-        let want = custom_effect(&mp, &md, &metal_caller, &metals);
-        assert_eq!(
-            want.is_some(),
-            specialized == Some("custom_fn"),
-            "{specialized:?}"
-        );
         let drawn = catch_death(|| custom_effect(&p, &d, &caller, &ours));
-        assert_eq!(drawn, Ok(want), "{specialized:?}");
+        let drawn = drawn.unwrap_or_else(|site| panic!("{specialized:?}: died at {site:?}"));
+        crate::metal_check!(key, drawn);
     }
 }
 
 /// A pipeline creator's answer in [`linked_answers`]: made, or the `NSError`'s code, or where the
 /// creator dies.
-type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::DeathSite>;
+type LinkedAnswer = Result<Result<(), i64>, crate::core::raise::death::DeathSite>;
 
 /// What the compute and render creators answer for `linked_caller.metal`'s functions with
 /// `linked_callee.metal`'s `linked_add_one`, which they call, linked by each list a value
@@ -1534,7 +1378,7 @@ type LinkedAnswer = Result<Result<(), i64>, reims_vgpu_core::raise::death::Death
 /// library made of the same bytes, and the copy turns the function made before it into that
 /// object (measured on the M3 Max, macOS 27.0.1). A case after the copy would link the binary
 /// where it names the function made by name.
-fn linked_answers<P: reims_vgpu_core::platform::Platform>(
+fn linked_answers<P: crate::core::platform::Platform>(
     d: &P::Device,
 ) -> Vec<(&'static str, LinkedAnswer)> {
     let library = |bytes| d.new_library(bytes).unwrap().unwrap().unwrap();
@@ -1548,18 +1392,16 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
     let add_one = named(&callee, "linked_add_one");
     let one = |f: &P::Function| vec![f.clone_ref()];
     let group = || vec![("g".to_owned(), one(&add_one))];
-    let answer = |made: Result<
-        Result<Option<()>, NsErrorText>,
-        reims_vgpu_core::raise::death::DeathSite,
-    >| {
-        made.map(|made| match made {
-            Ok(state) => {
-                assert!(state.is_some());
-                Ok(())
-            }
-            Err(e) => Err(e.code),
-        })
-    };
+    let answer =
+        |made: Result<Result<Option<()>, NsErrorText>, crate::core::raise::death::DeathSite>| {
+            made.map(|made| match made {
+                Ok(state) => {
+                    assert!(state.is_some());
+                    Ok(())
+                }
+                Err(e) => Err(e.code),
+            })
+        };
     let compute = |functions, binary_functions, groups, private_functions| {
         answer(catch_death(|| {
             d.new_compute_pipeline_state_full(&FullComputePipelineDesc {
@@ -1576,6 +1418,8 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
                     groups,
                     private_functions,
                 },
+                libraries: Default::default(),
+                open_cl_mode: false,
             })
             .map(|state| state.map(drop))
         }))
@@ -1605,6 +1449,7 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
                 support_indirect_command_buffers: false,
                 vertex_linked,
                 fragment_linked,
+                private_state: None,
             })
             .map(|state| state.map(drop))
         }))
@@ -1677,14 +1522,9 @@ fn linked_answers<P: reims_vgpu_core::platform::Platform>(
 /// was made compiled to a binary, and code 2 where it was not
 #[test]
 fn unresolved_visible_calls_are_metals() {
-    use reims_vgpu_metal::MetalPlatform;
-    let Some(md) = MetalPlatform::system_default_device() else {
-        return;
-    };
-    let metals = linked_answers::<MetalPlatform>(&md);
     let ours = linked_answers::<VulkanPlatform>(&dev());
-    assert_eq!(ours.len(), metals.len());
-    for ((case, ours), (_, metals)) in ours.into_iter().zip(metals) {
-        assert_eq!(ours, metals, "{case}");
+    assert_eq!(ours.len(), 13);
+    for (case, ours) in ours {
+        crate::metal_check!(case, ours);
     }
 }

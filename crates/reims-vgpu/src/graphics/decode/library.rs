@@ -15,8 +15,9 @@
 //! through the slot, so ring order holds.
 //!
 //! **The cache.** A library made from keyed bytes is kept under its key ([`verified_key`]) where
-//! the key the host computes from the bytes is the key the guest sent; a `LIBRARY_LOOKUP` of that
-//! key binds a new id to the same platform library, and no bytes cross. Each id is a handle of its
+//! the key the host computes from the bytes is the key the guest sent, and, where the host cannot
+//! vouch for any key of that kind, under the key of its whole bytes ([`whole_key`]); a
+//! `LIBRARY_LOOKUP` of that key binds a new id to the same platform library, and no bytes cross. Each id is a handle of its
 //! own in the table. An entry no id names any more is released into a least-recently-released
 //! list bounded by [`RELEASED_BUDGET`] bytes of keyed bytes, so a process that loads the library
 //! again (WindowServer after a restart) still finds it.
@@ -24,26 +25,29 @@
 //! **What the key names.** The key leaves the bitcode section out, and names each function's
 //! bitcode by its `HASH` tag, a SHA-256 of it. The host vouches for a key only where it checked
 //! every `HASH` against its bitcode and the functions' bitcode covers the whole section, so a
-//! lookup can only ever bind content with that key; bytes whose tags lie are made for their
-//! request, uncached. Every AIR `.metallib` of macOS 27's system, 210 of them, covers its section
-//! (measured).
+//! lookup can only ever bind content with that key; bytes whose tags lie are kept under the key
+//! of their whole bytes alone, or, past [`WHOLE_KEY_MOST`] bytes, uncached. Every AIR
+//! `.metallib` of macOS 27's system, 210 of them, covers its section (measured). Both keys hash
+//! their bytes in [`KEY_PIECE`] pieces, each on its own, which the guest hashes across its cores:
+//! the system frameworks' libraries are megabytes past their bitcode, which a guest core hashes
+//! at 567 MB/s (measured, the RTX 3090 host's guest).
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
-use reims_graphics::wire::{
+use reims_vgpu_graphics::wire::{
     RGFX_CMD_LIBRARY_CREATE, RGFX_CMD_LIBRARY_FROM_REGION, RGFX_EVT_COMPLETE,
     RGFX_LIBRARY_BYTES_OFFSET, RGFX_LIBRARY_FLAG_KEYED, RGFX_STATUS_INVALID_ARGUMENT,
     RGFX_STATUS_NOT_FOUND, RGFX_STATUS_OK, RGFX_STATUS_REFUSED, RgfxComplete, RgfxLibraryCreate,
     RgfxLibraryFromRegion, RgfxLibraryLookup, RgfxMsgHeader,
 };
-use reims_vgpu_core::platform::device::GpuDevice;
-use reims_vgpu_core::platform::{Handle, Platform};
-use reims_vgpu_core::raise::RaiseResult;
-use reims_vgpu_core::sync::{Condvar, Mutex};
+use reims_vgpu_vulkan::core::platform::device::GpuDevice;
+use reims_vgpu_vulkan::core::platform::{Handle, Platform};
+use reims_vgpu_vulkan::core::raise::RaiseResult;
+use reims_vgpu_vulkan::core::sync::{Condvar, Mutex};
 use sha2::{Digest, Sha256};
 
-use reims_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
+use reims_vgpu_graphics::wire::RGFX_CONTEXT_OBJ_ID_SHIFT;
 
 use super::tables::Entry;
 use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
@@ -52,7 +56,18 @@ use super::{DecodeError, GraphicsDecoder, ObjHandle, read};
 pub(crate) type LibraryKey = [u8; 32];
 
 /// The bytes the key's digest starts with ([`RgfxLibraryLookup`]).
-const KEY_PREFIX: &[u8] = b"rgfx-library-v1";
+const KEY_PREFIX: &[u8] = b"rgfx-library-v2";
+
+/// The bytes the key of a library's whole bytes starts with ([`whole_key`]).
+const WHOLE_KEY_PREFIX: &[u8] = b"rgfx-library-whole-v2";
+
+/// The pieces a key hashes the bytes it names in ([`RgfxLibraryLookup`]), which the guest hashes
+/// across its cores: 256 KiB, the last the rest.
+const KEY_PIECE: usize = 256 << 10;
+
+/// The largest library kept under the key of its whole bytes ([`whole_key`]), as the guest asks
+/// for that key of no larger one (its `kRgfxWholeKeyMost`).
+const WHOLE_KEY_MOST: usize = 4 << 20;
 
 /// The most bytes of keyed libraries the cache keeps once no id names them.
 pub(crate) const RELEASED_BUDGET: u64 = 64 << 20;
@@ -89,13 +104,48 @@ pub(crate) fn verified_key(bytes: &[u8]) -> Option<LibraryKey> {
     (at == section.len()).then(|| content_key(bytes, bitcode_at, bitcode_len))
 }
 
-/// SHA-256 of [`KEY_PREFIX`] and `bytes` without `[bitcode_at, bitcode_at + bitcode_len)`.
+/// The key of a library's whole bytes, the bitcode included: SHA-256 of [`WHOLE_KEY_PREFIX`] and
+/// of each [`KEY_PIECE`] piece's SHA-256 of `bytes` ([`key_of_pieces`]). It names them with nothing left to vouch for, so a library whose `HASH` tags the host
+/// cannot vouch for ([`verified_key`]: Core Image's, whose tags are no SHA-256 of their bitcode)
+/// is kept under it, where it is a `.metallib` of at most [`WHOLE_KEY_MOST`] bytes.
+pub(crate) fn whole_key(bytes: &[u8]) -> Option<LibraryKey> {
+    (bytes.len() <= WHOLE_KEY_MOST && bytes.get(..4)? == b"MTLB")
+        .then(|| key_of_pieces(WHOLE_KEY_PREFIX, &[bytes]))
+}
+
+/// The key of `bytes` without `[bitcode_at, bitcode_at + bitcode_len)`, under [`KEY_PREFIX`]
+/// ([`key_of_pieces`]).
 fn content_key(bytes: &[u8], bitcode_at: usize, bitcode_len: usize) -> LibraryKey {
-    let mut hasher = Sha256::new();
-    hasher.update(KEY_PREFIX);
-    hasher.update(&bytes[..bitcode_at]);
-    hasher.update(&bytes[bitcode_at + bitcode_len..]);
-    hasher.finalize().into()
+    key_of_pieces(
+        KEY_PREFIX,
+        &[&bytes[..bitcode_at], &bytes[bitcode_at + bitcode_len..]],
+    )
+}
+
+/// SHA-256 of `prefix`, then of the SHA-256 of each [`KEY_PIECE`] piece, in order, of the bytes
+/// `runs` hold back to back, as the guest's `keyOfPieces` hashes them.
+fn key_of_pieces(prefix: &[u8], runs: &[&[u8]]) -> LibraryKey {
+    let mut key = Sha256::new();
+    key.update(prefix);
+    let mut piece = Sha256::new();
+    let mut filled = 0usize;
+    for run in runs {
+        let mut rest = *run;
+        while !rest.is_empty() {
+            let (take, after) = rest.split_at((KEY_PIECE - filled).min(rest.len()));
+            piece.update(take);
+            filled += take.len();
+            rest = after;
+            if filled == KEY_PIECE {
+                key.update(piece.finalize_reset());
+                filled = 0;
+            }
+        }
+    }
+    if filled > 0 {
+        key.update(piece.finalize());
+    }
+    key.finalize().into()
 }
 
 /// The bitcode section of `.metallib` bytes, as `(offset, size)` inside them.
@@ -397,9 +447,14 @@ pub(crate) fn make_library<P: Platform>(
     device: &P::Device,
     job: &LibraryJob<P>,
 ) -> RaiseResult<MadeLibrary<P>> {
+    // Under the guest's key where the host vouches for it, else, where it cannot, under the key of
+    // the whole bytes.
     let key = job.guest_key.and_then(|guest| {
-        let host = verified_key(&job.bytes)?;
-        (host == guest).then_some((host, job.bytes.len() as u64))
+        let key = match verified_key(&job.bytes) {
+            Some(host) => (host == guest).then_some(host)?,
+            None => whole_key(&job.bytes)?,
+        };
+        Some((key, job.bytes.len() as u64))
     });
     // A nil library and a build failure both mean no usable library.
     let (library, refusal) = match device.new_library(&job.bytes)? {
@@ -502,6 +557,12 @@ impl<P: Platform> Libraries<P> {
         debug_assert!(self.cached.is_empty());
         self.resets += 1;
         std::mem::replace(&mut self.cache, LibraryCache::new(RELEASED_BUDGET))
+    }
+
+    /// The content key of the cache entry library `obj_id` names: `None` for a library the device
+    /// keeps under no key it vouches for, and for an id that names none.
+    pub(super) fn key_of(&self, obj_id: u64) -> Option<LibraryKey> {
+        self.cached.get(&obj_id).copied()
     }
 
     /// Forgets what these keep of library `obj_id`: its make, which is cancelled, its chunks, and
@@ -774,10 +835,12 @@ pub(crate) mod tests {
             &[(0, 14, sha(&bitcode[..14])), (14, 6, sha(&bitcode[14..]))],
         );
         let at = lib.len() - 4 - bitcode.len();
+        let mut around = lib[..at].to_vec();
+        around.extend_from_slice(&lib[at + bitcode.len()..]);
+        assert!(around.len() <= KEY_PIECE);
         let mut expect = Sha256::new();
-        expect.update(b"rgfx-library-v1");
-        expect.update(&lib[..at]);
-        expect.update(&lib[at + bitcode.len()..]);
+        expect.update(b"rgfx-library-v2");
+        expect.update(sha(&around));
         let expect: [u8; 32] = expect.finalize().into();
         assert_eq!(verified_key(&lib), Some(expect));
     }
@@ -793,11 +856,56 @@ pub(crate) mod tests {
         lib.extend_from_slice(b"funclistBITCODE-BITCODE!tail-end");
         assert_eq!(bitcode_section(&lib), Some((0x60, 0x10)));
         let expect = [
-            0xc0, 0x99, 0x93, 0x08, 0x93, 0xa6, 0x91, 0xa1, 0xaa, 0xed, 0xfa, 0x6d, 0xee, 0xd4,
-            0x1a, 0x58, 0x09, 0x95, 0x3e, 0x36, 0xa8, 0xe6, 0x9e, 0xd9, 0x86, 0xe1, 0xb2, 0x11,
-            0xff, 0x4e, 0x21, 0x7d,
+            0xc2, 0x98, 0xaa, 0x26, 0x7e, 0x84, 0x06, 0x18, 0xa9, 0xde, 0x5c, 0xa5, 0x3b, 0x39,
+            0xf7, 0x12, 0xeb, 0x30, 0xb7, 0x16, 0xee, 0xc2, 0xbc, 0xe7, 0x1f, 0x1c, 0xd4, 0x72,
+            0xb6, 0xbd, 0x2b, 0x30,
         ];
         assert_eq!(content_key(&lib, 0x60, 0x10), expect);
+    }
+
+    /// The bundle's large synthetic `.metallib` (`test_library_key_pieces`): 640 KiB, its
+    /// bitcode section 128 KiB at 192 KiB, so the content key's first piece spans the section and
+    /// its second is a whole piece, the last; the whole bytes are three pieces. Both keys are the
+    /// digests the bundle's test pins.
+    #[test]
+    fn keys_in_pieces_as_the_bundle_does() {
+        let mut lib: Vec<u8> = (0..0xa0000usize).map(|i| (i % 251) as u8).collect();
+        lib[..MTLB_HEADER_LEN].fill(0);
+        lib[..4].copy_from_slice(b"MTLB");
+        lib[0x48..0x50].copy_from_slice(&0x30000u64.to_le_bytes());
+        lib[0x50..0x58].copy_from_slice(&0x20000u64.to_le_bytes());
+        let content = [
+            0x05, 0x34, 0x27, 0xb9, 0xa6, 0xd3, 0xe1, 0xdd, 0xba, 0x82, 0x49, 0x63, 0x1f, 0xd3,
+            0x9b, 0xa1, 0xeb, 0x6f, 0x16, 0x1c, 0x98, 0xd2, 0xe2, 0x4f, 0x56, 0xb0, 0x2f, 0x67,
+            0xe1, 0x74, 0x3c, 0x4a,
+        ];
+        assert_eq!(content_key(&lib, 0x30000, 0x20000), content);
+        let whole = [
+            0xe4, 0x9b, 0x7d, 0x62, 0x71, 0x76, 0xdb, 0x48, 0xe2, 0xd5, 0xd3, 0x5b, 0x03, 0xb2,
+            0x6b, 0x91, 0xf0, 0x02, 0x7a, 0x33, 0x0e, 0xc3, 0x25, 0xfd, 0x26, 0x20, 0xc9, 0x86,
+            0xc3, 0xa0, 0x72, 0x8b,
+        ];
+        assert_eq!(whole_key(&lib), Some(whole));
+    }
+
+    /// The key of the bundle's synthetic `.metallib`'s whole bytes is the digest the bundle's test
+    /// pins (`test_library_key`); none for bytes past [`WHOLE_KEY_MOST`] or no `.metallib`.
+    #[test]
+    fn whole_keys_as_the_bundle_does() {
+        let mut lib = vec![0u8; MTLB_HEADER_LEN];
+        lib[..4].copy_from_slice(b"MTLB");
+        lib[0x48..0x50].copy_from_slice(&0x60u64.to_le_bytes());
+        lib[0x50..0x58].copy_from_slice(&0x10u64.to_le_bytes());
+        lib.extend_from_slice(b"funclistBITCODE-BITCODE!tail-end");
+        let expect = [
+            0x41, 0xa4, 0x8e, 0x77, 0x6f, 0xec, 0xa5, 0x8f, 0x52, 0x67, 0x0e, 0xd8, 0x93, 0x50,
+            0x17, 0x03, 0xdb, 0x0f, 0xf3, 0x4e, 0xd8, 0x4e, 0x59, 0x78, 0x35, 0x85, 0x96, 0x16,
+            0xff, 0x1b, 0xf6, 0xcb,
+        ];
+        assert_eq!(whole_key(&lib), Some(expect));
+        lib.resize(WHOLE_KEY_MOST + 1, 0);
+        assert_eq!(whole_key(&lib), None);
+        assert_eq!(whole_key(b"not a metallib"), None);
     }
 
     /// A tag that lies, a gap in the section, an overlap, and bytes that are no `.metallib` get
@@ -833,7 +941,7 @@ pub(crate) mod tests {
     /// leaves the list, and named entries are never dropped
     #[test]
     fn the_released_list_keeps_to_its_budget() {
-        use reims_vgpu_core::testkit::FakePlatform;
+        use reims_vgpu_vulkan::core::testkit::FakePlatform;
         let platform = FakePlatform::new();
         let device = platform.device();
         let library = || device.new_library(&[1]).unwrap().unwrap().unwrap();

@@ -4,12 +4,11 @@
 //! surface, its input, its end) is its [`os`]'s.
 //!
 //! **Opening.** A window opens on the screen [`crate::screens::screen_for_port`] picks for the
-//! display's port, else on the main screen, so the screen whose density the guest was told of is
-//! the one it opens on. Windowed (the default), its content is the guest's mode, else the first
-//! mode the display offers, else [`DEFAULT_MODE`], at one guest point per host point, shrunk to fit
-//! the screen ([`crate::geometry::initial_content_size`]), on whole pixels at the screen's scale,
-//! and never below [`MIN_CONTENT`]. Borderless (`REIMS_VGPU_WINDOW_BORDERLESS=1`), it fills its
-//! screen.
+//! display's port, else on the main screen. Windowed (the default), its content is the guest's
+//! mode, else the first mode the display offers, else [`DEFAULT_MODE`], at one guest pixel per
+//! host point, shrunk to fit the screen ([`crate::geometry::initial_content_size`]), on whole
+//! pixels at the screen's scale, and never below [`MIN_CONTENT`]. Borderless
+//! (`REIMS_VGPU_WINDOW_BORDERLESS=1`), it fills its screen.
 //!
 //! **Following the guest's mode.** Until the person resizes it (an edge, tiling, maximizing or
 //! zooming, full screen), a windowed window follows the guest's mode: each mode change resizes its
@@ -43,6 +42,15 @@
 //! pointer's hold and the size's hold with it ([`ended`]), and hides; SDL's window is
 //! destroyed once the OS lets it go ([`os::close`]): on Linux once its render thread has let its
 //! swapchain and Vulkan surface go too ([`released`]), whichever of the two comes last.
+//!
+//! **A parked window.** Where the window's presenter was parked (`crate::present`, "A parked
+//! presenter"), its SDL window is the old swapchain's for good: on Linux the render thread asks for
+//! a new one ([`park`]). The input lets go of the old window as at the display's end ([`ended`]),
+//! a new SDL window opens for the display as a window opens (on its screen, at the size for the
+//! guest's mode, borderless where the windows are), and the old one hides and is kept, never
+//! destroyed, since the Vulkan surface the old swapchain is made over is never destroyed either
+//! ([`PARKED`]). The display then goes on in the new window, which is the display's from then on,
+//! to its end.
 
 use std::cell::RefCell;
 use std::sync::Arc;
@@ -109,6 +117,9 @@ pub(crate) struct Opened {
 thread_local! {
     /// The windows open, on SDL's thread.
     static OPEN: RefCell<Vec<Shell>> = const { RefCell::new(Vec::new()) };
+    /// SDL's windows whose presenters were parked, hidden and kept until the process ends (the
+    /// module doc, "A parked window").
+    static PARKED: RefCell<Vec<*mut SDL_Window>> = const { RefCell::new(Vec::new()) };
 }
 
 /// Runs `f` on window `id`'s shell, if it is open.
@@ -197,8 +208,11 @@ pub(crate) fn close(id: u64) {
 
 /// Window `id`'s render thread let its surface go: SDL's window goes where the display has ended.
 #[cfg_attr(
-    not(target_os = "linux"),
-    expect(dead_code, reason = "only Linux's render thread holds SDL's window")
+    not(any(target_os = "linux", target_os = "windows")),
+    expect(
+        dead_code,
+        reason = "only the SDL thread's render thread holds SDL's window (Linux, Windows)"
+    )
 )]
 pub(crate) fn released(id: u64) {
     let gone = with_shell(id, |shell| {
@@ -208,6 +222,75 @@ pub(crate) fn released(id: u64) {
     if gone == Some(true) {
         destroy(id);
     }
+}
+
+/// Window `id`'s presenter was parked: its SDL window is the old swapchain's for good, and a new
+/// one opens for the display in its place (the module doc, "A parked window"). Where the display
+/// has ended, the old one is kept and the window forgotten; where SDL makes no new one, the old
+/// one stays as it is, drawn no more.
+#[cfg_attr(
+    not(any(target_os = "linux", target_os = "windows")),
+    expect(
+        dead_code,
+        reason = "only the SDL thread's render thread holds SDL's window (Linux, Windows)"
+    )
+)]
+pub(crate) fn park(id: u64) {
+    let Some((window, closed)) = with_shell(id, |s| (Arc::clone(&s.window), s.closed)) else {
+        return;
+    };
+    if closed {
+        let shell = OPEN.with(|open| {
+            let mut open = open.borrow_mut();
+            let at = open.iter().position(|s| s.window.id() == id)?;
+            Some(open.remove(at))
+        });
+        if let Some(shell) = shell {
+            let sdl = shell.sdl;
+            os::destroy(shell);
+            PARKED.with(|parked| parked.borrow_mut().push(sdl));
+        }
+        return;
+    }
+    with_shell(id, ended);
+    let borderless = crate::env::settings().borderless;
+    let taken = each_open(|s| (s.window.id() != id).then(|| os::frame_of(s)).flatten());
+    let Some(opened) = os::open(&window, borderless, &taken) else {
+        log::warn!(
+            target: "reims_vgpu_window",
+            "window {:?}: its GPU device stopped and no new window opened: it stays as it is",
+            window.title()
+        );
+        return;
+    };
+    // SAFETY: SDL's window, just made on this thread.
+    let sdl_id = unsafe { SDL_GetWindowID(opened.sdl).0 };
+    let old = with_shell(id, |shell| {
+        let old = std::mem::replace(&mut shell.sdl, opened.sdl);
+        shell.sdl_id = sdl_id;
+        shell.asked = opened.asked;
+        shell.input = opened.input;
+        shell.os = opened.state;
+        shell.follows_guest = !borderless && !shell.window.keeps_its_size();
+        shell.layout = Layout::default();
+        shell.density = 1.0;
+        shell.over_image = false;
+        shell.shown = None;
+        shell.relayout();
+        shell.refresh_title();
+        old
+    });
+    if let Some(old) = old {
+        // SAFETY: the window is SDL's, on this thread; it is kept, hidden, never destroyed.
+        unsafe { SDL_HideWindow(old) };
+        PARKED.with(|parked| parked.borrow_mut().push(old));
+    }
+    log::warn!(
+        target: "reims_vgpu_window",
+        "window {:?}: its GPU device stopped and recovered on a new one: the display goes on in a \
+         new window, the old one hidden and kept under the old device's swapchain",
+        window.title()
+    );
 }
 
 /// Destroys window `id`'s SDL window and forgets it.
@@ -478,28 +561,61 @@ impl Shell {
 
     /// Sets the cursor: over the image the guest's, or none while the guest hides its own or the
     /// window draws it itself (`handle`'s module doc); the host's arrow elsewhere and before the
-    /// guest has set one.
+    /// guest has set one. SDL's cursor is the process's, so only the window the pointer is in
+    /// (SDL's mouse focus) sets it ([`cursor_step`]).
     fn refresh_cursor(&mut self) {
         let guest = self.window.guest();
-        let ours = if self.over_image {
-            let per_pixel =
-                geometry::cursor_points_per_pixel(self.layout.image, guest.mode.unwrap_or((0, 0)));
-            if !guest.host_cursor_visible() && guest.cursor.is_some() {
+        // SAFETY: SDL's video runs on this thread.
+        let has_pointer = unsafe { SDL_GetMouseFocus() } == self.sdl;
+        let hidden = !guest.host_cursor_visible() && guest.cursor.is_some();
+        let ours = match cursor_step(has_pointer, self.over_image, hidden) {
+            CursorStep::Leave => return,
+            CursorStep::Hide => {
                 // SAFETY: SDL's video runs on this thread.
                 unsafe { SDL_HideCursor() };
                 return;
             }
-            self.cursor
-                .cursor(guest.cursor.as_deref(), per_pixel, self.density)
-                .map(|c| c.raw())
-        } else {
-            None
+            CursorStep::Guest => {
+                let mode = guest.mode.unwrap_or((0, 0));
+                let per_pixel = geometry::cursor_points_per_pixel(self.layout.image, mode);
+                self.cursor
+                    .cursor(guest.cursor.as_deref(), per_pixel, self.density)
+                    .map(|c| c.raw())
+            }
+            CursorStep::Arrow => None,
         };
         // SAFETY: SDL's video runs on this thread; the cursor is one it made, or its default.
         unsafe {
             SDL_SetCursor(ours.unwrap_or_else(|| SDL_GetDefaultCursor()));
             SDL_ShowCursor();
         }
+    }
+}
+
+/// What a window's refresh does to SDL's cursor.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CursorStep {
+    /// Nothing: the pointer is in another window, or in none.
+    Leave,
+    /// Hides it: the guest hides its own, or the window draws it.
+    Hide,
+    /// The guest's, else the host's arrow where the guest has set none.
+    Guest,
+    /// The host's arrow.
+    Arrow,
+}
+
+/// What a window's refresh does to SDL's cursor, which is the process's: a window the pointer is
+/// not in (`has_pointer`, SDL's mouse focus) leaves it as it is, so that another display's window,
+/// whose guest changes its cursor or whose layout changes, does not set the arrow over the image
+/// the pointer is in; the window the pointer is in sets it over its image (`over_image`), hidden
+/// where the guest hides its own (`hidden`), and the arrow elsewhere.
+fn cursor_step(has_pointer: bool, over_image: bool, hidden: bool) -> CursorStep {
+    match (has_pointer, over_image, hidden) {
+        (false, _, _) => CursorStep::Leave,
+        (true, true, true) => CursorStep::Hide,
+        (true, true, false) => CursorStep::Guest,
+        (true, false, _) => CursorStep::Arrow,
     }
 }
 
@@ -521,7 +637,7 @@ fn mouse_rect(image: Rect) -> SDL_Rect {
 /// Logs that SDL refused `what` for the window titled `title`.
 pub(crate) fn refused(what: &str, title: &str) {
     log::warn!(
-        target: "reims_vgpu_window",
+        target: "reims_vgpu_window", kind:% = what;
         "window {title:?}: {what}: {}",
         sdl_error()
     );
@@ -632,6 +748,25 @@ fn ended(c: &mut impl Closing) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Only the window the pointer is in sets SDL's cursor, which is the process's: another
+    /// window's refresh leaves it as it is, whatever it shows
+    #[test]
+    fn a_window_the_pointer_is_not_in_leaves_the_cursor() {
+        for over_image in [false, true] {
+            for hidden in [false, true] {
+                assert_eq!(
+                    cursor_step(false, over_image, hidden),
+                    CursorStep::Leave,
+                    "over the image {over_image}, hidden {hidden}"
+                );
+            }
+        }
+        assert_eq!(cursor_step(true, true, false), CursorStep::Guest);
+        assert_eq!(cursor_step(true, true, true), CursorStep::Hide);
+        assert_eq!(cursor_step(true, false, false), CursorStep::Arrow);
+        assert_eq!(cursor_step(true, false, true), CursorStep::Arrow);
+    }
 
     /// The pointer is held over the image in whole points, rounded out; an image on whole points
     /// is the rect itself

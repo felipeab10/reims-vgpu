@@ -29,18 +29,44 @@
 //     constants compute is at that index and of that count, and one the AIR marks
 //     `air.arg_unused`, or the specialised code does not use, is not used (isUsed and isActive
 //     0);
-//   - a constant buffer's alignment is 32, a device or threadgroup buffer's its pointee's;
+//   - a constant buffer's alignment is 32, a device or threadgroup buffer's its pointee's; on an
+//     Apple GPU (rgfxAppleGPU, the arm64 guest's device) a constant buffer's is its pointee's too,
+//     but at least 4, the M3 Max's answer (tools/pipeline_reflection_check Apple, macOS 27.0.1),
+//     which differs from an x86 Mac's there and nowhere else a getter reaches;
+//   - a fragment function's input of its tile's imageblock data (`[[imageblock_data]]`, and
+//     `[[imageblock_data(Master)]]`, a view of a master struct) is a binding in its place among the
+//     others, and so, on an Apple GPU, is a kernel's imageblock of an explicit layout, as the M3
+//     Max and the x86 Macs answer them (RgfxPipelineReflection.mm's imageblock); a texture in a
+//     raster order group (`[[texture(n), raster_order_group(g)]]`) is answered as one in none;
 //   - a descriptor's buffer is named `vertexBuffer.N` (`stageInBuffer.N` for a compute
 //     pipeline's), N its place among the descriptor's buffers in buffer index order (buffers 1, 4
 //     and 30 are `vertexBuffer.0`, `.1` and `.2`), at its buffer index, of its layout's stride,
 //     alignment 4 and data type struct,
 //     of no struct type, used where the function reads an attribute it holds, and no argument
 //     (isArgument 0) where every other binding is one;
+//   - a post-tessellation vertex function's control points and patch inputs are no binding, its
+//     descriptor's buffers are unused whatever it reads of them, and its position in the patch
+//     and its patch's id are built-ins (types 14 and 13);
 //   - a vertex function's `postVertexDumpStride` is its outputs' size and 12 (the AMD GPU's; the
-//     Intel GPU's is 8 more than the outputs), a mesh pipeline's 0.
+//     Intel GPU's is 8 more than the outputs), and a post-tessellation vertex function's 12 more
+//     for a triangle patch and 8 for a quad, whether or not it takes its position in the patch; a
+//     mesh pipeline's 0.
 // The objects are Metal's own reflection classes, made through their initialisers, with the
 // instance variables those leave unset set by name, each class, initialiser and instance variable
 // looked up at run time: what is missing makes no reflection.
+// Before macOS 13, whose Metal has no binding classes (MTLBindingInternal and its kind), each
+// binding is an argument of that release's argument class of its kind (MTLBufferArgument,
+// MTLTextureArgument, MTLThreadgroupMemoryArgument, and MTLArgumentInternal for the others), made
+// by the initialiser macOS 13's binding class of the kind takes (MTLArgumentType numbers each kind
+// as MTLBindingType does), its use its `active`, of the binding's own type object; only an
+// argument of its kind's class answers that kind's getters, which the guest's frameworks ask;
+// built-ins and an argument buffer's constants are of that release's MTLBuiltInArgument and
+// MTLIndirectConstantArgument; the pipelines' reflections keep no binding lists and no print
+// style, and a struct type is made of no type name where its class takes none (macOS 11). Mesh
+// pipelines and objects' payloads, macOS 13's, answer none (measured: macOS 11.7.11's and 12.7.6's
+// classes, their instance variables and methods, and each argument class's getters). The GL
+// renderer reads a stage's uniforms and textures from these arguments, beside its variant's return
+// data (measured: macOS 11.7.11, a reflection of return data alone binds none of them).
 //
 // What is left out, logged once per reason, answering nil (no reflection, as the device did
 // before):
@@ -49,8 +75,9 @@
 //   - an argument at a binding index or of a count function constants compute, or under a
 //     predicate, where the function has no value of a constant it needs, or the module's code is
 //     not one the reader follows;
-//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for, an
-//     imageblock among them (neither x86 Mac makes a pipeline of one).
+//   - a binding, member, built-in or type of a kind no x86 Mac's answer was measured for, a
+//     kernel's imageblock among them on an x86 Mac's device (neither x86 Mac makes a pipeline of
+//     one), and on an Apple GPU's one of an implicit layout (the M3 Max makes no pipeline of it).
 // Where the module's code is not one the reader follows, an argument the AIR marks used whose only
 // reads are in code the function's constants remove is answered used, where Metal answers it
 // unused (it reflects the specialised code).
@@ -91,26 +118,58 @@ std::vector<RgfxDescriptorBuffer> RgfxStageInputBuffers(MTLStageInputOutputDescr
 struct RgfxStageReflection {
 	NSArray *_Nullable bindings = nil; // nil where there are none
 	NSArray *_Nullable builtIns = nil; // nil where there are none
-	uint64_t outputBytes = 0;          // a vertex function's outputs' size
+	uint64_t outputBytes = 0;          // a vertex function's outputs' size, its patch's position's
+	NSData *_Nullable pluginReturnData = nil; // a GL shader variant's (RgfxGLPluginReturnData)
 };
 
 // The answers of the entry point `entry` of the module `module` (rgfxReadAirEntries), specialised by
 // the `count` function constant values at `values`, the descriptor's `buffers` (in buffer index
 // order) first, named `prefix.0` on: false where they are not made (the file's comment), with
-// `*why` saying why.
+// `*why` saying why. `appleGPU` asks for an Apple GPU's answers where they differ from an x86
+// Mac's.
 bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                 const RgfxFunctionConstant *_Nullable values, uint32_t count, NSString *prefix,
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
-                                NSString *__strong _Nullable *_Nonnull why);
+                                NSString *__strong _Nullable *_Nonnull why, bool appleGPU = false);
 
-// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction). This and the
-// creators' three below are RgfxPipelineReflectionOf.mm's.
+// Metal's refusal of the entry point `entry` of the module `module` (rgfxReadAirEntries) specialised
+// by the `count` function constant values at `values`, where they put two of its present arguments
+// at overlapping locations of one argument table; nil where they put none there, and nil where
+// that is not known. Metal refuses such values where it makes the function, by values or by a
+// descriptor, at once or with a completion handler, the function's specialized name or not
+// (MTLLibraryErrorDomain, MTLLibraryErrorCompileFailure, "error: buffer argument b has invalid
+// location (<0,1>) in k_overlap\n"): a line for each argument, in their order, whose location
+// overlaps an earlier present one's in its table, with its own index and count, as `buffer` (a
+// buffer, a constant buffer, an argument buffer, threadgroup memory), `texture` (a texture or an
+// array of them) or `sampler`. A buffer's table is not threadgroup memory's. An argument is
+// present where its predicate is true, used or not, its code dead or not; its index or count may
+// be a function constant's. A kernel's, a vertex function's and a fragment function's alike
+// (measured: tools/oracle/oracle_overlap, the AMD Radeon Pro 5300M and the Intel UHD Graphics 630
+// on macOS 26.7.1 and the M3 Max on macOS 27.0.1, the same answers). Not known, so not
+// refused: a predicate, index or count the module's code does not compute from the values, a
+// buffer whose address space is not stated, and an argument of another table's kind (a function
+// table, an acceleration structure), which the host's compile then refuses.
+NSError *_Nullable RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                                const RgfxFunctionConstant *_Nullable values, uint32_t count);
+
+// As RgfxStageReflectionOfEntry, of `function`, one of our libraries' (RgfxFunction), with an
+// Apple GPU's answers where its device is one (rgfxAppleGPU); where
+// `openCLMode` and the function is a kernel's of OpenCL mode (RgfxFunction's rgfxClBindings), as
+// its pipeline of OpenCL mode binds it (RgfxClMode.hpp). This and the creators' three below are
+// RgfxPipelineReflectionOf.mm's.
 bool RgfxStageReflectionOf(id<MTLFunction> function, NSString *prefix, const std::vector<RgfxDescriptorBuffer> &buffers,
-                           RgfxStageReflection &out, NSString *__strong _Nullable *_Nonnull why);
+                           RgfxStageReflection &out, NSString *__strong _Nullable *_Nonnull why,
+                           bool openCLMode = false);
 
 // Metal's compute pipeline reflection of a kernel's answers; nil, with `*why`, where Metal lacks a
 // class or instance variable it needs.
 id _Nullable RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString *__strong _Nullable *_Nonnull why);
+
+// Metal's reflection of a function by itself (MTLFunctionReflectionInternal, which
+// -[_MTLFunction reflectionWithOptions:] answers): its arguments and bindings, the same objects, as
+// a pipeline's of the function lists them (measured: macOS 26.7.1, the AMD 5300M and the Intel 630
+// alike, OpenCL C and Metal kernels). nil, with `*why`, as RgfxComputePipelineReflectionMake.
+id _Nullable RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__strong _Nullable *_Nonnull why);
 
 // Metal's render pipeline reflection of its stages' answers, null for a stage the pipeline does not
 // have: a vertex pipeline's (`vertex`, `fragment`), or a mesh pipeline's (`object`, `mesh`,
@@ -130,6 +189,14 @@ id _Nullable RgfxComputePipelineReflectionOf(id<MTLFunction> _Nullable kernel,
 id _Nullable RgfxRenderPipelineReflectionOf(id<MTLFunction> _Nullable vertex,
                                             MTLVertexDescriptor *_Nullable vertexDescriptor,
                                             id<MTLFunction> _Nullable fragment, MTLPipelineOption options);
+// For tests: answers from then on of the classes `standIns` names in place of Metal's (each Metal
+// class's name, to its stand-in, or to NSNull for one Metal is to lack), as on a release whose
+// Metal has those; nil goes back to Metal's own.
+void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *_Nullable standIns);
+
+// The reflection a function answers by itself (RgfxFunctionReflectionMake): nil, logged once per
+// reason, where it is not made.
+id _Nullable RgfxFunctionReflectionOf(id<MTLFunction> function);
 id _Nullable RgfxMeshPipelineReflectionOf(id<MTLFunction> _Nullable object, id<MTLFunction> _Nullable mesh,
                                           id<MTLFunction> _Nullable fragment, MTLPipelineOption options);
 

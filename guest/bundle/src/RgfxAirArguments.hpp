@@ -22,11 +22,17 @@
 // a post-tessellation vertex function's patch inputs, function tables and acceleration structures
 // are named, as bindings of no texture. Threadgroup memory is an `air.buffer` of
 // `air.address_space` 3, at an index of its own that no buffer is bound to: it is no argument
-// here. Read from modules that Apple's Metal compiler built from our own sources
-// (tests/air_arguments.metal), and as LLVM's text form of the same modules prints them; a count
-// set by function constants, which no source of ours declares, from macOS 27's frameworks'
-// modules on the M3 Max, where 709 entry points bind one (Metal Performance Shaders' kernels
-// among them).
+// here. An OpenCL C kernel's argument passed by value (a scalar, a vector, a struct or a union)
+// is an `air.constant`, bound at an `air.location_index` among the buffers, with no access key;
+// the kernel's function takes it as a pointer of address space 2 to the value. It is read as a
+// buffer at its index, of no access the reader knows (read: Metal's compiler on macOS 27.0.1, the
+// M3 Max, OpenCL C programs of our own compiled as the GL renderer compiles them, for each scalar
+// type, vectors of 2 to 16 components, half and half4, structs, a nested struct and a union, as
+// LLVM's text form prints the modules; tests/cl_mode_tests.mm). Read from modules that Apple's
+// Metal compiler built from our own sources (tests/air_arguments.metal), and as LLVM's text form
+// of the same modules prints them; a count set by function constants, which no source of ours
+// declares, from macOS 27's frameworks' modules on the M3 Max, where 709 entry points bind one
+// (Metal Performance Shaders' kernels among them).
 //
 // A module built for macOS 10.12 (-std=macos-metal1.2) holds LLVM 3.5's metadata nodes, each
 // operand a type and a value: a metadata where the type is metadata, else a value in place of a
@@ -97,17 +103,34 @@ struct RgfxAirConstant {
 };
 
 // One entry point: its name, stage and binding arguments, in the module's order, and the function
-// constants its module declares (`constantsRead` false where they did not read).
+// constants its module declares (`constantsRead` false where they did not read). `argumentsRead`
+// is false where an argument's node is not one the reader follows (a binding of a kind it does
+// not know, a texture of no access it knows, a binding it cannot read): which bindings the
+// function writes is then unknown, and `arguments` is empty.
 struct RgfxAirFunction {
 	std::string name;
 	RgfxAirStage stage;
+	bool argumentsRead = true;
 	std::vector<RgfxAirArgument> arguments;
 	std::vector<RgfxAirConstant> constants;
 	bool constantsRead = false;
+	// Whether function constants may put two of its binding arguments at overlapping locations of
+	// one argument table (its buffers, argument buffers among them; its threadgroup memory; its
+	// textures; its samplers), which Metal refuses where it makes the specialised function
+	// (RgfxOverlappingArgumentError): where two of them declare locations that overlap, or one's
+	// index or count is computed from function constants. False where none can.
+	bool locationsMayOverlap = false;
+	// A kernel's `[[max_total_threads_per_threadgroup(n)]]`: n, which its entry point's node states
+	// in a node of its own after its arguments' (`air.max_work_group_size` and n), read whether or
+	// not its arguments read; 0 where it states none, or one not of that form.
+	uint32_t maxTotalThreads = 0;
 };
 
-// The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header).
-// False where it is not one the reader can follow; `out` then holds nothing.
+// The entry points of the AIR module at `bitcode` (raw bitcode, or in LLVM's wrapper header),
+// each with its own answer: an entry point whose arguments the reader does not follow is listed,
+// `argumentsRead` false, beside the others, and one whose node names no function of the module is
+// left out. False where the bytes are not a module the reader can follow; `out` then holds
+// nothing.
 bool rgfxReadAirFunctions(const uint8_t *bitcode, size_t size, std::vector<RgfxAirFunction> &out);
 
 // The signatures of a module's visible functions. The module lists them in the named metadata
@@ -203,7 +226,7 @@ struct RgfxAirVisible {
 	enum class Signature : uint8_t {
 		None,    // no `air.stitching_info`: a visible function that is not stitchable
 		Read,    // the signature below
-		Unknown, // a signature with a type the reader does not know
+		Unknown, // a signature with a type or a node the reader does not know
 	};
 	std::string name;
 	Signature signature = Signature::None;
@@ -219,7 +242,9 @@ struct RgfxAirVisible {
 };
 
 // The visible functions of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), in
-// `air.visible`'s order. False where it is not one the reader can follow; `out` then holds nothing.
+// `air.visible`'s order, each with its own answer: one whose node is not of the form above has a
+// signature Unknown, and one whose node names no function of the module is left out. False where
+// the bytes are not a module the reader can follow; `out` then holds nothing.
 bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAirVisible> &out);
 
 // --- An entry point's nodes, whole, for its pipeline's reflection -----------------------------
@@ -239,7 +264,30 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 //   `air.read`, `air.write`, `air.read_write`, `air.sample`: its access;
 //   `air.arg_unused`: the function never references it;
 //   `air.render_target` n, as its kind: a fragment function's input of colour attachment n's value
-//   (`[[color(n)]]`);
+//   (`[[color(n)]]`), n an integer or a global the module's initialiser sets, for an index function
+//   constants compute (`[[color(kIndex)]]`), then `air.raster_order_group` g where the input is in
+//   raster order group g (`[[color(0), raster_order_group(g)]]`; read: Metal's compiler on macOS
+//   27.0.1, tools/oracle/oracle_reflection.metal's f_fetch_at and f_fetch_group, as LLVM's text form
+//   prints them);
+//   `air.imageblock`, as its kind, then its layout (`explicit`, `implicit`): an imageblock (an
+//   Apple GPU's kernel's `imageblock<T, imageblock_layout_explicit>`); `air.imageblock_data`, as
+//   its kind: a fragment function's input of its tile's imageblock data (`[[imageblock_data]]`);
+//   either then `air.imageblock_data_size` n, its data's size in bytes, and its layout as
+//   `air.struct_type_info`; imageblock data that views a master struct
+//   (`[[imageblock_data(Master)]]`) then `air.imageblock_master` and the master's layout, of the
+//   same form (read: Metal's compiler on macOS 27.0.1, tools/oracle/oracle_reflection.metal's
+//   k_imageblock_explicit, k_imageblock_if, f_imageblock_data and f_imageblock_master, as LLVM's
+//   text form prints them);
+//   `air.raster_order_group` g after a texture's access: a fragment function's texture in raster
+//   order group g (`[[texture(n), raster_order_group(g)]]`; read: the same, f_rog_texture);
+//   `air.patch_control_point_input`, as its kind: a post-tessellation vertex function's control
+//   points (its `patch_control_point<T>` stage input, alone or a member of its stage input's
+//   struct), then a node of its control point function (`air.patch_control_point_function` and
+//   the function), then a node of each attribute of the control point, of the keys above
+//   (`air.location_index` the attribute's index), under `air.function_constant` and its
+//   predicate's node where it is declared under one (read: Metal's compiler on macOS 27.0.1, the
+//   M3 Max, tools/oracle/oracle_reflection.metal's v_patch and v_patch_points and
+//   tests/air_arguments.metal's reads_patch, as LLVM's text form prints them);
 //   `air.mesh` !info: a mesh function's mesh, its `air.mesh_type_info` node of its vertex and
 //   primitive data (each a node of outputs, below), its vertex and primitive counts and its
 //   topology (`air.triangle`, ...).
@@ -251,6 +299,15 @@ bool rgfxReadAirVisible(const uint8_t *bitcode, size_t size, std::vector<RgfxAir
 // A layout is a run of members, each `[air.struct_type_info !layout] offset size arrayLength
 // "type" "name"` and, in an argument buffer's, `air.indirect_argument` and the member's own node
 // (or its first id, for a struct of members), or `air.render_target` n, `air.raster_order_group` n.
+// The reader follows layouts and argument buffers' members to kRgfxAirNesting deep.
+
+// How deep the reader follows a node's layouts and argument buffers' members, each a level: past
+// it, a node does not read (and an argument buffer's members are taken as writing a texture). It
+// only bounds the reader's recursion: a layout that holds itself reads as none at any depth. Every
+// entry point of macOS 27's frameworks reads within 12 (measured: the M3 Max under macOS 27.0.1,
+// every system .metallib; the 39 past 8, VFX's vfx_rt_direct_lighting_reservoir and CoreUSDEdit's
+// evaluate among them, all read at 12).
+constexpr unsigned kRgfxAirNesting = 32;
 
 struct RgfxAirNode;
 
@@ -297,27 +354,58 @@ struct RgfxAirNode {
 	std::string typeName, name;
 	bool unused = false;
 	std::shared_ptr<const std::vector<RgfxAirMember>> layout;
-	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value.
-	bool hasRenderTarget = false;
-	uint32_t renderTarget = 0;
+	// `air.render_target` n, its kind: a fragment function's input of colour attachment n's value;
+	// `renderTargetIsGlobal` where function constants compute n, which the module's initialiser
+	// stores in the global `renderTargetGlobal`, `renderTarget` then 0. `air.raster_order_group`:
+	// the input's raster order group, or a texture's.
+	bool hasRenderTarget = false, renderTargetIsGlobal = false, hasRasterOrderGroup = false;
+	uint32_t renderTarget = 0, rasterOrderGroup = 0;
+	uint64_t renderTargetGlobal = UINT64_MAX;
+	// `air.imageblock`: its layout's name (`explicit`, `implicit`); `air.imageblock_data_size`: its
+	// data's size in bytes; `air.imageblock_master`: the master struct imageblock data views.
+	std::string imageblockLayout;
+	bool hasImageblockDataSize = false;
+	uint32_t imageblockDataSize = 0;
+	std::shared_ptr<const std::vector<RgfxAirMember>> imageblockMaster;
 	// `air.mesh`: its vertex and primitive data, its vertex and primitive counts and its topology's
 	// name.
 	bool hasMesh = false;
 	std::vector<RgfxAirOutput> meshVertexData, meshPrimitiveData;
 	uint32_t meshVertices = 0, meshPrimitives = 0;
 	std::string meshTopology;
+	// `air.patch_control_point_input`, its kind: the control point's attributes, each a node of no
+	// kind and no position, its `index` the attribute's.
+	std::vector<RgfxAirNode> controlPoints;
 };
 
 enum class RgfxAirEntryStage : uint8_t { Kernel, Vertex, Fragment, Object, Mesh };
+
+// A post-tessellation vertex function's patch type, its [[patch(type)]].
+enum class RgfxAirPatch { None, Triangle, Quad };
 
 struct RgfxAirEntry {
 	std::string name;
 	// Its function's value number in the module.
 	uint64_t function = 0;
 	RgfxAirEntryStage stage = RgfxAirEntryStage::Kernel;
+	// False where a node of it (its entry's, an output's, an argument's or a layout's, its work
+	// group size's) is not of a form the reader knows: its outputs, arguments and work group size
+	// are then unknown, and empty here.
+	bool nodesRead = true;
 	// Its outputs (the entry's second node), in order: none for a kernel or a void function.
 	std::vector<RgfxAirOutput> outputs;
 	std::vector<RgfxAirNode> arguments;
+	// A kernel's `air.work_group_size` and its three sizes, a node of the entry's after its
+	// arguments' (an OpenCL C kernel's reqd_work_group_size, as Metal's compiler writes it for the
+	// GL renderer's programs; measured: macOS 26.7.1 and macOS 27).
+	bool hasWorkGroupSize = false;
+	uint32_t workGroupSize[3] = {1, 1, 1};
+	// A post-tessellation vertex function's patch type, from its node of `air.patch` after its
+	// arguments' (`!{!"air.patch", !"quad", !"air.patch_control_point", i32 4}` as LLVM's text form
+	// prints it; read: tools/oracle/oracle_reflection.metal's v_patch functions and
+	// tests/air_arguments.metal's reads_patch, as Apple's Metal compiler builds them); None for any
+	// other function.
+	RgfxAirPatch patch = RgfxAirPatch::None;
 };
 
 // The code of a module that declares function constants: its functions' bodies, as the reader
@@ -325,7 +413,8 @@ struct RgfxAirEntry {
 struct RgfxAirCode;
 
 // A module's entry points, its function constants' indices by name (`air.function_constants`:
-// each the constant's global, its type, its name and its index), and, where it declares function
+// each the constant's global, its type, its name and its index; one whose node does not read is
+// left out, so a predicate that names it has no value), and, where it declares function
 // constants, its code (null where the reader does not follow it).
 struct RgfxAirEntries {
 	std::vector<RgfxAirEntry> entries;
@@ -334,25 +423,37 @@ struct RgfxAirEntries {
 };
 
 // The entry points of the AIR module at `bitcode` (as rgfxReadAirFunctions takes it), every node
-// of each whole. False where it is not one the reader can follow, or a node or layout is not one
-// it knows the form of; `out` then holds nothing.
+// of each whole, each entry point with its own answer: one a node or layout of which is not of a
+// form the reader knows is listed, `nodesRead` false, beside the others, and one whose node names
+// no function of the module is left out. False where the bytes are not a module the reader can
+// follow; `out` then holds nothing.
 bool rgfxReadAirEntries(const uint8_t *bitcode, size_t size, RgfxAirEntries &out);
 
 // --- One read of a module, kept for the process -----------------------------------------------
 
 // What the three readers above answer for one module, from one read of its bitstream: each
-// `...Read` and its value are what that reader returns and puts in `out` for the same bytes.
+// `...Read` and its value are what that reader returns and puts in `out` for the same bytes. The
+// entry points' are there only where the read asked for them (`withEntries`).
 struct RgfxAirModule {
 	bool functionsRead = false;
 	std::vector<RgfxAirFunction> functions; // rgfxReadAirFunctions
 	bool visibleRead = false;
 	std::vector<RgfxAirVisible> visible; // rgfxReadAirVisible
+	// Whether the read took the entry points (rgfxReadAirModule's `entries`); where it did not,
+	// `entriesRead` is false and `entries` empty, whatever the module holds.
+	bool withEntries = false;
 	bool entriesRead = false;
 	RgfxAirEntries entries; // rgfxReadAirEntries
 };
 
-// Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`.
-void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out);
+// Reads the AIR module at `bitcode` (as rgfxReadAirFunctions takes it) once, into `out`: its
+// entry points too where `entries`, else its arguments and visible functions alone, without
+// decoding its function bodies. A module that declares function constants keeps its bodies, which
+// the entry points' specialisation takes; decoding them costs several times the rest of the read
+// (MPSNeuralNetwork's cnnConvArray: 391 us against 40 us; Espresso's dequantizeGeneric: 54 against
+// 17, measured on the M3 Max under macOS 27), and only a pipeline's reflection, a function of
+// OpenCL mode and constants set by name that no function list resolves need the entry points.
+void rgfxReadAirModule(const uint8_t *bitcode, size_t size, RgfxAirModule &out, bool entries = true);
 
 // What a module of `size` bytes read as `module` costs a cache's budget: its bytes, and the bytes
 // its decoded code holds (RgfxAirEntries::code: its containers' elements, for a module that
@@ -364,17 +465,20 @@ size_t rgfxAirModuleCost(const RgfxAirModule &module, size_t size);
 // so every lookup of equal bytes, from any library over them, shares one read. It keeps the most
 // recently looked-up modules, a copy of each one's bytes (its key, compared whole) with its
 // reads, while their costs (rgfxAirModuleCost) total at most `budget`; a module it let go is read
-// again at its next lookup. The reads it hands out stay valid while a holder keeps them. Safe on
-// any thread; two threads that look up one module at once may each read it, and both are answered
-// the first read kept.
+// again at its next lookup. A module has two reads, one without its entry points and one with
+// them (rgfxReadAirModule's `entries`), each made at the first lookup of its kind, so every
+// lookup of a kind is answered one object; where the read with them came first, it answers both.
+// The reads it hands out stay valid while a holder keeps them. Safe on any thread; two threads
+// that look up one module at once may each read it, and both are answered the first read kept.
 class RgfxAirModuleCache {
 public:
 	explicit RgfxAirModuleCache(size_t budget) : budget_(budget) {}
 	RgfxAirModuleCache(const RgfxAirModuleCache &) = delete;
 	RgfxAirModuleCache &operator=(const RgfxAirModuleCache &) = delete;
 
-	// The reads of the module at `bitcode`: those kept for equal bytes, else read now (and kept).
-	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size);
+	// The reads of the module at `bitcode`, its entry points among them where `entries`
+	// (rgfxReadAirModule): those kept for equal bytes, else read now (and kept).
+	std::shared_ptr<const RgfxAirModule> moduleOf(const uint8_t *bitcode, size_t size, bool entries = true);
 
 	// How many modules it read, how many it keeps, and their costs (tests).
 	uint64_t reads() const;
@@ -384,8 +488,10 @@ public:
 private:
 	struct Kept {
 		std::string bytes;
-		std::shared_ptr<const RgfxAirModule> module;
-		size_t cost;
+		// The read without the entry points and the one with them, either null until asked; the
+		// first where the second came first is the second.
+		std::shared_ptr<const RgfxAirModule> plain, full;
+		size_t cost; // the bytes', and each distinct read's code's
 	};
 	using Order = std::list<Kept>;
 	mutable std::mutex lock_;
@@ -425,8 +531,9 @@ RgfxAirModuleCache &rgfxAirModules();
 // The reader decodes a module's function bodies (FUNCTION_BLOCK, of LLVM's documented records,
 // as a module of typed pointers writes them) where it declares function constants. It runs the
 // initialisers over integers and floating-point scalars: a load of a constant's global gives the
-// constant's value (none where the function has no value for it), `air.is_function_constant_
-// defined` whether it has one, `air.normalize_function_constant_predicate` 1 for a value other
+// constant's value (none where the function has no value for it, any value where the constant's
+// node in `air.function_constants` does not read), `air.is_function_constant_defined` whether it
+// has one, `air.normalize_function_constant_predicate` 1 for a value other
 // than 0. In the entry point's body it propagates the values those globals then hold through the
 // branches, switches, selects and phis they decide (sparse conditional constant propagation), and
 // counts as used each argument a live instruction of a reachable block reads: an instruction is
@@ -449,6 +556,20 @@ struct RgfxAirSpecialisation {
 // false where the module has no code the reader follows (`out` then empty).
 bool rgfxAirSpecialise(const RgfxAirEntries &module, const RgfxAirEntry &entry, const RgfxFunctionConstant *values,
                        uint32_t count, RgfxAirSpecialisation &out);
+
+// The globals of `module` under the `count` function constant values at `values`, as
+// rgfxAirSpecialise answers them (RgfxAirSpecialisation's `globals`), from its initialisers alone:
+// no entry point's body is followed, which costs many times them (VideoToolbox's
+// VTMTSComputeFunction: 35.6 ms a specialisation against 0.19 ms for its initialisers, measured on
+// the M3 Max under macOS 27). False where the module has no code the reader follows (`out` then
+// empty).
+bool rgfxAirConstantGlobals(const RgfxAirEntries &module, const RgfxFunctionConstant *values, uint32_t count,
+                            std::map<uint64_t, int64_t> &out);
+
+// How many times the process ran a module's initialisers and followed an entry point's body,
+// each specialisation's and each pass of rgfxAirSpecialise's (tests).
+uint64_t rgfxAirInitialisersRun();
+uint64_t rgfxAirBodiesFollowed();
 
 // Narrows a universal .metallib (a big-endian fat header: magic CA FE BA BE, or CA FE BA BF with
 // 64-bit offsets) to its slice of generic AIR bitcode, a .metallib itself; other bytes, and a

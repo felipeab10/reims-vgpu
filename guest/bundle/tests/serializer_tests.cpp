@@ -3,7 +3,7 @@
  * run on the Mac (guest/bundle/Makefile `test`). It builds a plain-buffer region,
  * a ring writer over it, and a serialiser, posts every message the slice covers,
  * and reads each back with a minimal host-side consumer (the mirror of
- * crates/reims-graphics/src/ring.rs), asserting the type, size and fields on the
+ * crates/reims-vgpu-graphics/src/ring.rs), asserting the type, size and fields on the
  * wire. No Metal, no device: this validates the serialiser's bytes alone.
  *
  * Exits 0 and prints a one-line summary when every check passes; aborts on the
@@ -11,19 +11,25 @@
  */
 
 #include <IOKit/IOReturn.h>
+#include <mach/mach.h>
+#include <mach/mach_vm.h>
 #include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
+#include <mutex>
 #include <vector>
 
 #include "RgfxArgumentLayout.hpp"
 #include "RgfxBinaryArchiveFile.hpp"
 #include "RgfxCaps.hpp"
+#include "../../kext/src/RgfxUserClientABI.hpp"
+#include "../../kext/src/RgfxSubmitGate.hpp"
 #include <utility>
 #include "RgfxEncoder.hpp"
+#include "RgfxFeatureProfile.hpp"
 #include "RgfxHeapRanges.hpp"
 #include "RgfxLibraryKey.hpp"
 #include "RgfxMemoryShadow.hpp"
@@ -168,22 +174,84 @@ void test_address_picks()
 	CHECK(std::adjacent_find(all.begin(), all.end()) == all.end());
 }
 
-// A chunk source standing in for the kext: it hands each first id of `firsts` in turn, then
-// answers none left, and counts its calls (the user-client calls a create would make).
+// A chunk source standing in for the kext: it hands each first id of `firsts` in turn, with
+// the grant's size from `sizes` where it holds one for it (else none, the space's own size),
+// then answers none left, and counts its calls (the user-client calls a create would make).
 struct FakeChunks {
 	std::vector<uint64_t> firsts;
+	std::vector<uint64_t> sizes;
 	size_t next = 0;
 	int calls = 0;
 };
 
-bool fakeChunk(void *context, uint64_t *first_id)
+bool fakeChunk(void *context, uint64_t *first_id, uint64_t *ids)
 {
 	FakeChunks *f = static_cast<FakeChunks *>(context);
 	f->calls++;
 	if (f->next == f->firsts.size())
 		return false;
+	if (f->next < f->sizes.size())
+		*ids = f->sizes[f->next];
 	*first_id = f->firsts[f->next++];
 	return true;
+}
+
+// The kext's grant says how many ids its chunk holds, and the space takes that many, whatever
+// size it was set up for: a process whose features query a sandbox refused set chunks of 64
+// up, while the kext granted 16 (Safari's WebContent on macOS 12.7.6), and named ids past its
+// chunk that the device refused.
+void test_resource_id_chunk_size_is_the_grant_s()
+{
+	const uint64_t small = RGFX_RESOURCE_ID_SMALL_CHUNK;
+	const uint64_t chunk = RGFX_RESOURCE_ID_CHUNK;
+
+	// Set up for chunks of 64; the kext grants small chunk 29 (ids 465 to 480), then small
+	// chunk 3 (ids 49 to 64): 16 ids each, and the 17th id takes the next grant.
+	FakeChunks f;
+	f.firsts = {1 + 29 * small, 1 + 3 * small};
+	f.sizes = {small, small};
+	RgfxIdSpace ids;
+	ids.setResourceIdSource(&fakeChunk, &f, chunk);
+	for (uint64_t id = 465; id <= 480; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(f.calls == 1);
+	CHECK(ids.allocResourceId() == 49);
+	CHECK(f.calls == 2);
+	for (uint64_t id = 50; id <= 64; id++)
+		CHECK(ids.allocResourceId() == id);
+	CHECK(ids.allocResourceId() == 0);
+	CHECK(f.calls == 3);
+	// Ids next to the grants, which a chunk of 64 would have held, are no chunk's.
+	ids.freeResourceId(481);
+	ids.freeResourceId(65);
+	CHECK(ids.allocResourceId() == 0);
+
+	// Set up for small chunks; the kext grants a chunk of 64 (ids 129 to 192): all 64 are the
+	// process's.
+	FakeChunks big;
+	big.firsts = {1 + 2 * chunk};
+	big.sizes = {chunk};
+	RgfxIdSpace bigIds;
+	bigIds.setResourceIdSource(&fakeChunk, &big, small);
+	for (uint64_t id = 129; id <= 192; id++)
+		CHECK(bigIds.allocResourceId() == id);
+	CHECK(big.calls == 1);
+
+	// A grant of a size that is not whole small chunks, or more than a chunk, is no chunk; one
+	// whose first id is not a multiple of its own size past 1 is none either; one of 32 at a
+	// multiple of 32 is two small chunks.
+	FakeChunks bad;
+	bad.firsts = {1 + 2 * small, 1 + 2 * chunk, 1 + small, 1 + 2 * small};
+	bad.sizes = {small + 1, 2 * chunk, 2 * small, 2 * small};
+	RgfxIdSpace badIds;
+	badIds.setResourceIdSource(&fakeChunk, &bad, chunk);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(badIds.allocResourceId() == 0);
+	for (uint64_t id = 33; id <= 64; id++)
+		CHECK(badIds.allocResourceId() == id);
+	CHECK(badIds.allocResourceId() == 0);
+	CHECK(bad.calls == 5);
 }
 
 // The kext's small chunks (RGFX_FEATURE_SMALL_ID_CHUNKS): 16 ids each, from the same pool as
@@ -401,33 +469,53 @@ static_assert(offsetof(RgfxDeviceInfo, features_lo) == 0x451 &&
                   offsetof(RgfxDeviceInfo, sampler_reduction_support) == 0x452,
               "the device info's feature and reduction bytes");
 
-// The feature words: the kext's where it answers the call, and where it answers
-// kIOReturnUnsupported (a kext older than the call) or fails otherwise, the blob's bits 0 to 2
-// and no kext feature.
+// The features call's answer: taken where the kext gave its three words and its selector map is
+// this bundle's, as they are, bits from 3 and 32 among them; refused, with both words 0, where it
+// answered kIOReturnUnsupported (a kext of the map before, whose features call had another
+// number), failed otherwise, gave fewer words, or named another map. The device info's offered
+// bits stand in for none of them.
 void test_caps_features()
 {
 	RgfxCaps caps;
-	caps.takeFeatures(kIOReturnUnsupported, 0, 0);
-	CHECK(caps.features() == 0 && caps.kextFeatures() == 0); // no blob: nothing
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0); // nothing before the call
+	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
+	const uint64_t ours[3] = {word, 1ull << 4, kRgfxSelectorMap};
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, ours));
+	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
+
+	CHECK(!caps.takeFeatures(kIOReturnUnsupported, 3, ours));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, ours));
+	CHECK(!caps.takeFeatures(kIOReturnBadArgument, 3, ours));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 2, ours));
+	const uint64_t before[3] = {word, 1ull << 4, kRgfxSelectorMap - 1};
+	const uint64_t after[3] = {word, 1ull << 4, kRgfxSelectorMap + 1};
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 3, before));
+	CHECK(!caps.takeFeatures(KERN_SUCCESS, 3, after));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
 
 	RgfxDeviceInfo info = {};
 	info.version = RGFX_DEVICE_INFO_VERSION;
 	info.features_lo = RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED |
-	                   RGFX_FEATURE_QUIET_SCHEDULED; // bit 3 offered, but taken by no kext
+	                   RGFX_FEATURE_QUIET_SCHEDULED;
 	CHECK(caps.load(info));
-	CHECK(caps.features() == 0); // nothing before the probe
-	caps.takeFeatures(kIOReturnUnsupported, 0xffff, 0x1f);
-	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	CHECK(caps.kextFeatures() == 0);
-	caps.takeFeatures(kIOReturnBadArgument, 0xffff, 0x1f);
-	CHECK(caps.features() == (RGFX_FEATURE_SURFACE_PAGES | RGFX_FEATURE_CB_SUBMITTED));
-	CHECK(caps.kextFeatures() == 0);
-	// A kext that answers gives both words as they are, bits from 3 and 32 among them.
-	const uint64_t word = RGFX_FEATURE_CB_SUBMITTED | RGFX_FEATURE_CB_PARTS | (1ull << 40);
-	caps.takeFeatures(KERN_SUCCESS, word, 1ull << 4);
-	CHECK(caps.features() == word && caps.kextFeatures() == 1ull << 4);
-	caps.takeFeatures(KERN_SUCCESS, 0, 0);
+	CHECK(!caps.takeFeatures(kIOReturnUnsupported, 0, ours));
 	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+	const uint64_t none[3] = {0, 0, kRgfxSelectorMap};
+	CHECK(caps.takeFeatures(KERN_SUCCESS, 3, none));
+	CHECK(caps.features() == 0 && caps.kextFeatures() == 0);
+}
+
+// The feature profile the device answers, on every host: the x86 Macs' that the guest's Metal
+// knows, 10002 where it has the MTLArchitecture class (macOS 13 and later), else 10001, the one
+// macOS 11 and 12's Metal has limits for.
+void test_feature_profile_for_guest()
+{
+	static_assert(rgfx_profile::kX86Mac == 10002);
+	static_assert(rgfx_profile::kX86Mac12 == 10001);
+	CHECK(rgfx_profile::forGuest(true) == 10002);  // macOS 13 to 26
+	CHECK(rgfx_profile::forGuest(false) == 10001); // macOS 11 and 12
 }
 
 void test_caps()
@@ -465,17 +553,25 @@ void test_caps()
 	info.identity_flags[kRgfxIdentityIsLowPower] = 1;              // first by position
 	info.identity_flags[kRgfxIdentitySupportsPlacementSparse] = 1; // last by position
 	info.counter_sampling[0] = 1; // at stage boundaries
-	info.format_count = 1;
+	info.format_count = 3;
 	info.formats[0].format = 80; // BGRA8Unorm
 	info.formats[0].texture_buffer_alignment = 16;
+	info.formats[0].linear_alignment = 256;
 	info.formats[0].sparse_tiles[0][0] = 64; // 1 sample, 16 KiB pages
 	info.formats[0].sparse_tiles[0][1] = 64;
 	info.formats[0].sparse_tiles[0][2] = 1;
 	info.formats[0].sparse_tiles[8][0] = 128; // 4 samples, 256 KiB pages
 	info.formats[0].sparse_tiles[8][1] = 128;
 	info.formats[0].sparse_tiles[8][2] = 1;
-	info.formats[1].format = 70; // past format_count: not read
-	info.formats[1].texture_buffer_alignment = 16;
+	// A host GPU whose linear images ask more of larger texels: a 16-byte texel's 1024 bytes
+	// beside a 4-byte texel's 256, the largest the device's linearTextureAlignmentBytes.
+	info.formats[1].format = 125; // RGBA32Float
+	info.formats[1].linear_alignment = 1024;
+	info.formats[2].format = 70; // RGBA8Unorm
+	info.formats[2].linear_alignment = 256;
+	info.formats[3].format = 115; // RGBA16Float, past format_count: not read
+	info.formats[3].texture_buffer_alignment = 16;
+	info.formats[3].linear_alignment = 512;
 	const char *arch = "test_arch";
 	info.architecture_name_len = static_cast<uint32_t>(std::strlen(arch));
 	std::memcpy(info.architecture_name, arch, info.architecture_name_len);
@@ -484,7 +580,9 @@ void test_caps()
 	info.primitive_types[3] = 1;
 	info.write_rounding_modes[1] = 1; // mode 2
 	info.limits[kRgfxLimitDeviceLinearTextureAlignmentBytes] = 64;
-	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 256;
+	info.limits[kRgfxLimitLinearTextureAlignmentBytes] = 1024;
+	info.limits[kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes] = 32;
+	info.limits[kRgfxLimitIOSurfaceTextureAlignmentBytes] = 128;
 	info.limits[kRgfxLimitMaxViewportCount] = 16; // last by position
 	info.flags[kRgfxFlagAreRasterOrderGroupsSupported] = 1; // first by position
 	info.flags[kRgfxFlagSupportsTileShaders] = 1;           // last by position
@@ -519,14 +617,17 @@ void test_caps()
 	CHECK(!caps.supportsCounterSampling(5));
 	CHECK(std::strcmp(caps.architectureName(), "test_arch") == 0);
 	CHECK(caps.textureBufferAlignment(80) == 16);
-	CHECK(caps.textureBufferAlignment(70) == 0); // listed past the count
+	CHECK(caps.textureBufferAlignment(115) == 0); // listed past the count
 	CHECK(caps.textureBufferAlignment(130) == 0); // not listed
-	// The linear alignment is the one limit for every format, never 0: those with a
-	// texture-buffer answer, and those without, where Metal ends the process.
+	// The linear alignment is each format's own where the blob answers it, and the device's
+	// largest, never 0, where it does not: a format listed without one, listed past the count,
+	// or not listed, where Metal ends the process.
 	CHECK(caps.minimumLinearTextureAlignment(80) == 256);
-	CHECK(caps.minimumLinearTextureAlignment(70) == 256);  // listed past the count
-	CHECK(caps.minimumLinearTextureAlignment(130) == 256); // not listed (ASTC)
-	CHECK(caps.minimumLinearTextureAlignment(0) == 256);   // Invalid
+	CHECK(caps.minimumLinearTextureAlignment(70) == 256);
+	CHECK(caps.minimumLinearTextureAlignment(125) == 1024);
+	CHECK(caps.minimumLinearTextureAlignment(115) == 1024); // listed past the count
+	CHECK(caps.minimumLinearTextureAlignment(130) == 1024); // not listed (ASTC)
+	CHECK(caps.minimumLinearTextureAlignment(0) == 1024);   // Invalid
 	uint64_t tile[3];
 	CHECK(caps.sparseTile(80, 1, 101, tile) && tile[0] == 64 && tile[1] == 64 && tile[2] == 1);
 	CHECK(caps.sparseTile(80, 4, 103, tile) && tile[0] == 128 && tile[2] == 1);
@@ -544,11 +645,37 @@ void test_caps()
 	CHECK(caps.supportsWriteRoundingMode(2));
 	CHECK(!caps.supportsWriteRoundingMode(1));
 	CHECK(caps.limit(kRgfxLimitDeviceLinearTextureAlignmentBytes) == 64);
+	// The IOSurface alignments the device answers, at their places between the linear ones.
+	CHECK(caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes) == 32);
+	CHECK(caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes) == 128);
+	CHECK(caps.limit(kRgfxLimitLinearTextureAlignmentBytes) == 1024);
 	CHECK(caps.limit(kRgfxLimitMaxViewportCount) == 16);
 	CHECK(caps.flag(kRgfxFlagAreRasterOrderGroupsSupported));
 	CHECK(caps.flag(kRgfxFlagSupportsTileShaders));
 	CHECK(!caps.flag(kRgfxFlagSupportsImageBlocks));
 	CHECK(std::strcmp(caps.name(), "NVIDIA GeForce RTX 5080 Laptop GPU") == 0);
+}
+
+// The device answers Metal's 16 for both IOSurface alignments whatever the host answers
+// (kRgfxIOSurfaceTextureAlignmentBytes): CoreAnimation makes no texture of a surface whose rows are
+// not at a multiple of the answer, and draws nothing of its layer. The rows are those WindowServer
+// made no texture of in macOS 26.7.2 guests answering an RTX 3090's and an RTX 2080's 128, where
+// Safari drew its pages blank, and IOSurface's own alignment, 64 bytes.
+void test_iosurface_alignments_divide_other_codes_surface_rows()
+{
+	CHECK(kRgfxIOSurfaceTextureAlignmentBytes == 16);
+	const uint64_t rows[] = {64, 192, 448, 576, 704, 1088, 1216, 4160, 5184, 5312, 14272};
+	for (uint64_t r : rows)
+		CHECK(r % kRgfxIOSurfaceTextureAlignmentBytes == 0);
+	// The host's answers stay in the caps, and only there.
+	RgfxDeviceInfo info = {};
+	info.version = RGFX_DEVICE_INFO_VERSION;
+	info.limits[kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes] = 128;
+	info.limits[kRgfxLimitIOSurfaceTextureAlignmentBytes] = 256;
+	RgfxCaps caps;
+	CHECK(caps.load(info));
+	CHECK(caps.limit(kRgfxLimitIOSurfaceReadOnlyTextureAlignmentBytes) == 128);
+	CHECK(caps.limit(kRgfxLimitIOSurfaceTextureAlignmentBytes) == 256);
 }
 
 // The MTLDeviceSPI feature queries the device answers itself (RgfxCaps::spiFeature): each YES on
@@ -623,6 +750,49 @@ void test_family_names()
 		CHECK(rgfxFamilyNameOf(name) == family);
 }
 
+// The SPI vendor name, from the device name's first word: the two x86 Macs' names give their
+// own answers (measured), the hosts' names their vendors' in those words, and a name of no vendor
+// the GL renderer knows the AMD's.
+void test_vendor_names()
+{
+	const std::pair<const char *, const char *> cases[] = {
+	    {"AMD Radeon Pro 5300M", "AMD"},
+	    {"Intel(R) UHD Graphics 630", "Intel(R)"},
+	    {"NVIDIA GeForce RTX 5080 Laptop GPU", "NVIDIA"},
+	    {"AMD Radeon 780M (RADV GFX1103_R1)", "AMD"},
+	    {"Intel(R) Arc(tm) Graphics (MTL)", "Intel(R)"},
+	    {"Intel Arc A770", "Intel(R)"},
+	    {"Apple M3 Max", "AMD"},
+	    {"llvmpipe (LLVM 20.1.8, 256 bits)", "AMD"},
+	    {"reims-graphics", "AMD"},
+	    {"", "AMD"},
+	    {"NVIDIAX", "AMD"}, // a first word that only begins with a vendor's
+	};
+	for (const auto &[name, vendor] : cases)
+		CHECK(rgfxVendorNameOf(name) == vendor);
+}
+
+// Heap and buffer creates carry the three modes and Metal's bit 24 to the host, and no other
+// bit: the GL renderer's no-copy buffers' bit 20 (0x100000) among them.
+void test_host_resource_options()
+{
+	CHECK(RgfxHostResourceOptions(0x100010u) == 0x10u);
+	CHECK(RgfxHostResourceOptions(0x1000321u) == 0x1000321u);
+	CHECK(RgfxHostResourceOptions(0xfffffcffu) == 0x10000ffu);
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	CHECK(ser.createBuffer(0x1000, 0x100010).posted);
+	CHECK(expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE).options == 0x10);
+	CHECK(ser.createBufferOverPages(0x1000, 0x100000, 0x60000, 0x1000, 0x40).posted);
+	CHECK(expectMessage<RgfxBufferOverPages>(ring, RGFX_CMD_BUFFER_OVER_PAGES).options == 0);
+	CHECK(ser.createHeap(0x10000, 0x1100020, 1).posted);
+	CHECK(expectMessage<RgfxHeapCreate>(ring, RGFX_CMD_HEAP_CREATE).options == 0x1000020);
+}
+
 // A heap, buffer or device-placed texture (Managed or not) whose GPU address finds no room in the
 // context's range is no object: the create posts nothing and answers ids of 0, so the caller
 // answers nil, as Metal does for one it cannot place, and a texture's resource id goes back; a
@@ -642,6 +812,9 @@ void test_creates_with_no_address_post_nothing()
 	RgfxCreated bh = ser.createBufferOverHostMemory(past, 0, 0x50000);
 	RgfxCreated bp = ser.createBufferOverPages(past, 0, 0x60000, 0x1000, 0x123);
 	RgfxCreated wraps = ser.createBufferOverPages(UINT64_MAX - 0x100, 0, 0x60000, 0x1000, 0x123);
+	RgfxCreated mp = ser.createManagedBuffer(1, past, 0x10);
+	RgfxCreated mwraps = ser.createManagedBuffer(1, UINT64_MAX - 0x100, 0x10,
+	                                             RgfxSerializer::kDefaultAddressAlign, 0x123);
 	RgfxCreated hp = ser.createHeapOverPages(past, 0, 1, 0x60000, 0x4000);
 	RgfxTextureDescriptor desc = {};
 	desc.pixel_format = 80;
@@ -650,7 +823,7 @@ void test_creates_with_no_address_post_nothing()
 	desc.mipmap_level_count = desc.array_length = desc.sample_count = 1;
 	RgfxCreated t = ser.createTexture(desc, RGFX_OBJ_NONE, 0, 256, past);
 	RgfxCreated tm = ser.createManagedTexture(desc, 9, 4, 1, 1, 0, 256, past);
-	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, hp, t, tm})
+	for (const RgfxCreated &c : {h, hh, b, bh, bp, wraps, mp, mwraps, hp, t, tm})
 		CHECK(!c.posted && c.obj_id == 0 && c.gpu_address == 0 && c.resource_id == 0);
 	RgfxMsgHeader header = {};
 	std::vector<uint8_t> bytes;
@@ -725,6 +898,19 @@ void test_lifecycle_messages()
 	CHECK(next.gpu_address >= bp.gpu_address + RgfxIdSpace::addressSpan(0x3123));
 	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
 
+	// A Managed buffer over that one, as a no-copy Managed buffer over the pages is: its pick
+	// holds the span from the page's start too, and its address keeps the offset.
+	RgfxCreated mb = ser.createManagedBuffer(bp.obj_id, 0x3000, 0x10,
+	                                         RgfxSerializer::kDefaultAddressAlign, 0x123);
+	CHECK(mb.posted && mb.gpu_address % RgfxIdSpace::kAddressGranule == 0);
+	auto mbm = expectMessage<RgfxManagedBufferCreate>(ring, RGFX_CMD_MANAGED_BUFFER_CREATE);
+	CHECK(mbm.obj_id == mb.obj_id && mbm.cpu_buffer_obj_id == bp.obj_id);
+	CHECK(mbm.gpu_address == mb.gpu_address + 0x123 && mbm.length == 0x3000 &&
+	      mbm.options == 0x10);
+	RgfxCreated beyond = ser.createBuffer(0x1000, 0);
+	CHECK(beyond.gpu_address >= mb.gpu_address + RgfxIdSpace::addressSpan(0x3123));
+	(void)expectMessage<RgfxBufferCreate>(ring, RGFX_CMD_BUFFER_CREATE);
+
 	// A slab's heap over a pages block's guest RAM, at an address of its size.
 	RgfxCreated slab = ser.createHeapOverPages(0x200000, 0x200, 1, 0x60000, 0x4000);
 	CHECK(slab.posted && slab.gpu_address % RgfxIdSpace::kAddressGranule == 0);
@@ -792,7 +978,8 @@ void test_lifecycle_messages()
 	CHECK(tvm.texture_type == 2 && tvm.level_count == 1 && tvm.slice_count == 1);
 	CHECK(tvm.swizzle == 0x05020202);
 
-	// Sampler: the float clamps are stored as bits.
+	// Sampler: the float clamps and bias are stored as bits, the reduction mode and the bias in
+	// the create's extension.
 	RgfxSamplerParams sp = {};
 	sp.min_filter = 1;
 	sp.mag_filter = 1;
@@ -801,13 +988,18 @@ void test_lifecycle_messages()
 	sp.lod_min_clamp = 0.0f;
 	sp.lod_max_clamp = 7.5f;
 	sp.flags = 0x1;
+	sp.reduction_mode = 2;
+	sp.lod_bias = -1.25f;
 	RgfxCreated s = ser.createSampler(sp);
 	CHECK(s.posted);
-	auto sm = expectMessage<RgfxSamplerCreate>(ring, RGFX_CMD_SAMPLER_CREATE);
-	CHECK(sm.obj_id == s.obj_id && sm.max_anisotropy == 4 && sm.flags == 0x1);
+	auto sm = expectMessage<RgfxSamplerCreateWhole>(ring, RGFX_CMD_SAMPLER_CREATE);
+	CHECK(sm.create.obj_id == s.obj_id && sm.create.max_anisotropy == 4 && sm.create.flags == 0x1);
 	float lodMax;
-	std::memcpy(&lodMax, &sm.lod_max_clamp_bits, 4);
+	std::memcpy(&lodMax, &sm.create.lod_max_clamp_bits, 4);
 	CHECK(lodMax == 7.5f);
+	float bias;
+	std::memcpy(&bias, &sm.ext.lod_bias_bits, 4);
+	CHECK(sm.ext.reduction_mode == 2 && bias == -1.25f);
 
 	// Depth/stencil.
 	RgfxStencilDescriptor front = {};
@@ -1346,6 +1538,72 @@ void test_mesh_ops()
 // post() waits while the ring is full, ringing the doorbell and calling its hook, until the
 // host takes room; a message over half the ring does not fit() and is refused at once; and
 // beforePublish sees the seqno before `producer` moves.
+// The doorbell rings where the host marked the ring asleep, and where it marked it walking only
+// for a command buffer whose stream ends in its ask for its submission, which the host answers
+// inside the doorbell's write; a walking host takes the rest once its walk is done, and one that
+// takes the ring is rung for nothing.
+void test_ring_doorbell_follows_the_mark()
+{
+	TestRing ring(0x8000);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	const auto rang = [&](uint32_t mark, bool asks) {
+		ring.setConsumerIdle(mark);
+		const int before = TestRing::doorbells.load();
+		RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+		enc.beginComputePass();
+		enc.endEncoder();
+		if (asks)
+			enc.appendSubmitted();
+		CHECK(enc.endsInAsk() == asks);
+		CHECK(enc.finish());
+		RgfxMsgHeader header = {};
+		std::vector<uint8_t> body;
+		CHECK(ring.next(&header, &body) && header.type == RGFX_CMD_COMMAND_BUFFER);
+		return TestRing::doorbells.load() - before;
+	};
+	CHECK(rang(RGFX_CONSUMER_ASLEEP, false) == 1);
+	CHECK(rang(RGFX_CONSUMER_ASLEEP, true) == 1);
+	CHECK(rang(RGFX_CONSUMER_WALKING, false) == 0);
+	CHECK(rang(RGFX_CONSUMER_WALKING, true) == 1);
+	CHECK(rang(0, false) == 0);
+	CHECK(rang(0, true) == 0);
+}
+
+// Where the device's word holds DOORBELL_ASKS, a command buffer that asks for its submission
+// rings its ring's id with RGFX_DOORBELL_ASKS, for the host to answer inside the write, and
+// every other doorbell writes the id alone; where it does not, every doorbell writes the id
+// alone, as before the bit.
+void test_ring_doorbell_asks_where_the_device_takes_them()
+{
+	constexpr uint32_t kRingId = 0x1000; // a region offset, as the device's ring ids are
+	static std::vector<uint32_t> written;
+	const auto record = [](void *, uint32_t value) { written.push_back(value); };
+	for (const bool takes : { false, true }) {
+		TestRing ring(0x8000);
+		RgfxRingWriter writer(ring.base(), ring.dataSize, kRingId, record, nullptr);
+		writer.setDoorbellAsks(takes);
+		const auto rang = [&](uint32_t mark, bool asks) {
+			ring.setConsumerIdle(mark);
+			written.clear();
+			RgfxEncoder enc(writer, /*queue*/ 1, /*cb*/ 100);
+			enc.beginComputePass();
+			enc.endEncoder();
+			if (asks)
+				enc.appendSubmitted();
+			CHECK(enc.finish());
+			RgfxMsgHeader header = {};
+			std::vector<uint8_t> body;
+			CHECK(ring.next(&header, &body) && header.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(written.size() == 1);
+			return written.empty() ? 0u : written[0];
+		};
+		const uint32_t asking = takes ? kRingId | RGFX_DOORBELL_ASKS : kRingId;
+		CHECK(rang(RGFX_CONSUMER_ASLEEP, false) == kRingId);
+		CHECK(rang(RGFX_CONSUMER_ASLEEP, true) == asking);
+		CHECK(rang(RGFX_CONSUMER_WALKING, true) == asking);
+	}
+}
+
 void test_ring_post_waits_for_room()
 {
 	constexpr uint32_t kData = 0x1000;
@@ -1367,7 +1625,9 @@ void test_ring_post_waits_for_room()
 	uint64_t full = ring.producer();
 	int before = TestRing::doorbells.load();
 
-	// The host takes everything 20 ms from now.
+	// The host takes everything 20 ms from now. The post's time is counted from before the host's
+	// thread starts, so it is at least those 20 ms however late this thread gets to the post.
+	auto start = std::chrono::steady_clock::now();
 	std::thread host([&ring, full] {
 		std::this_thread::sleep_for(std::chrono::milliseconds(20));
 		__atomic_store_n(reinterpret_cast<uint64_t *>(ring.mem.data() +
@@ -1376,7 +1636,6 @@ void test_ring_post_waits_for_room()
 	});
 	std::atomic<int> waits{0};
 	uint64_t seen = 0, producerAtPublish = ~0ull, seqno = 0;
-	auto start = std::chrono::steady_clock::now();
 	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), &seqno, [&] { waits++; },
 	                  [&](uint64_t s) {
 		                  seen = s;
@@ -1397,45 +1656,63 @@ void test_ring_post_waits_for_room()
 // with no record leaves it waiting (its backstop is 20 ms), and the record, which the queue's
 // reader hands over as it reads RGFX_EVT_SUBMIT_ROOM, ends the wait at once. A post that finds
 // room touches no flag.
+//
+// The backstop also ends the wait, 20 ms after it began, wherever a busy host keeps this test's
+// threads off a CPU that long. So a run counts only where it ends inside the backstop from
+// before its post began: its post can then have been ended by the record alone, and was still
+// waiting when looked at. Runs repeat until one counts.
 void test_ring_post_waits_for_the_room_record()
 {
+	// RgfxRingWriter.cpp's kRoomBackstopUs.
+	constexpr auto kBackstop = std::chrono::milliseconds(20);
 	constexpr uint32_t kData = 0x1000;
 	TestRing ring(kData);
 	RgfxRingWriter writer(ring.base(), kData, 1, TestRing::doorbell, nullptr);
 	auto room = std::make_shared<RgfxRingRoomEvents>();
 	writer.setRoomEvents(room);
-	auto waiting = [&ring] {
-		return __atomic_load_n(reinterpret_cast<uint32_t *>(
-		                           ring.mem.data() +
-		                           __builtin_offsetof(RgfxRingHeader, producer_waiting)),
-		                       __ATOMIC_SEQ_CST);
-	};
+	auto *waitingFlag = reinterpret_cast<uint32_t *>(
+	    ring.mem.data() + __builtin_offsetof(RgfxRingHeader, producer_waiting));
+	auto waiting = [waitingFlag] { return __atomic_load_n(waitingFlag, __ATOMIC_SEQ_CST); };
 	uint8_t msg[256] = {};
 	CHECK(writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr));
 	CHECK(waiting() == 0);
 	while (writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr)) {
 	}
-	std::atomic<bool> posted{false};
-	bool postedOK = false;
-	std::thread poster([&] {
-		postedOK = writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr);
-		posted = true;
-	});
-	for (int i = 0; i < 5000 && waiting() == 0; i++)
-		std::this_thread::sleep_for(std::chrono::milliseconds(1));
-	CHECK(waiting() == 1);
-	// The host takes one message and posts no record: the post still waits.
-	RgfxMsgHeader h = {};
-	std::vector<uint8_t> bytes;
-	CHECK(ring.next(&h, &bytes));
-	std::this_thread::sleep_for(std::chrono::milliseconds(3));
-	CHECK(!posted);
-	// Its record: the post looks again, and finds the room.
-	const auto start = std::chrono::steady_clock::now();
-	room->arrived();
-	poster.join();
-	CHECK(posted && postedOK);
-	CHECK(std::chrono::steady_clock::now() - start < std::chrono::milliseconds(15));
+	// Each run starts with the ring full: it takes one message and its post puts one back.
+	bool counted = false;
+	for (int run = 0; run < 50 && !counted; run++) {
+		// The host clears the flag as it posts its record.
+		__atomic_store_n(waitingFlag, 0u, __ATOMIC_SEQ_CST);
+		const int rung = TestRing::doorbells.load();
+		std::atomic<bool> posted{false};
+		bool postedOK = false;
+		const auto began = std::chrono::steady_clock::now();
+		std::thread poster([&] {
+			postedOK = writer.post(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr);
+			posted = true;
+		});
+		// The post rings the doorbell once its look after storing the flag found no room: from
+		// then on only the record or the backstop ends its wait.
+		for (int i = 0; i < 5000 && TestRing::doorbells.load() == rung; i++)
+			std::this_thread::sleep_for(std::chrono::milliseconds(1));
+		CHECK(TestRing::doorbells.load() > rung);
+		CHECK(waiting() == 1);
+		// The host takes one message and posts no record: the post still waits.
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes));
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+		const bool postedBeforeRecord = posted;
+		// Its record: the post looks again, and finds the room.
+		room->arrived();
+		poster.join();
+		CHECK(posted && postedOK);
+		if (std::chrono::steady_clock::now() - began < kBackstop) {
+			CHECK(!postedBeforeRecord);
+			counted = true;
+		}
+	}
+	CHECK(counted);
 
 	// A queue's reader hands each RGFX_EVT_SUBMIT_ROOM on its completion ring to the room.
 	TestRing completion(kData);
@@ -1492,11 +1769,12 @@ struct TestBlocks final : RgfxMessageBlocks {
 	void giveBack(const RgfxMessageBlock &block) override { given.push_back(block); }
 };
 
-// A command buffer's message is built where it is posted from: on the ring while it fits half of
-// it, else in a block, which it moves to once as it outgrows the ring and grows from by doubling,
-// and which the COMMAND_BUFFER_IN_REGION names, the whole COMMAND_BUFFER in it; the block goes to
-// whoever holds the posted message, the ones it outgrew back to the pool. The surface uses a
-// commit puts first lead the op stream, in the order put, before every op, however many.
+// A command buffer's message is built in the builder's own buffer and posted from it on the ring
+// while it fits half of it, else copied at the commit into one block, from its start, which the
+// COMMAND_BUFFER_IN_REGION names, the whole COMMAND_BUFFER in it; the block goes to whoever holds
+// the posted message. The buffer grows to the queue's guess as the message outgrows the ring.
+// The surface uses a commit puts first lead the op stream, in the order put, before every op,
+// however many.
 void test_command_buffer_storage()
 {
 	TestRing ring(0x1000); // up to 2 KiB a message on the ring
@@ -1558,35 +1836,43 @@ void test_command_buffer_storage()
 		CHECK(blocks->taken.empty());
 	}
 
-	// Past the ring: built in a block from the op that outgrows it, grown block to block, the
-	// outgrown ones back to the pool; more uses than the room before the header move the ops.
+	// Past the ring: built in the builder's buffer, which grows to the guess at the op that
+	// outgrows the ring and doubles past it, with no block taken; more uses than the room before
+	// the header move the ops; the commit copies the message into one block, from its start.
 	{
 		RgfxEncoder enc(writer, 1, 3, 0x100);
-		enc.setMessageBlocks(blocks, 0);
+		enc.setMessageBlocks(blocks, 0x10000);
 		enc.beginBlitPass();
 		int fills = 0;
-		while (!enc.inBlock()) {
+		auto fill = [&enc, &fills] {
 			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
 			fills++;
-		}
-		CHECK(blocks->taken.size() == 1 && fills > 2048 / 48 && fills < 4096 / 32);
-		for (; fills < 5000; fills++) // 5000 fills of 40 bytes: 200 KB, past one 64 KiB block
-			enc.blitFillBuffer(static_cast<RgfxObjId>(fills), 0, 4, 1);
+		};
+		while (enc.fitsRing())
+			fill();
+		CHECK(fills > 2048 / 48 && fills < 4096 / 32);
+		// Its first growth past the ring takes the guess at once.
+		const size_t fitted = enc.capacity();
+		while (enc.capacity() == fitted)
+			fill();
+		CHECK(fitted < 0x10000 && enc.capacity() >= 0x10000);
+		while (fills < 5000) // 5000 fills of 40 bytes: 200 KB, past the 64 KiB guess
+			fill();
 		enc.endEncoder();
-		CHECK(blocks->taken.size() == 3 && blocks->given.size() == 2);
+		CHECK(blocks->taken.empty() && !enc.inBlock());
 		std::vector<RgfxOpSurfaceUse> u = uses(100, 1000);
 		enc.prependSurfaceUses(u.data(), u.size());
 		uint64_t seqno = 0;
 		RgfxMessageBlock held = {};
 		CHECK(enc.finish(&seqno, {}, {}, &held));
-		CHECK(held.ptr == blocks->taken.back().ptr && blocks->given.size() == 2);
+		CHECK(blocks->taken.size() == 1 && held.ptr == blocks->taken.back().ptr &&
+		      blocks->given.empty() && !enc.inBlock());
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> bytes;
 		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
 		RgfxCommandBufferInRegion ref = {};
 		std::memcpy(&ref, bytes.data(), sizeof(ref));
-		CHECK(ref.region_offset >= held.offset && ref.region_offset % 8 == 0 &&
-		      ref.region_offset + ref.byte_length <= held.offset + held.size);
+		CHECK(ref.region_offset == held.offset && ref.byte_length <= held.size);
 		const uint8_t *message = blocks->mem.data() + ref.region_offset;
 		RgfxCommandBuffer cb = {};
 		std::memcpy(&cb, message, sizeof(cb));
@@ -1615,13 +1901,166 @@ void test_command_buffer_storage()
 		for (int i = 0; i < 200; i++)
 			enc.blitFillBuffer(9, 0, 4, 1);
 		enc.endEncoder();
-		CHECK(!enc.inBlock() && enc.messageSize() > 2048);
+		CHECK(!enc.fitsRing() && enc.messageSize() > 2048);
 		RgfxMessageBlock held = {};
-		CHECK(!enc.finish(nullptr, {}, {}, &held) && held.ptr == nullptr);
+		CHECK(!enc.finish(nullptr, {}, {}, &held) && held.ptr == nullptr && !enc.inBlock());
 		RgfxMsgHeader h = {};
 		std::vector<uint8_t> bytes;
 		CHECK(!ring.next(&h, &bytes));
 		blocks->refuse = false;
+	}
+}
+
+// A message's posted time (tryPost's stampAt) is written in the ring's copy, not the caller's
+// bytes, after the copy and beforePublish and before the publish: no earlier than the clock read
+// in beforePublish, no later than the doorbell the publish rings. A post with no stamp writes
+// nothing there, and a forwarding writer none.
+void test_ring_stamps_the_posted_time_before_the_publish()
+{
+	static uint64_t rang = 0;
+	const auto doorbell = [](void *, uint32_t) { rang = rgfxGuestClockNs(); };
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(RGFX_CONSUMER_ASLEEP);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, doorbell, nullptr);
+	uint8_t msg[96] = {};
+	const uint64_t marker = 0x0123456789abcdefull;
+	std::memcpy(msg + 64, &marker, sizeof(marker));
+	uint64_t before = 0;
+	const auto seen = [&](uint64_t) { before = rgfxGuestClockNs(); };
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr, nullptr, seen, false,
+	                     RGFX_GUEST_TIMES_POSTED_OFFSET));
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(ring.next(&h, &bytes) && bytes.size() == sizeof(msg));
+	uint64_t posted = 0;
+	std::memcpy(&posted, bytes.data() + RGFX_GUEST_TIMES_POSTED_OFFSET, sizeof(posted));
+	CHECK(before != 0 && rang != 0);
+	CHECK(posted >= before && posted <= rang);
+	uint64_t kept = 0;
+	std::memcpy(&kept, msg + 64, sizeof(kept));
+	CHECK(kept == marker); // the caller's bytes stay as they were
+	// No stamp asked: the bytes go as given.
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, msg, sizeof(msg), nullptr));
+	CHECK(ring.next(&h, &bytes));
+	std::memcpy(&posted, bytes.data() + RGFX_GUEST_TIMES_POSTED_OFFSET, sizeof(posted));
+	CHECK(posted == marker);
+	// Past the message: no stamp.
+	uint8_t small[32] = {};
+	CHECK(writer.tryPost(RGFX_CMD_COMMAND_BUFFER, small, sizeof(small), nullptr, nullptr, {}, false,
+	                     RGFX_GUEST_TIMES_POSTED_OFFSET));
+	CHECK(ring.next(&h, &bytes) && bytes.size() == sizeof(small));
+}
+
+// Where the buffer stamps the guest's times (stampGuestTimes), its stream starts with
+// RGFX_OP_GUEST_TIMES, the last op put first, before its surface uses and its commit order: its
+// making and its commit as noted, and its posted time stamped as it went on the ring, on the
+// ring for a message there and in the block for one too large for the ring. A buffer that does
+// not stamp carries none, and its message keeps its size.
+void test_guest_times_go_first()
+{
+	TestRing ring(0x1000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, 1, TestRing::doorbell, nullptr);
+	auto blocks = std::make_shared<TestBlocks>();
+	const auto build = [&](RgfxEncoder &enc, int fills) {
+		enc.setMessageBlocks(blocks, 0);
+		enc.beginBlitPass();
+		for (int i = 0; i < fills; i++)
+			enc.blitFillBuffer(9, 0, 4, 1);
+		enc.endEncoder();
+		RgfxOpSurfaceUse use = {};
+		use.block_offset = 77;
+		enc.prependSurfaceUses(&use, 1);
+		RgfxSurfaceOrderWait wait = {2, 5};
+		enc.prependCommitOrder(&wait, 1);
+	};
+	const auto tags = [](const uint8_t *ops, uint64_t n) {
+		std::vector<uint16_t> out;
+		OpWalk walk(ops, n);
+		while (!walk.done()) {
+			uint16_t tag = 0, flags = 0;
+			uint32_t len = 0;
+			const uint8_t *body = nullptr;
+			size_t body_len = 0;
+			CHECK(walk.next(&tag, &flags, &len, &body, &body_len));
+			out.push_back(tag);
+		}
+		return out;
+	};
+	const std::vector<uint16_t> plain = {RGFX_OP_COMMIT_ORDER, RGFX_OP_SURFACE_USE,
+	                                     RGFX_OP_ENCODER_BEGIN_BLIT, RGFX_OP_BLIT_FILL_BUFFER,
+	                                     RGFX_OP_ENCODER_END};
+	std::vector<uint16_t> timed = plain;
+	timed.insert(timed.begin(), RGFX_OP_GUEST_TIMES);
+
+	// Not stamped: no times.
+	{
+		RgfxEncoder enc(writer, 1, 2);
+		build(enc, 1);
+		CHECK(!enc.stampsGuestTimes());
+		const uint64_t size = enc.messageSize();
+		CHECK(enc.finish());
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.size == size);
+		CHECK(tags(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET,
+		           bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET) == plain);
+	}
+	// Stamped, on the ring: first, its size counted before the finish.
+	{
+		RgfxEncoder enc(writer, 1, 3);
+		enc.stampGuestTimes(1000);
+		CHECK(enc.stampsGuestTimes());
+		build(enc, 1);
+		enc.noteCommitted(2000);
+		const uint64_t size = enc.messageSize();
+		const uint64_t before = rgfxGuestClockNs();
+		CHECK(enc.fitsRing() && enc.finish());
+		const uint64_t after = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.size == size && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, bytes.data(), sizeof(cb));
+		CHECK(cb.op_bytes == bytes.size() - RGFX_COMMAND_BUFFER_OPS_OFFSET);
+		CHECK(tags(bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes) == timed);
+		RgfxOpHeader op = {};
+		std::memcpy(&op, bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET, sizeof(op));
+		CHECK(op.len == RGFX_OP_BODY_OFFSET + sizeof(RgfxOpGuestTimes));
+		RgfxOpGuestTimes t = {};
+		std::memcpy(&t, bytes.data() + RGFX_COMMAND_BUFFER_OPS_OFFSET + RGFX_OP_BODY_OFFSET,
+		            sizeof(t));
+		CHECK(t.began_ns == 1000 && t.committed_ns == 2000);
+		CHECK(t.posted_ns >= before && t.posted_ns <= after);
+	}
+	// Stamped, too large for the ring: in the block, its posted time there too.
+	{
+		RgfxEncoder enc(writer, 1, 4);
+		enc.stampGuestTimes(3000);
+		build(enc, 200);
+		enc.noteCommitted(4000);
+		CHECK(!enc.fitsRing());
+		const uint64_t size = enc.messageSize();
+		RgfxMessageBlock held = {};
+		const uint64_t before = rgfxGuestClockNs();
+		CHECK(enc.finish(nullptr, {}, {}, &held));
+		const uint64_t after = rgfxGuestClockNs();
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER_IN_REGION);
+		RgfxCommandBufferInRegion ref = {};
+		std::memcpy(&ref, bytes.data(), sizeof(ref));
+		CHECK(ref.byte_length == size && ref.region_offset == held.offset);
+		const uint8_t *message = blocks->mem.data() + ref.region_offset;
+		RgfxCommandBuffer cb = {};
+		std::memcpy(&cb, message, sizeof(cb));
+		const std::vector<uint16_t> got = tags(message + RGFX_COMMAND_BUFFER_OPS_OFFSET, cb.op_bytes);
+		CHECK(got.size() == timed.size() + 199 && got[0] == RGFX_OP_GUEST_TIMES &&
+		      got[1] == RGFX_OP_COMMIT_ORDER);
+		RgfxOpGuestTimes t = {};
+		std::memcpy(&t, message + RGFX_COMMAND_BUFFER_OPS_OFFSET + RGFX_OP_BODY_OFFSET, sizeof(t));
+		CHECK(t.began_ns == 3000 && t.committed_ns == 4000);
+		CHECK(t.posted_ns >= before && t.posted_ns <= after);
 	}
 }
 
@@ -2047,6 +2486,7 @@ void test_video_command_buffer()
 	d.bitstream_size = 4321;
 	d.luma_texture_obj_id = 6;
 	d.chroma_texture_obj_id = 7;
+	d.output_rows = 1088;
 	const uint8_t sets[11] = {0, 0, 0, 1, 0x67, 0x42, 0, 0, 0, 1, 0x68};
 	enc.videoDecodeH264(d, sets, sizeof(sets));
 	enc.videoDecodeH264(d, nullptr, 0);
@@ -2087,7 +2527,8 @@ void test_video_command_buffer()
 	std::memcpy(&got, op + RGFX_OP_BODY_OFFSET, sizeof(got));
 	CHECK(got.bitstream_buffer_obj_id == 5 && got.bitstream_offset == 0x100 &&
 	      got.bitstream_size == 4321 && got.luma_texture_obj_id == 6 &&
-	      got.chroma_texture_obj_id == 7 && got.parameter_sets_size == sizeof(sets));
+	      got.chroma_texture_obj_id == 7 && got.parameter_sets_size == sizeof(sets) &&
+	      got.output_rows == 1088);
 	const uint8_t *tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H264_PARAMETER_SETS_OFFSET;
 	CHECK(std::memcmp(tail, sets, sizeof(sets)) == 0);
 	for (size_t i = sizeof(sets); i < 16; i++)
@@ -2109,7 +2550,8 @@ void test_video_command_buffer()
 	std::memcpy(&hevc, op + RGFX_OP_BODY_OFFSET, sizeof(hevc));
 	CHECK(hevc.bitstream_buffer_obj_id == 8 && hevc.bitstream_offset == 0 &&
 	      hevc.bitstream_size == 512 && hevc.luma_texture_obj_id == 9 &&
-	      hevc.chroma_texture_obj_id == 10 && hevc.parameter_sets_size == sizeof(hevcSets));
+	      hevc.chroma_texture_obj_id == 10 && hevc.parameter_sets_size == sizeof(hevcSets) &&
+	      hevc.output_rows == 0);
 	tail = op + RGFX_OP_BODY_OFFSET + RGFX_VIDEO_DECODE_H265_PARAMETER_SETS_OFFSET;
 	CHECK(std::memcmp(tail, hevcSets, sizeof(hevcSets)) == 0);
 	for (size_t i = sizeof(hevcSets); i < 24; i++)
@@ -2166,6 +2608,410 @@ void test_forwarded_lifecycle()
 	CHECK(!reader.awaitingReflection(8));
 }
 
+// The kext's two routes, one call log: each Submit (one message) and each SubmitBatch (its
+// messages), in the order made, with the batch's calls apart. `batchTakes` caps how many of a
+// batch's messages the "kext" posts (its ring stayed full past them).
+struct KextLog {
+	struct Call {
+		bool batch;
+		std::vector<RgfxObjId> objs; // each message's obj_id (the destroy's, the create's)
+		std::vector<uint32_t> types;
+	};
+	// A timer posts from a thread of its own: the calls are made and read under `lock`.
+	std::mutex lock;
+	std::vector<Call> calls;
+	uint32_t batchTakes = UINT32_MAX;
+	uint64_t nextSeqno = 1;
+
+	static RgfxObjId objOf(const uint8_t *m)
+	{
+		RgfxObjId obj = 0;
+		std::memcpy(&obj, m + sizeof(RgfxMsgHeader), sizeof(obj));
+		return obj;
+	}
+	// Every obj_id the "kext" posted, in ring order.
+	std::vector<RgfxObjId> ring()
+	{
+		std::lock_guard<std::mutex> hold(lock);
+		std::vector<RgfxObjId> out;
+		for (const Call &c : calls)
+			out.insert(out.end(), c.objs.begin(), c.objs.end());
+		return out;
+	}
+};
+
+bool kextSubmit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+                uint32_t *out_status)
+{
+	KextLog *log = static_cast<KextLog *>(context);
+	std::lock_guard<std::mutex> hold(log->lock);
+	RgfxMsgHeader header;
+	std::memcpy(&header, message, sizeof(header));
+	log->calls.push_back({false, {KextLog::objOf(static_cast<const uint8_t *>(message))},
+	                      {header.type}});
+	*out_seqno = log->nextSeqno++;
+	if (out_status)
+		*out_status = kRgfxNoAnswer;
+	return true;
+}
+
+uint32_t kextSubmitBatch(void *context, const void *messages, uint32_t bytes)
+{
+	KextLog *log = static_cast<KextLog *>(context);
+	std::lock_guard<std::mutex> hold(log->lock);
+	const uint8_t *m = static_cast<const uint8_t *>(messages);
+	KextLog::Call call = {true, {}, {}};
+	uint32_t taken = 0;
+	for (uint32_t at = 0; at < bytes && taken < log->batchTakes; taken++) {
+		RgfxMsgHeader header;
+		std::memcpy(&header, m + at, sizeof(header));
+		CHECK(header.seqno == 0);
+		// Each of a type and size the kext's SubmitBatch takes.
+		CHECK(header.size != 0 && header.size == rgfxSubmitBatchSize(header.type));
+		call.objs.push_back(KextLog::objOf(m + at));
+		call.types.push_back(header.type);
+		at += header.size;
+		log->nextSeqno++;
+	}
+	if (taken != 0)
+		log->calls.push_back(call);
+	return taken;
+}
+
+// Destroys held to go together (RgfxRingWriter::postLater): each `after` runs at the destroy, as
+// it did once the destroy was posted, and the destroys reach the "kext" in their order before
+// anything the process posts after them, at most a batch's bytes a call, or once the timer fires,
+// whose arm an RgfxRingLaterArms holds until it ends; a destroy the host orders other contexts by goes at once; a batch the kext takes only in part
+// keeps the rest held, first, and the writer posts nothing past them until they go.
+void test_held_destroys()
+{
+	// A timer far past the test, so only the steps below post; the timer's own step has its own.
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	CHECK(!writer.batches());
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	CHECK(writer.batches());
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	// Held, `after` run at once, nothing posted yet.
+	int afters = 0;
+	CHECK(ser.destroy(0x101, [&afters] { afters++; }));
+	CHECK(ser.destroy(0x102, [&afters] { afters++; }));
+	CHECK(afters == 2);
+	CHECK(log.calls.empty());
+	// A create goes after them: one batch of both, in order, then the create alone.
+	RgfxCreated ev = ser.createEvent();
+	CHECK(ev.posted);
+	CHECK(log.calls.size() == 2);
+	CHECK(log.calls[0].batch && log.calls[0].objs == std::vector<RgfxObjId>({0x101, 0x102}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>(2, RGFX_CMD_OBJECT_DESTROY));
+	CHECK(!log.calls[1].batch && log.calls[1].objs[0] == ev.obj_id);
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 2);
+
+	// 170 destroys fill a 4096-byte call (24 bytes each): the 171st sends them, and waits.
+	log.calls.clear();
+	for (RgfxObjId i = 0; i < 171; i++)
+		CHECK(ser.destroy(0x1000 + i));
+	CHECK(log.calls.size() == 1 && log.calls[0].batch && log.calls[0].objs.size() == 170);
+	CHECK(log.calls[0].objs.front() == 0x1000 && log.calls[0].objs.back() == 0x1000 + 169);
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 2 && log.calls[1].objs == std::vector<RgfxObjId>({0x1000 + 170}));
+
+	// The timer posts what is held, with no post behind it: kRgfxLaterNs after the first held.
+	KextLog timed;
+	RgfxRingWriter timedWriter(&kextSubmit, &timed, 4096);
+	timedWriter.setBatch(&kextSubmitBatch, 4096);
+	RgfxSerializer tser(timedWriter, ids);
+	const auto from = std::chrono::steady_clock::now();
+	CHECK(tser.destroy(0x2001));
+	CHECK(tser.destroy(0x2002));
+	for (int i = 0; i < 20000 && timed.ring().size() < 2; i++)
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	CHECK(std::chrono::steady_clock::now() - from >= std::chrono::nanoseconds(kRgfxLaterNs));
+	CHECK(timed.ring() == std::vector<RgfxObjId>({0x2001, 0x2002}));
+
+	// Held inside an RgfxRingLaterArms, nothing goes while it lives, however long, and the timer
+	// it arms as it ends posts kRgfxLaterNs after that.
+	KextLog scoped;
+	RgfxRingWriter scopedWriter(&kextSubmit, &scoped, 4096);
+	scopedWriter.setBatch(&kextSubmitBatch, 4096);
+	RgfxSerializer sser(scopedWriter, ids);
+	std::chrono::steady_clock::time_point ended;
+	{
+		RgfxRingLaterArms arms;
+		CHECK(sser.destroy(0x2101));
+		CHECK(sser.destroy(0x2102));
+		std::this_thread::sleep_for(std::chrono::nanoseconds(5 * kRgfxLaterNs));
+		CHECK(scoped.ring().empty());
+		ended = std::chrono::steady_clock::now();
+	}
+	for (int i = 0; i < 20000 && scoped.ring().size() < 2; i++)
+		std::this_thread::sleep_for(std::chrono::microseconds(100));
+	CHECK(std::chrono::steady_clock::now() - ended >= std::chrono::nanoseconds(kRgfxLaterNs));
+	CHECK(scoped.ring() == std::vector<RgfxObjId>({0x2101, 0x2102}));
+
+	// At once: the held first, then the destroy alone, its `after` run.
+	log.calls.clear();
+	CHECK(ser.destroy(0x3001));
+	afters = 0;
+	CHECK(ser.destroy(0x3002, [&afters] { afters++; }, /*atOnce*/ true));
+	CHECK(afters == 1);
+	CHECK(log.calls.size() == 2 && log.calls[0].batch && log.calls[0].objs[0] == 0x3001);
+	CHECK(!log.calls[1].batch && log.calls[1].objs[0] == 0x3002);
+
+	// The kext takes one of three: the other two stay held, first, and the create behind them is
+	// refused, posting nothing; once the kext takes them, they go, then what follows.
+	log.calls.clear();
+	for (RgfxObjId i = 0; i < 3; i++)
+		CHECK(ser.destroy(0x4000 + i));
+	log.batchTakes = 1;
+	CHECK(!ser.createEvent().posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000}));
+	CHECK(!writer.flushLater());
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000, 0x4001}));
+	log.batchTakes = UINT32_MAX;
+	RgfxCreated after = ser.createEvent();
+	CHECK(after.posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x4000, 0x4001, 0x4002, after.obj_id}));
+
+	// A writer that does not batch posts each destroy at once, as before.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	afters = 0;
+	CHECK(pser.destroy(0x5001, [&afters] { afters++; }));
+	CHECK(afters == 1 && plain.calls.size() == 1 && !plain.calls[0].batch);
+
+	// The writer's end posts what it holds. Its timer comes 1 ms after the post, and a busy host
+	// can keep this thread off a CPU that long, letting the timer post first: a run counts only
+	// where the look at the calls comes inside that 1 ms from before the post, so the end alone can
+	// have posted the destroy. Runs repeat until one counts. Each run's log outlives its timer's
+	// use of it: the timer posts only while the writer is there.
+	constexpr auto kTimer = std::chrono::nanoseconds(1000000);
+	bool counted = false;
+	for (int run = 0; run < 50 && !counted; run++) {
+		KextLog ending;
+		bool noneBeforeEnd = false;
+		std::chrono::steady_clock::duration took{};
+		{
+			RgfxRingWriter going(&kextSubmit, &ending, 4096);
+			going.setBatch(&kextSubmitBatch, 4096, kTimer.count());
+			RgfxObjectDestroy d = {};
+			d.obj_id = 0x6001;
+			const auto began = std::chrono::steady_clock::now();
+			CHECK(going.postLater(RGFX_CMD_OBJECT_DESTROY, &d, sizeof(d)));
+			noneBeforeEnd = ending.ring().empty();
+			took = std::chrono::steady_clock::now() - began;
+		}
+		CHECK(ending.ring() == std::vector<RgfxObjId>({0x6001}));
+		// Its timer, which outlives it, then finds it gone and posts nothing more.
+		std::this_thread::sleep_for(std::chrono::milliseconds(3));
+		CHECK(ending.ring().size() == 1);
+		if (took < kTimer) {
+			CHECK(noneBeforeEnd);
+			counted = true;
+		}
+	}
+	CHECK(counted);
+}
+
+// Heap-placed buffers held to go together with the destroys around them
+// (RgfxSerializer::createBufferAtOffset): each answered as made and held, in their order with the
+// destroys, before anything posted after them; a commit's postHeldCreates() answers whether none
+// stays held, destroys left aside; a buffer that needs the held to go first to make room is
+// refused at once where they are refused, holding nothing more; a writer that does not batch
+// posts each at once, as before.
+void test_held_buffers()
+{
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+
+	RgfxCreated a = ser.createBufferAtOffset(0x10, 0, 256, 0);
+	CHECK(a.posted && a.obj_id != 0 && a.seqno == 0);
+	CHECK(ser.destroy(0x101));
+	RgfxCreated b = ser.createBufferAtOffset(0x10, 256, 256, 0);
+	CHECK(b.posted);
+	CHECK(log.calls.empty());
+	CHECK(ser.postHeldCreates());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch);
+	CHECK(log.calls[0].objs == std::vector<RgfxObjId>({a.obj_id, 0x101, b.obj_id}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>({RGFX_CMD_BUFFER_AT_OFFSET,
+	                                                   RGFX_CMD_OBJECT_DESTROY,
+	                                                   RGFX_CMD_BUFFER_AT_OFFSET}));
+
+	// Before what is posted after them.
+	log.calls.clear();
+	RgfxCreated c = ser.createBufferAtOffset(0x10, 512, 256, 0);
+	RgfxCreated ev = ser.createEvent();
+	CHECK(c.posted && ev.posted);
+	CHECK(log.ring() == std::vector<RgfxObjId>({c.obj_id, ev.obj_id}));
+
+	// The kext takes none: a held buffer leaves the commit's answer false, held destroys alone
+	// do not; once it takes them they go, in order.
+	log.calls.clear();
+	log.batchTakes = 0;
+	CHECK(ser.destroy(0x201));
+	CHECK(ser.postHeldCreates());
+	RgfxCreated d = ser.createBufferAtOffset(0x10, 768, 256, 0);
+	CHECK(d.posted);
+	CHECK(!ser.postHeldCreates());
+	CHECK(!ser.postHeldCreates());
+	CHECK(log.calls.empty());
+	// So is the next post refused, posting nothing.
+	CHECK(!ser.createEvent().posted);
+	CHECK(log.calls.empty());
+	log.batchTakes = UINT32_MAX;
+	CHECK(ser.postHeldCreates());
+	CHECK(log.ring() == std::vector<RgfxObjId>({0x201, d.obj_id}));
+
+	// 73 buffers fill a call (56 bytes each): with the kext taking none, the 74th, which needs
+	// them gone to make room, is refused, and nothing more is held; once the kext takes them,
+	// the 73 go in one call.
+	log.calls.clear();
+	std::vector<RgfxObjId> held;
+	for (int i = 0; i < 73; i++) {
+		RgfxCreated m = ser.createBufferAtOffset(0x10, 4096u * i, 64, 0);
+		CHECK(m.posted);
+		held.push_back(m.obj_id);
+	}
+	CHECK(log.calls.empty());
+	log.batchTakes = 0;
+	CHECK(!ser.createBufferAtOffset(0x10, 0, 64, 0).posted);
+	log.batchTakes = UINT32_MAX;
+	CHECK(writer.flushLater());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch && log.calls[0].objs == held);
+
+	// A writer that does not batch posts each at once.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	RgfxCreated p = pser.createBufferAtOffset(0x10, 0, 64, 0);
+	CHECK(p.posted && p.seqno != 0);
+	CHECK(plain.calls.size() == 1 && !plain.calls[0].batch &&
+	      plain.calls[0].types[0] == RGFX_CMD_BUFFER_AT_OFFSET);
+	CHECK(pser.postHeldCreates());
+}
+
+// The other creates no one waits for that name no block, and a Managed buffer's modified range,
+// held as a heap-placed buffer is (RgfxSerializer::postUnwaited): each answered as made and held,
+// in their order with the destroys, before anything posted after them; a commit's
+// postHeldCreates() answers false while any of them stays held, each on its own; a texture over
+// an IOSurface, which a present waits for, goes at once, behind the held; a writer that does not
+// batch posts each at once, as before.
+void test_held_creates()
+{
+	constexpr uint64_t kNever = 600ull * 1000000000;
+	KextLog log;
+	RgfxRingWriter writer(&kextSubmit, &log, 4096);
+	writer.setBatch(&kextSubmitBatch, 4096, kNever);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	RgfxTextureDescriptor desc = {};
+	desc.texture_type = 2;
+	desc.pixel_format = 70;
+	desc.width = 4;
+	desc.height = 4;
+	desc.depth = 1;
+	desc.mipmap_level_count = 1;
+	desc.sample_count = 1;
+	desc.array_length = 1;
+	RgfxTextureView view = {};
+	view.parent_obj_id = 0x77;
+	view.pixel_format = 70;
+
+	// Each kind, made one at a time with the kext taking none: answered as made, held, and the
+	// commit's answer false until the kext takes it, which posts it alone.
+	auto heldAlone = [&](const char *what, uint32_t type, const std::function<RgfxObjId()> &make) {
+		log.calls.clear();
+		log.batchTakes = 0;
+		const RgfxObjId obj = make();
+		CHECK(log.calls.empty());
+		CHECK(!ser.postHeldCreates());
+		log.batchTakes = UINT32_MAX;
+		CHECK(ser.postHeldCreates());
+		const bool alone = log.calls.size() == 1 && log.calls[0].batch &&
+		                   log.calls[0].objs == std::vector<RgfxObjId>({obj}) &&
+		                   log.calls[0].types == std::vector<uint32_t>({type});
+		if (!alone)
+			std::fprintf(stderr, "held alone: %s\n", what);
+		CHECK(alone);
+	};
+	heldAlone("texture", RGFX_CMD_TEXTURE_CREATE, [&] {
+		RgfxCreated c = ser.createTexture(desc, RGFX_OBJ_NONE, 0, 256, 1024);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("view", RGFX_CMD_TEXTURE_VIEW, [&] {
+		RgfxCreated c = ser.createTextureView(view);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("managed texture", RGFX_CMD_MANAGED_TEXTURE_CREATE, [&] {
+		RgfxCreated c = ser.createManagedTexture(desc, 0x78, 4, 1, 1, 0, 256, 1024);
+		CHECK(c.posted && c.obj_id != 0 && c.resource_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("managed buffer", RGFX_CMD_MANAGED_BUFFER_CREATE, [&] {
+		RgfxCreated c = ser.createManagedBuffer(0x79, 256, 0x10);
+		CHECK(c.posted && c.obj_id != 0 && c.gpu_address != 0 && c.seqno == 0);
+		return c.obj_id;
+	});
+	heldAlone("modified range", RGFX_CMD_BUFFER_DID_MODIFY_RANGE, [&] {
+		CHECK(ser.bufferDidModifyRange(0x7a, 16, 32));
+		return RgfxObjId{0x7a};
+	});
+
+	// Together with destroys and heap-placed buffers, in the order made, in one call.
+	log.calls.clear();
+	CHECK(ser.destroy(0x101));
+	RgfxCreated t = ser.createTexture(desc, 0x10, 4096);
+	RgfxCreated a = ser.createBufferAtOffset(0x10, 0, 256, 0);
+	RgfxCreated v = ser.createTextureView(view);
+	CHECK(ser.bufferDidModifyRange(0x7a, 0, 16));
+	RgfxCreated m = ser.createManagedBuffer(a.obj_id, 256, 0x10);
+	CHECK(t.posted && t.gpu_address == 0 && a.posted && v.posted && m.posted);
+	CHECK(log.calls.empty());
+	CHECK(ser.postHeldCreates());
+	CHECK(log.calls.size() == 1 && log.calls[0].batch);
+	CHECK(log.calls[0].objs ==
+	      std::vector<RgfxObjId>({0x101, t.obj_id, a.obj_id, v.obj_id, 0x7a, m.obj_id}));
+	CHECK(log.calls[0].types == std::vector<uint32_t>({RGFX_CMD_OBJECT_DESTROY,
+	                                                   RGFX_CMD_TEXTURE_CREATE,
+	                                                   RGFX_CMD_BUFFER_AT_OFFSET,
+	                                                   RGFX_CMD_TEXTURE_VIEW,
+	                                                   RGFX_CMD_BUFFER_DID_MODIFY_RANGE,
+	                                                   RGFX_CMD_MANAGED_BUFFER_CREATE}));
+
+	// A texture over an IOSurface goes at once, behind what is held.
+	log.calls.clear();
+	RgfxCreated before = ser.createTexture(desc);
+	RgfxCreated surface = ser.createTextureFromIOSurface(0x7b, 0, 16, 0x55, 0, desc, 0,
+	                                                     RgfxSurfaceFacts{});
+	CHECK(before.posted && surface.posted && surface.seqno != 0);
+	CHECK(log.calls.size() == 2 && log.calls[0].batch && !log.calls[1].batch);
+	CHECK(log.ring() == std::vector<RgfxObjId>({before.obj_id, surface.obj_id}));
+	CHECK(log.calls[1].types == std::vector<uint32_t>({RGFX_CMD_TEXTURE_FROM_IOSURFACE}));
+
+	// A writer that does not batch posts each at once.
+	KextLog plain;
+	RgfxRingWriter direct(&kextSubmit, &plain, 4096);
+	RgfxSerializer pser(direct, ids);
+	RgfxCreated pt = pser.createTexture(desc);
+	RgfxCreated pv = pser.createTextureView(view);
+	CHECK(pt.posted && pt.seqno != 0 && pv.posted && pv.seqno != 0);
+	CHECK(pser.bufferDidModifyRange(0x7a, 0, 16));
+	CHECK(plain.calls.size() == 3 && !plain.calls[0].batch && !plain.calls[1].batch &&
+	      !plain.calls[2].batch);
+	CHECK(pser.postHeldCreates());
+}
+
 // A synthetic .metallib: its header (the bitcode section at 0x60, 16 bytes), a stand-in for the
 // function list, the bitcode, and a tail.
 std::vector<uint8_t> syntheticMetallib()
@@ -2180,14 +3026,48 @@ std::vector<uint8_t> syntheticMetallib()
 	return b;
 }
 
-// A library's content key is the SHA-256 of the prefix and the bytes around the bitcode section:
-// the digest computed independently (and pinned on the host's side too), the same whatever the
-// section holds, and none for bytes that are no .metallib or whose section lies outside them.
+// The keys of a 640 KiB library, its bitcode section 128 KiB at 192 KiB: the content key's first
+// piece spans the section and its second is a whole piece, the last; the whole bytes are three
+// pieces, hashed on threads at once. Both are the digests computed independently and pinned on
+// the host's side too (library.rs, keys_in_pieces_as_the_bundle_does).
+void test_library_key_pieces()
+{
+	std::vector<uint8_t> lib(0xa0000);
+	for (size_t i = 0; i < lib.size(); i++)
+		lib[i] = static_cast<uint8_t>(i % 251);
+	std::memset(lib.data(), 0, 0x58);
+	std::memcpy(lib.data(), "MTLB", 4);
+	const uint64_t at = 0x30000, size = 0x20000;
+	std::memcpy(lib.data() + 0x48, &at, 8);
+	std::memcpy(lib.data() + 0x50, &size, 8);
+	static const uint8_t content[32] = {
+		0x05, 0x34, 0x27, 0xb9, 0xa6, 0xd3, 0xe1, 0xdd, 0xba, 0x82, 0x49, 0x63, 0x1f, 0xd3, 0x9b, 0xa1,
+		0xeb, 0x6f, 0x16, 0x1c, 0x98, 0xd2, 0xe2, 0x4f, 0x56, 0xb0, 0x2f, 0x67, 0xe1, 0x74, 0x3c, 0x4a,
+	};
+	static const uint8_t whole[32] = {
+		0xe4, 0x9b, 0x7d, 0x62, 0x71, 0x76, 0xdb, 0x48, 0xe2, 0xd5, 0xd3, 0x5b, 0x03, 0xb2, 0x6b, 0x91,
+		0xf0, 0x02, 0x7a, 0x33, 0x0e, 0xc3, 0x25, 0xfd, 0x26, 0x20, 0xc9, 0x86, 0xc3, 0xa0, 0x72, 0x8b,
+	};
+	uint8_t key[32] = {};
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, content, sizeof(key)) == 0);
+	CHECK(rgfxLibraryWholeKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, whole, sizeof(key)) == 0);
+	// A byte past the section, in the last piece, changes the content key.
+	lib[0x9ffff] ^= 0xff;
+	CHECK(rgfxLibraryKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, content, sizeof(key)) != 0);
+}
+
+// A library's content key is the SHA-256 of the prefix and the SHA-256 of the bytes around the
+// bitcode section, one piece: the digest computed independently (and pinned on the host's side
+// too), the same whatever the section holds, and none for bytes that are no .metallib or whose
+// section lies outside them.
 void test_library_key()
 {
 	static const uint8_t expect[32] = {
-		0xc0, 0x99, 0x93, 0x08, 0x93, 0xa6, 0x91, 0xa1, 0xaa, 0xed, 0xfa, 0x6d, 0xee, 0xd4, 0x1a, 0x58,
-		0x09, 0x95, 0x3e, 0x36, 0xa8, 0xe6, 0x9e, 0xd9, 0x86, 0xe1, 0xb2, 0x11, 0xff, 0x4e, 0x21, 0x7d,
+		0xc2, 0x98, 0xaa, 0x26, 0x7e, 0x84, 0x06, 0x18, 0xa9, 0xde, 0x5c, 0xa5, 0x3b, 0x39, 0xf7, 0x12,
+		0xeb, 0x30, 0xb7, 0x16, 0xee, 0xc2, 0xbc, 0xe7, 0x1f, 0x1c, 0xd4, 0x72, 0xb6, 0xbd, 0x2b, 0x30,
 	};
 	std::vector<uint8_t> lib = syntheticMetallib();
 	CHECK(lib.size() == 0x78);
@@ -2210,6 +3090,22 @@ void test_library_key()
 	std::memcpy(other.data() + 0x50, &past, 8);
 	CHECK(!rgfxLibraryKey(other.data(), other.size(), key));
 	CHECK(!rgfxLibraryKey(other.data(), 0x40, key));
+
+	// The key of the whole bytes, the bitcode included, is the digest the host's
+	// `whole_keys_as_the_bundle_does` pins: Core Image's libraries are kept under it.
+	static const uint8_t whole[32] = {
+		0x41, 0xa4, 0x8e, 0x77, 0x6f, 0xec, 0xa5, 0x8f, 0x52, 0x67, 0x0e, 0xd8, 0x93, 0x50, 0x17, 0x03,
+		0xdb, 0x0f, 0xf3, 0x4e, 0xd8, 0x4e, 0x59, 0x78, 0x35, 0x85, 0x96, 0x16, 0xff, 0x1b, 0xf6, 0xcb,
+	};
+	lib = syntheticMetallib();
+	CHECK(rgfxLibraryWholeKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, whole, sizeof(key)) == 0);
+	lib[0x65] ^= 0xff;
+	CHECK(rgfxLibraryWholeKey(lib.data(), lib.size(), key));
+	CHECK(std::memcmp(key, whole, sizeof(key)) != 0);
+	other = syntheticMetallib();
+	other[0] = 'X';
+	CHECK(!rgfxLibraryWholeKey(other.data(), other.size(), key));
 }
 
 // A file's library key is found once for the file's identity: a load of the same identity takes
@@ -2298,6 +3194,68 @@ void test_keyed_library_messages()
 	CHECK(chunk.header.type == RGFX_CMD_LIBRARY_FROM_REGION);
 	CHECK(chunk.flags == RGFX_LIBRARY_FLAG_KEYED);
 	CHECK(std::memcmp(chunk.key, key, 32) == 0);
+}
+
+// Dynamic libraries: none is asked for until the host takes RGFX_FEATURE_DYNAMIC_LIBRARIES;
+// then DYNAMIC_LIBRARY_CREATE names the library and hands back the host's answer, and a compute
+// create that links dynamic libraries ends with their run, each loaded one's install name in the
+// tail before it.
+void test_dynamic_library_messages()
+{
+	ForwardLog log;
+	RgfxRingWriter writer(&forwardTo, &log, 4096);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	log.answer = RGFX_STATUS_OK;
+	RgfxCreated none = ser.createDynamicLibrary(0x21);
+	CHECK(!none.posted && none.status == kRgfxNoAnswer && log.messages.empty());
+
+	ser.setCarriesDynamicLibraries(true);
+	RgfxCreated made = ser.createDynamicLibrary(0x21);
+	CHECK(made.posted && made.status == RGFX_STATUS_OK && made.obj_id != 0);
+	CHECK(log.messages.size() == 1);
+	RgfxDynamicLibraryCreate create = {};
+	CHECK(log.messages[0].size() == sizeof(create));
+	std::memcpy(&create, log.messages[0].data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_DYNAMIC_LIBRARY_CREATE);
+	CHECK(create.header.size == sizeof(RgfxDynamicLibraryCreate));
+	CHECK(create.obj_id == made.obj_id && create.library_obj_id == 0x21);
+	log.answer = RGFX_STATUS_REFUSED;
+	CHECK(ser.createDynamicLibrary(0x22).status == RGFX_STATUS_REFUSED);
+
+	const char *name = "@executable_path/libx.metallib";
+	const RgfxPipelineLibraryRef libraries[2] = {{0x31, nullptr}, {0x32, name}};
+	RgfxComputePipelineParams cp = {};
+	cp.function.library = 10;
+	cp.function.entry_point = "k";
+	cp.libraries = libraries;
+	cp.library_count = 2;
+	RgfxCreated c = ser.createComputePipeline(cp);
+	CHECK(c.posted);
+	CHECK(log.messages.size() == 3);
+	const std::vector<uint8_t> &bytes = log.messages[2];
+	RgfxComputePipelineCreate cc = {};
+	std::memcpy(&cc, bytes.data(), sizeof(cc));
+	CHECK(cc.header.type == RGFX_CMD_COMPUTE_PIPELINE_CREATE);
+	CHECK(cc.header.size == bytes.size() && bytes.size() % 8 == 0);
+	CHECK(cc.library_count == 2);
+	CHECK(bytes.size() >= sizeof(cc) + 2 * sizeof(RgfxPipelineLibrary));
+	RgfxPipelineLibrary run[2] = {};
+	std::memcpy(run, bytes.data() + bytes.size() - sizeof(run), sizeof(run));
+	CHECK(run[0].obj_id == 0x31 && run[0].name_len == 0);
+	CHECK(run[1].obj_id == 0x32 && run[1].name_len == std::strlen(name));
+	CHECK(run[1].name_offset >= sizeof(cc));
+	CHECK(run[1].name_offset + run[1].name_len <= bytes.size() - sizeof(run));
+	CHECK(std::memcmp(bytes.data() + run[1].name_offset, name, std::strlen(name)) == 0);
+
+	// A pipeline that links none leaves the count 0 and nothing after its tail.
+	cp.libraries = nullptr;
+	cp.library_count = 0;
+	CHECK(ser.createComputePipeline(cp).posted);
+	RgfxComputePipelineCreate plain = {};
+	std::memcpy(&plain, log.messages[3].data(), sizeof(plain));
+	CHECK(plain.library_count == 0);
+	CHECK(log.messages[3].size() < bytes.size());
 }
 
 // The archive file: its sections round-trip, whatever does not parse whole is no archive, and a
@@ -2528,6 +3486,271 @@ void test_heap_texture_size_query()
 	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 4);
 	other.usage = 1;
 	CHECK(ser.heapTextureSizeAndAlign(other, &size, &align) && asker.calls == 5);
+}
+
+// The device's answers to the rate map messages, and what it was last asked.
+struct RateMapAsker {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<RateMapAsker *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxMsgHeader h = {};
+		std::memcpy(&h, message, sizeof(h));
+		if (h.type == RGFX_CMD_RATE_MAP_QUERY) {
+			RgfxRateMapAnswer answer = {};
+			answer.header = {RGFX_EVT_RATE_MAP_ANSWER, sizeof(answer), 11};
+			answer.status = self->status;
+			answer.values[0] = 0x3f800000; // 1.0f
+			answer.values[1] = 0x40000000; // 2.0f
+			answer.values[2] = 7;
+			CHECK(capacity >= sizeof(answer));
+			std::memcpy(reply, &answer, sizeof(answer));
+			*reply_size = sizeof(answer);
+			return true;
+		}
+		RgfxRateMapState answer = {};
+		answer.header = {RGFX_EVT_RATE_MAP_STATE, sizeof(answer), 10};
+		answer.status = self->status;
+		answer.screen_width = 256;
+		answer.screen_height = 128;
+		answer.granularity_width = answer.granularity_height = 32;
+		answer.granularity_depth = 1;
+		answer.layer_count = 1;
+		answer.mutability = 2;
+		answer.parameter_size = 24624;
+		answer.parameter_align = 4;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A rate map's create, reset and queries ask the device and post nothing on the ring: the create
+// under a new id of the context, carrying the descriptor's screen size, its mutability where set
+// and each layer's record with its samples after the layers, each the bits of its float; a reset
+// the same under the map's id. Nothing is asked where the host makes no maps, or where the
+// message is past half the control ring, which the kext takes no lifecycle message past.
+void test_rate_map_messages()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(3ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	RateMapAsker asker;
+	ser.setAsker(&RateMapAsker::ask, &asker);
+	RgfxRateMapShape shape;
+	shape.screen_width = 256;
+	shape.screen_height = 128;
+	shape.mutability_set = true;
+	shape.mutability = 1;
+	shape.layers.push_back({3, 2, {1.0f, 0.25f, 1.0f, 1.0f, 0.5f}});
+	RgfxRateMapState state = {};
+	RgfxCreated none = ser.createRateMap(shape, &state);
+	CHECK(!none.posted && none.status == kRgfxNoAnswer && asker.calls == 0);
+
+	ser.setCarriesRateMaps(true);
+	RgfxCreated made = ser.createRateMap(shape, &state);
+	CHECK(made.posted && made.status == RGFX_STATUS_OK && asker.calls == 1);
+	CHECK(made.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 3 && made.seqno == 10);
+	CHECK(state.screen_width == 256 && state.parameter_size == 24624 && state.layer_count == 1);
+	const size_t head = sizeof(RgfxRateMapCreate), layer = sizeof(RgfxRateMapLayer);
+	CHECK(asker.asked.size() == ((head + layer + 5 * 4 + 7) & ~size_t(7)));
+	RgfxRateMapCreate create = {};
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_CREATE && create.header.size == asker.asked.size());
+	CHECK(create.obj_id == made.obj_id && create.screen_width == 256 && create.screen_height == 128);
+	CHECK(create.screen_depth == 0 && create.flags == RGFX_RATE_MAP_MUTABILITY_SET);
+	CHECK(create.mutability == 1 && create.layer_count == 1 && create.layers_offset == head);
+	RgfxRateMapLayer l = {};
+	std::memcpy(&l, asker.asked.data() + head, sizeof(l));
+	CHECK(l.horizontal_count == 3 && l.vertical_count == 2 && l.samples_offset == head + layer);
+	float samples[5] = {};
+	std::memcpy(samples, asker.asked.data() + l.samples_offset, sizeof(samples));
+	CHECK(samples[0] == 1.0f && samples[1] == 0.25f && samples[2] == 1.0f && samples[3] == 1.0f &&
+	      samples[4] == 0.5f);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	// A reset names the map; a refusal answers its status.
+	shape.mutability_set = false;
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.resetRateMap(made.obj_id, shape, &state) == RGFX_STATUS_REFUSED);
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_RATE_MAP_RESET && create.obj_id == made.obj_id);
+	CHECK(create.flags == 0 && create.mutability == 0);
+
+	// A query carries its kind, its argument and its coordinate's bits, and answers the values
+	// where the device answers OK, zeros where it does not.
+	uint64_t values[3] = {9, 9, 9};
+	asker.status = RGFX_STATUS_OK;
+	CHECK(ser.queryRateMap(made.obj_id, RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL, 1, RGFX_OBJ_NONE,
+	                       10.5f, 3.25f, values) == RGFX_STATUS_OK);
+	CHECK(values[0] == 0x3f800000 && values[1] == 0x40000000 && values[2] == 7);
+	RgfxRateMapQuery q = {};
+	CHECK(asker.asked.size() == sizeof(q));
+	std::memcpy(&q, asker.asked.data(), sizeof(q));
+	float x = 0, y = 0;
+	std::memcpy(&x, &q.x_bits, 4);
+	std::memcpy(&y, &q.y_bits, 4);
+	CHECK(q.header.type == RGFX_CMD_RATE_MAP_QUERY && q.obj_id == made.obj_id && q.at == 1);
+	CHECK(q.query == RGFX_RATE_MAP_QUERY_SCREEN_TO_PHYSICAL && x == 10.5f && y == 3.25f);
+	asker.status = RGFX_STATUS_REFUSED;
+	CHECK(ser.queryRateMap(made.obj_id, RGFX_RATE_MAP_QUERY_COPY_PARAMETER_DATA, 4, 0x77, 0, 0,
+	                       values) == RGFX_STATUS_REFUSED);
+	CHECK(values[0] == 0 && values[1] == 0 && values[2] == 0);
+	std::memcpy(&q, asker.asked.data(), sizeof(q));
+	CHECK(q.buffer_obj_id == 0x77 && q.at == 4);
+
+	// A descriptor past half the control ring is asked nothing.
+	const uint32_t calls = asker.calls;
+	shape.layers[0].horizontal_count = 4096;
+	shape.layers[0].vertical_count = 2;
+	shape.layers[0].samples.assign(4098, 1.0f);
+	CHECK(ser.createRateMap(shape, &state).status == kRgfxNoAnswer && asker.calls == calls);
+	CHECK(!ring.next(&h, &bytes));
+}
+
+// The device's answers to the function pointer creates, and what it was last asked.
+struct FunctionPointerAsker {
+	uint32_t calls = 0;
+	uint32_t status = RGFX_STATUS_OK;
+	std::vector<uint8_t> asked;
+	static bool ask(void *context, const void *message, uint32_t size, void *reply,
+	                uint32_t capacity, uint32_t *reply_size)
+	{
+		auto *self = static_cast<FunctionPointerAsker *>(context);
+		self->calls++;
+		const auto *bytes = static_cast<const uint8_t *>(message);
+		self->asked.assign(bytes, bytes + size);
+		RgfxFunctionPointerState answer = {};
+		answer.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(answer), 12};
+		answer.status = self->status;
+		answer.gpu_resource_id = 3;
+		answer.allocated_size = 4096;
+		answer.resource_options = 528;
+		CHECK(capacity >= sizeof(answer));
+		std::memcpy(reply, &answer, sizeof(answer));
+		*reply_size = sizeof(answer);
+		return true;
+	}
+};
+
+// A function handle's and a visible function table's creates ask the device and post nothing on
+// the ring: the handle under a new id of the context, naming its pipeline and carrying its
+// function as a linked function's record, with the strings and constants after the head; the
+// table naming its pipeline and its entry count. A table's set is posted on the ring unanswered,
+// in runs of entries each message holds at most half the control ring of. Nothing is asked or
+// posted where the host makes no function pointers.
+void test_function_pointer_messages()
+{
+	TestRing ring(0x8000);
+	ring.setConsumerIdle(1);
+	RgfxRingWriter writer(ring.base(), ring.dataSize, RGFX_CONTROL_RING_ID, TestRing::doorbell,
+	                      nullptr);
+	RgfxIdSpace ids;
+	ids.setBases(3ull << RGFX_CONTEXT_OBJ_ID_SHIFT, RgfxIdSpace::kDefaultAddressBase);
+	RgfxSerializer ser(writer, ids);
+	FunctionPointerAsker asker;
+	ser.setAsker(&FunctionPointerAsker::ask, &asker);
+	RgfxFunctionConstant constant = {};
+	constant.index = 7;
+	constant.data_type = 29;
+	constant.value[0] = 0x5a;
+	RgfxLinkedFunctionRef fn = {};
+	fn.function.library = 0x55;
+	fn.function.entry_point = "fp_add1";
+	fn.function.constants = &constant;
+	fn.function.constant_count = 1;
+	fn.list = RGFX_LINKED_FUNCTIONS;
+	fn.options = 4;
+	fn.specialized_name = "add1_7";
+	RgfxFunctionPointerState state = {};
+	const RgfxObjId handles[3] = {0x31, 0, 0x32};
+	CHECK(ser.createFunctionHandle(0x44, fn, &state).status == kRgfxNoAnswer);
+	CHECK(ser.createFunctionTable(0x44, 3, &state).status == kRgfxNoAnswer);
+	CHECK(!ser.setFunctionTable(0x66, 0, handles, 3) && asker.calls == 0);
+	RgfxMsgHeader h = {};
+	std::vector<uint8_t> bytes;
+	CHECK(!ring.next(&h, &bytes));
+
+	ser.setCarriesFunctionPointers(true);
+	RgfxCreated handle = ser.createFunctionHandle(0x44, fn, &state);
+	CHECK(handle.posted && handle.status == RGFX_STATUS_OK && asker.calls == 1);
+	CHECK(handle.obj_id >> RGFX_CONTEXT_OBJ_ID_SHIFT == 3 && handle.seqno == 12);
+	const size_t head = sizeof(RgfxFunctionHandleCreate);
+	CHECK(asker.asked.size() == ((head + 7 + sizeof(constant) + 6 + 7) & ~size_t(7)));
+	RgfxFunctionHandleCreate create = {};
+	std::memcpy(&create, asker.asked.data(), sizeof(create));
+	CHECK(create.header.type == RGFX_CMD_FUNCTION_HANDLE_CREATE &&
+	      create.header.size == asker.asked.size());
+	CHECK(create.obj_id == handle.obj_id && create.pipeline_obj_id == 0x44);
+	const RgfxLinkedFunction &f = create.function;
+	CHECK(f.library_obj_id == 0x55 && f.list == RGFX_LINKED_FUNCTIONS && f.options == 4);
+	CHECK(f.name_offset == head && f.name_len == 7 &&
+	      std::memcmp(asker.asked.data() + f.name_offset, "fp_add1", 7) == 0);
+	RgfxFunctionConstant c = {};
+	std::memcpy(&c, asker.asked.data() + f.constants_offset, sizeof(c));
+	CHECK(f.constant_count == 1 && c.index == 7 && c.data_type == 29 && c.value[0] == 0x5a);
+	CHECK(f.group_len == 0 && f.specialized_name_len == 6 &&
+	      std::memcmp(asker.asked.data() + f.specialized_name_offset, "add1_7", 6) == 0);
+
+	// Not found (a function the pipeline does not link) answers its status, no resource id.
+	asker.status = RGFX_STATUS_NOT_FOUND;
+	RgfxCreated none = ser.createFunctionHandle(0x44, fn, &state);
+	CHECK(none.posted && none.status == RGFX_STATUS_NOT_FOUND && none.resource_id == 0);
+
+	asker.status = RGFX_STATUS_OK;
+	RgfxCreated table = ser.createFunctionTable(0x44, 3, &state);
+	CHECK(table.posted && table.status == RGFX_STATUS_OK && table.resource_id == 3);
+	CHECK(state.gpu_resource_id == 3 && state.allocated_size == 4096 &&
+	      state.resource_options == 528);
+	RgfxFunctionTableCreate tc = {};
+	CHECK(asker.asked.size() == sizeof(tc));
+	std::memcpy(&tc, asker.asked.data(), sizeof(tc));
+	CHECK(tc.header.type == RGFX_CMD_FUNCTION_TABLE_CREATE && tc.header.size == sizeof(tc));
+	CHECK(tc.obj_id == table.obj_id && tc.obj_id != handle.obj_id && tc.pipeline_obj_id == 0x44);
+	CHECK(tc.function_count == 3);
+	CHECK(!ring.next(&h, &bytes));
+
+	// A set goes on the ring, unanswered, its handles after the head.
+	const uint32_t calls = asker.calls;
+	CHECK(ser.setFunctionTable(table.obj_id, 1, handles, 3) && asker.calls == calls);
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	RgfxFunctionTableSet set = {};
+	CHECK(bytes.size() == sizeof(set) + 3 * 8);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.obj_id == table.obj_id && set.first == 1 && set.count == 3);
+	RgfxObjId sent[3] = {};
+	std::memcpy(sent, bytes.data() + sizeof(set), sizeof(sent));
+	CHECK(sent[0] == 0x31 && sent[1] == 0 && sent[2] == 0x32);
+
+	// Entries past what one message holds go in runs, each from where the last ended.
+	const uint64_t run = (writer.dataSize() / 2 - sizeof(set)) / 8;
+	std::vector<RgfxObjId> many(run + 5);
+	for (size_t i = 0; i < many.size(); i++)
+		many[i] = 0x100 + i;
+	CHECK(ser.setFunctionTable(table.obj_id, 2, many.data(), many.size()));
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 2 && set.count == run && bytes.size() == sizeof(set) + run * 8);
+	CHECK(ring.next(&h, &bytes) && h.type == RGFX_CMD_FUNCTION_TABLE_SET);
+	std::memcpy(&set, bytes.data(), sizeof(set));
+	CHECK(set.first == 2 + run && set.count == 5);
+	RgfxObjId last = 0;
+	std::memcpy(&last, bytes.data() + sizeof(set) + 4 * 8, 8);
+	CHECK(last == 0x100 + run + 4);
+	CHECK(!ring.next(&h, &bytes));
 }
 
 // A no-copy buffer's block and the app's memory (RgfxMemoryShadow): the block starts as the
@@ -2823,18 +4046,296 @@ void test_region_pages_blocks()
 	CHECK(src.released.size() == 1 && src.released[0] == mem.size() - 0x800);
 }
 
+// A pages block asked with a join (RgfxRegion::acquirePages) is given again for the same bytes,
+// writability and join while it is joinable, the kext asked once: it stays joinable until
+// leavePages came for each time it was given, and goes back to the block source at the release
+// for the last of them, whichever order those come in. Other bytes, another writability, another
+// join and kPagesOwn each take a block of their own; once a block is joinable no longer, the same
+// bytes take a new block though the old one is still held.
+void test_region_pages_joins()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+		std::vector<uint64_t> released;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Source *s = static_cast<Source *>(c);
+			s->asked++;
+			*offset = s->next;
+			*size = 0x4000;
+			s->next += 0x4000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	// Written, so every page has its object, as the kext's wire of a block faults them in.
+	static uint8_t bytes[0x8000];
+	std::memset(bytes, 0x5a, sizeof(bytes));
+	const uint32_t join = 1;
+
+	RgfxRegion::Block a = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block b = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(a.ok && b.ok && a.offset == b.offset && a.size == b.size && b.ptr == nullptr);
+	CHECK(src.asked == 1);
+	// Each of these takes a block of its own.
+	const RgfxRegion::Block others[] = {
+	    region.acquirePages(bytes, 0x3000, true, join),
+	    region.acquirePages(bytes + 0x1000, 0x4000, true, join),
+	    region.acquirePages(bytes, 0x4000, false, join),
+	    region.acquirePages(bytes, 0x4000, true, join + 1),
+	    region.acquirePages(bytes, 0x4000, true, RgfxRegion::kPagesOwn),
+	    region.acquirePages(bytes, 0x4000, true, RgfxRegion::kPagesOwn),
+	};
+	CHECK(src.asked == 7);
+	for (const RgfxRegion::Block &o : others)
+		CHECK(o.ok && o.offset != a.offset);
+	CHECK(others[4].offset != others[5].offset);
+
+	// The first holder's release before its leave: held still, and joinable.
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	RgfxRegion::Block c = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(c.ok && c.offset == a.offset && src.asked == 7);
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == a.offset && src.asked == 7);
+	// The last leave: the same bytes take a new block while the old one is held.
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	RgfxRegion::Block d = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(d.ok && d.offset != a.offset && src.asked == 8);
+	region.leavePages(a.offset); // past the last leave: nothing
+	region.release(a.offset);
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	region.release(a.offset); // the last of the four
+	CHECK(src.released.size() == 1 && src.released[0] == a.offset);
+	region.release(d.offset);
+	CHECK(src.released.size() == 2 && src.released[1] == d.offset);
+	// A block of kPagesOwn goes back at its one release.
+	region.leavePages(others[4].offset);
+	region.release(others[4].offset);
+	CHECK(src.released.size() == 3 && src.released[2] == others[4].offset);
+}
+
+// A joinable pages block is joined only while the memory at its bytes is the memory it was given
+// for (RgfxRegion::acquirePages, rgfxPagesIdentity): new memory mapped at the same address and
+// length, with other contents, takes a block of its own while the first is still held and
+// joinable, and the first is joinable no longer, its leaves and releases still its own; the same
+// memory mapped again at the same address and offset joins; the same memory at another offset,
+// and memory with no pages yet, do not.
+void test_region_pages_join_over_remapped_memory()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	struct Source {
+		int asked = 0;
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET + 0x10000;
+		std::vector<uint64_t> released;
+		static bool block(void *c, const void *, uint64_t, bool, uint64_t *offset, uint64_t *size)
+		{
+			Source *s = static_cast<Source *>(c);
+			s->asked++;
+			*offset = s->next;
+			*size = 0x4000;
+			s->next += 0x4000;
+			return true;
+		}
+		static bool alloc(void *, uint64_t, uint64_t, uint64_t *) { return false; }
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	} src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setPagesBlockSource(&Source::block, &src);
+	const uint32_t join = 1;
+	const mach_vm_size_t length = 0x8000;
+	mach_vm_address_t at = 0;
+	CHECK(mach_vm_allocate(mach_task_self(), &at, length, VM_FLAGS_ANYWHERE) == KERN_SUCCESS);
+	uint8_t *bytes = reinterpret_cast<uint8_t *>(at);
+	std::memset(bytes, 0xaa, length);
+	std::vector<uint64_t> first;
+	CHECK(rgfxPagesIdentity(bytes, 0x4000, &first) && first.size() == 3);
+
+	RgfxRegion::Block a = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block b = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(a.ok && b.ok && a.offset == b.offset && src.asked == 1);
+	CHECK(region.pagesRejoinsRefused() == 0);
+
+	// Other memory at the same address, other contents: a block of its own, the first still
+	// held twice and never asked to join again. The kext wires a pages block's memory (its
+	// IOMemoryDescriptor's prepare), which keeps the first memory's object alive while the block
+	// is held, so the new memory's object cannot reuse its identity (measured: a macOS 26.7.2
+	// guest's no-copy buffer kept it in 200 of 200 overwrites, where with no buffer the new
+	// object took the old one's identity in 198 of 200). The fake source wires nothing: a memory
+	// entry of the first memory, held to the end, keeps it alive as the kext does (measured on
+	// macOS 27.0.1: the identity was the old one's in 0 of 5000 overwrites with the entry held,
+	// and in 717 of 5000 without it).
+	mach_port_t firstMemory = MACH_PORT_NULL;
+	memory_object_size_t firstSize = length;
+	CHECK(mach_make_memory_entry_64(mach_task_self(), &firstSize, at, VM_PROT_READ | VM_PROT_WRITE,
+	                                &firstMemory, MACH_PORT_NULL) == KERN_SUCCESS);
+	mach_vm_address_t again = at;
+	CHECK(mach_vm_allocate(mach_task_self(), &again, length, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) ==
+	      KERN_SUCCESS);
+	CHECK(again == at);
+	std::memset(bytes, 0x55, length);
+	std::vector<uint64_t> second;
+	CHECK(rgfxPagesIdentity(bytes, 0x4000, &second) && second != first);
+	RgfxRegion::Block c = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(c.ok && c.offset != a.offset && src.asked == 2);
+	CHECK(region.pagesRejoinsRefused() == 1);
+	RgfxRegion::Block d = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(d.ok && d.offset == c.offset && src.asked == 2 && region.pagesRejoinsRefused() == 1);
+	// The first block's leaves and releases are its own: it goes back at its last release, and
+	// the second stays joinable.
+	region.leavePages(a.offset);
+	region.leavePages(a.offset);
+	region.release(a.offset);
+	CHECK(src.released.empty());
+	region.release(a.offset);
+	CHECK(src.released.size() == 1 && src.released[0] == a.offset);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == c.offset && src.asked == 2);
+
+	// The same memory mapped again at the same address and offset: joined.
+	mach_vm_size_t entrySize = length;
+	mach_port_t entry = MACH_PORT_NULL;
+	CHECK(mach_make_memory_entry_64(mach_task_self(), &entrySize, at,
+	                                VM_PROT_READ | VM_PROT_WRITE, &entry,
+	                                MACH_PORT_NULL) == KERN_SUCCESS);
+	mach_vm_address_t mapped = at;
+	CHECK(mach_vm_map(mach_task_self(), &mapped, length, 0, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+	                  entry, 0, false, VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+	                  VM_INHERIT_NONE) == KERN_SUCCESS);
+	CHECK(mapped == at && bytes[0] == 0x55);
+	CHECK(region.acquirePages(bytes, 0x4000, true, join).offset == c.offset && src.asked == 2);
+	CHECK(region.pagesRejoinsRefused() == 1);
+	// The same memory at another offset: other memory for these bytes.
+	CHECK(mach_vm_map(mach_task_self(), &mapped, length - 0x1000, 0,
+	                  VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, entry, 0x1000, false,
+	                  VM_PROT_READ | VM_PROT_WRITE, VM_PROT_READ | VM_PROT_WRITE,
+	                  VM_INHERIT_NONE) == KERN_SUCCESS);
+	RgfxRegion::Block e = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(e.ok && e.offset != c.offset && src.asked == 3 && region.pagesRejoinsRefused() == 2);
+	mach_port_deallocate(mach_task_self(), entry);
+
+	// Memory with no pages yet: no identity, so neither joined nor joinable.
+	CHECK(mach_vm_allocate(mach_task_self(), &again, length, VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE) ==
+	      KERN_SUCCESS);
+	std::vector<uint64_t> none;
+	CHECK(!rgfxPagesIdentity(bytes, 0x4000, &none));
+	RgfxRegion::Block f = region.acquirePages(bytes, 0x4000, true, join);
+	RgfxRegion::Block g = region.acquirePages(bytes, 0x4000, true, join);
+	CHECK(f.ok && g.ok && f.offset != e.offset && g.offset != f.offset && src.asked == 5);
+	CHECK(region.pagesRejoinsRefused() == 3);
+	mach_port_deallocate(mach_task_self(), firstMemory);
+	mach_vm_deallocate(mach_task_self(), at, length);
+}
+
+// Where the kext maps parts of blocks write-combined, a block asked with a write-combined part
+// takes it from the write-combined source, and one asked without from the block source; a queue's
+// submission ring's data starts its block's second page, write-combined, with the ring's header
+// ending the first, and the pair names the blocks to release. Without the source every block is
+// the block source's, the rings at their blocks' starts.
+void test_region_write_combined_parts()
+{
+	std::vector<uint8_t> mem(RGFX_ALLOCATIONS_OFFSET + 0x100000, 0xee);
+	struct Source {
+		uint64_t next = RGFX_ALLOCATIONS_OFFSET;
+		std::vector<uint64_t> combinedFrom; // UINT64_MAX for a plain block
+		std::vector<uint64_t> released;
+		bool place(uint64_t size, uint64_t align, uint64_t from, uint64_t *offset)
+		{
+			next = (next + align - 1) & ~(align - 1);
+			*offset = next;
+			next += size;
+			combinedFrom.push_back(from);
+			return true;
+		}
+		static bool alloc(void *c, uint64_t size, uint64_t align, uint64_t *offset)
+		{
+			return static_cast<Source *>(c)->place(size, align, UINT64_MAX, offset);
+		}
+		static bool combined(void *c, uint64_t size, uint64_t align, uint64_t from,
+		                     uint64_t *offset)
+		{
+			return static_cast<Source *>(c)->place(size, align, from, offset);
+		}
+		static void release(void *c, uint64_t offset)
+		{
+			static_cast<Source *>(c)->released.push_back(offset);
+		}
+	};
+	{
+		RgfxRegion region(mem.data(), mem.size());
+		Source src;
+		region.setBlockSource(&Source::alloc, &Source::release, &src);
+		CHECK(!region.writeCombines());
+		RgfxRegion::Block b = region.allocate(0x2000, 0x1000, 0);
+		CHECK(b.ok && src.combinedFrom == std::vector<uint64_t>({UINT64_MAX}));
+		RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+		CHECK(rings.ok && rings.submit_offset == rings.submit_block);
+		CHECK(rings.complete_offset == rings.complete_block && rings.complete_offset != 0);
+	}
+	std::fill(mem.begin(), mem.end(), 0xee); // the rings above zeroed theirs
+	RgfxRegion region(mem.data(), mem.size());
+	Source src;
+	region.setBlockSource(&Source::alloc, &Source::release, &src);
+	region.setWriteCombinedSource(&Source::combined);
+	CHECK(region.writeCombines());
+	RgfxRegion::Block plain = region.allocate(0x2000);
+	RgfxRegion::Block whole = region.allocate(0x2000, 0x1000, 0);
+	RgfxRegion::Block tail = region.allocate(0x3000, 0x1000, 0x1000);
+	RgfxRegion::Block past = region.allocate(0x1000, 0x1000, 0x1000);
+	CHECK(plain.ok && whole.ok && tail.ok && past.ok);
+	CHECK(src.combinedFrom ==
+	      std::vector<uint64_t>({UINT64_MAX, 0, 0x1000, UINT64_MAX}));
+	src.combinedFrom.clear();
+	RgfxRegion::RingPair rings = region.allocateRingPair(0x8000, 0x8000);
+	CHECK(rings.ok && rings.submit_data_size == 0x8000);
+	CHECK(src.combinedFrom == std::vector<uint64_t>({0x1000, UINT64_MAX}));
+	CHECK(rings.submit_block % 0x1000 == 0);
+	CHECK(rings.submit_offset == rings.submit_block + 0x1000 - RGFX_RING_HEADER_SIZE);
+	CHECK((rings.submit_offset + RGFX_RING_HEADER_SIZE) % 0x1000 == 0);
+	CHECK(rings.submit_offset % RgfxRegion::kRingAlign == 0);
+	CHECK(rings.complete_block == rings.complete_offset);
+	// The ring's header and data are zeroed; the head of the block before them is not touched.
+	bool zeroed = true;
+	for (uint64_t i = 0; i < RGFX_RING_HEADER_SIZE + 0x8000; i++)
+		zeroed = zeroed && mem[rings.submit_offset + i] == 0;
+	CHECK(zeroed && mem[rings.submit_block] == 0xee);
+}
+
 int main()
 {
 	test_id_space();
 	test_obj_ids_are_given_once();
 	test_region_pages_blocks();
+	test_region_pages_joins();
+	test_region_pages_join_over_remapped_memory();
+	test_region_write_combined_parts();
 	test_address_picks();
 	test_resource_id_chunks();
 	test_small_resource_id_chunks();
+	test_resource_id_chunk_size_is_the_grant_s();
 	test_caps();
+	test_iosurface_alignments_divide_other_codes_surface_rows();
 	test_spi_features();
 	test_family_names();
+	test_vendor_names();
+	test_host_resource_options();
 	test_caps_features();
+	test_feature_profile_for_guest();
 	test_archive_file();
 	test_lifecycle_messages();
 	test_creates_with_no_address_post_nothing();
@@ -2843,26 +4344,37 @@ int main()
 	test_mesh_pipeline_messages();
 	test_mesh_ops();
 	test_ring_wrap_and_no_room();
+	test_ring_doorbell_follows_the_mark();
+	test_ring_doorbell_asks_where_the_device_takes_them();
 	test_ring_post_waits_for_room();
 	test_ring_post_waits_for_the_room_record();
 	test_ring_room_sleeps_count_for_the_line();
 	test_command_buffer_encoder();
 	test_command_buffer_storage();
+	test_ring_stamps_the_posted_time_before_the_publish();
+	test_guest_times_go_first();
 	test_video_command_buffer();
 	test_render_pass_sample_positions();
 	test_render_pass_visibility();
 	test_forwarded_lifecycle();
+	test_held_destroys();
+	test_held_buffers();
+	test_held_creates();
 	test_library_key();
+	test_library_key_pieces();
 	test_library_key_of_file();
 	test_keyed_library_messages();
+	test_dynamic_library_messages();
 	test_heap_ranges();
 	test_heap_texture_size_query();
+	test_rate_map_messages();
+	test_function_pointer_messages();
 	test_memory_shadow();
 	test_argument_layout_queries();
 	test_argument_layout_parse();
 	rgfxSlabTests();
 	rgfxLibraryStreamTests();
 	rgfxFunctionConstantsTests();
-	std::printf("serializer_tests: OK (%d checks)\n", g_checks);
+	std::printf("serializer_tests: OK (%d checks)\n", g_checks.load());
 	return 0;
 }

@@ -1,7 +1,7 @@
 // RgfxPipelineReflection: see RgfxPipelineReflection.h. Our own ObjC++: Metal's reflection classes,
 // their initialisers and their instance variables are named as the Objective-C runtime lists them
 // (measured: macOS 26.7.1, AMD Radeon Pro 5300M and Intel UHD Graphics 630; tools/oracle
-// oracle_reflection's class dump).
+// oracle_reflection's class dump; macOS 11.7.11 and 12.7.6, the classes' dump in a guest).
 #import "RgfxPipelineReflection.h"
 
 #import "RgfxMetalPrivate.h"
@@ -11,6 +11,7 @@
 
 #include <algorithm>
 #include <cstring>
+#include <iterator>
 #include <set>
 #include <string>
 
@@ -82,6 +83,31 @@ NS_ASSUME_NONNULL_BEGIN
              elementIsIndirectArgumentBuffer:(BOOL)elementIsIndirectArgumentBuffer
                             isConstantBuffer:(BOOL)isConstantBuffer
                                     doRetain:(BOOL)doRetain;
+// An Apple GPU's imageblock and imageblock data arguments' (measured: macOS 27.0.1 on the M3
+// Max, the classes' method lists, `@80@0:8@16Q24Q32B40Q44Q52I60@64B72I76` and
+// `@72@0:8@16Q24Q32B40Q44I52@56B64I68`).
+- (nullable instancetype)initWithName:(NSString *)name
+                                 type:(NSUInteger)type
+                               access:(NSUInteger)access
+                             isActive:(BOOL)isActive
+                                index:(NSUInteger)index
+                                 kind:(NSUInteger)kind
+                             dataSize:(uint32_t)dataSize
+                  masterStructMembers:(nullable id)masterStructMembers
+              aliasImplicitImageBlock:(BOOL)aliasImplicitImageBlock
+  aliasImplicitImageBlockRenderTarget:(uint32_t)aliasImplicitImageBlockRenderTarget;
+- (nullable instancetype)initWithName:(NSString *)name
+                                 type:(NSUInteger)type
+                               access:(NSUInteger)access
+                             isActive:(BOOL)isActive
+                                index:(NSUInteger)index
+                             dataSize:(uint32_t)dataSize
+                  masterStructMembers:(nullable id)masterStructMembers
+              aliasImplicitImageBlock:(BOOL)aliasImplicitImageBlock
+  aliasImplicitImageBlockRenderTarget:(uint32_t)aliasImplicitImageBlockRenderTarget;
+// A struct type's before macOS 12, of no type name (measured: macOS 11.7.11).
+- (nullable instancetype)initWithMembers:(__unsafe_unretained id _Nonnull const *_Nullable)members
+                                   count:(NSUInteger)count;
 - (void)setIsIndirectArgumentBuffer:(BOOL)value;
 - (void)setIndirectArgumentIndexStride:(NSUInteger)stride;
 - (void)setVertexDescriptorBuffer:(BOOL)value;
@@ -99,16 +125,28 @@ constexpr NSUInteger kNoIndex = 0xFFFFFFFF;
 // The binding type of a built-in argument, of an argument buffer's constant member, and of a mesh.
 constexpr NSUInteger kBuiltInBindingType = 15;
 constexpr NSUInteger kIndirectConstantBindingType = 4;
+// The binding type of a kernel's argument passed by value (an OpenCL C kernel's, `air.constant`).
+constexpr NSUInteger kValueBindingType = 22;
 constexpr NSUInteger kMeshBindingType = 35;
 // The built-in type and data type of a mesh, and the data type of mesh_grid_properties.
 constexpr NSUInteger kMeshBuiltInType = 24;
 constexpr NSUInteger kMeshDataType = 157;
 constexpr NSUInteger kMeshGridPropertiesDataType = 156;
-// A constant buffer's alignment, and a descriptor buffer's.
+// A constant buffer's alignment on an x86 Mac, and a descriptor buffer's. On an Apple GPU a
+// constant buffer's alignment is its pointee's, but at least 4 (measured:
+// tools/pipeline_reflection_check Apple on the M3 Max under macOS 27.0.1: 16 for a struct of
+// float4x4 members, 8 for a half3 and for structs of 8, 4 for a float, a half and a char, where an
+// x86 Mac answers 32).
 constexpr NSUInteger kConstantBufferAlignment = 32;
+constexpr NSUInteger kAppleConstantBufferMinAlignment = 4;
 constexpr NSUInteger kDescriptorBufferAlignment = 4;
 // What a vertex function's post-vertex dump stride adds to its outputs' size (the AMD GPU's).
 constexpr uint64_t kPostVertexDumpPadding = 12;
+// An explicit imageblock's kind (imageBlockKind), and the index an imageblock and a fragment
+// function's imageblock data are at, whatever the argument's place (measured: c_imageblock_explicit,
+// c_imageblock_late and r_imageblock_data on the M3 Max under macOS 27.0.1).
+constexpr NSUInteger kExplicitImageblockKind = 1;
+constexpr NSUInteger kImageblockIndex = 0;
 // The print style a vertex pipeline's reflection is of, and a mesh pipeline's.
 constexpr NSUInteger kVertexPrintStyle = 3;
 constexpr NSUInteger kMeshPrintStyle = 26;
@@ -136,6 +174,17 @@ const struct {
     {"air.thread_index_in_simdgroup", 18},
     {"air.threads_per_simdgroup", 20},
     {"air.mesh_grid_properties", 23},
+    // A post-tessellation vertex function's (measured: tools/pipeline_reflection_check's r_patch and
+    // r_patch_points on the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1,
+    // and the M3 Max under macOS 27.0.1).
+    {"air.patch_id", 13},
+    {"air.position_in_patch", 14},
+    // A kernel's stage input region (measured: a kernel of air.stage_in_grid_origin and
+    // air.stage_in_grid_size, both uint2, its pipeline made with no stage input descriptor, on the
+    // M3 Max under macOS 27.0.1 and the AMD Radeon Pro 5300M and the Intel UHD Graphics 630 under
+    // macOS 26.7.1: data type 34, m3-max-30339, m3-max-30340 and m3-max-30341).
+    {"air.stage_in_grid_origin", 15},
+    {"air.stage_in_grid_size", 16},
     {"air.simdgroup_index_in_threadgroup", 0},
     {"air.simdgroups_per_threadgroup", 0},
     {"air.quadgroup_index_in_threadgroup", 0},
@@ -144,70 +193,168 @@ const struct {
 };
 
 // A stage's nodes that are no binding and no built-in: a kernel's and a vertex function's stage
-// input attributes.
+// input attributes, and a post-tessellation vertex function's patch input attributes and its
+// control points.
 bool isStageInput(const std::string &kind)
+{
+	return kind == "air.stage_in" || kind == "air.vertex_input" || kind == "air.patch_input" ||
+	       kind == "air.patch_control_point_input";
+}
+
+// A stage input whose reads use the descriptor's buffer that holds its attribute: a kernel's and a
+// vertex function's. A post-tessellation vertex function's patch inputs and control points use
+// none: Metal answers each of its descriptor's buffers unused, isUsed and isActive 0, though the
+// function reads attributes they hold (measured: r_patch and r_patch_points, as kBuiltIns'
+// post-tessellation ones).
+bool usesDescriptorBuffer(const std::string &kind)
 {
 	return kind == "air.stage_in" || kind == "air.vertex_input";
 }
 
 // The classes the answers are made of, each looked up once with the initialiser it is made with.
+// macOS 11 and 12 have no binding classes (MTLBinding is macOS 13's), and macOS 11's struct type
+// takes no type name (measured: macOS 11.7.11 and 12.7.6, the classes' dump in a guest): there each
+// binding is an argument of the release's argument classes (`legacy`), and a struct type is made of
+// its members alone. A buffer's, a texture's and threadgroup memory's argument is of the class of
+// its kind (MTLBufferArgument, MTLTextureArgument, MTLThreadgroupMemoryArgument), which takes the
+// initialiser macOS 13's binding class of that kind takes; any other is an MTLArgumentInternal. Only
+// an argument of its kind's class answers that kind's getters: the guest's frameworks ask them (the
+// GL renderer asks a vertex descriptor's buffer for its bufferDataType), and on an argument of
+// another class each such getter fails its assertion and ends the process (measured: macOS 11.7.11
+// and 12.7.6, each getter of each class, made by each initialiser, in a guest).
 struct Classes {
 	Class type, structType, arrayType, pointerType, textureType, member, binding, bufferBinding, textureBinding,
 	    threadgroupBinding, builtIn, indirectConstant, payload, meshBuiltIn, compute, render;
-	NSString *missing; // the first class or initialiser that is not there, or nil
+	Class imageblock = Nil, imageblockData = Nil; // an Apple GPU's, Nil where missing (no reflection of one)
+	bool legacy = false;      // no binding classes: the bindings are the release's arguments
+	bool namedStructs = true; // the struct type's initialiser takes a type name
+	NSString *missing;        // the first class or initialiser that is not there, or nil
 };
+
+// The class Metal names `name`, or its stand-in among `standIns`
+// (RgfxPipelineReflectionUseClassesForTests).
+Class classNamed(NSDictionary<NSString *, id> *standIns, const char *name)
+{
+	id stand = standIns[@(name)];
+	if (stand == nil)
+		return NSClassFromString(@(name));
+	return stand == [NSNull null] ? Nil : (Class)stand;
+}
+
+Classes lookUpClasses(NSDictionary<NSString *, id> *standIns)
+{
+	Classes c;
+	struct Needed {
+		Class *cls;
+		const char *name;
+		SEL init;
+	};
+	// Each class of `list` with its initialiser; false, setting `missing`, at the first missing.
+	auto find = [&c, standIns](const Needed *list, size_t count) {
+		for (size_t i = 0; i < count; i++) {
+			const Needed &n = list[i];
+			*n.cls = classNamed(standIns, n.name);
+			if (*n.cls == Nil || ![*n.cls instancesRespondToSelector:n.init]) {
+				c.missing = [NSString stringWithFormat:@"-[%s %s]", n.name, sel_getName(n.init)];
+				return false;
+			}
+		}
+		return true;
+	};
+	const Needed kTypes[] = {
+	    {&c.type, "MTLTypeInternal", @selector(initWithDataType:)},
+	    {&c.structType, "MTLStructTypeInternal", @selector(initWithMembers:count:typeName:)},
+	    {&c.arrayType, "MTLArrayTypeInternal",
+	     @selector(initWithArrayLength:elementType:stride:pixelFormat:aluType:details:)},
+	    {&c.pointerType, "MTLPointerTypeInternal",
+	     @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:
+	                   elementIsIndirectArgumentBuffer:isConstantBuffer:doRetain:)},
+	    {&c.textureType, "MTLTextureReferenceTypeInternal",
+	     @selector(initWithDataType:textureType:access:isDepthTexture:)},
+	    {&c.member, "MTLStructMemberInternal",
+	     @selector(initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:
+	                   raster_order_group:details:)},
+	};
+	const Needed kBindings[] = {
+	    {&c.binding, "MTLBindingInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
+	    {&c.bufferBinding, "MTLBufferBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
+	                   isConstantBuffer:dataSize:alignment:)},
+	    {&c.textureBinding, "MTLTextureBindingInternal",
+	     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
+	    {&c.threadgroupBinding, "MTLThreadgroupMemoryBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
+	};
+	const Needed kArguments[] = {
+	    {&c.builtIn, "MTLBuiltInArgument", @selector(initWithName:type:access:active:index:dataType:builtInType:)},
+	    {&c.indirectConstant, "MTLIndirectConstantArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:dataType:pixelFormat:aluType:dataSize:
+	                   alignment:)},
+	};
+	const Needed kMeshes[] = {
+	    {&c.payload, "MTLObjectPayloadBindingInternal",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
+	    {&c.meshBuiltIn, "MTLBuiltInMeshArgument",
+	     @selector(initWithName:type:access:active:index:dataType:builtInType:meshVertexStructType:
+	                   meshPrimitiveStructType:meshVertexCount:meshPrimitiveCount:meshTopologyType:)},
+	};
+	const Needed kPipelines[] = {
+	    {&c.compute, "MTLComputePipelineReflectionInternal", @selector(init)},
+	    {&c.render, "MTLRenderPipelineReflectionInternal", @selector(init)},
+	};
+	// Before macOS 13, the release's argument classes in their place, of the same initialisers.
+	const Needed kLegacyBindings[] = {
+	    {&c.binding, "MTLArgumentInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
+	    {&c.bufferBinding, "MTLBufferArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
+	                   isConstantBuffer:dataSize:alignment:)},
+	    {&c.textureBinding, "MTLTextureArgument",
+	     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
+	    {&c.threadgroupBinding, "MTLThreadgroupMemoryArgument",
+	     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
+	};
+	// Before macOS 13, no binding classes and no mesh's (both macOS 13's); before macOS 12, a struct
+	// type of no type name.
+	c.legacy = classNamed(standIns, "MTLBindingInternal") == Nil;
+	Class structType = classNamed(standIns, "MTLStructTypeInternal");
+	c.namedStructs = !c.legacy || structType == Nil ||
+	                 [structType instancesRespondToSelector:@selector(initWithMembers:count:typeName:)];
+	Needed types[std::size(kTypes)];
+	std::copy(std::begin(kTypes), std::end(kTypes), types);
+	if (!c.namedStructs)
+		types[1].init = @selector(initWithMembers:count:);
+	if (!find(types, std::size(types)))
+		return c;
+	if (c.legacy) {
+		find(kLegacyBindings, std::size(kLegacyBindings)) && find(kArguments, std::size(kArguments)) &&
+		    find(kPipelines, std::size(kPipelines));
+		return c;
+	}
+	find(kBindings, std::size(kBindings)) && find(kArguments, std::size(kArguments)) &&
+	    find(kMeshes, std::size(kMeshes)) && find(kPipelines, std::size(kPipelines));
+	// Only a pipeline of an imageblock needs these: one the release lacks makes no reflection of it.
+	const Needed kImageblocks[] = {
+	    {&c.imageblock, "MTLImageBlockArgument",
+	     @selector(initWithName:type:access:isActive:index:kind:dataSize:masterStructMembers:aliasImplicitImageBlock:
+	                   aliasImplicitImageBlockRenderTarget:)},
+	    {&c.imageblockData, "MTLImageBlockDataArgument",
+	     @selector(initWithName:type:access:isActive:index:dataSize:masterStructMembers:aliasImplicitImageBlock:
+	                   aliasImplicitImageBlockRenderTarget:)},
+	};
+	for (const Needed &n : kImageblocks) {
+		*n.cls = classNamed(standIns, n.name);
+		if (*n.cls != Nil && ![*n.cls instancesRespondToSelector:n.init])
+			*n.cls = Nil;
+	}
+	return c;
+}
+
+const Classes *gTestClassSet; // the stand-ins' (RgfxPipelineReflectionUseClassesForTests), or null
 
 const Classes &classes()
 {
-	static Classes c;
-	static dispatch_once_t once;
-	dispatch_once(&once, ^{
-		const struct {
-			Class *cls;
-			const char *name;
-			SEL init;
-		} kNeeded[] = {
-		    {&c.type, "MTLTypeInternal", @selector(initWithDataType:)},
-		    {&c.structType, "MTLStructTypeInternal", @selector(initWithMembers:count:typeName:)},
-		    {&c.arrayType, "MTLArrayTypeInternal",
-		     @selector(initWithArrayLength:elementType:stride:pixelFormat:aluType:details:)},
-		    {&c.pointerType, "MTLPointerTypeInternal",
-		     @selector(initWithElementType:elementTypeDescription:access:alignment:dataSize:
-		                   elementIsIndirectArgumentBuffer:isConstantBuffer:doRetain:)},
-		    {&c.textureType, "MTLTextureReferenceTypeInternal",
-		     @selector(initWithDataType:textureType:access:isDepthTexture:)},
-		    {&c.member, "MTLStructMemberInternal",
-		     @selector(initWithName:offset:dataType:pixelFormat:aluType:indirectArgumentIndex:render_target:
-		                   raster_order_group:details:)},
-		    {&c.binding, "MTLBindingInternal", @selector(initWithName:type:access:index:active:arrayLength:)},
-		    {&c.bufferBinding, "MTLBufferBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:pixelFormat:aluType:
-		                   isConstantBuffer:dataSize:alignment:)},
-		    {&c.textureBinding, "MTLTextureBindingInternal",
-		     @selector(initWithName:access:isActive:locationIndex:arraySize:dataType:textureType:isDepthTexture:)},
-		    {&c.threadgroupBinding, "MTLThreadgroupMemoryBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
-		    {&c.builtIn, "MTLBuiltInArgument", @selector(initWithName:type:access:active:index:dataType:builtInType:)},
-		    {&c.indirectConstant, "MTLIndirectConstantArgument",
-		     @selector(initWithName:type:access:isActive:locationIndex:dataType:pixelFormat:aluType:dataSize:
-		                   alignment:)},
-		    {&c.payload, "MTLObjectPayloadBindingInternal",
-		     @selector(initWithName:type:access:isActive:locationIndex:arraySize:dataType:dataSize:alignment:)},
-		    {&c.meshBuiltIn, "MTLBuiltInMeshArgument",
-		     @selector(initWithName:type:access:active:index:dataType:builtInType:meshVertexStructType:
-		                   meshPrimitiveStructType:meshVertexCount:meshPrimitiveCount:meshTopologyType:)},
-		    {&c.compute, "MTLComputePipelineReflectionInternal", @selector(init)},
-		    {&c.render, "MTLRenderPipelineReflectionInternal", @selector(init)},
-		};
-		for (const auto &n : kNeeded) {
-			*n.cls = NSClassFromString(@(n.name));
-			if (*n.cls == Nil || ![*n.cls instancesRespondToSelector:n.init]) {
-				c.missing = [NSString stringWithFormat:@"-[%s %s]", n.name, sel_getName(n.init)];
-				return;
-			}
-		}
-	});
-	return c;
+	static const Classes c = lookUpClasses(nil);
+	return gTestClassSet != nullptr ? *gTestClassSet : c;
 }
 
 // The instance variable `name` of `o`'s class or a superclass, of an encoding of `type`'s first
@@ -311,10 +458,24 @@ bool textureType(const std::string &name, NSUInteger &type, NSUInteger &dataType
 			found = true;
 		}
 	}
+	// An OpenCL C image's sample type is `unknown` (`texture2d<unknown, read>`, Metal's compile of
+	// an image2d_t), which Metal's pipelines of OpenCL mode answer as MTLDataTypeNone; they answer
+	// its 1D images as 2D textures, image1d_t's texture1d a 2D one and image1d_array_t's
+	// texture1d_array a 2D array one (measured: macOS 26.7.1, the Intel 630 and the AMD 5300M
+	// alike, of every image of OpenCL C 1.2 and image2d_depth_t).
+	const std::string sample = n.substr(open + 1, comma - open - 1);
+	if (sample == "unknown") {
+		if (type == MTLTextureType1D)
+			type = MTLTextureType2D;
+		else if (type == MTLTextureType1DArray)
+			type = MTLTextureType2DArray;
+		dataType = MTLDataTypeNone;
+		return found;
+	}
 	// A texture of ulong is one of 64-bit atomics (measured: the Intel UHD Graphics 630 answers it of
 	// MTLDataTypeULong; the AMD Radeon Pro 5300M makes no pipeline of one).
 	uint32_t align = 0;
-	return found && valueType(n.substr(open + 1, comma - open - 1), dataType, align) &&
+	return found && valueType(sample, dataType, align) &&
 	       (dataType == MTLDataTypeFloat || dataType == MTLDataTypeHalf || dataType == MTLDataTypeInt ||
 	        dataType == MTLDataTypeUInt || dataType == MTLDataTypeShort || dataType == MTLDataTypeUShort ||
 	        dataType == MTLDataTypeULong);
@@ -364,6 +525,7 @@ NSUInteger accessOf(RgfxAirAccess a)
 // Makes the objects; the first thing it cannot make sets `why`.
 struct Maker {
 	const Classes &c;
+	bool appleGPU = false; // an Apple GPU's answers where they differ (RgfxStageReflectionOfEntry)
 	NSString *why = nil;
 
 	bool fail(NSString *w)
@@ -458,7 +620,8 @@ struct Maker {
 		std::vector<__unsafe_unretained id> list(members.count);
 		for (NSUInteger i = 0; i < members.count; i++)
 			list[i] = members[i];
-		id s = [make(c.structType) initWithMembers:list.data() count:list.size() typeName:nil];
+		id s = c.namedStructs ? [make(c.structType) initWithMembers:list.data() count:list.size() typeName:nil]
+		                      : [make(c.structType) initWithMembers:list.data() count:list.size()];
 		if (argumentBuffer)
 			[s setIsIndirectArgumentBuffer:YES];
 		return s;
@@ -530,7 +693,7 @@ struct Maker {
 		out = 0;
 		for (const RgfxAirMember &m : layout) {
 			NSUInteger first = 0, each = 0;
-			if (m.hasFirstId && m.layout != nullptr && depth < 8) {
+			if (m.hasFirstId && m.layout != nullptr && depth < kRgfxAirNesting) {
 				if (!idsOf(*m.layout, depth + 1, each))
 					return false;
 				first = m.firstId;
@@ -704,7 +867,50 @@ struct Maker {
 			                                   alignment:align];
 			return argument(b, used);
 		}
+		// A kernel's argument passed by value, as Metal's compiler describes an OpenCL C kernel's
+		// scalar one: a buffer binding of type 22, read only, of the value's type, size and
+		// alignment, its type object a pointer to the value that is no constant buffer (measured:
+		// macOS 26.7.1, the AMD 5300M and the Intel 630 alike, a float and a uint). A struct passed
+		// so is of MTLDataTypeStruct, its size and alignment the node's, as both Macs' pipelines of
+		// OpenCL mode answer one of a float and an int (8 bytes, aligned to 4); its function
+		// reflection's binding type was not measured apart from the scalars', and is theirs.
+		if (n.kind == "air.constant") {
+			NSUInteger type = 0;
+			uint32_t align = 0;
+			id element = nil;
+			if (n.layout != nullptr && n.hasTypeSize && n.hasTypeAlign) {
+				type = MTLDataTypeStruct;
+				align = n.typeAlign;
+				if ((element = structType(*n.layout, false)) == nil)
+					return nil;
+			} else if (n.layout != nullptr || !n.hasTypeSize || !valueType(n.typeName, type, align)) {
+				fail([NSString stringWithFormat:@"a value argument of %s was not measured", n.typeName.c_str()]);
+				return nil;
+			}
+			const NSUInteger alignment = n.hasTypeAlign ? n.typeAlign : align;
+			id p = pointer(type, element, MTLBindingAccessReadOnly, alignment, n.typeSize, false, false);
+			id b = [make(c.bufferBinding) initWithName:name
+			                                     type:kValueBindingType
+			                                   access:MTLBindingAccessReadOnly
+			                                 isActive:used
+			                            locationIndex:n.index
+			                                arraySize:1
+			                                 dataType:type
+			                              pixelFormat:MTLPixelFormatInvalid
+			                                  aluType:0
+			                         isConstantBuffer:NO
+			                                 dataSize:n.typeSize
+			                                alignment:alignment];
+			if (p == nil || b == nil || !setObject(b, "_typeInfo", p))
+				return nil;
+			*info = p;
+			return argument(b, used);
+		}
 		if (n.kind == "air.payload") {
+			if (c.legacy) {
+				fail(@"Metal has no MTLObjectPayloadBindingInternal");
+				return nil;
+			}
 			if (n.layout == nullptr || !n.hasTypeSize || !n.hasTypeAlign) {
 				fail(@"a payload of other than a struct");
 				return nil;
@@ -771,7 +977,10 @@ struct Maker {
 			return nil;
 		}
 		const bool constant = n.addressSpace == 2;
-		const NSUInteger alignment = constant ? kConstantBufferAlignment : n.typeAlign;
+		const NSUInteger alignment =
+		    !constant  ? n.typeAlign
+		    : appleGPU ? std::max<NSUInteger>(n.typeAlign, kAppleConstantBufferMinAlignment)
+		               : kConstantBufferAlignment;
 		id p = pointer(type, st, access, alignment, n.typeSize, argumentBuffer, constant);
 		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
@@ -791,13 +1000,16 @@ struct Maker {
 		return argument(b, used);
 	}
 
-	// `b`, an argument, used or not.
+	// `b`, an argument, used or not. Before macOS 13 an argument is one by its class, and its use is
+	// its `active`, where its class has no setter of either.
 	id argument(id b, BOOL used)
 	{
 		if (b == nil)
 			return nil;
-		[b setIsArgument:YES];
-		[b setIsUsed:used];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsArgument:)])
+			[b setIsArgument:YES];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsUsed:)])
+			[b setIsUsed:used];
 		return b;
 	}
 
@@ -806,7 +1018,8 @@ struct Maker {
 	{
 		id p = pointer(MTLDataTypeStruct, nil, MTLBindingAccessReadOnly, kDescriptorBufferAlignment,
 		               static_cast<NSUInteger>(d.stride), false, false);
-		id b = [make(c.bufferBinding) initWithName:[NSString stringWithFormat:@"%@.%zu", prefix, ordinal]
+		NSString *name = [NSString stringWithFormat:@"%@.%zu", prefix, ordinal];
+		id b = [make(c.bufferBinding) initWithName:name
 		                                     type:MTLBindingTypeBuffer
 		                                   access:MTLBindingAccessReadOnly
 		                                 isActive:used
@@ -820,10 +1033,76 @@ struct Maker {
 		                                alignment:kDescriptorBufferAlignment];
 		if (p == nil || b == nil || !setObject(b, "_typeInfo", p))
 			return nil;
-		// No argument of the function's (measured: isArgument 0).
+		// No argument of the function's (measured: isArgument 0). Before macOS 13 its use is its
+		// `active` alone.
 		[b setVertexDescriptorBuffer:YES];
-		[b setIsUsed:used];
+		if (!c.legacy || [b respondsToSelector:@selector(setIsUsed:)])
+			[b setIsUsed:used];
 		return b;
+	}
+
+	// An Apple GPU's kernel's explicit imageblock (`air.imageblock`), or a fragment function's input
+	// of its tile's imageblock data (`air.imageblock_data`), as Metal answers them (measured:
+	// pipeline_reflection_check's c_imageblock_explicit, c_imageblock_late, c_imageblock_on,
+	// r_imageblock_data and r_imageblock_master, the M3 Max under macOS 27.0.1, and the AMD Radeon
+	// Pro 5300M and the Intel UHD Graphics 630 under macOS 26.7.1): an MTLImageBlockArgument of binding
+	// type 17, kind 1 (explicit), or an MTLImageBlockDataArgument of binding type 16; read-only, at
+	// index 0 wherever the argument is, of the data's size and of its struct's type (a nameless struct
+	// of its members, their raster order groups among them), the data's master struct, where it views
+	// one, its masterStructMembers (a struct of the same form), and aliasing no implicit imageblock
+	// (its render target 0xFFFFFFFF). Neither x86 Mac makes a pipeline of a kernel's imageblock: there
+	// one makes no reflection, as an implicit imageblock does on any GPU (the M3 Max makes no pipeline
+	// of c_imageblock's). Imageblock data is answered on every GPU: the Intel GPU makes both render
+	// cases' pipelines, the AMD GPU r_imageblock_master's and none of r_imageblock_data's (its compiler
+	// dies), and each answers them so.
+	id imageblock(const RgfxAirNode &n)
+	{
+		const bool data = n.kind == "air.imageblock_data";
+		if (!appleGPU && !data) {
+			fail(@"a kernel's imageblock, of which no x86 Mac's Metal makes a pipeline");
+			return nil;
+		}
+		if (!data && n.imageblockLayout != "explicit") {
+			fail(@"an imageblock of an implicit layout was not measured");
+			return nil;
+		}
+		if (!n.hasImageblockDataSize || n.layout == nullptr) {
+			fail(@"an imageblock of no size or struct");
+			return nil;
+		}
+		Class cls = data ? c.imageblockData : c.imageblock;
+		if (cls == Nil) {
+			fail(data ? @"Metal has no MTLImageBlockDataArgument" : @"Metal has no MTLImageBlockArgument");
+			return nil;
+		}
+		id st = structType(*n.layout, false);
+		id master = data && n.imageblockMaster != nullptr ? structType(*n.imageblockMaster, false) : nil;
+		if (st == nil || (n.imageblockMaster != nullptr && master == nil))
+			return nil;
+		NSString *name = @(n.name.c_str());
+		const BOOL used = !n.unused;
+		id b = data ? [make(cls) initWithName:name
+		                                 type:MTLBindingTypeImageblockData
+		                               access:MTLBindingAccessReadOnly
+		                             isActive:used
+		                                index:kImageblockIndex
+		                             dataSize:n.imageblockDataSize
+		                  masterStructMembers:master
+		              aliasImplicitImageBlock:NO
+		  aliasImplicitImageBlockRenderTarget:static_cast<uint32_t>(kNoIndex)]
+		            : [make(cls) initWithName:name
+		                                 type:MTLBindingTypeImageblock
+		                               access:MTLBindingAccessReadOnly
+		                             isActive:used
+		                                index:kImageblockIndex
+		                                 kind:kExplicitImageblockKind
+		                             dataSize:n.imageblockDataSize
+		                  masterStructMembers:nil
+		              aliasImplicitImageBlock:NO
+		  aliasImplicitImageBlockRenderTarget:static_cast<uint32_t>(kNoIndex)];
+		if (b == nil || !setObject(b, "_typeInfo", st))
+			return nil;
+		return argument(b, used);
 	}
 
 	// A built-in argument, or a mesh; nil with `*listed` false for one Metal lists nowhere.
@@ -832,6 +1111,10 @@ struct Maker {
 		*listed = true;
 		NSString *name = @(n.name.c_str());
 		if (n.kind == "air.mesh") {
+			if (c.legacy) {
+				fail(@"Metal has no MTLBuiltInMeshArgument");
+				return nil;
+			}
 			if (!n.hasMesh)
 				return nil;
 			NSUInteger topology = 0;
@@ -1019,6 +1302,17 @@ NSArray *listOf(NSMutableArray *a)
 
 } // namespace
 
+void RgfxPipelineReflectionUseClassesForTests(NSDictionary<NSString *, id> *standIns)
+{
+	static Classes set;
+	if (standIns == nil) {
+		gTestClassSet = nullptr;
+		return;
+	}
+	set = lookUpClasses(standIns);
+	gTestClassSet = &set;
+}
+
 std::vector<RgfxDescriptorBuffer> RgfxVertexDescriptorBuffers(MTLVertexDescriptor *descriptor)
 {
 	std::vector<RgfxDescriptorBuffer> out;
@@ -1065,10 +1359,100 @@ std::vector<RgfxDescriptorBuffer> RgfxStageInputBuffers(MTLStageInputOutputDescr
 	return out;
 }
 
+NSError *RgfxOverlappingArgumentError(const RgfxAirEntries &module, const RgfxAirEntry &entry,
+                                      const RgfxFunctionConstant *values, uint32_t count)
+{
+	// Each binding node's table: 0 buffers, 1 threadgroup memory, 2 textures, 3 samplers; -1 for a
+	// node of none (a built-in, a stage input), -2 for one of a table the answer is not known for.
+	auto tableOf = [](const RgfxAirNode &n) {
+		if (!n.hasLocation || isStageInput(n.kind))
+			return -1;
+		if (n.kind == "air.buffer")
+			return !n.hasAddressSpace ? -2 : n.addressSpace == 3 ? 1 : 0;
+		// Function tables and acceleration structures take locations of the buffers' table, and
+		// Metal's word for them is `buffer` (measured: oracle Q33's probe of them).
+		if (n.kind == "air.indirect_buffer" || n.kind == "air.constant" ||
+		    n.kind == "air.visible_function_table" || n.kind == "air.intersection_function_table" ||
+		    n.kind == "air.primitive_acceleration_structure" ||
+		    n.kind == "air.instance_acceleration_structure")
+			return 0;
+		if (n.kind == "air.texture")
+			return 2;
+		if (n.kind == "air.sampler")
+			return 3;
+		return -2;
+	};
+	static const char *const kWords[] = {"buffer", "buffer", "texture", "sampler"};
+	// The globals the initialisers leave under the values, which the arguments' predicates,
+	// indices and counts read; which arguments the body uses changes nothing here, and following
+	// it costs many times them (rgfxAirConstantGlobals), at every make of the function.
+	std::map<uint64_t, int64_t> globals;
+	if (!rgfxAirConstantGlobals(module, values, count, globals))
+		return nil;
+	auto global = [&](uint64_t g, int64_t &v) {
+		auto it = globals.find(g);
+		if (it == globals.end())
+			return false;
+		v = it->second;
+		return true;
+	};
+	struct Taken {
+		int table;
+		uint64_t from, to;
+	};
+	std::vector<Taken> taken;
+	NSMutableString *what = nil;
+	for (const RgfxAirNode &n : entry.arguments) {
+		const int table = tableOf(n);
+		if (table == -1)
+			continue;
+		if (table == -2)
+			return nil;
+		int64_t v = 0;
+		if (n.predicated) {
+			if (!global(n.predicateGlobal, v))
+				return nil;
+			if (v == 0)
+				continue;
+		}
+		uint64_t index = n.index, length = n.count;
+		if (n.indexIsGlobal) {
+			if (!global(n.indexGlobal, v) || v < 0 || v > UINT32_MAX)
+				return nil;
+			index = static_cast<uint64_t>(v);
+		}
+		if (n.countIsGlobal) {
+			if (!global(n.countGlobal, v) || v < 0 || v > UINT32_MAX)
+				return nil;
+			length = static_cast<uint64_t>(v);
+		}
+		if (length == 0)
+			continue;
+		bool overlaps = false;
+		for (const Taken &t : taken)
+			overlaps = overlaps || (t.table == table && t.from < index + length && index < t.to);
+		if (overlaps) {
+			if (n.name.empty())
+				return nil;
+			if (what == nil)
+				what = [NSMutableString string];
+			[what appendFormat:@"error: %s argument %s has invalid location (<%llu,%llu>) in %s\n", kWords[table],
+			                   n.name.c_str(), static_cast<unsigned long long>(index),
+			                   static_cast<unsigned long long>(length), entry.name.c_str()];
+		}
+		taken.push_back({table, index, index + length});
+	}
+	if (what == nil)
+		return nil;
+	return [NSError errorWithDomain:MTLLibraryErrorDomain
+	                           code:MTLLibraryErrorCompileFailure
+	                       userInfo:@{NSLocalizedDescriptionKey : [what copy]}];
+}
+
 bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry &entry,
                                 const RgfxFunctionConstant *values, uint32_t count, NSString *prefix,
                                 const std::vector<RgfxDescriptorBuffer> &buffers, RgfxStageReflection &out,
-                                NSString *__strong *why)
+                                NSString *__strong *why, bool appleGPU)
 {
 	const Classes &c = classes();
 	if (c.missing != nil) {
@@ -1076,6 +1460,7 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		return false;
 	}
 	Maker m{c};
+	m.appleGPU = appleGPU;
 	NSMutableArray *bindings = [NSMutableArray array];
 	NSMutableArray *builtIns = [NSMutableArray array];
 	// The function as its constants' values specialise it: its nodes' indices, counts and
@@ -1092,10 +1477,11 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		if (kept)
 			nodes.push_back(std::move(s));
 	}
-	// The descriptor's buffers, each used where the function reads an attribute it holds.
+	// The descriptor's buffers, each used where the function reads an attribute it holds through a
+	// stage input that uses it (usesDescriptorBuffer).
 	std::set<uint32_t> read;
 	for (const RgfxAirNode &n : nodes)
-		if (isStageInput(n.kind) && n.hasLocation && !n.unused)
+		if (usesDescriptorBuffer(n.kind) && n.hasLocation && !n.unused)
 			read.insert(n.index);
 	for (size_t i = 0; i < buffers.size(); i++) {
 		const RgfxDescriptorBuffer &d = buffers[i];
@@ -1112,8 +1498,18 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 	for (const RgfxAirNode &n : nodes) {
 		if (isStageInput(n.kind))
 			continue;
+		if (n.kind == "air.imageblock" || n.kind == "air.imageblock_data") {
+			id b = m.imageblock(n);
+			if (b == nil) {
+				*why = m.why ?: @"Metal's imageblock was not made";
+				return false;
+			}
+			[bindings addObject:b];
+			continue;
+		}
 		const bool resource = n.kind == "air.buffer" || n.kind == "air.indirect_buffer" || n.kind == "air.texture" ||
-		                      n.kind == "air.sampler" || n.kind == "air.payload" || tableType(n.kind);
+		                      n.kind == "air.sampler" || n.kind == "air.payload" || n.kind == "air.constant" ||
+		                      tableType(n.kind);
 		if (resource) {
 			id info = nil;
 			id b = m.resource(n, entry.stage, &info, nullptr);
@@ -1147,6 +1543,13 @@ bool RgfxStageReflectionOfEntry(const RgfxAirEntries &module, const RgfxAirEntry
 		*why = @"a vertex output of a type not measured";
 		return false;
 	}
+	// A post-tessellation vertex function's position in its patch is dumped beside its outputs,
+	// whether or not the function takes it: Metal's postVertexDumpStride adds 12 for a triangle
+	// patch's (a float3) and 8 for a quad's (a float2) (measured: r_patch, r_patch_points,
+	// r_patch_buffers, r_patch_plain and r_patch_unused, as kBuiltIns' post-tessellation ones, and
+	// on the M3 Max under macOS 27.0.1).
+	if (entry.stage == RgfxAirEntryStage::Vertex)
+		bytes += entry.patch == RgfxAirPatch::Triangle ? 12 : entry.patch == RgfxAirPatch::Quad ? 8 : 0;
 	out.bindings = listOf(bindings);
 	out.builtIns = listOf(builtIns);
 	out.outputBytes = bytes;
@@ -1162,10 +1565,46 @@ id RgfxComputePipelineReflectionMake(const RgfxStageReflection &kernel, NSString
 	}
 	Maker m{c};
 	id r = [[c.compute alloc] init];
+	// A GL shader variant's return data goes where Metal's class keeps one: macOS 26's does
+	// (measured: 26.7.1), macOS 27's has no such instance variable (measured: 27.0.1).
+	const bool keepsReturnData = class_getInstanceVariable(c.compute, "_pluginReturnData") != nullptr;
 	if (r == nil || !m.setObject(r, "_arguments", kernel.bindings) ||
-	    !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil) ||
+	    (kernel.pluginReturnData != nil && keepsReturnData &&
+	     !m.setObject(r, "_pluginReturnData", kernel.pluginReturnData)) ||
+	    (!c.legacy &&
+	     !m.setObject(r, "_bindings", kernel.bindings ? [NSArray arrayWithArray:kernel.bindings] : nil)) ||
 	    !m.setObject(r, "_builtInArguments", kernel.builtIns) || !m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex)) {
 		*why = m.why ?: @"Metal's compute pipeline reflection was not made";
+		return nil;
+	}
+	return r;
+}
+
+id RgfxFunctionReflectionMake(const RgfxStageReflection &stage, NSString *__strong *why)
+{
+	const Classes &c = classes();
+	if (c.missing != nil) {
+		*why = [NSString stringWithFormat:@"Metal has no %@", c.missing];
+		return nil;
+	}
+	// Metal's class of a function's own reflection (macOS 26's MTLFunctionReflection), which
+	// macOS releases before 26 do not have.
+	static Class cls = NSClassFromString(@"MTLFunctionReflectionInternal");
+	if (cls == Nil || ![cls instancesRespondToSelector:@selector(init)]) {
+		*why = @"Metal has no MTLFunctionReflectionInternal";
+		return nil;
+	}
+	Maker m{c};
+	id r = [[cls alloc] init];
+	// As the compute pipeline's, a GL shader variant's return data where the class keeps one
+	// (measured: macOS 26.7.1's does).
+	const bool keepsReturnData = class_getInstanceVariable(cls, "_pluginReturnData") != nullptr;
+	if (r == nil || !m.setObject(r, "_arguments", stage.bindings) ||
+	    (!c.legacy && !m.setObject(r, "_bindings", stage.bindings ? [NSArray arrayWithArray:stage.bindings] : nil)) ||
+	    !m.setObject(r, "_builtInArguments", stage.builtIns) ||
+	    (stage.pluginReturnData != nil && keepsReturnData &&
+	     !m.setObject(r, "_pluginReturnData", stage.pluginReturnData))) {
+		*why = m.why ?: @"Metal's function reflection was not made";
 		return nil;
 	}
 	return r;
@@ -1185,27 +1624,33 @@ id RgfxRenderPipelineReflectionMake(const RgfxStageReflection *vertex, const Rgf
 	bool ok = r != nil;
 	const struct {
 		const RgfxStageReflection *stage;
-		const char *arguments, *bindings, *builtIns;
+		const char *arguments, *bindings, *builtIns, *pluginReturnData;
 	} kStages[] = {
-	    {vertex, "_vertexArguments", "_vertexBindings", "_vertexBuiltInArguments"},
-	    {fragment, "_fragmentArguments", "_fragmentBindings", nullptr},
-	    {object, "_objectArguments", "_objectBindings", "_objectBuiltInArguments"},
-	    {mesh, "_meshArguments", "_meshBindings", "_meshBuiltInArguments"},
+	    {vertex, "_vertexArguments", "_vertexBindings", "_vertexBuiltInArguments", "_vertexPluginReturnData"},
+	    {fragment, "_fragmentArguments", "_fragmentBindings", nullptr, "_fragmentPluginReturnData"},
+	    {object, "_objectArguments", "_objectBindings", "_objectBuiltInArguments", "_objectPluginReturnData"},
+	    {mesh, "_meshArguments", "_meshBindings", "_meshBuiltInArguments", "_meshPluginReturnData"},
 	};
 	for (const auto &s : kStages) {
 		if (!ok || s.stage == nullptr || s.stage->bindings == nil)
 			continue;
 		ok = m.setObject(r, s.arguments, s.stage->bindings) &&
-		     m.setObject(r, s.bindings, [NSArray arrayWithArray:s.stage->bindings]);
+		     (c.legacy || m.setObject(r, s.bindings, [NSArray arrayWithArray:s.stage->bindings]));
 	}
 	for (const auto &s : kStages) {
 		if (ok && s.stage != nullptr && s.stage->builtIns != nil && s.builtIns != nullptr)
 			ok = m.setObject(r, s.builtIns, s.stage->builtIns);
 	}
+	// A GL shader variant's return data, which Metal's own device answers from its compiler's
+	// run of the GL code generator (measured: macOS 26.7.1, the bytes the generator gives).
+	for (const auto &s : kStages) {
+		if (ok && s.stage != nullptr && s.stage->pluginReturnData != nil)
+			ok = m.setObject(r, s.pluginReturnData, s.stage->pluginReturnData);
+	}
 	const uint64_t stride = vertex != nullptr ? vertex->outputBytes + kPostVertexDumpPadding : 0;
 	ok = ok && m.setNumber(r, "_postVertexDumpStride", 'Q', stride) &&
 	     m.setNumber(r, "_traceBufferIndex", 'I', kNoIndex) &&
-	     m.setNumber(r, "_printStyle", 'Q', mesh != nullptr ? kMeshPrintStyle : kVertexPrintStyle);
+	     (c.legacy || m.setNumber(r, "_printStyle", 'Q', mesh != nullptr ? kMeshPrintStyle : kVertexPrintStyle));
 	if (!ok) {
 		*why = m.why ?: @"Metal's render pipeline reflection was not made";
 		return nil;

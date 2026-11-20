@@ -1,15 +1,19 @@
-//! reims-ctl: creates, boots and manages macOS VMs on QEMU's apple-gfx, on the QEMU
+//! reims-ctl: creates, boots and manages x86-64 macOS VMs on Linux, on the QEMU
 //! scripts/install-ctl.sh builds with reims-vgpu. With no command it opens its interactive
 //! interface.
 
 mod cli;
+mod copy;
 mod create;
 mod form;
 mod gpu;
 mod host;
 mod install;
 mod logs;
+mod macos;
+mod migrate;
 mod opencore;
+mod os;
 mod paths;
 mod prebuilt;
 mod qemu;
@@ -20,9 +24,9 @@ mod runtime;
 mod testenv;
 mod tui;
 mod update;
+mod usb;
 mod view;
 mod vm;
-mod vz;
 
 use clap::Parser;
 
@@ -44,7 +48,7 @@ fn main() {
 /// is an error the caller handles rather than a signal that ends the interactive interface.
 fn quiet_on_closed_stdout() {
     let default = std::panic::take_hook();
-    let closed = format!("(os error {})", libc::EPIPE);
+    let closed = format!("(os error {})", os::CLOSED_PIPE);
     std::panic::set_hook(Box::new(move |info| {
         let msg = info
             .payload()

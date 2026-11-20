@@ -1,14 +1,14 @@
 //! The boundary's tests on every OS; each OS's own catch has its tests beside them.
 
-use std::os::unix::process::ExitStatusExt as _;
 use std::process::Command;
 
-use reims_vgpu_core::raise::death::{DeathKind, DeathSite};
-use reims_vgpu_core::rt::is_our_thread;
+use reims_vgpu_vulkan::core::raise::death::{DeathKind, DeathSite};
+use reims_vgpu_vulkan::core::rt::is_our_thread;
+use reims_vgpu_vulkan::core::testkit::death::exit_signal;
 
 use super::*;
 
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "windows"))]
 mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
@@ -77,7 +77,7 @@ fn a_panic_under_an_export_aborts_before_unwinding() {
         "ffi::tests::a_panic_under_an_export_aborts_before_unwinding",
         "RVG_FFI_PANIC_CHILD",
     );
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     let stdout = String::from_utf8_lossy(&out.stdout);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(!stdout.contains("DROPPED"), "{stdout}");
@@ -98,29 +98,41 @@ unsafe extern "C-unwind" fn panicking_destroy(_ctx: *mut std::ffi::c_void) {
 #[test]
 fn a_panic_in_a_callback_of_the_first_export_ends_in_the_hook() {
     if std::env::var_os("RVG_FFI_CALLBACK_CHILD").is_some() {
-        let callbacks = crate::device::RvgHostCallbacks {
-            struct_size: crate::sized::size_u32::<crate::device::RvgHostCallbacks>(),
+        let callbacks = crate::graphics::RvgGraphicsCallbacks {
+            struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsCallbacks>(),
             ctx: std::ptr::null_mut(),
             destroy: Some(panicking_destroy),
-            create_task: None,
-            destroy_task: None,
-            map_memory: None,
-            unmap_memory: None,
-            read_memory: None,
             raise_interrupt: None,
-            add_trace_range: None,
-            remove_trace_range: None,
+            cursor_glyph: None,
+            cursor_show: None,
+            cursor_move: None,
+            route_doorbell: None,
+            route_doorbell_page: None,
+            cursor_glyph_at: None,
+            cursor_show_at: None,
+            cursor_move_at: None,
         };
-        let config = crate::testkit::config(1, &callbacks);
+        let config = crate::graphics::RvgGraphicsDeviceConfig {
+            struct_size: crate::sized::size_u32::<crate::graphics::RvgGraphicsDeviceConfig>(),
+            callbacks: &callbacks,
+            window: std::ptr::null(),
+            memory_map: std::ptr::null(),
+            memory_files: std::ptr::null(),
+            guest_arch: crate::graphics::RVG_GUEST_ARCH_X86_64,
+            doorbell_pages: 0,
+            display_count: 0,
+            display_windows: std::ptr::null(),
+        };
         // SAFETY: a live config; a NULL out-pointer, which the create refuses.
-        let _ = unsafe { crate::device::rvg_device_create(&config, std::ptr::null_mut()) };
+        let _ =
+            unsafe { crate::graphics::rvg_graphics_device_create(&config, std::ptr::null_mut()) };
         return;
     }
     let out = child(
         "ffi::tests::a_panic_in_a_callback_of_the_first_export_ends_in_the_hook",
         "RVG_FFI_CALLBACK_CHILD",
     );
-    assert_eq!(out.status.signal(), Some(6), "{out:?}");
+    assert_eq!(exit_signal(out.status), Some(6), "{out:?}");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("reims-vgpu: panic: ") && stderr.contains("in the host's destroy"),

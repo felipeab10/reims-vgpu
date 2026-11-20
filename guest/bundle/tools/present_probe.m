@@ -2,8 +2,10 @@
 // on a Mac sees it: each drawable's presented handler and its presentedTime, how long nextDrawable
 // blocks, and the display link's rate. It renders as little as it can (one clear a frame, its
 // colour changing), so what it measures is the present path, not the GPU.
-//   present_probe [-t SECONDS] [-w WIDTHxHEIGHT] [-n] [-c COUNT] [-f FPS] [-a MS]
+//   present_probe [-t SECONDS] [-v SECONDS] [-w WIDTHxHEIGHT] [-n] [-c COUNT] [-f FPS] [-a MS]
 //     -t SECONDS  how long to measure, after a second of warm-up (default 10).
+//     -v SECONDS  waits up to SECONDS for the window to be shown before the warm-up, rendering all
+//                 the while; past them it measures anyway (default 0: no wait).
 //     -w WxH      a titled window of that size in points, in place of a full-screen borderless
 //                 one at the status level.
 //     -n          displaySyncEnabled NO (the default is YES, CAMetalLayer's).
@@ -17,12 +19,24 @@
 //                   presentedTime, gave 0, or had not run by the end;
 //   presented_fps   presented frames a second, from the span of their presentedTimes;
 //   gap_ms_p50/max  between consecutive presentedTimes;
-//   latency_ms_p50  from a frame's commit to its presentedTime;
+//   latency_ms_p10/p50/p90  from a frame's commit to its presentedTime;
 //   at_ms_p05/p50/p95  with -a, from the time asked for to the presentedTime (0 without);
 //   wait_ms_p50/max how long nextDrawable blocked;
 //   link_hz         CVDisplayLink callbacks a second, link_period_ms the period it states;
 //   vsync_ms_p05/p50/p95/absmax  from each presentedTime to the nearest refresh the display link
-//                   gave (its callbacks' current time), signed, and the largest distance.
+//                   gave (its callbacks' current time), signed, and the largest distance;
+//   visible_s       from the window's ordering front to its first showing, the earlier of its
+//                   occlusion state turning visible and a frame's nonzero presentedTime; none
+//                   where it was not shown during the run.
+// Then one line "present_probe-timeline: key=value ...", where a run that falls short shows when:
+//   occlusion       each change of the window's occlusion state, as seconds:visible (1) or not
+//                   (0), from the run's start (the window's ordering front);
+//   committed, presented, dropped, wait_ms_max  per half second of the measured window, by
+//                   commit time: frames committed, presented, dropped, and nextDrawable's longest
+//                   block;
+//   first_waits_ms  the first 12 blocks of nextDrawable from the run's start, warm-up included,
+//                   as seconds:milliseconds; long_waits_ms the first 20 of 100 ms or more;
+//   presented_first_s, presented_last_s  the first and last presentedTime, from the run's start.
 // It needs the logged-in user's window server session (launchctl asuser).
 // Build (-arch arm64 for an Apple-silicon Mac):
 //   xcrun clang -arch x86_64 -fobjc-arc -Wall -Wextra -Werror -Wno-unused-parameter
@@ -51,6 +65,7 @@ static BOOL gSync = YES;
 static int gCount = 3;
 static double gFps = 0;
 static double gAt = 0;
+static double gWaitVisible = 0;
 
 static double now(void)
 {
@@ -64,6 +79,32 @@ static double percentile(NSArray<NSNumber *> *values, double p)
 	NSArray *s = [values sortedArrayUsingSelector:@selector(compare:)];
 	NSUInteger i = (NSUInteger)(p * (double)(s.count - 1) + 0.5);
 	return [s[i] doubleValue];
+}
+
+// The timeline line's series, from the run's start (gT0).
+static double gT0;
+// When the window was first shown (now()'s clock), 0 until then.
+static _Atomic double gVisibleAt;
+
+static void noteVisible(double t)
+{
+	double none = 0;
+	atomic_compare_exchange_strong(&gVisibleAt, &none, t);
+}
+
+static NSString *gTimeline;
+enum { kBucketsMax = 512 };
+static const double kBucket = 0.5;
+
+static int gCommittedB[kBucketsMax], gPresentedB[kBucketsMax], gDroppedB[kBucketsMax];
+static double gWaitMaxB[kBucketsMax];
+
+static NSString *joinInts(const int *v, int n)
+{
+	NSMutableArray *a = [NSMutableArray arrayWithCapacity:(NSUInteger)n];
+	for (int i = 0; i < n; i++)
+		[a addObject:[NSString stringWithFormat:@"%d", v[i]]];
+	return [a componentsJoinedByString:@","];
 }
 
 static _Atomic int gLinkTicks;
@@ -119,6 +160,20 @@ static NSString *run(void)
 	view.layer = layer;
 	view.wantsLayer = YES;
 	win.contentView = view;
+	NSMutableArray<NSString *> *occlusion = [NSMutableArray array];
+	id occlusionObserver = [NSNotificationCenter.defaultCenter
+	    addObserverForName:NSWindowDidChangeOcclusionStateNotification
+	                object:win
+	                 queue:NSOperationQueue.mainQueue
+	            usingBlock:^(NSNotification *note) {
+		            const BOOL visible = (win.occlusionState & NSWindowOcclusionStateVisible) != 0;
+		            if (visible)
+			            noteVisible(now());
+		            @synchronized(occlusion) {
+			            [occlusion addObject:[NSString stringWithFormat:@"%.2f:%d", now() - gT0, visible]];
+		            }
+	            }];
+	gT0 = now();
 	[win orderFrontRegardless];
 
 	CVDisplayLinkRef link = NULL;
@@ -136,12 +191,30 @@ static NSString *run(void)
 		NSLock *lock = [NSLock new];
 		__block atomic_int dropped = 0, answered = 0;
 		int submitted = 0, nils = 0, linkStart = 0;
-		const double start = now(), measure = start + 1, end = measure + gSeconds;
+		// The measured window opens a second after the start, or with -v a second after the window
+		// is first shown (or once the wait is over), and lasts gSeconds; 0 until it is known.
+		const double start = now();
+		__block double measure = gWaitVisible > 0 ? 0 : start + 1;
+		double end = measure > 0 ? measure + gSeconds : 0;
+		const int buckets = MIN(kBucketsMax, (int)ceil(gSeconds / kBucket));
+		int (^bucketOf)(double) = ^int(double t) {
+			return MAX(0, MIN(buckets - 1, (int)floor((t - measure) / kBucket)));
+		};
+		NSMutableArray<NSString *> *firstWaits = [NSMutableArray array], *longWaits = [NSMutableArray array];
 		double next = start;
 		BOOL counting = NO;
 		id<MTLCommandBuffer> last = nil;
-		while (now() < end) {
+		while (end == 0 || now() < end) {
 			@autoreleasepool {
+				if (measure == 0) {
+					const double shown = atomic_load(&gVisibleAt), t = now();
+					if (shown > 0)
+						measure = MAX(start + 1, shown + 1);
+					else if (t >= start + gWaitVisible)
+						measure = t;
+					if (measure > 0)
+						end = measure + gSeconds;
+				}
 				if (gFps > 0) {
 					while (now() < next)
 						usleep(200);
@@ -150,11 +223,15 @@ static NSString *run(void)
 				const double asked = now();
 				id<CAMetalDrawable> d = [layer nextDrawable];
 				const double got = now();
+				if (firstWaits.count < 12)
+					[firstWaits addObject:[NSString stringWithFormat:@"%.2f:%.1f", asked - gT0, (got - asked) * 1e3]];
+				if (got - asked >= 0.1 && longWaits.count < 20)
+					[longWaits addObject:[NSString stringWithFormat:@"%.2f:%.1f", asked - gT0, (got - asked) * 1e3]];
 				if (d == nil) {
 					nils++;
 					continue;
 				}
-				if (!counting && got >= measure) {
+				if (!counting && measure > 0 && got >= measure) {
 					counting = YES;
 					linkStart = atomic_load(&gLinkTicks);
 				}
@@ -171,11 +248,16 @@ static NSString *run(void)
 				if (counting) {
 					submitted++;
 					[waits addObject:@((got - asked) * 1e3)];
+					const int b = bucketOf(committed);
+					gCommittedB[b]++;
+					gWaitMaxB[b] = MAX(gWaitMaxB[b], (got - asked) * 1e3);
 					[d addPresentedHandler:^(id<MTLDrawable> dr) {
 						atomic_fetch_add(&answered, 1);
 						const double t = dr.presentedTime;
 						if (t > 0) {
+							noteVisible(t);
 							[lock lock];
+							gPresentedB[b]++;
 							[presented addObject:@(t)];
 							[latency addObject:@((t - committed) * 1e3)];
 							if (gAt > 0)
@@ -183,7 +265,16 @@ static NSString *run(void)
 							[lock unlock];
 						} else {
 							atomic_fetch_add(&dropped, 1);
+							[lock lock];
+							gDroppedB[b]++;
+							[lock unlock];
 						}
+					}];
+				} else if (atomic_load(&gVisibleAt) == 0) {
+					// A frame before the measured window counts nothing, but its showing is the window's.
+					[d addPresentedHandler:^(id<MTLDrawable> dr) {
+						if (dr.presentedTime > 0)
+							noteVisible(dr.presentedTime);
 					}];
 				}
 				if (gAt > 0)
@@ -232,20 +323,40 @@ static NSString *run(void)
 		result = [NSString
 		    stringWithFormat:@"OK mode=%@ size=%.0fx%.0f sync=%d drawables=%d submitted_fps=%.1f presented=%lu "
 		                     @"dropped=%d unanswered=%d presented_fps=%.1f gap_ms_p50=%.2f gap_ms_max=%.2f "
-		                     @"latency_ms_p50=%.2f at_ms_p05=%.2f at_ms_p50=%.2f at_ms_p95=%.2f wait_ms_p50=%.2f wait_ms_max=%.2f nil_drawables=%d "
+		                     @"latency_ms_p10=%.2f latency_ms_p50=%.2f latency_ms_p90=%.2f at_ms_p05=%.2f at_ms_p50=%.2f at_ms_p95=%.2f wait_ms_p50=%.2f wait_ms_max=%.2f nil_drawables=%d "
 		                     @"link_hz=%.1f link_period_ms=%.3f vsync_ms_p05=%.3f vsync_ms_p50=%.3f vsync_ms_p95=%.3f "
 		                     @"vsync_ms_absmax=%.3f "
-		                     @"screen_max_fps=%ld seconds=%.0f",
+		                     @"screen_max_fps=%ld seconds=%.0f visible_s=%@",
 		                     windowed ? @"windowed" : @"fullscreen", layer.drawableSize.width,
 		                     layer.drawableSize.height, gSync, gCount, submitted / gSeconds,
 		                     (unsigned long)ts.count, atomic_load(&dropped), submitted - atomic_load(&answered),
 		                     span > 0 ? (double)(ts.count - 1) / span : 0, percentile(gaps, 0.5),
-		                     percentile(gaps, 1), percentile(latency, 0.5), percentile(late, 0.05),
+		                     percentile(gaps, 1), percentile(latency, 0.1), percentile(latency, 0.5),
+		                     percentile(latency, 0.9), percentile(late, 0.05),
 		                     percentile(late, 0.5), percentile(late, 0.95), percentile(waits, 0.5),
 		                     percentile(waits, 1), nils, linkTicks / gSeconds,
 		                     atomic_load(&gLinkPeriodNs) / 1e6, percentile(offs, 0.05), percentile(offs, 0.5),
 		                     percentile(offs, 0.95), percentile(absOffs, 1),
-		                     (long)screen.maximumFramesPerSecond, gSeconds];
+		                     (long)screen.maximumFramesPerSecond, gSeconds,
+		                     atomic_load(&gVisibleAt) > 0
+		                         ? [NSString stringWithFormat:@"%.2f", atomic_load(&gVisibleAt) - gT0]
+		                         : @"none"];
+		NSMutableArray *waitMax = [NSMutableArray arrayWithCapacity:(NSUInteger)buckets];
+		for (int i = 0; i < buckets; i++)
+			[waitMax addObject:[NSString stringWithFormat:@"%.0f", gWaitMaxB[i]]];
+		NSString *seen;
+		@synchronized(occlusion) {
+			seen = [occlusion componentsJoinedByString:@","];
+		}
+		gTimeline = [NSString
+		    stringWithFormat:@"occlusion=%@ bucket_s=%.1f committed=%@ presented=%@ dropped=%@ wait_ms_max=%@ "
+		                     @"first_waits_ms=%@ long_waits_ms=%@ presented_first_s=%.2f presented_last_s=%.2f",
+		                     seen.length ? seen : @"none", kBucket, joinInts(gCommittedB, buckets),
+		                     joinInts(gPresentedB, buckets), joinInts(gDroppedB, buckets),
+		                     [waitMax componentsJoinedByString:@","], [firstWaits componentsJoinedByString:@","],
+		                     longWaits.count ? [longWaits componentsJoinedByString:@","] : @"none",
+		                     ts.count ? [ts.firstObject doubleValue] - gT0 : 0,
+		                     ts.count ? [ts.lastObject doubleValue] - gT0 : 0];
 		[lock unlock];
 		dispatch_async(dispatch_get_main_queue(), ^{
 			[NSApp stop:nil];
@@ -267,6 +378,7 @@ static NSString *run(void)
 		CVDisplayLinkStop(link);
 		CVDisplayLinkRelease(link);
 	}
+	[NSNotificationCenter.defaultCenter removeObserver:occlusionObserver];
 	[win orderOut:nil];
 	return result ?: @"FAIL the render thread gave no result";
 }
@@ -275,10 +387,13 @@ int main(int argc, char **argv)
 {
 	@autoreleasepool {
 		int c;
-		while ((c = getopt(argc, argv, "t:w:nc:f:a:")) != -1) {
+		while ((c = getopt(argc, argv, "t:v:w:nc:f:a:")) != -1) {
 			switch (c) {
 			case 't':
 				gSeconds = atof(optarg);
+				break;
+			case 'v':
+				gWaitVisible = atof(optarg);
 				break;
 			case 'w':
 				if (sscanf(optarg, "%lfx%lf", &gWidth, &gHeight) != 2) {
@@ -299,16 +414,19 @@ int main(int argc, char **argv)
 				gAt = atof(optarg);
 				break;
 			default:
-				fprintf(stderr, "usage: present_probe [-t SECONDS] [-w WxH] [-n] [-c COUNT] [-f FPS] [-a MS]\n");
+				fprintf(stderr, "usage: present_probe [-t SECONDS] [-v SECONDS] [-w WxH] [-n] [-c COUNT] [-f FPS] "
+				                "[-a MS]\n");
 				return 2;
 			}
 		}
-		if (gSeconds <= 0 || gCount < 2 || gCount > 3 || gAt < 0) {
-			fprintf(stderr, "present_probe: -t must be positive, -c 2 or 3 and -a not negative\n");
+		if (gSeconds <= 0 || gCount < 2 || gCount > 3 || gAt < 0 || gWaitVisible < 0) {
+			fprintf(stderr, "present_probe: -t must be positive, -c 2 or 3, and -a and -v not negative\n");
 			return 2;
 		}
 		NSString *r = run();
 		printf("present_probe: %s\n", r.UTF8String);
+		if (gTimeline)
+			printf("present_probe-timeline: %s\n", gTimeline.UTF8String);
 		return [r hasPrefix:@"OK"] ? 0 : 1;
 	}
 }

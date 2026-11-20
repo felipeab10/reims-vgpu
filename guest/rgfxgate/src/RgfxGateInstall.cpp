@@ -19,8 +19,7 @@
 // below the MAC layer, as the directory creates do. In the installer/Recovery
 // the kext does nothing. The pass is published on IOResources from its start to
 // its end (RgfxGate.hpp), and the accelerator registers only once it has ended.
-#include <Headers/kern_file.hpp>
-#include <Headers/kern_util.hpp>
+#include "RgfxGateFile.hpp"
 
 #include <IOKit/IOLib.h>
 #include <IOKit/IOService.h>
@@ -37,26 +36,9 @@
 #include "RgfxGate.hpp"
 #include "RgfxGatePayload.h"
 #include "RgfxGatePrefs.hpp"
+#include "RgfxGateVnop.hpp"
 #include "rgfx_match.h"
 #include "rgfx_tree.h"
-
-// MacKernelSDK omits these VNOP prototypes. No KPI symbol set lists them (the
-// macOS 26.7.1 KDK's BSDKernel and MACFramework sets name none); they are the
-// kernel's own global functions, which the kext imports as it imports
-// VNOP_MKDIR.
-extern "C" int VNOP_MKDIR(vnode_t, vnode_t *, struct componentname *,
-                          struct vnode_attr *, vfs_context_t);
-extern "C" int VNOP_REMOVE(vnode_t, vnode_t, struct componentname *, int,
-                           vfs_context_t);
-extern "C" int VNOP_RMDIR(vnode_t, vnode_t, struct componentname *,
-                          vfs_context_t);
-extern "C" int VNOP_RENAME(vnode_t, vnode_t, struct componentname *, vnode_t,
-                           vnode_t, struct componentname *, vfs_context_t);
-extern "C" int VNOP_RENAMEX(vnode_t, vnode_t, struct componentname *, vnode_t,
-                            vnode_t, struct componentname *, vfs_rename_flags_t,
-                            vfs_context_t);
-extern "C" int VNOP_REMOVEXATTR(vnode_t, const char *, int, vfs_context_t);
-extern "C" int VNOP_READDIR(vnode_t, struct uio *, int, int *, int *, vfs_context_t);
 
 namespace rgfxgate {
 
@@ -150,7 +132,7 @@ static bool ensureDir(const char *path, vfs_context_t ctx) {
 	VATTR_SET(&va, va_gid, 0);
 
 	vnode_t nvp = nullptr;
-	int err = VNOP_MKDIR(dvp, &nvp, &cn, &va, ctx);
+	int err = rgfxVnopMkdir(dvp, &nvp, &cn, &va, ctx);
 	if (nvp)
 		vnode_put(nvp);
 	vnode_put(dvp);
@@ -176,15 +158,15 @@ static bool installNeeded(vfs_context_t ctx) {
 	joinPath(markerPath, sizeof(markerPath), kBundlePath, kMarkerRel);
 
 	size_t sz = 0;
-	uint8_t *buf = FileIO::readFileToBuffer(execPath, sz);
+	uint8_t *buf = readFile(execPath, sz, ex->size);
 	if (buf == nullptr)
 		return true;
 	bool differ = (sz != ex->size) || (memcmp(buf, ex->data, ex->size) != 0);
-	Buffer::deleter(buf);
+	IOFree(buf, sz);
 	if (differ)
 		return true;
 
-	// The marker is empty, and FileIO::readFileToBuffer refuses an empty file,
+	// The marker is empty, and readFile refuses an empty file,
 	// so test that it exists, as the accelerator does.
 	vnode_t vp = nullptr;
 	if (vnode_lookup(markerPath, 0, &vp, ctx) != 0)
@@ -197,10 +179,10 @@ static bool writeOne(const char *root, const PayloadFile *f, vfs_context_t ctx) 
 	char path[1024];
 	joinPath(path, sizeof(path), root, f->rel);
 	int cmode = f->is_exec ? 0755 : 0644;
-	int err = FileIO::writeBufferToFile(path, (void *)(uintptr_t)f->data, f->size,
+	int err = writeFile(path, (void *)(uintptr_t)f->data, f->size,
 	                                    O_CREAT | O_TRUNC | O_WRONLY | O_NOFOLLOW, cmode);
 	if (err != 0)
-		SYSLOG("rgfxgate", "write %s failed (%d)", f->rel, err);
+		graft_client_log(kClientID, "write %s failed (%d)", f->rel, err);
 	return err == 0;
 }
 
@@ -221,7 +203,7 @@ static const char kKextMgmtClass[] = "KernelExtensionManagement";
 static void tagRootless(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
 	if (vnode_lookup(path, 0, &vp, ctx) != 0) {
-		SYSLOG("rgfxgate", "tag: %s not found", path);
+		graft_client_log(kClientID, "tag: %s not found", path);
 		return;
 	}
 	uio_t uio = uio_create(1, 0, UIO_SYSSPACE, UIO_WRITE);
@@ -230,7 +212,7 @@ static void tagRootless(const char *path, vfs_context_t ctx) {
 		           sizeof(kKextMgmtClass) - 1);
 		int xerr = VNOP_SETXATTR(vp, kRootlessXattr, uio, 0, ctx);
 		if (xerr != 0)
-			SYSLOG("rgfxgate", "set rootless class on %s failed (%d)", path, xerr);
+			graft_client_log(kClientID, "set rootless class on %s failed (%d)", path, xerr);
 		uio_free(uio);
 	}
 	struct vnode_attr va;
@@ -238,7 +220,7 @@ static void tagRootless(const char *path, vfs_context_t ctx) {
 	VATTR_SET(&va, va_flags, SF_RESTRICTED);
 	int ferr = vnode_setattr(vp, &va, ctx);
 	if (ferr != 0)
-		SYSLOG("rgfxgate", "set restricted flag on %s failed (%d)", path, ferr);
+		graft_client_log(kClientID, "set restricted flag on %s failed (%d)", path, ferr);
 	vnode_put(vp);
 }
 
@@ -299,7 +281,7 @@ static void clearRootless(const char *path, vfs_context_t ctx) {
 	vnode_t vp = nullptr;
 	if (vnode_lookup(path, VNODE_LOOKUP_NOFOLLOW, &vp, ctx) != 0)
 		return;
-	VNOP_REMOVEXATTR(vp, kRootlessXattr, 0, ctx);
+	rgfxVnopRemovexattr(vp, kRootlessXattr, 0, ctx);
 	struct vnode_attr va;
 	VATTR_INIT(&va);
 	VATTR_SET(&va, va_flags, 0);
@@ -337,7 +319,7 @@ static void removeFile(const char *path, vfs_context_t ctx) {
 		cn.cn_pnlen = (int)strlen(leaf);
 		cn.cn_nameptr = (char *)leaf;
 		cn.cn_namelen = (int)strlen(leaf);
-		VNOP_REMOVE(dvp, vp, &cn, 0, ctx);
+		rgfxVnopRemove(dvp, vp, &cn, 0, ctx);
 		vnode_put(dvp);
 	}
 	vnode_put(vp);
@@ -353,7 +335,7 @@ static void removeDir(const char *path, vfs_context_t ctx) {
 	struct componentname cn;
 	vnode_t dvp = parentAndLeaf(path, DELETE, &cn, leaf, sizeof(leaf), ctx);
 	if (dvp != nullptr) {
-		VNOP_RMDIR(dvp, vp, &cn, ctx);
+		rgfxVnopRmdir(dvp, vp, &cn, ctx);
 		vnode_put(dvp);
 	}
 	vnode_put(vp);
@@ -380,12 +362,11 @@ bool rgfxRenameNode(const char *from, const char *to, bool swap,
 		vnode_t fdvp = parentAndLeaf(from, RENAME, &fcn, fleaf, sizeof(fleaf), ctx);
 		vnode_t tdvp = parentAndLeaf(to, RENAME, &tcn, tleaf, sizeof(tleaf), ctx);
 		if (fdvp != nullptr && tdvp != nullptr) {
-			int err = swap ? VNOP_RENAMEX(fdvp, fvp, &fcn, tdvp, tvp, &tcn,
-			                              VFS_RENAME_SWAP, ctx)
-			               : VNOP_RENAME(fdvp, fvp, &fcn, tdvp, tvp, &tcn, ctx);
+			int err = swap ? rgfxVnopRenamex(fdvp, fvp, &fcn, tdvp, tvp, &tcn, VFS_RENAME_SWAP, ctx)
+			               : rgfxVnopRename(fdvp, fvp, &fcn, tdvp, tvp, &tcn, ctx);
 			ok = err == 0;
 			if (!ok)
-				SYSLOG("rgfxgate", "rename %s -> %s failed (%d)", from, to, err);
+				graft_client_log(kClientID, "rename %s -> %s failed (%d)", from, to, err);
 		}
 		if (tdvp)
 			vnode_put(tdvp);
@@ -430,7 +411,7 @@ struct KernelTree {
 			uio_reset(uio, offset, UIO_SYSSPACE, UIO_READ);
 			uio_addiov(uio, (user_addr_t)(uintptr_t)buf, cap);
 			int eof = 0, count = 0;
-			if (VNOP_READDIR(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx) != 0)
+			if (rgfxVnopReaddir(vp, uio, VNODE_READDIR_EXTENDED, &eof, &count, ctx) != 0)
 				break;
 			const size_t got = cap - (size_t)uio_resid(uio);
 			size_t pos = 0;
@@ -481,13 +462,13 @@ static void removeTree(const char *root, vfs_context_t ctx) {
 	};
 	Scratch *s = static_cast<Scratch *>(IOMalloc(sizeof(Scratch)));
 	if (s == nullptr) {
-		SYSLOG("rgfxgate", "no memory to remove %s", root);
+		graft_client_log(kClientID, "no memory to remove %s", root);
 		return;
 	}
 	if (strlcpy(s->path, root, sizeof(s->path)) < sizeof(s->path)) {
 		KernelTree fs = {ctx, s->records, sizeof(s->records)};
 		if (!rgfx_tree_remove(fs, s->path, sizeof(s->path)))
-			SYSLOG("rgfxgate", "%s could not be removed whole", root);
+			graft_client_log(kClientID, "%s could not be removed whole", root);
 	}
 	IOFree(s, sizeof(Scratch));
 }
@@ -533,7 +514,7 @@ static const char kStageSuffix[] = ".new";
 static bool installBundle(vfs_context_t ctx) {
 	char stageRoot[1024];
 	if (!rgfx_sibling_path(kBundlePath, kStageSuffix, stageRoot, sizeof(stageRoot))) {
-		SYSLOG("rgfxgate", "staging path too long; no install");
+		graft_client_log(kClientID, "staging path too long; no install");
 		return false;
 	}
 	bool ok = ensureDir(kContainerPath, ctx);
@@ -558,22 +539,66 @@ static bool installBundle(vfs_context_t ctx) {
 	return ok;
 }
 
+// Records the install's outcome as RgfxGate's Graft client state
+// (GraftClient.ai.aneesiqbal.RgfxGate, "<state>: <reason>"), so a refusal is
+// visible there and never hidden behind the install-done flag, which only says
+// the pass ended. Published on arm64, whose boots read it back; a no-op on
+// x86-64, which keeps that build byte-identical.
+#if defined(__arm64e__)
+static inline void recordInstallState(const char *state, const char *reason) {
+	graft_client_state(kClientID, state, reason);
+}
+#else
+// A macro, not an empty inline: it drops its arguments at the preprocessor, so
+// the states and reasons compile to nothing at all and the x86-64 build is
+// byte-identical to one without this recording.
+#define recordInstallState(state, reason) ((void)0)
+#endif
+
 static void doInstall() {
 	vfs_context_t ctx = vfs_context_create(nullptr);
-	if (ctx == nullptr)
+	if (ctx == nullptr) {
+		recordInstallState("refused", "no VFS context for the install");
 		return;
+	}
 
 	// Installer/Recovery: do nothing.
 	vnode_t inst = nullptr;
 	if (vnode_lookup("/System/Installation", 0, &inst, ctx) == 0) {
 		vnode_put(inst);
+		recordInstallState("skipped", "installer or Recovery environment");
 		vfs_context_rele(ctx);
 		return;
 	}
+
+#if defined(__arm64e__)
+	// The arm64 install writes through the vnode op vector, whose offset in
+	// struct vnode is a measured per-release fact. Confirm it against a live
+	// vnode before any op-vector call: the root always exists and carries no
+	// probe xattr, so the cross-check against the exported VNOP_GETXATTR is
+	// clean. A release outside the measured five, or a failed cross-check,
+	// refuses the install rather than dereferencing an unverified layout.
+	{
+		vnode_t root = nullptr;
+		const char *why = "no root vnode";
+		bool ready = vnode_lookup("/", 0, &root, ctx) == 0 &&
+		             rgfxVnopInstallReady(root, ctx, &why);
+		if (root != nullptr)
+			vnode_put(root);
+		if (!ready) {
+			graft_client_log(kClientID, "vnode op vector unverified (%s); no install", why);
+			recordInstallState("refused", why);
+			vfs_context_rele(ctx);
+			return;
+		}
+	}
+#endif
+
 	bool needWrite = installNeeded(ctx);
 	bool tagged = bundleTagged(ctx);
 	if (!needWrite && tagged) {
-		DBGLOG("rgfxgate", "bundle current and tagged; no install");
+		graft_client_log(kClientID, "bundle current and tagged; no install");
+		recordInstallState("present", "bundle already installed and tagged");
 		vfs_context_rele(ctx);
 		return;
 	}
@@ -599,8 +624,14 @@ static void doInstall() {
 	gInstalling = false;
 	gInstallThread = nullptr;
 	vfs_context_rele(ctx);
-	SYSLOG("rgfxgate", "bundle %s %s", needWrite ? "install" : "tag",
+	graft_client_log(kClientID, "bundle %s %s", needWrite ? "install" : "tag",
 	       ok ? "complete" : "FAILED");
+	if (ok)
+		recordInstallState(needWrite ? "installed" : "tagged",
+		                   needWrite ? "wrote the bundle to /Library/GPUBundles and tagged it"
+		                             : "tagged the current bundle in place");
+	else
+		recordInstallState("failed", "the bundle write did not complete");
 }
 
 // Publishes the install pass on IOResources (RgfxGate.hpp): `done` false while
@@ -618,11 +649,21 @@ static void installEntry(void *, wait_result_t) {
 	// lookup: this thread is entered as a continuation very early in boot, and
 	// IOSleep yields it through the scheduler into a normal preemptible state
 	// before it takes the VFS namecache lock, which a development kernel
-	// otherwise faults on (lock_rw_old.c, preemption check).
-	vfs_context_t ctx = vfs_context_create(nullptr);
+	// otherwise faults on (lock_rw_old.c, preemption check). The VFS context
+	// waits for IOBSD too: Graft starts this kext before BSD is up on some
+	// releases, and a credential taken before the kernel task has its BSD
+	// process panics (Darwin 20: "thread wants credential but has no BSD
+	// process").
+	vfs_context_t ctx = nullptr;
 	bool ready = false;
 	for (int i = 0; i < 600; i++) {
 		IOSleep(100);
+		if (!ctx) {
+			IOService *resources = IOService::getResourceService();
+			if (!resources || !resources->getProperty("IOBSD"))
+				continue;
+			ctx = vfs_context_create(nullptr);
+		}
 		vnode_t vp = nullptr;
 		if (ctx && vnode_lookup("/Library/Preferences", 0, &vp, ctx) == 0) {
 			vnode_put(vp);
@@ -634,8 +675,10 @@ static void installEntry(void *, wait_result_t) {
 		vfs_context_rele(ctx);
 	if (ready)
 		doInstall();
-	else
-		SYSLOG("rgfxgate", "Data volume never appeared; no install");
+	else {
+		graft_client_log(kClientID, "Data volume never appeared; no install");
+		recordInstallState("refused", "Data volume never mounted");
+	}
 	publishPass(true);
 	if (ready)
 		keepVideoPreference();
@@ -644,11 +687,13 @@ static void installEntry(void *, wait_result_t) {
 
 void startInstaller() {
 	publishPass(false);
+	recordInstallState("pending", "install thread starting");
 	thread_t t = nullptr;
 	if (kernel_thread_start(installEntry, nullptr, &t) == KERN_SUCCESS)
 		thread_deallocate(t);
 	else {
-		SYSLOG("rgfxgate", "could not start install thread");
+		graft_client_log(kClientID, "could not start install thread");
+		recordInstallState("refused", "could not start the install thread");
 		publishPass(true);
 	}
 }

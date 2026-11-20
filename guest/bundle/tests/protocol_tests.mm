@@ -13,6 +13,7 @@
 #import <Metal/Metal.h>
 #import <objc/message.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cstring>
 #include <string>
@@ -28,11 +29,13 @@
 #import "RgfxEvent.h"
 #import "RgfxFence.h"
 #import "RgfxFunction.h"
+#import "RgfxFunctionTable.h"
 #import "RgfxHeap.h"
 #import "RgfxIndirectCommandBuffer.h"
 #import "RgfxInterop.h"
 #import "RgfxBlockCall.h"
 #import "RgfxLibrary.h"
+#import "RgfxRasterizationRateMap.h"
 #import "RgfxRenderPipelineState.h"
 #import "RgfxResource.h"
 #import "RgfxSampler.h"
@@ -40,6 +43,7 @@
 #import "RgfxTexture.h"
 #import "RgfxUnsupported.h"
 
+#include "RgfxDoorbellPage.hpp"
 #include "RgfxHeapSizes.hpp"
 #include "RgfxObjectModel.hpp"
 #include "RgfxRegion.hpp"
@@ -50,8 +54,10 @@
 #include "rgfx_argument_reply.hpp"
 #include "reims_graphics_wire.h"
 #include "rgfx_test_ring.hpp" // CHECK, g_checks, TestRing, expectMessage
+#include "../../kext/src/RgfxQueuePublish.hpp"
 
 void rgfxProtocolTests();
+void drainRing(TestRing &ring); // shell_tests.mm
 
 namespace {
 
@@ -338,6 +344,109 @@ void test_inline_bytes()
 	} // @autoreleasepool
 }
 
+// A parallel pass's sub-encoders put inline bytes from threads of their own at once, each into a
+// run of a chunk of its own: every binding holds its own bytes, at a place no other binding has,
+// in its sub-encoder's order; and the encoder after the pass fills on in a run one of them
+// handed back as it ended.
+void test_inline_bytes_parallel()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:64
+	                                                      height:64
+	                                                   mipmapped:NO],
+	    0x42);
+	constexpr uint32_t kSubs = 4, kPuts = 40;
+	auto put = [](id<MTLRenderCommandEncoder> sub, uint32_t i, uint32_t j) {
+		const uint32_t v[4] = {i, j, 0x5eed0000u + i, ~j};
+		[sub setVertexBytes:v length:sizeof(v) atIndex:0];
+	};
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLParallelRenderCommandEncoder> par =
+	    [cb parallelRenderCommandEncoderWithDescriptor:onePass(target)];
+	std::vector<id<MTLRenderCommandEncoder>> subs;
+	// Each sub-encoder's first put here, so each holds a run before any hands one back.
+	for (uint32_t i = 0; i < kSubs; i++) {
+		subs.push_back([par renderCommandEncoder]);
+		put(subs[i], i, 0);
+	}
+	std::vector<std::thread> threads;
+	for (uint32_t i = 0; i < kSubs; i++) {
+		id<MTLRenderCommandEncoder> sub = subs[i];
+		threads.emplace_back([sub, i, put] {
+			@autoreleasepool {
+				for (uint32_t j = 1; j < kPuts; j++)
+					put(sub, i, j);
+				[sub endEncoding];
+			}
+		});
+	}
+	for (std::thread &t : threads)
+		t.join();
+	[par endEncoding];
+	id<MTLComputeCommandEncoder> cenc = [cb computeCommandEncoder];
+	const uint32_t last[4] = {9, 8, 7, 6};
+	[cenc setBytes:last length:sizeof(last) atIndex:0];
+	[cenc endEncoding];
+
+	// One chunk a sub-encoder, and none for the compute encoder.
+	std::vector<RgfxBufferOverHostMemory> chunks;
+	for (uint32_t i = 0; i < kSubs; i++)
+		chunks.push_back(
+		    expectMessage<RgfxBufferOverHostMemory>(fx.control, RGFX_CMD_BUFFER_OVER_HOST_MEMORY));
+	RgfxMsgHeader none = {};
+	std::vector<uint8_t> noneBytes;
+	CHECK(!fx.control.next(&none, &noneBytes));
+	auto chunkOf = [&](uint64_t objId) -> const RgfxBufferOverHostMemory * {
+		for (const RgfxBufferOverHostMemory &c : chunks) {
+			if (c.obj_id == objId)
+				return &c;
+		}
+		return nullptr;
+	};
+
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	std::vector<std::pair<uint64_t, uint64_t>> places;
+	std::vector<uint32_t> next(kSubs, 0);
+	for (const Op &op : ops) {
+		if (op.tag != RGFX_OP_RENDER_SET_VERTEX_BUFFER)
+			continue;
+		auto vb = op.as<RgfxOpSetVertexBuffer>();
+		const RgfxBufferOverHostMemory *c = chunkOf(vb.buffer_obj_id);
+		CHECK(c != nullptr && vb.index == 0 && vb.offset % 256 == 0);
+		if (c == nullptr)
+			continue;
+		const std::pair<uint64_t, uint64_t> place(vb.buffer_obj_id, vb.offset);
+		CHECK(std::find(places.begin(), places.end(), place) == places.end());
+		places.push_back(place);
+		uint32_t v[4];
+		std::memcpy(v, fx.regionAt(c->region_offset, vb.offset), sizeof(v));
+		CHECK(v[0] < kSubs);
+		if (v[0] >= kSubs)
+			continue;
+		CHECK(v[1] == next[v[0]] && v[2] == 0x5eed0000u + v[0] && v[3] == ~v[1]);
+		next[v[0]]++;
+	}
+	for (uint32_t i = 0; i < kSubs; i++)
+		CHECK(next[i] == kPuts);
+	// The compute encoder's bytes follow a sub-encoder's last, in its chunk.
+	const Op *cs = findOp(ops, RGFX_OP_COMPUTE_SET_BUFFERS);
+	CHECK(cs != nullptr);
+	auto cse = cs->elem<RgfxComputeOpSetBuffers, RgfxComputeBufferBinding>(0);
+	const RgfxBufferOverHostMemory *cc = chunkOf(cse.buffer_obj_id);
+	CHECK(cc != nullptr && cse.offset == kPuts * 256);
+	if (cc != nullptr)
+		CHECK(std::memcmp(fx.regionAt(cc->region_offset, cse.offset), last, sizeof(last)) == 0);
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
 // Without a region the bytes have nowhere to go: no binding is made (and it is logged), and the
 // command buffer fails with MTLCommandBufferErrorOutOfMemory.
 void test_inline_bytes_without_region()
@@ -369,6 +478,438 @@ void test_inline_bytes_without_region()
 	CHECK([cb.error.localizedDescription
 	    isEqualToString:@"Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)"]);
 	} // @autoreleasepool
+}
+
+// A control route as the kext's, which holds destroys and heap-placed buffers to go together
+// (RgfxRingWriter::setBatch), over `direct`'s ring; while `refuse` is set it takes nothing, as the
+// kext where its control ring stays full or the device stopped.
+struct RefusingKext {
+	RgfxRingWriter *direct;
+	bool refuse = false;
+
+	static bool submit(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                   uint32_t *out_status)
+	{
+		RefusingKext *kext = static_cast<RefusingKext *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return !kext->refuse && kext->direct->tryPost(header.type, message, size, out_seqno);
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		RefusingKext *kext = static_cast<RefusingKext *>(context);
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes && !kext->refuse; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			if (!kext->direct->tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+};
+
+// A heap-placed buffer the kext never took when it was made (RgfxSerializer::createBufferAtOffset
+// holds it to go with others) fails the next command buffer committed, unposted, with
+// MTLCommandBufferErrorInternal, as the buffer may name it, and the next post is refused, as a
+// full control ring refuses it; once the kext takes them again, the buffer goes before the next
+// command buffer, which goes on its ring. A texture held so does the same (serializer_tests'
+// test_held_creates checks each kind held).
+void test_commit_behind_an_untaken_buffer_fails()
+{
+	TestRing control(0x8000);
+	RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+	                      TestRing::doorbell, nullptr);
+	RefusingKext kext{&direct};
+	RgfxRingWriter writer(&RefusingKext::submit, &kext, 0x4000);
+	writer.setBatch(&RefusingKext::batch, 4096, 600ull * 1000000000);
+	RgfxIdSpace ids;
+	RgfxSerializer ser(writer, ids);
+	TestRing submit(0x8000);
+	RgfxRingWriter submitWriter(submit.base(), submit.dataSize, 1, TestRing::doorbell, nullptr);
+	TestRing completion(0x8000);
+	RgfxReplyReader reader(completion.base(), completion.dataSize);
+	std::vector<uint8_t> mem(0x800000, 0);
+	RgfxRegion region(mem.data(), mem.size());
+	control.setConsumerIdle(1);
+	submit.setConsumerIdle(1);
+	@autoreleasepool {
+		RgfxCommandQueue *queue = nil;
+		@autoreleasepool {
+			queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+			                                 submitOffset:0
+			                               completeOffset:0
+			                             completeDataSize:0
+			                                          ids:&ids
+			                                     maxCount:0
+			                                       device:nil
+			                                   serializer:&ser];
+		}
+		CHECK(queue != nil);
+		queue.replyReader = &reader;
+		queue.region = &region;
+		(void)expectQueueCreate(control);
+		MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+		hd.size = 0x100000;
+		hd.storageMode = MTLStorageModePrivate;
+		RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+		CHECK(heap != nil);
+		drainRing(control);
+
+		// Made while the kext takes nothing: answered as made, held.
+		kext.refuse = true;
+		id<MTLBuffer> buffer = [heap newBufferWithLength:256 options:MTLResourceStorageModePrivate];
+		CHECK(buffer != nil);
+		id<MTLCommandBuffer> cb = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+		[blit fillBuffer:buffer range:NSMakeRange(0, 256) value:0];
+		[blit endEncoding];
+		[cb commit];
+		[cb waitUntilCompleted];
+		CHECK(cb.status == MTLCommandBufferStatusError);
+		CHECK(cb.error != nil && [cb.error.domain isEqualToString:MTLCommandBufferErrorDomain] &&
+		      cb.error.code == MTLCommandBufferErrorInternal);
+		RgfxMsgHeader h = {};
+		std::vector<uint8_t> bytes;
+		CHECK(!submit.next(&h, &bytes));
+		CHECK(!control.next(&h, &bytes));
+		// The next post is refused: the held go first, and the kext takes none of them.
+		CHECK(!ser.createEvent().posted);
+
+		// The kext takes them again: the buffer goes, then the next command buffer is posted.
+		kext.refuse = false;
+		id<MTLCommandBuffer> next = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit2 = [next blitCommandEncoder];
+		[blit2 fillBuffer:buffer range:NSMakeRange(0, 256) value:1];
+		[blit2 endEncoding];
+		[next commit];
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+		uint64_t obj = 0;
+		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		CHECK(obj == [(RgfxResource *)buffer rgfxObjId]);
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		RgfxCbComplete done = {};
+		done.header.type = RGFX_EVT_CB_COMPLETE;
+		done.header.size = sizeof(done);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)next).rgfxObjId;
+		done.status = RGFX_CB_OK;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		[next waitUntilCompleted];
+		CHECK(next.status == MTLCommandBufferStatusCompleted);
+
+		// A texture held so fails the next commit too, as it may name it, and goes before the
+		// command buffer after it once the kext takes it again.
+		kext.refuse = true;
+		MTLTextureDescriptor *td =
+		    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm
+		                                                       width:4
+		                                                      height:4
+		                                                   mipmapped:NO];
+		td.storageMode = MTLStorageModePrivate;
+		RgfxTexture *texture = [RgfxTexture textureWithDescriptor:td
+		                                                     heap:RGFX_OBJ_NONE
+		                                               heapOffset:0
+		                                                   device:nil
+		                                               serializer:&ser];
+		CHECK(texture != nil);
+		id<MTLCommandBuffer> third = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit3 = [third blitCommandEncoder];
+		[blit3 fillBuffer:buffer range:NSMakeRange(0, 256) value:2];
+		[blit3 endEncoding];
+		[third commit];
+		[third waitUntilCompleted];
+		CHECK(third.status == MTLCommandBufferStatusError);
+		CHECK(third.error != nil && third.error.code == MTLCommandBufferErrorInternal);
+		CHECK(!submit.next(&h, &bytes));
+		CHECK(!control.next(&h, &bytes));
+		kext.refuse = false;
+		id<MTLCommandBuffer> fourth = [queue commandBuffer];
+		id<MTLBlitCommandEncoder> blit4 = [fourth blitCommandEncoder];
+		[blit4 fillBuffer:buffer range:NSMakeRange(0, 256) value:3];
+		[blit4 endEncoding];
+		[fourth commit];
+		CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_TEXTURE_CREATE);
+		std::memcpy(&obj, bytes.data() + sizeof(h), sizeof(obj));
+		CHECK(obj == [texture rgfxObjId]);
+		CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+		done.header.seqno = h.seqno;
+		done.cb_obj_id = ((RgfxResource *)fourth).rgfxObjId;
+		CHECK(completion.postFromHost(&done, sizeof(done)));
+		[fourth waitUntilCompleted];
+		CHECK(fourth.status == MTLCommandBufferStatusCompleted);
+	}
+}
+
+// A control route as the kext's that takes a queue's publish with the held messages
+// (RgfxRingWriter::setBatchPublish, the kext's SubmitBatch with its publish): it posts the held on
+// `direct`'s ring, and once every one went it publishes the queue's ring after them by the kext's
+// own rule (RgfxQueuePublish.hpp), as the kext does. Every call and doorbell goes in `calls`: B a
+// batch, P a batch with a publish, D a doorbell the bundle rang through the kext, K one the kext
+// rang in the publish; `heldAtPublish` is what the control ring held as the kext published.
+struct PublishingKext {
+	RgfxRingWriter *direct;
+	TestRing *control;
+	TestRing *submit;
+	bool refuse = false;
+	std::string calls;
+	uint64_t heldAtPublish = 0;
+	uint32_t word = 0;
+
+	static bool submitOne(void *context, const void *message, uint32_t size, uint64_t *out_seqno,
+	                      uint32_t *out_status)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		RgfxMsgHeader header;
+		std::memcpy(&header, message, sizeof(header));
+		if (out_status)
+			*out_status = kRgfxNoAnswer;
+		return !kext->refuse && kext->direct->tryPost(header.type, message, size, out_seqno);
+	}
+
+	uint32_t post(const void *messages, uint32_t bytes)
+	{
+		const uint8_t *m = static_cast<const uint8_t *>(messages);
+		uint32_t posted = 0;
+		for (uint32_t at = 0; at < bytes && !refuse; posted++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, m + at, sizeof(header));
+			if (!direct->tryPost(header.type, m + at, header.size, nullptr))
+				break;
+			at += header.size;
+		}
+		return posted;
+	}
+
+	static uint32_t batch(void *context, const void *messages, uint32_t bytes)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		kext->calls += 'B';
+		return kext->post(messages, bytes);
+	}
+
+	struct Header {
+		TestRing *ring;
+		void storeProducer(uint64_t producer) { ring->setProducer(producer); }
+		void fullFence() { std::atomic_thread_fence(std::memory_order_seq_cst); }
+		uint32_t consumerIdle()
+		{
+			uint32_t idle;
+			std::memcpy(&idle, ring->mem.data() + __builtin_offsetof(RgfxRingHeader, consumer_idle),
+			            sizeof(idle));
+			return idle;
+		}
+	};
+
+	static uint32_t batchPublish(void *context, const void *messages, uint32_t bytes,
+	                             const RgfxQueuePublish &publish, bool *out_published)
+	{
+		PublishingKext *kext = static_cast<PublishingKext *>(context);
+		kext->calls += 'P';
+		uint32_t count = 0;
+		for (uint32_t at = 0; at < bytes; count++) {
+			RgfxMsgHeader header;
+			std::memcpy(&header, static_cast<const uint8_t *>(messages) + at, sizeof(header));
+			at += header.size;
+		}
+		const uint32_t posted = kext->post(messages, bytes);
+		*out_published = false;
+		if (posted == count) {
+			kext->heldAtPublish = kext->control->producer();
+			Header h{kext->submit};
+			const uint64_t flags = (publish.answered ? kRgfxPublishAnswered : 0) |
+			                       (publish.asks ? kRgfxPublishAsks : 0);
+			if (rgfxQueuePublish(h, kQueueRing, publish.producer, flags, &kext->word))
+				kext->calls += 'K';
+			*out_published = true;
+		}
+		return posted;
+	}
+
+	static void doorbell(void *context, uint32_t)
+	{
+		static_cast<PublishingKext *>(context)->calls += 'D';
+	}
+
+	static constexpr uint32_t kQueueRing = 0x40000;
+};
+
+// The doorbell page (RgfxDoorbellPage.hpp): the bundle asks OpenContext for seven outputs only
+// where the kext answers the span and the page, and for the six or five it asked before
+// otherwise; it takes the page from the seventh where it is not 0, and rings a ring there with one
+// 32-bit store of the ring's id at the page's first byte, touching nothing else of the page.
+void test_doorbell_page_rings_at_its_first_byte()
+{
+	CHECK(rgfxOpenContextOutputs(0) == 5);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureDoorbellPage) == 5);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureContextSpan) == 6);
+	CHECK(rgfxOpenContextOutputs(kRgfxKextFeatureContextSpan | kRgfxKextFeatureDoorbellPage) == 7);
+	std::vector<uint32_t> page(RGFX_DOORBELL_PAGE_SIZE / sizeof(uint32_t), 0xffffffffu);
+	uint64_t out[7] = {1, 2, 3, 4, 5, 6, reinterpret_cast<uintptr_t>(page.data())};
+	CHECK(rgfxDoorbellPageOf(out, 5) == nullptr);
+	CHECK(rgfxDoorbellPageOf(out, 6) == nullptr);
+	CHECK(rgfxDoorbellPageOf(out, 7) == page.data());
+	rgfxDoorbellPageRing(rgfxDoorbellPageOf(out, 7), 0x40000 | RGFX_DOORBELL_ASKS);
+	CHECK(page[0] == (0x40000u | RGFX_DOORBELL_ASKS));
+	CHECK(std::all_of(page.begin() + 1, page.end(), [](uint32_t w) { return w == 0xffffffffu; }));
+	out[6] = 0;
+	CHECK(rgfxDoorbellPageOf(out, 7) == nullptr);
+}
+
+// A command buffer committed behind held messages hands its publish to them where the kext takes
+// it (kRgfxKextFeatureQueuePublish): one call posts the held on the control ring and then publishes
+// the buffer on its queue's ring, ringing its doorbell as the bundle's own publish would, so the
+// host sees what it saw before, the held first. With nothing held the bundle publishes as before;
+// with a kext without the feature (no setBatchPublish) the held go in a call of their own first,
+// then the bundle publishes and rings. A held create the kext refuses fails the buffer, unposted
+// and unseen, its seqno the next buffer's; held destroys it refuses leave the buffer to the bundle's
+// own publish, as postHeldCreates leaves it.
+void test_commit_hands_its_publish_to_the_held()
+{
+	for (int withFeature = 0; withFeature < 2; withFeature++) {
+		TestRing control(0x8000);
+		RgfxRingWriter direct(control.base(), control.dataSize, RGFX_CONTROL_RING_ID,
+		                      TestRing::doorbell, nullptr);
+		TestRing submit(0x8000);
+		PublishingKext kext{&direct, &control, &submit, false, {}, 0, 0};
+		RgfxRingWriter writer(&PublishingKext::submitOne, &kext, 0x4000);
+		writer.setBatch(&PublishingKext::batch, 4096, 600ull * 1000000000);
+		if (withFeature)
+			writer.setBatchPublish(&PublishingKext::batchPublish);
+		CHECK(writer.publishesQueues() == (withFeature != 0));
+		RgfxIdSpace ids;
+		RgfxSerializer ser(writer, ids);
+		RgfxRingWriter submitWriter(submit.base(), submit.dataSize, PublishingKext::kQueueRing,
+		                            &PublishingKext::doorbell, &kext);
+		TestRing completion(0x8000);
+		RgfxReplyReader reader(completion.base(), completion.dataSize);
+		std::vector<uint8_t> mem(0x800000, 0);
+		RgfxRegion region(mem.data(), mem.size());
+		control.setConsumerIdle(1);
+		submit.setConsumerIdle(RGFX_CONSUMER_ASLEEP);
+		@autoreleasepool {
+			RgfxCommandQueue *queue = nil;
+			@autoreleasepool {
+				queue = [RgfxCommandQueue queueWithSubmitRing:&submitWriter
+				                                 submitOffset:PublishingKext::kQueueRing
+				                               completeOffset:0
+				                             completeDataSize:0
+				                                          ids:&ids
+				                                     maxCount:0
+				                                       device:nil
+				                                   serializer:&ser];
+			}
+			CHECK(queue != nil);
+			queue.replyReader = &reader;
+			queue.region = &region;
+			(void)expectQueueCreate(control);
+			MTLHeapDescriptor *hd = [[MTLHeapDescriptor alloc] init];
+			hd.size = 0x100000;
+			hd.storageMode = MTLStorageModePrivate;
+			RgfxHeap *heap = [RgfxHeap heapWithDescriptor:hd device:nil serializer:&ser];
+			CHECK(heap != nil);
+			drainRing(control);
+			RgfxMsgHeader h = {};
+			std::vector<uint8_t> bytes;
+			auto commitFill = [&](id<MTLBuffer> buffer, uint8_t value) {
+				id<MTLCommandBuffer> cb = [queue commandBuffer];
+				id<MTLBlitCommandEncoder> blit = [cb blitCommandEncoder];
+				[blit fillBuffer:buffer range:NSMakeRange(0, 256) value:value];
+				[blit endEncoding];
+				[cb commit];
+				return cb;
+			};
+			auto complete = [&](id<MTLCommandBuffer> cb, uint64_t seqno) {
+				RgfxCbComplete done = {};
+				done.header.type = RGFX_EVT_CB_COMPLETE;
+				done.header.size = sizeof(done);
+				done.header.seqno = seqno;
+				done.cb_obj_id = ((RgfxResource *)cb).rgfxObjId;
+				done.status = RGFX_CB_OK;
+				CHECK(completion.postFromHost(&done, sizeof(done)));
+				[cb waitUntilCompleted];
+				CHECK(cb.status == MTLCommandBufferStatusCompleted);
+			};
+
+			// A heap-placed buffer, held, then a commit that names it.
+			kext.calls.clear();
+			id<MTLBuffer> buffer = [heap newBufferWithLength:256
+			                                         options:MTLResourceStorageModePrivate];
+			CHECK(buffer != nil);
+			id<MTLCommandBuffer> first = commitFill(buffer, 0);
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER && h.seqno == 1);
+			if (withFeature) {
+				// One call: the held, then the buffer's publish and its doorbell, by the kext.
+				CHECK(kext.calls == "PK");
+				CHECK(kext.heldAtPublish == control.consumed);
+				CHECK(kext.word == PublishingKext::kQueueRing);
+			} else {
+				// The held in their own call, then the bundle's publish and doorbell.
+				CHECK(kext.calls == "BD");
+			}
+			complete(first, 1);
+
+			// Nothing held: the bundle publishes and rings, as before.
+			kext.calls.clear();
+			id<MTLCommandBuffer> second = commitFill(buffer, 1);
+			CHECK(!control.next(&h, &bytes));
+			CHECK(submit.next(&h, &bytes) && h.seqno == 2);
+			CHECK(kext.calls == "D");
+			complete(second, 2);
+
+			// A held create the kext refuses: the buffer fails unposted, unseen by the host.
+			kext.refuse = true;
+			kext.calls.clear();
+			id<MTLBuffer> refused = [heap newBufferWithLength:256
+			                                          options:MTLResourceStorageModePrivate];
+			CHECK(refused != nil);
+			const uint64_t producedBefore = submit.producer();
+			id<MTLCommandBuffer> third = commitFill(refused, 2);
+			[third waitUntilCompleted];
+			CHECK(third.status == MTLCommandBufferStatusError);
+			CHECK(third.error != nil && third.error.code == MTLCommandBufferErrorInternal);
+			CHECK(submit.producer() == producedBefore);
+			CHECK(!submit.next(&h, &bytes) && !control.next(&h, &bytes));
+			CHECK(kext.calls == (withFeature ? "P" : "B"));
+			// Taken again: the create goes, then the next buffer, at the seqno the failed one
+			// never used.
+			kext.refuse = false;
+			kext.calls.clear();
+			id<MTLCommandBuffer> fourth = commitFill(refused, 3);
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(h.seqno == 3);
+			CHECK(kext.calls == (withFeature ? "PK" : "BD"));
+			complete(fourth, h.seqno);
+
+			// Held destroys alone that the kext refuses: the buffer goes all the same, published
+			// by the bundle, the destroys still held.
+			@autoreleasepool {
+				id<MTLBuffer> gone = [heap newBufferWithLength:256
+				                                       options:MTLResourceStorageModePrivate];
+				CHECK(gone != nil);
+				CHECK(ser.postHeldCreates());
+				CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_BUFFER_AT_OFFSET);
+				gone = nil;
+			}
+			CHECK(writer.holdsBut(RGFX_CMD_OBJECT_DESTROY) == false);
+			kext.refuse = true;
+			kext.calls.clear();
+			id<MTLCommandBuffer> fifth = commitFill(buffer, 4);
+			CHECK(submit.next(&h, &bytes) && h.type == RGFX_CMD_COMMAND_BUFFER);
+			CHECK(kext.calls == (withFeature ? "PD" : "BD"));
+			complete(fifth, h.seqno);
+			kext.refuse = false;
+			CHECK(writer.flushLater());
+			CHECK(control.next(&h, &bytes) && h.type == RGFX_CMD_OBJECT_DESTROY);
+		}
+	}
 }
 
 // The render barriers: the scope barrier as given; a resource barrier as the scope of the
@@ -460,6 +1001,56 @@ void test_compute_dispatch_type()
 	CHECK(p1.dispatch_type == MTLDispatchTypeConcurrent);
 	auto p2 = findOp(ops, RGFX_OP_ENCODER_BEGIN_COMPUTE, 2)->as<RgfxComputePassDesc>();
 	CHECK(p2.dispatch_type == MTLDispatchTypeConcurrent);
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
+// A compute encoder binds a visible function table by its id at a buffer index (nil as 0), and a
+// range of them by theirs, nil among them; an empty range binds nothing.
+void test_compute_function_table_bindings()
+{
+	QueueFixture fx;
+	// Drained while fx lives: what the test lets go (a command buffer, the queue it holds)
+	// posts its destroy through fx.
+	@autoreleasepool {
+	RgfxVisibleFunctionTable *t = [[RgfxVisibleFunctionTable alloc] initWithObjId:0x77
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	RgfxVisibleFunctionTable *u = [[RgfxVisibleFunctionTable alloc] initWithObjId:0x78
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	id<MTLComputeCommandEncoder> e = [cb computeCommandEncoder];
+	[e setVisibleFunctionTable:t atBufferIndex:3];
+	id<MTLVisibleFunctionTable> tables[3] = {u, nil, t};
+	[e setVisibleFunctionTables:tables withBufferRange:NSMakeRange(4, 3)];
+	[e setVisibleFunctionTables:tables withBufferRange:NSMakeRange(9, 0)];
+	[e setVisibleFunctionTable:nil atBufferIndex:3];
+	[e endEncoding];
+	[cb commit];
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	std::vector<RgfxComputeOpSetVisibleFunctionTable> ones;
+	std::vector<const Op *> ranges;
+	for (const Op &op : ops) {
+		if (op.tag == RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLE)
+			ones.push_back(op.as<RgfxComputeOpSetVisibleFunctionTable>());
+		else if (op.tag == RGFX_OP_COMPUTE_SET_VISIBLE_FUNCTION_TABLES)
+			ranges.push_back(&op);
+	}
+	CHECK(ones.size() == 2 && ranges.size() == 1);
+	if (ones.size() == 2 && ranges.size() == 1) {
+		CHECK(ones[0].table_obj_id == 0x77 && ones[0].index == 3);
+		CHECK(ones[1].table_obj_id == 0 && ones[1].index == 3);
+		auto head = ranges[0]->as<RgfxComputeOpSetVisibleFunctionTables>();
+		CHECK(head.location == 4 && head.length == 3);
+		auto tableAt = [&](size_t i) {
+			return ranges[0]
+			    ->elem<RgfxComputeOpSetVisibleFunctionTables, RgfxComputeVisibleFunctionTableBinding>(i)
+			    .table_obj_id;
+		};
+		CHECK(tableAt(0) == 0x78 && tableAt(1) == 0 && tableAt(2) == 0x77);
+	}
 	fx.complete(cb, seqno);
 	} // @autoreleasepool
 }
@@ -757,6 +1348,47 @@ void test_framework_members()
 	}
 	CHECK(findOp(together, RGFX_OP_RENDER_SET_LINE_WIDTH, 2) == nullptr);
 
+	// The GL renderer's two encoder SPIs, as the Intel 630 answers them. A restart that is not
+	// enabled posts nothing until an enabled one came before it, then the all-ones index once; an
+	// enabled one posts its index, once while it stays. Every provoking vertex mode is posted.
+	{
+		id<MTLCommandBuffer> rcb = [fx.queue commandBuffer];
+		id<MTLRenderCommandEncoder> renc = [rcb renderCommandEncoderWithDescriptor:onePass(target)];
+		const SEL restartSel = @selector(setPrimitiveRestartEnabled:index:);
+		const SEL provokingSel = @selector(setProvokingVertexMode:);
+		CHECK([renc respondsToSelector:restartSel] && [renc respondsToSelector:provokingSel]);
+		auto restart = [&](BOOL enabled, NSUInteger index) {
+			((void (*)(id, SEL, BOOL, NSUInteger))objc_msgSend)(renc, restartSel, enabled, index);
+		};
+		restart(NO, 0);
+		restart(YES, 3);
+		restart(YES, 3);
+		restart(NO, 7);
+		restart(NO, 7);
+		restart(YES, 0xffff);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(renc, provokingSel, 1);
+		((void (*)(id, SEL, NSUInteger))objc_msgSend)(renc, provokingSel, 0);
+		[renc endEncoding];
+		[rcb commit];
+		uint64_t seqno = 0;
+		const std::vector<Op> ops = fx.nextOps(&seqno);
+		fx.complete(rcb, seqno);
+		// The second carries the all-ones index (kRgfxRestartAtAllOnes).
+		const uint64_t restarts[][2] = {{3, 1}, {0xffffffffu, 0}, {0xffff, 1}};
+		for (size_t n = 0; n < 3; n++) {
+			const Op *r = findOp(ops, RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, n);
+			CHECK(r != nullptr && r->body.size() == sizeof(RgfxOpSetPrimitiveRestartEnabled));
+			const RgfxOpSetPrimitiveRestartEnabled b = r->as<RgfxOpSetPrimitiveRestartEnabled>();
+			CHECK(b.index == restarts[n][0] && b.enabled == restarts[n][1] && b.reserved_0c == 0);
+		}
+		CHECK(findOp(ops, RGFX_OP_RENDER_SET_PRIMITIVE_RESTART_ENABLED, 3) == nullptr);
+		for (uint64_t mode = 0; mode < 2; mode++) {
+			const Op *p = findOp(ops, RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, mode);
+			CHECK(p != nullptr && p->as<RgfxOpSetProvokingVertexMode>().mode == 1 - mode);
+		}
+		CHECK(findOp(ops, RGFX_OP_RENDER_SET_PROVOKING_VERTEX_MODE, 2) == nullptr);
+	}
+
 	// The command buffer: its dictionary, its agent-masked signal, statistics, validate.
 	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
 	auto userDictionary = [cb] {
@@ -809,6 +1441,18 @@ void test_framework_members()
 - (BOOL)supportsTextureSampleCount:(NSUInteger)sampleCount
 {
 	return sampleCount == 1 || sampleCount == 2 || sampleCount == 4;
+}
+@end
+
+// A device that answers an Apple family (Apple7, as every Apple-silicon Mac's GPU), so the
+// objects made of it take an Apple GPU's rules (rgfxAppleGPU).
+@interface RgfxAppleRulesTestDevice : NSObject
+- (BOOL)supportsFamily:(MTLGPUFamily)family;
+@end
+@implementation RgfxAppleRulesTestDevice
+- (BOOL)supportsFamily:(MTLGPUFamily)family
+{
+	return family >= MTLGPUFamilyApple1 && family <= MTLGPUFamilyApple9;
 }
 @end
 
@@ -914,6 +1558,76 @@ void test_sample_positions()
 		CHECK(o1->as<RgfxOpSetDepthStoreActionOptions>().store_action_options ==
 		      MTLStoreActionOptionNone);
 	}
+	fx.complete(cb, seqno);
+	} // @autoreleasepool
+}
+
+// A pass's rasterization rate map travels after its colour records and its visibility result
+// buffer, in render and parallel passes, and the command buffer keeps it; a pass with none
+// carries none.
+void test_rasterization_rate_map_pass()
+{
+	QueueFixture fx;
+	@autoreleasepool {
+	RgfxTexture *target = shapeTexture(
+	    [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
+	                                                       width:8
+	                                                      height:8
+	                                                   mipmapped:NO],
+	    0x42);
+	RgfxBuffer *results = [[RgfxBuffer alloc] initWithObjId:0x50
+	                                             gpuAddress:0
+	                                                 length:16
+	                                                options:0
+	                                                 device:nil
+	                                             serializer:nullptr];
+	RgfxRasterizationRateMap *map = [[RgfxRasterizationRateMap alloc] initWithObjId:0x60
+	                                                                         device:nil
+	                                                                     serializer:nullptr];
+	__weak RgfxRasterizationRateMap *weakMap = map;
+	id<MTLCommandBuffer> cb = [fx.queue commandBuffer];
+	MTLRenderPassDescriptor *rp = onePass(target);
+	rp.visibilityResultBuffer = results;
+	rp.rasterizationRateMap = map;
+	[[cb renderCommandEncoderWithDescriptor:rp] endEncoding];
+	rp.visibilityResultBuffer = nil;
+	[[cb parallelRenderCommandEncoderWithDescriptor:rp] endEncoding];
+	[[cb renderCommandEncoderWithDescriptor:onePass(target)] endEncoding];
+	rp = nil;
+	map = nil;
+	// The command buffer keeps the map it names until it completes.
+	CHECK(weakMap != nil);
+	[cb commit];
+
+	uint64_t seqno = 0;
+	std::vector<Op> ops = fx.nextOps(&seqno);
+	const size_t at = RGFX_RENDER_PASS_COLOR_OFFSET + sizeof(RgfxRenderPassColorAttachment);
+	const Op *both = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 0);
+	CHECK(both != nullptr);
+	if (both != nullptr) {
+		CHECK(both->as<RgfxRenderPassDesc>().flags ==
+		      (RGFX_PASS_FLAG_VISIBILITY_RESULT | RGFX_PASS_FLAG_RATE_MAP));
+		const size_t mapAt = at + sizeof(RgfxRenderPassVisibility);
+		CHECK(both->body.size() == mapAt + sizeof(RgfxRenderPassRateMap));
+		if (both->body.size() == mapAt + sizeof(RgfxRenderPassRateMap)) {
+			RgfxRenderPassRateMap m = {};
+			std::memcpy(&m, both->body.data() + mapAt, sizeof(m));
+			CHECK(m.map_obj_id == 0x60);
+		}
+	}
+	const Op *parallel = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 1);
+	CHECK(parallel != nullptr);
+	if (parallel != nullptr) {
+		CHECK(parallel->as<RgfxRenderPassDesc>().flags == RGFX_PASS_FLAG_RATE_MAP);
+		CHECK(parallel->body.size() == at + sizeof(RgfxRenderPassRateMap));
+		if (parallel->body.size() == at + sizeof(RgfxRenderPassRateMap)) {
+			RgfxRenderPassRateMap m = {};
+			std::memcpy(&m, parallel->body.data() + at, sizeof(m));
+			CHECK(m.map_obj_id == 0x60);
+		}
+	}
+	const Op *plain = findOp(ops, RGFX_OP_ENCODER_BEGIN_RENDER, 2);
+	CHECK(plain != nullptr && plain->body.size() == at && plain->as<RgfxRenderPassDesc>().flags == 0);
 	fx.complete(cb, seqno);
 	} // @autoreleasepool
 }
@@ -1200,8 +1914,8 @@ void test_queue_barriers()
 
 // --- the command buffer and the queue ---------------------------------------------
 
-// The encoders of features the device does not support are nil, logged; residency sets
-// (which the device does not make) change nothing; a capture boundary marks nothing.
+// The encoders of features the device does not support are nil, logged; no residency sets
+// change nothing; a capture boundary marks nothing.
 void test_command_buffer_and_queue_members()
 {
 	QueueFixture fx;
@@ -1433,14 +2147,23 @@ void test_pipeline_state_members()
 	CHECK(cs.supportIndirectCommandBuffers == YES);
 	MTLSize req = cs.requiredThreadsPerThreadgroup;
 	CHECK(req.width == 8 && req.height == 4 && req.depth == 1);
-	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageAutomatic);
+	CHECK(cs.maxTotalThreadsPerThreadgroup == 32); // the required size's threads, as Metal answers
+	// Automatic answers Weak, as the M3 Max under macOS 27.0.1 answers it (oracle_threads).
+	CHECK(cs.forwardProgressUsage == MTLForwardProgressUsageWeak);
 	CHECK(cs.shaderValidation == MTLShaderValidationDisabled);
 	CHECK(cs.reflection == nil);
 	CHECK(cs.allocatedSize == 0);
 	CHECK([cs imageblockMemoryLengthForDimensions:MTLSizeMake(8, 8, 1)] == 0);
 	CHECK(RgfxUnsupportedWasLogged([RgfxComputePipelineState class], @selector(allocatedSize)));
 	CHECK([cs functionHandleWithFunction:kfn] == nil);
-	CHECK([cs functionHandleWithName:@"kmain"] == nil);
+	// The AMD 5300M's pipeline raises an unrecognized selector at a handle by name.
+	bool raisedByName = false;
+	@try {
+		(void)[cs functionHandleWithName:@"kmain"];
+	} @catch (NSException *e) {
+		raisedByName = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(raisedByName);
 	CHECK([cs newVisibleFunctionTableWithDescriptor:[MTLVisibleFunctionTableDescriptor
 	                                                    visibleFunctionTableDescriptor]] == nil);
 	CHECK([cs newIntersectionFunctionTableWithDescriptor:
@@ -1466,6 +2189,32 @@ void test_pipeline_state_members()
 	CHECK(u64(cs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)cs));
 	CHECK(u64(cs, @"uniqueIdentifier") == u64(cs, @"uniqueIdentifier"));
 	CHECK(u64(cs, @"uniqueIdentifier") != u64(plain, @"uniqueIdentifier"));
+	// Metal's compute-pipeline SPI, as its base pipeline answers it: the resource index and the
+	// handle are gpuResourceID's value, the telemetry ID uniqueIdentifier's low 32 bits; no debug
+	// instrumentation, global constants or binaries; validation disabled; the descriptor's texture
+	// write rounding; and an unrecognized selector for a function's reflection.
+	auto obj = [](id object, NSString *name) {
+		return ((id (*)(id, SEL))objc_msgSend)(object, NSSelectorFromString(name));
+	};
+	CHECK(u64(cs, @"resourceIndex") == cs.gpuResourceID._impl &&
+	      u64(cs, @"gpuHandle") == u64(cs, @"resourceIndex"));
+	CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(cs, NSSelectorFromString(@"getComputeKernelTelemetryID")) ==
+	      static_cast<uint32_t>(u64(cs, @"uniqueIdentifier")));
+	CHECK(obj(cs, @"debugInstrumentationData") == nil && u64(cs, @"globalConstantsBase") == 0 &&
+	      u64(cs, @"globalConstantsSize") == 0);
+	NSDictionary *binaries = obj(cs, @"pipelineBinaries");
+	CHECK(binaries != nil && binaries.count == 0);
+	CHECK(u64(cs, @"shaderValidationState") == static_cast<uint64_t>(MTLShaderValidationDisabled));
+	CHECK(u64(cs, @"textureWriteRoundingMode") == 0 && u64(plain, @"textureWriteRoundingMode") == 0);
+	bool computeRaised = false;
+	@try {
+		(void)((id (*)(id, SEL, id))objc_msgSend)(
+		    cs, NSSelectorFromString(@"functionReflectionWithFunctionDescriptor:"),
+		    [MTLFunctionDescriptor functionDescriptor]);
+	} @catch (NSException *e) {
+		computeRaised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(computeRaised);
 
 	// --- render ---
 	MTLRenderPipelineDescriptor *rd = [[MTLRenderPipelineDescriptor alloc] init];
@@ -1490,6 +2239,60 @@ void test_pipeline_state_members()
 	CHECK(rs.requiredThreadsPerMeshThreadgroup.width == 0);
 	CHECK(u64(rs, @"gpuAddress") == 0);
 	CHECK(u64(rs, @"uniqueIdentifier") == reinterpret_cast<uintptr_t>((__bridge void *)rs));
+	// Metal's render-pipeline SPI, as its base pipeline answers it: the resource index and the
+	// handle are gpuResourceID's value, the telemetry IDs uniqueIdentifier's low 32 bits; for each
+	// stage no debug instrumentation, global constants or function handle, and its function tables
+	// the device's (none); no binaries or visibility group; validation disabled; the descriptor's
+	// texture write rounding; no mesh shader emulation, whatever is set; and an unrecognized
+	// selector for a function's reflection.
+	CHECK(u64(rs, @"resourceIndex") == rs.gpuResourceID._impl &&
+	      u64(rs, @"gpuHandle") == u64(rs, @"resourceIndex"));
+	for (NSString *member in @[ @"getVertexShaderTelemetryID", @"getFragmentShaderTelemetryID" ])
+		CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(member)) ==
+		      static_cast<uint32_t>(u64(rs, @"uniqueIdentifier")));
+	for (NSString *stage in @[ @"vertex", @"fragment", @"tile", @"mesh", @"object" ]) {
+		NSString *Stage = [stage capitalizedString];
+		CHECK(obj(rs, [stage stringByAppendingString:@"DebugInstrumentationData"]) == nil);
+		CHECK(u64(rs, [stage stringByAppendingString:@"GlobalConstantsBase"]) == 0 &&
+		      u64(rs, [stage stringByAppendingString:@"GlobalConstantsSize"]) == 0);
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString([stage stringByAppendingString:@"FunctionHandleWithFunction:"]),
+		          vfn) == nil);
+		NSString *visible =
+		    [NSString stringWithFormat:@"newVisibleFunctionTableFrom%@StageWithDescriptor:", Stage];
+		NSString *intersection =
+		    [NSString stringWithFormat:@"new%@IntersectionFunctionTableWithDescriptor:", Stage];
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString(visible),
+		          [MTLVisibleFunctionTableDescriptor visibleFunctionTableDescriptor]) == nil);
+		CHECK(((id (*)(id, SEL, id))objc_msgSend)(
+		          rs, NSSelectorFromString(intersection),
+		          [MTLIntersectionFunctionTableDescriptor intersectionFunctionTableDescriptor]) == nil);
+	}
+	CHECK(((NSDictionary *)obj(rs, @"pipelineBinaries")).count == 0 && obj(rs, @"pipelineBinaries") != nil);
+	CHECK(obj(rs, @"newVertexShaderDebugInfo") == nil && obj(rs, @"newFragmentShaderDebugInfo") == nil);
+	CHECK(((uint32_t (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(@"explicitVisibilityGroupID")) == 0);
+	CHECK(u64(rs, @"shaderValidationState") == static_cast<uint64_t>(MTLShaderValidationDisabled));
+	CHECK(u64(rs, @"textureWriteRoundingMode") == 0);
+	((void (*)(id, SEL, NSUInteger))objc_msgSend)(rs, NSSelectorFromString(@"setEmulationMeshSize:"), 64);
+	((void (*)(id, SEL, BOOL))objc_msgSend)(rs, NSSelectorFromString(@"setUsesMeshShaderEmulation:"), YES);
+	CHECK(!((BOOL (*)(id, SEL))objc_msgSend)(rs, NSSelectorFromString(@"usesMeshShaderEmulation")));
+	CHECK(u64(rs, @"emulationMeshSize") == 0 && obj(rs, @"emulationMeshShaderPSO") == nil);
+	CHECK(RgfxUnsupportedWasLogged([RgfxRenderPipelineState class],
+	                               NSSelectorFromString(@"setEmulationMeshSize:")));
+	err = nil;
+	CHECK(((id (*)(id, SEL, id, NSError **))objc_msgSend)(
+	          rs, NSSelectorFromString(@"newTileRenderPipelineStateWithAdditionalBinaryFunctions:error:"),
+	          @[], &err) == nil &&
+	      err != nil);
+	bool renderRaised = false;
+	@try {
+		(void)((id (*)(id, SEL, id))objc_msgSend)(rs, NSSelectorFromString(@"reflectionForFunctionDescriptor:"),
+		                                          [MTLFunctionDescriptor functionDescriptor]);
+	} @catch (NSException *e) {
+		renderRaised = [e.name isEqualToString:NSInvalidArgumentException];
+	}
+	CHECK(renderRaised);
 	// The two members a compute pipeline declares, which Metal's render pipelines answer too.
 	id<MTLComputePipelineState> asCompute = (id<MTLComputePipelineState>)rs;
 	MTLSize rsRequired = asCompute.requiredThreadsPerThreadgroup;
@@ -1520,6 +2323,16 @@ void test_pipeline_state_members()
 	}
 	CHECK(raised);
 	CHECK(!RgfxUnsupportedWasLogged([RgfxDepthStencilState class], @selector(gpuResourceID)));
+	// Nor an index or an identifier.
+	for (NSString *member in @[ @"resourceIndex", @"uniqueIdentifier" ]) {
+		bool stateRaised = false;
+		@try {
+			(void)((uint64_t (*)(id, SEL))objc_msgSend)(ds, NSSelectorFromString(member));
+		} @catch (NSException *e) {
+			stateRaised = [e.name isEqualToString:NSInvalidArgumentException];
+		}
+		CHECK(stateRaised);
+	}
 	} // @autoreleasepool
 }
 
@@ -1572,13 +2385,13 @@ struct SamplerAsker {
 	uint64_t id = 1;
 	uint32_t status = RGFX_STATUS_OK;
 	bool answers = true;
-	std::vector<RgfxSamplerCreate> asked;
+	std::vector<RgfxSamplerCreateWhole> asked;
 
 	static bool ask(void *context, const void *message, uint32_t size, void *reply,
 	                uint32_t capacity, uint32_t *reply_size)
 	{
 		SamplerAsker *self = static_cast<SamplerAsker *>(context);
-		RgfxSamplerCreate m = {};
+		RgfxSamplerCreateWhole m = {};
 		CHECK(size == sizeof(m));
 		std::memcpy(&m, message, sizeof(m));
 		self->asked.push_back(m);
@@ -1596,7 +2409,9 @@ struct SamplerAsker {
 };
 
 // A sampler takes the resource id its create was answered with, and is nil where the device
-// refused it or no answer came back; with no asker its create goes on the ring unanswered.
+// refused it or no answer came back; with no asker its create goes on the ring unanswered. The
+// create carries the descriptor's lodBias and reductionMode in its extension, Metal's defaults
+// where the descriptor has neither.
 void test_sampler_resource_ids()
 {
 	TestRing control(0x8000);
@@ -1614,18 +2429,28 @@ void test_sampler_resource_ids()
 	d.minFilter = MTLSamplerMinMagFilterLinear;
 	d.supportArgumentBuffers = YES;
 	d.lodMaxClamp = 4.0f;
+	const BOOL extended = [d respondsToSelector:@selector(setLodBias:)] &&
+	                      [d respondsToSelector:@selector(setReductionMode:)];
+	if (extended) {
+		d.lodBias = 1.5f;
+		d.reductionMode = MTLSamplerReductionModeMinimum;
+	}
 	RgfxSampler *a = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	RgfxSampler *b = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	CHECK(a != nil && b != nil);
 	CHECK(a.gpuResourceID._impl == 7 && b.gpuResourceID._impl == 8);
 	CHECK(asker.asked.size() == 2);
-	const RgfxSamplerCreate &m = asker.asked[0];
-	CHECK(m.header.type == RGFX_CMD_SAMPLER_CREATE && m.header.size == sizeof(m));
-	CHECK(m.obj_id == a.rgfxObjId && asker.asked[1].obj_id == b.rgfxObjId);
-	CHECK(m.min_filter == MTLSamplerMinMagFilterLinear && (m.flags & 0x4) != 0);
+	const RgfxSamplerCreateWhole &m = asker.asked[0];
+	CHECK(m.create.header.type == RGFX_CMD_SAMPLER_CREATE && m.create.header.size == sizeof(m));
+	CHECK(m.create.obj_id == a.rgfxObjId && asker.asked[1].create.obj_id == b.rgfxObjId);
+	CHECK(m.create.min_filter == MTLSamplerMinMagFilterLinear && (m.create.flags & 0x4) != 0);
 	float lod = 0;
-	std::memcpy(&lod, &m.lod_max_clamp_bits, sizeof(lod));
+	std::memcpy(&lod, &m.create.lod_max_clamp_bits, sizeof(lod));
 	CHECK(lod == 4.0f);
+	float bias = -1.0f;
+	std::memcpy(&bias, &m.ext.lod_bias_bits, sizeof(bias));
+	CHECK(extended ? bias == 1.5f && m.ext.reduction_mode == MTLSamplerReductionModeMinimum
+	               : bias == 0.0f && m.ext.reduction_mode == 0);
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!control.next(&h, &bytes)); // asked, not posted
@@ -1639,7 +2464,7 @@ void test_sampler_resource_ids()
 	ser.setAsker(nullptr, nullptr);
 	RgfxSampler *plain = [RgfxSampler samplerWithDescriptor:d device:nil serializer:&ser];
 	CHECK(plain != nil && plain.gpuResourceID._impl == 0);
-	(void)expectMessage<RgfxSamplerCreate>(control, RGFX_CMD_SAMPLER_CREATE);
+	(void)expectMessage<RgfxSamplerCreateWhole>(control, RGFX_CMD_SAMPLER_CREATE);
 	} // @autoreleasepool
 }
 
@@ -1677,6 +2502,9 @@ void test_argument_encoder_members()
 	RgfxMsgHeader h = {};
 	std::vector<uint8_t> bytes;
 	CHECK(!control.next(&h, &bytes)); // an encoder makes nothing on the device
+	// Metal's encoder SPI: no layout object of the device's, logged.
+	CHECK(((id (*)(id, SEL))objc_msgSend)(enc, NSSelectorFromString(@"layout")) == nil);
+	CHECK(RgfxUnsupportedWasLogged(c, NSSelectorFromString(@"layout")));
 
 	// No argument buffer: nothing to write into.
 	[enc setBuffer:nil offset:0 atIndex:4];
@@ -1789,6 +2617,26 @@ void test_argument_encoder_members()
 	}));
 	CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setDepthStencilState:atIndex:)));
+	// On an Apple GPU, as the M3 Max under macOS 27.0.1 answers (oracle_bundle Apple argbuf.ds.id,
+	// .set, .mixed, .tex, .texnil and .nil): a state's gpuResourceID is 0, and setting a state or
+	// nil writes nothing and raises nothing.
+	{
+		id apple = [RgfxAppleRulesTestDevice new]; // held: objects keep their device weakly
+		RgfxDepthStencilState *appleDs = [RgfxDepthStencilState
+		    depthStencilStateWithDescriptor:[[MTLDepthStencilDescriptor alloc] init]
+		                             device:(id<MTLDevice>)apple
+		                         serializer:&ser];
+		CHECK(appleDs != nil && appleDs.gpuResourceID._impl == 0);
+		RgfxArgumentEncoder *appleEnc =
+		    [[RgfxArgumentEncoder alloc] initWithLayout:RgfxArgLayout::parse(probe.data(), probe.size())
+		                                         device:(id<MTLDevice>)apple
+		                                     serializer:&ser];
+		[appleEnc setArgumentBuffer:args offset:0];
+		std::memset(args.contents, 0x5c, 8);
+		[appleEnc setDepthStencilState:appleDs atIndex:0];
+		[appleEnc setDepthStencilState:nil atIndex:0];
+		CHECK(wordAt(args, 0) == 0x5c5c5c5c5c5c5c5cull);
+	}
 	// An indirect command buffer writes its gpuResourceID, the host's id, as a pipeline; nil 0.
 	{
 		RgfxIcbState state = {};
@@ -1819,7 +2667,35 @@ void test_argument_encoder_members()
 	[enc setIndirectCommandBuffer:nil atIndex:0];
 	CHECK(wordAt(args, 0) == 0);
 	CHECK(!RgfxUnsupportedWasLogged(c, @selector(setIndirectCommandBuffer:atIndex:)));
-	// What the device makes no object of: nil writes 0, unlogged.
+	// A visible function table writes its gpuResourceID, the host's id, as a pipeline; nil 0.
+	{
+		RgfxFunctionPointerState state = {};
+		state.header = {RGFX_EVT_FUNCTION_POINTER_STATE, sizeof(state), 1};
+		state.status = RGFX_STATUS_OK;
+		state.gpu_resource_id = 0x3d;
+		static RgfxFunctionPointerState answer;
+		answer = state;
+		ser.setAsker(
+		    [](void *, const void *, uint32_t, void *reply, uint32_t, uint32_t *size) {
+			    std::memcpy(reply, &answer, sizeof(answer));
+			    *size = sizeof(answer);
+			    return true;
+		    },
+		    nullptr);
+		ser.setCarriesFunctionPointers(true);
+		RgfxVisibleFunctionTable *table = [RgfxVisibleFunctionTable tableOfPipeline:0x21
+		                                                                      count:2
+		                                                                     device:nil
+		                                                                 serializer:&ser];
+		ser.setCarriesFunctionPointers(false);
+		ser.setAsker(nullptr, nullptr);
+		CHECK(table != nil);
+		std::memset(args.contents, 0x5c, 8);
+		[enc setVisibleFunctionTable:table atIndex:0];
+		CHECK(wordAt(args, 0) == 0x3d);
+		CHECK(!RgfxUnsupportedWasLogged(c, @selector(setVisibleFunctionTable:atIndex:)));
+	}
+	// What the device makes no object of, and a nil table: nil writes 0, unlogged.
 	std::memset(args.contents, 0x5c, 8);
 	[enc setAccelerationStructure:nil atIndex:0];
 	[enc setVisibleFunctionTable:nil atIndex:0];
@@ -2176,12 +3052,13 @@ void test_argument_encoders_of_bindings()
 		      asker.asked.back().buffer_index == 2 &&
 		      asker.asked.back().library_obj_id == reflected.rgfxObjId);
 	}
+	// The encoder's reflection of buffer 2: the binding the function's pipelines reflect, built from
+	// its AIR, of the library's binding's name.
 	RgfxFunction *fn = (RgfxFunction *)[reflected newFunctionWithName:@"every_access"];
 	MTLArgument *of2 = [fn rgfxArgumentOfBufferAtIndex:2];
-	CHECK((of2 == nil) ==
-	      (reflectedBuffer == nil || ![(id)reflectedBuffer isKindOfClass:[MTLArgument class]]));
-	CHECK(of2 == nil || ([of2.name isEqualToString:reflectedBuffer.name] && of2.index == 2 &&
-	                     of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct));
+	CHECK(of2 != nil && [of2.name isEqualToString:@"writesOne"] && of2.index == 2 &&
+	      of2.type == MTLArgumentTypeBuffer && of2.bufferDataType == MTLDataTypeStruct);
+	CHECK(reflectedBuffer == nil || [of2.name isEqualToString:reflectedBuffer.name]);
 	CHECK([fn rgfxArgumentOfBufferAtIndex:7] == nil);
 	while (control.next(&h, &drained)) {
 	}
@@ -2331,9 +3208,14 @@ void test_surface_texture_alloc_sizes()
 void rgfxProtocolTests()
 {
 	test_inline_bytes();
+	test_inline_bytes_parallel();
 	test_inline_bytes_without_region();
+	test_commit_behind_an_untaken_buffer_fails();
+	test_commit_hands_its_publish_to_the_held();
+	test_doorbell_page_rings_at_its_first_byte();
 	test_render_barriers();
 	test_compute_dispatch_type();
+	test_compute_function_table_bindings();
 	test_blit_copy_texture_to_texture();
 	test_render_tile_size();
 	test_trace_ids();
@@ -2341,6 +3223,7 @@ void rgfxProtocolTests()
 	test_framework_members();
 	test_sample_positions();
 	test_visibility_result_buffer();
+	test_rasterization_rate_map_pass();
 	test_color_attachment_mapping_pass();
 	test_encoders_unsupported();
 	test_command_buffer_and_queue_members();

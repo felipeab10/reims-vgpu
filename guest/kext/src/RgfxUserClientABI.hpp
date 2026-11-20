@@ -23,17 +23,120 @@ enum {
 };
 
 // External-method selectors the user client dispatches.
+//
+// Every selector of ours, on the 'RGFX' client and on a shared event's port, is a number that
+// every WebKit web-content sandbox lets its process call on an IOAccelerator connection, on every
+// release from macOS 11 to 26: the web content process of Safari 15.1 to 17.6 on macOS 12 may
+// call only 0 to 13, 15 to 18, 22 to 24, 28 to 31, 40, 42, 48, 256 to 265, 267, 268 and 512
+// there, the numbers Apple's own drivers take, and its sandbox refuses any other before the kext
+// sees it; on macOS 11, 13 and later it may call any number (design.md, "The accelerator's user
+// client: its numbers"; tests/user_client_words_test.cpp holds the set and checks every selector
+// the bundle calls against it). The numbers are free to move only because the bundle and the
+// kext ship as one set: the features call stays at kRgfxAccelMethodFeatures in every map and
+// answers the map's number, kRgfxSelectorMap, and a bundle that meets a kext of another map, or
+// none, refuses the device rather than call a number that means something else there.
+enum {
+	// The selector map these numbers make, which the features call answers third. A change of
+	// any number below takes the next map number.
+	kRgfxSelectorMap = 1,
+};
+
 enum {
 	// Ring a ring's doorbell: scalarInput[0] is the ring id, written to
 	// RGFX_REG_DOORBELL. No output.
 	kRgfxAccelMethodDoorbell = 0,
 	// 1 is kept for Consumed, the completion ring's room doorbell (kRgfxKextFeatureConsumedDoorbell).
+	// 2 is given to no selector of ours: it is the IOGPU base's device-info call on its own client
+	// type (RgfxIOGPUReplies.hpp), so a trace names one call per number.
+	// The features: no input; out: the device's feature word (the kext's RgfxFeatures.hpp), the
+	// RGFX_FEATURE_* bits 0 to 2 as the host offers them and from bit 3 the ones the framebuffer
+	// took for the kext and its bundle; then the kext's own word (kRgfxKextFeature*, below); then
+	// the selector map, kRgfxSelectorMap. It keeps this number in every map. A kext of the map
+	// before this one answers kIOReturnUnsupported here, and the bundle then has no device.
+	kRgfxAccelMethodFeatures = 3,
+	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
+	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and 1 for memory the
+	// process may write; out the block's region offset and its size. The kext wires the pages that
+	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
+	// lists their guest RAM runs in the block, and hands them to the device (SURFACE_PAGES, marked
+	// RGFX_SURFACE_PAGES_PRIVATE) before its grant (BLOCK_GRANT): the device's view of them starts
+	// at the range's first page, so a buffer over the range's first byte lies at that byte's
+	// offset in its page (BUFFER_OVER_PAGES). The block is the client's, freed through
+	// kRgfxAccelMethodFree; the process never maps it, so it never sees a guest physical address.
+	// The pages are unwired once the device has answered the block's release, or the client's
+	// close, and stay wired for good where neither is answered. Memory the process may not write
+	// (0) is wired for reading alone and its SURFACE_PAGES marked RGFX_SURFACE_PAGES_READ_ONLY,
+	// where the device took RGFX_FEATURE_READ_ONLY_PAGES: the host lets only objects whose GPU
+	// writes it drops lie over it. kIOReturnUnsupported where the device lacks
+	// RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may not write
+	// where it lacks RGFX_FEATURE_READ_ONLY_PAGES: the GPU's writes would land in pages the
+	// process cannot write. kIOReturnBadArgument where the range is not mapped in the process;
+	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
+	// for the block.
+	kRgfxAccelMethodPagesBlock = 4,
+	// Posts the client's messages no one waits for that name no block, of its own objects, on
+	// the control ring in one call (kRgfxKextFeatureSubmitBatch): struct in, inline, messages
+	// back to back of the types RgfxSubmitGate's rgfxSubmitBatchSize names (OBJECT_DESTROY,
+	// BUFFER_AT_OFFSET, TEXTURE_CREATE, TEXTURE_VIEW, MANAGED_TEXTURE_CREATE,
+	// MANAGED_BUFFER_CREATE and BUFFER_DID_MODIFY_RANGE), each whole (its header's type and size
+	// set, the size its type's; the kext stamps its seqno) and of an object in the client's
+	// context, at most kRgfxSubmitBatchBytes in all; out: how many were posted, in their order,
+	// each as kRgfxAccelMethodSubmit posts it (a destroy of one of the client's command queues
+	// ends the queue as Submit's does, after the messages before it; an object made for a context
+	// closed since is destroyed behind it). None is posted where any is not such a message
+	// (kIOReturnBadArgument). Succeeds with fewer than all only where the control ring stayed full
+	// or the device stopped: the rest were not posted, and go in a later call, before anything
+	// else of the client's.
+	// With three scalars in and two out (kRgfxKextFeatureQueuePublish): one of the client's
+	// queues, its submission ring's new producer and the publish's flags (RgfxQueuePublish.hpp's
+	// kRgfxPublish*): once every message is posted, the kext publishes the producer on the queue's
+	// ring after them and rings its doorbell as the bundle's own publish would; the second output
+	// says whether it did (0 where any message was not posted, or the queue is not one whose ring
+	// header the kext keeps: the bundle then publishes the buffer itself, or fails it).
+	kRgfxAccelMethodSubmitBatch = 5,
+	// 6 is kept for WakeCompletions (kRgfxKextFeatureWakeCompletions).
+	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
+	// device has given (kRgfxKextFeatureDeferredAnswers): in the seqno of one to wait for first
+	// (0: none), up to a minute; struct out, the answers taken, each a whole
+	// RGFX_EVT_PIPELINE_REFLECTION, in their seqnos' order, as many as fit; out their count.
+	// Returns success whether or not the one waited for came: the answers that did are out all
+	// the same.
+	kRgfxAccelMethodTakeAnswers = 7,
+	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
+	// once no process holds it, through its BLOCK_RELEASE.
+	kRgfxAccelMethodSurfaceBlockRelease = 8,
+	// The client's queue scalarInput[0] has its buffers up to the seqno scalarInput[1] complete,
+	// their copies written back: their writes retire.
+	kRgfxAccelMethodSurfaceRetire = 9,
+	// 10 and 11 are a shared event's port's own (below).
+	// A pages block over memory of the kext's own (kRgfxKextFeaturePagesChunked;
+	// RgfxPagesBlock.hpp): in the memory's length, a multiple of kRgfxPagesChunk (below); out its address
+	// in the process, the block's region offset and its size. The kext takes the length in
+	// physically contiguous chunks of kRgfxPagesChunk bytes each, zero-filled, maps them into the
+	// process in order, read and write, and makes the block of their runs as PagesBlock makes one
+	// of the process's pages: so a 2 MiB slab is a few runs of the guest's RAM where the
+	// process's own pages are hundreds. The memory is the block's: the process never unmaps it,
+	// and kRgfxAccelMethodFree of the block takes it with the block, unmapped from the process and
+	// freed once the device has answered the block's release, or the client's close.
+	// kIOReturnUnsupported as for PagesBlock; kIOReturnBadArgument for a length of no chunks, not a
+	// multiple of one, or past kRgfxPagesChunkedMaxBytes; kIOReturnNoMemory where the kernel has
+	// not that many chunks to give, which the process then takes plain pages for.
+	kRgfxAccelMethodPagesChunked = 12,
+	// The two seeds of an IOSurface the client's process holds (kRgfxKextFeatureSurfaceSeeds): in
+	// its IOSurfaceID; out its lock seed (IOSurfaceGetSeed's) and its unlock seed. IOSurface moves
+	// the lock seed at a read-write lock and the unlock seed at that lock's unlock, and both at a
+	// GPU write (IOSurface::getUnlockSeed, which the Mac's GPU families read: the kext's
+	// RgfxIOSurfaceKPI.hpp), so the two differ while a CPU holds the surface locked for writing.
+	// The bundle reads them for a copy of the surface synced while such a lock was held, which it
+	// syncs again once the unlock seed moves. kIOReturnNotFound where the process holds no such
+	// surface; kIOReturnUnsupported where IOSurface has no unlock seed to read.
+	kRgfxAccelMethodSurfaceSeeds = 13,
+	// A new selector takes the next number design.md's registry gives out.
 };
 
-// The process's device context (RgfxAcceleratorContexts.cpp), on our own user client only,
-// numbered clear of the selectors Apple's IOGPU base drives on its clients. They run from
-// kRgfxAccelMethodContextFirst to kRgfxAccelMethodContextLast with no gap, which is the range the
-// kext routes to its context methods.
+// The process's device context (RgfxAcceleratorContexts.cpp), on our own user client only: the
+// selectors below, and the features call, pages blocks, answers, releases and retires above,
+// which the kext routes to its context methods (rgfxAccelContextSelector).
 enum {
 	// Opens the client's context and its window. No input; out: the context number c, the
 	// object-id base (c << RGFX_CONTEXT_OBJ_ID_SHIFT), the GPU-address base of the context's
@@ -41,10 +144,20 @@ enum {
 	// of what the client is given lies at the base plus o, and nothing else of the region is
 	// mapped there (RgfxAcceleratorUserClient.hpp). A sixth output, where asked
 	// (kRgfxKextFeatureContextSpan), is the range's span in bytes, from the base; a client that
-	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. kIOReturnNoResources where the
-	// kext has no range left (RgfxContextSlots.hpp).
+	// asks for five holds RGFX_CONTEXT_VA_SPAN from the base. A seventh, where asked
+	// (kRgfxKextFeatureDoorbellPage), is the address in the process of the context's doorbell
+	// page (RGFX_FEATURE_DOORBELL_PAGES, RgfxDoorbellPages.hpp), mapped uncached for its whole
+	// RGFX_DOORBELL_PAGE_SIZE bytes, where a 32-bit store at its first byte of one of the
+	// context's queues' ring ids rings that ring as kRgfxAccelMethodDoorbell does; 0 where the
+	// context has none, and the process rings through kRgfxAccelMethodDoorbell. A context opened
+	// without asking for the seventh has no page. kIOReturnNoResources where the kext has no
+	// range left (RgfxContextSlots.hpp).
 	kRgfxAccelMethodOpenContext = 0x100,
-	// A region block: in size, align (a power of two); out: its region offset.
+	// A region block: in size, align (a power of two); out: its region offset. A third input,
+	// where the kext's word holds kRgfxKextFeatureWriteCombined, is the byte of the block from
+	// which the process's mapping of it is write-combined (kIOMapWriteCombineCache), a multiple of
+	// a page; the bytes before it, and the whole block where it is the block's size or more, are
+	// mapped write-back as any block's.
 	kRgfxAccelMethodAlloc = 0x101,
 	// Frees the client's block at the region offset scalarInput[0], and returns at once: the
 	// block is no longer the client's to name, and is given out again once the device answers
@@ -71,11 +184,18 @@ enum {
 	// kRgfxSubmit* flags, may follow: kRgfxSubmitDeferred posts a pipeline create without
 	// waiting, its answer kept for kRgfxAccelMethodTakeAnswers, and answers no struct out; where
 	// the kext has no slot left for the answer, the create is posted and answered as without it.
+	// kRgfxSubmitShared, with the create's pipeline key after the flags (kRgfxSubmitKeyWords
+	// scalars, its bytes in order) and two outputs: where the kext keeps the device's answer to an
+	// equal create of any process (RgfxSharedPipelines.hpp) and has a slot left, the create is
+	// posted as with kRgfxSubmitDeferred and the kept answer is the struct out, stamped with this
+	// create's seqno and obj_id, the second output 1; else it is posted and answered as without it,
+	// the second output 0.
 	kRgfxAccelMethodSubmit = 0x105,
 	// Gives the client's context a chunk of texture resource ids from the guest's one pool:
 	// RGFX_RESOURCE_ID_SMALL_CHUNK of them where the kext's feature word holds
 	// RGFX_FEATURE_SMALL_ID_CHUNKS, else RGFX_RESOURCE_ID_CHUNK. No input; out: the chunk's first
-	// id. kIOReturnNoResources once every chunk is held. The device has the grant
+	// id, and, where two outputs are asked, how many ids the chunk holds, which the bundle takes
+	// as the chunk's size. kIOReturnNoResources once every chunk is held. The device has the grant
 	// (RESOURCE_ID_SMALL_CHUNK or RESOURCE_ID_CHUNK) before it returns; the context holds the
 	// chunk until its close.
 	kRgfxAccelMethodResourceIds = 0x106,
@@ -110,11 +230,15 @@ enum {
 	// RGFX_FEATURE_SURFACE_CACHE, the block that ask makes is cached (RgfxSurfaceCaches.hpp), and
 	// its header holds the surface's CPU generation at kRgfxSurfaceCpuGenOffset and its clients at
 	// kRgfxSurfaceClientsOffset. A fifth output, where asked, is 1 where the block is cached, else
-	// 0.
+	// 0. With six inputs, a struct input of exactly sizeof(RgfxSurfacePagesLayout) is the
+	// surface's planes as its memory holds them: where the device answers which surfaces need a
+	// device cache (RGFX_FEATURE_SURFACE_CACHE_REFUSED), a new cacheable block asks it with them,
+	// and is cached only where it answers so; with none, it stays in place. A struct input of
+	// the layout followed by an RgfxSurfaceResident (RgfxDeferCarry.hpp) lists the surface's
+	// resident pages the process found in its mapping, where the kext took
+	// RGFX_FEATURE_SURFACE_DEFERRED_CARRY: a new block of a surface fresh but for those is
+	// deferred carrying them, where the kext's read proves them; elsewhere the list is ignored.
 	kRgfxAccelMethodSurfaceBlock = 0x109,
-	// Lets go of one ask of the shared block at the region offset scalarInput[0]; the block goes
-	// once no process holds it, through its BLOCK_RELEASE.
-	kRgfxAccelMethodSurfaceBlockRelease = 0x10a,
 	// The device info the host wrote at RGFX_DEVICE_INFO_OFFSET (RgfxDeviceInfo): no input;
 	// struct out, exactly sizeof(RgfxDeviceInfo) bytes, or those and the video caps after them
 	// (RgfxVideoCaps). Its page holds the control completion ring's tail, so no process maps
@@ -128,50 +252,40 @@ enum {
 	// completion of the buffer for a surface drawn in place). No output; a pair the kext cannot
 	// follow is logged and skipped.
 	kRgfxAccelMethodSurfaceWrites = 0x10c,
-	// The client's queue scalarInput[0] has its buffers up to the seqno scalarInput[1] complete,
-	// their copies written back: their writes retire.
-	kRgfxAccelMethodSurfaceRetire = 0x10d,
-	// A pages block over the process's own memory (kRgfxKextFeaturePagesBlock;
-	// RgfxPagesBlock.hpp): in the memory's address in the process, its bytes, and 1 for memory the
-	// process may write; out the block's region offset and its size. The kext wires the pages that
-	// hold the range, rounded out to whole pages, in the process for as long as the block lives,
-	// lists their guest RAM runs in the block, and hands them to the device (SURFACE_PAGES, marked
-	// RGFX_SURFACE_PAGES_PRIVATE) before its grant (BLOCK_GRANT): the device's view of them starts
-	// at the range's first page, so a buffer over the range's first byte lies at that byte's
-	// offset in its page (BUFFER_OVER_PAGES). The block is the client's, freed through
-	// kRgfxAccelMethodFree; the process never maps it, so it never sees a guest physical address.
-	// The pages are unwired once the device has answered the block's release, or the client's
-	// close, and stay wired for good where neither is answered. kIOReturnUnsupported where the
-	// device lacks RGFX_FEATURE_PAGES_BUFFERS or refused the pages, and for memory the process may
-	// not write (0) until read-only pages have a user: the GPU's writes would land in pages the
-	// process cannot write. kIOReturnBadArgument where the range is not mapped in the process;
-	// kIOReturnNoSpace or kIOReturnNoResources where the region or the kext's table has no room
-	// for the block.
-	kRgfxAccelMethodPagesBlock = 0x10e,
-
-	kRgfxAccelMethodContextFirst = kRgfxAccelMethodOpenContext,
-	kRgfxAccelMethodContextLast = kRgfxAccelMethodPagesBlock,
-
-	// The features: no input; out: the device's feature word (the kext's RgfxFeatures.hpp), the
-	// RGFX_FEATURE_* bits 0 to 2 as the host offers them and from bit 3 the ones the framebuffer
-	// took for the kext and its bundle; then the kext's own word (kRgfxKextFeature*, below). A
-	// kext older than it answers kIOReturnUnsupported. The kext routes it to its context methods
-	// beside the range above.
-	kRgfxAccelMethodFeatures = 0x10f,
-	// 0x110 is kept for SubmitBatch (kRgfxKextFeatureSubmitBatch), 0x111 for WakeCompletions
-	// (kRgfxKextFeatureWakeCompletions).
-	// The answers to the client's deferred pipeline creates (Submit's kRgfxSubmitDeferred) the
-	// device has given (kRgfxKextFeatureDeferredAnswers): in the seqno of one to wait for first
-	// (0: none), up to a minute; struct out, the answers taken, each a whole
-	// RGFX_EVT_PIPELINE_REFLECTION, in their seqnos' order, as many as fit; out their count.
-	// Returns success whether or not the one waited for came: the answers that did are out all
-	// the same. The kext routes it to its context methods beside the range above.
-	kRgfxAccelMethodTakeAnswers = 0x112,
-	// A new selector takes the next number design.md's registry gives out. 0x113 and 0x114 are a
-	// shared event's port's own (below).
 };
 
-// A shared event's port's selectors (kRgfxSharedEventUserClientType), numbered past the
+// Whether the 'RGFX' client routes `selector` to its context methods (RgfxAcceleratorContexts.cpp):
+// every selector of its own but the doorbell's.
+static inline int rgfxAccelContextSelector(unsigned selector)
+{
+	switch (selector) {
+	case kRgfxAccelMethodFeatures:
+	case kRgfxAccelMethodPagesBlock:
+	case kRgfxAccelMethodPagesChunked:
+	case kRgfxAccelMethodSurfaceSeeds:
+	case kRgfxAccelMethodSubmitBatch:
+	case kRgfxAccelMethodTakeAnswers:
+	case kRgfxAccelMethodSurfaceBlockRelease:
+	case kRgfxAccelMethodSurfaceRetire:
+	case kRgfxAccelMethodOpenContext:
+	case kRgfxAccelMethodAlloc:
+	case kRgfxAccelMethodFree:
+	case kRgfxAccelMethodQueueCreate:
+	case kRgfxAccelMethodQueueDestroy:
+	case kRgfxAccelMethodSubmit:
+	case kRgfxAccelMethodResourceIds:
+	case kRgfxAccelMethodWaitCompletions:
+	case kRgfxAccelMethodSurfaceScanout:
+	case kRgfxAccelMethodSurfaceBlock:
+	case kRgfxAccelMethodDeviceInfo:
+	case kRgfxAccelMethodSurfaceWrites:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+// A shared event's port's selectors (kRgfxSharedEventUserClientType), numbered apart from the
 // accelerator's own so that a call on a connection of another kind is refused there as unknown.
 enum {
 	// Names the caller's shared event for other processes, once per port: in the caller's
@@ -181,14 +295,31 @@ enum {
 	// the port then names the event until no process holds it (SHARED_EVENT_UNNAME).
 	// kIOReturnBadArgument where the context is not one the calling task holds, or the ids are
 	// not in it; kIOReturnExclusiveAccess where the port names an event already.
-	kRgfxSharedEventMethodExport = 0x113,
+	kRgfxSharedEventMethodExport = 10,
 	// Makes the caller's new shared event from the event the port names: in the caller's context,
 	// the new event's obj_id and its listen queue, as Export's; out the device's status, and the
 	// event's value, which the new event starts at. Any task that holds the port may call it, and
 	// only one that does: that is what makes the port the capability. kIOReturnBadArgument where
 	// the context is not one the calling task holds, or the ids are not in it;
 	// kIOReturnNotReady where the port names no event yet.
-	kRgfxSharedEventMethodImport = 0x114,
+	kRgfxSharedEventMethodImport = 11,
+};
+
+// PagesChunked's (12) chunk, 64 KiB, and the most bytes one call takes, 1 GiB. A 64 KiB run of
+// RAM is one the kernel finds at once, however long the guest has run: measured on an x86-64
+// macOS 26.7.2 guest of 8 GiB on the Radeon 780M host, 4,096 such chunks in a row each took
+// 0.033 ms, and 0.036 ms once 978 MiB of 4 KiB pages had been taken, none longer than 0.74 ms,
+// none refused. Of 128 runs of 2 MiB asked, it gave 28 on the quiet guest and 16 once memory had
+// been taken, the slowest in 264 ms.
+enum {
+	kRgfxPagesChunk = 0x10000,
+	kRgfxPagesChunkedMaxBytes = 0x40000000,
+};
+
+// The most bytes of messages one kRgfxAccelMethodSubmitBatch takes: an inline struct in, 170
+// destroys, 73 heap-placed buffers or 39 textures.
+enum {
+	kRgfxSubmitBatchBytes = 4096,
 };
 
 // kRgfxAccelMethodSubmit's flags, its optional scalar in.
@@ -196,27 +327,45 @@ enum {
 	// Post a pipeline create without waiting for its answer (kRgfxAccelMethodTakeAnswers;
 	// kRgfxKextFeatureDeferredAnswers).
 	kRgfxSubmitDeferred = 1 << 0,
+	// Post a pipeline create without waiting where an equal create's answer is kept, by its
+	// pipeline key (kRgfxKextFeatureSharedPipelines).
+	kRgfxSubmitShared = 1 << 1,
+	// The scalars a kRgfxSubmitShared key takes: 32 bytes.
+	kRgfxSubmitKeyWords = 4,
 };
 
 // The kext's own features, the second word kRgfxAccelMethodFeatures answers: the user-client
 // calls and flags a kext may lack, which the bundle uses only where the word holds their bit
 // (design.md, "The accelerator's user client").
 enum {
-	// PagesBlock, 0x10e.
+	// PagesBlock, 4.
 	kRgfxKextFeaturePagesBlock = 1 << 0,
-	// SubmitBatch, 0x110.
+	// SubmitBatch, 5.
 	kRgfxKextFeatureSubmitBatch = 1 << 1,
-	// WakeCompletions, 0x111.
+	// WakeCompletions, 6.
 	kRgfxKextFeatureWakeCompletions = 1 << 2,
 	// The doorbell table's method 1, Consumed.
 	kRgfxKextFeatureConsumedDoorbell = 1 << 3,
-	// Submit's (0x105) deferred-answer flag, and TakeAnswers, 0x112.
+	// Submit's (0x105) deferred-answer flag, and TakeAnswers, 7.
 	kRgfxKextFeatureDeferredAnswers = 1 << 4,
 	// OpenContext's (0x100) sixth output, the span of the context's GPU addresses.
 	kRgfxKextFeatureContextSpan = 1 << 5,
-	// A shared event's port (kRgfxSharedEventUserClientType) and its selectors, 0x113 and 0x114,
+	// A shared event's port (kRgfxSharedEventUserClientType) and its selectors, 10 and 11,
 	// which the bundle uses where the feature word holds RGFX_FEATURE_SHARED_EVENT_NAMES too.
 	kRgfxKextFeatureSharedEvents = 1 << 6,
+	// Alloc's (0x101) third input, the part of the block mapped write-combined.
+	kRgfxKextFeatureWriteCombined = 1 << 7,
+	// PagesChunked, 12.
+	kRgfxKextFeaturePagesChunked = 1 << 8,
+	// Submit's (0x105) shared flag, kRgfxSubmitShared, which keeps answers only where the feature
+	// word also holds RGFX_FEATURE_PIPELINE_KEYS.
+	kRgfxKextFeatureSharedPipelines = 1 << 9,
+	// SurfaceSeeds, 13.
+	kRgfxKextFeatureSurfaceSeeds = 1 << 10,
+	// SubmitBatch's (5) publish of a queue's ring with the messages (RgfxQueuePublish.hpp).
+	kRgfxKextFeatureQueuePublish = 1 << 11,
+	// OpenContext's (0x100) seventh output, the context's doorbell page in the process.
+	kRgfxKextFeatureDoorbellPage = 1 << 12,
 };
 
 // Where a cached block's header holds its surface's CPU generation, a 64-bit count the kext

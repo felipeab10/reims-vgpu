@@ -2,7 +2,7 @@
  * RgfxMetalPrivate: minimal forward-declarations of the Apple-private Metal
  * interface the reims-graphics guest bundle plugs into. Metal loads our bundle as
  * the guest's MTLDevice (via MetalPluginName/MetalPluginClassName on the
- * accelerator's IOKit personality) and expects a device that subclasses Apple's
+ * accelerator's registry entry) and expects a device that subclasses Apple's
  * private IOAccel-backed Metal base class and conforms to <MTLDevice, MTLDeviceSPI>
  * (docs/graphics-kext/design.md, Stage 3; and the Stage-3 Apple-interface notes).
  *
@@ -236,6 +236,31 @@ NS_ASSUME_NONNULL_END
 - (uint64_t)protectionOptions;
 // measured: macOS 26 Metal.framework, optional, `c16@0:8`.
 - (BOOL)commitAndWaitUntilSubmitted;
+@end
+
+// read from code: macOS 27 Metal.framework and QuartzCore.framework — the drawable member Metal's
+// base command buffer's presentDrawable: calls (-[_MTLCommandBuffer presentDrawable:], which the
+// AMD 5300M's and the Intel 630's buffers call through super; measured, macOS 26.7.1: a drawable
+// without it ends the process there with an unrecognized selector). CAMetalDrawable keeps the
+// block and calls it once the layer's image queue has taken the present (its image queue's
+// collectable signal, the layer's next drawable or flush, or 1.1 s on), at once where the drawable
+// has no layer on screen.
+@protocol RgfxDrawablePresentScheduled
+- (void)addPresentScheduledHandler:(void (^_Nonnull)(id<MTLDrawable> _Nonnull))block;
+@end
+
+// read from code: macOS 27.0.1 Metal.framework — what Metal's base command queue reads off the
+// descriptor it is made with as it starts, the members of the descriptor's internal subclass
+// (`MTLCommandQueueDescriptorInternal`), which RgfxCommandQueue's rgfxTakeDescriptor: reads where
+// the guest's descriptor answers them.
+@protocol RgfxMetalQueueDescriptorInternals <NSObject>
+- (NSUInteger)qosLevel;
+- (nullable dispatch_queue_t)commitQueue;
+- (BOOL)commitSynchronously;
+- (BOOL)commitsWithQoS;
+- (BOOL)disableCrossQueueHazardTracking;
+- (BOOL)isOpenGLQueue;
+- (nullable dispatch_queue_t)completionQueue;
 @end
 
 // measured: macOS 27 Metal.framework — the initialisers of Metal's own IO command queue

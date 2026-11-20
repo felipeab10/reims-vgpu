@@ -8,11 +8,11 @@
  * region (RgfxRegionSlabSource), whose Shared slabs are each one placement heap over host memory
  * (HEAP_OVER_HOST_MEMORY) with every buffer a BUFFER_AT_OFFSET in it, and whose Managed slabs are
  * plain blocks with each buffer a BUFFER_OVER_HOST_MEMORY over its own range of the block, its CPU
- * copy; or a superpage of the process's own (RgfxPagesSlabSource), one heap over its guest RAM
+ * copy; or 2 MiB of the process's own pages (RgfxPagesSlabSource), one heap over its guest RAM
  * (HEAP_OVER_PAGES) with its buffers placed in it the same way, or for one large Shared buffer
- * several superpages, the buffer a BUFFER_OVER_PAGES over them. So a create is a take from a
- * free list and one post on ring 0, and a free a give back: neither calls the kext, and the
- * region's block table holds one entry per slab.
+ * more, the buffer a BUFFER_OVER_PAGES over them. So a create is a take from a free list and one
+ * post on ring 0, and a free a give back: neither calls the kext, and the region's block table
+ * holds one entry per slab.
  *
  * What the buffers answer, as both x86-64 Macs' GPUs (AMD 5300M, Intel 630) agree (measured with
  * tools/shmem's align and zero cases): a buffer takes whole 4 KiB pages (kGranule; allocatedSize
@@ -26,9 +26,9 @@
  * MANAGED OVER A COPY. Where the device took RGFX_FEATURE_MANAGED_BUFFER_SLABS (the sources'
  * `managedOverCopy`), a Managed buffer lies in the Shared class of its cache and hazard tracking
  * modes: its range is a Shared buffer's, made as any (BUFFER_AT_OFFSET in the slab's heap, or
- * BUFFER_OVER_PAGES over a larger slab of superpages), and the Managed buffer a
+ * BUFFER_OVER_PAGES over a larger slab of plain pages), and the Managed buffer a
  * MANAGED_BUFFER_CREATE over it, its CPU copy. So a Managed buffer of any size lies where a Shared
- * one of its size does, the process's own superpages first, on every host. Its range goes back
+ * one of its size does, the process's own pages first, on every host. Its range goes back
  * once the copy's destroy follows the buffer's. Without the feature a Managed buffer has a class
  * of its own (below, the region's source).
  *
@@ -59,10 +59,16 @@
  * that source's capacity.
  *
  * THE FALLBACKS, in order, where a buffer finds no room in its class's slabs: a new slab; then,
- * once the sources had no memory for one, the process's own empty and cached slabs let go and a
- * new slab asked again; then, for a small buffer, region slabs half as large down to the buffer's
- * own rounded size. Only where no source has memory even for that is the answer nil: the region
- * is full. (Where the kext's block source places blocks, WindowServer's asks may take its
+ * once the sources had no memory for one, the process's own empty and cached slabs let go, the
+ * slabs other threads (the background's among them) were giving back at that moment waited for,
+ * and a new slab asked again; then, for a small buffer, region slabs half as large down to the
+ * buffer's own rounded size. Only where no source has memory even for that is the answer nil: the
+ * region is full. A slab being given back is out of the slabs' books and not yet back in its
+ * source's, for as long as its block's release takes, a host round trip: without the wait, one
+ * thread's let-go of a batch of slabs makes another's create nil while the memory is on its way
+ * back (measured on the M3 Max: test_slab_thread's 3 MiB takes refused in 8 of 1,000 runs under
+ * Rosetta, with 237 to 253 MiB of its 256 MiB source taken while the slabs held 61 to 150 MiB).
+ * (Where the kext's block source places blocks, WindowServer's asks may take its
  * reserve.) A slab whose heap the device never got (the kext's submit refused it) is nil at once.
  *
  * Thread-safe: Metal creates and frees buffers on the app's threads. Our own C++, free of
@@ -98,6 +104,7 @@ public:
 		uint64_t regionOffset = 0;
 		bool zeroed = false;
 		uint64_t blockSize = 0; // a pages block's size, for a source of the process's own pages
+		bool chunked = false;   // the kext's chunks, which go with the pages block's release
 	};
 
 	/// The host's object over a slab of a class whose buffers are placed in it (heaped): its
@@ -217,24 +224,48 @@ protected:
 /// (RgfxMetalDevice: mach_vm_allocate) and the tests fake.
 struct RgfxPagesMemory {
 	void *context = nullptr;
-	/// `size` bytes of 2 MiB superpages, zeroed and wired: 0 (KERN_SUCCESS), or the kernel's
-	/// refusal, KERN_NO_SPACE where no contiguous 2 MiB is free and KERN_RESOURCE_SHORTAGE past the
-	/// user wire budget.
-	int (*superpages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
-	/// Gives back what superpages made.
+	/// `size` bytes of plain pages, zero-filled, which the kext's pages block wires: 0
+	/// (KERN_SUCCESS), or the kernel's refusal. Null for none.
+	int (*pages)(void *context, uint64_t size, uint8_t **bytes) = nullptr;
+	/// Gives back what pages made.
 	void (*unmap)(void *context, uint8_t *bytes, uint64_t size) = nullptr;
 };
 
-/// Slabs of the process's own pages: 2 MiB superpages wired into a pages block of the kext's
+/// Slabs of the process's own pages: the kext's chunks of 64 KiB where it gives them
+/// (RgfxRegion::acquireChunkedPages), else plain pages, wired into a pages block of the kext's
 /// (RgfxRegion::acquirePages; RGFX_FEATURE_PAGES_BUFFERS), so their buffers' memory is the guest's
-/// RAM, not the device region's, for the classes whose buffers lie in heaps. A slab of one
-/// superpage, one run of guest RAM, is a heap the host makes over that RAM (HEAP_OVER_PAGES;
+/// RAM, not the device region's, for the classes whose buffers lie in heaps. A slab of 2 MiB is a
+/// heap the host makes over the block's view of its runs (HEAP_OVER_PAGES;
 /// RGFX_FEATURE_HEAP_OVER_PAGES), its buffers placed there as in a region slab's heap. A larger
-/// slab is more than one run, and holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the
-/// block's view, or a Managed buffer over such a Shared copy (MANAGED OVER A COPY); a larger
-/// Managed one of a class of its own, and a slab where the kernel has no superpages to give or the
-/// kext no pages block, are the region's. A slab goes with its heap's destroy, then its block's
-/// release (the kext's Free, which waits for the device's answer), then its pages.
+/// slab holds one dedicated Shared buffer, a BUFFER_OVER_PAGES over the block's view, or a Managed
+/// buffer over such a Shared copy (MANAGED OVER A COPY); a larger Managed one of a class of its
+/// own, and a slab where the kernel has no pages to give or the kext no pages block, are the
+/// region's. A slab goes with its heap's destroy, then its block's release (the kext's Free, which
+/// waits for the device's answer), then its plain pages; chunks go with the release.
+///
+/// Why the process's own pages: the region is no RAM of the guest's, which the kernel maps
+/// uncached, as an AMD host applies (13 MB/s for a process's stores there, against 56 to 123 GB/s
+/// in a superpage of its own RAM; RgfxRegion.hpp).
+///
+/// Why plain pages, never superpages: the kernel's 2 MiB superpages, each one run of RAM, run out
+/// within minutes of a boot (measured on an x86-64 macOS 26.7.2 guest of 8 GiB: 19 for one
+/// process at boot with 2.5 GiB free, then KERN_NO_SPACE; none three minutes later), and asking
+/// for one stalls the process, on whatever thread asks. The kernel searches for a contiguous
+/// 2 MiB (vm_map_enter's superpage path, in cpm_allocate, which sleeps as it goes and moves pages
+/// to make a run) with the process's map held: in the public xnu-12377.101.15 source, under the
+/// map's interlock and with the new entry locked exclusive, which a walk of the map past it
+/// (vm_map_region's shared range lock) waits for. Measured with tailspin on that guest on the
+/// Radeon 780M host: a refused search took 140 to 190 ms, and while WindowServer's slabs thread
+/// searched, its main thread, making a texture over a layer's image as a window was resized,
+/// waited in vm_map_region for it, and Safari's page drew no frame for 179 ms. Plain pages are
+/// what every slab took once superpages ran out, minutes after a boot.
+///
+/// Why chunks first: a 2 MiB slab of plain pages is up to 512 runs of the guest's RAM, and the
+/// host maps each run of a view apart, against a budget of mappings per process (vm.max_map_count
+/// on Linux): at its stock 65530, views of scattered pages, slabs' among them, used up the budget on
+/// NVIDIA, and the buffers made after were copies. The kext's chunks are 64 KiB runs, so a 2 MiB slab is 32 runs at most,
+/// and a run of 64 KiB is one the kernel finds at once, however long the guest has run, where
+/// 2 MiB runs are as scarce as superpages (RgfxUserClientABI.hpp, kRgfxPagesChunk).
 class RgfxPagesSlabSource : public RgfxRegionSlabSource {
 public:
 	RgfxPagesSlabSource(RgfxRegion &region, RgfxSerializer &serializer,
@@ -251,7 +282,7 @@ public:
 	bool makeBuffer(const Memory &memory, const Heap &heap, uint64_t offset, uint64_t length,
 	                uint32_t options, Made *out) override;
 
-	/// A superpage, and the size of a slab with a heap.
+	/// The size of a slab with a heap.
 	static constexpr uint64_t kUnit = 2ull << 20;
 
 private:
@@ -278,7 +309,7 @@ public:
 		uint64_t cachedSlabs = 0;  // dedicated slabs with no buffer, kept for reuse
 		uint64_t cachedBytes = 0;
 		uint64_t dirtyBytes = 0;   // free bytes not yet zeroed
-		uint64_t dooming = 0;      // slabs let go whose drop has not run yet
+		uint64_t dooming = 0;      // slabs let go whose memory is not yet back in its source
 		uint64_t usedBytes = 0;    // bytes taken by buffers
 		uint64_t firstSlabs = 0;   // of the slabs, those the first source made
 	};
@@ -311,6 +342,10 @@ public:
 	bool makeBuffer(const Range &range, uint64_t length, uint32_t options,
 	                RgfxSlabSource::Made *out);
 
+	/// Whether a Managed buffer of `options` lies over a Shared copy (MANAGED OVER A COPY): the
+	/// device took RGFX_FEATURE_MANAGED_BUFFER_SLABS, and makes one over any Shared buffer.
+	bool overCopy(uint32_t options) const { return m_source.overCopy(options); }
+
 	/// The clock the idle times are read from, in ms: `now(context)`, for the tests; the steady
 	/// clock where none is set. Set before any take.
 	typedef uint64_t (*Clock)(void *context);
@@ -321,8 +356,9 @@ public:
 	void give(const Range &range);
 
 	/// Lets every empty and cached slab go, with the doomed ones, where the source had no room
-	/// for another block of the process's (RgfxRegion::setReclaim): true where one went. Called
-	/// without the lock.
+	/// for another block of the process's (RgfxRegion::setReclaim), and waits for the slabs other
+	/// threads were giving back as it was called (waitForDrops): true where one went or came
+	/// back. Called without the lock.
 	bool reclaim();
 
 	/// Does one piece of the background's work (a drop, a piece zeroed, an idle cached slab let
@@ -404,8 +440,16 @@ private:
 	/// go first where `evict`: the process's own room given back before a create is refused.
 	/// Answers how many it dropped.
 	size_t dropDoomed(bool evict);
-	/// Gives a slab's heap and memory back, and frees it. Called without the lock.
+	/// Gives a slab's heap and memory back, and frees it, its serial in m_dropping meanwhile.
+	/// Called without the lock.
 	void drop(Slab *slab);
+	/// Waits until the slabs being given back (m_dropping) and the doomed ones (m_doomed) as this
+	/// is called are gone, their memory back in their sources (THE FALLBACKS): whether there were
+	/// any. Called without the lock, by a thread that is giving none back, after its own
+	/// dropDoomed(true). Those are the drops that call would have made itself had it come first,
+	/// on the same locks and the same host answers (the heap's destroy, the block's release), so
+	/// the wait holds its thread on nothing that call would not have.
+	bool waitForDrops();
 	/// Gives `range` back to its slab, its buffers' destroys all posted.
 	void giveBack(const Range &range);
 	/// The class of `options`. Caller holds the lock.
@@ -431,6 +475,8 @@ private:
 	Clock m_clock = nullptr;
 	void *m_clockContext = nullptr;
 	std::vector<Slab *> m_doomed;
+	std::set<uint64_t> m_dropping;           // serials of the slabs being given back (drop)
+	std::condition_variable m_dropped;       // a drop is done
 	std::set<Slab *, BySerial> m_dirtySlabs; // slabs with dirty free bytes
 	uint64_t m_nextSerial = 1;
 	std::thread m_thread;

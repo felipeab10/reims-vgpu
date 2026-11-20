@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Graphics</key>
+	<dict>
+		<key>Driver</key>
+		<string>Drivers/ReimsGraphics.elf</string>
+	</dict>
+	<key>Kernel</key>
+	<dict>
+		<key>ExportVtableDiscriminators</key>
+		<array>
+			<string>__ZTV25IOMobileFramebufferLegacy</string>
+			<string>__ZTV26IOMobileFramebufferService</string>
+			<string>__ZTV19IOMobileFramebuffer</string>
+		</array>
+	</dict>
+</dict>
+</plist>
