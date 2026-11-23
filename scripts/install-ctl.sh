@@ -48,6 +48,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # The PATH this ran with, which the user's shell has; the build's own puts rustup's first.
 START_PATH="$PATH"
 YES=0 UPDATE=0 SKIP_QEMU=0
+SKIP_HOST_CHECKS="${REIMS_INSTALL_SKIP_HOST_CHECKS:-0}"
 for arg in "$@"; do
   case "$arg" in
     --yes | -y) YES=1 ;;
@@ -114,6 +115,17 @@ mkdir -p "$DATA" "$CACHE"
 # Every VM runs on QEMU: --skip-qemu keeps the installed one, and needs one.
 if [[ $SKIP_QEMU == 1 && ! -x "$DATA/qemu/current/bin/$QEMU_BINARY" ]]; then
   die "--skip-qemu keeps the installed QEMU, and none is installed ($DATA/qemu/current/bin/$QEMU_BINARY is missing): run this without --skip-qemu, which builds it"
+fi
+
+# MSYS2's UCRT64 shell, which this script runs on Windows in, has git at
+# /ucrt64/bin before /usr/bin on PATH, and only the git at /usr/bin (MSYS2's
+# git) reads C:/ paths. Without it, `git -C "$ROOT"` dies at its first call
+# below when the checkout is at a C:/ path.
+if [[ "$(uname -s)" == MSYS* || "$(uname -s)" == MINGW* ]]; then
+  if ! command -v git >/dev/null 2>&1; then
+    say "Installing git (MSYS2's git, which reads C:/ paths)"
+    pacman -S --needed --noconfirm git
+  fi
 fi
 
 # ------------------------------------------------------------------ update
@@ -339,7 +351,7 @@ if ! grep -qsxF "$usb_rule" "$usb_rule_file"; then
   fi
 fi
 # Unless /dev/udmabuf's group, kvm, was the one named above.
-if [[ ${group:-} != kvm ]] && getent group kvm >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx kvm; then
+if [[ ${group:-} != kvm && $SKIP_HOST_CHECKS == 0 ]] && getent group kvm >/dev/null && ! id -nG | tr ' ' '\n' | grep -qx kvm; then
   say "You're not in the kvm group: over SSH, where a desktop session's access doesn't apply, add yourself to it (sudo usermod -aG kvm \$USER) to give VMs USB devices there"
 fi
 
