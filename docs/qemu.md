@@ -1472,7 +1472,9 @@ library takes no part in, in QEMU's own window:
 
 scripts/install-ctl.sh builds QEMU on Linux with GTK for it, and reims-ctl
 refuses to start such a VM on a QEMU whose `-display help` lists no `gtk`,
-until `reims-ctl update` builds one.
+until `reims-ctl update` builds one. `REIMS_INSTALL_SKIP_HOST_CHECKS=1` skips
+the script's host checks (for example KVM access and group setup) when the
+host is already prepared.
 Where the environment names no Wayland compositor or X server, GTK's window
 ends QEMU as it starts, so reims-ctl gives such a VM `-display none` there.
 Closing the window ends QEMU at once (`gd_window_close`, `qmp_quit`), as
